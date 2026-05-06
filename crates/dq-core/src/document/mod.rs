@@ -30,6 +30,7 @@ use serde::ser::{SerializeMap, SerializeSeq, Serializer};
 
 use crate::Result;
 use crate::error::{Error, PathErrorKind};
+use crate::ir::{Ir, Provenance, ProvenanceMap};
 use crate::pointer::Pointer;
 use crate::textual_edit::renderer_for_format;
 
@@ -197,6 +198,23 @@ pub struct Document {
     /// `Format::write` can re-serialise through the right writer and then
     /// concatenate the body bytes verbatim.
     frontmatter_payload: Option<FrontmatterPayload>,
+    /// Provenance side-channel paired with `spans`.
+    ///
+    /// One [`Provenance::Original`] entry per pointer in `spans`, sharing
+    /// the same canonical RFC 6901 keys. Empty for read-only formats whose
+    /// parsers do not record byte ranges (jsonl, hcl, ini, dotenv, csv,
+    /// tsv, dockerfile, ignore-list, markdown body) — see
+    /// [`Document::as_ir`] for how this surfaces to callers.
+    ///
+    /// Eagerly built in the [`Document::with_spans`] constructor (Phase 1
+    /// `add-ir-foundation`): the cost is one ordered iteration over an
+    /// already-allocated [`SpanMap`], paid at parse time, so the public
+    /// [`Document::as_ir`] view is strictly zero-copy at call time. The
+    /// alternative — lazy [`std::sync::OnceLock`] materialisation — would
+    /// have required hand-rolled `Clone` / `PartialEq` impls for
+    /// `Document` to ignore the cache; the eager path keeps the existing
+    /// derives intact for a fixed parse-time hashmap iteration.
+    provenance: ProvenanceMap,
 }
 
 impl Value {
@@ -231,6 +249,7 @@ impl Document {
             format,
             multi_doc: false,
             frontmatter_payload: None,
+            provenance: ProvenanceMap::new(),
         }
     }
 
@@ -251,6 +270,7 @@ impl Document {
             format,
             multi_doc: true,
             frontmatter_payload: None,
+            provenance: ProvenanceMap::new(),
         }
     }
 
@@ -267,6 +287,7 @@ impl Document {
         spans: SpanMap,
         format: FormatTag,
     ) -> Self {
+        let provenance = provenance_from_spans(&spans);
         Self {
             value,
             original_bytes,
@@ -274,6 +295,7 @@ impl Document {
             format,
             multi_doc: false,
             frontmatter_payload: None,
+            provenance,
         }
     }
 
@@ -289,6 +311,7 @@ impl Document {
             format: FormatTag::Frontmatter,
             multi_doc: false,
             frontmatter_payload: Some(FrontmatterPayload { kind, body }),
+            provenance: ProvenanceMap::new(),
         }
     }
 
@@ -388,6 +411,40 @@ impl Document {
         self.format
     }
 
+    /// Borrow this `Document` as an [`Ir<'_>`] — the read-only IR view used
+    /// by the lint pipeline (Phase 2+ of `add-ir-foundation`) to resolve
+    /// per-pointer provenance and source spans.
+    ///
+    /// # Zero-copy contract
+    ///
+    /// This call neither clones the [`Value`] tree nor the underlying
+    /// [`SpanMap`]. The returned [`Ir<'_>`] borrows three already-allocated
+    /// fields:
+    ///
+    /// - `&self.value` — the parsed value tree.
+    /// - `&self.provenance` — the [`ProvenanceMap`] eagerly derived in
+    ///   [`Document::with_spans`] from the parser-supplied span map.
+    ///   Mutated alongside `spans` inside [`Document::set_at`] /
+    ///   [`Document::del_at`] so the IR view stays consistent across
+    ///   writes.
+    /// - `self.format` — a `Copy` [`FormatTag`].
+    ///
+    /// # Empty provenance
+    ///
+    /// Documents produced by read-only parsers (jsonl, hcl, ini, dotenv,
+    /// csv, tsv, dockerfile, ignore-list, frontmatter body, markdown body)
+    /// carry an empty [`ProvenanceMap`] — the parsers route through
+    /// [`Document::value_only`] / [`Document::multi_value_only`] /
+    /// [`Document::frontmatter`], none of which emit provenance entries.
+    /// `as_ir().provenance_for(p)` returns `None` for every pointer in
+    /// such documents, while `as_ir().format()` still surfaces the
+    /// concrete tag — callers can therefore distinguish "no provenance
+    /// available for this format" from "this format does not exist".
+    #[must_use]
+    pub fn as_ir(&self) -> Ir<'_> {
+        Ir::new(&self.value, &self.provenance, self.format)
+    }
+
     /// Access the frontmatter payload, if this `Document` was produced by the
     /// frontmatter parser. Returns `None` for every other format.
     #[must_use]
@@ -470,6 +527,12 @@ impl Document {
                 let line_end = signed_extend(span.line_range.end, line_shift);
                 updated.line_range = span.line_range.start..line_end;
             }
+            // Re-sync the provenance side-channel with the post-edit spans
+            // so `Document::as_ir().span_for(p)` keeps matching
+            // `Document::span_at(p)` after the write. Cost is one ordered
+            // iteration over the updated `SpanMap`, dwarfed by the byte
+            // splice and span-recompute that already ran above.
+            self.provenance = provenance_from_spans(&self.spans);
             Ok(())
         } else {
             // mkdir-p path: M2 baseline does not yet support inserting brand
@@ -559,8 +622,41 @@ impl Document {
         }
         apply_delta(&mut self.spans, delta);
         delete_value_at(&mut self.value, pointer)?;
+        // Mirror `set_at`: regenerate provenance from the post-edit span
+        // map so the IR view stays consistent across writes.
+        self.provenance = provenance_from_spans(&self.spans);
         Ok(())
     }
+}
+
+/// Build a [`ProvenanceMap`] from a [`SpanMap`] by emitting one
+/// [`Provenance::Original`] entry per pointer, sharing the same canonical
+/// keys.
+///
+/// Every populated span yields `Original { pointer, span: Some(span) }`;
+/// the read-only parser path does not call this helper — it leaves
+/// `Document::provenance` empty so `as_ir().provenance` reports "no
+/// provenance available" for every lookup.
+fn provenance_from_spans(spans: &SpanMap) -> ProvenanceMap {
+    let mut map = ProvenanceMap::with_capacity(spans.len());
+    for (canonical, span) in spans {
+        // Re-parse the canonical pointer string so the structured
+        // [`Pointer`] inside `Original` matches the canonical key. The
+        // canonical form was produced by [`Pointer::as_canonical`], so
+        // [`Pointer::parse`] is the exact inverse and cannot fail on
+        // well-formed input. Defensive `expect` documents the invariant
+        // for future readers.
+        let pointer = Pointer::parse(canonical)
+            .expect("canonical span keys are produced by Pointer::as_canonical");
+        map.insert(
+            canonical.clone(),
+            Provenance::Original {
+                pointer,
+                span: Some(span.clone()),
+            },
+        );
+    }
+    map
 }
 
 /// Apply a signed shift to a `usize`, saturating on negative overflow.
