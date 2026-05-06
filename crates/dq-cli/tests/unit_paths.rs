@@ -9,16 +9,20 @@ use clap::Parser;
 use dq::Cli;
 use tempfile::NamedTempFile;
 
-fn write_yaml(content: &str) -> NamedTempFile {
+/// Returns a `TempPath` so the underlying handle is closed before the binary
+/// touches the path. Windows requires this for the binary to overwrite the
+/// path during in-place edits — the same pattern propagated from
+/// `cli_set_jq.rs`. We apply it uniformly even for read-only sites.
+fn write_yaml(content: &str) -> tempfile::TempPath {
     let mut tmp = NamedTempFile::with_suffix(".yaml").expect("tempfile");
     tmp.write_all(content.as_bytes()).expect("write tempfile");
-    tmp
+    tmp.into_temp_path()
 }
 
 #[test]
 fn paths_console_output_lists_pre_order_pointers() {
     let tmp = write_yaml("server:\n  port: 8080\n  host: x\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "paths", path, "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -43,7 +47,8 @@ fn paths_json_output_is_a_pointer_to_type_object() {
     // `-F json` switches both the parser and the reporter; we feed JSON in.
     let mut tmp = NamedTempFile::with_suffix(".json").expect("tempfile");
     std::io::Write::write_all(&mut tmp, br#"{"a": 1, "b": "c"}"#).unwrap();
-    let path = tmp.path().to_str().unwrap();
+    let tmp = tmp.into_temp_path();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "-F", "json", "paths", path, "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -75,7 +80,7 @@ fn paths_handles_empty_document() {
     // `-F json` here so the YAML parser handles the `~` token correctly; the
     // ConsoleReporter still writes the root entry as a single line.
     let tmp = write_yaml("~\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "paths", path, "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();

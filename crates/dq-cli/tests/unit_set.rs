@@ -23,19 +23,23 @@ use clap::Parser;
 use dq::Cli;
 use tempfile::NamedTempFile;
 
-/// Write `content` to a temp YAML file and return the handle (so it stays
-/// alive for the test's lifetime).
-fn write_yaml(content: &str) -> NamedTempFile {
+/// Write `content` to a temp YAML file and return a `TempPath`. We return
+/// `TempPath` (not `NamedTempFile`) so the underlying handle is closed before
+/// the binary touches the path. On Windows, holding the `NamedTempFile` open
+/// blocks any in-place rewrite of the same path with "Access is denied. (os
+/// error 5)" — see CI failure on `cli_set_jq.rs`. The `TempPath` still
+/// removes the file on drop, so cleanup is preserved.
+fn write_yaml(content: &str) -> tempfile::TempPath {
     let mut tmp = NamedTempFile::with_suffix(".yaml").expect("tempfile");
     tmp.write_all(content.as_bytes()).expect("write tempfile");
-    tmp
+    tmp.into_temp_path()
 }
 
 /// Write `content` to a temp JSON file (used for `--value-from` fixtures).
-fn write_json(content: &str) -> NamedTempFile {
+fn write_json(content: &str) -> tempfile::TempPath {
     let mut tmp = NamedTempFile::with_suffix(".json").expect("tempfile");
     tmp.write_all(content.as_bytes()).expect("write tempfile");
-    tmp
+    tmp.into_temp_path()
 }
 
 #[test]
@@ -44,7 +48,7 @@ fn set_replaces_scalar() {
     // stdout. The file on disk is untouched. Asserting the stdout substring
     // pins the behaviour without binding to the parser's exact reflow.
     let tmp = write_yaml("spec:\n  replicas: 3\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::try_parse_from(["dq", "set", path, "/spec/replicas", "5"]).unwrap();
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -55,7 +59,7 @@ fn set_replaces_scalar() {
         "stdout must contain `replicas: 5`, got: {s:?}",
     );
     // File on disk untouched without `-i`.
-    let on_disk = std::fs::read_to_string(tmp.path()).unwrap();
+    let on_disk = std::fs::read_to_string(&tmp).unwrap();
     assert_eq!(on_disk, "spec:\n  replicas: 3\n");
 }
 
@@ -65,13 +69,13 @@ fn set_in_place_writes_file_atomically() {
     // path through `dq_core::atomic_write::write` — its byte-for-byte
     // semantics are exercised here.
     let tmp = write_yaml("spec:\n  replicas: 3\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::try_parse_from(["dq", "-i", "set", path, "/spec/replicas", "5"]).unwrap();
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
     dq::run(&cli, false, &mut out, &mut err).expect("set should succeed");
     assert!(out.is_empty(), "in-place mode must not write to stdout");
-    let on_disk = std::fs::read_to_string(tmp.path()).unwrap();
+    let on_disk = std::fs::read_to_string(&tmp).unwrap();
     assert_eq!(on_disk, "spec:\n  replicas: 5\n");
 }
 
@@ -82,19 +86,18 @@ fn set_in_place_with_backup_creates_bak_file() {
     // `.bak` (`foo.yaml` → `foo.yaml.bak`) per `atomic_write::backup_path_for`.
     let original = "spec:\n  replicas: 3\n";
     let tmp = write_yaml(original);
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli =
         Cli::try_parse_from(["dq", "-i", "--backup", "set", path, "/spec/replicas", "5"]).unwrap();
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
     dq::run(&cli, false, &mut out, &mut err).expect("set should succeed");
 
-    let on_disk = std::fs::read_to_string(tmp.path()).unwrap();
+    let on_disk = std::fs::read_to_string(&tmp).unwrap();
     assert_eq!(on_disk, "spec:\n  replicas: 5\n");
 
     // Backup path: append `.bak` to the full path (`foo.yaml` → `foo.yaml.bak`).
-    let bak_path =
-        std::path::PathBuf::from(format!("{}.bak", tmp.path().to_str().expect("utf-8 path")));
+    let bak_path = std::path::PathBuf::from(format!("{}.bak", tmp.to_str().expect("utf-8 path")));
     let bak_contents = std::fs::read_to_string(&bak_path)
         .unwrap_or_else(|e| panic!("backup file missing at {}: {e}", bak_path.display()));
     assert_eq!(
@@ -112,7 +115,7 @@ fn set_diff_outputs_unified_diff() {
     // the removed-original and added-new line so a regression where the diff
     // is reversed (or empty) is caught immediately.
     let tmp = write_yaml("spec:\n  replicas: 3\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::try_parse_from(["dq", "--diff", "set", path, "/spec/replicas", "5"]).unwrap();
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -127,7 +130,7 @@ fn set_diff_outputs_unified_diff() {
         "expected `+  replicas: 5` in diff, got:\n{s}",
     );
     // File on disk untouched in diff mode.
-    let on_disk = std::fs::read_to_string(tmp.path()).unwrap();
+    let on_disk = std::fs::read_to_string(&tmp).unwrap();
     assert_eq!(on_disk, "spec:\n  replicas: 3\n");
 }
 
@@ -139,7 +142,7 @@ fn set_no_create_rejects_missing_pointer() {
     // mkdir-p path is not yet wired; this test pins the `--no-create` case
     // so the future M3 work cannot accidentally regress the strict mode.
     let tmp = write_yaml("a: 1\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli =
         Cli::try_parse_from(["dq", "set", path, "/missing/path", "hello", "--no-create"]).unwrap();
     let mut out: Vec<u8> = Vec::new();
@@ -164,7 +167,7 @@ fn set_value_string_forces_string() {
     // We pass the literal `8080` (which would normally parse as Int) plus
     // `--value-string` so the resulting node is a string.
     let tmp = write_yaml("port: 80\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::try_parse_from(["dq", "set", path, "/port", "8080", "--value-string"]).unwrap();
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -184,7 +187,7 @@ fn set_inline_json_literal_int_heuristic() {
     // the flag MUST be parsed as an integer. A regression that broke the
     // heuristic would emit `'8080'` instead.
     let tmp = write_yaml("port: 80\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::try_parse_from(["dq", "set", path, "/port", "8080"]).unwrap();
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -205,8 +208,8 @@ fn set_at_file_value_from_path() {
     // M2 baseline's "no mkdir-p yet" restriction doesn't apply.
     let target = write_yaml("name: old\n");
     let value_src = write_json(r#""loaded-from-file""#);
-    let target_path = target.path().to_str().unwrap();
-    let value_path = value_src.path().to_str().unwrap();
+    let target_path = target.to_str().unwrap();
+    let value_path = value_src.to_str().unwrap();
     let at_arg = format!("@{value_path}");
     let cli = Cli::try_parse_from(["dq", "set", target_path, "/name", &at_arg]).unwrap();
     let mut out: Vec<u8> = Vec::new();
@@ -226,8 +229,8 @@ fn set_with_value_from_flag() {
     // the value source is a single value rather than a map.
     let target = write_yaml("greeting: hello\n");
     let value_src = write_json(r#""hi there""#);
-    let target_path = target.path().to_str().unwrap();
-    let value_path = value_src.path().to_str().unwrap();
+    let target_path = target.to_str().unwrap();
+    let value_path = value_src.to_str().unwrap();
     let cli = Cli::try_parse_from([
         "dq",
         "set",
@@ -252,7 +255,7 @@ fn set_rejects_in_place_with_diff() {
     // `-i --diff` is a contradictory output-mode pair; `ensure_write_flags_consistent`
     // raises an `InvalidInput` so the exit-code mapper produces 6.
     let tmp = write_yaml("a: 1\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::try_parse_from(["dq", "-i", "--diff", "set", path, "/a", "2"]).unwrap();
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -273,7 +276,7 @@ fn set_rejects_in_place_with_format_override() {
     // `-i -F json` against a YAML file would imply an in-place format change,
     // which is M3 territory. The handler must reject it before any I/O.
     let tmp = write_yaml("a: 1\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::try_parse_from(["dq", "-i", "-F", "json", "set", path, "/a", "2"]).unwrap();
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -293,7 +296,7 @@ fn set_rejects_backup_without_in_place() {
     // `--backup` only makes sense with `-i`; without `-i` there's no
     // replacement to back up, so the flag has no effect and is rejected.
     let tmp = write_yaml("a: 1\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::try_parse_from(["dq", "--backup", "set", path, "/a", "2"]).unwrap();
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -322,7 +325,7 @@ fn set_inline_json_literal_string_heuristic_falls_back() {
     // triggers the heuristic (leading `{`) but is not valid JSON, so it must
     // round-trip as the literal string `{not json}`.
     let tmp = write_yaml("name: old\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::try_parse_from(["dq", "set", path, "/name", "{not json}"]).unwrap();
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();

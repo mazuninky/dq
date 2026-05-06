@@ -53,6 +53,11 @@ check:
     rule_tmp
         .write_all(rule_yaml.as_bytes())
         .expect("write rule");
+    // Close the file handle before the binary opens it. On Windows, leaving
+    // the `NamedTempFile` open blocks any subsequent open with "Access is
+    // denied. (os error 5)" — see the same pattern in `cli_set_jq.rs`.
+    // Applied here uniformly even though `dq lint` only reads the rule file.
+    let rule_tmp = rule_tmp.into_temp_path();
 
     // The doc is a minimal k8s-shaped YAML — nothing about the body matters
     // for the dispatch contract, but a structured map exercises the full
@@ -69,6 +74,7 @@ spec:
 "#;
     let mut doc_tmp = NamedTempFile::with_suffix(".yaml").expect("doc tmp");
     doc_tmp.write_all(doc_yaml.as_bytes()).expect("write doc");
+    let doc_tmp = doc_tmp.into_temp_path();
 
     let cli = dq::Cli::try_parse_from([
         "dq",
@@ -76,8 +82,8 @@ spec:
         "json",
         "lint",
         "--rules",
-        rule_tmp.path().to_str().expect("UTF-8 rule path"),
-        doc_tmp.path().to_str().expect("UTF-8 doc path"),
+        rule_tmp.to_str().expect("UTF-8 rule path"),
+        doc_tmp.to_str().expect("UTF-8 doc path"),
     ])
     .expect("clap parse");
 

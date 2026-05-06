@@ -9,17 +9,21 @@ use clap::Parser;
 use dq::Cli;
 use tempfile::NamedTempFile;
 
-fn write_yaml(content: &str) -> NamedTempFile {
+/// Returns a `TempPath` so the underlying handle is closed before the binary
+/// touches the path. Windows requires this for in-place rewrites — the same
+/// pattern propagated from `cli_set_jq.rs`. Applied uniformly even on
+/// read-only sites for consistency.
+fn write_yaml(content: &str) -> tempfile::TempPath {
     let mut tmp = NamedTempFile::with_suffix(".yaml").expect("tempfile");
     tmp.write_all(content.as_bytes()).expect("write tempfile");
-    tmp
+    tmp.into_temp_path()
 }
 
 #[test]
 fn select_returns_array_for_single_match_default_console() {
     // Console output for an array prints one element per line.
     let tmp = write_yaml("spec:\n  replicas: 3\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "select", path, "$.spec.replicas", "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -33,7 +37,8 @@ fn select_returns_empty_array_for_no_match_under_json() {
     // `-F json` overrides input parser → use JSON file.
     let mut tmp = NamedTempFile::with_suffix(".json").expect("tempfile");
     std::io::Write::write_all(&mut tmp, br#"{"spec": {"replicas": 3}}"#).unwrap();
-    let path = tmp.path().to_str().unwrap();
+    let tmp = tmp.into_temp_path();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from([
         "dq",
         "-F",
@@ -63,7 +68,8 @@ fn select_multi_match_returns_each_in_document_order() {
     });
     let mut tmp = NamedTempFile::with_suffix(".json").expect("tempfile");
     std::io::Write::write_all(&mut tmp, json_input.to_string().as_bytes()).unwrap();
-    let path = tmp.path().to_str().unwrap();
+    let tmp = tmp.into_temp_path();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from([
         "dq",
         "-F",
@@ -83,7 +89,7 @@ fn select_multi_match_returns_each_in_document_order() {
 #[test]
 fn select_malformed_expression_returns_generic_error() {
     let tmp = write_yaml("a: 1\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "select", path, "this is not jsonpath", "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();

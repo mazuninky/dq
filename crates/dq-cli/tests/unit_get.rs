@@ -12,24 +12,28 @@ use clap::Parser;
 use dq::Cli;
 use tempfile::NamedTempFile;
 
-/// Write a YAML file to a temp location and return both the handle (so it's not
-/// dropped) and the path string. The caller passes the path to `Cli::parse_from`.
-fn write_yaml(content: &str) -> NamedTempFile {
+/// Write a YAML file to a temp location and return a `TempPath`. We return
+/// `TempPath` (not `NamedTempFile`) so the underlying handle is closed before
+/// the binary touches the path. On Windows, holding the `NamedTempFile` open
+/// blocks any in-place rewrite of the same path with "Access is denied. (os
+/// error 5)". The `TempPath` still removes the file on drop, so cleanup is
+/// preserved. We apply the pattern uniformly even for read-only sites.
+fn write_yaml(content: &str) -> tempfile::TempPath {
     let mut tmp = NamedTempFile::with_suffix(".yaml").expect("tempfile");
     tmp.write_all(content.as_bytes()).expect("write tempfile");
-    tmp
+    tmp.into_temp_path()
 }
 
-fn write_json(content: &str) -> NamedTempFile {
+fn write_json(content: &str) -> tempfile::TempPath {
     let mut tmp = NamedTempFile::with_suffix(".json").expect("tempfile");
     tmp.write_all(content.as_bytes()).expect("write tempfile");
-    tmp
+    tmp.into_temp_path()
 }
 
 #[test]
 fn get_existing_pointer_emits_value_to_stdout() {
     let tmp = write_yaml("server:\n  port: 8080\n");
-    let path = tmp.path().to_str().expect("utf-8 path");
+    let path = tmp.to_str().expect("utf-8 path");
     let cli = Cli::parse_from(["dq", "get", path, "/server/port", "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -46,7 +50,7 @@ fn get_missing_pointer_returns_path_error_for_exit_code_two() {
     // maps `Error::Path` → `NOT_FOUND` (already covered in exit_code.rs unit
     // tests). Here we only need to confirm the handler produces a `Path` error.
     let tmp = write_yaml("server:\n  port: 8080\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "get", path, "/server/missing", "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -70,7 +74,8 @@ fn get_against_unsupported_format_extension_returns_format_error() {
     // (INVALID_INPUT) at the binary level.
     let mut tmp = NamedTempFile::with_suffix(".sh").expect("tempfile");
     tmp.write_all(b"echo hi\n").unwrap();
-    let path = tmp.path().to_str().unwrap();
+    let tmp = tmp.into_temp_path();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "get", path, "/x", "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -88,7 +93,8 @@ fn get_with_format_override_parses_unknown_extension() {
     // override path works through the full `dq::run` pipeline.
     let mut tmp = NamedTempFile::with_suffix(".txt").expect("tempfile");
     tmp.write_all(br#"{"a": 1}"#).unwrap();
-    let path = tmp.path().to_str().unwrap();
+    let tmp = tmp.into_temp_path();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "-F", "json", "get", path, "/a", "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -105,7 +111,7 @@ fn get_rejects_jsonpath_input_with_helpful_message() {
     // The handler refuses `$.a` and points at `dq select` instead. This is the
     // user-friendly affordance test.
     let tmp = write_json(r#"{"a": 1}"#);
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "get", path, "$.a", "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();

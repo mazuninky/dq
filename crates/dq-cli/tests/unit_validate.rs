@@ -16,7 +16,8 @@ use tempfile::NamedTempFile;
 fn validate_succeeds_silently_for_valid_yaml() {
     let mut tmp = NamedTempFile::with_suffix(".yaml").expect("tempfile");
     tmp.write_all(b"a: 1\nb: 2\n").unwrap();
-    let path = tmp.path().to_str().unwrap();
+    let tmp = tmp.into_temp_path();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "validate", path, "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -29,7 +30,8 @@ fn validate_succeeds_silently_for_valid_yaml() {
 fn validate_malformed_json_returns_validate_fail_with_structured_stderr() {
     let mut tmp = NamedTempFile::with_suffix(".json").expect("tempfile");
     tmp.write_all(b"{ \"x\": 1, }").unwrap();
-    let path = tmp.path().to_str().unwrap();
+    let tmp = tmp.into_temp_path();
+    let path = tmp.to_str().unwrap();
     // Use `-F json` to also pick the JSON reporter for stderr; .json
     // extension already selects the input parser.
     let cli = Cli::parse_from(["dq", "-F", "json", "validate", path, "--no-color"]);
@@ -56,7 +58,8 @@ fn validate_unsupported_extension_returns_unsupported_format() {
     // UnsupportedFormat error (mapped to INVALID_INPUT / exit 6).
     let mut tmp = NamedTempFile::with_suffix(".unknown").expect("tempfile");
     tmp.write_all(b"hi\n").unwrap();
-    let path = tmp.path().to_str().unwrap();
+    let tmp = tmp.into_temp_path();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "validate", path, "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -71,7 +74,8 @@ fn validate_succeeds_silently_for_valid_json() {
     // different `Format::parse` in the registry.
     let mut tmp = NamedTempFile::with_suffix(".json").expect("tempfile");
     tmp.write_all(br#"{"x": 1, "y": [1, 2, 3]}"#).unwrap();
-    let path = tmp.path().to_str().unwrap();
+    let tmp = tmp.into_temp_path();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "validate", path, "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();

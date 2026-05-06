@@ -26,22 +26,26 @@ use dq::Cli;
 use dq::exit_code;
 use tempfile::NamedTempFile;
 
-/// Write `content` to a YAML temp file and return the handle (kept alive for
-/// the test's lifetime so the path stays valid).
-fn write_yaml(content: &str) -> NamedTempFile {
+/// Write `content` to a YAML temp file and return a `TempPath`. We return
+/// `TempPath` (not `NamedTempFile`) so the underlying handle is closed before
+/// the binary touches the path. On Windows, holding the `NamedTempFile` open
+/// blocks any in-place rewrite of the same path with "Access is denied. (os
+/// error 5)". The `TempPath` still removes the file on drop, so cleanup is
+/// preserved. Applied uniformly even on read-only sites for consistency.
+fn write_yaml(content: &str) -> tempfile::TempPath {
     let mut tmp = NamedTempFile::with_suffix(".yaml").expect("tempfile");
     tmp.write_all(content.as_bytes()).expect("write tempfile");
-    tmp
+    tmp.into_temp_path()
 }
 
 /// Write `content` to a JSON temp file. Tests that pass `-F json` must use
 /// this — the `-F` flag overrides the *input* parser too (see the comment in
 /// `unit_select.rs::select_returns_empty_array_for_no_match_under_json`),
 /// so feeding a YAML file to a JSON-format invocation produces a parse error.
-fn write_json(content: &str) -> NamedTempFile {
+fn write_json(content: &str) -> tempfile::TempPath {
     let mut tmp = NamedTempFile::with_suffix(".json").expect("tempfile");
     tmp.write_all(content.as_bytes()).expect("write tempfile");
-    tmp
+    tmp.into_temp_path()
 }
 
 #[test]
@@ -50,7 +54,7 @@ fn query_single_output_prints_scalar_to_console() {
     // raw value, exit 0. The default console reporter renders the
     // single-element JSON array `[3]` as `3\n`.
     let tmp = write_yaml("spec:\n  replicas: 3\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::try_parse_from(["dq", "query", ".spec.replicas", path, "--no-color"]).unwrap();
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -70,7 +74,7 @@ fn query_multi_output_with_json_format_returns_array() {
     let tmp = write_json(
         r#"{"spec": {"containers": [{"image": "img-a"}, {"image": "img-b"}, {"image": "img-c"}]}}"#,
     );
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::try_parse_from([
         "dq",
         "query",
@@ -97,7 +101,7 @@ fn query_missing_key_returns_array_with_null_under_json() {
     // jq filter (e.g. `empty`). Uses a JSON fixture because `-F json` also
     // overrides the input parser.
     let tmp = write_json(r#"{"a": 1}"#);
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::try_parse_from([
         "dq",
         "query",
@@ -126,7 +130,7 @@ fn query_compile_error_maps_to_parse_error_exit_three() {
     // expression must produce a `dq_core::Error::Parse` so the exit-code
     // mapper picks 3 (same family as file-parse failures).
     let tmp = write_yaml("a: 1\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::try_parse_from(["dq", "query", ".foo |=", path, "--no-color"]).unwrap();
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -156,7 +160,7 @@ fn query_runtime_error_maps_to_generic_exit_one() {
     //
     // Use a YAML file whose top-level value is the string "hello".
     let tmp = write_yaml("\"hello\"\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::try_parse_from(["dq", "query", ". + 1", path, "--no-color"]).unwrap();
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -182,7 +186,7 @@ fn query_rejects_in_place_with_invalid_input_exit_six() {
     // The path doesn't have to exist — the gate short-circuits before any
     // I/O.
     let tmp = write_yaml("a: 1\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::try_parse_from(["dq", "-i", "query", ".a", path, "--no-color"]).unwrap();
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -243,7 +247,7 @@ fn query_multi_doc_yaml_with_doc_index_picks_second_document() {
         "kind: Deployment\n",
         "name: web\n",
     ));
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli =
         Cli::try_parse_from(["dq", "--doc", "1", "query", ".kind", path, "--no-color"]).unwrap();
     let mut out: Vec<u8> = Vec::new();
@@ -262,7 +266,7 @@ fn query_with_sarif_format_is_rejected() {
     // arbitrary JSON, not SARIF-shaped; the SarifReporter raises
     // `InvalidInput` (no `diagnostics` array) → exit 6.
     let tmp = write_yaml("a: 1\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli =
         Cli::try_parse_from(["dq", "-F", "sarif", "query", ".a", path, "--no-color"]).unwrap();
     let mut out: Vec<u8> = Vec::new();
@@ -288,8 +292,8 @@ fn query_update_assignment_does_not_modify_file_on_disk() {
     // document to stdout. Uses a JSON fixture because `-F json` also
     // overrides the input parser.
     let tmp = write_json(r#"{"spec": {"replicas": 3}}"#);
-    let path = tmp.path().to_str().unwrap();
-    let original = std::fs::read_to_string(tmp.path()).unwrap();
+    let path = tmp.to_str().unwrap();
+    let original = std::fs::read_to_string(&tmp).unwrap();
     let cli = Cli::try_parse_from([
         "dq",
         "query",
@@ -305,7 +309,7 @@ fn query_update_assignment_does_not_modify_file_on_disk() {
     dq::run(&cli, false, &mut out, &mut err).expect("query with `|=` must succeed");
 
     // File on disk is untouched.
-    let after = std::fs::read_to_string(tmp.path()).unwrap();
+    let after = std::fs::read_to_string(&tmp).unwrap();
     assert_eq!(after, original, "query must NEVER touch the file on disk");
 
     // Stdout is the *transformed* document with `replicas: 4`.
@@ -330,7 +334,7 @@ fn query_doc_all_returns_array_of_all_documents() {
         "---\n",
         "kind: C\n",
     ));
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli =
         Cli::try_parse_from(["dq", "--doc", "all", "query", "length", path, "--no-color"]).unwrap();
     let mut out: Vec<u8> = Vec::new();
@@ -386,7 +390,7 @@ fn query_with_format_override_does_not_misparse_input_yaml() {
     // parameter for file inputs and uses the extension. This test exercises
     // the full dq::run path so a future dispatcher-arm regression is caught.
     let tmp = write_yaml("spec:\n  containers:\n    - image: a\n    - image: b\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::try_parse_from([
         "dq",
         "-F",

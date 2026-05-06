@@ -25,18 +25,24 @@ use clap::Parser;
 use dq::Cli;
 use tempfile::NamedTempFile;
 
-/// Write `content` to a temp YAML file and return the handle.
-fn write_yaml(content: &str) -> NamedTempFile {
+/// Write `content` to a temp YAML file and return a `TempPath`. We return
+/// `TempPath` (not `NamedTempFile`) so the underlying handle is closed before
+/// the binary touches the path. On Windows, holding the `NamedTempFile` open
+/// blocks any in-place rewrite of the same path with "Access is denied. (os
+/// error 5)". The `TempPath` still removes the file on drop, so cleanup is
+/// preserved.
+fn write_yaml(content: &str) -> tempfile::TempPath {
     let mut tmp = NamedTempFile::with_suffix(".yaml").expect("tempfile");
     tmp.write_all(content.as_bytes()).expect("write tempfile");
-    tmp
+    tmp.into_temp_path()
 }
 
-/// Write `content` to a temp JSON file and return the handle.
-fn write_json(content: &str) -> NamedTempFile {
+/// Write `content` to a temp JSON file and return a `TempPath` — see
+/// `write_yaml` for the Windows rationale.
+fn write_json(content: &str) -> tempfile::TempPath {
     let mut tmp = NamedTempFile::with_suffix(".json").expect("tempfile");
     tmp.write_all(content.as_bytes()).expect("write tempfile");
-    tmp
+    tmp.into_temp_path()
 }
 
 /// Render `path` through `dq fmt` (default mode → stdout) and return the
@@ -55,7 +61,7 @@ fn fmt_default_writes_to_stdout() {
     // YAML to stdout and leaves the file on disk untouched.
     let original = "a: 1\nb: 2\n";
     let tmp = write_yaml(original);
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::try_parse_from(["dq", "fmt", path]).unwrap();
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -69,7 +75,7 @@ fn fmt_default_writes_to_stdout() {
         "stdout must contain both YAML keys, got: {s:?}",
     );
     // File on disk untouched without `-i` or `--check`.
-    let on_disk = std::fs::read_to_string(tmp.path()).unwrap();
+    let on_disk = std::fs::read_to_string(&tmp).unwrap();
     assert_eq!(on_disk, original, "default mode must not modify the file");
 }
 
@@ -81,7 +87,7 @@ fn fmt_in_place_writes_back_atomically() {
     // we strip), and verify `-i` produces the canonical bytes.
     let original = "a: 1\nb: 2";
     let tmp = write_yaml(original);
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let canonical = render_canonical(path);
 
     let cli = Cli::try_parse_from(["dq", "-i", "fmt", path]).unwrap();
@@ -89,7 +95,7 @@ fn fmt_in_place_writes_back_atomically() {
     let mut err: Vec<u8> = Vec::new();
     dq::run(&cli, false, &mut out, &mut err).expect("fmt -i should succeed");
     assert!(out.is_empty(), "in-place mode must not write to stdout");
-    let on_disk = std::fs::read(tmp.path()).unwrap();
+    let on_disk = std::fs::read(&tmp).unwrap();
     assert_eq!(
         on_disk, canonical,
         "in-place fmt must write the canonical bytes",
@@ -103,7 +109,7 @@ fn fmt_diff_shows_unified_diff_without_writing() {
     // newline missing) so the diff is non-empty.
     let original = "a: 1\nb: 2"; // no trailing newline → writer will add one
     let tmp = write_yaml(original);
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::try_parse_from(["dq", "--diff", "fmt", path]).unwrap();
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -115,7 +121,7 @@ fn fmt_diff_shows_unified_diff_without_writing() {
         "expected unified-diff `---` / `+++` markers, got:\n{s}",
     );
     // File on disk untouched in diff mode.
-    let on_disk = std::fs::read_to_string(tmp.path()).unwrap();
+    let on_disk = std::fs::read_to_string(&tmp).unwrap();
     assert_eq!(on_disk, original, "--diff must not write to disk");
 }
 
@@ -126,10 +132,11 @@ fn fmt_check_exits_zero_on_canonical_file() {
     // and writing back; that file is by construction byte-equal to its
     // re-emission.
     let seed = write_yaml("a: 1\nb: 2\n");
-    let canonical_bytes = render_canonical(seed.path().to_str().unwrap());
+    let canonical_bytes = render_canonical(seed.to_str().unwrap());
     let mut canonical = NamedTempFile::with_suffix(".yaml").unwrap();
     canonical.write_all(&canonical_bytes).unwrap();
-    let canonical_path = canonical.path().to_str().unwrap();
+    let canonical = canonical.into_temp_path();
+    let canonical_path = canonical.to_str().unwrap();
 
     let cli = Cli::try_parse_from(["dq", "--check", "fmt", canonical_path]).unwrap();
     let mut out: Vec<u8> = Vec::new();
@@ -145,7 +152,7 @@ fn fmt_check_exits_one_on_non_canonical_file() {
     // says `y:` (unquoted), writer produces `'y':`, so they cannot match.
     let original = "z: 1\ny: 2\n";
     let tmp = write_yaml(original);
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::try_parse_from(["dq", "--check", "fmt", path]).unwrap();
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -167,7 +174,7 @@ fn fmt_check_exits_one_on_non_canonical_file() {
         "CheckPending must map to exit code 1, got: {e:?}",
     );
     // File on disk untouched.
-    let on_disk = std::fs::read_to_string(tmp.path()).unwrap();
+    let on_disk = std::fs::read_to_string(&tmp).unwrap();
     assert_eq!(on_disk, original, "--check must not modify the file");
 }
 
@@ -178,13 +185,13 @@ fn fmt_sort_keys_in_place_reorders_yaml_keys() {
     // We use `z, a` at the top and `y, b` nested under `a` to verify both
     // top-level and nested ordering.
     let tmp = write_yaml("z: 1\na:\n  y: 2\n  b: 3\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::try_parse_from(["dq", "--sort-keys", "-i", "fmt", path]).unwrap();
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
     dq::run(&cli, false, &mut out, &mut err).expect("fmt --sort-keys -i should succeed");
 
-    let on_disk = std::fs::read_to_string(tmp.path()).unwrap();
+    let on_disk = std::fs::read_to_string(&tmp).unwrap();
     // Assert ordering by byte index — `a` must precede `z` at the top level,
     // and `b` must precede `y` under `a`. Robust against minor formatting
     // differences (trailing newlines, quoting of reserved words like `y`).
@@ -218,7 +225,7 @@ fn fmt_preserves_source_format_yaml_to_yaml() {
     // rejecting JSON-only artefacts (curly brace at column 0). The output
     // must contain YAML mapping syntax (`key: value` lines).
     let tmp = write_yaml("a: 1\nb: hello\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::try_parse_from(["dq", "fmt", path]).unwrap();
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -242,12 +249,12 @@ fn fmt_preserves_source_format_json_to_json() {
     // with `Unchanged`. After `-i`, the file on disk is JSON (the writer
     // never silently switches to YAML/TOML).
     let tmp = write_json(r#"{"a":1,"b":"hello"}"#); // no trailing newline
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::try_parse_from(["dq", "-i", "fmt", path]).unwrap();
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
     dq::run(&cli, false, &mut out, &mut err).expect("fmt should succeed");
-    let on_disk = std::fs::read(tmp.path()).unwrap();
+    let on_disk = std::fs::read(&tmp).unwrap();
     let parsed: serde_json::Value =
         serde_json::from_slice(&on_disk).expect("on-disk bytes must be valid JSON");
     assert_eq!(parsed["a"], 1, "key `a` must round-trip, got: {parsed}");
@@ -272,12 +279,13 @@ fn fmt_preserves_source_format_toml_to_toml() {
     let mut tmp = NamedTempFile::with_suffix(".toml").unwrap();
     // Tight whitespace so the writer's canonical form differs.
     tmp.write_all(b"a=1\nb=\"hello\"").unwrap();
-    let path = tmp.path().to_str().unwrap();
+    let tmp = tmp.into_temp_path();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::try_parse_from(["dq", "-i", "fmt", path]).unwrap();
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
     dq::run(&cli, false, &mut out, &mut err).expect("fmt should succeed");
-    let on_disk = std::fs::read_to_string(tmp.path()).unwrap();
+    let on_disk = std::fs::read_to_string(&tmp).unwrap();
     // TOML uses `=` for key-value; YAML uses `:`. The output must look
     // like TOML, not YAML or JSON.
     assert!(
@@ -346,13 +354,13 @@ fn fmt_indent_4_for_json() {
     // JSON. The default JSON writer uses 2-space indent; `--indent 4` must
     // override it.
     let tmp = write_json(r#"{"a": 1, "b": [1, 2, 3]}"#);
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::try_parse_from(["dq", "--indent", "4", "-i", "fmt", path]).unwrap();
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
     dq::run(&cli, false, &mut out, &mut err).expect("fmt --indent 4 -i should succeed");
 
-    let on_disk = std::fs::read_to_string(tmp.path()).unwrap();
+    let on_disk = std::fs::read_to_string(&tmp).unwrap();
     // 4-space indent: the line `"a": 1` (or any first-level entry) must be
     // preceded by exactly 4 spaces. Use `\n    "` as a probe — robust
     // against `serde_json` ordering of `a` vs `b`.

@@ -29,7 +29,7 @@ use tempfile::NamedTempFile;
 /// Layout: `keyN: { entryM: <int> }` for N in 0..50 and M in 0..25 — that's
 /// 50 keys × 25 entries × (object + leaf) = ~2500 pointers, well above the
 /// 1000-path bar.
-fn write_large_yaml() -> NamedTempFile {
+fn write_large_yaml() -> tempfile::TempPath {
     let mut tmp = NamedTempFile::with_suffix(".yaml").expect("tempfile");
     for n in 0..50 {
         writeln!(tmp, "key{n}:").unwrap();
@@ -38,14 +38,19 @@ fn write_large_yaml() -> NamedTempFile {
         }
     }
     tmp.flush().unwrap();
-    tmp
+    // Return `TempPath` (not `NamedTempFile`) so the underlying handle is
+    // closed before the spawned binary opens the path. This file is
+    // `#[cfg(unix)]` so the Windows-specific failure mode does not apply,
+    // but we use the same shape as the rest of the test suite for
+    // consistency with `cli_set_jq.rs` etc.
+    tmp.into_temp_path()
 }
 
 #[test]
 fn dq_paths_piped_into_head_does_not_panic() {
     let dq_bin = assert_cmd::cargo::cargo_bin("dq");
     let fixture = write_large_yaml();
-    let path = fixture.path().to_str().expect("utf-8 fixture path");
+    let path = fixture.to_str().expect("utf-8 fixture path");
 
     // Spawn `dq paths <large> --no-color` and capture both pipes.
     let mut dq_child = Command::new(&dq_bin)

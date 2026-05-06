@@ -31,11 +31,17 @@ use dq::Cli;
 use dq::exit_code;
 use tempfile::NamedTempFile;
 
-/// Write `content` to a YAML temp file, kept alive for the test's lifetime.
-fn write_yaml(content: &str) -> NamedTempFile {
+/// Write `content` to a YAML temp file. Returns a `TempPath` so the file
+/// handle is closed (Windows requires this for the binary to overwrite the
+/// path during in-place edits — see CI failure on
+/// `cli_set_jq.rs:set_jq_increments_counter_in_place` where Windows reported
+/// "Access is denied. (os error 5)" because `NamedTempFile` kept the handle
+/// open). The `TempPath` still removes the file on drop, so cleanup is
+/// preserved.
+fn write_yaml(content: &str) -> tempfile::TempPath {
     let mut tmp = NamedTempFile::with_suffix(".yaml").expect("tempfile");
     tmp.write_all(content.as_bytes()).expect("write tempfile");
-    tmp
+    tmp.into_temp_path()
 }
 
 #[test]
@@ -43,7 +49,7 @@ fn set_jq_increments_counter_in_place() {
     // Spec scenario "`--jq` increments a counter": `.spec.replicas |= . + 1`
     // bumps the field on disk and exits 0. Stdout is empty under `-i` mode.
     let tmp = write_yaml("spec:\n  replicas: 3\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::try_parse_from([
         "dq",
         "-i",
@@ -63,7 +69,7 @@ fn set_jq_increments_counter_in_place() {
         String::from_utf8_lossy(&out),
     );
 
-    let on_disk = std::fs::read_to_string(tmp.path()).unwrap();
+    let on_disk = std::fs::read_to_string(&tmp).unwrap();
     assert!(
         on_disk.contains("replicas: 4"),
         "expected `replicas: 4` on disk, got:\n{on_disk}",
@@ -79,7 +85,7 @@ fn set_jq_adds_new_key_to_object() {
     // Spec scenario "`--jq` adds a new key": `. + {"newKey": "newValue"}`
     // unions a new top-level entry. Existing keys must survive.
     let tmp = write_yaml("foo: 1\nbar: hello\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::try_parse_from([
         "dq",
         "-i",
@@ -94,7 +100,7 @@ fn set_jq_adds_new_key_to_object() {
     let mut err: Vec<u8> = Vec::new();
     dq::run(&cli, false, &mut out, &mut err).expect("--jq add-key must succeed");
 
-    let on_disk = std::fs::read_to_string(tmp.path()).unwrap();
+    let on_disk = std::fs::read_to_string(&tmp).unwrap();
     assert!(
         on_disk.contains("newKey:") && on_disk.contains("newValue"),
         "newKey: newValue must land on disk, got:\n{on_disk}",
@@ -122,7 +128,7 @@ fn set_jq_deletes_nested_key_preserving_siblings() {
         "    old: drop-me\n",
         "    new: keep-me\n",
     ));
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::try_parse_from([
         "dq",
         "-i",
@@ -137,7 +143,7 @@ fn set_jq_deletes_nested_key_preserving_siblings() {
     let mut err: Vec<u8> = Vec::new();
     dq::run(&cli, false, &mut out, &mut err).expect("--jq del must succeed");
 
-    let on_disk = std::fs::read_to_string(tmp.path()).unwrap();
+    let on_disk = std::fs::read_to_string(&tmp).unwrap();
     assert!(
         !on_disk.contains("drop-me"),
         "deleted value `drop-me` must be gone, got:\n{on_disk}",
@@ -162,8 +168,8 @@ fn set_jq_with_diff_renders_unified_diff_and_leaves_file_unchanged() {
     // contains both the removed-original (`-replicas: 3`) and the added-new
     // (`+replicas: 4`) lines, and the file on disk is untouched.
     let tmp = write_yaml("spec:\n  replicas: 3\n");
-    let path = tmp.path().to_str().unwrap();
-    let original = std::fs::read_to_string(tmp.path()).unwrap();
+    let path = tmp.to_str().unwrap();
+    let original = std::fs::read_to_string(&tmp).unwrap();
     let cli = Cli::try_parse_from([
         "dq",
         "--diff",
@@ -191,7 +197,7 @@ fn set_jq_with_diff_renders_unified_diff_and_leaves_file_unchanged() {
         "expected `+  replicas: 4` in diff, got:\n{s}",
     );
     // File on disk untouched in --diff mode.
-    let after = std::fs::read_to_string(tmp.path()).unwrap();
+    let after = std::fs::read_to_string(&tmp).unwrap();
     assert_eq!(after, original, "--diff must NOT modify the file");
 }
 
@@ -201,7 +207,7 @@ fn set_jq_compile_error_maps_to_parse_error_exit_three() {
     // jq syntax at compile time surfaces as `dq_core::Error::Parse` so the
     // exit-code mapper picks 3 (same family as file-parse failures).
     let tmp = write_yaml("a: 1\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli =
         Cli::try_parse_from(["dq", "-i", "set", path, "--jq", ".foo |=", "--no-color"]).unwrap();
     let mut out: Vec<u8> = Vec::new();
@@ -229,7 +235,7 @@ fn set_jq_runtime_error_maps_to_generic_exit_one() {
     // fine, expression compiled fine, but the evaluation against this
     // specific data (string + number) failed → exit 1.
     let tmp = write_yaml("\"hello\"\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli =
         Cli::try_parse_from(["dq", "-i", "set", path, "--jq", ". + 1", "--no-color"]).unwrap();
     let mut out: Vec<u8> = Vec::new();
@@ -254,8 +260,8 @@ fn set_jq_check_against_pending_change_exits_one_via_check_pending() {
     // `CheckPending` which the exit-code mapper translates to GENERIC (1).
     // The file on disk MUST stay unchanged.
     let tmp = write_yaml("spec:\n  replicas: 3\n");
-    let path = tmp.path().to_str().unwrap();
-    let original = std::fs::read_to_string(tmp.path()).unwrap();
+    let path = tmp.to_str().unwrap();
+    let original = std::fs::read_to_string(&tmp).unwrap();
     let cli = Cli::try_parse_from([
         "dq",
         "--check",
@@ -279,7 +285,7 @@ fn set_jq_check_against_pending_change_exits_one_via_check_pending() {
         exit_code::GENERIC,
         "CheckPending must map to exit 1 (GENERIC), got: {e:?}",
     );
-    let after = std::fs::read_to_string(tmp.path()).unwrap();
+    let after = std::fs::read_to_string(&tmp).unwrap();
     assert_eq!(after, original, "--check must NOT modify the file");
 }
 
@@ -294,8 +300,8 @@ fn set_jq_check_against_no_op_transform_exits_zero() {
     // the writer emits. Single top-level scalar key is the simplest shape
     // that round-trips byte-identically through the YAML emitter.
     let tmp = write_yaml("replicas: 3\n");
-    let path = tmp.path().to_str().unwrap();
-    let original = std::fs::read_to_string(tmp.path()).unwrap();
+    let path = tmp.to_str().unwrap();
+    let original = std::fs::read_to_string(&tmp).unwrap();
     let cli = Cli::try_parse_from([
         "dq",
         "--check",
@@ -309,7 +315,7 @@ fn set_jq_check_against_no_op_transform_exits_zero() {
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
     dq::run(&cli, false, &mut out, &mut err).expect("--check on no-op transform must exit 0");
-    let after = std::fs::read_to_string(tmp.path()).unwrap();
+    let after = std::fs::read_to_string(&tmp).unwrap();
     assert_eq!(after, original, "no-op --check must NOT modify the file");
 }
 
@@ -325,14 +331,14 @@ fn set_jq_drops_yaml_comments_on_re_emit_documented_behaviour() {
     // Source has a leading line-comment plus a trailing one; both must be
     // gone after re-emit, and the new value must land on disk.
     let tmp = write_yaml("# leading comment\nx: 1   # trailing comment\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli =
         Cli::try_parse_from(["dq", "-i", "set", path, "--jq", ".x |= 2", "--no-color"]).unwrap();
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
     dq::run(&cli, false, &mut out, &mut err).expect("--jq with comments must succeed");
 
-    let on_disk = std::fs::read_to_string(tmp.path()).unwrap();
+    let on_disk = std::fs::read_to_string(&tmp).unwrap();
     assert!(
         !on_disk.contains("# leading comment"),
         "re-emit drops comments by design, but `# leading comment` survived: {on_disk}",

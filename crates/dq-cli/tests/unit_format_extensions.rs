@@ -30,10 +30,14 @@ fn seed_file(dir: &TempDir, name: &str, content: &str) -> Utf8PathBuf {
     path
 }
 
-fn write_with_extension(ext: &str, content: &str) -> NamedTempFile {
+/// Returns a `TempPath` so the underlying handle is closed before the binary
+/// touches the path. Windows requires this for in-place rewrites — the same
+/// pattern propagated from `cli_set_jq.rs`. Applied uniformly even on
+/// read-only sites for consistency.
+fn write_with_extension(ext: &str, content: &str) -> tempfile::TempPath {
     let mut tmp = NamedTempFile::with_suffix(format!(".{ext}")).expect("tempfile");
     tmp.write_all(content.as_bytes()).expect("write tempfile");
-    tmp
+    tmp.into_temp_path()
 }
 
 // ---------------------------------------------------------------------------
@@ -50,7 +54,7 @@ fn write_with_extension(ext: &str, content: &str) -> NamedTempFile {
 #[test]
 fn get_hcl_backend_region_via_label_keyed_pointer() {
     let tmp = write_with_extension("tf", "backend \"s3\" {\n  region = \"us-east-1\"\n}\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "get", path, "/backend/s3/region", "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -73,7 +77,7 @@ fn paths_ini_lists_section_and_key_pointers_as_console_lines() {
         "ini",
         "log = info\n[server]\nport = 8080\n[client]\ntimeout = 30\n",
     );
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "paths", path, "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -104,7 +108,7 @@ fn get_dotenv_database_url_returns_string_value() {
         "env",
         "DATABASE_URL=postgres://user@db.example.test:5432/svc\n# comment\n",
     );
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "get", path, "/DATABASE_URL", "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -126,7 +130,7 @@ fn paths_csv_lists_per_cell_pointers() {
         "csv",
         "name,email\nalice,alice@example.test\nbob,bob@example.test\n",
     );
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "paths", path, "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -234,7 +238,7 @@ fn get_frontmatter_title_returns_yaml_header_value() {
         "md",
         "---\ntitle: Hello, dq\nauthor: example-team\n---\n# Body\n",
     );
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "get", path, "/frontmatter/value/title", "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -267,7 +271,7 @@ fn convert_frontmatter_to_json_emits_object_with_header_keys() {
         "md",
         "---\ntitle: Hello\nauthor: ex\n---\nBody to be dropped.\n",
     );
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "-F", "json", "convert", path, "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -303,7 +307,7 @@ fn convert_ini_to_json_uses_section_names_as_top_level_keys() {
         "ini",
         "[server]\nport = 80\nhost = localhost\n[client]\ntimeout = 30\n",
     );
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "-F", "json", "convert", path, "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();

@@ -9,16 +9,20 @@ use clap::Parser;
 use dq::Cli;
 use tempfile::NamedTempFile;
 
-fn write_yaml(content: &str) -> NamedTempFile {
+/// Returns a `TempPath` so the underlying handle is closed before the binary
+/// touches the path. Windows requires this for in-place rewrites — the same
+/// pattern propagated from `cli_set_jq.rs`. Applied uniformly even on
+/// read-only sites for consistency.
+fn write_yaml(content: &str) -> tempfile::TempPath {
     let mut tmp = NamedTempFile::with_suffix(".yaml").expect("tempfile");
     tmp.write_all(content.as_bytes()).expect("write tempfile");
-    tmp
+    tmp.into_temp_path()
 }
 
 #[test]
 fn len_returns_array_length() {
     let tmp = write_yaml("- a\n- b\n- c\n- d\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "len", path, "", "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -29,7 +33,7 @@ fn len_returns_array_length() {
 #[test]
 fn len_returns_object_key_count() {
     let tmp = write_yaml("a: 1\nb: 2\nc: 3\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "len", path, "", "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -43,7 +47,7 @@ fn len_returns_string_char_count_not_byte_count() {
     // values), which is documented as the M1 behaviour even though the spec
     // mentions grapheme clusters as a future refinement.
     let tmp = write_yaml("name: café\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "len", path, "/name", "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -55,7 +59,7 @@ fn len_returns_string_char_count_not_byte_count() {
 fn len_against_scalar_bool_returns_type_mismatch_error() {
     // Per spec scenario "Length of scalar bool/number/null".
     let tmp = write_yaml("flag: true\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "len", path, "/flag", "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();

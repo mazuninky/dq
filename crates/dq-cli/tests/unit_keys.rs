@@ -9,10 +9,14 @@ use clap::Parser;
 use dq::Cli;
 use tempfile::NamedTempFile;
 
-fn write_yaml(content: &str) -> NamedTempFile {
+/// Returns a `TempPath` so the underlying handle is closed before the binary
+/// touches the path. Windows requires this for in-place rewrites — the same
+/// pattern propagated from `cli_set_jq.rs`. Applied uniformly even on
+/// read-only sites for consistency.
+fn write_yaml(content: &str) -> tempfile::TempPath {
     let mut tmp = NamedTempFile::with_suffix(".yaml").expect("tempfile");
     tmp.write_all(content.as_bytes()).expect("write tempfile");
-    tmp
+    tmp.into_temp_path()
 }
 
 #[test]
@@ -20,7 +24,7 @@ fn keys_lists_object_keys_one_per_line_in_source_order() {
     // Console reporter prints one key per line. Source order matters: keys
     // come from `IndexMap`, so insertion order is preserved.
     let tmp = write_yaml("z: 1\na: 2\nm: 3\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "keys", path, "", "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -35,7 +39,7 @@ fn keys_against_scalar_returns_type_mismatch_error() {
     // Pointer addresses a scalar — keys must report a Path/TypeMismatch error
     // so the CLI can show "kind=type" diagnostic.
     let tmp = write_yaml("a: 1\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "keys", path, "/a", "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -61,7 +65,8 @@ fn keys_with_json_format_writes_json_array() {
     // here instead of YAML.
     let mut tmp = NamedTempFile::with_suffix(".json").expect("tempfile");
     std::io::Write::write_all(&mut tmp, br#"{"a": 1, "b": 2}"#).unwrap();
-    let path = tmp.path().to_str().unwrap();
+    let tmp = tmp.into_temp_path();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "-F", "json", "keys", path, "", "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -76,7 +81,7 @@ fn keys_against_array_returns_type_mismatch_error() {
     // Arrays are not objects — `keys` must reject them too. The error kind is
     // `TypeMismatch { expected: "object", found: "array" }`.
     let tmp = write_yaml("- a\n- b\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "keys", path, "", "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();

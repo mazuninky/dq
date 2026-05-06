@@ -20,22 +20,26 @@ use dq::Cli;
 use dq::error::InvalidInput;
 use tempfile::{NamedTempFile, TempDir};
 
-fn write_yaml(content: &str) -> NamedTempFile {
+/// Returns a `TempPath` so the underlying handle is closed before the binary
+/// touches the path. Windows requires this for in-place rewrites — the same
+/// pattern propagated from `cli_set_jq.rs`. Applied uniformly even on
+/// read-only sites for consistency.
+fn write_yaml(content: &str) -> tempfile::TempPath {
     let mut tmp = NamedTempFile::with_suffix(".yaml").expect("tempfile");
     tmp.write_all(content.as_bytes()).expect("write tempfile");
-    tmp
+    tmp.into_temp_path()
 }
 
-fn write_json(content: &str) -> NamedTempFile {
+fn write_json(content: &str) -> tempfile::TempPath {
     let mut tmp = NamedTempFile::with_suffix(".json").expect("tempfile");
     tmp.write_all(content.as_bytes()).expect("write tempfile");
-    tmp
+    tmp.into_temp_path()
 }
 
 #[test]
 fn convert_yaml_to_json_emits_valid_json() {
     let tmp = write_yaml("server:\n  port: 8080\n  host: x\n");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "-F", "json", "convert", path, "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -54,7 +58,7 @@ fn convert_json_to_toon_emits_toon_text_containing_keys() {
     // exact text shape (it's owned by the crate), only that the output
     // mentions the source keys (i.e. encoder ran).
     let tmp = write_json(r#"{"name": "alice", "age": 30}"#);
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "-F", "toon", "convert", path, "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -70,7 +74,7 @@ fn convert_json_to_toon_emits_toon_text_containing_keys() {
 fn convert_malformed_json_returns_parse_error() {
     // Trailing comma — invalid JSON.
     let tmp = write_json("{ \"x\": 1, }");
-    let path = tmp.path().to_str().unwrap();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "-F", "yaml", "convert", path, "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
@@ -87,7 +91,8 @@ fn convert_preserves_big_int_through_json_round_trip() {
     let mut tmp = NamedTempFile::with_suffix(".json").expect("tempfile");
     tmp.write_all(format!("{{\"id\":{big}}}").as_bytes())
         .unwrap();
-    let path = tmp.path().to_str().unwrap();
+    let tmp = tmp.into_temp_path();
+    let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "-F", "json", "convert", path, "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();

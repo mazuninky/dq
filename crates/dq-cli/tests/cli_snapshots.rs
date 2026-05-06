@@ -329,7 +329,11 @@ fn snapshot_json_render_unsupported_format_via_get() {
     let mut tmp = tempfile::NamedTempFile::with_suffix(".unknown").unwrap();
     use std::io::Write as _;
     tmp.write_all(b"hello\n").unwrap();
-    let f_str = tmp.path().to_str().unwrap();
+    // Close the underlying handle so the spawned binary can open the path
+    // on Windows ("Access is denied. (os error 5)"). The `TempPath` keeps
+    // the file alive for the test's lifetime and removes it on drop.
+    let tmp = tmp.into_temp_path();
+    let f_str = tmp.to_str().unwrap();
     let out = dq()
         .args(["-F", "json", "get", f_str, "/x", "--no-color"])
         .output()
