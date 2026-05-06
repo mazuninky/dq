@@ -1,0 +1,11 @@
+# Force LF line endings on checkout regardless of platform.
+# Required for byte-identical round-trip tests that compare on-disk file
+# bytes against expected fixtures: Windows' default core.autocrlf=true
+# would otherwise rewrite *.md / *.yaml / *.json fixtures to CRLF on
+# checkout, which breaks tests like
+# `smoke_fmt_frontmatter_in_place_preserves_body_bytes`.
+* text=auto eol=lf
+
+# Test fixtures are byte-checked; never let git massage them.
+crates/*/tests/fixtures/** -text
+spikes/*/fixtures/** -text
