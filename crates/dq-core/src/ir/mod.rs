@@ -135,7 +135,7 @@ pub enum Provenance {
 
 /// Borrowed view of a parsed document plus its provenance side-channel.
 ///
-/// `Ir<'a>` is the read-only IR shape: three borrowed fields, no owned
+/// `Ir<'a>` is the read-only IR shape: four borrowed fields, no owned
 /// data. The type is `Copy` so callers can pass it into helpers without
 /// re-borrowing — useful in chained access patterns where every step takes
 /// `&Ir<'_>` as input.
@@ -144,26 +144,63 @@ pub enum Provenance {
 /// raw triple is intentionally not exposed — the IR's invariant is "the
 /// provenance map keys agree with the canonical form of pointers reachable
 /// in `value`", and only the document constructors guarantee that today.
+///
+/// # Source bytes
+///
+/// Phase 2 of `add-ir-foundation` added a `bytes` field — a borrowed slice
+/// of the parser's `original_bytes`. It powers [`Ir::line_col_for`], the
+/// helper that turns a `ValueSpan`'s byte range into a 1-indexed
+/// `(line, col)` for diagnostic emission. Synthesised IRs (the
+/// `Phase 2 jq adapter`-produced [`OwnedIr`], for example) have no source
+/// bytes — they construct an [`Ir`] via [`Ir::new`], which leaves the
+/// `bytes` field empty, and [`Ir::line_col_for`] correctly returns `None`.
 #[derive(Debug, Clone, Copy)]
 pub struct Ir<'a> {
     value: &'a Value,
     provenance: &'a ProvenanceMap,
     format: FormatTag,
+    /// Borrowed source bytes — the parser's `original_bytes` for write-aware
+    /// documents, an empty slice otherwise. See [`Ir::line_col_for`].
+    bytes: &'a [u8],
 }
 
 impl<'a> Ir<'a> {
-    /// Construct an `Ir<'a>` from already-aligned parts.
+    /// Construct an `Ir<'a>` from already-aligned parts (no source bytes).
     ///
-    /// Used internally by [`crate::Document::as_ir`]. Public so future
-    /// transformations (Phase 2+) that build their own `(value, provenance,
-    /// format)` triple can wrap it in a borrowed view without going through
-    /// `Document`.
+    /// Used internally by transformations that produce a fresh
+    /// `(value, provenance, format)` triple but have no parser-provided
+    /// `original_bytes` to attach (Phase 2 jq adapter, future fix-op
+    /// application). The resulting [`Ir`]'s `bytes` slice is empty, so
+    /// [`Ir::line_col_for`] always returns `None`.
+    ///
+    /// For read paths against a parsed [`crate::Document`] the IR is
+    /// produced by [`crate::Document::as_ir`], which routes through
+    /// [`Ir::with_bytes`] so [`Ir::line_col_for`] can resolve to a real
+    /// source position.
     #[must_use]
     pub fn new(value: &'a Value, provenance: &'a ProvenanceMap, format: FormatTag) -> Self {
+        Self::with_bytes(value, provenance, format, &[])
+    }
+
+    /// Construct an `Ir<'a>` carrying a borrowed slice of the parser's
+    /// source bytes alongside the value/provenance/format triple.
+    ///
+    /// The `bytes` slice is the byte buffer the parser was handed (or an
+    /// empty slice when none is available). [`Ir::line_col_for`] reads
+    /// `bytes` to derive a 1-indexed `(line, col)` from a `ValueSpan`'s
+    /// byte range.
+    #[must_use]
+    pub fn with_bytes(
+        value: &'a Value,
+        provenance: &'a ProvenanceMap,
+        format: FormatTag,
+        bytes: &'a [u8],
+    ) -> Self {
         Self {
             value,
             provenance,
             format,
+            bytes,
         }
     }
 
@@ -186,6 +223,18 @@ impl<'a> Ir<'a> {
     #[must_use]
     pub fn format(&self) -> FormatTag {
         self.format
+    }
+
+    /// Borrowed source bytes, when the IR was constructed via
+    /// [`Ir::with_bytes`] (read paths through [`crate::Document::as_ir`]).
+    ///
+    /// Returns an empty slice for IRs produced by [`Ir::new`] — the
+    /// "synthesised, no source" path. Callers wanting a real
+    /// `(line, col)` should prefer [`Ir::line_col_for`], which already
+    /// handles the empty case by returning `None`.
+    #[must_use]
+    pub fn bytes(&self) -> &'a [u8] {
+        self.bytes
     }
 
     /// Look up the [`Provenance`] entry for `pointer`'s canonical RFC 6901
@@ -217,6 +266,54 @@ impl<'a> Ir<'a> {
             Provenance::Synthetic { .. } => None,
         }
     }
+
+    /// Resolve `pointer` to a 1-indexed `(line, col)` position in the
+    /// source bytes.
+    ///
+    /// Returns `None` when:
+    ///
+    /// - The pointer has no [`ValueSpan`] (same conditions as
+    ///   [`Ir::span_for`]).
+    /// - The IR was constructed without source bytes (synthesised IRs
+    ///   produced via [`Ir::new`], including
+    ///   [`OwnedIr::to_borrowed`]) — there is no buffer to count newlines
+    ///   in.
+    ///
+    /// On success, returns the position of `span.value_range.start` —
+    /// `line` is `1 + count of '\n' bytes before the offset`, `col` is
+    /// `1 + bytes since the previous newline`. Behaviour matches
+    /// `crates/dq-core/src/parsers/json.rs::derive_line_col` byte-for-byte.
+    #[must_use]
+    pub fn line_col_for(&self, pointer: &Pointer) -> Option<(u32, u32)> {
+        let span = self.span_for(pointer)?;
+        if self.bytes.is_empty() {
+            return None;
+        }
+        Some(derive_line_col(self.bytes, span.value_range.start))
+    }
+}
+
+/// Derive a 1-indexed `(line, col)` for byte offset `idx` in `bytes`.
+///
+/// Behaviour mirrors `crates/dq-core/src/parsers/json.rs::derive_line_col`
+/// byte-for-byte; the helper is duplicated here rather than exposed from
+/// the JSON parser because it is the load-bearing primitive for the IR
+/// layer's diagnostic-position chain (Phase 2 of `add-ir-foundation`),
+/// independent of any one parser.
+#[must_use]
+fn derive_line_col(bytes: &[u8], idx: usize) -> (u32, u32) {
+    let cap = idx.min(bytes.len());
+    let mut line: u32 = 1;
+    let mut col: u32 = 1;
+    for &b in &bytes[..cap] {
+        if b == b'\n' {
+            line = line.saturating_add(1);
+            col = 1;
+        } else {
+            col = col.saturating_add(1);
+        }
+    }
+    (line, col)
 }
 
 /// Owned IR: a `(Value, ProvenanceMap, FormatTag)` triple that holds the
@@ -663,6 +760,69 @@ mod tests {
             doc.span_at(&pointer),
             post.span_for(&pointer),
             "Document::span_at and Ir::span_for must agree after a mutation",
+        );
+    }
+
+    // -- Phase 2: line_col_for sanity tests -------------------------------
+    //
+    // The Phase 2 contract pins two cases per the spec:
+    //   - positive: a populated span + non-empty source bytes resolve to a
+    //     1-indexed `(line, col)` matching the parser-supplied byte range.
+    //   - negative: any of (no span, empty source bytes) yields `None`.
+    // The `Ir::new` 3-arg constructor leaves `bytes` empty, so synthesised
+    // IRs never accidentally claim a spurious source position.
+
+    #[test]
+    fn line_col_for_returns_some_for_span_in_source_bytes() {
+        // Build a write-aware YAML doc with a known span at byte offset
+        // 3..4 (the `1` in `a: 1\n`). On the first line the column maps
+        // directly to byte offset + 1 — i.e. (1, 4).
+        use crate::Document;
+        use crate::document::SpanMap;
+        use indexmap::IndexMap;
+
+        let mut spans = SpanMap::new();
+        spans.insert(
+            "/a".into(),
+            ValueSpan {
+                value_range: 3..4,
+                line_range: 0..5,
+                indent: 0,
+                context: SpanContext::BlockMapValue,
+            },
+        );
+        let mut map = IndexMap::new();
+        map.insert("a".to_owned(), Value::Int(1));
+        let doc = Document::with_spans(Value::Map(map), b"a: 1\n".to_vec(), spans, FormatTag::Yaml);
+        let pointer = Pointer::parse("/a").expect("/a parses");
+        assert_eq!(
+            doc.as_ir().line_col_for(&pointer),
+            Some((1, 4)),
+            "line_col_for must derive (1, 4) for byte offset 3 in `a: 1\\n`",
+        );
+    }
+
+    #[test]
+    fn line_col_for_returns_none_without_source_bytes() {
+        // `Ir::new` (the 3-arg constructor) leaves `bytes` empty even if a
+        // span is present in the provenance map. `line_col_for` MUST
+        // therefore return `None` — synthesised IRs (jq adapter, fix-op
+        // application) cannot claim a source position they don't have.
+        let value = sample_value();
+        let mut provenance = ProvenanceMap::new();
+        let pointer = Pointer::parse("/foo").expect("/foo parses");
+        provenance.insert(
+            pointer.as_canonical(),
+            Provenance::Original {
+                pointer: pointer.clone(),
+                span: Some(sample_span()),
+            },
+        );
+        let ir = Ir::new(&value, &provenance, FormatTag::Yaml);
+        assert!(ir.bytes().is_empty(), "Ir::new must default bytes to &[]");
+        assert!(
+            ir.line_col_for(&pointer).is_none(),
+            "line_col_for must return None when bytes is empty",
         );
     }
 }

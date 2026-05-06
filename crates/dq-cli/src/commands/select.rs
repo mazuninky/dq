@@ -14,7 +14,7 @@ use std::io::Write;
 
 use jsonpath_rust::{JsonPath, JsonPtr};
 
-use super::io_helpers::{load_document_with_path, value_to_serde_json};
+use super::io_helpers::load_document_with_path;
 use crate::cli::{Cli, SelectArgs};
 use crate::output::Reporter;
 
@@ -43,10 +43,10 @@ pub fn run(
     let value: serde_json::Value = if let Some(values) = doc.values() {
         values
             .first()
-            .map(value_to_serde_json)
+            .map(dq_core::Value::to_serde_json)
             .unwrap_or(serde_json::Value::Null)
     } else {
-        value_to_serde_json(doc.value())
+        doc.value().to_serde_json()
     };
 
     let path = JsonPath::try_from(args.jsonpath.as_str())

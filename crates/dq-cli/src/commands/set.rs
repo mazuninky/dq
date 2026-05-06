@@ -40,7 +40,7 @@ use camino::Utf8Path;
 use dq_core::{Document, Pointer, Value};
 use indexmap::IndexMap;
 
-use super::io_helpers::{load_document_with_path, pick_format, read_bytes, value_to_serde_json};
+use super::io_helpers::{load_document_with_path, pick_format, read_bytes};
 use super::query::jq_compile_to_parse;
 use crate::bulk::{self, FileOp, FileOpResult};
 use crate::cli::{Cli, SetArgs};
@@ -249,7 +249,7 @@ impl<'a> FileOp for JqFileOp<'a> {
 
         // Convert the document's top-level value into serde_json so the jq
         // engine can consume it.
-        let serde_value = value_to_serde_json(document.value());
+        let serde_value = document.value().to_serde_json();
 
         // Evaluate the filter. Runtime / Conversion errors stay as plain
         // anyhow (exit 1) — they aren't compile failures and aren't IO

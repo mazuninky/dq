@@ -50,7 +50,7 @@ use std::io::Write;
 use camino::{Utf8Path, Utf8PathBuf};
 use dq_core::{Document, FormatTag, FrontmatterKind, WriteOptions};
 
-use super::io_helpers::{load_document_with_path, value_to_serde_json};
+use super::io_helpers::load_document_with_path;
 use crate::bulk;
 use crate::cli::{Cli, ConvertArgs};
 use crate::error::InvalidInput;
@@ -483,9 +483,9 @@ fn render_to_format(
             // serde_json::Value as the lowest-common-denominator
             // representation.
             let v = if let Some(values) = doc.values() {
-                serde_json::Value::Array(values.iter().map(value_to_serde_json).collect())
+                serde_json::Value::Array(values.iter().map(dq_core::Value::to_serde_json).collect())
             } else {
-                value_to_serde_json(doc.value())
+                doc.value().to_serde_json()
             };
             let reporter = ToonReporter;
             reporter.report(&v, &mut buf)?;
@@ -496,9 +496,9 @@ fn render_to_format(
             // still route through ConsoleReporter so the rendering matches
             // every other command's console mode.
             let v = if let Some(values) = doc.values() {
-                serde_json::Value::Array(values.iter().map(value_to_serde_json).collect())
+                serde_json::Value::Array(values.iter().map(dq_core::Value::to_serde_json).collect())
             } else {
-                value_to_serde_json(doc.value())
+                doc.value().to_serde_json()
             };
             let reporter = ConsoleReporter::new(use_color);
             reporter.report(&v, &mut buf)?;

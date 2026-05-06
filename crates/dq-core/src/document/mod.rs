@@ -24,6 +24,7 @@
 pub mod spans;
 
 use std::fmt;
+use std::str::FromStr;
 
 use indexmap::IndexMap;
 use serde::ser::{SerializeMap, SerializeSeq, Serializer};
@@ -231,6 +232,115 @@ impl Value {
             Self::Map(_) => "object",
         }
     }
+
+    /// Convert into a [`serde_json::Value`].
+    ///
+    /// `BigInt` / `BigFloat` are routed through
+    /// [`serde_json::Number::from_str`], which honours the workspace's
+    /// `serde_json/arbitrary_precision` feature and preserves the original
+    /// textual literal across the round-trip. When the literal cannot be
+    /// parsed as a number (malformed input from a transformation), the
+    /// value falls back to a `String` — losing numeric typing but never
+    /// panicking.
+    ///
+    /// Object key insertion order is preserved via the workspace-level
+    /// `serde_json/preserve_order` feature.
+    ///
+    /// Non-finite floats (`NaN`, `±Infinity`) — which are not
+    /// representable in JSON — fall back to a [`serde_json::Value::String`]
+    /// carrying the textual rendering (`"NaN"`, `"inf"`, `"-inf"`) so the
+    /// value survives reporting instead of silently becoming `Null`.
+    #[must_use]
+    pub fn to_serde_json(&self) -> serde_json::Value {
+        match self {
+            Self::Null => serde_json::Value::Null,
+            Self::Bool(b) => serde_json::Value::Bool(*b),
+            Self::Int(n) => serde_json::Value::Number((*n).into()),
+            Self::Float(f) => serde_json::Number::from_f64(*f)
+                .map(serde_json::Value::Number)
+                .unwrap_or_else(|| serde_json::Value::String(f.to_string())),
+            Self::BigInt(s) | Self::BigFloat(s) => match serde_json::Number::from_str(s) {
+                Ok(n) => serde_json::Value::Number(n),
+                Err(_) => serde_json::Value::String(s.clone()),
+            },
+            Self::String(s) => serde_json::Value::String(s.clone()),
+            Self::Array(items) => {
+                serde_json::Value::Array(items.iter().map(Self::to_serde_json).collect())
+            }
+            Self::Map(map) => {
+                let mut out = serde_json::Map::new();
+                for (k, child) in map {
+                    out.insert(k.clone(), child.to_serde_json());
+                }
+                serde_json::Value::Object(out)
+            }
+        }
+    }
+
+    /// Convert from a [`serde_json::Value`].
+    ///
+    /// Inverse of [`Value::to_serde_json`]. Numbers go through
+    /// [`serde_json::Number`]'s textual literal (the workspace's
+    /// `arbitrary_precision` feature keeps the original literal verbatim) so
+    /// 22-digit integers survive as [`Value::BigInt`] and round-trip
+    /// byte-for-byte. Object key insertion order is preserved via
+    /// [`indexmap::IndexMap`].
+    #[must_use]
+    pub fn from_serde_json(v: &serde_json::Value) -> Self {
+        match v {
+            serde_json::Value::Null => Self::Null,
+            serde_json::Value::Bool(b) => Self::Bool(*b),
+            serde_json::Value::Number(n) => serde_json_number_to_value(n),
+            serde_json::Value::String(s) => Self::String(s.clone()),
+            serde_json::Value::Array(items) => {
+                Self::Array(items.iter().map(Self::from_serde_json).collect())
+            }
+            serde_json::Value::Object(map) => {
+                let mut out = IndexMap::with_capacity(map.len());
+                for (k, child) in map {
+                    out.insert(k.clone(), Self::from_serde_json(child));
+                }
+                Self::Map(out)
+            }
+        }
+    }
+}
+
+/// Convert a [`serde_json::Number`] into a [`Value`] that preserves
+/// big-int / big-float literals.
+///
+/// With the workspace's `arbitrary_precision` feature on `serde_json`,
+/// `Number::to_string()` returns the original textual literal verbatim —
+/// `as_i64()` / `as_f64()` lossily collapse a 22-digit integer to a
+/// `Float(4.7e21)`. Mirror the parsing heuristic
+/// `dq-core::parsers::json::json_number_to_value` uses on the read side:
+/// try `i64` first, then float-with-round-trip, falling back to `BigInt` /
+/// `BigFloat` literals.
+fn serde_json_number_to_value(n: &serde_json::Number) -> Value {
+    let literal = n.to_string();
+    if let Ok(i) = literal.parse::<i64>() {
+        return Value::Int(i);
+    }
+    if literal.contains('.') || literal.contains('e') || literal.contains('E') {
+        if let Ok(f) = f64::from_str(&literal)
+            && f.is_finite()
+            && literal_round_trips_to(&literal, f)
+        {
+            return Value::Float(f);
+        }
+        return Value::BigFloat(literal);
+    }
+    Value::BigInt(literal)
+}
+
+/// Lossless round-trip check for a parsed `f64` against its source
+/// literal. Mirrors `dq_core::parsers::json::f64_matches_literal` and
+/// `dq-cli::commands::set::f64_matches_literal`: re-parse the shortest
+/// float formatting and compare for exact equality so cosmetic
+/// reformatting (e.g. `1e2` vs `100`) does not trigger the BigFloat
+/// branch.
+fn literal_round_trips_to(literal: &str, f: f64) -> bool {
+    f64::from_str(literal).is_ok_and(|parsed| parsed.to_bits() == f.to_bits())
 }
 
 impl Document {
@@ -442,7 +552,12 @@ impl Document {
     /// available for this format" from "this format does not exist".
     #[must_use]
     pub fn as_ir(&self) -> Ir<'_> {
-        Ir::new(&self.value, &self.provenance, self.format)
+        Ir::with_bytes(
+            &self.value,
+            &self.provenance,
+            self.format,
+            &self.original_bytes,
+        )
     }
 
     /// Access the frontmatter payload, if this `Document` was produced by the

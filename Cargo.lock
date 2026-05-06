@@ -647,6 +647,7 @@ dependencies = [
 name = "dq-transform"
 version = "0.1.0"
 dependencies = [
+ "dq-core",
  "jaq-core",
  "jaq-json",
  "jaq-std",

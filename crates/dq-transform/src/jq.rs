@@ -149,10 +149,31 @@ mod stub {
             hint: FEATURE_DISABLED_HINT,
         })
     }
+
+    /// Feature-disabled stub for the IR-aware adapter. Mirrors
+    /// [`serde_to_val`]'s shape so the public surface stays consistent.
+    /// Always returns [`JqError::FeatureDisabled`].
+    pub fn ir_to_val(_input: &dq_core::Ir<'_>) -> Result<(), JqError> {
+        Err(JqError::FeatureDisabled {
+            hint: FEATURE_DISABLED_HINT,
+        })
+    }
+
+    /// Feature-disabled stub for the IR-aware adapter. Mirrors
+    /// [`val_to_serde`]'s shape so the public surface stays consistent.
+    /// Always returns [`JqError::FeatureDisabled`].
+    pub fn val_to_owned_ir(
+        _val: &(),
+        _format: dq_core::FormatTag,
+    ) -> Result<dq_core::OwnedIr, JqError> {
+        Err(JqError::FeatureDisabled {
+            hint: FEATURE_DISABLED_HINT,
+        })
+    }
 }
 
 #[cfg(not(feature = "embedded-jq"))]
-pub use stub::{JqEngine, serde_to_val, val_to_serde};
+pub use stub::{JqEngine, ir_to_val, serde_to_val, val_to_owned_ir, val_to_serde};
 
 // ---------------------------------------------------------------------------
 // Real implementation behind the `embedded-jq` feature.
@@ -279,6 +300,125 @@ mod imp {
         serde_json::from_value::<Val>(v.clone()).map_err(|e| JqError::Conversion {
             message: format!("serde_json -> jaq_json::Val: {e}"),
         })
+    }
+
+    /// Convert an [`Ir<'_>`](dq_core::Ir) into a [`jaq_json::Val`].
+    ///
+    /// IR-aware variant of [`serde_to_val`]: routes the underlying
+    /// [`dq_core::Value`] tree through [`dq_core::Value::to_serde_json`]
+    /// and then through [`serde_to_val`].
+    ///
+    /// # Provenance is discarded
+    ///
+    /// `jaq_json::Val` cannot carry pointer-keyed provenance — it is a
+    /// plain JSON shape. The conversion therefore drops the input
+    /// [`dq_core::ProvenanceMap`]. Callers that need pointer-based
+    /// attribution should re-emit RFC 6901 pointer strings from the jq
+    /// expression itself and look them up against the **input** `Ir` via
+    /// [`dq_core::Ir::span_for`] / [`dq_core::Ir::provenance_for`] — see
+    /// the `data-query-exec` capability's `loc.pointer` requirement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JqError::Conversion`] when the underlying serde-shape
+    /// conversion fails — same shape as [`serde_to_val`].
+    pub fn ir_to_val(input: &dq_core::Ir<'_>) -> Result<Val, JqError> {
+        let serde_value = input.value().to_serde_json();
+        serde_to_val(&serde_value)
+    }
+
+    /// Convert a [`jaq_json::Val`] into a fresh [`dq_core::OwnedIr`].
+    ///
+    /// IR-aware variant of [`val_to_serde`]: routes the `Val` through
+    /// [`val_to_serde`] then through [`dq_core::Value::from_serde_json`]
+    /// to produce an [`dq_core::OwnedIr`] whose [`dq_core::ProvenanceMap`]
+    /// marks every value-tree node as
+    /// [`dq_core::Provenance::Synthetic`] with reason
+    /// [`dq_core::SyntheticReason::Computed`]. The supplied `format` is
+    /// stamped onto the resulting `OwnedIr`.
+    ///
+    /// # Why every node is `Synthetic { Computed }`
+    ///
+    /// jaq's `Val` shape carries no source-location metadata — by the time
+    /// a value reaches this function the input pointer has been lost (a
+    /// generic jq filter such as `.x + .y` emits a value with no clear
+    /// input correspondence). The `Computed` reason is the explicit "I do
+    /// not know" signal callers use to suppress span lookup. Callers that
+    /// need pointer attribution should opt in by emitting pointer-tagged
+    /// shapes (`[pointer, value]` pairs) from their jq expressions and
+    /// reconstructing provenance host-side.
+    ///
+    /// # Pointer enumeration
+    ///
+    /// Every reachable [`dq_core::Pointer`] in the produced `Value` tree
+    /// gets one entry in the resulting [`dq_core::ProvenanceMap`]. The
+    /// walk is inline (rather than going through
+    /// [`dq_core::enumerate_pointers`], which operates on a
+    /// [`dq_core::Document`]) — keying the map directly off the canonical
+    /// pointer strings produced by [`dq_core::Pointer::as_canonical`]
+    /// matches the same convention used by
+    /// [`dq_core::Document::with_spans`] for [`dq_core::ProvenanceMap`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JqError::Conversion`] when the underlying [`val_to_serde`]
+    /// conversion fails (e.g. a non-UTF-8 [`jaq_json::Val::BStr`]).
+    pub fn val_to_owned_ir(
+        val: &Val,
+        format: dq_core::FormatTag,
+    ) -> Result<dq_core::OwnedIr, JqError> {
+        let serde_value = val_to_serde(val)?;
+        let dq_value = dq_core::Value::from_serde_json(&serde_value);
+        let mut provenance = dq_core::ProvenanceMap::new();
+        record_synthetic_provenance(&dq_value, &mut Vec::new(), &mut provenance);
+        Ok(dq_core::OwnedIr::new(dq_value, provenance, format))
+    }
+
+    /// Walk `value` in pre-order and record one
+    /// [`dq_core::Provenance::Synthetic`] entry per addressable node into
+    /// `out`, keyed by the canonical RFC 6901 form of the running path.
+    ///
+    /// Mirrors the leaf-and-container traversal used by
+    /// [`dq_core::enumerate_pointers`] but operates on a bare
+    /// [`dq_core::Value`] (not a [`dq_core::Document`]) so it can run
+    /// against the freshly-built tree from [`val_to_serde`] +
+    /// [`dq_core::Value::from_serde_json`] without needing a document
+    /// envelope.
+    fn record_synthetic_provenance(
+        value: &dq_core::Value,
+        path: &mut Vec<dq_core::Segment>,
+        out: &mut dq_core::ProvenanceMap,
+    ) {
+        let pointer = dq_core::Pointer::new(path.clone());
+        out.insert(
+            pointer.as_canonical(),
+            dq_core::Provenance::Synthetic {
+                reason: dq_core::SyntheticReason::Computed,
+            },
+        );
+        match value {
+            dq_core::Value::Array(items) => {
+                for (idx, item) in items.iter().enumerate() {
+                    path.push(dq_core::Segment::Index(idx));
+                    record_synthetic_provenance(item, path, out);
+                    path.pop();
+                }
+            }
+            dq_core::Value::Map(map) => {
+                for (k, v) in map {
+                    path.push(dq_core::Segment::Key(k.clone()));
+                    record_synthetic_provenance(v, path, out);
+                    path.pop();
+                }
+            }
+            dq_core::Value::Null
+            | dq_core::Value::Bool(_)
+            | dq_core::Value::Int(_)
+            | dq_core::Value::BigInt(_)
+            | dq_core::Value::Float(_)
+            | dq_core::Value::BigFloat(_)
+            | dq_core::Value::String(_) => {}
+        }
     }
 
     /// Convert a [`jaq_json::Val`] back into a [`serde_json::Value`].
@@ -520,7 +660,7 @@ mod imp {
 }
 
 #[cfg(feature = "embedded-jq")]
-pub use imp::{JqEngine, serde_to_val, val_to_serde};
+pub use imp::{JqEngine, ir_to_val, serde_to_val, val_to_owned_ir, val_to_serde};
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -695,6 +835,70 @@ mod tests_enabled {
         fn require_send_sync<T: Send + Sync>(_: &T) {}
         let engine = JqEngine::compile(".").expect("compile");
         require_send_sync(&engine);
+    }
+
+    // -- IR-aware adapters (Phase 2 of add-ir-foundation) --------------
+
+    #[test]
+    fn ir_to_val_preserves_value_and_discards_provenance() {
+        // Construct an `Ir` whose ProvenanceMap is non-empty (so we can
+        // observe that the provenance is dropped on the way to `Val`); the
+        // round-trip back through `val_to_owned_ir` should yield a value
+        // equal to the input plus a Synthetic-only provenance map.
+        use dq_core::{
+            FormatTag, Ir, OwnedIr, Pointer, Provenance, ProvenanceMap, SyntheticReason, Value,
+        };
+
+        // Build the value tree via the `from_serde_json` pathway so we don't
+        // need to import `indexmap` (which is not a direct dependency of
+        // dq-transform).
+        let value = Value::from_serde_json(&serde_json::json!({"a": 1}));
+
+        let mut provenance = ProvenanceMap::new();
+        provenance.insert(
+            String::new(),
+            Provenance::Synthetic {
+                reason: SyntheticReason::Constructed,
+            },
+        );
+        let pointer = Pointer::parse("/a").expect("/a parses");
+        provenance.insert(
+            pointer.as_canonical(),
+            Provenance::Synthetic {
+                reason: SyntheticReason::Constructed,
+            },
+        );
+
+        let ir = Ir::new(&value, &provenance, FormatTag::Yaml);
+        let val = ir_to_val(&ir).expect("ir_to_val");
+        let owned: OwnedIr = val_to_owned_ir(&val, FormatTag::Yaml).expect("val_to_owned_ir");
+        let (round_value, round_provenance, round_format) = owned.into_parts();
+        assert_eq!(round_value, value, "value must round-trip structurally");
+        assert_eq!(round_format, FormatTag::Yaml);
+        // Every provenance entry must be `Synthetic { Computed }` per the
+        // documented contract — even though the input map carried
+        // `Synthetic { Constructed }`, ir_to_val drops it.
+        assert!(
+            !round_provenance.is_empty(),
+            "round-tripped provenance must enumerate every node",
+        );
+        for (_, prov) in &round_provenance {
+            match prov {
+                Provenance::Synthetic { reason } => {
+                    assert_eq!(*reason, SyntheticReason::Computed);
+                }
+                other => panic!("expected Synthetic{{Computed}}, got: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn val_to_owned_ir_carries_format_tag_through() {
+        use dq_core::FormatTag;
+        let val = serde_to_val(&serde_json::json!({"x": 1})).expect("serde_to_val");
+        let owned = val_to_owned_ir(&val, FormatTag::Json).expect("val_to_owned_ir");
+        let (_v, _p, fmt) = owned.into_parts();
+        assert_eq!(fmt, FormatTag::Json);
     }
 }
 

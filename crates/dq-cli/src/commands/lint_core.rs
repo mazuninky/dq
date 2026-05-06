@@ -29,7 +29,7 @@ use indexmap::IndexSet;
 use walkdir::WalkDir;
 
 use crate::cli::Cli;
-use crate::commands::io_helpers::{load_document_with_path, pick_format, value_to_serde_json};
+use crate::commands::io_helpers::{load_document_for_lint, pick_format};
 use crate::error::{InvalidInput, LintFail, LintWarnStrict};
 use crate::output::Reporter;
 
@@ -101,9 +101,14 @@ pub(crate) fn run_with_rulesets(
     for file in &expanded {
         let fmt = pick_format(file, input_format)?;
         let format_name = fmt.name().to_owned();
-        let (_doc_fmt, doc) = load_document_with_path(file, input_format)?;
-        let value = value_to_serde_json(doc.value());
-        let mut file_diags = evaluator.evaluate_file(file, &value, &format_name);
+        // Use the lint-specific loader so YAML/JSON are parsed through
+        // their span-aware parsers — the resulting `Document` carries a
+        // populated provenance map, which `Ir::line_col_for(&Pointer)` (used
+        // by the evaluator's `loc.pointer` chain) needs to resolve to a
+        // real `(line, col)`. See `load_document_for_lint` for the rationale.
+        let (_doc_fmt, doc) = load_document_for_lint(file, input_format)?;
+        let ir = doc.as_ir();
+        let mut file_diags = evaluator.evaluate_file(file, &ir, &format_name);
         diagnostics.append(&mut file_diags);
     }
 

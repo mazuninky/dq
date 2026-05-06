@@ -37,7 +37,7 @@
 use std::io::Write;
 
 use crate::cli::{Cli, DiffArgs};
-use crate::commands::io_helpers::{load_document_with_path, value_to_serde_json};
+use crate::commands::io_helpers::load_document_with_path;
 use crate::output::{OutputFormat, Reporter};
 
 /// Run the `diff` command.
@@ -70,8 +70,8 @@ pub fn run(
         // `preserve_order`) and unified-diff the textual forms. JSON is the
         // lowest-common-denominator stable representation that both YAML and
         // TOML inputs can be normalised through.
-        let a_json = serde_json::to_string_pretty(&value_to_serde_json(doc_a.value()))?;
-        let b_json = serde_json::to_string_pretty(&value_to_serde_json(doc_b.value()))?;
+        let a_json = serde_json::to_string_pretty(&doc_a.value().to_serde_json())?;
+        let b_json = serde_json::to_string_pretty(&doc_b.value().to_serde_json())?;
         let label = format!("{} -> {}", args.a, args.b);
         let unified = crate::diff::render_unified(&a_json, &b_json, &label, !cli.no_color);
         out.write_all(unified.as_bytes())?;

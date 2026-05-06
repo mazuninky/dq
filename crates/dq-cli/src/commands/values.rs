@@ -9,7 +9,7 @@ use std::io::Write;
 
 use dq_core::{Pointer, Value};
 
-use super::io_helpers::{load_document_with_path, select_document, value_to_serde_json};
+use super::io_helpers::{load_document_with_path, select_document};
 use crate::cli::{Cli, ValuesArgs};
 use crate::output::Reporter;
 
@@ -45,7 +45,7 @@ pub fn run(
             did_you_mean: Vec::new(),
         }));
     };
-    let items: Vec<serde_json::Value> = map.values().map(value_to_serde_json).collect();
+    let items: Vec<serde_json::Value> = map.values().map(Value::to_serde_json).collect();
     reporter.report(&serde_json::Value::Array(items), out)?;
     Ok(())
 }

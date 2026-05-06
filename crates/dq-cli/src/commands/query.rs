@@ -23,7 +23,7 @@ use std::io::Write;
 
 use camino::Utf8Path;
 
-use super::io_helpers::{load_document_with_path, select_document, value_to_serde_json};
+use super::io_helpers::{load_document_with_path, select_document};
 use crate::cli::{Cli, QueryArgs};
 use crate::output::Reporter;
 
@@ -73,7 +73,7 @@ pub fn run(
 
     let (_fmt, doc) = load_document_with_path(&args.file, input_format)?;
     let view = select_document(&doc, doc_arg)?;
-    let serde_value = value_to_serde_json(&view);
+    let serde_value = view.to_serde_json();
 
     // Compile errors → dq_core::Error::Parse → exit 3 (PARSE_ERROR).
     let engine = dq_transform::JqEngine::compile(&args.expression)

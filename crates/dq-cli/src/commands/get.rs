@@ -9,7 +9,7 @@ use std::io::Write;
 
 use dq_core::Pointer;
 
-use super::io_helpers::{load_document_with_path, select_document, value_to_serde_json};
+use super::io_helpers::{load_document_with_path, select_document};
 use crate::cli::{Cli, GetArgs};
 use crate::output::Reporter;
 
@@ -47,7 +47,7 @@ pub fn run(
     let view = select_document(&doc, doc_arg)?;
     let pointer = Pointer::parse(&args.pointer).map_err(anyhow::Error::new)?;
     let value = pointer.resolve(view.as_ref()).map_err(anyhow::Error::new)?;
-    let json = value_to_serde_json(value);
+    let json = value.to_serde_json();
     reporter.report(&json, out)?;
     Ok(())
 }
