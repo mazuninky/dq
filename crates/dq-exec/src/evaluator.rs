@@ -84,8 +84,16 @@ pub(crate) struct CompiledRule {
     /// walks the new `loc.pointer → loc.line → intrinsic` chain.
     pub(crate) loc_pointer_engine: Option<JqEngine>,
     /// M10 — pre-compiled `fix.jq` engine. Populated when the rule
-    /// declares a `fix:` block; consumed by [`crate::Fixer`].
+    /// declares a `fix:` block with a `jq:` field; consumed by
+    /// [`crate::Fixer`] as the legacy whole-document transform path.
     pub(crate) fix_engine: Option<JqEngine>,
+    /// Phase 4 — pre-compiled `fix.ops` engine. Populated when the rule
+    /// declares a `fix:` block with an `ops:` field; consumed by
+    /// [`crate::Fixer`] as the per-violation [`dq_core::EditScript`]
+    /// vocabulary path. When both `fix.jq` and `fix.ops` are set, the
+    /// fixer prefers `fix.ops` and logs a `tracing::warn!` shadowing
+    /// notice. See `data-query-exec` Requirement "`Fixer` runtime".
+    pub(crate) fix_ops_engine: Option<JqEngine>,
 }
 
 impl std::fmt::Debug for CompiledRule {
@@ -97,7 +105,8 @@ impl std::fmt::Debug for CompiledRule {
             .field("has_loc_pointer", &self.loc_pointer_engine.is_some())
             .field("has_loc_file", &self.loc_file_engine.is_some())
             .field("has_loc_line", &self.loc_line_engine.is_some())
-            .field("has_fix", &self.fix_engine.is_some())
+            .field("has_fix_jq", &self.fix_engine.is_some())
+            .field("has_fix_ops", &self.fix_ops_engine.is_some())
             .finish()
     }
 }
@@ -254,12 +263,22 @@ fn compile_rule(rule: Rule) -> Result<CompiledRule> {
         }
         None => (None, None, None),
     };
-    // M10: compile `fix.jq` alongside the other engines so per-file
-    // autofix runs don't pay re-compilation cost. Compile-time failures
-    // surface here as the same `RuleCompile` shape the lint runtime uses.
-    let fix_engine = match rule.fix.as_ref() {
-        Some(fix) => Some(
-            JqEngine::compile(&fix.jq).map_err(|err| ExecError::RuleCompile {
+    // M10 + Phase 4: compile both `fix.jq` and `fix.ops` (each
+    // `Option<String>`) up-front so per-file autofix runs don't pay
+    // re-compilation cost. Compile-time failures surface here as the
+    // same `RuleCompile` shape the lint runtime uses.
+    let fix_engine = match rule.fix.as_ref().and_then(|f| f.jq.as_deref()) {
+        Some(expr) => Some(
+            JqEngine::compile(expr).map_err(|err| ExecError::RuleCompile {
+                rule_id: rule.id.clone(),
+                source: err,
+            })?,
+        ),
+        None => None,
+    };
+    let fix_ops_engine = match rule.fix.as_ref().and_then(|f| f.ops.as_deref()) {
+        Some(expr) => Some(
+            JqEngine::compile(expr).map_err(|err| ExecError::RuleCompile {
                 rule_id: rule.id.clone(),
                 source: err,
             })?,
@@ -276,6 +295,7 @@ fn compile_rule(rule: Rule) -> Result<CompiledRule> {
         loc_file_engine,
         loc_line_engine,
         fix_engine,
+        fix_ops_engine,
     })
 }
 

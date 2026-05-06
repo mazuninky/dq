@@ -12,11 +12,26 @@ check:
   jq: 'select((.private // false) != true and ((.license // "") == ""))'
   message: "package.json is missing the 'license' field"
 fix:
-  # When the license field is missing or empty on a non-private package,
-  # set it to "UNLICENSED" — npm's documented placeholder value for
-  # packages with no chosen SPDX identifier. The fix is idempotent: once
-  # `.license` is non-empty the predicate `(.license // "") == ""` no
-  # longer holds, so a second application leaves the value alone.
-  jq: 'if (.private // false) != true and ((.license // "") == "") then .license = "UNLICENSED" else . end'
+  # Phase 4 (`add-ir-foundation`): migrated from `fix.jq` to `fix.ops`
+  # so the autofix preserves comments and surrounding bytes — this is
+  # the reference comment-preserving rule for the @std/* library.
+  #
+  # The patch is emitted only when `/license` already exists in the
+  # document (with an empty-string value). The missing-field case
+  # (no `license` key at all) is currently NOT covered because the
+  # M2 `Document::set_at` baseline does not yet support mkdir-p
+  # insertion of new keys (it returns `Error::Path { MissingKey }`).
+  # Tracking: a follow-up change will land mkdir-p so the `add` branch
+  # can take over the missing-field case; until then this rule is a
+  # no-op for newly-created `package.json` files that omit `license`.
+  #
+  # The rule is idempotent: once `/license` is `"UNLICENSED"`, the
+  # `if`-guard collapses to `else []` (the empty patch), so a second
+  # application is a clean no-op.
+  ops: |
+    if (.private // false) != true and (has("license") and (.license // "") == "")
+    then [{"op": "replace", "path": "/license", "value": "UNLICENSED"}]
+    else []
+    end
 references:
   - https://docs.npmjs.com/cli/v10/configuring-npm/package-json#license

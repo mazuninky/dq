@@ -46,26 +46,76 @@ pub struct Rule {
     pub loc: Option<RuleLoc>,
 }
 
-/// M10 autofix payload — a whole-document jq transformation.
+/// Autofix payload — either a whole-document jq transform (`jq`,
+/// M10 legacy) or a per-violation [`crate::EditScript`]-emitting jq
+/// expression (`ops`, Phase 4 of `add-ir-foundation`).
 ///
-/// The fix is applied at document level: `fix.jq` is evaluated against
-/// the entire parsed value and must produce **exactly one** output that
-/// becomes the post-fix document. Anything more elaborate (per-violation
-/// fixes, an explicit ops vocabulary) is out of scope for M10.
+/// At least one of `jq` / `ops` MUST be set. Both unset is a parse
+/// error surfaced by the custom [`Deserialize`] impl below; both set is
+/// allowed (`ops` wins at runtime, with a `tracing::warn!` log line).
 ///
-/// **Idempotency.** The runtime [`crate::Fixer`] requires that applying
-/// `fix.jq` twice produces the same value as applying it once; non-
-/// idempotent fixes are a rule-author bug and are skipped at runtime
-/// with a `tracing::warn!` log line.
+/// ## `jq` (legacy, deprecated)
 ///
-/// **Comment preservation.** None — the re-emit path routes through
+/// Whole-document jq transformation: the expression is evaluated
+/// against the entire parsed document and must produce **exactly one**
+/// output that becomes the post-fix document. Comment preservation is
+/// **none** — the re-emit path routes through
 /// `Format::write_with_options`, same trade-off as `dq set --jq`.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+///
+/// ## `ops` (Phase 4, preferred)
+///
+/// jq expression that returns a JSON Patch array (RFC 6902 subset:
+/// `add`, `replace`, `remove`). The patch is applied via
+/// [`crate::EditScript::apply`] against the parsed document, preserving
+/// comments and surrounding bytes. The expression must produce **exactly
+/// one** output (the array). Empty arrays are accepted and treated as
+/// a no-op.
+///
+/// ## Idempotency
+///
+/// The runtime [`crate::Fixer`] requires that applying the fix twice
+/// produces the same result as applying it once. Non-idempotent fixes
+/// are a rule-author bug and are skipped at runtime with a
+/// `tracing::warn!` log line; the document is restored to its pre-apply
+/// state for the offending rule.
+#[derive(Debug, Clone, PartialEq)]
 pub struct RuleFix {
-    /// jq expression run against the whole document. The single output
-    /// replaces the document.
-    pub jq: String,
+    /// Legacy whole-document jq transform. **Deprecated** — prefer
+    /// [`RuleFix::ops`] for new rules so comments are preserved.
+    pub jq: Option<String>,
+    /// Phase 4 per-violation patch expression. The jq output must be a
+    /// JSON Patch array (RFC 6902 subset: `add` / `replace` / `remove`).
+    pub ops: Option<String>,
+}
+
+/// Wire-shape for [`RuleFix`]. Mirrors the public struct one-for-one;
+/// the manual [`Deserialize`] impl on `RuleFix` deserializes through
+/// this and then enforces the at-least-one-of validation.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRuleFix {
+    #[serde(default)]
+    jq: Option<String>,
+    #[serde(default)]
+    ops: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for RuleFix {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawRuleFix::deserialize(deserializer)?;
+        if raw.jq.is_none() && raw.ops.is_none() {
+            return Err(serde::de::Error::custom(
+                "fix block requires at least one of `jq` or `ops` to be set",
+            ));
+        }
+        Ok(Self {
+            jq: raw.jq,
+            ops: raw.ops,
+        })
+    }
 }
 
 /// Applicability filter for a rule.
@@ -390,9 +440,8 @@ match:
 
     #[test]
     fn parses_fix_jq_field() {
-        // M10: `fix:` is now a typed struct with a single `jq` field.
-        // The jq expression is the whole-document transform that
-        // `Fixer::apply` runs.
+        // Phase 4: `RuleFix.jq` is now `Option<String>` (legacy slot).
+        // A rule with `fix.jq` only must parse to `Some(jq), None ops`.
         let yaml = r#"
 id: a.b
 description: x
@@ -407,15 +456,64 @@ fix:
 "#;
         let rule = parse(yaml);
         let fix = rule.fix.expect("fix should parse");
-        assert_eq!(fix.jq, ".fixed = true");
+        assert_eq!(fix.jq.as_deref(), Some(".fixed = true"));
+        assert!(fix.ops.is_none());
+    }
+
+    #[test]
+    fn parses_fix_ops_field() {
+        // Phase 4 spec scenario: `fix:{ops:.}` parses with `jq == None`
+        // and `ops == Some(...)`.
+        let yaml = r#"
+id: a.b
+description: x
+severity: warn
+match:
+  format: yaml
+check:
+  jq: '.'
+  message: m
+fix:
+  ops: '[{"op":"replace","path":"/x","value":1}]'
+"#;
+        let rule = parse(yaml);
+        let fix = rule.fix.expect("fix should parse");
+        assert!(fix.jq.is_none());
+        assert_eq!(
+            fix.ops.as_deref(),
+            Some(r#"[{"op":"replace","path":"/x","value":1}]"#)
+        );
+    }
+
+    #[test]
+    fn parses_fix_with_both_jq_and_ops() {
+        // Phase 4 spec scenario: rule with both `jq` and `ops` parses.
+        // Runtime precedence (ops wins, with a `tracing::warn!`) is
+        // tested in the fixer tests; here we only pin that parse succeeds.
+        let yaml = r#"
+id: a.b
+description: x
+severity: warn
+match:
+  format: yaml
+check:
+  jq: '.'
+  message: m
+fix:
+  jq: 'A'
+  ops: 'B'
+"#;
+        let rule = parse(yaml);
+        let fix = rule.fix.expect("fix should parse");
+        assert_eq!(fix.jq.as_deref(), Some("A"));
+        assert_eq!(fix.ops.as_deref(), Some("B"));
     }
 
     #[test]
     fn rejects_unknown_field_in_fix() {
-        // `deny_unknown_fields` on `RuleFix` rejects forward-incompatible
-        // ops vocabularies that pre-M10 rules might still ship — the
-        // loader catches the typo at parse time instead of silently
-        // ignoring the field.
+        // `deny_unknown_fields` on the `RawRuleFix` shape rejects typos
+        // and forward-incompatible vocabularies — the loader catches
+        // them at parse time instead of silently ignoring the field.
         let yaml = r#"
 id: a.b
 description: x
@@ -438,9 +536,10 @@ fix:
     }
 
     #[test]
-    fn rejects_fix_missing_jq() {
-        // `jq` is required — there is no other field on `RuleFix` so an
-        // empty / partial map must fail.
+    fn rejects_fix_missing_jq_and_ops() {
+        // Phase 4 spec scenario: empty `fix:{}` block is a parse error.
+        // The error message must mention `jq` and `ops` so rule authors
+        // see what's missing.
         let yaml = r#"
 id: a.b
 description: x
@@ -452,7 +551,12 @@ check:
   message: m
 fix: {}
 "#;
-        parse_err(yaml);
+        let err = parse_err(yaml);
+        let formatted = format!("{err}");
+        assert!(
+            formatted.contains("jq") && formatted.contains("ops"),
+            "expected error to mention both `jq` and `ops`, got: {formatted}",
+        );
     }
 
     #[test]

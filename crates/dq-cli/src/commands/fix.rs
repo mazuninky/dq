@@ -9,11 +9,24 @@
 //!
 //! ## Comment preservation
 //!
-//! None — same trade-off as `dq set --jq`. The handler re-emits the
-//! post-fix value through `Format::write_with_options`, which drops
-//! comments and any whitespace that was preserved by the M2 textual-edit
-//! splice path. Users who care about comments must reach for point-edits
-//! (`dq set FILE POINTER VALUE`) and write the fix manually.
+//! Phase 4 of `add-ir-foundation` introduced two paths:
+//!
+//! - **`fix.ops` (preferred)**: rules emit a JSON Patch array
+//!   (`add`/`replace`/`remove`); the patch is applied via
+//!   `EditScript::apply` against the parsed [`Document`], which routes
+//!   through the per-format `ScalarRenderer` to splice individual byte
+//!   ranges. Comments and surrounding whitespace are preserved
+//!   byte-for-byte. The handler then writes `doc.original_bytes()` to
+//!   disk directly.
+//! - **`fix.jq` (legacy, deprecated)**: whole-document jq transform
+//!   replaces the document tree, dropping `original_bytes` and the
+//!   span map. The handler re-emits via `Format::write_with_options`,
+//!   same comment-loss trade-off as `dq set --jq`.
+//!
+//! `FixOutcome::legacy_jq_applied` distinguishes the two paths: when
+//! `false`, `original_bytes` is canonical and goes to disk verbatim;
+//! when `true`, the document is re-emitted to recover a renderable
+//! byte buffer.
 //!
 //! ## Write-mode flags
 //!
@@ -37,14 +50,12 @@ use std::io::Write;
 use std::sync::Arc;
 
 use camino::{Utf8Path, Utf8PathBuf};
-use dq_core::Document;
 use dq_exec::{Evaluator, FixOutcome, Fixer, LoaderArgs, RuleLoader};
-use indexmap::IndexMap;
 use indexmap::IndexSet;
 
 use crate::bulk::{self, FileOp, FileOpResult};
 use crate::cli::{Cli, FixArgs};
-use crate::commands::io_helpers::{pick_format, read_bytes};
+use crate::commands::io_helpers::{load_document_for_lint, pick_format, read_bytes};
 use crate::commands::lint_core::expand_lint_inputs;
 use crate::error::InvalidInput;
 
@@ -138,14 +149,18 @@ struct FixFileOp<'a> {
 
 impl<'a> FileOp for FixFileOp<'a> {
     fn apply(&self, path: &Utf8Path) -> anyhow::Result<FileOpResult> {
-        let format = pick_format(path, self.input_format)?;
+        // Read the bytes once for the diff renderer below; route the
+        // parse through the lint helper so YAML / JSON pick up the
+        // span-aware parsers (otherwise `EditScript::apply` would fail
+        // with `WriteUnavailable` against a value-only `Document`).
+        // The helper re-reads the file internally — accept the 2× I/O
+        // for the simpler call site.
         let original_bytes = read_bytes(path)?;
-        let document = format.parse(&original_bytes).map_err(anyhow::Error::new)?;
+        let (format, mut document) = load_document_for_lint(path, self.input_format)?;
 
-        let serde_value = document.value().to_serde_json();
         let outcome = self
             .fixer
-            .apply(path, &serde_value, format.name())
+            .apply(path, &mut document, format.name())
             .map_err(anyhow::Error::new)?;
 
         // Audit log — visible at `-v` (info) verbosity. The check path
@@ -156,15 +171,23 @@ impl<'a> FileOp for FixFileOp<'a> {
             return Ok(FileOpResult::Unchanged);
         }
 
-        // Build a value-only document and re-emit through the format's
-        // native writer (same as `dq set --jq`).
-        let new_value = serde_json_to_dq_value(&outcome.new_value);
-        let new_doc = Document::value_only(new_value, document.format());
-
-        let mut final_bytes = Vec::new();
-        format
-            .write_with_options(&new_doc, &mut final_bytes, &self.cli.write_options())
-            .map_err(anyhow::Error::new)?;
+        // Phase 4: choose the output path based on which engine ran.
+        //
+        // - Only `fix.ops` ran → `document.original_bytes()` is the
+        //   canonical post-fix byte buffer; comments are preserved.
+        // - Any `fix.jq` ran → the document was replaced with a
+        //   value-only one (no spans, no `original_bytes`); re-emit
+        //   through the format writer, same trade-off as
+        //   `dq set --jq`.
+        let final_bytes = if outcome.legacy_jq_applied {
+            let mut buf = Vec::new();
+            format
+                .write_with_options(&document, &mut buf, &self.cli.write_options())
+                .map_err(anyhow::Error::new)?;
+            buf
+        } else {
+            document.original_bytes().to_vec()
+        };
 
         let diff = if self.cli.diff {
             let original_str = String::from_utf8_lossy(&original_bytes);
@@ -194,63 +217,6 @@ fn log_outcome(path: &Utf8Path, outcome: &FixOutcome) {
         skipped_non_idempotent = ?outcome.skipped_non_idempotent,
         "dq fix",
     );
-}
-
-/// Convert a `serde_json::Value` into a [`dq_core::Value`] for re-emit.
-///
-/// Mirrors `crate::commands::set::serde_json_to_dq_value` but lives here
-/// to keep the M10 handler self-contained — the `set` module's helper is
-/// `fn`-private and exporting it would broaden the API surface for one
-/// caller.
-fn serde_json_to_dq_value(v: &serde_json::Value) -> dq_core::Value {
-    match v {
-        serde_json::Value::Null => dq_core::Value::Null,
-        serde_json::Value::Bool(b) => dq_core::Value::Bool(*b),
-        serde_json::Value::Number(n) => number_to_value(n),
-        serde_json::Value::String(s) => dq_core::Value::String(s.clone()),
-        serde_json::Value::Array(items) => {
-            dq_core::Value::Array(items.iter().map(serde_json_to_dq_value).collect())
-        }
-        serde_json::Value::Object(map) => {
-            let mut out = IndexMap::with_capacity(map.len());
-            for (k, child) in map {
-                out.insert(k.clone(), serde_json_to_dq_value(child));
-            }
-            dq_core::Value::Map(out)
-        }
-    }
-}
-
-/// `serde_json::Number` → `dq_core::Value` with arbitrary-precision
-/// preservation (via `BigInt` / `BigFloat`).
-///
-/// Same heuristic as `dq_cli::commands::set::number_to_value`: try `i64`
-/// first, then float-with-round-trip, falling back to literal-preserving
-/// big variants. Duplication is intentional — the M10 handler should not
-/// reach into `set`'s private internals.
-fn number_to_value(n: &serde_json::Number) -> dq_core::Value {
-    use std::str::FromStr;
-    let literal = n.to_string();
-    if let Ok(i) = literal.parse::<i64>() {
-        return dq_core::Value::Int(i);
-    }
-    if literal.contains('.') || literal.contains('e') || literal.contains('E') {
-        if let Ok(f) = f64::from_str(&literal)
-            && f.is_finite()
-            && f64_matches_literal(f, &literal)
-        {
-            return dq_core::Value::Float(f);
-        }
-        return dq_core::Value::BigFloat(literal);
-    }
-    dq_core::Value::BigInt(literal)
-}
-
-fn f64_matches_literal(f: f64, literal: &str) -> bool {
-    use std::str::FromStr;
-    let formatted = format!("{f}");
-    f64::from_str(&formatted).is_ok_and(|round_trip| round_trip.to_bits() == f.to_bits())
-        && f64::from_str(literal).is_ok_and(|parsed| parsed.to_bits() == f.to_bits())
 }
 
 #[cfg(test)]
