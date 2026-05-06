@@ -31,8 +31,51 @@ fn dq() -> Command {
 
 /// Replace the absolute fixture path with `<FIXTURE>` so snapshots stay
 /// portable across machines.
+///
+/// On Windows the path separator is `\`, which appears two ways in CLI
+/// output: literally (in plain text / diff markers) and JSON-escaped as
+/// `\\` (inside `serde_json` strings). Snapshots are committed in
+/// Unix-style with forward slashes, so we normalize all three forms here.
 fn normalize_path(s: &str, original: &str) -> String {
-    s.replace(original, "<FIXTURE>")
+    // First replace any escaped or forward-slash variants of the path so
+    // they match `<FIXTURE>` on Windows. Order matters: replace the
+    // longest / most-specific form first so a later, shorter pattern
+    // doesn't partially match.
+    let json_escaped = original.replace('\\', "\\\\");
+    let forward_slash = original.replace('\\', "/");
+    let mut out = s.to_string();
+    if json_escaped != original {
+        out = out.replace(&json_escaped, "<FIXTURE>");
+    }
+    out = out.replace(original, "<FIXTURE>");
+    if forward_slash != original {
+        out = out.replace(&forward_slash, "<FIXTURE>");
+    }
+    normalize_path_separators(&out)
+}
+
+/// Convert any backslashes inside `<TMP>...` / `<FIXTURE>...` segments and
+/// on diff-marker lines (`=== ===`, `--- a/...`, `+++ b/...`) to forward
+/// slashes so Windows output matches the Unix-anchored snapshot.
+///
+/// This is a hand-rolled, line-by-line pass — we deliberately do NOT
+/// rewrite every backslash in the buffer because diff payload bytes (the
+/// `+a: 1` / `+b: 2` lines below the markers) may legitimately contain
+/// backslashes and must be preserved verbatim.
+fn normalize_path_separators(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for line in s.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches('\n');
+        let is_marker = trimmed.starts_with("=== ")
+            || trimmed.starts_with("--- ")
+            || trimmed.starts_with("+++ ");
+        if is_marker || line.contains("<TMP>") || line.contains("<FIXTURE>") {
+            out.push_str(&line.replace('\\', "/"));
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
 }
 
 #[test]
@@ -315,9 +358,17 @@ fn snapshot_fmt_diff_marker_format() {
     let stdout = String::from_utf8(out).expect("stdout must be UTF-8");
 
     // Replace the random tempdir prefix so the snapshot is stable across
-    // runs. We anchor on `<TMP>/alpha.yaml` and `<TMP>/bravo.yaml`.
+    // runs. We anchor on `<TMP>/alpha.yaml` and `<TMP>/bravo.yaml`. On
+    // Windows, `tmp_str` and the produced output use `\` separators; we
+    // normalize both the prefix variants and the trailing `<TMP>\file`
+    // segment so Windows output matches the Unix-anchored snapshot.
     let tmp_str = dir.path().to_str().unwrap();
-    let normalized = stdout.replace(tmp_str, "<TMP>");
+    let tmp_forward = tmp_str.replace('\\', "/");
+    let mut normalized = stdout.replace(tmp_str, "<TMP>");
+    if tmp_forward != tmp_str {
+        normalized = normalized.replace(&tmp_forward, "<TMP>");
+    }
+    let normalized = normalize_path_separators(&normalized);
     insta::assert_snapshot!("fmt_diff_marker_format", normalized);
 }
 
