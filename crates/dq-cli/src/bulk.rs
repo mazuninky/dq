@@ -463,7 +463,13 @@ mod tests {
         for name in ["a.yaml", "b.yaml", "c.json", "d.txt"] {
             fs::write(root.join(name).as_std_path(), b"x: 1\n").unwrap();
         }
-        let pattern = root.join("**/*.yaml");
+        // Build the pattern with forward slashes so it works on both Unix
+        // (native) and Windows. `Utf8PathBuf::join` uses the platform
+        // separator, which on Windows produces `…\tmpXXX\**/*.yaml` — a
+        // mix of backslashes and forward slashes that the `glob` crate
+        // matches literally and finds zero files. The `glob` crate
+        // accepts `/` on Windows and matches against any path separator.
+        let pattern = Utf8PathBuf::from(format!("{}/**/*.yaml", root.as_str().replace('\\', "/")));
         let mut result = expand_glob(&pattern).expect("glob should match yaml files");
         // Compare basenames only — the absolute prefix varies by tempdir
         // location.

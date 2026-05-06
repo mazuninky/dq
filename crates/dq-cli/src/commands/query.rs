@@ -147,10 +147,14 @@ mod tests {
     use clap::Parser;
     use tempfile::NamedTempFile;
 
-    fn write_yaml(content: &str) -> NamedTempFile {
+    // Returns a `TempPath` (not a `NamedTempFile`) so the underlying `File`
+    // handle is released after writing. Required for Windows: production
+    // atomic-write uses `MoveFileEx` which fails with `Access is denied` if
+    // the target is still held open elsewhere in the same process.
+    fn write_yaml(content: &str) -> tempfile::TempPath {
         let mut tmp = NamedTempFile::with_suffix(".yaml").unwrap();
         tmp.write_all(content.as_bytes()).unwrap();
-        tmp
+        tmp.into_temp_path()
     }
 
     fn cli_for(extra: &[&str], file: &str) -> Cli {
@@ -163,7 +167,7 @@ mod tests {
     #[test]
     fn query_identity_filter_round_trips_yaml() {
         let tmp = write_yaml("foo: 1\nbar: 2\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = cli_for(&[], path.as_str());
         let args = QueryArgs {
             expression: ".".to_owned(),
@@ -180,7 +184,7 @@ mod tests {
     #[test]
     fn query_field_selector_returns_value() {
         let tmp = write_yaml("foo: 42\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = cli_for(&[], path.as_str());
         let args = QueryArgs {
             expression: ".foo".to_owned(),
@@ -223,7 +227,7 @@ mod tests {
         // so the exit-code mapper picks `PARSE_ERROR` (3) — same as a
         // file-parse failure.
         let tmp = write_yaml("x: 1\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = cli_for(&[], path.as_str());
         let args = QueryArgs {
             expression: ".foo |=".to_owned(),
@@ -257,7 +261,7 @@ mod tests {
         // ignore it for non-stdin inputs and detect the format from the
         // file extension. Only the stdin branch consults `cli.format`.
         let tmp = write_yaml("spec:\n  containers:\n    - image: a\n    - image: b\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = Cli::try_parse_from([
             "dq",
             "-F",
@@ -287,7 +291,7 @@ mod tests {
         // — only the evaluation against this specific data failed, which is
         // GENERIC (1) territory.
         let tmp = write_yaml("\"hello\"\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = cli_for(&[], path.as_str());
         let args = QueryArgs {
             expression: ". + 1".to_owned(),

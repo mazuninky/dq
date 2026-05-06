@@ -178,10 +178,14 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
-    fn write_yaml(content: &str) -> NamedTempFile {
+    // Returns a `TempPath` (not a `NamedTempFile`) so the underlying `File`
+    // handle is released after writing. Required for Windows: production
+    // atomic-write uses `MoveFileEx` which fails with `Access is denied` if
+    // the target is still held open elsewhere in the same process.
+    fn write_yaml(content: &str) -> tempfile::TempPath {
         let mut tmp = NamedTempFile::with_suffix(".yaml").expect("tempfile");
         tmp.write_all(content.as_bytes()).expect("write");
-        tmp
+        tmp.into_temp_path()
     }
 
     #[test]
@@ -216,7 +220,7 @@ check:
   message: 'fires'
 "#;
         let doc_tmp = write_yaml("a: 1\n");
-        let path = Utf8PathBuf::from_path_buf(doc_tmp.path().to_path_buf()).expect("UTF-8 path");
+        let path = Utf8PathBuf::from_path_buf(doc_tmp.to_path_buf()).expect("UTF-8 path");
         let cli = Cli::try_parse_from(["dq", "check", "--inline", inline, path.as_str()])
             .expect("clap parse");
         let args = CheckArgs {

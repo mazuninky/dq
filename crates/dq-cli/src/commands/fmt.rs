@@ -133,10 +133,14 @@ mod tests {
     use clap::Parser;
     use tempfile::NamedTempFile;
 
-    fn write_yaml(content: &str) -> NamedTempFile {
+    // Returns a `TempPath` (not a `NamedTempFile`) so the underlying `File`
+    // handle is released after writing. Required for Windows: production
+    // atomic-write uses `MoveFileEx` which fails with `Access is denied` if
+    // the target is still held open elsewhere in the same process.
+    fn write_yaml(content: &str) -> tempfile::TempPath {
         let mut tmp = NamedTempFile::with_suffix(".yaml").unwrap();
         tmp.write_all(content.as_bytes()).unwrap();
-        tmp
+        tmp.into_temp_path()
     }
 
     #[test]
@@ -148,7 +152,7 @@ mod tests {
         // the test-writer agent's job; this only proves the wiring runs
         // end-to-end without panicking.
         let tmp = write_yaml("a: 1\nb: 2\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = Cli::try_parse_from(["dq", "fmt", path.as_str()]).unwrap();
         let args = FmtArgs { file: path.clone() };
         let opts = cli.write_options();

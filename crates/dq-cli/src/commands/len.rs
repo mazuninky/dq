@@ -71,10 +71,14 @@ mod tests {
     use clap::Parser;
     use tempfile::NamedTempFile;
 
-    fn write_yaml(content: &str) -> NamedTempFile {
+    // Returns a `TempPath` (not a `NamedTempFile`) so the underlying `File`
+    // handle is released after writing. Required for Windows: production
+    // atomic-write uses `MoveFileEx` which fails with `Access is denied` if
+    // the target is still held open elsewhere in the same process.
+    fn write_yaml(content: &str) -> tempfile::TempPath {
         let mut tmp = NamedTempFile::with_suffix(".yaml").unwrap();
         tmp.write_all(content.as_bytes()).unwrap();
-        tmp
+        tmp.into_temp_path()
     }
 
     fn cli_no_flags(file: &str) -> Cli {
@@ -84,7 +88,7 @@ mod tests {
     #[test]
     fn len_reports_array_length() {
         let tmp = write_yaml("- a\n- b\n- c\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = cli_no_flags(path.as_str());
         let args = LenArgs {
             file: path,
@@ -100,7 +104,7 @@ mod tests {
     fn len_reports_string_char_count() {
         // 'café' has 4 chars but 5 bytes — chars().count() is the right unit.
         let tmp = write_yaml("greeting: café\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = cli_no_flags(path.as_str());
         let args = LenArgs {
             file: path,
@@ -115,7 +119,7 @@ mod tests {
     #[test]
     fn len_rejects_scalar() {
         let tmp = write_yaml("flag: true\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = cli_no_flags(path.as_str());
         let args = LenArgs {
             file: path,

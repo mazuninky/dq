@@ -53,10 +53,14 @@ mod tests {
     use clap::Parser;
     use tempfile::NamedTempFile;
 
-    fn write_yaml(content: &str) -> NamedTempFile {
+    // Returns a `TempPath` (not a `NamedTempFile`) so the underlying `File`
+    // handle is released after writing. Required for Windows: production
+    // atomic-write uses `MoveFileEx` which fails with `Access is denied` if
+    // the target is still held open elsewhere in the same process.
+    fn write_yaml(content: &str) -> tempfile::TempPath {
         let mut tmp = NamedTempFile::with_suffix(".yaml").unwrap();
         tmp.write_all(content.as_bytes()).unwrap();
-        tmp
+        tmp.into_temp_path()
     }
 
     fn cli_no_flags(file: &str) -> Cli {
@@ -66,7 +70,7 @@ mod tests {
     #[test]
     fn paths_emits_root_and_children_in_pre_order_console() {
         let tmp = write_yaml("server:\n  port: 8080\n  host: x\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = cli_no_flags(path.as_str());
         let args = PathsArgs { file: path };
         let reporter = ConsoleReporter::new(false);
@@ -98,7 +102,7 @@ mod tests {
     #[test]
     fn paths_json_output_is_an_object() {
         let tmp = write_yaml("a: 1\nb: c\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = cli_no_flags(path.as_str());
         let args = PathsArgs { file: path };
         let reporter = JsonReporter;

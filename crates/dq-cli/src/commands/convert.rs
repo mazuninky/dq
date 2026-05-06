@@ -592,10 +592,14 @@ mod tests {
     use clap::Parser;
     use tempfile::NamedTempFile;
 
-    fn write_yaml(content: &str) -> NamedTempFile {
+    // Returns a `TempPath` (not a `NamedTempFile`) so the underlying `File`
+    // handle is released after writing. Required for Windows: production
+    // atomic-write uses `MoveFileEx` which fails with `Access is denied` if
+    // the target is still held open elsewhere in the same process.
+    fn write_yaml(content: &str) -> tempfile::TempPath {
         let mut tmp = NamedTempFile::with_suffix(".yaml").unwrap();
         tmp.write_all(content.as_bytes()).unwrap();
-        tmp
+        tmp.into_temp_path()
     }
 
     fn cli_no_flags(file: &str) -> Cli {
@@ -605,7 +609,7 @@ mod tests {
     #[test]
     fn convert_yaml_to_json_emits_valid_json() {
         let tmp = write_yaml("server:\n  port: 8080\n  host: x\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = cli_no_flags(path.as_str());
         let args = ConvertArgs {
             file: path,
@@ -633,11 +637,11 @@ mod tests {
 
     #[test]
     fn convert_preserves_big_int_through_json() {
-        let mut tmp = NamedTempFile::with_suffix(".json").unwrap();
+        let mut json_tmp = NamedTempFile::with_suffix(".json").unwrap();
         let big = "4722366482869645213696";
         let json_in = format!("{{\"id\":{big}}}");
-        tmp.write_all(json_in.as_bytes()).unwrap();
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        json_tmp.write_all(json_in.as_bytes()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(json_tmp.path().to_path_buf()).unwrap();
         let cli = cli_no_flags(path.as_str());
         let args = ConvertArgs {
             file: path,
@@ -665,7 +669,7 @@ mod tests {
     #[test]
     fn convert_to_toon_renders_toon_output() {
         let tmp = write_yaml("name: alice\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = cli_no_flags(path.as_str());
         let args = ConvertArgs {
             file: path,
@@ -693,7 +697,7 @@ mod tests {
         // NOT emit ANSI escapes — this proves the global --no-color flag is
         // threaded through the dispatcher.
         let tmp = write_yaml("name: alice\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = cli_no_flags(path.as_str());
         let args = ConvertArgs {
             file: path,
@@ -773,7 +777,7 @@ mod tests {
         // HCL is registered in the M5 parsers::registry(); a flat
         // string-keyed map is the simplest shape its writer accepts.
         let tmp = write_yaml("region: eu-west-1\nzone: a\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let (_fmt, doc) = super::super::io_helpers::load_document_with_path(&path, None).unwrap();
         let opts = WriteOptions::default();
         let bytes = render_to_format(&doc, OutputFormat::Hcl, false, &opts).unwrap();
@@ -790,7 +794,7 @@ mod tests {
         // input through YAML to avoid hand-rolling a Document — the YAML
         // parser produces the right shape.
         let tmp = write_yaml("- name: alice\n  age: 30\n- name: bob\n  age: 25\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let (_fmt, doc) = super::super::io_helpers::load_document_with_path(&path, None).unwrap();
         let opts = WriteOptions::default();
         let bytes = render_to_format(&doc, OutputFormat::Csv, false, &opts).unwrap();
@@ -814,7 +818,7 @@ mod tests {
         // otherwise return Error::Format("document is not a frontmatter
         // document").
         let tmp = write_yaml("title: hello\nauthor: alice\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let (_fmt, doc) = super::super::io_helpers::load_document_with_path(&path, None).unwrap();
         let opts = WriteOptions::default();
         let bytes = render_to_format(&doc, OutputFormat::Frontmatter, false, &opts).unwrap();

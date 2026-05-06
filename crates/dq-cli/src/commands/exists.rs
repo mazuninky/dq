@@ -44,10 +44,14 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
-    fn write_yaml(content: &str) -> NamedTempFile {
+    // Returns a `TempPath` (not a `NamedTempFile`) so the underlying `File`
+    // handle is released after writing. Required for Windows: production
+    // atomic-write uses `MoveFileEx` which fails with `Access is denied` if
+    // the target is still held open elsewhere in the same process.
+    fn write_yaml(content: &str) -> tempfile::TempPath {
         let mut tmp = NamedTempFile::with_suffix(".yaml").unwrap();
         tmp.write_all(content.as_bytes()).unwrap();
-        tmp
+        tmp.into_temp_path()
     }
 
     fn cli_no_flags(file: &str) -> Cli {
@@ -57,7 +61,7 @@ mod tests {
     #[test]
     fn exists_returns_ok_on_match() {
         let tmp = write_yaml("server:\n  port: 8080\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = cli_no_flags(path.as_str());
         let args = ExistsArgs {
             file: path,
@@ -69,7 +73,7 @@ mod tests {
     #[test]
     fn exists_returns_silent_error_on_miss() {
         let tmp = write_yaml("server:\n  port: 8080\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = cli_no_flags(path.as_str());
         let args = ExistsArgs {
             file: path,

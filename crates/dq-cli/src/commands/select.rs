@@ -74,10 +74,14 @@ mod tests {
     use clap::Parser;
     use tempfile::NamedTempFile;
 
-    fn write_yaml(content: &str) -> NamedTempFile {
+    // Returns a `TempPath` (not a `NamedTempFile`) so the underlying `File`
+    // handle is released after writing. Required for Windows: production
+    // atomic-write uses `MoveFileEx` which fails with `Access is denied` if
+    // the target is still held open elsewhere in the same process.
+    fn write_yaml(content: &str) -> tempfile::TempPath {
         let mut tmp = NamedTempFile::with_suffix(".yaml").unwrap();
         tmp.write_all(content.as_bytes()).unwrap();
-        tmp
+        tmp.into_temp_path()
     }
 
     fn cli_no_flags(file: &str) -> Cli {
@@ -87,7 +91,7 @@ mod tests {
     #[test]
     fn select_returns_array_of_one_for_single_match() {
         let tmp = write_yaml("spec:\n  replicas: 3\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = cli_no_flags(path.as_str());
         let args = SelectArgs {
             file: path,
@@ -103,7 +107,7 @@ mod tests {
     #[test]
     fn select_returns_empty_array_for_no_match() {
         let tmp = write_yaml("spec:\n  replicas: 3\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = cli_no_flags(path.as_str());
         let args = SelectArgs {
             file: path,
@@ -121,7 +125,7 @@ mod tests {
     fn select_returns_multi_match_in_order() {
         let tmp =
             write_yaml("spec:\n  containers:\n    - image: a\n    - image: b\n    - image: c\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = cli_no_flags(path.as_str());
         let args = SelectArgs {
             file: path,
@@ -137,7 +141,7 @@ mod tests {
     #[test]
     fn select_rejects_malformed_expression() {
         let tmp = write_yaml("a: 1\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = cli_no_flags(path.as_str());
         let args = SelectArgs {
             file: path,

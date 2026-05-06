@@ -261,10 +261,14 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
-    fn write_yaml(content: &str) -> NamedTempFile {
+    // Returns a `TempPath` (not a `NamedTempFile`) so the underlying `File`
+    // handle is released after writing. Required for Windows: production
+    // atomic-write uses `MoveFileEx` which fails with `Access is denied` if
+    // the target is still held open elsewhere in the same process.
+    fn write_yaml(content: &str) -> tempfile::TempPath {
         let mut tmp = NamedTempFile::with_suffix(".yaml").expect("tempfile");
         tmp.write_all(content.as_bytes()).expect("write");
-        tmp
+        tmp.into_temp_path()
     }
 
     /// Write an inline rule YAML to disk so we can pass it via
@@ -298,7 +302,7 @@ fix:
     fn fix_with_inline_rule_writes_diff_to_stdout() {
         let (_rule_tmp, rule_path) = write_rule(SET_FIXED_RULE);
         let doc_tmp = write_yaml("name: x\n");
-        let path = Utf8PathBuf::from_path_buf(doc_tmp.path().to_path_buf()).expect("UTF-8 path");
+        let path = Utf8PathBuf::from_path_buf(doc_tmp.to_path_buf()).expect("UTF-8 path");
 
         let cli = Cli::try_parse_from([
             "dq",
@@ -329,7 +333,7 @@ fix:
     fn fix_with_inline_rule_returns_check_pending_under_check_flag() {
         let (_rule_tmp, rule_path) = write_rule(SET_FIXED_RULE);
         let doc_tmp = write_yaml("name: x\n");
-        let path = Utf8PathBuf::from_path_buf(doc_tmp.path().to_path_buf()).expect("UTF-8 path");
+        let path = Utf8PathBuf::from_path_buf(doc_tmp.to_path_buf()).expect("UTF-8 path");
 
         let cli = Cli::try_parse_from([
             "dq",
@@ -360,7 +364,7 @@ fix:
     fn fix_writes_in_place_with_i_flag() {
         let (_rule_tmp, rule_path) = write_rule(SET_FIXED_RULE);
         let doc_tmp = write_yaml("name: x\n");
-        let path = Utf8PathBuf::from_path_buf(doc_tmp.path().to_path_buf()).expect("UTF-8 path");
+        let path = Utf8PathBuf::from_path_buf(doc_tmp.to_path_buf()).expect("UTF-8 path");
 
         let cli = Cli::try_parse_from([
             "dq",
@@ -395,7 +399,7 @@ fix:
         // rejection in `set.rs`.
         let (_rule_tmp, rule_path) = write_rule(SET_FIXED_RULE);
         let doc_tmp = write_yaml("name: x\n");
-        let path = Utf8PathBuf::from_path_buf(doc_tmp.path().to_path_buf()).expect("UTF-8 path");
+        let path = Utf8PathBuf::from_path_buf(doc_tmp.to_path_buf()).expect("UTF-8 path");
 
         let cli = Cli::try_parse_from([
             "dq",
@@ -429,7 +433,7 @@ fix:
     fn fix_rejects_raw_template_strings() {
         let (_rule_tmp, rule_path) = write_rule(SET_FIXED_RULE);
         let doc_tmp = write_yaml("name: x\n");
-        let path = Utf8PathBuf::from_path_buf(doc_tmp.path().to_path_buf()).expect("UTF-8 path");
+        let path = Utf8PathBuf::from_path_buf(doc_tmp.to_path_buf()).expect("UTF-8 path");
 
         let cli = Cli::try_parse_from([
             "dq",
@@ -468,7 +472,7 @@ check:
 "#;
         let (_rule_tmp, rule_path) = write_rule(report_only);
         let doc_tmp = write_yaml("name: x\n");
-        let path = Utf8PathBuf::from_path_buf(doc_tmp.path().to_path_buf()).expect("UTF-8 path");
+        let path = Utf8PathBuf::from_path_buf(doc_tmp.to_path_buf()).expect("UTF-8 path");
 
         let cli = Cli::try_parse_from([
             "dq",
@@ -495,7 +499,7 @@ check:
         // resulting bytes to stdout (single-file path).
         let (_rule_tmp, rule_path) = write_rule(SET_FIXED_RULE);
         let doc_tmp = write_yaml("name: x\n");
-        let path = Utf8PathBuf::from_path_buf(doc_tmp.path().to_path_buf()).expect("UTF-8 path");
+        let path = Utf8PathBuf::from_path_buf(doc_tmp.to_path_buf()).expect("UTF-8 path");
 
         let cli = Cli::try_parse_from(["dq", "fix", "--rules", rule_path.as_str(), path.as_str()])
             .expect("clap parse");

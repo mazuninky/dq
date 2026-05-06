@@ -543,10 +543,14 @@ mod tests {
         Cli::try_parse_from(argv).expect("clap parse")
     }
 
-    fn write_yaml(content: &str) -> NamedTempFile {
+    // Returns a `TempPath` (not a `NamedTempFile`) so the underlying `File`
+    // handle is released after writing. Required for Windows: production
+    // atomic-write uses `MoveFileEx` which fails with `Access is denied` if
+    // the target is still held open elsewhere in the same process.
+    fn write_yaml(content: &str) -> tempfile::TempPath {
         let mut tmp = NamedTempFile::with_suffix(".yaml").unwrap();
         tmp.write_all(content.as_bytes()).unwrap();
-        tmp
+        tmp.into_temp_path()
     }
 
     #[test]
@@ -554,7 +558,7 @@ mod tests {
         // Smoke test for the `-i` path: the file content must match exactly
         // after the splice, with no spurious whitespace / encoding drift.
         let tmp = write_yaml("spec:\n  replicas: 3\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli =
             Cli::try_parse_from(["dq", "-i", "set", path.as_str(), "/spec/replicas", "5"]).unwrap();
         let args = SetArgs {
@@ -580,7 +584,7 @@ mod tests {
         // path. The bulk driver's single-file fast path must NOT add a
         // `=== <path> ===` marker.
         let tmp = write_yaml("spec:\n  replicas: 3\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = cli_for(&[]);
         let args = SetArgs {
             file: path.clone(),
@@ -613,7 +617,7 @@ mod tests {
     #[test]
     fn set_diff_mode_renders_unified_diff() {
         let tmp = write_yaml("spec:\n  replicas: 3\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli =
             Cli::try_parse_from(["dq", "--diff", "set", path.as_str(), "/spec/replicas", "5"])
                 .unwrap();
@@ -647,7 +651,7 @@ mod tests {
         // missing pointer, so this test exercises both the no-create flag
         // path AND the baseline mkdir-p stub.
         let tmp = write_yaml("a: 1\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = cli_for(&[]);
         let args = SetArgs {
             file: path,
@@ -670,7 +674,7 @@ mod tests {
         // would parse as `Value::Int(8080)`. With the flag, it must be a
         // string in the rendered output.
         let tmp = write_yaml("port: 80\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = cli_for(&[]);
         let args = SetArgs {
             file: path,
@@ -695,7 +699,7 @@ mod tests {
         // The complementary case to `set_value_string_forces_string_interpretation`:
         // `8080` without the flag MUST end up as an integer.
         let tmp = write_yaml("port: 80\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = cli_for(&[]);
         let args = SetArgs {
             file: path,
@@ -721,7 +725,7 @@ mod tests {
         // Without an escape-hatch flag, a Helm-style template must produce
         // a structured `TemplatedFile` error before any parse attempt.
         let tmp = write_yaml("image:\n  tag: {{ .Values.image.tag }}\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = cli_for(&[]);
         let args = SetArgs {
             file: path,
@@ -745,7 +749,7 @@ mod tests {
         // verbatim in the output.
         let src = "name: my-app\nimage:\n  tag: {{ .Values.image.tag }}\n";
         let tmp = write_yaml(src);
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = Cli::try_parse_from([
             "dq",
             "--raw-template-strings",
@@ -787,7 +791,7 @@ mod tests {
         // + 1' -i` increments the field on disk through the re-emit path.
         // Comments would be lost — the test fixture has none on purpose.
         let tmp = write_yaml("spec:\n  replicas: 3\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = Cli::try_parse_from([
             "dq",
             "-i",
@@ -822,7 +826,7 @@ mod tests {
         // rejects this with `InvalidInput` so the user cannot silently lose
         // data; the message names the count to point them at `[.[]]`.
         let tmp = write_yaml("- 1\n- 2\n- 3\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = Cli::try_parse_from(["dq", "-i", "set", path.as_str(), "--jq", ".[]"]).unwrap();
         let args = SetArgs {
             file: path,
@@ -851,7 +855,7 @@ mod tests {
         // `empty` produces zero outputs — accepting it would silently make
         // the document empty. Rejected with `InvalidInput`.
         let tmp = write_yaml("a: 1\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = Cli::try_parse_from(["dq", "-i", "set", path.as_str(), "--jq", "empty"]).unwrap();
         let args = SetArgs {
             file: path,
@@ -883,7 +887,7 @@ mod tests {
         // flags so users (and `cargo deny`-style grep audits) can trace the
         // rejection back to the CLI surface.
         let tmp = write_yaml("foo: 1\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = Cli::try_parse_from([
             "dq",
             "--allow-templates",
@@ -924,7 +928,7 @@ mod tests {
         // round-trip placeholder positions, so accepting this combination
         // would silently drop the restored markers; reject up front.
         let tmp = write_yaml("foo: 1\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = Cli::try_parse_from([
             "dq",
             "--raw-template-strings",

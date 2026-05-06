@@ -180,16 +180,20 @@ mod tests {
     use clap::Parser;
     use tempfile::NamedTempFile;
 
-    fn write_yaml(content: &str) -> NamedTempFile {
+    // Returns a `TempPath` (not a `NamedTempFile`) so the underlying `File`
+    // handle is released after writing. Required for Windows: production
+    // atomic-write uses `MoveFileEx` which fails with `Access is denied` if
+    // the target is still held open elsewhere in the same process.
+    fn write_yaml(content: &str) -> tempfile::TempPath {
         let mut tmp = NamedTempFile::with_suffix(".yaml").unwrap();
         tmp.write_all(content.as_bytes()).unwrap();
-        tmp
+        tmp.into_temp_path()
     }
 
     #[test]
     fn del_removes_leaf_in_place() {
         let tmp = write_yaml("a: 1\nb: 2\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = Cli::try_parse_from(["dq", "-i", "del", path.as_str(), "/a"]).unwrap();
         let args = DelArgs {
             file: path.clone(),
@@ -207,7 +211,7 @@ mod tests {
         // structured `Path` error so `dq del` can be relied upon for "this
         // key existed and is now gone" semantics.
         let tmp = write_yaml("a: 1\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = Cli::try_parse_from(["dq", "del", path.as_str(), "/b"]).unwrap();
         let args = DelArgs {
             file: path,
@@ -226,7 +230,7 @@ mod tests {
         // clear "you cannot delete the document" error instead of a silent
         // empty file.
         let tmp = write_yaml("a: 1\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = Cli::try_parse_from(["dq", "del", path.as_str(), ""]).unwrap();
         let args = DelArgs {
             file: path,
@@ -252,7 +256,7 @@ mod tests {
     #[test]
     fn del_diff_shows_removal() {
         let tmp = write_yaml("a: 1\nb: 2\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = Cli::try_parse_from(["dq", "--diff", "del", path.as_str(), "/a"]).unwrap();
         let args = DelArgs {
             file: path,
@@ -273,7 +277,7 @@ mod tests {
         // to stdout and leaves the file on disk untouched. CRITICAL:
         // single-file mode must not emit a `=== <path> ===` marker.
         let tmp = write_yaml("a: 1\nb: 2\n");
-        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = Cli::try_parse_from(["dq", "del", path.as_str(), "/a"]).unwrap();
         let args = DelArgs {
             file: path.clone(),
