@@ -44,7 +44,7 @@ use indexmap::IndexSet;
 
 use crate::bulk::{self, FileOp, FileOpResult};
 use crate::cli::{Cli, FixArgs};
-use crate::commands::io_helpers::{pick_format, read_bytes, value_to_serde_json};
+use crate::commands::io_helpers::{pick_format, read_bytes};
 use crate::commands::lint_core::expand_lint_inputs;
 use crate::error::InvalidInput;
 
@@ -142,7 +142,7 @@ impl<'a> FileOp for FixFileOp<'a> {
         let original_bytes = read_bytes(path)?;
         let document = format.parse(&original_bytes).map_err(anyhow::Error::new)?;
 
-        let serde_value = value_to_serde_json(document.value());
+        let serde_value = document.value().to_serde_json();
         let outcome = self
             .fixer
             .apply(path, &serde_value, format.name())

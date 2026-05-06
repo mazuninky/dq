@@ -103,16 +103,34 @@ pub struct RuleCheck {
 
 /// Optional override for the per-violation diagnostic location.
 ///
-/// Both fields are jq expressions evaluated against the violation value;
+/// All three fields are jq expressions evaluated against the violation value;
 /// when set, they replace the default "use the violation node's parser
 /// position, falling back to line/col 1" behaviour.
+///
+/// **Resolution precedence for `line/col`** (per
+/// `data-query-exec`'s "Location override via `loc:`" requirement):
+/// `pointer` (preferred) → `line` (deprecated, M8 fallback) → intrinsic
+/// (line 1, col 1 today). The `pointer` expression must produce a
+/// non-empty RFC 6901 string the evaluator looks up in the input `Ir`'s
+/// provenance map; on a successful span lookup the diagnostic's `line` and
+/// `col` come from the source bytes. `loc.file` is independent of this
+/// chain and continues to override the diagnostic's file path.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuleLoc {
+    /// Optional jq expression producing an RFC 6901 JSON Pointer string.
+    /// Preferred over [`RuleLoc::line`]; see the struct-level rustdoc for
+    /// the resolution precedence.
+    #[serde(default)]
+    pub pointer: Option<String>,
     /// Optional jq expression producing the file path.
     #[serde(default)]
     pub file: Option<String>,
     /// Optional jq expression producing the 1-based line number.
+    ///
+    /// **Deprecated**: prefer [`RuleLoc::pointer`]. Kept for backwards
+    /// compatibility with M8-era rules; removal is deferred to a future
+    /// change.
     #[serde(default)]
     pub line: Option<String>,
 }

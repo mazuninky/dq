@@ -1,8 +1,10 @@
 # Release workflow — triggered on `v*` tag pushes.
 #
-# Builds prebuilt binaries for the four targets in the M6 release matrix,
-# packages them as tar.gz / zip, generates a single dq-checksums.txt with
-# SHA256 of every artifact, and uploads everything to a new GitHub Release.
+# Builds prebuilt binaries for the Linux targets only (x86_64 + aarch64),
+# packages them as tar.gz, generates a single dq-checksums.txt with SHA256
+# of every artifact, and uploads everything to a new GitHub Release. macOS
+# / Windows targets were removed alongside the CI matrix simplification —
+# add them back here when those platforms return as release targets.
 # Optional cosign signing runs only when COSIGN_PRIVATE_KEY is configured;
 # absence is a no-op (so forks pass without secrets).
 
@@ -42,14 +44,6 @@ jobs:
             os: ubuntu-latest
             archive_ext: tar.gz
             cross: true
-          - target: aarch64-apple-darwin
-            os: macos-14
-            archive_ext: tar.gz
-            cross: false
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            archive_ext: zip
-            cross: false
     steps:
       - uses: actions/checkout@v4
 
@@ -103,21 +97,13 @@ jobs:
           TARGET="${{ matrix.target }}"
           STAGE="dist/${TAG}-${TARGET}"
           mkdir -p "${STAGE}/man" "${STAGE}/completions"
-          if [ "${{ matrix.archive_ext }}" = "zip" ]; then
-            cp "target/${TARGET}/release/dq.exe" "${STAGE}/dq.exe"
-          else
-            cp "target/${TARGET}/release/dq" "${STAGE}/dq"
-          fi
+          cp "target/${TARGET}/release/dq" "${STAGE}/dq"
           cp dist/docs/man/*.1 "${STAGE}/man/" 2>/dev/null || true
           cp dist/docs/completions/* "${STAGE}/completions/" 2>/dev/null || true
           cp README.md LICENSE "${STAGE}/" 2>/dev/null || true
-          NAME="dq-${TAG}-${TARGET}.${{ matrix.archive_ext }}"
+          NAME="dq-${TAG}-${TARGET}.tar.gz"
           cd dist
-          if [ "${{ matrix.archive_ext }}" = "zip" ]; then
-            ( cd "${TAG}-${TARGET}" && 7z a -bd "../${NAME}" . >/dev/null )
-          else
-            tar -czf "${NAME}" -C "${TAG}-${TARGET}" .
-          fi
+          tar -czf "${NAME}" -C "${TAG}-${TARGET}" .
           echo "name=${NAME}" >> "$GITHUB_OUTPUT"
           echo "path=dist/${NAME}" >> "$GITHUB_OUTPUT"
 
@@ -162,7 +148,7 @@ jobs:
           cd dist
           ls -la
           : > dq-checksums.txt
-          for f in dq-*.tar.gz dq-*.zip; do
+          for f in dq-*.tar.gz; do
             [ -f "$f" ] || continue
             sha256sum "$f" >> dq-checksums.txt
           done
@@ -196,7 +182,7 @@ jobs:
           chmod +x cosign-linux-amd64
           sudo mv cosign-linux-amd64 /usr/local/bin/cosign
           cd dist
-          for f in dq-*.tar.gz dq-*.zip dq-checksums.txt; do
+          for f in dq-*.tar.gz dq-checksums.txt; do
             [ -f "$f" ] || continue
             cosign sign-blob --yes --key env://COSIGN_PRIVATE_KEY \
               --output-signature "${f}.sig" "${f}"
@@ -210,7 +196,6 @@ jobs:
           generate_release_notes: true
           files: |
             dist/dq-*.tar.gz
-            dist/dq-*.zip
             dist/dq-checksums.txt
             dist/dq-*.sig
           fail_on_unmatched_files: false

@@ -8,6 +8,13 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Sibling crate: dq-core provides the IR types (`Ir`, `OwnedIr`, `FormatTag`,
+# `ProvenanceMap`, `Provenance`, `SyntheticReason`) and the `Value`/`Pointer`
+# domain types the IR-aware variants of the value adapter (`ir_to_val`,
+# `val_to_owned_ir`) operate on. These are always-on types in dq-core, so the
+# dependency is unconditional rather than gated behind `embedded-jq`.
+dq-core = { path = "../dq-core", version = "0.1" }
+
 # `jaq-*` crates are gated behind the `embedded-jq` feature so consumers can
 # opt out of the heavy jq stack (e.g. minimal CI builds). With the feature
 # off, every method on `JqEngine` returns `JqError::FeatureDisabled` rather

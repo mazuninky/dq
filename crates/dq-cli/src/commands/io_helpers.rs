@@ -14,7 +14,6 @@
 
 use std::fs;
 use std::io::Read;
-use std::str::FromStr;
 
 use camino::Utf8Path;
 use dq_core::{Document, Format, Value};
@@ -48,6 +47,61 @@ pub(crate) fn load_document_with_path(
     };
     let doc = format
         .parse(&bytes)
+        .map_err(|mut e| {
+            if let dq_core::Error::Parse { ref mut file, .. } = e
+                && file.is_none()
+            {
+                file.clone_from(&path_label);
+            }
+            e
+        })
+        .map_err(anyhow::Error::new)?;
+    Ok((format, doc))
+}
+
+/// Load a [`Document`] for the **lint read path**, choosing the
+/// span-aware parser when one exists for the format.
+///
+/// # Why a separate helper
+///
+/// `loc.pointer` resolution in the evaluator looks up
+/// `Ir::line_col_for(&Pointer)`, which only resolves to a `(line, col)`
+/// when the parser populated `Provenance::Original { span: Some(_), .. }`
+/// for the value at that pointer. The default `Format::parse` for YAML and
+/// JSON is span-LESS — it routes through `serde_yml` / `serde_json`'s
+/// `Deserializer::from_slice` and produces a `Document` whose `spans` map
+/// is empty, which collapses every `loc.pointer` resolution to `(1, 1)`.
+/// The write-mode commands (`set`, `del`, `patch`, `merge`) already
+/// dispatch through `parse_yaml_with_spans` / `parse_json_with_spans` for
+/// the same reason — see e.g. `commands::set::parse_to_document`.
+///
+/// This helper mirrors [`load_document_with_path`] but routes YAML and
+/// JSON through their span-collecting parsers. Every other format falls
+/// through to `Format::parse` (span-aware for TOML via `toml_edit`,
+/// span-less and read-only for the rest by design — the spec at
+/// `add-ir-foundation/specs/data-query-ir/spec.md` documents the
+/// fall-through to `(1, 1)` for those formats).
+///
+/// We deliberately do NOT change the semantics of [`load_document_with_path`]
+/// — it is shared with every read command (`get`, `query`, `select`, etc.)
+/// where the extra span bookkeeping is pure overhead.
+pub(crate) fn load_document_for_lint(
+    file: &Utf8Path,
+    format_override: Option<&str>,
+) -> anyhow::Result<(&'static dyn Format, Document)> {
+    let format = pick_format(file, format_override)?;
+    let bytes = read_bytes(file)?;
+    let path_label = if file == "-" {
+        None
+    } else {
+        Some(file.to_path_buf())
+    };
+    let doc_result: dq_core::Result<Document> = match format.name() {
+        "yaml" => dq_core::parse_yaml_with_spans(&bytes),
+        "json" => dq_core::parse_json_with_spans(&bytes),
+        _ => format.parse(&bytes),
+    };
+    let doc = doc_result
         .map_err(|mut e| {
             if let dq_core::Error::Parse { ref mut file, .. } = e
                 && file.is_none()
@@ -168,58 +222,10 @@ pub(crate) fn select_document<'a>(
     }
 }
 
-/// Convert a [`dq_core::Value`] into a [`serde_json::Value`] so the reporter
-/// can render it through one shared code path.
-///
-/// `BigInt` / `BigFloat` are routed through `serde_json::Number::from_str`,
-/// which honours the `serde_json/arbitrary_precision` feature already enabled
-/// in the workspace. When the textual literal cannot be parsed as a number
-/// (e.g. malformed input), the value falls back to a `String` — losing
-/// numeric typing but never panicking.
-pub(crate) fn value_to_serde_json(v: &Value) -> serde_json::Value {
-    match v {
-        Value::Null => serde_json::Value::Null,
-        Value::Bool(b) => serde_json::Value::Bool(*b),
-        Value::Int(n) => serde_json::Value::Number((*n).into()),
-        Value::Float(f) => serde_json::Number::from_f64(*f)
-            .map(serde_json::Value::Number)
-            // `serde_json::Number::from_f64` returns `None` for NaN / ±Inf —
-            // the only `f64` values rejected by the JSON spec. Fall back to a
-            // string so the value survives reporting (`"NaN"`, `"inf"`,
-            // `"-inf"`) instead of silently becoming `Null`.
-            // TODO(M2): this is a stop-gap. Proper non-finite handling
-            // requires `dq-core` to track finite-vs-non-finite at parse time
-            // (see fix #10's `Error::Parse` span/snippet groundwork) so
-            // callers can decide whether to error or coerce per format.
-            .unwrap_or_else(|| serde_json::Value::String(f.to_string())),
-        Value::BigInt(s) | Value::BigFloat(s) => match serde_json::Number::from_str(s) {
-            Ok(n) => serde_json::Value::Number(n),
-            Err(_) => serde_json::Value::String(s.clone()),
-        },
-        Value::String(s) => serde_json::Value::String(s.clone()),
-        Value::Array(items) => {
-            serde_json::Value::Array(items.iter().map(value_to_serde_json).collect())
-        }
-        Value::Map(map) => {
-            // `preserve_order` is enabled in the workspace, so building a
-            // `serde_json::Map` keeps insertion order. We could also use
-            // `serde_json::Map::with_capacity`, but the iterator path is
-            // cleaner and the perf difference is irrelevant for human-scale
-            // documents.
-            let mut out = serde_json::Map::new();
-            for (k, child) in map {
-                out.insert(k.clone(), value_to_serde_json(child));
-            }
-            serde_json::Value::Object(out)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use dq_core::Value;
-    use indexmap::IndexMap;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -296,51 +302,5 @@ mod tests {
         let doc = Document::single(Value::Int(7));
         let v = select_document(&doc, Some("3")).unwrap();
         assert_eq!(*v, Value::Int(7));
-    }
-
-    #[test]
-    fn value_to_serde_json_handles_big_int() {
-        let v = Value::BigInt("4722366482869645213696".into());
-        let j = value_to_serde_json(&v);
-        // With arbitrary_precision, the number round-trips as a Number node.
-        assert!(j.is_number(), "expected number, got: {j:?}");
-        assert_eq!(j.to_string(), "4722366482869645213696");
-    }
-
-    #[test]
-    fn value_to_serde_json_preserves_map_order() {
-        let mut m = IndexMap::new();
-        m.insert("z".to_owned(), Value::Int(1));
-        m.insert("a".to_owned(), Value::Int(2));
-        let j = value_to_serde_json(&Value::Map(m));
-        let serde_json::Value::Object(obj) = j else {
-            panic!()
-        };
-        let keys: Vec<&str> = obj.keys().map(String::as_str).collect();
-        assert_eq!(keys, vec!["z", "a"]);
-    }
-
-    #[test]
-    fn value_to_serde_json_non_finite_float_becomes_string() {
-        // NaN, +Inf, -Inf cannot be represented as `serde_json::Number` —
-        // they would have silently become `Null` before fix #11. Now they
-        // survive as strings so the user sees what was in the source data.
-        for (input, expected) in [
-            (f64::NAN, "NaN"),
-            (f64::INFINITY, "inf"),
-            (f64::NEG_INFINITY, "-inf"),
-        ] {
-            let j = value_to_serde_json(&Value::Float(input));
-            let serde_json::Value::String(s) = j else {
-                panic!("expected string fallback for {expected}, got: {j:?}");
-            };
-            assert_eq!(s, expected, "wrong fallback string for {expected}");
-        }
-    }
-
-    #[test]
-    fn value_to_serde_json_finite_float_stays_a_number() {
-        let j = value_to_serde_json(&Value::Float(3.5));
-        assert!(j.is_number(), "finite floats must remain numbers: {j:?}");
     }
 }

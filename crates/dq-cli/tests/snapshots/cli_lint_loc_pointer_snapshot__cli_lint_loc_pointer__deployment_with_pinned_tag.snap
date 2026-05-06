@@ -1,0 +1,20 @@
+---
+source: crates/dq-cli/tests/cli_lint_loc_pointer_snapshot.rs
+assertion_line: 137
+expression: normalized
+---
+{
+  "diagnostics": [
+    {
+      "path": "[TEMP_DOC]",
+      "line": 9,
+      "col": 17,
+      "message": "container 'web' uses imagePullPolicy=Always with a pinned tag",
+      "severity": "warn",
+      "rule_id": "test.k8s.image-pull-policy-always",
+      "references": [
+        "https://kubernetes.io/docs/concepts/containers/images/#updating-images"
+      ]
+    }
+  ]
+}

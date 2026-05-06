@@ -20,12 +20,10 @@
 //!
 //! [`Value`]: crate::Value
 
-use indexmap::IndexMap;
 use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::str::FromStr;
 
 use crate::Result;
 use crate::document::{Document, Value};
@@ -227,7 +225,7 @@ impl<'de> Visitor<'de> for PatchOpVisitor {
                 let value = value.ok_or_else(|| de::Error::missing_field("value"))?;
                 Ok(PatchOp::Add {
                     path,
-                    value: serde_json_to_dq_value(&value),
+                    value: Value::from_serde_json(&value),
                 })
             }
             "remove" => {
@@ -239,7 +237,7 @@ impl<'de> Visitor<'de> for PatchOpVisitor {
                 let value = value.ok_or_else(|| de::Error::missing_field("value"))?;
                 Ok(PatchOp::Replace {
                     path,
-                    value: serde_json_to_dq_value(&value),
+                    value: Value::from_serde_json(&value),
                 })
             }
             "move" => {
@@ -257,7 +255,7 @@ impl<'de> Visitor<'de> for PatchOpVisitor {
                 let value = value.ok_or_else(|| de::Error::missing_field("value"))?;
                 Ok(PatchOp::Test {
                     path,
-                    value: serde_json_to_dq_value(&value),
+                    value: Value::from_serde_json(&value),
                 })
             }
             other => Err(de::Error::unknown_variant(
@@ -266,59 +264,6 @@ impl<'de> Visitor<'de> for PatchOpVisitor {
             )),
         }
     }
-}
-
-// --------------------- serde_json -> dq Value bridge -----------------------
-
-// NOTE: this helper duplicates `crates/dq-cli/src/commands/set.rs` for now;
-// extracting a shared helper is a deliberately-deferred refactor (see the
-// M3 §1 prompt — the duplication is bounded and the shared module is not
-// yet load-bearing).
-
-/// Convert a [`serde_json::Value`] into a [`Value`], preserving big-int and
-/// big-float literals.
-fn serde_json_to_dq_value(v: &serde_json::Value) -> Value {
-    match v {
-        serde_json::Value::Null => Value::Null,
-        serde_json::Value::Bool(b) => Value::Bool(*b),
-        serde_json::Value::Number(n) => number_to_value(n),
-        serde_json::Value::String(s) => Value::String(s.clone()),
-        serde_json::Value::Array(items) => {
-            Value::Array(items.iter().map(serde_json_to_dq_value).collect())
-        }
-        serde_json::Value::Object(map) => {
-            let mut out = IndexMap::with_capacity(map.len());
-            for (k, child) in map {
-                out.insert(k.clone(), serde_json_to_dq_value(child));
-            }
-            Value::Map(out)
-        }
-    }
-}
-
-fn number_to_value(n: &serde_json::Number) -> Value {
-    // Mirror `dq_cli::commands::set::number_to_value`: with serde_json's
-    // arbitrary_precision feature on, `n.to_string()` returns the original
-    // textual literal verbatim, which lets us pick the right precision-
-    // preserving variant rather than collapsing through `as_i64`/`as_f64`.
-    let literal = n.to_string();
-    if let Ok(i) = literal.parse::<i64>() {
-        return Value::Int(i);
-    }
-    if literal.contains('.') || literal.contains('e') || literal.contains('E') {
-        if let Ok(f) = f64::from_str(&literal)
-            && f.is_finite()
-            && literal_round_trips_to(&literal, f)
-        {
-            return Value::Float(f);
-        }
-        return Value::BigFloat(literal);
-    }
-    Value::BigInt(literal)
-}
-
-fn literal_round_trips_to(literal: &str, f: f64) -> bool {
-    f64::from_str(literal).is_ok_and(|parsed| parsed.to_bits() == f.to_bits())
 }
 
 // ------------------------------- engine -----------------------------------

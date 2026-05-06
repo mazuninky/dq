@@ -295,7 +295,16 @@ fn run_case(
             };
         }
     };
-    let actual = evaluator.evaluate_file(fixture, &value, &format);
+    // The fixture path doesn't carry spans — fixtures parse via
+    // `serde_yml`/`serde_json`/markdown which give us a bare
+    // `serde_json::Value` with no provenance metadata. Build a fresh
+    // `OwnedIr` with an empty provenance map so the evaluator sees the
+    // new IR signature; rules that use `loc.pointer` simply fall through
+    // to the default (1, 1) position in the fixture context.
+    let dq_value = dq_core::Value::from_serde_json(&value);
+    let format_tag = dq_core::FormatTag::from_name(&format).unwrap_or(dq_core::FormatTag::Yaml);
+    let owned = dq_core::OwnedIr::new(dq_value, dq_core::ProvenanceMap::new(), format_tag);
+    let actual = evaluator.evaluate_file(fixture, &owned.to_borrowed(), &format);
     compare(
         fixture.to_path_buf(),
         case.name,

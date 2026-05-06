@@ -27,4 +27,4 @@
 
 pub mod jq;
 
-pub use jq::{JqEngine, JqError, serde_to_val, val_to_serde};
+pub use jq::{JqEngine, JqError, ir_to_val, serde_to_val, val_to_owned_ir, val_to_serde};
