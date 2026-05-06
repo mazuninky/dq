@@ -1,0 +1,21 @@
+# Keep the build context lean — exclude everything that doesn't influence
+# `cargo build --bin dq`. Mirrors .gitignore-style globs.
+
+target/
+.git/
+.github/
+.claude/
+.openspec/
+docs/
+spikes/
+tests/
+**/tests/
+**/snapshots/
+*.md
+*.bak
+.DS_Store
+
+# Keep README.md / LICENSE since the runtime stage may want them as labels
+# or for `docker inspect` consumers. Re-include them explicitly.
+!README.md
+!LICENSE

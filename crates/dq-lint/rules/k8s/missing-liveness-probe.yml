@@ -1,0 +1,14 @@
+id: k8s.missing-liveness-probe
+description: |
+  Containers should declare a livenessProbe so the kubelet can detect
+  hung processes and restart them. Without one, a deadlocked container
+  remains "Running" forever.
+severity: warn
+match:
+  format: yaml
+  filter: '.kind == "Deployment" or .kind == "StatefulSet" or .kind == "DaemonSet" or .kind == "Pod"'
+check:
+  jq: '(.spec.template.spec.containers // .spec.containers // [])[] | select((.livenessProbe // null) == null)'
+  message: "Container '{{ .name }}' has no livenessProbe"
+references:
+  - https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/

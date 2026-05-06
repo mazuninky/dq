@@ -1,0 +1,56 @@
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+ignore = [
+    # serde_yml is unmaintained (project archived) and has an unsoundness in
+    # `Serializer.emitter`. dq uses serde_yml ONLY for the read-pat (parsers/
+    # yaml.rs), never as a Serializer. M2 added a parallel write-pat parser
+    # via saphyr-parser (parsers/yaml_spans.rs) which builds a Pointer→
+    # ByteRange span map and splices `original_bytes` directly — no emitter
+    # involved on the write side either. Unifying read-pat onto saphyr-parser
+    # is post-M2 work; until that change lands this advisory ignore stays.
+    # See openspec/changes/archive/2026-05-03-add-safe-writes/design.md D1+D13.
+    { id = "RUSTSEC-2025-0068", reason = "serde_yml read-pat dep; write-pat uses saphyr-parser (no Serializer access)" },
+    # number_prefix is unmaintained, pulled transitively by indicatif (a
+    # progress-bar lib used by `self_update` for the `dq self update` flow).
+    # The recommended replacement is `unit-prefix`; switching requires an
+    # upstream PR to indicatif. Low risk — it formats human-readable byte
+    # sizes during binary download, no security surface.
+    { id = "RUSTSEC-2025-0119", reason = "number_prefix via indicatif via self_update; formatting only, no security surface" },
+]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "Zlib",
+    "CC0-1.0",
+    # webpki-roots ships under CDLA-Permissive-2.0 (Mozilla's CA bundle is
+    # licensed by Mozilla under this license; rustls/ureq vendor the bundle
+    # via webpki-roots). It's a permissive data-licensing scheme — see
+    # https://cdla.dev/permissive-2-0/.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

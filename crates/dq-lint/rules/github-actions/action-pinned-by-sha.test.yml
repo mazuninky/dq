@@ -1,0 +1,33 @@
+tests:
+  - name: third-party action pinned by version fires
+    input: |
+      name: ci
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: docker/build-push-action@v5
+    expected:
+      violations:
+        - rule: github-actions.action-pinned-by-sha
+          message_contains: "build-push-action"
+  - name: third-party action pinned by full SHA passes
+    input: |
+      name: ci
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: docker/build-push-action@4f7cdeb6d091a4e3c9a45f1d0a1dc5b05f1f0e2a
+    expected:
+      violations: []
+  - name: official actions/* are exempt
+    input: |
+      name: ci
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+    expected:
+      violations: []

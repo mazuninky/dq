@@ -1,0 +1,14 @@
+id: k8s.privileged-container
+description: |
+  Containers must not run as privileged. securityContext.privileged=true
+  disables almost every Linux containment feature and is equivalent to
+  running root on the host node.
+severity: error
+match:
+  format: yaml
+  filter: '.kind == "Deployment" or .kind == "StatefulSet" or .kind == "DaemonSet" or .kind == "Pod"'
+check:
+  jq: '(.spec.template.spec.containers // .spec.containers // [])[] | select(.securityContext.privileged == true)'
+  message: "Container '{{ .name }}' runs as privileged"
+references:
+  - https://kubernetes.io/docs/concepts/security/pod-security-standards/

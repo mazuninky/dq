@@ -1,0 +1,44 @@
+tests:
+  - name: pull_request_target with PR head checkout fires
+    input: |
+      name: ci
+      on:
+        pull_request_target:
+          types: [opened]
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.pull_request.head.sha }}
+    expected:
+      violations:
+        - rule: github-actions.no-pull-request-target-with-checkout
+  - name: pull_request_target without PR-ref checkout passes
+    input: |
+      name: ci
+      on:
+        pull_request_target:
+          types: [opened]
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./scripts/label.sh
+    expected:
+      violations: []
+  - name: pull_request workflow is exempt
+    input: |
+      name: ci
+      on: [pull_request]
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.pull_request.head.sha }}
+    expected:
+      violations: []

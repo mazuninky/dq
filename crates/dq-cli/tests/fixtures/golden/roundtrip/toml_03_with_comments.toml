@@ -1,0 +1,14 @@
+# Top-level comment.
+title = "TOML with comments"
+
+# Database section
+[database]
+# Connection URL
+url = "postgres://localhost/db"
+# Connection pool size
+pool_size = 10  # inline comment
+
+# Server section
+[server]
+host = "0.0.0.0"
+port = 8080

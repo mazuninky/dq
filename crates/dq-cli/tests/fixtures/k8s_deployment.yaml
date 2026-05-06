@@ -1,0 +1,29 @@
+# Sample Kubernetes Deployment for dq-cli integration tests.
+# Original — not copied from any external project.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: default
+  labels:
+    app.kubernetes.io/name: web
+    app.kubernetes.io/component: server
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: ghcr.io/example/web:1.2.3
+          ports:
+            - containerPort: 8080
+        - name: sidecar
+          image: ghcr.io/example/sidecar:0.4.1
+        - name: init
+          image: busybox:1.36

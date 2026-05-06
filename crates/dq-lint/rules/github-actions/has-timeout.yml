@@ -1,0 +1,14 @@
+id: github-actions.has-timeout
+description: |
+  Jobs should declare a `timeout-minutes` so a hung runner doesn't
+  consume the default 360 minute (6 hour) ceiling, blocking concurrent
+  runs and burning Actions budget.
+severity: info
+match:
+  format: yaml
+  filter: 'has("jobs")'
+check:
+  jq: '(.jobs // {}) | to_entries[] | select(.value["timeout-minutes"] == null) | {job: .key}'
+  message: "Job '{{ .job }}' has no timeout-minutes (defaults to 360)"
+references:
+  - https://docs.github.com/en/actions/using-jobs/setting-a-maximum-execution-time-for-a-job

@@ -1,0 +1,29 @@
+tests:
+  - name: pod with hostPath volume fires
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+      spec:
+        template:
+          spec:
+            containers: [{ name: app, image: app:v1 }]
+            volumes:
+              - name: docker-sock
+                hostPath: { path: /var/run/docker.sock }
+    expected:
+      violations:
+        - rule: k8s.hostpath-volume
+          message_contains: "hostPath"
+  - name: pod with emptyDir passes
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+      spec:
+        template:
+          spec:
+            containers: [{ name: app, image: app:v1 }]
+            volumes:
+              - name: cache
+                emptyDir: {}
+    expected:
+      violations: []

@@ -1,0 +1,13 @@
+---
+source: crates/dq-cli/tests/golden.rs
+expression: combined
+---
+exit_code: 0
+--- stdout ---
+: object
+/extends: string
+/parser: string
+/rules: object
+/rules/no-unused-vars: string
+/rules/no-console: string
+--- stderr ---

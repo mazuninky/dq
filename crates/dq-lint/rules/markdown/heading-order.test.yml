@@ -1,0 +1,36 @@
+tests:
+  - name: H1 followed by H3 fires
+    input: |
+      # Title
+
+      ### Skipped H2
+
+      Body.
+    expected:
+      violations:
+        - rule: markdown.heading-order
+          message_contains: "H1 to H3"
+  - name: H1 H2 H3 sequence passes
+    input: |
+      # Title
+
+      ## Section
+
+      ### Sub
+
+      Body.
+    expected:
+      violations: []
+  - name: descending levels pass
+    input: |
+      # Title
+
+      ## Section
+
+      Body.
+
+      # Another top
+
+      ## Sub
+    expected:
+      violations: []

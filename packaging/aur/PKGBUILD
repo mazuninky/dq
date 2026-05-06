@@ -1,0 +1,55 @@
+# Maintainer: Konstantin Mazunin <konstantin.mazunin@01.tech>
+#
+# Arch Linux package for dq — bin-* style PKGBUILD that pulls a prebuilt
+# release tarball from GitHub Releases. Avoids requiring a Rust toolchain
+# at install time. Released to AUR as `dq-bin`; companion `dq-git` (build
+# from source) is a follow-up.
+
+pkgname=dq-bin
+_pkgname=dq
+pkgver=0.6.0
+pkgrel=1
+pkgdesc="Agent-friendly Rust CLI for structured data (yq/dasel drop-in) + linter platform"
+arch=('x86_64' 'aarch64')
+url="https://github.com/mazuninky/dq"
+license=('MIT')
+provides=('dq')
+conflicts=('dq')
+
+source_x86_64=("dq-v${pkgver}-x86_64-unknown-linux-gnu.tar.gz::${url}/releases/download/v${pkgver}/dq-v${pkgver}-x86_64-unknown-linux-gnu.tar.gz")
+source_aarch64=("dq-v${pkgver}-aarch64-unknown-linux-gnu.tar.gz::${url}/releases/download/v${pkgver}/dq-v${pkgver}-aarch64-unknown-linux-gnu.tar.gz")
+
+# Replaced by tap-style automation on each tag. Until the first release,
+# `makepkg` will fail — that's expected.
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
+
+package() {
+    install -Dm755 "${srcdir}/dq" "${pkgdir}/usr/bin/dq"
+
+    # Man pages
+    if [ -d "${srcdir}/man" ]; then
+        for page in "${srcdir}/man/"*.1; do
+            install -Dm644 "${page}" "${pkgdir}/usr/share/man/man1/$(basename "${page}")"
+        done
+    fi
+
+    # Shell completions
+    if [ -f "${srcdir}/completions/dq.bash" ]; then
+        install -Dm644 "${srcdir}/completions/dq.bash" \
+            "${pkgdir}/usr/share/bash-completion/completions/dq"
+    fi
+    if [ -f "${srcdir}/completions/_dq" ]; then
+        install -Dm644 "${srcdir}/completions/_dq" \
+            "${pkgdir}/usr/share/zsh/site-functions/_dq"
+    fi
+    if [ -f "${srcdir}/completions/dq.fish" ]; then
+        install -Dm644 "${srcdir}/completions/dq.fish" \
+            "${pkgdir}/usr/share/fish/vendor_completions.d/dq.fish"
+    fi
+
+    # License
+    if [ -f "${srcdir}/LICENSE" ]; then
+        install -Dm644 "${srcdir}/LICENSE" "${pkgdir}/usr/share/licenses/${_pkgname}/LICENSE"
+    fi
+}

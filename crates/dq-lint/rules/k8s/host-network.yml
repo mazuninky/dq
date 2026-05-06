@@ -1,0 +1,14 @@
+id: k8s.host-network
+description: |
+  Pods should not request host network access. hostNetwork=true gives
+  the pod the node's network namespace and bypasses NetworkPolicy
+  isolation, drastically expanding the blast radius of a compromise.
+severity: error
+match:
+  format: yaml
+  filter: '.kind == "Deployment" or .kind == "StatefulSet" or .kind == "DaemonSet" or .kind == "Pod"'
+check:
+  jq: '(.spec.template.spec // .spec) | select(.hostNetwork == true)'
+  message: "Pod uses hostNetwork: true"
+references:
+  - https://kubernetes.io/docs/concepts/security/pod-security-standards/

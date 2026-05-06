@@ -1,0 +1,8 @@
+---
+source: crates/dq-cli/tests/cli_snapshots.rs
+assertion_line: 204
+expression: "format!(\"exit_code: {}\\nstderr:\\n{}\", code.unwrap_or(-1), stderr)"
+---
+exit_code: 3
+stderr:
+parse error in <FIXTURE>: [serde_json message]

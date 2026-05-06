@@ -1,0 +1,21 @@
+id: markdown.no-trailing-spaces-in-headings
+description: |
+  Heading text should not end with whitespace — trailing spaces are
+  invisible in source but show up in generated anchor IDs and table
+  of contents entries.
+severity: warn
+match:
+  format: markdown
+check:
+  jq: |
+    .children[]?
+    | select(.type == "heading")
+    | . as $h
+    | ([$h | recurse(.children?[]?) | select(.type == "text") | .value] | join(""))
+    | select(test("\\s$"))
+    | { text: ., level: $h.level, position: $h.position }
+  message: "Heading at H{{ .level }} ends with whitespace"
+references:
+  - https://commonmark.org/help/
+loc:
+  line: '.position.start.line // 1'

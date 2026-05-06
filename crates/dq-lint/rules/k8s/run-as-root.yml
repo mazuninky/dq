@@ -1,0 +1,15 @@
+id: k8s.run-as-root
+description: |
+  Pods should explicitly declare runAsNonRoot=true so they cannot
+  accidentally run as UID 0. The Pod Security Standards "restricted"
+  profile requires this; missing the field means the kubelet falls back
+  to the image's default user, which is often root.
+severity: warn
+match:
+  format: yaml
+  filter: '.kind == "Deployment" or .kind == "StatefulSet" or .kind == "DaemonSet" or .kind == "Pod"'
+check:
+  jq: '. as $doc | (.spec.template.spec // .spec) | select((.securityContext.runAsNonRoot // null) != true) | {kind: "pod", name: ($doc.metadata.name // "<unnamed>")}'
+  message: "Pod-spec '{{ .name }}' does not set securityContext.runAsNonRoot=true"
+references:
+  - https://kubernetes.io/docs/concepts/security/pod-security-standards/

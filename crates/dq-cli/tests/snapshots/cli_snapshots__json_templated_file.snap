@@ -1,0 +1,9 @@
+---
+source: crates/dq-cli/tests/cli_snapshots.rs
+expression: "format!(\n    \"exit_code: {}\\nstdout:\\n{}stderr:\\n{}\",\n    code.unwrap_or(-1),\n    stdout,\n    stderr,\n)"
+---
+exit_code: 3
+stdout:
+stderr:
+file contains Go template syntax (line [NUM]): pullPolicy: {{ .Values.image.pullPolicy | default "IfNotPresent" }}
+  hint: use --allow-templates to parse anyway (formatting may break) or --raw-template-strings to preserve template values as opaque strings

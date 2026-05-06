@@ -1,0 +1,30 @@
+/target/
+**/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# OS / editor cruft
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Editor configs that shouldn't be committed
+.idea/
+.vscode/
+
+# Distribution artifacts
+/dist/
+
+# Node (skill-build tooling, mdbook output)
+/node_modules/
+
+# OpenSpec runtime cache
+openspec/changes/.openspec.cache/
+
+# Subagent scratch memory (rust-cli-writer / rust-cli-test-writer)
+.claude/agent-memory/
+
+# /local-fix per-pass artefacts (review findings + thread payloads)
+.claude/local-fix-*.jsonl
+.claude/local-fix-*.json

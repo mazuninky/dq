@@ -1,0 +1,75 @@
+[package]
+name = "dq-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+# Both a library and a binary target — the library exposes `dq::run` so
+# integration tests can drive the CLI in-process (no `assert_cmd` spawn) while
+# still producing the standard `dq` binary.
+[lib]
+name = "dq"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dq"
+path = "src/main.rs"
+
+[dependencies]
+dq-core = { path = "../dq-core", version = "0.1" }
+# M7: embedded jq engine, consumed by `dq query` and `dq set --jq`. Defaults
+# to the `embedded-jq` feature, which links jaq-core / jaq-std / jaq-json.
+dq-transform = { path = "../dq-transform", version = "0.1" }
+# M8: rule runtime (Evaluator, RuleLoader, RuleSet, RuleTester) consumed by
+# the lint / check / test / explain / rules subcommands.
+dq-exec = { path = "../dq-exec", version = "0.1" }
+# M8: embedded standard rule library (`@std/<ns>`) consumed by `rules list /
+# add` and `explain` for std-namespace rule discovery.
+dq-lint = { path = "../dq-lint", version = "0.1" }
+
+clap = { workspace = true }
+clap_complete = { workspace = true }
+clap_mangen = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+indexmap = { workspace = true }
+camino = { workspace = true }
+jsonpath-rust = { workspace = true }
+toon-format = { workspace = true }
+globset = { workspace = true }
+rayon = { workspace = true }
+walkdir = { workspace = true }
+# M6 distribution. `self_update` drives `dq self update` (atomic GitHub
+# Releases download); `ureq` powers the `dq self check` API ping. Workspace
+# defaults already disable OpenSSL in favour of rustls. `tempfile` is used
+# by the `self update` install-dir writability probe (the dev-dependencies
+# entry is for unit tests; this runtime entry is a separate consumer).
+self_update = { workspace = true }
+ureq = { workspace = true }
+tempfile = { workspace = true }
+# Unified-diff rendering for `dq set --diff` / `dq del --diff` (M2 §11).
+# Default features cover the line-based unified-diff use case; `inline` /
+# `text` features would only matter if we exposed character-level diffs,
+# which the spec does not require.
+similar = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+tempfile = { workspace = true }
+insta = { workspace = true, features = ["redactions", "json", "filters"] }
+pretty_assertions = { workspace = true }
+proptest = { workspace = true }
+serde_json = { workspace = true }
+indexmap = { workspace = true }
+dq-core = { path = "../dq-core", version = "0.1" }

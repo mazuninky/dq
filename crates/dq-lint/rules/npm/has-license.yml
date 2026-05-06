@@ -1,0 +1,22 @@
+id: npm.has-license
+description: |
+  Packages should declare a SPDX license identifier so consumers can
+  evaluate redistribution rights at install time. Missing the field
+  triggers npm's "UNLICENSED" warning and blocks publishing in some
+  internal registries.
+severity: warn
+match:
+  format: json
+  filter: 'has("name") and has("version")'
+check:
+  jq: 'select((.private // false) != true and ((.license // "") == ""))'
+  message: "package.json is missing the 'license' field"
+fix:
+  # When the license field is missing or empty on a non-private package,
+  # set it to "UNLICENSED" — npm's documented placeholder value for
+  # packages with no chosen SPDX identifier. The fix is idempotent: once
+  # `.license` is non-empty the predicate `(.license // "") == ""` no
+  # longer holds, so a second application leaves the value alone.
+  jq: 'if (.private // false) != true and ((.license // "") == "") then .license = "UNLICENSED" else . end'
+references:
+  - https://docs.npmjs.com/cli/v10/configuring-npm/package-json#license

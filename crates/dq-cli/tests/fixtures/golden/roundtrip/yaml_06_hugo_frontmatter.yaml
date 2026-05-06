@@ -1,0 +1,15 @@
+title: "Hello, world"
+date: 2024-08-12T09:30:00Z
+draft: false
+tags:
+  - rust
+  - cli
+categories:
+  - dev
+authors:
+  - name: Jane Doe
+    email: jane@example.test
+description: |
+  A short post about hand-written
+  Hugo frontmatter for tests.
+weight: 5

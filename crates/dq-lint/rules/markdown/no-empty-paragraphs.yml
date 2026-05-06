@@ -1,0 +1,21 @@
+id: markdown.no-empty-paragraphs
+description: |
+  A paragraph with no inline text content usually indicates a stray
+  newline pair or a half-finished edit.
+severity: warn
+match:
+  format: markdown
+check:
+  jq: |
+    .children[]?
+    | select(.type == "paragraph")
+    | . as $p
+    | ([$p | recurse(.children?[]?) | select(.type? == "image" or .type? == "link" or .type? == "code" or .type? == "html_inline")] | length) as $non_text_count
+    | ([$p | recurse(.children?[]?) | select(.type? == "text") | .value] | join("") | gsub("^\\s+|\\s+$"; "")) as $text
+    | select($non_text_count == 0 and $text == "")
+    | { position: $p.position }
+  message: "Empty paragraph"
+references:
+  - https://commonmark.org/help/
+loc:
+  line: '.position.start.line // 1'

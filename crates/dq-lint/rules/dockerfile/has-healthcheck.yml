@@ -1,0 +1,14 @@
+id: dockerfile.has-healthcheck
+description: |
+  Long-running Docker images benefit from a HEALTHCHECK directive so
+  Docker / Kubernetes can detect frozen processes. Missing one is not
+  always wrong (init-style helper images don't need it), but it's
+  worth confirming intent.
+severity: info
+match:
+  format: [dockerfile, yaml]
+check:
+  jq: 'select(map(.instruction) | (contains(["HEALTHCHECK"]) | not)) | {summary: "no HEALTHCHECK"}'
+  message: "Dockerfile has no HEALTHCHECK directive"
+references:
+  - https://docs.docker.com/engine/reference/builder/#healthcheck

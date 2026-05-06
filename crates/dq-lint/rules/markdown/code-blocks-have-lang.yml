@@ -1,0 +1,19 @@
+id: markdown.code-blocks-have-lang
+description: |
+  Every fenced code block should declare a language in its info string
+  so syntax highlighting and language-aware tooling work. For plain
+  text, use `text` or `plain`.
+severity: warn
+match:
+  format: markdown
+check:
+  jq: |
+    .children[]?
+    | select(.type == "code_block" and .fenced == true)
+    | select(.lang == null or .lang == "")
+    | { position: .position }
+  message: "Fenced code block has no language declared"
+references:
+  - https://github.github.com/gfm/#fenced-code-blocks
+loc:
+  line: '.position.start.line // 1'

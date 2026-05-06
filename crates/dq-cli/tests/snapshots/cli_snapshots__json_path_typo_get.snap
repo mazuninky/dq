@@ -1,0 +1,9 @@
+---
+source: crates/dq-cli/tests/cli_snapshots.rs
+assertion_line: 176
+expression: stderr
+---
+path '/server/prot' not found (matched up to '/server')
+  matched prefix: /server
+  did_you_mean: port
+  pointer: /server/prot

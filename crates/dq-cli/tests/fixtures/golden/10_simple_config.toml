@@ -1,0 +1,8 @@
+title = "demo"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[database]
+url = "postgres://localhost/demo"
+pool_size = 10

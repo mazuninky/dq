@@ -1,0 +1,16 @@
+pkgbase = dq-bin
+	pkgdesc = Agent-friendly Rust CLI for structured data (yq/dasel drop-in) + linter platform
+	pkgver = 0.6.0
+	pkgrel = 1
+	url = https://github.com/mazuninky/dq
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	provides = dq
+	conflicts = dq
+	source_x86_64 = dq-v0.6.0-x86_64-unknown-linux-gnu.tar.gz::https://github.com/mazuninky/dq/releases/download/v0.6.0/dq-v0.6.0-x86_64-unknown-linux-gnu.tar.gz
+	source_aarch64 = dq-v0.6.0-aarch64-unknown-linux-gnu.tar.gz::https://github.com/mazuninky/dq/releases/download/v0.6.0/dq-v0.6.0-aarch64-unknown-linux-gnu.tar.gz
+	sha256sums_x86_64 = SKIP
+	sha256sums_aarch64 = SKIP
+
+pkgname = dq-bin

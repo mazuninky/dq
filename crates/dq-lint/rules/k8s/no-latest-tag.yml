@@ -1,0 +1,14 @@
+id: k8s.no-latest-tag
+description: |
+  Containers should not use the :latest image tag because it makes
+  rollbacks impossible and ties production deployments to a mutable
+  reference. Pin to an immutable tag or digest instead.
+severity: error
+match:
+  format: yaml
+  filter: '.kind == "Deployment" or .kind == "StatefulSet" or .kind == "DaemonSet" or .kind == "Pod"'
+check:
+  jq: '.spec.template.spec.containers[]? // .spec.containers[]? | select(.image | tostring | test(":latest$") or (test(":") | not))'
+  message: "Container '{{ .name }}' uses :latest tag (image: {{ .image }})"
+references:
+  - https://kubernetes.io/docs/concepts/containers/images/#image-names

@@ -1,0 +1,15 @@
+---
+source: crates/dq-cli/tests/golden.rs
+expression: combined
+---
+exit_code: 0
+--- stdout ---
+: object
+/$schema: string
+/extends: array
+/extends/0: string
+/labels: array
+/labels/0: string
+/schedule: array
+/schedule/0: string
+--- stderr ---

@@ -1,0 +1,21 @@
+# Synthetic GitHub Actions workflow for dq-core component tests.
+# Original — not copied from any public repository.
+name: ci
+on:
+  push:
+    branches: [main]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+      - name: build
+        run: |
+          set -euo pipefail
+          cargo build --workspace --all-features
+          cargo test --workspace --all-features
+      - name: lint
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace -- -D warnings

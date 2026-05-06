@@ -1,0 +1,15 @@
+id: k8s.missing-resources-limits
+description: |
+  Containers should declare CPU and memory resource limits so the
+  scheduler can pack pods reliably and the kubelet can apply OOM
+  protections. Missing limits let a noisy neighbour starve other
+  workloads on the node.
+severity: warn
+match:
+  format: yaml
+  filter: '.kind == "Deployment" or .kind == "StatefulSet" or .kind == "DaemonSet" or .kind == "Pod"'
+check:
+  jq: '(.spec.template.spec.containers // .spec.containers // [])[] | select((.resources.limits.cpu // null) == null or (.resources.limits.memory // null) == null)'
+  message: "Container '{{ .name }}' is missing resources.limits (cpu and/or memory)"
+references:
+  - https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/

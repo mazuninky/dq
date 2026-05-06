@@ -1,0 +1,15 @@
+id: github-actions.action-pinned-by-sha
+description: |
+  Third-party actions should be pinned to a full 40-char Git SHA, not
+  a movable tag like `@v1` or `@main`. Tag-based references can be
+  rewritten by the action author at any time, allowing supply-chain
+  attacks. SHAs are immutable.
+severity: warn
+match:
+  format: yaml
+  filter: 'has("jobs")'
+check:
+  jq: '(.jobs // {}) | to_entries[] as $j | ($j.value.steps // [])[] | select(.uses) | select(.uses | tostring | test("^actions/") | not) | select(.uses | tostring | test("@[0-9a-f]{40}$") | not) | {step: (.name // .id // "<unnamed>"), uses: .uses}'
+  message: "Step '{{ .step }}' uses '{{ .uses }}' (pin to a full SHA, not a tag)"
+references:
+  - https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions

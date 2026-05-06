@@ -1,0 +1,20 @@
+id: markdown.no-duplicate-headings
+description: |
+  Two headings with the same text within one document confuse anchor
+  links (the auto-generated id collides) and the table of contents.
+  Disambiguate the wording.
+severity: warn
+match:
+  format: markdown
+check:
+  jq: |
+    [.children[]? | select(.type == "heading") | { text: ([recurse(.children?[]?) | select(.type == "text") | .value] | join("") | gsub("^\\s+|\\s+$"; "")), level: .level, position: .position }]
+    | group_by(.text)
+    | .[]
+    | select(length > 1)
+    | .[1:][]
+  message: "Duplicate heading text: '{{ .text }}'"
+references:
+  - https://daringfireball.net/projects/markdown/syntax#header
+loc:
+  line: '.position.start.line // 1'

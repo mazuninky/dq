@@ -1,0 +1,14 @@
+id: k8s.missing-readiness-probe
+description: |
+  Containers should declare a readinessProbe so the kubelet can hold
+  traffic until the workload is ready, preventing 5xx during rollouts
+  and slow-start scenarios.
+severity: warn
+match:
+  format: yaml
+  filter: '.kind == "Deployment" or .kind == "StatefulSet" or .kind == "DaemonSet" or .kind == "Pod"'
+check:
+  jq: '(.spec.template.spec.containers // .spec.containers // [])[] | select((.readinessProbe // null) == null)'
+  message: "Container '{{ .name }}' has no readinessProbe"
+references:
+  - https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/

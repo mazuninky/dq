@@ -1,0 +1,27 @@
+# Fixture (a): k8s Deployment with trailing comment on every top-level key
+# and one leading comment block on a nested mapping.
+# Original — written for the saphyr round-trip spike, not copied.
+apiVersion: apps/v1                             # API group + version
+kind: Deployment                                # workload kind
+metadata:                                       # object metadata
+  name: web                                     # release name
+  namespace: default                            # target namespace
+  labels:                                       # selector labels
+    app.kubernetes.io/name: web                 # standard k8s label
+    app.kubernetes.io/component: server         # role within the app
+spec:                                           # desired state
+  replicas: 3                                   # scale target
+  # The selector pins which pods this Deployment owns.
+  selector:                                     # pod selector
+    matchLabels:                                # match all of these
+      app: web                                  # must match template.metadata.labels.app
+  template:                                     # pod template
+    metadata:                                   # pod metadata
+      labels:                                   # pod labels
+        app: web                                # selector mirror
+    spec:                                       # pod spec
+      containers:                               # one or more containers
+        - name: web                             # primary container
+          image: ghcr.io/example/web:1.2.3      # immutable digest in real prod
+          ports:                                # container ports
+            - containerPort: 8080               # http

@@ -1,0 +1,22 @@
+# Hand-written helm-style values fixture (no `{{ ... }}` blocks — those go
+# through a separate template-guard test, not the round-trip pipeline).
+image:
+  repository: registry.example.test/app
+  tag: v1.0.0
+  pullPolicy: IfNotPresent
+service:
+  type: ClusterIP
+  port: 80
+ingress:
+  enabled: false
+  hosts:
+    - host: app.example.test
+      paths:
+        - /
+resources:
+  limits:
+    cpu: 500m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 64Mi

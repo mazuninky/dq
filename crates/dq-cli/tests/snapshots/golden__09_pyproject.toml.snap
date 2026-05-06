@@ -1,0 +1,18 @@
+---
+source: crates/dq-cli/tests/golden.rs
+expression: combined
+---
+exit_code: 0
+--- stdout ---
+: object
+/project: object
+/project/name: string
+/project/version: string
+/project/requires-python: string
+/project/dependencies: object
+/project/dependencies/requests: string
+/tool: object
+/tool/poetry: object
+/tool/poetry/authors: array
+/tool/poetry/authors/0: string
+--- stderr ---

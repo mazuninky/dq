@@ -1,0 +1,10 @@
+# Helm values fixture with Go-template blocks, for `dq set --raw-template-strings`
+# tests. Hand-written original. The template blocks must round-trip verbatim
+# when the substitution / restoration path runs.
+image:
+  repository: registry.example.test/svc
+  tag: stable
+  pullPolicy: {{ .Values.image.pullPolicy | default "IfNotPresent" }}
+service:
+  port: {{ .Values.service.port }}
+replicas: {{ .Values.replicaCount }}

@@ -1,0 +1,18 @@
+tests:
+  - name: dockerfile without HEALTHCHECK fires
+    input: |
+      - { instruction: FROM, arguments: "nginx:1.25", line: 1 }
+      - { instruction: COPY, arguments: ["./site","/usr/share/nginx/html"], line: 2 }
+      - { instruction: CMD, arguments: ["nginx","-g","daemon off;"], line: 3 }
+    format: yaml
+    expected:
+      violations:
+        - rule: dockerfile.has-healthcheck
+  - name: dockerfile with HEALTHCHECK passes
+    input: |
+      - { instruction: FROM, arguments: "nginx:1.25", line: 1 }
+      - { instruction: HEALTHCHECK, arguments: "--interval=30s CMD curl -f http://localhost", line: 2 }
+      - { instruction: CMD, arguments: ["nginx","-g","daemon off;"], line: 3 }
+    format: yaml
+    expected:
+      violations: []

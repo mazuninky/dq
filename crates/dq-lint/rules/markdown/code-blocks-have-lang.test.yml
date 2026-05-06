@@ -1,0 +1,34 @@
+tests:
+  - name: fenced block with no lang fires
+    input: |
+      Body.
+
+      ```
+      foo bar
+      ```
+
+      End.
+    expected:
+      violations:
+        - rule: markdown.code-blocks-have-lang
+          message_contains: "no language"
+  - name: fenced block with lang passes
+    input: |
+      Body.
+
+      ```yaml
+      foo: bar
+      ```
+
+      End.
+    expected:
+      violations: []
+  - name: indented code block does not fire (not fenced)
+    input: |
+      Body.
+
+          plain code
+
+      End.
+    expected:
+      violations: []

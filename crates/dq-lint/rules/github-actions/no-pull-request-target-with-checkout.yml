@@ -1,0 +1,15 @@
+id: github-actions.no-pull-request-target-with-checkout
+description: |
+  Workflows triggered on `pull_request_target` run with elevated
+  privileges and access to repository secrets. Checking out the PR's
+  HEAD ref in such a workflow lets a malicious PR run arbitrary code
+  with full repo write access — a documented supply-chain attack.
+severity: error
+match:
+  format: yaml
+  filter: 'has("jobs")'
+check:
+  jq: 'select((.on // {}) | (type == "object" and (has("pull_request_target")))) | (.jobs // {}) | to_entries[] as $j | ($j.value.steps // [])[] | select((.uses // "") | tostring | test("^actions/checkout@")) | select((.with.ref // "") | tostring | test("github\\.event\\.pull_request|head\\.sha"))'
+  message: "Workflow uses pull_request_target AND checks out untrusted PR ref — security risk"
+references:
+  - https://securitylab.github.com/research/github-actions-preventing-pwn-requests/
