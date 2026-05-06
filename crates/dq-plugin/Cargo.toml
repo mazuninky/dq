@@ -1,0 +1,64 @@
+[package]
+name = "dq-plugin"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Sibling crates: `dq-core` provides the `Ir` / `EditScript` / `Pointer` types
+# that the plugin runtime marshals across the WIT boundary; `dq-exec` provides
+# `Diagnostic` / `Severity` so plugin-emitted violations are interchangeable
+# with `@std/*` rule outputs in the lint pipeline; `dq-transform` provides the
+# host-side `JqEngine` that backs the `interface jq` host import.
+dq-core = { path = "../dq-core", version = "0.1" }
+dq-exec = { path = "../dq-exec", version = "0.1" }
+dq-transform = { path = "../dq-transform", version = "0.1" }
+
+# Core data / serialization. JSON-Patch byte payloads returned by plugin `fix`
+# exports parse through `serde_json::from_slice::<EditScript>`; WIT diagnostic
+# records marshal through serde-derived structs in the runtime layer.
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Errors / logging.
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# UTF-8 path types — see the `/rust-cli` skill conventions. Used by
+# `PluginRuntime::load(path: &Utf8Path)` and the `PluginError::Load { path }`
+# variant.
+camino = { workspace = true }
+
+# Optional (feature-gated) dependencies.
+#
+# `wasmtime` is the WASM Component-Model runtime. `default-features = false`
+# strips out the cache, async, profiling, debug, and threads features — none
+# of which are needed for synchronous lint/fix invocation — so the binary
+# stays small. `cranelift` is the JIT we compile against; `runtime` is the
+# embedder API; `component-model` enables the `wasmtime::component::*` types
+# the host bindings macro depends on.
+#
+# `wit-bindgen` is the *guest-side* code generator (the one example plugins
+# under `examples/plugin-rust/` use to derive their `lint`/`fix` exports from
+# the same WIT file). The host bindings come from
+# `wasmtime::component::bindgen!`, which is bundled with `wasmtime` itself.
+# The crate stays in the feature gate per the spec's exact feature shape:
+#   plugins = ["dep:wasmtime", "dep:wit-bindgen"]
+# It is not yet referenced by the host code — see Task 5.12 for the example
+# plugin that consumes it. A no-op `use wit_bindgen as _;` import in
+# `runtime.rs` keeps the dependency live so cargo does not warn about an
+# unused optional dep when the feature is on but the example plugin is not
+# yet in the workspace.
+wasmtime = { version = "44.0.1", optional = true, default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
+wit-bindgen = { version = "0.57.1", optional = true }
+
+[features]
+default = []
+plugins = ["dep:wasmtime", "dep:wit-bindgen"]
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+indexmap = { workspace = true }

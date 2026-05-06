@@ -7,7 +7,7 @@ linter-engine — всё в одном single static binary.
 
 ## Status
 
-**M10 alpha — adds `dq fix` autofix engine.** M1–M9 archived (see [openspec/changes/archive/](openspec/changes/archive/)). M10 adds the `dq fix` subcommand: rules carry an optional `fix.jq` whole-document transform that the engine applies to every matching file. The handler honours the same write-mode discipline as `dq set` / `dq del` (`-i` atomic write, `--diff` unified-diff to stdout, `--check` pre-commit gate exit 1, `--continue-on-error`, `--parallel`). `Fixer` enforces idempotency at runtime — applying `fix.jq` twice must yield the same value or the rule is skipped with a `tracing::warn!` log line (rule-author bug, never silently double-applied). Two existing `@std` rules (`@std/k8s/image-pull-policy-always`, `@std/npm/has-license`) ship `fix:` blocks as proof. **Comment preservation**: same trade-off as `dq set --jq` — re-emit goes through `Format::write_with_options` and drops comments. Anti-scope still deferred: per-violation fixes / explicit ops vocabulary (M10 is whole-document jq only), composite rules / JSON Schema (M11), inline-level position spans (M11), community registry / WASM (M12), `--quote-style` / `--flow-style` / `--strip-comments` (need comment-preserving emitter), XML write (M11+).
+**M10 alpha — adds `dq fix` autofix engine. M12 alpha (experimental) — WASM plugin ABI on WIT + wasmtime.** M1–M9 archived (see [openspec/changes/archive/](openspec/changes/archive/)). M10 adds the `dq fix` subcommand: rules carry an optional `fix.jq` whole-document transform that the engine applies to every matching file. The handler honours the same write-mode discipline as `dq set` / `dq del` (`-i` atomic write, `--diff` unified-diff to stdout, `--check` pre-commit gate exit 1, `--continue-on-error`, `--parallel`). `Fixer` enforces idempotency at runtime — applying `fix.jq` twice must yield the same value or the rule is skipped with a `tracing::warn!` log line (rule-author bug, never silently double-applied). Two existing `@std` rules (`@std/k8s/image-pull-policy-always`, `@std/npm/has-license`) ship `fix:` blocks as proof. **Comment preservation**: same trade-off as `dq set --jq` — re-emit goes through `Format::write_with_options` and drops comments. M12 lands the `dq-plugin` crate, the `dq:plugin@0.1.0` WIT schema, and a `--plugins <DIR>` global flag for `dq lint` / `dq fix`; feature-gated behind `--features plugins` so the default static binary stays small. See [Plugins (experimental)](#plugins-experimental) below for the contract and a Rust reference plugin. Anti-scope still deferred: composite rules / JSON Schema (M11), inline-level position spans (M11), community registry (M12+), `--quote-style` / `--flow-style` / `--strip-comments` (need comment-preserving emitter), XML write (M11+).
 
 ## Install
 
@@ -134,6 +134,49 @@ Exit-codes: 0 success, 1 GENERIC (incl. `--check` changes pending,
 VALIDATE_FAIL, 5 IO_ERROR (read; **`self check`/`update` network errors**),
 6 INVALID_INPUT, 7 WRITE_FAILED (write IO, renderer unavailable, **bulk
 partial-failure**, **self-update atomic-replace failure**).
+
+## Plugins (experimental)
+
+WASM lint+fix плагины через WIT-описанный ABI и `wasmtime`-runtime
+(Component Model). Каждый плагин — отдельный `*.wasm` файл, `dq` его
+загружает sandbox'ом без WASI: ни сети, ни файловой системы, ни процессов;
+fuel budget ~1 сек CPU, memory cap 64 MiB. Контракт пакета —
+`dq:plugin@0.1.0`, версионируется по semver: minor — additive, major —
+breaking (host откажется грузить плагин с другим major). Включается за
+cargo feature `plugins`:
+
+```sh
+# Build dq with plugin support enabled.
+cargo install --locked --features plugins dq-cli
+
+# Build the example plugin (see examples/plugin-rust/README.md for the
+# full recipe + alternative wasm-tools path).
+cd examples/plugin-rust && cargo component build --release
+mkdir -p ../../plugins
+cp target/wasm32-wasip2/release/dq_plugin_example_noop.wasm ../../plugins/
+
+# Use it.
+cd ../..
+dq lint --plugins ./plugins config.yaml
+dq fix  --plugins ./plugins config.yaml
+```
+
+`--plugins <DIR>` discovery — non-recursive, lexically sorted `*.wasm`
+под `<DIR>`. Без feature-flag'а флаг парсится, но при попытке загрузить
+любой `*.wasm` exit 6 (`InvalidInput`).
+
+> **Warning — v0.1.0 experimental WIT preview.** Breaking changes to the
+> WIT schema, host-imported interfaces, and diagnostic / EditScript
+> marshalling are possible before `v1.0.0`. Pin a specific dq version in
+> CI until the ABI stabilizes.
+
+Подробности:
+
+- **[examples/plugin-rust/](examples/plugin-rust/)** — minimal Rust
+  reference plugin (one demo lint diagnostic + empty-EditScript fix) с
+  build-recipe для `cargo-component` и `wasm-tools component new`.
+- **[openspec/changes/add-ir-foundation/specs/data-query-plugin-abi/spec.md](openspec/changes/add-ir-foundation/specs/data-query-plugin-abi/spec.md)** —
+  authoritative WIT contract, error taxonomy, exit-code mapping.
 
 ## CI integration
 

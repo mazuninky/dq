@@ -29,6 +29,13 @@ dq-exec = { path = "../dq-exec", version = "0.1" }
 # M8: embedded standard rule library (`@std/<ns>`) consumed by `rules list /
 # add` and `explain` for std-namespace rule discovery.
 dq-lint = { path = "../dq-lint", version = "0.1" }
+# Phase 5 of `add-ir-foundation`: WASM plugin runtime. The crate is linked
+# unconditionally — its own `plugins` feature gates the wasmtime-backed
+# implementation. Without the feature, `PluginRuntime::new()` returns
+# `PluginError::FeatureDisabled` and the CLI surfaces a structured
+# `InvalidInput` (exit 6) when the user passes `--plugins <DIR>` against a
+# directory that contains at least one `*.wasm` file.
+dq-plugin = { path = "../dq-plugin", version = "0.1" }
 
 clap = { workspace = true }
 clap_complete = { workspace = true }
@@ -59,6 +66,15 @@ tempfile = { workspace = true }
 # `text` features would only matter if we exposed character-level diffs,
 # which the spec does not require.
 similar = "2"
+
+[features]
+default = []
+# Forwards to `dq-plugin/plugins`, which links wasmtime + the host-side WIT
+# bindings. With this feature off (the default) `--plugins <DIR>` is a no-op
+# unless the directory contains at least one `*.wasm` file, in which case the
+# CLI errors with `InvalidInput` (exit 6) and the message
+# `"plugins are not enabled in this build"`.
+plugins = ["dq-plugin/plugins"]
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

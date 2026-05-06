@@ -57,6 +57,7 @@ use crate::bulk::{self, FileOp, FileOpResult};
 use crate::cli::{Cli, FixArgs};
 use crate::commands::io_helpers::{load_document_for_lint, pick_format, read_bytes};
 use crate::commands::lint_core::expand_lint_inputs;
+use crate::commands::plugin_loader::{self, LoadedPlugins};
 use crate::error::InvalidInput;
 
 /// Run the `dq fix` command.
@@ -127,11 +128,29 @@ pub fn run(
     let evaluator = Evaluator::new(rulesets).map_err(anyhow::Error::new)?;
     let fixer = Arc::new(Fixer::new(&evaluator));
 
+    // Phase 5 (`add-ir-foundation`): load `--plugins <DIR>` once up front. The
+    // shared `Arc<PluginRuntime>` is cloned into every `FixFileOp` so rayon
+    // workers reuse the same wasmtime engine. When the flag is absent or the
+    // directory contains no `*.wasm` files, `plugins` is `None` and the
+    // per-file path skips plugin invocation entirely.
+    let plugins: Option<Arc<LoadedPlugins>> = match cli.plugins.as_deref() {
+        Some(dir) => {
+            let loaded = plugin_loader::load_all(dir)?;
+            if loaded.handles.is_empty() {
+                None
+            } else {
+                Some(Arc::new(loaded))
+            }
+        }
+        None => None,
+    };
+
     let op = FixFileOp {
         cli,
         input_format,
         use_color,
         fixer,
+        plugins,
     };
 
     bulk::run_per_file(expanded, &op, cli, out)
@@ -145,6 +164,10 @@ struct FixFileOp<'a> {
     input_format: Option<&'a str>,
     use_color: bool,
     fixer: Arc<Fixer>,
+    /// Loaded `--plugins <DIR>` runtime + handles, shared across rayon
+    /// workers via the outer `Arc`. `None` when the flag is absent or the
+    /// directory contains no `*.wasm` files.
+    plugins: Option<Arc<LoadedPlugins>>,
 }
 
 impl<'a> FileOp for FixFileOp<'a> {
@@ -167,14 +190,56 @@ impl<'a> FileOp for FixFileOp<'a> {
         // also benefits from this so users see what would change.
         log_outcome(path, &outcome);
 
-        if !outcome.fixed {
+        // Phase 5 of `add-ir-foundation`: after the rule-engine fixer
+        // finishes, give every loaded plugin a chance to contribute its
+        // own `EditScript`. Plugin scripts are applied AFTER all
+        // rule-based fixes; if a script fails to apply (e.g. format
+        // mismatch — the script targets pointers that no longer exist
+        // post-rule-fix), we log a warning and skip rather than aborting,
+        // mirroring the existing rule-fixer's idempotency-failure
+        // semantics. Plugin INVOCATION errors (PluginError) propagate so
+        // the exit-code mapper can route via `kind_name()`.
+        let mut plugin_fixed = false;
+        if let Some(loaded) = self.plugins.as_ref()
+            && let Some(runtime) = loaded.runtime.as_ref()
+        {
+            for handle in &loaded.handles {
+                let ir = document.as_ir();
+                let script = runtime
+                    .invoke_fix(handle, &ir)
+                    .map_err(anyhow::Error::new)?;
+                if script.is_noop() {
+                    continue;
+                }
+                match script.apply(&mut document) {
+                    Ok(()) => {
+                        plugin_fixed = true;
+                    }
+                    Err(e) => {
+                        // The feature-disabled `PluginHandle` stub does not
+                        // expose `rule_id()`, so we keep the warning
+                        // log path-keyed. The path uniquely identifies the
+                        // file under fix; per-plugin attribution is
+                        // recoverable from the load order printed at -vv.
+                        tracing::warn!(
+                            path = %path,
+                            error = %e,
+                            "plugin EditScript failed to apply; skipping",
+                        );
+                    }
+                }
+            }
+        }
+
+        if !outcome.fixed && !plugin_fixed {
             return Ok(FileOpResult::Unchanged);
         }
 
         // Phase 4: choose the output path based on which engine ran.
         //
-        // - Only `fix.ops` ran → `document.original_bytes()` is the
-        //   canonical post-fix byte buffer; comments are preserved.
+        // - Only `fix.ops` (rule-engine) and/or plugin EditScripts ran →
+        //   `document.original_bytes()` is the canonical post-fix byte
+        //   buffer; comments are preserved.
         // - Any `fix.jq` ran → the document was replaced with a
         //   value-only one (no spans, no `original_bytes`); re-emit
         //   through the format writer, same trade-off as

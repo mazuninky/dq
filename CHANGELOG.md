@@ -33,6 +33,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   comment-preserving autofix. The migration covers the empty-string-value
   case (`/license: ""`); the missing-key case is deferred until mkdir-p
   insertion lands in `Document::set_at`.
+- Plugin ABI v0.1.0 (experimental). New `dq-plugin` crate exposes
+  `PluginRuntime` over WIT + Component-Model wasmtime. The WIT package is
+  `dq:plugin@0.1.0` with host-imported `ir` (read-only document access)
+  and `jq` (compile/eval against the document) interfaces, plus a
+  `world plugin` that exports `lint() -> list<diagnostic>` and
+  `fix() -> result<list<u8>, string>`. Plugins run sandboxed: no WASI,
+  no filesystem / network / process control, ~1s of CPU per invocation
+  (fuel budget), 64 MiB linear-memory cap. New global `--plugins <DIR>`
+  flag on `dq lint` / `dq fix` discovers `*.wasm` files non-recursively
+  under `<DIR>` (lexical sort) and loads them through the runtime.
+  Feature-gated behind `--features plugins`; without the feature the
+  flag still parses, but encountering any `*.wasm` errors with exit `6`
+  (`InvalidInput`). Breaking changes to the WIT schema and marshalling
+  shapes are possible before `v1.0.0`. See `examples/plugin-rust/` for a
+  working Rust reference plugin and the full build recipe.
 
 ### Changed
 

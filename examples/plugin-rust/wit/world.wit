@@ -1,0 +1,93 @@
+// MIRROR of `crates/dq-plugin/wit/dq-plugin.wit` — keep this file in sync
+// with the host's WIT contract. A copy (rather than a symlink) is committed
+// because:
+//   * Git on Windows mishandles symlinks unless `core.symlinks=true` is set
+//     globally, which we cannot assume for plugin authors cloning this
+//     example.
+//   * Source archives produced by `cargo package` / `git archive` have
+//     historically dropped or rewritten symlinks, breaking offline builds.
+//
+// If you change the host WIT, copy the new contents into this file (or run
+// `diff` to verify they match) and bump `dq:plugin@MAJOR.MINOR.PATCH`
+// accordingly.
+
+// dq plugin ABI — experimental v0.1.0.
+//
+// Versioning: this package follows semver.
+//   * patch (0.1.x) — bug fixes only; no schema changes.
+//   * minor (0.x.0) — additive: new optional fields, new host-imported
+//                     interfaces, new exports. Existing plugins continue to
+//                     load unmodified.
+//   * major (x.0.0) — breaking: removed fields, retyped fields, removed
+//                     interfaces. The host SHALL refuse to load a plugin
+//                     whose declared WIT major version differs from the
+//                     host's compiled-against major (see
+//                     `PluginError::SchemaVersion`).
+//
+// The full contract is in
+// `openspec/changes/add-ir-foundation/specs/data-query-plugin-abi/spec.md`.
+package dq:plugin@0.1.0;
+
+// Host-imported: read-only access to the document under lint/fix.
+//
+// `pointer` values are RFC 6901 strings, identical to the format the host's
+// `dq_core::Pointer::as_canonical()` produces. `format-tag` is a short
+// string (e.g. `"yaml"`, `"json"`, `"toml"`) the plugin can branch on when
+// rules are format-aware.
+interface ir {
+    type pointer = string;
+    type format-tag = string;
+
+    get-root: func() -> list<u8>;
+    get-at: func(p: pointer) -> option<list<u8>>;
+    iterate: func(p: pointer) -> list<pointer>;
+    // Named `get-format-tag` rather than `format-tag` because WIT does not
+    // allow a `func` to share a name with a `type` in the same interface
+    // (the spec text uses `format-tag` for both — we keep the type name to
+    // match the spec and disambiguate the function side).
+    get-format-tag: func() -> format-tag;
+}
+
+// Host-imported: jq compilation and evaluation against the document.
+//
+// `compile` returns a `u32` handle scoped to the plugin instance. `eval`
+// takes the handle and a JSON-encoded input, returns each emitted stream
+// value as a JSON-encoded byte vector.
+interface jq {
+    compile: func(expr: string) -> result<u32, string>;
+    eval: func(handle: u32, input: string) -> result<list<list<u8>>, string>;
+}
+
+// Host-defined record types reused across the world's exports.
+//
+// These live in their own interface (rather than nested inside `world
+// plugin`) so the `wasmtime::component::bindgen!` macro can resolve `use
+// types.{diagnostic}` from the world.
+interface types {
+    enum severity {
+        error,
+        warn,
+        info,
+    }
+
+    record diagnostic {
+        rule-id: string,
+        severity: severity,
+        message: string,
+        pointer: option<string>,
+    }
+}
+
+// World composed by every dq plugin: read-only `ir` + `jq` host imports
+// plus two exports (`lint` returning a list of diagnostics, `fix`
+// returning JSON Patch bytes the host parses into an `EditScript`).
+world plugin {
+    import ir;
+    import jq;
+    import types;
+
+    use types.{diagnostic};
+
+    export lint: func() -> list<diagnostic>;
+    export fix: func() -> result<list<u8>, string>;
+}
