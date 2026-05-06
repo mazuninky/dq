@@ -1,0 +1,16 @@
+tests:
+  - name: well-formed table passes
+    input: |
+      | a | b | c |
+      |---|---|---|
+      | 1 | 2 | 3 |
+      | 4 | 5 | 6 |
+    expected:
+      violations: []
+  - name: aligned 2-column table passes
+    input: |
+      | k | v |
+      |---|---|
+      | 1 | 2 |
+    expected:
+      violations: []

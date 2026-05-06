@@ -1,0 +1,43 @@
+tests:
+  - name: privileged container fires
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+      spec:
+        template:
+          spec:
+            containers:
+              - name: app
+                image: app:v1
+                securityContext:
+                  privileged: true
+    expected:
+      violations:
+        - rule: k8s.privileged-container
+          message_contains: "privileged"
+  - name: non-privileged container passes
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+      spec:
+        template:
+          spec:
+            containers:
+              - name: app
+                image: app:v1
+                securityContext:
+                  privileged: false
+    expected:
+      violations: []
+  - name: container without securityContext passes (this rule)
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+      spec:
+        template:
+          spec:
+            containers:
+              - name: app
+                image: app:v1
+    expected:
+      violations: []

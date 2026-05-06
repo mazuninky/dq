@@ -1,0 +1,14 @@
+id: dockerfile.no-latest-base-image
+description: |
+  Dockerfiles should pin base images to a specific tag (or digest),
+  not the default :latest. Using :latest produces non-reproducible
+  builds and makes rollbacks impossible — the same Dockerfile can
+  produce different images day to day.
+severity: error
+match:
+  format: [dockerfile, yaml]
+check:
+  jq: '.[] | select(.instruction == "FROM") | select(.arguments | tostring | test(":latest($|\\s)") or (test(":") | not))'
+  message: "FROM line uses :latest (or no tag): {{ .arguments }}"
+references:
+  - https://docs.docker.com/develop/develop-images/dockerfile_best-practices/

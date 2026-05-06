@@ -1,0 +1,25 @@
+tests:
+  - name: duplicate heading fires
+    input: |
+      ## Section
+
+      Body.
+
+      ## Section
+
+      More body.
+    expected:
+      violations:
+        - rule: markdown.no-duplicate-headings
+          message_contains: "Section"
+  - name: unique headings pass
+    input: |
+      ## Setup
+
+      Body.
+
+      ## Usage
+
+      More body.
+    expected:
+      violations: []

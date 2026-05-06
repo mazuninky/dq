@@ -1,0 +1,13 @@
+tests:
+  - name: normal paragraph passes
+    input: |
+      A paragraph with content.
+
+      Another paragraph.
+    expected:
+      violations: []
+  - name: paragraph with image only passes (image is not text)
+    input: |
+      ![alt](https://example.com/img.png)
+    expected:
+      violations: []

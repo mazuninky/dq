@@ -1,0 +1,14 @@
+id: dockerfile.no-curl-pipe-bash
+description: |
+  RUN steps that pipe curl/wget output directly into a shell are a
+  classic supply-chain footgun: any compromise of the URL endpoint
+  means arbitrary code in your image. Download first, verify a
+  checksum, then execute.
+severity: warn
+match:
+  format: [dockerfile, yaml]
+check:
+  jq: '.[] | select(.instruction == "RUN") | select(.arguments | tostring | test("(curl|wget)[^|]*\\|\\s*(ba)?sh"))'
+  message: "RUN line {{ .line }} pipes curl/wget into a shell"
+references:
+  - https://www.idontplaydarts.com/2016/04/detecting-curl-pipe-bash-server-side/

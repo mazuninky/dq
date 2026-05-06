@@ -1,0 +1,9 @@
+# build artifacts
+target/
+node_modules/
+
+*.log
+.env
+
+# editor backups
+*.swp

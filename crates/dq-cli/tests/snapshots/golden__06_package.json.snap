@@ -1,0 +1,14 @@
+---
+source: crates/dq-cli/tests/golden.rs
+expression: combined
+---
+exit_code: 0
+--- stdout ---
+: object
+/name: string
+/version: string
+/scripts: object
+/scripts/build: string
+/dependencies: object
+/dependencies/lodash: string
+--- stderr ---

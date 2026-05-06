@@ -1,0 +1,14 @@
+id: k8s.allow-privilege-escalation
+description: |
+  Containers should set allowPrivilegeEscalation=false. The default
+  (true) lets a process gain more privileges than its parent (e.g. via
+  setuid binaries), which subverts the runAsNonRoot guarantee.
+severity: warn
+match:
+  format: yaml
+  filter: '.kind == "Deployment" or .kind == "StatefulSet" or .kind == "DaemonSet" or .kind == "Pod"'
+check:
+  jq: '(.spec.template.spec.containers // .spec.containers // [])[] | select(.securityContext.allowPrivilegeEscalation != false)'
+  message: "Container '{{ .name }}' does not set allowPrivilegeEscalation=false"
+references:
+  - https://kubernetes.io/docs/concepts/security/pod-security-standards/

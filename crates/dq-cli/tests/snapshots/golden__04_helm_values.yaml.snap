@@ -1,0 +1,16 @@
+---
+source: crates/dq-cli/tests/golden.rs
+expression: combined
+---
+exit_code: 0
+--- stdout ---
+: object
+/image: object
+/image/repository: string
+/image/tag: string
+/image/pullPolicy: string
+/service: object
+/service/type: string
+/service/port: int
+/resources: object
+--- stderr ---

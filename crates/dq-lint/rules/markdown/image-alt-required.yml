@@ -1,0 +1,22 @@
+id: markdown.image-alt-required
+description: |
+  Every image should have non-empty alt text. Empty alt text is
+  inaccessible to screen-reader users and silently misses the chance
+  to describe what the image conveys.
+severity: warn
+match:
+  format: markdown
+check:
+  jq: |
+    [.. | objects | select(.type? == "paragraph" or .type? == "heading" or .type? == "list_item" or .type? == "table_cell" or .type? == "block_quote")][]
+    | . as $block
+    | [$block | recurse(.children?[]?) | select(.type? == "image")][]
+    | . as $img
+    | ($img.alt // "" | tostring | gsub("^\\s+|\\s+$"; ""))
+    | select(. == "")
+    | { url: $img.url, position: $block.position }
+  message: "Image '{{ .url }}' has empty alt text"
+references:
+  - https://www.w3.org/WAI/tutorials/images/
+loc:
+  line: '.position.start.line // 1'

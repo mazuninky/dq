@@ -1,0 +1,124 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/dq-cli",
+    "crates/dq-core",
+    "crates/dq-exec",
+    "crates/dq-lint",
+    "crates/dq-transform",
+]
+exclude = ["spikes/*"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+authors = ["Mazunin Konstantin"]
+rust-version = "1.94"
+repository = "https://github.com/mazuninky/dq"
+
+[workspace.dependencies]
+# Core data / serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
+serde_yml = "0.0.12"
+# saphyr-parser exposes the low-level event API (with byte spans) that the M2
+# textual-edit YAML write path consumes — see `dq-core/src/parsers/yaml_spans.rs`.
+# Pinned at the spike-validated 0.0.6 release; the high-level `saphyr` crate is
+# explicitly NOT used here (it does not surface byte spans).
+saphyr-parser = "0.0.6"
+toml = { version = "0.8", features = ["preserve_order"] }
+# `toml_edit` is the textual-edit DOM used by the M2 §4 TOML round-trip path
+# (see `dq-core/src/parsers/toml.rs`). It exposes `Item::span()` byte ranges
+# for every parsed node, which the SpanMap builder records and the
+# `Document::set_at` splice path consumes — the same way `cargo` mutates
+# `Cargo.toml` while preserving comments, key order, and formatting.
+toml_edit = "0.22"
+indexmap = { version = "2", features = ["serde"] }
+
+# Paths
+camino = { version = "1", features = ["serde1"] }
+
+# Errors
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "wrap_help"] }
+clap_complete = "4"
+clap_mangen = "0.2"
+
+# Query / format
+jsonpath-rust = "0.7"
+toon-format = { version = "0.4", default-features = false }
+
+# Regex — used by dq-core's template_guard to detect Helm/Go-template
+# expressions before they reach the YAML/JSON parser.
+regex = "1"
+
+# Glob expansion for the M3 §3 bulk driver: matches `*.yaml` / `**` patterns
+# against the file tree without per-pattern recompilation cost.
+globset = "0.4"
+# Parallel write driver for `--parallel N` in the M3 §3 bulk runner. Used
+# only inside `crates/dq-cli/src/bulk.rs`; per-file atomic-write contract is
+# preserved through `tempfile + persist`.
+rayon = "1.10"
+# Walks the file tree from the longest non-meta prefix of a glob pattern,
+# feeding entries through `globset::GlobMatcher`.
+walkdir = "2"
+
+# M5 format extensions — landed in workspace deps at Stage 1; per-crate
+# `[dependencies]` entries are added by Stage 2 alongside each format's
+# `Format` impl in `dq-core/src/parsers/`.
+hcl-rs = "0.19"
+rust-ini = "0.21"
+dotenvy = "0.15"
+csv = "1.3"
+dockerfile-parser-rs = "3.3"
+
+# M6 distribution — `dq self check` / `dq self update`. `self_update` handles
+# the download → verify SHA256 → atomic rename dance against GitHub Releases;
+# `ureq` is a lightweight blocking HTTP client used directly by `self check`
+# to hit the GitHub API without dragging in tokio. Both are MIT/Apache-2.0
+# dual-licensed so the default `cargo deny` policy passes without amendment.
+self_update = { version = "0.41", default-features = false, features = ["rustls", "compression-flate2", "archive-tar", "archive-zip"] }
+ureq = { version = "2.10", default-features = false, features = ["tls"] }
+
+# M9 markdown — `comrak` is the CommonMark+GFM parser used by
+# `dq-core/src/parsers/markdown.rs`. Default features pull in the standalone
+# `comrak` CLI plus the `syntect` syntax-highlighter, both of which are
+# unnecessary (and license-noisy) for an embedded library parser. We disable
+# the default feature set entirely; the parser API and `format_commonmark`
+# renderer are part of the crate's core and require no opt-in features.
+# Comrak is BSD-2-Clause-licensed (matches the existing `cargo deny` allow
+# list) and edition-2024 / Rust 1.94 clean as of 0.52.
+comrak = { version = "0.52", default-features = false }
+
+# M7 transform — `dq-transform` embeds a jq evaluator via the `jaq` family
+# (jaq-core 3.0 + jaq-std 3.0 + jaq-json 2.0). The `sync` feature on
+# `jaq-json` swaps `Rc` for `Arc` so `Val: Send + Sync`, which is required for
+# the rayon-driven bulk path in `dq set --jq EXPR 'glob' -i --parallel N`.
+# The `serde` feature provides `Val: Deserialize`, used by the inbound value
+# adapter (`serde_to_val`). All three crates are MIT-licensed.
+jaq-core = "3.0"
+jaq-std = "3.0"
+jaq-json = { version = "2.0", features = ["sync", "serde"] }
+
+# OS
+libc = "0.2"
+
+# Dev / test (consumed via `[dev-dependencies] foo = { workspace = true }`)
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+insta = { version = "1", features = ["yaml"] }
+pretty_assertions = "1"
+proptest = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

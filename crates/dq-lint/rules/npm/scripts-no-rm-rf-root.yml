@@ -1,0 +1,14 @@
+id: npm.scripts-no-rm-rf-root
+description: |
+  Scripts that contain `rm -rf /` (or `rm -rf $HOME`, `rm -rf ~`) are
+  almost always typos for a relative path and have caused real
+  catastrophic data loss. Reject them outright.
+severity: error
+match:
+  format: json
+  filter: 'has("name") and has("version")'
+check:
+  jq: '(.scripts // {}) | to_entries[] | select(.value | tostring | test("rm\\s+-[a-zA-Z]*[rR][a-zA-Z]*[fF]?\\s+(/(?:\\s|$)|\\$HOME|~(?:\\s|$|/))"))'
+  message: "Script '{{ .key }}' contains a dangerous 'rm -rf' targeting root/home"
+references:
+  - https://github.com/npm/cli/issues/1361

@@ -1,0 +1,23 @@
+tests:
+  - name: dependency on '*' fires
+    input: |
+      {"name":"foo","version":"1.0.0","dependencies":{"left-pad":"*"}}
+    format: json
+    expected:
+      violations:
+        - rule: npm.no-wildcard-deps
+          message_contains: "left-pad"
+  - name: dependency on 'latest' fires
+    input: |
+      {"name":"foo","version":"1.0.0","dependencies":{"react":"latest"}}
+    format: json
+    expected:
+      violations:
+        - rule: npm.no-wildcard-deps
+          message_contains: "react"
+  - name: pinned dependency passes
+    input: |
+      {"name":"foo","version":"1.0.0","dependencies":{"react":"^18.2.0"}}
+    format: json
+    expected:
+      violations: []

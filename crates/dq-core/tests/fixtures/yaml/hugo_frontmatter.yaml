@@ -1,0 +1,14 @@
+# Hugo-style YAML frontmatter (head only — markdown body is M9 territory).
+# Original — not copied from any blog template.
+title: "Hello, dq"
+description: "A short post about querying data files."
+date: 2026-05-03T10:30:00Z
+draft: false
+author: testing
+tags:
+  - rust
+  - cli
+  - dq
+categories:
+  - tooling
+weight: 5

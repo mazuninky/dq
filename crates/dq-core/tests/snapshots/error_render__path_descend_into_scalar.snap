@@ -1,0 +1,13 @@
+---
+source: crates/dq-core/tests/error_render.rs
+assertion_line: 208
+expression: view(&err)
+---
+kind: path
+pointer: /server/port/version
+matched_prefix: /server/port
+path_kind:
+  kind: TypeMismatch
+  expected: object or array
+  found: int
+did_you_mean: []

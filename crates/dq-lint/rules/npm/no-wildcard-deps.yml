@@ -1,0 +1,14 @@
+id: npm.no-wildcard-deps
+description: |
+  Dependencies pinned to "*" or "latest" cause non-reproducible
+  builds: every install pulls the newest release, including breaking
+  changes. Pin to a specific version or a narrow range (^X.Y.Z).
+severity: error
+match:
+  format: json
+  filter: 'has("name") and has("version")'
+check:
+  jq: '((.dependencies // {}) + (.devDependencies // {}) + (.peerDependencies // {})) | to_entries[] | select(.value == "*" or .value == "latest")'
+  message: "Dependency '{{ .key }}' is pinned to '{{ .value }}' (use a specific version)"
+references:
+  - https://docs.npmjs.com/cli/v10/configuring-npm/package-json#dependencies

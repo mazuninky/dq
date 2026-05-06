@@ -1,0 +1,216 @@
+# Release workflow — triggered on `v*` tag pushes.
+#
+# Builds prebuilt binaries for the four targets in the M6 release matrix,
+# packages them as tar.gz / zip, generates a single dq-checksums.txt with
+# SHA256 of every artifact, and uploads everything to a new GitHub Release.
+# Optional cosign signing runs only when COSIGN_PRIVATE_KEY is configured;
+# absence is a no-op (so forks pass without secrets).
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag name (e.g. v0.6.0) for manual re-runs.'
+        required: true
+
+permissions:
+  contents: write
+  id-token: write  # Needed for cosign keyless signing fallback.
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: '-D warnings'
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive_ext: tar.gz
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive_ext: tar.gz
+            cross: true
+          - target: aarch64-apple-darwin
+            os: macos-14
+            archive_ext: tar.gz
+            cross: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive_ext: zip
+            cross: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        # Route the user-controlled `inputs.tag` through an env var so the
+        # value is never expanded inline by the shell (avoids command injection
+        # via a crafted `workflow_dispatch` input).
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          if [ -n "${INPUT_TAG}" ]; then
+            printf 'name=%s\n' "${INPUT_TAG}" >> "$GITHUB_OUTPUT"
+          else
+            printf 'name=%s\n' "${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Set up cross toolchain
+        if: matrix.cross
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Build release binary
+        shell: bash
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin dq
+
+      - name: Generate man pages and completions
+        shell: bash
+        run: |
+          # Use the host-platform binary (built above for cross targets is non-runnable
+          # on the runner). For cross targets, run a host build to generate docs.
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cargo build --release --bin dq
+            ./target/release/dq generate-docs --output-dir dist/docs
+          else
+            ./target/${{ matrix.target }}/release/dq generate-docs --output-dir dist/docs
+          fi
+
+      - name: Stage artifact
+        id: stage
+        shell: bash
+        run: |
+          set -eu
+          TAG="${{ steps.tag.outputs.name }}"
+          TARGET="${{ matrix.target }}"
+          STAGE="dist/${TAG}-${TARGET}"
+          mkdir -p "${STAGE}/man" "${STAGE}/completions"
+          if [ "${{ matrix.archive_ext }}" = "zip" ]; then
+            cp "target/${TARGET}/release/dq.exe" "${STAGE}/dq.exe"
+          else
+            cp "target/${TARGET}/release/dq" "${STAGE}/dq"
+          fi
+          cp dist/docs/man/*.1 "${STAGE}/man/" 2>/dev/null || true
+          cp dist/docs/completions/* "${STAGE}/completions/" 2>/dev/null || true
+          cp README.md LICENSE "${STAGE}/" 2>/dev/null || true
+          NAME="dq-${TAG}-${TARGET}.${{ matrix.archive_ext }}"
+          cd dist
+          if [ "${{ matrix.archive_ext }}" = "zip" ]; then
+            ( cd "${TAG}-${TARGET}" && 7z a -bd "../${NAME}" . >/dev/null )
+          else
+            tar -czf "${NAME}" -C "${TAG}-${TARGET}" .
+          fi
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+          echo "path=dist/${NAME}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dq-${{ matrix.target }}
+          path: ${{ steps.stage.outputs.path }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        # Route the user-controlled `inputs.tag` through an env var so the
+        # value is never expanded inline by the shell (avoids command injection
+        # via a crafted `workflow_dispatch` input).
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          if [ -n "${INPUT_TAG}" ]; then
+            printf 'name=%s\n' "${INPUT_TAG}" >> "$GITHUB_OUTPUT"
+          else
+            printf 'name=%s\n' "${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -eu
+          cd dist
+          ls -la
+          : > dq-checksums.txt
+          for f in dq-*.tar.gz dq-*.zip; do
+            [ -f "$f" ] || continue
+            sha256sum "$f" >> dq-checksums.txt
+          done
+          cat dq-checksums.txt
+
+      # Step-level `env:` is NOT visible to the same step's `if:` expression,
+      # and `secrets.*` cannot be referenced directly in `if:`. Detect once
+      # in a tiny pre-step that exposes a boolean output, then gate the real
+      # signing step on that output.
+      - name: Detect cosign secret
+        id: cosign_check
+        shell: bash
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+        run: |
+          if [ -n "${COSIGN_PRIVATE_KEY:-}" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Sign artifacts with cosign
+        if: steps.cosign_check.outputs.available == 'true'
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        shell: bash
+        run: |
+          set -eu
+          curl -sSfLO https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
+          chmod +x cosign-linux-amd64
+          sudo mv cosign-linux-amd64 /usr/local/bin/cosign
+          cd dist
+          for f in dq-*.tar.gz dq-*.zip dq-checksums.txt; do
+            [ -f "$f" ] || continue
+            cosign sign-blob --yes --key env://COSIGN_PRIVATE_KEY \
+              --output-signature "${f}.sig" "${f}"
+          done
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: ${{ steps.tag.outputs.name }}
+          generate_release_notes: true
+          files: |
+            dist/dq-*.tar.gz
+            dist/dq-*.zip
+            dist/dq-checksums.txt
+            dist/dq-*.sig
+          fail_on_unmatched_files: false

@@ -1,0 +1,13 @@
+id: dockerfile.no-add-use-copy
+description: |
+  ADD does too much (URL fetch + auto-extract); use COPY instead.
+  COPY is explicit and predictable. Reserve ADD for the rare cases
+  that genuinely need its archive-extraction behaviour.
+severity: warn
+match:
+  format: [dockerfile, yaml]
+check:
+  jq: '.[] | select(.instruction == "ADD") | select(.arguments | tostring | test("^https?://") | not)'
+  message: "ADD used for local copy (line {{ .line }}); prefer COPY"
+references:
+  - https://docs.docker.com/develop/develop-images/dockerfile_best-practices/#add-or-copy

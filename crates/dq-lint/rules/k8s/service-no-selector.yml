@@ -1,0 +1,14 @@
+id: k8s.service-no-selector
+description: |
+  Services should declare a selector so endpoints are populated
+  automatically. A Service without a selector is a manual-endpoints
+  Service — valid but unusual; the rule fires so you confirm intent.
+severity: warn
+match:
+  format: yaml
+  filter: '.kind == "Service" and (.spec.type // "ClusterIP") != "ExternalName"'
+check:
+  jq: 'select((.spec.selector // {}) | length == 0) | {name: (.metadata.name // "<unnamed>")}'
+  message: "Service '{{ .name }}' has no selector (manual endpoints?)"
+references:
+  - https://kubernetes.io/docs/concepts/services-networking/service/#services-without-selectors

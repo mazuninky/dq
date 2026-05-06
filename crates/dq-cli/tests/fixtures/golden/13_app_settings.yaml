@@ -1,0 +1,12 @@
+app:
+  name: demo
+  log_level: info
+  features:
+    auth: true
+    metrics: true
+    tracing: false
+listeners:
+  - port: 8080
+    host: 0.0.0.0
+  - port: 9090
+    host: 127.0.0.1

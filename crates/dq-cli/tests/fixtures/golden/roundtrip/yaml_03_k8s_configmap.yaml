@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+data:
+  # An embedded multi-line value
+  app.conf: |
+    debug = true
+    workers = 4
+  log_level: info

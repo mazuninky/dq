@@ -1,0 +1,11 @@
+---
+source: crates/dq-core/tests/error_render.rs
+assertion_line: 188
+expression: view(&err)
+---
+kind: path
+pointer: /users/5
+matched_prefix: /users
+path_kind:
+  kind: OutOfBounds
+did_you_mean: []

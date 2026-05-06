@@ -1,0 +1,32 @@
+[package]
+name = "saphyr-spike"
+version = "0.0.2"
+edition = "2024"
+publish = false
+description = "Spike: textual-edit (Option B) POC for byte-exact YAML mutation via saphyr-parser event spans (M2 Tasks 1.2-1.4 of openspec/changes/add-safe-writes)."
+
+# This crate is intentionally NOT a workspace member — see workspace `exclude` in
+# the repo root Cargo.toml. The spike is a throwaway probe; we do not want it in
+# the production build graph.
+[workspace]
+
+[[bin]]
+name = "saphyr-spike"
+path = "src/main.rs"
+
+[dependencies]
+# Low-level event API — gives us Spans (byte ranges) for each YAML event,
+# which is the structural primitive textual-edit needs (D1, D4 in design.md).
+saphyr-parser = "0.0.6"
+# Used in `insert-test` only: parse the result of a synthetic insertion to
+# verify that the rendered fragment is valid YAML. This is the safety net
+# described in D14 of design.md.
+serde_yml = "0.0.12"
+camino = "1"
+anyhow = "1"
+similar = "2"
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"

@@ -1,0 +1,41 @@
+tests:
+  - name: deployment with :latest fires
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: app
+      spec:
+        template:
+          spec:
+            containers:
+              - name: app
+                image: my-app:latest
+    expected:
+      violations:
+        - rule: k8s.no-latest-tag
+          message_contains: "uses :latest"
+  - name: deployment with pinned tag passes
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: app
+      spec:
+        template:
+          spec:
+            containers:
+              - name: app
+                image: my-app:v1.2.3
+    expected:
+      violations: []
+  - name: service is not matched
+    input: |
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: app
+      spec:
+        selector: { app: app }
+    expected:
+      violations: []

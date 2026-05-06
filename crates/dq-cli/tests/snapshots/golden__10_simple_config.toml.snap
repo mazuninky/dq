@@ -1,0 +1,15 @@
+---
+source: crates/dq-cli/tests/golden.rs
+expression: combined
+---
+exit_code: 0
+--- stdout ---
+: object
+/title: string
+/server: object
+/server/host: string
+/server/port: int
+/database: object
+/database/url: string
+/database/pool_size: int
+--- stderr ---

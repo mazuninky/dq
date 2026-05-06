@@ -1,0 +1,18 @@
+id: markdown.no-inline-html
+description: |
+  Markdown documents that contain raw HTML are not portable across
+  CommonMark consumers (some strip HTML, some pass it through).
+  Prefer markdown syntax where possible. This rule fires at info
+  severity — it is a hint, not a blocker.
+severity: info
+match:
+  format: markdown
+check:
+  jq: |
+    [.. | objects | select(.type? == "html_block" or .type? == "html_inline")][]
+    | { type: .type, position: (.position // null) }
+  message: "Inline HTML detected ({{ .type }}); prefer pure markdown when possible"
+references:
+  - https://commonmark.org/help/
+loc:
+  line: '.position.start.line // 1'

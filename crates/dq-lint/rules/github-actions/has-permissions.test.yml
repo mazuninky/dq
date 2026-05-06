@@ -1,0 +1,35 @@
+tests:
+  - name: workflow without permissions block fires
+    input: |
+      name: ci
+      on: [push]
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps: [{ uses: actions/checkout@v4 }]
+    expected:
+      violations:
+        - rule: github-actions.has-permissions
+  - name: workflow with top-level permissions passes
+    input: |
+      name: ci
+      on: [push]
+      permissions:
+        contents: read
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps: [{ uses: actions/checkout@v4 }]
+    expected:
+      violations: []
+  - name: workflow with per-job permissions passes
+    input: |
+      name: ci
+      on: [push]
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          permissions: { contents: read }
+          steps: [{ uses: actions/checkout@v4 }]
+    expected:
+      violations: []

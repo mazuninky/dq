@@ -1,0 +1,73 @@
+[package]
+name = "dq-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yml = { workspace = true }
+# Low-level event-API YAML parser used by the M2 textual-edit write path
+# (see `parsers/yaml_spans.rs`). Read-pat M1 still uses `serde_yml`; the two
+# coexist deliberately — they parse the same fixtures and any divergence in
+# `Value` produced from byte-equal input would surface as a test failure.
+saphyr-parser = { workspace = true }
+toml = { workspace = true }
+# `toml_edit` powers the M2 §4 TOML round-trip path: it parses the source
+# into a textual-edit DOM whose nodes carry byte spans (`Item::span()`),
+# which the `SpanMap` builder records so `Document::set_at` / `del_at`
+# can splice the replacement into `original_bytes` while preserving
+# comments, key order, and formatting (the same way `cargo` mutates
+# `Cargo.toml`). The read-only `toml` crate is retained for the
+# `value_only` write fallback (used by `dq convert` into TOML and by the
+# CLI's `TomlReporter`), where there is no source buffer to round-trip
+# through.
+toml_edit = { workspace = true }
+indexmap = { workspace = true }
+camino = { workspace = true }
+thiserror = { workspace = true }
+# Used only for debug-level diagnostics from the YAML span builder when an
+# alias event is encountered (aliases are not editable in M2 — see
+# `parsers/yaml_spans.rs` module docs). The dependency is also useful for
+# future write-pat error paths, so it lands here ahead of §4–§6.
+tracing = { workspace = true }
+# tempfile lives in `[dependencies]` (not just `[dev-dependencies]`) because
+# Section 6 of the M2 plan introduces an `atomic_write` helper that consumes
+# `tempfile::NamedTempFile` from production code paths; landing the dep early
+# avoids a Cargo.toml diff in §6 that would otherwise be lumped with the IO
+# logic itself.
+tempfile = { workspace = true }
+# Used by `template_guard` (M2 §6) to detect Helm/Go-template / GitHub Actions
+# expression syntax before parsing — the YAML/JSON parsers would otherwise
+# error out on raw `{{ .Values.x }}` / `${{ secrets.X }}` markers.
+regex = { workspace = true }
+
+# M5 format extensions — see `parsers/{hcl,ini,dotenv,csv,dockerfile,...}.rs`
+# for usage. License audit: hcl-rs (MIT OR Apache-2.0), rust-ini (MIT), dotenvy (MIT),
+# csv (Unlicense/MIT), dockerfile-parser-rs (MIT). All cleared by
+# `cargo deny check licenses`.
+hcl-rs = { workspace = true }
+rust-ini = { workspace = true }
+dotenvy = { workspace = true }
+csv = { workspace = true }
+dockerfile-parser-rs = { workspace = true }
+
+# M9 markdown — `comrak` is the CommonMark + GFM parser consumed by
+# `parsers/markdown.rs`. License: BSD-2-Clause (cleared by the workspace
+# `cargo deny` allow list). See workspace Cargo.toml for the rationale on
+# the `default-features = false` choice.
+comrak = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true, features = ["redactions"] }
+pretty_assertions = { workspace = true }
+indexmap = { workspace = true }
+serde = { workspace = true }
+# Property-based testing for the M2 §3.5 round-trip property: random
+# scalar substitutions must keep the YAML buffer well-formed and leave
+# unrelated bytes untouched. Workspace-pinned at proptest 1.x.
+proptest = { workspace = true }

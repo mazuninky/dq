@@ -1,0 +1,22 @@
+{
+  "name": "dq",
+  "description": "Agent-friendly CLI for YAML/JSON/TOML and a linter platform. Use for queries on structured data, in-place edits with round-trip preservation, format conversion, and CI validation.",
+  "version": "0.6.0",
+  "triggers": [
+    "yaml query",
+    "json patch",
+    "json pointer",
+    "kubernetes manifest",
+    "helm values",
+    "github actions yaml",
+    "toml edit",
+    "round-trip yaml",
+    "convert yaml to json",
+    "fmt yaml",
+    "yaml lint",
+    "dq cli"
+  ],
+  "homepage": "https://github.com/mazuninky/dq",
+  "repository": "https://github.com/mazuninky/dq",
+  "license": "MIT"
+}

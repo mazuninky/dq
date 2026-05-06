@@ -1,0 +1,45 @@
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+ignore = [
+    # serde_yml is unmaintained (project archived) and has an unsoundness in
+    # `Serializer.emitter`. dq uses serde_yml ONLY for the read-pat (parsers/
+    # yaml.rs), never as a Serializer. M2 added a parallel write-pat parser
+    # via saphyr-parser (parsers/yaml_spans.rs) which builds a Pointer→
+    # ByteRange span map and splices `original_bytes` directly — no emitter
+    # involved on the write side either. Unifying read-pat onto saphyr-parser
+    # is post-M2 work; until that change lands this advisory ignore stays.
+    # See openspec/changes/add-safe-writes/design.md D1+D13.
+    { id = "RUSTSEC-2025-0068", reason = "serde_yml read-pat dep; write-pat uses saphyr-parser (no Serializer access)" },
+]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "Zlib",
+    "CC0-1.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

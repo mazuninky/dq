@@ -1,0 +1,19 @@
+---
+source: crates/dq-cli/tests/cli_snapshots.rs
+assertion_line: 60
+expression: stderr
+---
+{
+  "diagnostics": [
+    {
+      "kind": "parse",
+      "file": "<FIXTURE>",
+      "path": "<FIXTURE>",
+      "line": "[NUM]",
+      "col": "[NUM]",
+      "severity": "error",
+      "message": "[serde_json message]",
+      "snippet": "{ \"x\": 1, }"
+    }
+  ]
+}

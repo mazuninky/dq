@@ -1,0 +1,11 @@
+---
+source: crates/dq-cli/tests/cli_snapshots.rs
+assertion_line: 88
+expression: stderr
+---
+kind: parse
+file: <FIXTURE>
+line: [NUM]
+col: [NUM]
+message: [serde_json message]
+snippet: { "x": 1, }

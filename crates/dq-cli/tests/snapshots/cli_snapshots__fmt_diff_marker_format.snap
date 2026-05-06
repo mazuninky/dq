@@ -1,0 +1,17 @@
+---
+source: crates/dq-cli/tests/cli_snapshots.rs
+expression: normalized
+---
+=== <TMP>/alpha.yaml ===
+--- a/<TMP>/alpha.yaml
++++ b/<TMP>/alpha.yaml
+@@ -0,0 +1,2 @@
++a: 1
++b: 2
+=== <TMP>/bravo.yaml ===
+--- a/<TMP>/bravo.yaml
++++ b/<TMP>/bravo.yaml
+@@ -0,0 +1,2 @@
++x: 1
++'y': 2
+Modified: 2, Skipped: 0, Failed: 0

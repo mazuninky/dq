@@ -1,0 +1,14 @@
+id: npm.no-deprecated-fields
+description: |
+  package.json should not use deprecated fields like `preferGlobal`
+  (removed in npm 7+) or `engineStrict` (removed in npm 3+) — they
+  are silently ignored by modern tooling and mislead readers.
+severity: warn
+match:
+  format: json
+  filter: 'has("name") and has("version")'
+check:
+  jq: '. | (if has("preferGlobal") then {field: "preferGlobal"} else empty end), (if has("engineStrict") then {field: "engineStrict"} else empty end)'
+  message: "package.json declares deprecated field '{{ .field }}'"
+references:
+  - https://docs.npmjs.com/cli/v10/configuring-npm/package-json

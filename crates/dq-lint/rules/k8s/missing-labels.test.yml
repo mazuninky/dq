@@ -1,0 +1,25 @@
+tests:
+  - name: deployment without recommended label fires
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: app
+        labels: { foo: bar }
+      spec: {}
+    expected:
+      violations:
+        - rule: k8s.missing-labels
+          message_contains: "app.kubernetes.io/name"
+  - name: deployment with recommended label passes
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: app
+        labels:
+          app.kubernetes.io/name: app
+          app.kubernetes.io/instance: prod
+      spec: {}
+    expected:
+      violations: []

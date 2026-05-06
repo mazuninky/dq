@@ -1,0 +1,27 @@
+tests:
+  - name: pod with hostPID fires
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+      spec:
+        template:
+          spec:
+            hostPID: true
+            containers:
+              - name: app
+                image: app:v1
+    expected:
+      violations:
+        - rule: k8s.host-pid
+  - name: pod without hostPID passes
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+      spec:
+        template:
+          spec:
+            containers:
+              - name: app
+                image: app:v1
+    expected:
+      violations: []

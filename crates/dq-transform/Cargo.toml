@@ -1,0 +1,33 @@
+[package]
+name = "dq-transform"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+# `jaq-*` crates are gated behind the `embedded-jq` feature so consumers can
+# opt out of the heavy jq stack (e.g. minimal CI builds). With the feature
+# off, every method on `JqEngine` returns `JqError::FeatureDisabled` rather
+# than failing to link.
+jaq-core = { workspace = true, optional = true }
+jaq-std = { workspace = true, optional = true }
+jaq-json = { workspace = true, optional = true }
+
+# Always-available deps: `serde_json` is the lingua franca for the value
+# adapter (callers convert their domain value to `serde_json::Value` first);
+# `thiserror` powers the `JqError` enum; `tracing` is wired in for any future
+# diagnostic emission (currently used only by the compile-error helpers).
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+default = ["embedded-jq"]
+embedded-jq = ["dep:jaq-core", "dep:jaq-std", "dep:jaq-json"]
+
+[dev-dependencies]
+serde_json = { workspace = true }
+pretty_assertions = { workspace = true }

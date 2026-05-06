@@ -1,0 +1,21 @@
+title = "Nested tables"
+
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[server.tls]
+enabled = true
+cert_path = "/etc/ssl/cert.pem"
+
+[server.tls.client]
+verify = "required"
+ca_path = "/etc/ssl/ca.pem"
+
+[[server.endpoints]]
+name = "primary"
+url = "/api/v1"
+
+[[server.endpoints]]
+name = "metrics"
+url = "/metrics"

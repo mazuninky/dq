@@ -1,0 +1,17 @@
+tests:
+  - name: missing repository fires
+    input: '{"name":"foo","version":"1.0.0","license":"MIT"}'
+    format: json
+    expected:
+      violations:
+        - rule: npm.has-repository
+  - name: repository as string passes
+    input: '{"name":"foo","version":"1.0.0","repository":"https://github.com/foo/bar"}'
+    format: json
+    expected:
+      violations: []
+  - name: repository as object passes
+    input: '{"name":"foo","version":"1.0.0","repository":{"type":"git","url":"https://github.com/foo/bar.git"}}'
+    format: json
+    expected:
+      violations: []

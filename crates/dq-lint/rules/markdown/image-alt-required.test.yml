@@ -1,0 +1,13 @@
+tests:
+  - name: empty alt text fires
+    input: |
+      ![](https://example.com/photo.png)
+    expected:
+      violations:
+        - rule: markdown.image-alt-required
+          message_contains: "photo.png"
+  - name: descriptive alt passes
+    input: |
+      ![A red sphere on a blue background](https://example.com/photo.png)
+    expected:
+      violations: []

@@ -1,0 +1,9 @@
+---
+source: crates/dq-cli/tests/cli_snapshots.rs
+expression: stdout
+---
+a:
+  b: 3
+  'y': 2
+m: 4
+z: 1
