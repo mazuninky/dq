@@ -2,6 +2,7 @@
 
 pub mod atomic_write;
 pub mod document;
+pub mod edit_ops;
 pub mod enumerate;
 pub mod error;
 pub mod format;
@@ -14,6 +15,7 @@ pub mod transform;
 pub mod write_options;
 
 pub use document::{Document, FormatTag, FrontmatterKind, FrontmatterPayload, Value};
+pub use edit_ops::{EditOp, EditScript};
 pub use enumerate::enumerate_pointers;
 pub use error::{Error, PathErrorKind};
 pub use format::{Format, by_name, detect};
