@@ -188,6 +188,7 @@ fn run_add_in_cwd(args: &RulesAddArgs, cwd: &Utf8Path) -> anyhow::Result<()> {
 /// `source_origin` is set, `--symlink` makes a symlink to that file rather
 /// than writing `contents` (the `@std/*` path leaves it `None` and always
 /// copies because the embedded files don't have a stable disk location).
+#[cfg_attr(not(unix), allow(unused_variables))]
 fn materialise_files(
     dest: &Utf8Path,
     files: &[(&str, &str)],
