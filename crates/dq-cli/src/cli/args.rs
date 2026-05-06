@@ -169,6 +169,13 @@ pub struct Cli {
     #[arg(long = "strict", global = true)]
     pub strict: bool,
 
+    /// Directory containing `*.wasm` plugins to load alongside `@std/*` rules
+    /// and `./.dq/rules/`. Plugins are loaded in lexical order by file name.
+    /// Without `--features plugins`, using this flag with at least one
+    /// resolved `*.wasm` file errors with exit code 6.
+    #[arg(long = "plugins", global = true, value_name = "DIR")]
+    pub plugins: Option<camino::Utf8PathBuf>,
+
     #[command(subcommand)]
     pub command: Command,
 }

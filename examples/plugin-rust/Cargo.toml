@@ -1,0 +1,44 @@
+# Example dq plugin — minimal noop lint+fix.
+#
+# This crate is intentionally NOT a member of the top-level cargo workspace
+# (the workspace `Cargo.toml` lists `examples/*` under its `exclude = [...]`
+# array). The empty `[workspace]` section below tells cargo "this manifest is
+# its own workspace root" so a normal `cargo build` inside this directory does
+# not try to walk up to the dq workspace and fail because it's been excluded.
+#
+# To rebuild as a Component-Model wasm artifact see this directory's README.
+
+[package]
+name = "dq-plugin-example-noop"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "Minimal noop dq plugin demonstrating the v0.1.0 plugin ABI."
+
+[lib]
+# `cdylib` is required so the WASM tooling (`cargo component build` or
+# `wasm-tools component new`) can wrap the produced module as a
+# Component-Model component.
+crate-type = ["cdylib"]
+
+[dependencies]
+# Guest-side WIT codegen. Pinned to the same major as the host's compiled-in
+# `wit-bindgen` (see `crates/dq-plugin/Cargo.toml`) so the generated bindings
+# match the host's expectations for the `dq:plugin@0.1.0` world.
+wit-bindgen = "0.57.1"
+
+[profile.release]
+# Component-model plugins typically benefit from LTO + size-oriented codegen
+# because they are loaded once per `dq` invocation and their cold-start cost
+# matters more than per-call throughput.
+lto = true
+codegen-units = 1
+strip = true
+opt-level = "s"
+
+# Sentinel: makes this manifest its own workspace root, isolated from the
+# top-level dq workspace. Keep this section even though it is empty —
+# without it, cargo treats the manifest as a member of the parent workspace
+# (which has `examples/*` excluded) and fails with E0463-style errors.
+[workspace]

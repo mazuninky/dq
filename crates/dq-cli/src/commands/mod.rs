@@ -26,6 +26,7 @@ pub mod man;
 pub mod merge;
 pub mod patch;
 pub mod paths;
+pub mod plugin_loader;
 pub mod query;
 pub mod rules;
 pub mod select;

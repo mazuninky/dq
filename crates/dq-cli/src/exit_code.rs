@@ -19,9 +19,34 @@
 //! - 7 — `WRITE_FAILED` — read+resolve+render succeeded but writing the
 //!   result to the filesystem failed (atomic-rename collision, missing
 //!   textual-edit renderer, document loaded read-only, ...).
+//!
+//! ## Plugin error mapping (Phase 5 of `add-ir-foundation`)
+//!
+//! [`dq_plugin::PluginError`] surfaces a stable category string via
+//! [`dq_plugin::PluginError::kind_name`] that drives the mapping below:
+//!
+//! | `kind_name()`        | exit code               |
+//! |----------------------|-------------------------|
+//! | `feature_disabled`   | `INVALID_INPUT` (6)     |
+//! | `disallowed_import`  | `INVALID_INPUT` (6)     |
+//! | `schema_version`    | `PARSE_ERROR` (3)       |
+//! | `malformed_fix`     | `PARSE_ERROR` (3)       |
+//! | `exhausted`         | `VALIDATE_FAIL` (4)     |
+//! | `memory`            | `VALIDATE_FAIL` (4)     |
+//! | `invoke`            | `VALIDATE_FAIL` (4)     |
+//! | `load`              | `VALIDATE_FAIL` (4)     |
+//!
+//! Note: the `data-query-plugin-abi` spec calls the exit-code-4 family
+//! `RUNTIME_ERROR` for plugin errors. The CLI's existing `4` constant is
+//! [`VALIDATE_FAIL`] (`document failed a quality gate`), which is the closest
+//! existing semantic match — a plugin trap or load failure is "the runtime /
+//! document failed a check". We map to [`VALIDATE_FAIL`] rather than
+//! introducing a parallel `RUNTIME_ERROR` constant to honour the spec's
+//! "exit code 4" intent without breaking the existing exit-code surface.
 
 use dq_core::Error;
 use dq_exec::ExecError;
+use dq_plugin::PluginError;
 
 use crate::error::{
     BulkPartialFailure, CheckPending, InvalidInput, LintFail, LintWarnStrict, ValidateFail,
@@ -86,6 +111,19 @@ pub fn exit_code_for_error(err: &anyhow::Error) -> i32 {
     }
     if err.downcast_ref::<BulkPartialFailure>().is_some() {
         return WRITE_FAILED;
+    }
+    // Phase 5 (`add-ir-foundation`): dq-plugin runtime errors. The mapping
+    // is documented in the module-level "Plugin error mapping" table above.
+    // Note that `exhausted` / `memory` / `invoke` / `load` map to
+    // `VALIDATE_FAIL` (4) rather than a dedicated `RUNTIME_ERROR` constant —
+    // see the module docs for the rationale.
+    if let Some(plugin_err) = err.downcast_ref::<PluginError>() {
+        return match plugin_err.kind_name() {
+            "feature_disabled" | "disallowed_import" => INVALID_INPUT,
+            "schema_version" | "malformed_fix" => PARSE_ERROR,
+            "exhausted" | "memory" | "invoke" | "load" => VALIDATE_FAIL,
+            _ => GENERIC,
+        };
     }
     // M8 §6.11: dq-exec rule-runtime errors. Map them to the same families
     // the dq-core errors use so callers can branch uniformly.
@@ -383,5 +421,85 @@ mod tests {
             message: "fix.jq produced 0 outputs".to_owned(),
         });
         assert_eq!(exit_code_for_error(&err), PARSE_ERROR);
+    }
+
+    // Phase 5 of `add-ir-foundation` — `dq_plugin::PluginError` mapping.
+    // Each `kind_name()` string is part of the public CLI contract; the
+    // assertions below pin down which exit-code constant each variant
+    // resolves to.
+
+    fn malformed_fix_serde_error() -> serde_json::Error {
+        // Force a typed serde_json::Error so we can construct
+        // `PluginError::MalformedFix` without depending on private parser
+        // internals.
+        serde_json::from_str::<serde_json::Value>("{not json").expect_err("parse must fail")
+    }
+
+    #[test]
+    fn maps_plugin_feature_disabled_to_invalid_input() {
+        let err = anyhow::Error::new(PluginError::FeatureDisabled {
+            hint: "rebuild with --features plugins".to_owned(),
+        });
+        assert_eq!(exit_code_for_error(&err), INVALID_INPUT);
+    }
+
+    #[test]
+    fn maps_plugin_disallowed_import_to_invalid_input() {
+        let err = anyhow::Error::new(PluginError::DisallowedImport {
+            interface: "wasi_snapshot_preview1".to_owned(),
+        });
+        assert_eq!(exit_code_for_error(&err), INVALID_INPUT);
+    }
+
+    #[test]
+    fn maps_plugin_schema_version_to_parse_error() {
+        let err = anyhow::Error::new(PluginError::SchemaVersion {
+            plugin_version: "2.0.0".to_owned(),
+            host_version: "0.1.0".to_owned(),
+        });
+        assert_eq!(exit_code_for_error(&err), PARSE_ERROR);
+    }
+
+    #[test]
+    fn maps_plugin_malformed_fix_to_parse_error() {
+        let err = anyhow::Error::new(PluginError::MalformedFix {
+            rule_id: "x.bad-fix".to_owned(),
+            source: malformed_fix_serde_error(),
+        });
+        assert_eq!(exit_code_for_error(&err), PARSE_ERROR);
+    }
+
+    #[test]
+    fn maps_plugin_exhausted_to_validate_fail() {
+        let err = anyhow::Error::new(PluginError::Exhausted {
+            rule_id: "x.infinite-loop".to_owned(),
+        });
+        assert_eq!(exit_code_for_error(&err), VALIDATE_FAIL);
+    }
+
+    #[test]
+    fn maps_plugin_memory_to_validate_fail() {
+        let err = anyhow::Error::new(PluginError::Memory {
+            rule_id: "x.allocates-too-much".to_owned(),
+        });
+        assert_eq!(exit_code_for_error(&err), VALIDATE_FAIL);
+    }
+
+    #[test]
+    fn maps_plugin_invoke_to_validate_fail() {
+        let err = anyhow::Error::new(PluginError::Invoke {
+            rule_id: "x.traps".to_owned(),
+            message: "unreachable executed".to_owned(),
+        });
+        assert_eq!(exit_code_for_error(&err), VALIDATE_FAIL);
+    }
+
+    #[test]
+    fn maps_plugin_load_to_validate_fail() {
+        let err = anyhow::Error::new(PluginError::Load {
+            path: camino::Utf8PathBuf::from("/no/such/plugin.wasm"),
+            message: "invalid magic bytes".to_owned(),
+        });
+        assert_eq!(exit_code_for_error(&err), VALIDATE_FAIL);
     }
 }

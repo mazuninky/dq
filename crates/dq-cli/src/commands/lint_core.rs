@@ -30,6 +30,7 @@ use walkdir::WalkDir;
 
 use crate::cli::Cli;
 use crate::commands::io_helpers::{load_document_for_lint, pick_format};
+use crate::commands::plugin_loader::{self, LoadedPlugins};
 use crate::error::{InvalidInput, LintFail, LintWarnStrict};
 use crate::output::Reporter;
 
@@ -97,6 +98,22 @@ pub(crate) fn run_with_rulesets(
 
     let evaluator = Evaluator::new(rulesets).map_err(anyhow::Error::new)?;
 
+    // Phase 5 (`add-ir-foundation`): load plugins from `--plugins <DIR>` once
+    // up front and reuse the runtime / handles across every file. When the
+    // flag is absent or the directory contains no `*.wasm` files, `plugins`
+    // is `None` and the per-file loop skips the plugin invocation entirely.
+    let plugins: Option<LoadedPlugins> = match cli.plugins.as_deref() {
+        Some(dir) => {
+            let loaded = plugin_loader::load_all(dir)?;
+            if loaded.handles.is_empty() {
+                None
+            } else {
+                Some(loaded)
+            }
+        }
+        None => None,
+    };
+
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
     for file in &expanded {
         let fmt = pick_format(file, input_format)?;
@@ -110,6 +127,22 @@ pub(crate) fn run_with_rulesets(
         let ir = doc.as_ir();
         let mut file_diags = evaluator.evaluate_file(file, &ir, &format_name);
         diagnostics.append(&mut file_diags);
+        // After the rule engine runs every `@std/*` and `--rules`-loaded
+        // rule, give every plugin loaded from `--plugins <DIR>` a chance to
+        // contribute its own diagnostics. Plugin invocation errors
+        // propagate up — they bubble through `exit_code_for_error` and
+        // route via `PluginError::kind_name()`. We do NOT swallow them
+        // here, mirroring the rule-engine semantics for buggy rules.
+        if let Some(loaded) = plugins.as_ref()
+            && let Some(runtime) = loaded.runtime.as_ref()
+        {
+            for handle in &loaded.handles {
+                let mut plugin_diags = runtime
+                    .invoke_lint(handle, &ir, Some(file.as_path()))
+                    .map_err(anyhow::Error::new)?;
+                diagnostics.append(&mut plugin_diags);
+            }
+        }
     }
 
     let envelope = build_envelope(&diagnostics);
