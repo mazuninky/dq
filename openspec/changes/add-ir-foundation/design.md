@@ -50,7 +50,15 @@ pub struct OwnedIr {              // для случаев, где нужен ow
     format: FormatTag,
 }
 
-pub type ProvenanceMap = HashMap<Pointer, Provenance>;
+pub type ProvenanceMap = IndexMap<String, Provenance>;
+//                       ^^^^^^^^   ^^^^^^
+//   IndexMap, не HashMap — даёт детерминированный порядок итерации/сериализации
+//   (требование M2 spec'а на воспроизводимый snapshot diff и SARIF-вывод).
+//   Ключ — канонический RFC 6901 pointer string, mirror SpanMap'а в
+//   `dq-core/src/document/spans.rs`. Структурный `Pointer` хранится внутри
+//   `Provenance::Original.pointer` — lookup-API всё равно принимает `&Pointer`
+//   и под капотом делает `pointer.as_canonical()` (тот же путь, что
+//   `Document::span_at`).
 
 pub enum Provenance {
     /// Узел соответствует pointer в исходном документе.
