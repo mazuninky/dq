@@ -1,0 +1,44 @@
+tests:
+  - name: openapi with paths passes
+    input: |
+      openapi: "3.1.0"
+      info: { title: API, version: "1.0.0" }
+      paths:
+        /users:
+          get:
+            responses:
+              "200":
+                description: ok
+    expected:
+      violations: []
+  - name: openapi with empty paths object fires
+    input: |
+      openapi: "3.1.0"
+      info: { title: API, version: "1.0.0" }
+      paths: {}
+    expected:
+      violations:
+        - rule: openapi.paths-non-empty
+  - name: openapi with no paths key fires
+    input: |
+      openapi: "3.1.0"
+      info: { title: API, version: "1.0.0" }
+    expected:
+      violations:
+        - rule: openapi.paths-non-empty
+  - name: non-openapi yaml is skipped (filter misses)
+    input: |
+      kind: ConfigMap
+    expected:
+      violations: []
+  - name: 3.1 webhook-only spec passes
+    input: |
+      openapi: "3.1.0"
+      info: { title: API, version: "1.0.0" }
+      webhooks:
+        userCreated:
+          post:
+            responses:
+              "200": { description: ok }
+    expected:
+      violations: []

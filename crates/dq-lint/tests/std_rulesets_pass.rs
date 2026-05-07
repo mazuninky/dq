@@ -31,6 +31,14 @@ fn stage_namespace_to_tempdir(ns: &str) -> TempDir {
         }
     }
 
+    // Stage sidecar JSON Schema files (e.g.
+    // `helm-values-template.schema.json`) so `check.schema_file:` paths
+    // resolve against the staged namespace directory just like they
+    // would when authored locally.
+    for (filename, contents) in dq_lint::std_schema_files(ns) {
+        std::fs::write(dir.join(filename), contents).expect("write schema file");
+    }
+
     tmp
 }
 
@@ -80,4 +88,22 @@ fn std_npm_fixtures_pass() {
 #[test]
 fn std_markdown_fixtures_pass() {
     assert_all_fixtures_pass("markdown");
+}
+
+/// M11 Phase 3: smoke test for `@std/jsonschema` fixtures.
+#[test]
+fn std_jsonschema_fixtures_pass() {
+    assert_all_fixtures_pass("jsonschema");
+}
+
+/// M11 Phase 5: smoke test for `@std/terraform` fixtures.
+#[test]
+fn std_terraform_fixtures_pass() {
+    assert_all_fixtures_pass("terraform");
+}
+
+/// M11 Phase 5: smoke test for `@std/openapi` fixtures.
+#[test]
+fn std_openapi_fixtures_pass() {
+    assert_all_fixtures_pass("openapi");
 }

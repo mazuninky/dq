@@ -113,7 +113,7 @@ Round-trip обеспечивает event-based парсер на уровне �
 | JSONL/NDJSON | ✓ | ✓ | n/a (line-oriented) | свой |
 | Markdown | ✓ | ✓ | full (M9, через comrak) | `comrak` |
 | MD frontmatter | ✓ | ✓ | full (within MD doc) | свой парсер блока + delegate |
-| XML | ✓ | — | n/a (read-only, M11+) | `quick-xml` |
+| XML | ✓ | partial | M11 — comments/CDATA/PI/namespaces/decl сохраняются; mixed-content opaque (`tracing::warn!`); pretty-printing не сохраняется | `quick-xml` |
 
 **Что в этом списке НЕТ и почему:**
 
@@ -483,17 +483,28 @@ Helm/Go-template guard: `--allow-templates` / `--raw-template-strings` — гл�
 
 **Definition of done:** `dq fix --check` в pre-commit ловит исправимые проблемы. `dq fix -i` чинит и пишет атомарно. Round-trip сохраняется (форматирование вокруг исправления остаётся прежним).
 
-### M11 — JSON Schema, composite-rules, расширенные форматы
+### M11 — JSON Schema, composite-rules, расширенные форматы ✅ Implemented 2026-05-07 (см. [openspec/changes/add-validation-and-extended-formats/](openspec/changes/add-validation-and-extended-formats/))
 
 **Цель:** убрать оставшиеся пробелы в покрытии.
 
-**JSON Schema:** валидация против JSON Schema 2020-12 через `jsonschema` крейт. Реализуется как стандартное правило (`@std/jsonschema`) — не отдельная команда, потому что архитектурно это просто rule с особым check'ом.
+**JSON Schema:** валидация против JSON Schema 2020-12 через `jsonschema` крейт. Реализуется как стандартное правило (`@std/jsonschema`) — не отдельная команда, потому что архитектурно это просто rule с особым check'ом. `Rule.check` стал `oneOf [jq | schema | schema_file | extract+nested]`; `instancePath` JSON Schema-ошибок мапится 1:1 в RFC 6901 `Pointer`. `$ref` ограничены internal-references — HTTP/file `$ref` отвергаются на этапе компиляции. Три референс-правила: `@std/jsonschema/{kubernetes-crd-shape, helm-values-against-schema, openapi-3.1-shape}`.
 
-**Composite-rules:** правило в одном формате может извлекать данные и валидировать через парсер другого. Пример: code blocks с lang=yaml в markdown должны быть валидным YAML; package.json scripts должны ссылаться на существующие команды; Helm values.yaml должен соответствовать values.schema.json.
+**Composite-rules:** правило в одном формате может извлекать данные и валидировать через парсер другого. `extract:` jq-выражение возвращает `[{value, format, anchor}]`, `nested:` рекурсивно типизированное правило. Координаты вложенных диагнозов проектируются на исходный файл через anchor + inline-offset. Hardcoded `MAX_EXTRACT_DEPTH = 4` защищает от self-similar extract'а. Inner-format parse failure эмитит `<outer>.parse-failed` как outer-rule violation. Первое правило: `@std/markdown/code-blocks-yaml-valid`.
 
-**Расширенные форматы:** Terraform HCL правила (`@std/terraform`), OpenAPI (`@std/openapi` через `oas3` крейт).
+**Inline-level position spans:** `Provenance::Original` расширен опциональным `inline_offset: Option<InlineBaseline>`. YAML block scalars (`|`, `>`, `|-`, `>-`) и markdown fenced code blocks обязательно выставляют inline-baseline; остальные парсеры — `None` (best-effort для JSON-strings с `\n`). Backward-compatible — existing callers не ломаются.
 
-**Definition of done:** все три направления имеют рабочие правила в стандартной библиотеке. JSON Schema покрывает типичные schema-validation use cases.
+**XML read+write** через `quick-xml` 0.36 — добавляется как новый формат с conventional-key мэппингом (`@attrs`, `#text`, `#comments`, `#cdata`, `#pi`, `#xml`). Round-trip **partial**: structure/attrs/comments/CDATA/PI/namespaces/decl сохраняются; mixed-content (текст вперемежку с элементами) folds в `#text` с `tracing::warn!`.
+
+**Расширенные форматы:** Terraform HCL правила (`@std/terraform` — 8 правил: secrets/tags/version-pinning/security/state-backend/sensitive-outputs/variable-docs), OpenAPI (`@std/openapi` — 6 правил: info-required/paths/uniqueness/responses/no-trailing-slash/security). OpenAPI shipped без `oas3` зависимости — все правила выражены через jq + JSON Schema (фича-гейт исключён, бинарь меньше). Standard rule library теперь ровно 64 правила в 8 namespaces (`k8s`, `dockerfile`, `npm`, `github-actions`, `markdown`, `jsonschema`, `terraform`, `openapi`).
+
+**Known limitations:**
+- HCL parser (M5) не populating'ит `Provenance::Original.span` — все Terraform диагнозы report at line 1, col 1. Span-aware HCL — отдельный отложенный change.
+- XML mixed-content opaque на round-trip; `tracing::warn!` сообщает пользователю.
+- XML parser принимает только UTF-8-совместимые input'ы — `quick-xml` 0.36 без feature-flag'а `encoding` отвергает XML декларации с UTF-16 / Windows-1251 / прочими non-UTF-8 кодировками. Re-encode in UTF-8 перед `dq` для legacy Windows / Visual Studio файлов.
+- `data-query-plugin-abi` WIT не extended — inline-spans **не** прокидываются в WASM-плагины в этом change'е.
+- XSD / RelaxNG / Schematron / OpenAPI runtime-validation — anti-scope.
+
+**Definition of done:** ✅ JSON Schema покрывает типичные schema-validation use cases. ✅ Composite rules работают для cross-format валидации. ✅ XML round-trip (partial) для config-shaped XML. ✅ 64 правила в стандартной библиотеке (8 namespaces). ✅ `cargo test --workspace --all-features` зелёный (1202 passed); `cargo test --workspace --no-default-features` зелёный (1187 passed).
 
 ### M12 — Community rules registry + WASM-плагины
 

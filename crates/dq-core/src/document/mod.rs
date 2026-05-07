@@ -96,6 +96,10 @@ pub enum FormatTag {
     /// Markdown (CommonMark + GFM, M9). Body parsed into a typed AST tree
     /// with frontmatter folded in as a top-level node field.
     Markdown,
+    /// XML 1.0 (M11). Mapped onto the `Value` enum via conventional keys
+    /// (`@attrs`, `#text`, `#comments`, `#cdata`, `#pi`, `#xml`); see
+    /// `parsers/xml.rs` for the full conventional-key contract.
+    Xml,
 }
 
 impl FormatTag {
@@ -120,6 +124,7 @@ impl FormatTag {
             "ignore-list" => Some(Self::IgnoreList),
             "frontmatter" => Some(Self::Frontmatter),
             "markdown" => Some(Self::Markdown),
+            "xml" => Some(Self::Xml),
             _ => None,
         }
     }
@@ -146,6 +151,7 @@ impl FormatTag {
             Self::IgnoreList => "ignore-list",
             Self::Frontmatter => "frontmatter",
             Self::Markdown => "markdown",
+            Self::Xml => "xml",
         }
     }
 }
@@ -402,6 +408,69 @@ impl Document {
             value,
             original_bytes,
             spans,
+            format,
+            multi_doc: false,
+            frontmatter_payload: None,
+            provenance,
+        }
+    }
+
+    /// Build a `Document` from an explicit provenance map alongside the value
+    /// tree, source bytes, and spans.
+    ///
+    /// This is the constructor parsers use when they need to populate
+    /// fields on `Provenance::Original` that the default
+    /// [`Document::with_spans`] path does not surface — most importantly
+    /// `inline_offset` for YAML block scalars and markdown fenced code
+    /// blocks (Phase 2 of `add-validation-and-extended-formats`). Callers
+    /// are expected to derive `provenance` from `spans` (one entry per
+    /// canonical pointer) and then enrich the entries that need
+    /// inline-offset metadata.
+    ///
+    /// `spans` and `provenance` SHOULD share the same key set — the IR
+    /// `as_ir()` path looks them up by the same canonical string and a
+    /// divergence would surface as inconsistent `span_for` /
+    /// `inline_offset_for` results. Tests in `tests/ir_yaml_provenance.rs`
+    /// pin the cross-channel agreement.
+    #[must_use]
+    pub fn with_spans_and_provenance(
+        value: Value,
+        original_bytes: Vec<u8>,
+        spans: SpanMap,
+        format: FormatTag,
+        provenance: ProvenanceMap,
+    ) -> Self {
+        Self {
+            value,
+            original_bytes,
+            spans,
+            format,
+            multi_doc: false,
+            frontmatter_payload: None,
+            provenance,
+        }
+    }
+
+    /// Build a read-only `Document` whose provenance map is supplied
+    /// externally, without a span map.
+    ///
+    /// Used by parsers that record `Provenance::Original` entries (with
+    /// `span: None` and an `inline_offset`) but cannot produce a write-pat
+    /// `SpanMap` for their format — the markdown parser (Phase 2 of
+    /// `add-validation-and-extended-formats`) is the first such caller.
+    /// The resulting document still has `original_bytes` populated for
+    /// round-trip detection in `Format::write`.
+    #[must_use]
+    pub fn with_value_bytes_and_provenance(
+        value: Value,
+        original_bytes: Vec<u8>,
+        format: FormatTag,
+        provenance: ProvenanceMap,
+    ) -> Self {
+        Self {
+            value,
+            original_bytes,
+            spans: SpanMap::new(),
             format,
             multi_doc: false,
             frontmatter_payload: None,
@@ -748,10 +817,17 @@ impl Document {
 /// [`Provenance::Original`] entry per pointer, sharing the same canonical
 /// keys.
 ///
-/// Every populated span yields `Original { pointer, span: Some(span) }`;
-/// the read-only parser path does not call this helper — it leaves
-/// `Document::provenance` empty so `as_ir().provenance` reports "no
-/// provenance available" for every lookup.
+/// Every populated span yields `Original { pointer, span: Some(span),
+/// inline_offset: None }`; the read-only parser path does not call this
+/// helper — it leaves `Document::provenance` empty so `as_ir().provenance`
+/// reports "no provenance available" for every lookup.
+///
+/// Inline-offset population is the parser's job (`add-validation-and-extended-formats`
+/// Phase 2): YAML block scalars and markdown fenced code blocks override
+/// `inline_offset` post-construction by writing a richer entry directly
+/// into `Document::provenance`. See `parsers::yaml_spans` and
+/// `parsers::markdown` for the populated branches; every other format
+/// keeps the `None` default produced here.
 fn provenance_from_spans(spans: &SpanMap) -> ProvenanceMap {
     let mut map = ProvenanceMap::with_capacity(spans.len());
     for (canonical, span) in spans {
@@ -765,10 +841,7 @@ fn provenance_from_spans(spans: &SpanMap) -> ProvenanceMap {
             .expect("canonical span keys are produced by Pointer::as_canonical");
         map.insert(
             canonical.clone(),
-            Provenance::Original {
-                pointer,
-                span: Some(span.clone()),
-            },
+            Provenance::original(pointer, Some(span.clone())),
         );
     }
     map
@@ -1714,7 +1787,9 @@ mod tests {
         );
         assert_eq!(FormatTag::from_name("markdown"), Some(FormatTag::Markdown),);
         assert_eq!(FormatTag::Markdown.name(), "markdown");
-        assert_eq!(FormatTag::from_name("xml"), None);
+        assert_eq!(FormatTag::from_name("xml"), Some(FormatTag::Xml));
+        assert_eq!(FormatTag::Xml.name(), "xml");
+        assert_eq!(FormatTag::from_name("zzz"), None);
     }
 
     #[test]

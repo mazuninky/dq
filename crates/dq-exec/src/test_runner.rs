@@ -11,15 +11,16 @@
 //! matter; flexibility comes from `message_contains` /
 //! `message_equals` / `line` filters in the expected entries.
 //!
-//! ## Format-input parsing scope (M8)
+//! ## Format-input parsing scope
 //!
-//! The runner parses a fixture's `input:` text by name. Only `yaml` and
-//! `json` are supported directly; any other format produces an
-//! [`TestOutcome::Error`] with a "format not yet supported in test
-//! runner" message. The standard rules in the §7-§8 batch all target
-//! `yaml` or `json`; richer format support will land alongside §4.5
-//! when the test runner gains a dependency on the full `dq-core`
-//! [`dq_core::Format`] machinery.
+//! The runner parses a fixture's `input:` text by name. M8 supported
+//! `yaml` / `json`; M9 added `markdown` (CommonMark + GFM AST); M11
+//! Phase 5 added `hcl` so the `@std/terraform` ruleset can ship with
+//! co-located fixtures. Any other format produces an [`TestOutcome::Error`]
+//! with a "format not yet supported in test runner" message — that
+//! message intentionally points future authors at the
+//! `dq_core::by_name` registry, since adding a format here is a
+//! one-arm change.
 
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::Deserialize;
@@ -338,8 +339,29 @@ fn parse_input(input: &str, format: &str) -> std::result::Result<serde_json::Val
             serde_json::to_value(doc.value())
                 .map_err(|err| format!("markdown AST serialize error: {err}"))
         }
+        "hcl" => {
+            // M11 Phase 5: `@std/terraform` rules carry `format: hcl` in
+            // their `match`, so fixtures need to parse `.tf` syntax. The
+            // HCL parser produces a `Value::Map` shaped per the M5 nesting
+            // contract (see `crates/dq-core/src/parsers/hcl.rs` —
+            // `block_type "label" { ... }` becomes `Map { block_type:
+            // { label: { ... } } }`); we serialize that to a
+            // `serde_json::Value` for the jq evaluator. HCL has no spans
+            // (`set_at`/`del_at` round-trip is unsupported per the parser
+            // module comment), so diagnostics emitted from these fixtures
+            // resolve to the default `(line=1, col=1)`. The fixture
+            // runner exercises the rule logic; the no-spans limitation is
+            // documented in CHANGELOG.md and the rule descriptions.
+            let parser =
+                dq_core::by_name("hcl").ok_or_else(|| "hcl format not registered".to_owned())?;
+            let doc = parser
+                .parse(input.as_bytes())
+                .map_err(|err| format!("hcl parse error: {err}"))?;
+            serde_json::to_value(doc.value())
+                .map_err(|err| format!("hcl value serialize error: {err}"))
+        }
         other => Err(format!(
-            "format not yet supported in test runner: {other} (M8 supports yaml/json/markdown; richer support lands with §4.5)",
+            "format not yet supported in test runner: {other} (supported: yaml, json, markdown, hcl; add a new arm in test_runner::parse_input that calls dq_core::by_name)",
         )),
     }
 }
@@ -621,10 +643,13 @@ tests:
     #[test]
     fn unsupported_format_in_test_case_yields_error_outcome() {
         let (_t, dir) = tempdir_utf8();
+        // Use a format that the test runner does NOT have a parse arm for.
+        // M11 Phase 5 wired up `hcl`; pick something we have not extended
+        // yet so the negative path stays exercised.
         let fixture = r#"
 tests:
   - name: unsupported format
-    format: hcl
+    format: dockerfile
     input: ""
     expected:
       violations: []

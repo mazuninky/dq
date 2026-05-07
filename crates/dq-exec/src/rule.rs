@@ -5,7 +5,17 @@
 //! long time. Schema changes after M8 land as additive `#[serde(default)]`
 //! fields. `#[serde(deny_unknown_fields)]` on every struct turns typos
 //! into structured errors instead of silent no-ops.
+//!
+//! Phase 3 of `add-validation-and-extended-formats` reshaped `check` from
+//! a single struct into a four-variant [`Check`] enum: `Jq` (legacy),
+//! `Schema` / `SchemaFile` (JSON Schema 2020-12), and `Composite`
+//! (recursive cross-format checks — Phase 4 turns the parser-side stub
+//! into a runtime). The custom [`Deserialize`] impl on [`Check`] enforces
+//! mutual exclusion at parse time (per design D1) so rule authors get a
+//! crisp error pointing at the offending fields rather than the opaque
+//! "no untagged variant matched" message `serde(untagged)` would emit.
 
+use camino::Utf8PathBuf;
 use serde::{Deserialize, Deserializer};
 
 use crate::diagnostic::Severity;
@@ -32,8 +42,8 @@ pub struct Rule {
     /// `match` is a Rust keyword.
     #[serde(rename = "match")]
     pub match_: RuleMatch,
-    /// The violation finder — a jq expression and a message template.
-    pub check: RuleCheck,
+    /// The violation finder — variant-specific; see [`Check`].
+    pub check: Check,
     /// M10 autofix payload. When present, [`crate::Fixer`] runs the
     /// `fix.jq` transform against the whole document.
     #[serde(default)]
@@ -140,16 +150,272 @@ pub struct RuleMatch {
 }
 
 /// The violation finder.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RuleCheck {
-    /// jq expression that emits a stream of violation values. Each
-    /// emitted value becomes one `Diagnostic`.
-    pub jq: String,
-    /// Message template — supports `{{ .field }}` substitution from the
-    /// violation value (see `crate::template` once it lands).
-    pub message: String,
+///
+/// Phase 3 of `add-validation-and-extended-formats` turned this into a
+/// four-variant enum. Existing `check: { jq: ..., message: ... }` rules
+/// continue to parse — they land in [`Check::Jq`]. The `Schema` /
+/// `SchemaFile` variants drive JSON Schema 2020-12 validation; the
+/// `Composite` variant is the parser-side stub for cross-format checks
+/// (Phase 4 fills in the runtime).
+///
+/// The custom [`Deserialize`] impl below enforces mutual exclusion at
+/// parse time: exactly one of `jq` / `schema` / `schema_file` /
+/// `extract+nested` MUST be present. Rule authors that mix variants get
+/// a [`CheckParseError`] tagged with the offending field names; the
+/// loader (`RuleSet::from_str`) maps that to a structured
+/// [`crate::error::ExecError`] in a follow-up pass once it has the rule
+/// id in hand.
+///
+/// `PartialEq` is intentionally NOT derived: `Rule` itself has no
+/// `PartialEq` impl, and the `serde_yml::Value` carried by `Schema`
+/// already provides one if a caller ever needs structural comparison.
+#[derive(Debug, Clone)]
+pub enum Check {
+    /// Variant 1: jq-driven check. The `jq` expression emits a stream
+    /// of violation values; each one becomes a [`crate::Diagnostic`]
+    /// rendered through `message` (mustache-lite templating).
+    Jq {
+        /// jq expression that emits a stream of violation values.
+        jq: String,
+        /// Message template — supports `{{ .field }}` substitution from
+        /// the violation value.
+        message: String,
+    },
+    /// Variant 2: inline JSON Schema 2020-12 document. `schema` is an
+    /// arbitrary YAML/JSON value that compiles into a
+    /// `jsonschema::Validator` at `Evaluator::new`.
+    Schema {
+        /// Inline JSON Schema 2020-12 document.
+        schema: serde_yml::Value,
+        /// Optional message prefix — when set, prepended to the
+        /// auto-generated `keywordLocation`-based message.
+        message: Option<String>,
+    },
+    /// Variant 3: schema document loaded from a file sibling of the
+    /// rule's `.yml` source. The path is resolved relative to the
+    /// rule directory; absolute paths and `..` escapes are rejected at
+    /// `Evaluator::new`.
+    SchemaFile {
+        /// Path relative to the rule directory.
+        schema_file: Utf8PathBuf,
+        /// Optional message prefix — same semantics as
+        /// [`Check::Schema::message`].
+        message: Option<String>,
+    },
+    /// Variant 4 (Phase 4 of M11): composite cross-format check.
+    /// `extract` returns an array of items the runtime re-parses
+    /// according to a per-item `format`; `nested` is recursively
+    /// applied to each parsed value.
+    ///
+    /// Phase 3 ships the parser-side shape only — the evaluator emits a
+    /// `tracing::warn!` and returns no diagnostics. The full runtime
+    /// (recursion bound, coordinate projection) lands in Phase 4.
+    Composite {
+        /// jq expression returning an array of `{value, format, anchor}`
+        /// items.
+        extract: String,
+        /// Recursively typed nested rule, applied to each extracted
+        /// item.
+        nested: Box<Rule>,
+        /// Required message template — same `{{ .field }}` semantics
+        /// as [`Check::Jq::message`].
+        message: String,
+    },
 }
+
+/// Parser-side error variants emitted by `Deserialize for Check`.
+///
+/// These are converted to [`crate::error::ExecError`] variants by
+/// [`RuleSet::from_str`] (which has the rule id in hand) — the
+/// [`Deserialize`] impl can't emit those directly because it doesn't
+/// know the id. Surfaced as `serde::de::Error::custom` strings prefixed
+/// with `dq:check-error:<kind>:<payload>` so the loader can recover the
+/// structured information without a fragile string-parse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CheckParseError {
+    /// More than one of the four mutually-exclusive variants is set.
+    MutuallyExclusive { present_fields: Vec<String> },
+    /// None of the four variants is set.
+    Missing,
+    /// `extract` is set but `nested` is not (or vice versa).
+    CompositeIncomplete { missing_field: String },
+}
+
+impl CheckParseError {
+    /// Sentinel prefix used when round-tripping the error through
+    /// `serde::de::Error::custom`. The loader recovers the structured
+    /// payload by stripping this prefix.
+    pub(crate) const SENTINEL_PREFIX: &'static str = "dq:check-error:";
+
+    /// Encode `self` as a sentinel-prefixed string suitable for
+    /// `serde::de::Error::custom`.
+    pub(crate) fn to_sentinel(&self) -> String {
+        match self {
+            Self::MutuallyExclusive { present_fields } => {
+                format!(
+                    "{}mutually_exclusive:{}",
+                    Self::SENTINEL_PREFIX,
+                    present_fields.join(",")
+                )
+            }
+            Self::Missing => format!("{}missing", Self::SENTINEL_PREFIX),
+            Self::CompositeIncomplete { missing_field } => {
+                format!(
+                    "{}composite_incomplete:{}",
+                    Self::SENTINEL_PREFIX,
+                    missing_field
+                )
+            }
+        }
+    }
+
+    /// Decode a sentinel string produced by [`to_sentinel`].
+    ///
+    /// Returns `None` when `s` is not a sentinel-prefixed
+    /// [`CheckParseError`] payload (the loader then treats the error as
+    /// a generic `ExecError::Parse`).
+    pub(crate) fn from_sentinel(s: &str) -> Option<Self> {
+        let body = s.strip_prefix(Self::SENTINEL_PREFIX)?;
+        let (kind, rest) = body.split_once(':').unwrap_or((body, ""));
+        match kind {
+            "mutually_exclusive" => {
+                let present_fields = if rest.is_empty() {
+                    Vec::new()
+                } else {
+                    rest.split(',').map(|s| s.to_owned()).collect()
+                };
+                Some(Self::MutuallyExclusive { present_fields })
+            }
+            "missing" => Some(Self::Missing),
+            "composite_incomplete" => Some(Self::CompositeIncomplete {
+                missing_field: rest.to_owned(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Wire-shape for [`Check`]. Every variant-discriminating field is
+/// optional so `serde` can surface "0 or many fields present" as a
+/// validation error rather than a missing-field error from the variant
+/// itself.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCheck {
+    #[serde(default)]
+    jq: Option<String>,
+    #[serde(default)]
+    schema: Option<serde_yml::Value>,
+    #[serde(default)]
+    schema_file: Option<Utf8PathBuf>,
+    #[serde(default)]
+    extract: Option<String>,
+    #[serde(default)]
+    nested: Option<Box<Rule>>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for Check {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawCheck::deserialize(deserializer)?;
+
+        // Composite is encoded as `extract + nested`. Either one alone
+        // is a `CompositeIncomplete` error; both together count as one
+        // discriminator slot for mutual-exclusion bookkeeping.
+        let composite_incomplete = match (raw.extract.is_some(), raw.nested.is_some()) {
+            (true, false) => Some("nested"),
+            (false, true) => Some("extract"),
+            _ => None,
+        };
+        if let Some(missing) = composite_incomplete {
+            return Err(serde::de::Error::custom(
+                CheckParseError::CompositeIncomplete {
+                    missing_field: missing.to_owned(),
+                }
+                .to_sentinel(),
+            ));
+        }
+
+        // Count the discriminators that ARE set. `extract+nested`
+        // counts once.
+        let mut present_fields: Vec<String> = Vec::new();
+        if raw.jq.is_some() {
+            present_fields.push("jq".to_owned());
+        }
+        if raw.schema.is_some() {
+            present_fields.push("schema".to_owned());
+        }
+        if raw.schema_file.is_some() {
+            present_fields.push("schema_file".to_owned());
+        }
+        if raw.extract.is_some() {
+            // `nested` is paired with `extract` and counted under the
+            // same `extract+nested` discriminator slot below.
+            present_fields.push("extract".to_owned());
+        }
+
+        match present_fields.len() {
+            0 => Err(serde::de::Error::custom(
+                CheckParseError::Missing.to_sentinel(),
+            )),
+            1 => build_one_variant(raw),
+            _ => Err(serde::de::Error::custom(
+                CheckParseError::MutuallyExclusive { present_fields }.to_sentinel(),
+            )),
+        }
+    }
+}
+
+/// Build the appropriate [`Check`] variant from a [`RawCheck`] that
+/// has already passed the "exactly one discriminator" gate.
+fn build_one_variant<E: serde::de::Error>(raw: RawCheck) -> Result<Check, E> {
+    if let Some(jq) = raw.jq {
+        let message = raw
+            .message
+            .ok_or_else(|| serde::de::Error::custom("check.jq requires `message`"))?;
+        return Ok(Check::Jq { jq, message });
+    }
+    if let Some(schema) = raw.schema {
+        return Ok(Check::Schema {
+            schema,
+            message: raw.message,
+        });
+    }
+    if let Some(schema_file) = raw.schema_file {
+        return Ok(Check::SchemaFile {
+            schema_file,
+            message: raw.message,
+        });
+    }
+    if let (Some(extract), Some(nested)) = (raw.extract, raw.nested) {
+        let message = raw
+            .message
+            .ok_or_else(|| serde::de::Error::custom("check.extract+nested requires `message`"))?;
+        return Ok(Check::Composite {
+            extract,
+            nested,
+            message,
+        });
+    }
+    // The discriminator-counting gate above guarantees this branch is
+    // unreachable, but emitting an explicit error keeps the function
+    // total without an `unwrap`.
+    Err(serde::de::Error::custom(
+        "internal: build_one_variant called with no discriminator",
+    ))
+}
+
+/// Backward-compat alias for the pre-Phase-3 `RuleCheck` struct name.
+///
+/// External callers that imported `dq_exec::RuleCheck` still see the
+/// type, but it now points at the [`Check`] enum. The alias will be
+/// removed in a follow-up cleanup once downstream consumers migrate to
+/// the new name.
+pub type RuleCheck = Check;
 
 /// Optional override for the per-violation diagnostic location.
 ///
@@ -256,18 +522,34 @@ check:
         serde_yml::from_str::<Rule>(yaml).expect_err("expected parse failure")
     }
 
+    /// Extract a [`CheckParseError`] from a serde error message that
+    /// embeds a sentinel string. Returns `None` if the error is not
+    /// sentinel-encoded (i.e. it's a regular YAML / serde error).
+    fn check_parse_error_from(err: &serde_yml::Error) -> Option<CheckParseError> {
+        let formatted = format!("{err}");
+        // The formatted error usually wraps the custom message in extra
+        // context; scan for the sentinel prefix anywhere in the string.
+        let idx = formatted.find(CheckParseError::SENTINEL_PREFIX)?;
+        let tail = &formatted[idx..];
+        // The sentinel runs until the next whitespace or `\n` (serde
+        // appends source-position info on a separate line).
+        let end = tail.find(['\n', ' ']).unwrap_or(tail.len());
+        CheckParseError::from_sentinel(&tail[..end])
+    }
+
     #[test]
-    fn parses_minimal_rule() {
+    fn parses_minimal_rule_into_check_jq_variant() {
         let rule = parse(MINIMAL_RULE);
         assert_eq!(rule.id, "k8s.no-latest-tag");
         assert_eq!(rule.severity, Severity::Error);
-        assert_eq!(rule.match_.format, vec!["yaml".to_owned()]);
-        assert_eq!(rule.match_.filter, None);
-        assert_eq!(rule.match_.glob, None);
-        assert!(rule.check.jq.contains(":latest"));
+        match &rule.check {
+            Check::Jq { jq, message } => {
+                assert!(jq.contains(":latest"));
+                assert!(message.contains("uses :latest tag"));
+            }
+            other => panic!("expected Check::Jq, got {other:?}"),
+        }
         assert!(rule.fix.is_none());
-        assert!(rule.references.is_empty());
-        assert!(rule.loc.is_none());
     }
 
     #[test]
@@ -347,12 +629,6 @@ loc:
     }
 
     #[test]
-    fn accepts_format_as_single_string() {
-        let rule = parse(MINIMAL_RULE);
-        assert_eq!(rule.match_.format, vec!["yaml".to_owned()]);
-    }
-
-    #[test]
     fn accepts_format_as_array() {
         let yaml = r#"
 id: a.b
@@ -386,47 +662,6 @@ check:
     }
 
     #[test]
-    fn rejects_rule_missing_description() {
-        let yaml = r#"
-id: a.b
-severity: error
-match:
-  format: yaml
-check:
-  jq: '.'
-  message: m
-"#;
-        parse_err(yaml);
-    }
-
-    #[test]
-    fn rejects_rule_missing_severity() {
-        let yaml = r#"
-id: a.b
-description: x
-match:
-  format: yaml
-check:
-  jq: '.'
-  message: m
-"#;
-        parse_err(yaml);
-    }
-
-    #[test]
-    fn rejects_rule_missing_match() {
-        let yaml = r#"
-id: a.b
-description: x
-severity: error
-check:
-  jq: '.'
-  message: m
-"#;
-        parse_err(yaml);
-    }
-
-    #[test]
     fn rejects_rule_missing_check() {
         let yaml = r#"
 id: a.b
@@ -438,10 +673,314 @@ match:
         parse_err(yaml);
     }
 
+    // -- Check enum variant parsing -------------------------------------
+
+    #[test]
+    fn parses_check_schema_inline() {
+        let yaml = r#"
+id: a.b
+description: x
+severity: error
+match:
+  format: yaml
+check:
+  schema:
+    type: object
+    required: [name]
+"#;
+        let rule = parse(yaml);
+        match rule.check {
+            Check::Schema { schema, message } => {
+                assert!(message.is_none());
+                let mapping = schema.as_mapping().expect("schema is a mapping");
+                assert!(mapping.contains_key("type"));
+                assert!(mapping.contains_key("required"));
+            }
+            other => panic!("expected Check::Schema, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_check_schema_with_message_prefix() {
+        let yaml = r#"
+id: a.b
+description: x
+severity: error
+match:
+  format: yaml
+check:
+  schema:
+    type: object
+  message: "shape mismatch: "
+"#;
+        let rule = parse(yaml);
+        match rule.check {
+            Check::Schema { message, .. } => {
+                assert_eq!(message.as_deref(), Some("shape mismatch: "));
+            }
+            other => panic!("expected Check::Schema, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_check_schema_file() {
+        let yaml = r#"
+id: a.b
+description: x
+severity: error
+match:
+  format: yaml
+check:
+  schema_file: ./shape.schema.json
+"#;
+        let rule = parse(yaml);
+        match rule.check {
+            Check::SchemaFile {
+                schema_file,
+                message,
+            } => {
+                assert_eq!(schema_file, Utf8PathBuf::from("./shape.schema.json"));
+                assert!(message.is_none());
+            }
+            other => panic!("expected Check::SchemaFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_check_composite_stub() {
+        let yaml = r#"
+id: a.b
+description: x
+severity: error
+match:
+  format: markdown
+check:
+  extract: '.. | objects | select(.type == "code")'
+  nested:
+    id: a.b.inner
+    description: inner
+    severity: error
+    match:
+      format: yaml
+    check:
+      jq: '.'
+      message: 'm'
+  message: "outer fail"
+"#;
+        let rule = parse(yaml);
+        match rule.check {
+            Check::Composite {
+                extract,
+                nested,
+                message,
+            } => {
+                assert!(extract.contains("type"));
+                assert_eq!(nested.id, "a.b.inner");
+                assert_eq!(message, "outer fail");
+            }
+            other => panic!("expected Check::Composite, got {other:?}"),
+        }
+    }
+
+    // -- Mutual-exclusion error cases -----------------------------------
+
+    #[test]
+    fn rejects_check_jq_plus_schema() {
+        let yaml = r#"
+id: a.b
+description: x
+severity: error
+match:
+  format: yaml
+check:
+  jq: '.'
+  message: m
+  schema:
+    type: object
+"#;
+        let err = parse_err(yaml);
+        let kind = check_parse_error_from(&err)
+            .unwrap_or_else(|| panic!("expected sentinel CheckParseError, got: {err}"));
+        match kind {
+            CheckParseError::MutuallyExclusive { present_fields } => {
+                assert!(present_fields.contains(&"jq".to_owned()));
+                assert!(present_fields.contains(&"schema".to_owned()));
+            }
+            other => panic!("expected MutuallyExclusive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_check_schema_plus_schema_file() {
+        let yaml = r#"
+id: a.b
+description: x
+severity: error
+match:
+  format: yaml
+check:
+  schema:
+    type: object
+  schema_file: ./x.json
+"#;
+        let err = parse_err(yaml);
+        let kind = check_parse_error_from(&err)
+            .unwrap_or_else(|| panic!("expected sentinel CheckParseError, got: {err}"));
+        match kind {
+            CheckParseError::MutuallyExclusive { present_fields } => {
+                assert!(present_fields.contains(&"schema".to_owned()));
+                assert!(present_fields.contains(&"schema_file".to_owned()));
+            }
+            other => panic!("expected MutuallyExclusive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_check_jq_plus_extract() {
+        let yaml = r#"
+id: a.b
+description: x
+severity: error
+match:
+  format: yaml
+check:
+  jq: '.'
+  message: m
+  extract: '.'
+  nested:
+    id: a.b.inner
+    description: i
+    severity: warn
+    match:
+      format: yaml
+    check:
+      jq: '.'
+      message: m2
+"#;
+        let err = parse_err(yaml);
+        let kind = check_parse_error_from(&err)
+            .unwrap_or_else(|| panic!("expected sentinel CheckParseError, got: {err}"));
+        match kind {
+            CheckParseError::MutuallyExclusive { present_fields } => {
+                assert!(present_fields.contains(&"jq".to_owned()));
+                assert!(present_fields.contains(&"extract".to_owned()));
+            }
+            other => panic!("expected MutuallyExclusive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_all_four_variants_present() {
+        let yaml = r#"
+id: a.b
+description: x
+severity: error
+match:
+  format: yaml
+check:
+  jq: '.'
+  message: m
+  schema: {type: object}
+  schema_file: ./x.json
+  extract: '.'
+  nested:
+    id: a.b.inner
+    description: i
+    severity: warn
+    match:
+      format: yaml
+    check:
+      jq: '.'
+      message: m
+"#;
+        let err = parse_err(yaml);
+        let kind = check_parse_error_from(&err)
+            .unwrap_or_else(|| panic!("expected sentinel CheckParseError, got: {err}"));
+        match kind {
+            CheckParseError::MutuallyExclusive { present_fields } => {
+                assert!(present_fields.contains(&"jq".to_owned()));
+                assert!(present_fields.contains(&"schema".to_owned()));
+                assert!(present_fields.contains(&"schema_file".to_owned()));
+                assert!(present_fields.contains(&"extract".to_owned()));
+            }
+            other => panic!("expected MutuallyExclusive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_empty_check_block() {
+        let yaml = r#"
+id: a.b
+description: x
+severity: error
+match:
+  format: yaml
+check: {}
+"#;
+        let err = parse_err(yaml);
+        let kind = check_parse_error_from(&err)
+            .unwrap_or_else(|| panic!("expected sentinel CheckParseError, got: {err}"));
+        assert!(matches!(kind, CheckParseError::Missing));
+    }
+
+    #[test]
+    fn rejects_extract_without_nested() {
+        let yaml = r#"
+id: a.b
+description: x
+severity: error
+match:
+  format: yaml
+check:
+  extract: '.'
+  message: m
+"#;
+        let err = parse_err(yaml);
+        let kind = check_parse_error_from(&err)
+            .unwrap_or_else(|| panic!("expected sentinel CheckParseError, got: {err}"));
+        match kind {
+            CheckParseError::CompositeIncomplete { missing_field } => {
+                assert_eq!(missing_field, "nested");
+            }
+            other => panic!("expected CompositeIncomplete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_nested_without_extract() {
+        let yaml = r#"
+id: a.b
+description: x
+severity: error
+match:
+  format: yaml
+check:
+  nested:
+    id: a.b.inner
+    description: i
+    severity: warn
+    match:
+      format: yaml
+    check:
+      jq: '.'
+      message: m2
+  message: m
+"#;
+        let err = parse_err(yaml);
+        let kind = check_parse_error_from(&err)
+            .unwrap_or_else(|| panic!("expected sentinel CheckParseError, got: {err}"));
+        match kind {
+            CheckParseError::CompositeIncomplete { missing_field } => {
+                assert_eq!(missing_field, "extract");
+            }
+            other => panic!("expected CompositeIncomplete, got {other:?}"),
+        }
+    }
+
+    // -- Existing fix / loc tests -- migrated to the Check enum shape ---
+
     #[test]
     fn parses_fix_jq_field() {
-        // Phase 4: `RuleFix.jq` is now `Option<String>` (legacy slot).
-        // A rule with `fix.jq` only must parse to `Some(jq), None ops`.
         let yaml = r#"
 id: a.b
 description: x
@@ -462,8 +1001,6 @@ fix:
 
     #[test]
     fn parses_fix_ops_field() {
-        // Phase 4 spec scenario: `fix:{ops:.}` parses with `jq == None`
-        // and `ops == Some(...)`.
         let yaml = r#"
 id: a.b
 description: x
@@ -487,9 +1024,6 @@ fix:
 
     #[test]
     fn parses_fix_with_both_jq_and_ops() {
-        // Phase 4 spec scenario: rule with both `jq` and `ops` parses.
-        // Runtime precedence (ops wins, with a `tracing::warn!`) is
-        // tested in the fixer tests; here we only pin that parse succeeds.
         let yaml = r#"
 id: a.b
 description: x
@@ -511,9 +1045,6 @@ fix:
 
     #[test]
     fn rejects_unknown_field_in_fix() {
-        // `deny_unknown_fields` on the `RawRuleFix` shape rejects typos
-        // and forward-incompatible vocabularies — the loader catches
-        // them at parse time instead of silently ignoring the field.
         let yaml = r#"
 id: a.b
 description: x
@@ -537,9 +1068,6 @@ fix:
 
     #[test]
     fn rejects_fix_missing_jq_and_ops() {
-        // Phase 4 spec scenario: empty `fix:{}` block is a parse error.
-        // The error message must mention `jq` and `ops` so rule authors
-        // see what's missing.
         let yaml = r#"
 id: a.b
 description: x
@@ -589,5 +1117,33 @@ loc:
             Some(".kind == \"Deployment\"")
         );
         assert_eq!(rule.match_.glob.as_deref(), Some("**/*.yaml"));
+    }
+
+    // -- Sentinel encode / decode round-trip ----------------------------
+
+    #[test]
+    fn check_parse_error_sentinel_round_trip() {
+        let inputs = [
+            CheckParseError::Missing,
+            CheckParseError::MutuallyExclusive {
+                present_fields: vec!["jq".to_owned(), "schema".to_owned()],
+            },
+            CheckParseError::CompositeIncomplete {
+                missing_field: "nested".to_owned(),
+            },
+        ];
+        for input in &inputs {
+            let encoded = input.to_sentinel();
+            let decoded = CheckParseError::from_sentinel(&encoded)
+                .unwrap_or_else(|| panic!("decode failed for {encoded}"));
+            assert_eq!(&decoded, input);
+        }
+    }
+
+    #[test]
+    fn check_parse_error_sentinel_rejects_non_sentinel_strings() {
+        assert!(CheckParseError::from_sentinel("plain serde error").is_none());
+        assert!(CheckParseError::from_sentinel("dq:other-error:foo").is_none());
+        assert!(CheckParseError::from_sentinel("dq:check-error:bogus_kind").is_none());
     }
 }

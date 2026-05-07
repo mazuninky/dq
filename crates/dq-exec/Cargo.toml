@@ -40,6 +40,11 @@ indexmap = { workspace = true }
 # `*.yaml` rule files while skipping `*.test.yml` / `*.test.yaml` fixtures.
 walkdir = { workspace = true }
 
+# M11 Phase 3 — JSON Schema validator for `Check::Schema` /
+# `Check::SchemaFile` rule variants. Compiled once per rule at
+# `Evaluator::new` and reused across every `evaluate_file` call.
+jsonschema = { workspace = true }
+
 [dev-dependencies]
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }

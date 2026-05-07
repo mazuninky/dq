@@ -1,0 +1,20 @@
+id: openapi.operation-id-unique
+description: |
+  `operationId` is the canonical handle most code generators use to
+  name SDK methods, route handlers, and test fixtures. Duplicate ids
+  silently overwrite each other in the generated output. Each
+  operation in the spec must declare a unique id (case-sensitive).
+severity: error
+match:
+  format: [yaml, json]
+  filter: '.openapi != null and (.openapi | type == "string")'
+check:
+  jq: |
+    [.. | objects | .operationId? | select(. != null)]
+    | group_by(.)
+    | map(select(length > 1))
+    | .[]
+    | {operationId: .[0], count: length}
+  message: "operationId '{{ .operationId }}' appears {{ .count }} times — must be unique"
+references:
+  - https://spec.openapis.org/oas/latest.html#fixed-fields-7

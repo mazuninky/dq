@@ -1,0 +1,49 @@
+id: terraform.no-public-ingress
+description: |
+  Security-group ingress and GCP firewall rules opened to `0.0.0.0/0`
+  (or the IPv6 equivalent `::/0`) expose the workload to the entire
+  internet. Restrict the source range to a VPN CIDR, a load-balancer
+  security group, or an IAM-authenticated bastion. If you really do
+  need a publicly reachable service, prefer a managed CDN / load
+  balancer in front of the workload and document the intent on the
+  resource so reviewers can override this rule.
+severity: error
+match:
+  format: hcl
+check:
+  # cidr_blocks / ipv6_cidr_blocks are scoped to an `ingress` block to
+  # avoid flagging the canonical aws_security_group egress = ["0.0.0.0/0"]
+  # pattern. AWS security groups encode IPv6 CIDRs in a separate
+  # ipv6_cidr_blocks attribute, so both are checked. source_ranges is
+  # searched anywhere — in google_compute_firewall it defines ingress
+  # sources by spec (destination_ranges is the egress counterpart), so a
+  # top-level source_ranges always implies ingress.
+  #
+  # Per the HCL JSON encoding, multiple `ingress {}` blocks on a single
+  # resource serialize as an array — one block becomes an object, two+
+  # become an array of objects. The leading `(if type == "array" then
+  # .[] else . end)` normalises both shapes into a stream of objects so
+  # we don't silently miss the "two ingress blocks, one is public" case.
+  # IPv6 ::/0 is treated as equally permissive as IPv4 0.0.0.0/0.
+  jq: |
+    [
+      ( .. | objects | .ingress?
+        | (if type == "array" then .[] else . end)
+        | objects
+        | to_entries[]?
+        | select(.key == "cidr_blocks" or .key == "ipv6_cidr_blocks")
+        | select(.value | type == "array")
+        | select(.value | any(. == "0.0.0.0/0" or . == "::/0"))
+        | {key: .key}
+      ),
+      ( .. | objects | to_entries[]?
+        | select(.key == "source_ranges")
+        | select(.value | type == "array")
+        | select(.value | any(. == "0.0.0.0/0" or . == "::/0"))
+        | {key: .key}
+      )
+    ] | flatten | .[]
+  message: "{{ .key }} contains 0.0.0.0/0 (or ::/0) — restrict to a private CIDR or named source"
+references:
+  - https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/security-group-rules.html
+  - https://cloud.google.com/vpc/docs/firewalls

@@ -258,7 +258,11 @@ mod tests {
 
     #[test]
     fn pick_format_unknown_extension_errors() {
-        let path = camino::Utf8PathBuf::from("a.xml");
+        // M11 wired up `.xml` as a registered format; pick a genuinely
+        // unknown extension to keep the negative-path coverage. Any ext
+        // not claimed by a registered `Format` works — `.unknownext` is
+        // chosen for clarity.
+        let path = camino::Utf8PathBuf::from("a.unknownext");
         let err = match pick_format(&path, None) {
             Ok(_) => panic!("unknown extension must error"),
             Err(e) => e,

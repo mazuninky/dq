@@ -99,7 +99,8 @@ pub fn renderer_for_format(format: FormatTag) -> Option<&'static dyn ScalarRende
         | FormatTag::Dockerfile
         | FormatTag::IgnoreList
         | FormatTag::Frontmatter
-        | FormatTag::Markdown => None,
+        | FormatTag::Markdown
+        | FormatTag::Xml => None,
     }
 }
 
@@ -126,7 +127,8 @@ pub fn insertion_renderer_for_format(format: FormatTag) -> Option<&'static dyn I
         | FormatTag::Dockerfile
         | FormatTag::IgnoreList
         | FormatTag::Frontmatter
-        | FormatTag::Markdown => None,
+        | FormatTag::Markdown
+        | FormatTag::Xml => None,
     }
 }
 

@@ -1,0 +1,27 @@
+tests:
+  - name: deployment with all envelope fields passes
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: my-app
+      spec:
+        replicas: 1
+    expected:
+      violations: []
+  - name: deployment missing metadata.name fails
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata: {}
+      spec:
+        replicas: 1
+    expected:
+      violations:
+        - rule: jsonschema.kubernetes-crd-shape
+  - name: non-kubernetes document is skipped
+    input: |
+      foo: bar
+      baz: qux
+    expected:
+      violations: []

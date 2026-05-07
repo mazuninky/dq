@@ -49,10 +49,16 @@ use camino::{Utf8Path, Utf8PathBuf};
 use dq_core::Pointer;
 use globset::GlobMatcher;
 
+use crate::composite::{
+    CompiledCompositeCheck, MAX_EXTRACT_DEPTH, compile_composite, run_composite,
+};
 use crate::diagnostic::Diagnostic;
 use crate::error::{ExecError, Result};
-use crate::rule::Rule;
-use crate::ruleset::RuleSet;
+use crate::rule::{Check, Rule};
+use crate::ruleset::{RuleSet, RuleSource};
+use crate::schema_check::{
+    CompiledSchemaCheck, compile_from_embedded, compile_from_file, compile_inline,
+};
 use crate::template;
 use dq_transform::JqEngine;
 
@@ -64,6 +70,58 @@ use dq_transform::JqEngine;
 #[derive(Debug, Clone)]
 pub struct Evaluator {
     rules: Vec<Arc<CompiledRule>>,
+    /// Composite-rule recursion bound (Phase 4 of M11). Defaults to
+    /// [`crate::composite::MAX_EXTRACT_DEPTH`] (`= 4`); overridable via
+    /// [`Evaluator::with_max_extract_depth`] for unit tests only — the
+    /// CLI does not surface this knob.
+    max_extract_depth: usize,
+}
+
+/// Pre-compiled `check` block, dispatched on at evaluate-time.
+///
+/// Each variant of [`Check`] turns into the matching variant here:
+/// `Jq` carries a [`JqEngine`] and a message template; the schema
+/// variants carry a [`CompiledSchemaCheck`] (validator + optional
+/// message prefix); `Composite` is a Phase 4 placeholder that emits no
+/// diagnostics.
+pub(crate) enum CompiledCheck {
+    /// Variant 1 — jq-driven check. The legacy path; existing rules
+    /// continue to use this.
+    Jq {
+        /// Compiled jq evaluator for `check.jq`.
+        engine: JqEngine,
+        /// Message template — substitution happens via
+        /// [`crate::template::render`].
+        message: String,
+    },
+    /// Variants 2 / 3 — JSON Schema 2020-12 (inline or sibling file).
+    /// Both compile through [`crate::schema_check`] into the same
+    /// [`CompiledSchemaCheck`] shape, so the runtime dispatch arm is
+    /// shared.
+    Schema(CompiledSchemaCheck),
+    /// Variant 4 — composite (Phase 4). Carries a recursively-compiled
+    /// inner rule plus the compiled `extract` jq filter; the runtime
+    /// arm dispatches into [`crate::composite::run_composite`].
+    Composite(Box<CompiledCompositeCheck>),
+}
+
+impl std::fmt::Debug for CompiledCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Jq { message, .. } => f
+                .debug_struct("Jq")
+                .field("message", message)
+                .finish_non_exhaustive(),
+            Self::Schema(s) => f
+                .debug_struct("Schema")
+                .field("message_prefix", &s.message_prefix)
+                .finish_non_exhaustive(),
+            Self::Composite(c) => f
+                .debug_struct("Composite")
+                .field("message_prefix", &c.message_prefix)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 /// One rule with all its jq filters and glob matcher pre-compiled.
@@ -74,7 +132,7 @@ pub struct Evaluator {
 pub(crate) struct CompiledRule {
     pub(crate) rule: Rule,
     pub(crate) filter_engine: Option<JqEngine>,
-    pub(crate) check_engine: JqEngine,
+    pub(crate) check: CompiledCheck,
     pub(crate) glob_matcher: Option<GlobMatcher>,
     pub(crate) loc_file_engine: Option<JqEngine>,
     pub(crate) loc_line_engine: Option<JqEngine>,
@@ -96,10 +154,25 @@ pub(crate) struct CompiledRule {
     pub(crate) fix_ops_engine: Option<JqEngine>,
 }
 
+impl CompiledRule {
+    /// Whether the rule declares a `loc.pointer` or `loc.line` override
+    /// that should drive the diagnostic's `(line, col)` instead of the
+    /// intrinsic span lookup.
+    ///
+    /// Used by [`run_schema_check`] to decide whether to fall back to
+    /// `Ir::line_col_for(instance_path)` when no override is set —
+    /// preserving the pre-Phase-2 schema behaviour for rules that did
+    /// not opt into the chain.
+    pub(crate) fn has_position_override(&self) -> bool {
+        self.loc_pointer_engine.is_some() || self.loc_line_engine.is_some()
+    }
+}
+
 impl std::fmt::Debug for CompiledRule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CompiledRule")
             .field("rule_id", &self.rule.id)
+            .field("check", &self.check)
             .field("has_filter", &self.filter_engine.is_some())
             .field("has_glob", &self.glob_matcher.is_some())
             .field("has_loc_pointer", &self.loc_pointer_engine.is_some())
@@ -127,11 +200,45 @@ impl Evaluator {
     pub fn new(rulesets: Vec<RuleSet>) -> Result<Self> {
         let mut compiled = Vec::new();
         for set in rulesets {
+            // Each ruleset's source flows into per-rule compilation so
+            // schema_file resolution and embedded-schema lookups can
+            // pick the right strategy per rule.
+            let source = set.source;
             for rule in set.rules {
-                compiled.push(Arc::new(compile_rule(rule)?));
+                compiled.push(Arc::new(compile_rule_to_depth(
+                    rule,
+                    &source,
+                    0,
+                    MAX_EXTRACT_DEPTH,
+                )?));
             }
         }
-        Ok(Self { rules: compiled })
+        Ok(Self {
+            rules: compiled,
+            max_extract_depth: MAX_EXTRACT_DEPTH,
+        })
+    }
+
+    /// Override the composite-rule recursion bound (Phase 4 of M11).
+    ///
+    /// Intended for unit tests that exercise the depth-exceeded branch
+    /// without authoring 4 levels of self-similar composite rules. The
+    /// production default is [`crate::composite::MAX_EXTRACT_DEPTH`]
+    /// (`= 4`); the CLI does not surface this knob.
+    ///
+    /// Returns `self` for chaining: `Evaluator::new(...)?.with_max_extract_depth(2)`.
+    #[must_use]
+    pub fn with_max_extract_depth(mut self, depth: usize) -> Self {
+        self.max_extract_depth = depth;
+        self
+    }
+
+    /// Composite-rule recursion bound currently in effect — used by the
+    /// per-evaluate dispatch and exposed for tests that pin the
+    /// builder-method override.
+    #[must_use]
+    pub fn max_extract_depth(&self) -> usize {
+        self.max_extract_depth
     }
 
     /// Run every applicable rule against `ir` and collect the resulting
@@ -164,7 +271,16 @@ impl Evaluator {
         let value = ir.value().to_serde_json();
         let mut diagnostics = Vec::new();
         for rule in &self.rules {
-            evaluate_one_rule(rule, path, ir, &value, format_name, &mut diagnostics);
+            evaluate_one_rule_at_depth(
+                rule,
+                path,
+                ir,
+                &value,
+                format_name,
+                0,
+                self.max_extract_depth,
+                &mut diagnostics,
+            );
         }
         diagnostics
     }
@@ -198,9 +314,25 @@ impl Evaluator {
     }
 }
 
-/// Compile one [`Rule`] into a [`CompiledRule`] — runs jq compile and
-/// glob compile up front.
-fn compile_rule(rule: Rule) -> Result<CompiledRule> {
+/// Compile one [`Rule`] into a [`CompiledRule`] at the given recursion
+/// depth.
+///
+/// `current_depth` is the position of `rule` in the composite chain
+/// (0 = top level, 1 = nested inside a top-level composite, …). The
+/// helper bumps `current_depth` when descending into a `Check::Composite`
+/// `nested` rule and surfaces
+/// [`crate::ExecError::CompositeDepthExceeded`] if the chain would
+/// exceed `max_depth` at compile time. Production callers (the
+/// [`Evaluator::new`] entry point and the recursive
+/// [`crate::composite::compile_composite`]) drive this through
+/// [`crate::composite::MAX_EXTRACT_DEPTH`]; tests can dial it down via
+/// [`Evaluator::with_max_extract_depth`].
+pub(crate) fn compile_rule_to_depth(
+    rule: Rule,
+    source: &RuleSource,
+    current_depth: usize,
+    max_depth: usize,
+) -> Result<CompiledRule> {
     let filter_engine = match rule.match_.filter.as_deref() {
         Some(expr) => Some(
             JqEngine::compile(expr).map_err(|err| ExecError::RuleCompile {
@@ -210,10 +342,7 @@ fn compile_rule(rule: Rule) -> Result<CompiledRule> {
         ),
         None => None,
     };
-    let check_engine = JqEngine::compile(&rule.check.jq).map_err(|err| ExecError::RuleCompile {
-        rule_id: rule.id.clone(),
-        source: err,
-    })?;
+    let check = compile_check(&rule, source, current_depth, max_depth)?;
     let glob_matcher = match rule.match_.glob.as_deref() {
         Some(pattern) => {
             let glob = globset::Glob::new(pattern).map_err(|err| ExecError::GlobCompile {
@@ -289,7 +418,7 @@ fn compile_rule(rule: Rule) -> Result<CompiledRule> {
     Ok(CompiledRule {
         rule,
         filter_engine,
-        check_engine,
+        check,
         glob_matcher,
         loc_pointer_engine,
         loc_file_engine,
@@ -299,18 +428,108 @@ fn compile_rule(rule: Rule) -> Result<CompiledRule> {
     })
 }
 
+/// Compile the `check` block of a rule into a [`CompiledCheck`].
+///
+/// Routes the schema-bearing variants through [`crate::schema_check`],
+/// the jq variant through [`JqEngine::compile`], and the composite
+/// variant through [`crate::composite::compile_composite`] which
+/// recursively compiles the `nested` rule and bumps the depth counter.
+fn compile_check(
+    rule: &Rule,
+    source: &RuleSource,
+    current_depth: usize,
+    max_depth: usize,
+) -> Result<CompiledCheck> {
+    match &rule.check {
+        Check::Jq { jq, message } => {
+            let engine = JqEngine::compile(jq).map_err(|err| ExecError::RuleCompile {
+                rule_id: rule.id.clone(),
+                source: err,
+            })?;
+            Ok(CompiledCheck::Jq {
+                engine,
+                message: message.clone(),
+            })
+        }
+        Check::Schema { schema, message } => {
+            let compiled = compile_inline(&rule.id, schema, message.clone())?;
+            Ok(CompiledCheck::Schema(compiled))
+        }
+        Check::SchemaFile {
+            schema_file,
+            message,
+        } => {
+            // For `@std/<ns>` rulesets, the schema file is embedded in
+            // dq-lint and accessed via `dq_lint::std_schema(ns, file)`.
+            // For local rules, we resolve the path against the rule
+            // directory.
+            if let RuleSource::Std(namespace) = source {
+                let key = schema_file.as_str();
+                // Strip any leading `./` so callers can write the
+                // sibling path either way.
+                let key = key.strip_prefix("./").unwrap_or(key);
+                let text = dq_lint::std_schema(namespace, key).ok_or_else(|| {
+                    ExecError::SchemaCompile {
+                        rule_id: rule.id.clone(),
+                        message: format!(
+                            "embedded schema not found in @std/{namespace}: {schema_file}"
+                        ),
+                    }
+                })?;
+                let compiled = compile_from_embedded(&rule.id, text, message.clone())?;
+                Ok(CompiledCheck::Schema(compiled))
+            } else {
+                let compiled = compile_from_file(&rule.id, schema_file, source, message.clone())?;
+                Ok(CompiledCheck::Schema(compiled))
+            }
+        }
+        Check::Composite {
+            extract,
+            nested,
+            message,
+        } => {
+            // Phase 4: recursively compile the nested rule and the
+            // extract jq expression. Depth bumps inside
+            // `compile_composite` so the entire chain is validated up
+            // front; depth-exceeded surfaces as
+            // `ExecError::CompositeDepthExceeded`.
+            let compiled = compile_composite(
+                &rule.id,
+                extract,
+                nested,
+                message,
+                source,
+                current_depth,
+                max_depth,
+            )?;
+            Ok(CompiledCheck::Composite(Box::new(compiled)))
+        }
+    }
+}
+
 /// Run the per-rule pipeline against `(path, ir, value, format_name)` and
-/// push any resulting diagnostics into `out`.
+/// push any resulting diagnostics into `out`. `current_depth` /
+/// `max_depth` carry the composite-recursion budget so a `Composite`
+/// dispatch can recurse into its `nested` rule and trip the bound
+/// without crashing.
 ///
 /// `value` is the result of `ir.value().to_serde_json()` — pre-computed
 /// once per file by the caller so each rule's jq engines can reuse it
 /// without paying for the conversion N times.
-fn evaluate_one_rule(
+///
+/// Crate-internal: [`crate::composite::run_composite`] re-enters this
+/// helper on the `nested` rule with `current_depth + 1`, so the composite
+/// runtime can pin diagnostics to the inner rule's identity while the
+/// outer evaluator keeps the depth budget honest.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_one_rule_at_depth(
     rule: &CompiledRule,
     path: &Utf8Path,
     ir: &dq_core::Ir<'_>,
     value: &serde_json::Value,
     format_name: &str,
+    current_depth: usize,
+    max_depth: usize,
     out: &mut Vec<Diagnostic>,
 ) {
     // 1. Format match.
@@ -350,33 +569,51 @@ fn evaluate_one_rule(
         }
     }
 
-    // 4. Check eval.
-    let violations = match rule.check_engine.run(value) {
-        Ok(v) => v,
-        Err(err) => {
-            tracing::warn!(
-                rule_id = %rule.rule.id,
-                error = %err,
-                "check.jq raised a runtime error; skipping rule for this file",
-            );
-            return;
+    // 4. Check eval — dispatch on the compiled check variant.
+    match &rule.check {
+        CompiledCheck::Jq { engine, message } => {
+            let violations = match engine.run(value) {
+                Ok(v) => v,
+                Err(err) => {
+                    tracing::warn!(
+                        rule_id = %rule.rule.id,
+                        error = %err,
+                        "check.jq raised a runtime error; skipping rule for this file",
+                    );
+                    return;
+                }
+            };
+            for violation in &violations {
+                out.push(build_jq_diagnostic(rule, path, ir, violation, message));
+            }
         }
-    };
-
-    // 5. Build a diagnostic per violation.
-    for violation in &violations {
-        out.push(build_diagnostic(rule, path, ir, violation));
+        CompiledCheck::Schema(compiled) => {
+            run_schema_check(rule, compiled, path, ir, value, out);
+        }
+        CompiledCheck::Composite(compiled) => {
+            run_composite(
+                rule,
+                compiled,
+                path,
+                ir,
+                value,
+                current_depth,
+                max_depth,
+                out,
+            );
+        }
     }
 }
 
-/// Render a diagnostic for one violation value.
-fn build_diagnostic(
+/// Render a diagnostic for one jq-driven violation value.
+fn build_jq_diagnostic(
     rule: &CompiledRule,
     path: &Utf8Path,
     ir: &dq_core::Ir<'_>,
     violation: &serde_json::Value,
+    message_template: &str,
 ) -> Diagnostic {
-    let message = template::render(&rule.rule.check.message, violation);
+    let message = template::render(message_template, violation);
     let file = resolve_loc_file(rule, path, violation);
     let (line, col) = resolve_loc_position(rule, ir, violation);
     Diagnostic {
@@ -389,6 +626,79 @@ fn build_diagnostic(
         span: None,
         references: rule.rule.references.clone(),
         fix: rule.rule.fix.clone(),
+    }
+}
+
+/// Run a JSON Schema check and append one diagnostic per validation
+/// error.
+///
+/// Each error's `instance_path` is parsed as an RFC 6901 [`Pointer`];
+/// when the IR has a span for that pointer, the diagnostic's
+/// `(line, col)` come from `Ir::line_col_for`. The message format is
+/// `<message_prefix><keyword_location>: <error>` so reporters can show
+/// both the schema location and the human-readable explanation.
+///
+/// `loc.file`, `loc.pointer`, and `loc.line` overrides on the rule are
+/// honored via the same [`resolve_loc_file`] / [`resolve_loc_position`]
+/// helpers that the jq path uses. The `violation` argument passed to
+/// those helpers is the JSON value at the schema error's
+/// `instance_path` (or `Null` when the pointer is unresolvable), so any
+/// jq expressions in the `loc.*` fields run against meaningful context.
+fn run_schema_check(
+    rule: &CompiledRule,
+    compiled: &CompiledSchemaCheck,
+    path: &Utf8Path,
+    ir: &dq_core::Ir<'_>,
+    value: &serde_json::Value,
+    out: &mut Vec<Diagnostic>,
+) {
+    for error in compiled.validator.iter_errors(value) {
+        let pointer_str = error.instance_path.as_str();
+        // Lift the offending sub-value out of the document so any
+        // `loc.*` jq expressions run against the same shape an
+        // equivalent jq check would have produced. `serde_json::Value::pointer`
+        // accepts the same RFC 6901 string the validator produced.
+        let violation = value
+            .pointer(pointer_str)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let file = resolve_loc_file(rule, path, &violation);
+        let (line, col) = if rule.has_position_override() {
+            // The user opted into overrides; trust whatever the chain
+            // returned, including the (1, 1) default that signals an
+            // override miss.
+            resolve_loc_position(rule, ir, &violation)
+        } else {
+            // No override set — fall back to the intrinsic
+            // `instance_path → span` lookup the schema check used
+            // before Phase 2.
+            match Pointer::parse(pointer_str) {
+                Ok(pointer) => ir.line_col_for(&pointer).unwrap_or((1, 1)),
+                Err(parse_err) => {
+                    tracing::trace!(
+                        rule_id = %rule.rule.id,
+                        pointer = %pointer_str,
+                        error = %parse_err,
+                        "schema instance_path failed to parse as RFC 6901; defaulting to (1, 1)",
+                    );
+                    (1, 1)
+                }
+            }
+        };
+        let prefix = compiled.message_prefix.as_deref().unwrap_or("");
+        let keyword = error.schema_path.as_str();
+        let message = format!("{prefix}{keyword}: {error}");
+        out.push(Diagnostic {
+            rule_id: rule.rule.id.clone(),
+            severity: rule.rule.severity,
+            message,
+            file,
+            line,
+            col,
+            span: None,
+            references: rule.rule.references.clone(),
+            fix: rule.rule.fix.clone(),
+        });
     }
 }
 
@@ -1028,15 +1338,15 @@ loc:
         let mut provenance = ProvenanceMap::new();
         provenance.insert(
             pointer.as_canonical(),
-            Provenance::Original {
-                pointer: pointer.clone(),
-                span: Some(ValueSpan {
+            Provenance::original(
+                pointer.clone(),
+                Some(ValueSpan {
                     value_range: start..(start + 3),
                     line_range: 0..0,
                     indent: 0,
                     context: SpanContext::BlockMapValue,
                 }),
-            },
+            ),
         );
         // The actual `Value` shape is irrelevant — `loc.pointer` is the
         // jq-emitted string `/spec/containers/0`, looked up against the

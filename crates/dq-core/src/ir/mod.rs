@@ -101,6 +101,40 @@ pub enum SyntheticReason {
     Computed,
 }
 
+/// Position of a node's content relative to the start of its parent multiline
+/// scalar.
+///
+/// Populated by parsers for scalars whose body is meant to be re-parsed by
+/// another format (YAML block scalars `|` / `>` / `|-` / `>-`, markdown fenced
+/// code blocks). `None` everywhere else.
+///
+/// This is the side-channel that lets composite-rule evaluation (Phase 4 of
+/// `add-validation-and-extended-formats`, see the
+/// [`data-query-composite-rules`] spec) project inner-document line / column
+/// coordinates back to the outer source-file with sub-line precision: given an
+/// inner diagnostic at `(inner_line, inner_col)` and a parent block scalar
+/// whose anchor is at `(anchor_line, anchor_col)`, the projection is
+/// `final_line = anchor_line + inner_line - 1` and (when `inner_line == 1`)
+/// `final_col = inline_offset.col + inner_col - 1`. For YAML block scalars
+/// and markdown fenced code blocks the body always starts at line 1 col 1 of
+/// its own content — the fields are still carried explicitly so future
+/// formats with non-zero offsets (e.g. JSON strings consumed by a composite
+/// extract) can populate them without changing the type shape.
+///
+/// [`data-query-composite-rules`]: ../../../openspec/specs/data-query-composite-rules/spec.md
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InlineBaseline {
+    /// Byte offset within the parent scalar's content where this node's
+    /// content begins (0-based). For YAML block scalars the body starts at
+    /// offset `0` after the indicator + newline; markdown fenced code blocks
+    /// likewise start at offset `0` after the opening fence + newline.
+    pub byte_start: usize,
+    /// Line number within the parent scalar's content (1-based).
+    pub line: u32,
+    /// Column number within the parent scalar's content (1-based).
+    pub col: u32,
+}
+
 /// Provenance of a single value node.
 ///
 /// `Original` carries the source pointer (always present so callers can
@@ -109,6 +143,13 @@ pub enum SyntheticReason {
 /// ranges (jsonl, hcl, ini, dotenv, csv, tsv, dockerfile, ignore-list,
 /// markdown body) — the pointer is still meaningful for navigation, only
 /// position-aware lookup is unavailable.
+///
+/// `Original` also carries an optional [`InlineBaseline`] for nodes whose
+/// content lies inside a multiline parent scalar (YAML block scalars, markdown
+/// fenced code blocks). See [`InlineBaseline`] for the projection contract;
+/// the field is `None` for every node that does not participate in inline
+/// re-parsing — defaulting to `None` keeps existing read-only formats
+/// byte-identical through the lint pipeline.
 ///
 /// `Synthetic` is emitted by a transformation that produced the node from
 /// thin air or from an aggregation; see [`SyntheticReason`] for the closed
@@ -124,6 +165,11 @@ pub enum Provenance {
         /// Source byte range, when the parser populated a [`ValueSpan`].
         /// `None` for read-only formats whose parser carries no span map.
         span: Option<ValueSpan>,
+        /// Inline-offset baseline when this node's content lies inside a
+        /// multiline parent scalar (YAML block scalar, markdown fenced code
+        /// block). `None` everywhere else — including every other format
+        /// whose parser does not opt in to inline-offset population.
+        inline_offset: Option<InlineBaseline>,
     },
     /// Node produced by a transformation; no source pointer applies.
     Synthetic {
@@ -131,6 +177,27 @@ pub enum Provenance {
         /// node.
         reason: SyntheticReason,
     },
+}
+
+impl Provenance {
+    /// Convenience constructor for [`Provenance::Original`] that defaults
+    /// `inline_offset` to `None`.
+    ///
+    /// Phase 2 of `add-validation-and-extended-formats` extended `Original`
+    /// with an `inline_offset` field. Most callsites construct an `Original`
+    /// without inline-offset information (every read-only format, every span
+    /// derived from a `SpanMap` round-trip), so this helper keeps those
+    /// callsites short. Callers that *do* populate inline-offset (the YAML
+    /// block-scalar branch and the markdown fenced-code-block branch)
+    /// construct the variant in-place with the explicit field.
+    #[must_use]
+    pub fn original(pointer: Pointer, span: Option<ValueSpan>) -> Self {
+        Self::Original {
+            pointer,
+            span,
+            inline_offset: None,
+        }
+    }
 }
 
 /// Borrowed view of a parsed document plus its provenance side-channel.
@@ -263,6 +330,26 @@ impl<'a> Ir<'a> {
     pub fn span_for(&self, pointer: &Pointer) -> Option<&'a ValueSpan> {
         match self.provenance_for(pointer)? {
             Provenance::Original { span, .. } => span.as_ref(),
+            Provenance::Synthetic { .. } => None,
+        }
+    }
+
+    /// Look up the [`InlineBaseline`] for `pointer`'s canonical RFC 6901 form.
+    ///
+    /// Returns `None` in three cases (mirroring [`Ir::span_for`]):
+    ///
+    /// - The pointer has no entry in the provenance map (unknown pointer).
+    /// - The entry is [`Provenance::Synthetic`] — synthesised nodes cannot
+    ///   carry an inline-offset baseline.
+    /// - The entry is [`Provenance::Original`] but its `inline_offset` field
+    ///   is `None` — every node whose content does not live inside a
+    ///   multiline parent scalar.
+    ///
+    /// `O(1)` average — same lookup path as [`Ir::provenance_for`].
+    #[must_use]
+    pub fn inline_offset_for(&self, pointer: &Pointer) -> Option<&'a InlineBaseline> {
+        match self.provenance_for(pointer)? {
+            Provenance::Original { inline_offset, .. } => inline_offset.as_ref(),
             Provenance::Synthetic { .. } => None,
         }
     }
@@ -415,16 +502,21 @@ mod tests {
         let pointer = Pointer::parse("/name").expect("/name parses");
         provenance.insert(
             pointer.as_canonical(),
-            Provenance::Original {
-                pointer: pointer.clone(),
-                span: Some(sample_span()),
-            },
+            Provenance::original(pointer.clone(), Some(sample_span())),
         );
         let ir = Ir::new(&value, &provenance, FormatTag::Yaml);
         match ir.provenance_for(&pointer) {
-            Some(Provenance::Original { pointer: p, span }) => {
+            Some(Provenance::Original {
+                pointer: p,
+                span,
+                inline_offset,
+            }) => {
                 assert_eq!(p, &pointer);
                 assert!(span.is_some());
+                assert!(
+                    inline_offset.is_none(),
+                    "Provenance::original must default inline_offset to None",
+                );
             }
             other => panic!("expected Original with span, got: {other:?}"),
         }
@@ -438,10 +530,7 @@ mod tests {
         let span = sample_span();
         provenance.insert(
             pointer.as_canonical(),
-            Provenance::Original {
-                pointer: pointer.clone(),
-                span: Some(span.clone()),
-            },
+            Provenance::original(pointer.clone(), Some(span.clone())),
         );
         let ir = Ir::new(&value, &provenance, FormatTag::Yaml);
         assert_eq!(ir.span_for(&pointer), Some(&span));
@@ -473,10 +562,7 @@ mod tests {
         let pointer = Pointer::parse("/foo").expect("/foo parses");
         provenance.insert(
             pointer.as_canonical(),
-            Provenance::Original {
-                pointer: pointer.clone(),
-                span: None,
-            },
+            Provenance::original(pointer.clone(), None),
         );
         let ir = Ir::new(&value, &provenance, FormatTag::Hcl);
         assert_eq!(ir.span_for(&pointer), None);
@@ -499,10 +585,7 @@ mod tests {
         let pointer = Pointer::parse("/answer").expect("/answer parses");
         provenance.insert(
             pointer.as_canonical(),
-            Provenance::Original {
-                pointer,
-                span: Some(sample_span()),
-            },
+            Provenance::original(pointer, Some(sample_span())),
         );
         let format = FormatTag::Json;
         let original = OwnedIr::new(value.clone(), provenance.clone(), format);
@@ -813,16 +896,138 @@ mod tests {
         let pointer = Pointer::parse("/foo").expect("/foo parses");
         provenance.insert(
             pointer.as_canonical(),
-            Provenance::Original {
-                pointer: pointer.clone(),
-                span: Some(sample_span()),
-            },
+            Provenance::original(pointer.clone(), Some(sample_span())),
         );
         let ir = Ir::new(&value, &provenance, FormatTag::Yaml);
         assert!(ir.bytes().is_empty(), "Ir::new must default bytes to &[]");
         assert!(
             ir.line_col_for(&pointer).is_none(),
             "line_col_for must return None when bytes is empty",
+        );
+    }
+
+    // -- Phase 2 (`add-validation-and-extended-formats`) ------------------
+    //
+    // `Provenance::original` constructor + `Ir::inline_offset_for` lookup
+    // helper. Pin the contract that the constructor defaults
+    // `inline_offset` to `None`, that the lookup surfaces
+    // `Some(InlineBaseline)` when the parser populated it, and that all the
+    // negative-shaped sources (Synthetic, Original-without-offset, unmapped)
+    // collapse to `None` — exactly mirroring `span_for`'s contract.
+
+    fn sample_inline_offset() -> InlineBaseline {
+        // YAML block-scalar / markdown-fenced-code-block contract: body
+        // starts at the first byte, line 1 col 1 of the inner content.
+        InlineBaseline {
+            byte_start: 0,
+            line: 1,
+            col: 1,
+        }
+    }
+
+    #[test]
+    fn provenance_original_constructor_defaults_inline_offset_to_none() {
+        // Spec scenario: `Provenance::original(pointer, span)` MUST default
+        // `inline_offset` to `None`. The contract exists so existing
+        // callsites migrate via find/replace without specifying the new
+        // field.
+        let pointer = Pointer::parse("/x").expect("/x parses");
+        let prov = Provenance::original(pointer.clone(), Some(sample_span()));
+        match prov {
+            Provenance::Original {
+                pointer: p,
+                span,
+                inline_offset,
+            } => {
+                assert_eq!(p, pointer);
+                assert!(span.is_some());
+                assert!(
+                    inline_offset.is_none(),
+                    "constructor MUST default inline_offset to None — \
+                     a regression that started populating it would silently \
+                     change every read-only format's coordinate projection",
+                );
+            }
+            other => panic!("expected Original, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inline_offset_for_returns_some_when_populated() {
+        // Spec scenario "Lookup returns inline-offset": the helper exposes
+        // the `InlineBaseline` of the node's `Provenance::Original` entry
+        // when present.
+        let value = sample_value();
+        let mut provenance = ProvenanceMap::new();
+        let pointer = Pointer::parse("/script").expect("/script parses");
+        let baseline = sample_inline_offset();
+        provenance.insert(
+            pointer.as_canonical(),
+            Provenance::Original {
+                pointer: pointer.clone(),
+                span: Some(sample_span()),
+                inline_offset: Some(baseline),
+            },
+        );
+        let ir = Ir::new(&value, &provenance, FormatTag::Yaml);
+        assert_eq!(
+            ir.inline_offset_for(&pointer),
+            Some(&baseline),
+            "inline_offset_for must surface the populated baseline by reference",
+        );
+    }
+
+    #[test]
+    fn inline_offset_for_returns_none_when_absent() {
+        // Spec scenario "Lookup returns None when offset absent": `Original`
+        // with `inline_offset: None` must collapse to `None` so callers
+        // fall back to span-only positions.
+        let value = sample_value();
+        let mut provenance = ProvenanceMap::new();
+        let pointer = Pointer::parse("/x").expect("/x parses");
+        provenance.insert(
+            pointer.as_canonical(),
+            Provenance::original(pointer.clone(), Some(sample_span())),
+        );
+        let ir = Ir::new(&value, &provenance, FormatTag::Yaml);
+        assert!(
+            ir.inline_offset_for(&pointer).is_none(),
+            "Original{{inline_offset: None}} must produce None",
+        );
+    }
+
+    #[test]
+    fn inline_offset_for_returns_none_for_synthetic() {
+        // Mirror of `span_for_returns_none_for_synthetic`: synthesised
+        // nodes cannot carry an inline-offset baseline because they have
+        // no source position.
+        let value = sample_value();
+        let mut provenance = ProvenanceMap::new();
+        let pointer = Pointer::parse("/computed").expect("/computed parses");
+        for reason in [
+            SyntheticReason::Constructed,
+            SyntheticReason::Aggregated,
+            SyntheticReason::Computed,
+        ] {
+            provenance.insert(pointer.as_canonical(), Provenance::Synthetic { reason });
+            let ir = Ir::new(&value, &provenance, FormatTag::Yaml);
+            assert!(
+                ir.inline_offset_for(&pointer).is_none(),
+                "inline_offset_for must return None for Synthetic{{{reason:?}}} — \
+                 a synthesised node has no parent scalar to anchor against",
+            );
+        }
+    }
+
+    #[test]
+    fn inline_offset_for_returns_none_for_unmapped_pointer() {
+        let value = sample_value();
+        let provenance = ProvenanceMap::new();
+        let ir = Ir::new(&value, &provenance, FormatTag::Yaml);
+        let pointer = Pointer::parse("/missing").expect("/missing parses");
+        assert!(
+            ir.inline_offset_for(&pointer).is_none(),
+            "unmapped pointer must collapse to None",
         );
     }
 }

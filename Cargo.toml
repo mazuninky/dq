@@ -98,6 +98,21 @@ ureq = { version = "2.10", default-features = false, features = ["tls"] }
 # list) and edition-2024 / Rust 1.94 clean as of 0.52.
 comrak = { version = "0.52", default-features = false }
 
+# M11 XML — `quick-xml` is the event-based XML parser/writer consumed by
+# `dq-core/src/parsers/xml.rs`. The `serialize` feature is enabled so the
+# crate's `BytesDecl::new` constructor is available for re-emitting the
+# XML declaration on the write path; the parse path uses only the core
+# event-reader API. License: MIT.
+quick-xml = { version = "0.36", features = ["serialize"] }
+
+# M11 Phase 3 — JSON Schema 2020-12 validator used by `dq-exec` for the
+# `Check::Schema` / `Check::SchemaFile` rule variants. `default-features =
+# false` disables the `resolve-http` and `resolve-file` features so
+# `$ref` resolution stays in-schema (no network calls, no filesystem reads
+# from the validator) — this is the contract `data-query-jsonschema`
+# requires. License: MIT.
+jsonschema = { version = "0.34", default-features = false }
+
 # M7 transform — `dq-transform` embeds a jq evaluator via the `jaq` family
 # (jaq-core 3.0 + jaq-std 3.0 + jaq-json 2.0). The `sync` feature on
 # `jaq-json` swaps `Rc` for `Arc` so `Val: Send + Sync`, which is required for

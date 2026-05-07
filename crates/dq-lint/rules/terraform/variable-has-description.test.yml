@@ -1,0 +1,42 @@
+tests:
+  - name: variable without description fires
+    input: |
+      variable "region" {
+        type    = string
+        default = "us-east-1"
+      }
+    expected:
+      violations:
+        - rule: terraform.variable-has-description
+          message_contains: "region"
+  - name: variable with description passes
+    input: |
+      variable "region" {
+        description = "AWS region for the deployment"
+        type        = string
+        default     = "us-east-1"
+      }
+    expected:
+      violations: []
+  - name: variable with empty description fires
+    input: |
+      variable "x" {
+        description = ""
+        type        = string
+      }
+    expected:
+      violations:
+        - rule: terraform.variable-has-description
+          message_contains: "x"
+  - name: multiple variables, only undocumented one fires
+    input: |
+      variable "a" {
+        description = "A value"
+      }
+      variable "b" {
+        type = number
+      }
+    expected:
+      violations:
+        - rule: terraform.variable-has-description
+          message_contains: "b"
