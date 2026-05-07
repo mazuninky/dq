@@ -39,6 +39,11 @@ allow = [
     # via webpki-roots). It's a permissive data-licensing scheme — see
     # https://cdla.dev/permissive-2-0/.
     "CDLA-Permissive-2.0",
+    # M11: borrow-or-share (transitive via fluent-uri → referencing →
+    # jsonschema 0.34) is licensed under MIT-0 (MIT No Attribution) — a
+    # strictly more permissive variant of MIT that drops the attribution
+    # requirement. See https://opensource.org/license/mit-0.
+    "MIT-0",
 ]
 confidence-threshold = 0.8
 
