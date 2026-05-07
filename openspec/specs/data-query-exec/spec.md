@@ -244,7 +244,7 @@ When `args.rules` is non-empty, the loader resolves each value as either `@std/<
 
 ### Requirement: Rule compilation happens once per evaluator construction
 
-`Evaluator::new` SHALL compile every rule's `match.filter` (when present), every `Check::Jq`'s `jq`, every `Check::Composite`'s `extract` (and recursively the `nested` rule's compiled artefacts), AND every `Check::Schema` / `Check::SchemaFile`'s schema (into a `jsonschema::Validator`) exactly once, store the resulting compiled artefacts on the corresponding `CompiledRule`, and reuse them for every `evaluate_file` call. Compile failures propagate as `ExecError::RuleCompile { rule_id, source }` for jq compile errors and `ExecError::SchemaCompile { rule_id, source }` for schema compile errors. The evaluator MUST be `Send + Sync + Clone` so `Arc<Evaluator>` can be shared across rayon workers in the bulk lint path.
+`Evaluator::new` SHALL compile every rule's `match.filter` (when present), every `Check::Jq`'s `jq`, every `Check::Composite`'s `extract` (and recursively the `nested` rule's compiled artefacts), AND every `Check::Schema` / `Check::SchemaFile`'s schema (into a `jsonschema::Validator`) exactly once, store the resulting compiled artefacts on the corresponding `CompiledRule`, and reuse them for every `evaluate_file` call. Compile failures propagate as `ExecError::RuleCompile { rule_id, source }` for jq compile errors and `ExecError::SchemaCompile { rule_id, message }` for schema compile errors (where `message` is a stringified `jsonschema::ValidationError`). The evaluator MUST be `Send + Sync + Clone` so `Arc<Evaluator>` can be shared across rayon workers in the bulk lint path.
 
 #### Scenario: jq compile error names the offending rule
 - **WHEN** rule `k8s.bad` has `check.jq: '.foo |='` (missing RHS)
@@ -252,7 +252,7 @@ When `args.rules` is non-empty, the loader resolves each value as either `@std/<
 
 #### Scenario: Schema compile error names the offending rule
 - **WHEN** rule `js.bad` has `check.schema: { $ref: "https://invalid.example/" }`
-- **THEN** `Evaluator::new` returns `ExecError::SchemaCompile { rule_id: "js.bad", source: ... }`
+- **THEN** `Evaluator::new` returns `ExecError::SchemaCompile { rule_id: "js.bad", message: ... }`
 
 #### Scenario: Engine is Send + Sync
 - **WHEN** `fn assert_send_sync<T: Send + Sync>(_: &T) {}` is called with `&Evaluator`
@@ -272,7 +272,7 @@ pub enum ExecError {
     CompositeExtractMalformed { rule_id: String, missing_field: String },      // kind: composite_extract_malformed, exit 1
     CompositeExtractUnknownFormat { rule_id: String, format: String },         // kind: composite_extract_unknown_format, exit 1
     CompositeDepthExceeded { rule_id: String, depth: usize, max: usize },      // kind: composite_depth_exceeded, exit 1
-    SchemaCompile { rule_id: String, source: jsonschema::Error },              // kind: schema_compile, exit 3
+    SchemaCompile { rule_id: String, message: String },                        // kind: schema_compile, exit 3 — `message` is a stringified `jsonschema::ValidationError`; the upstream type borrows from the input so flattening to `String` keeps `ExecError` `'static + Send + Sync`
     SchemaFileAbsolutePath { rule_id: String, path: Utf8PathBuf },             // kind: schema_file_absolute_path, exit 3
     SchemaFileEscapesRuleDir { rule_id: String, path: Utf8PathBuf },           // kind: schema_file_escapes_rule_dir, exit 3
 }

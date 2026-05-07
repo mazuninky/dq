@@ -36,7 +36,11 @@ pub struct InlineBaseline {
     pub byte_start: usize,
     /// Line number within the parent scalar's content (1-based).
     pub line: u32,
-    /// Column number within the parent scalar's content (1-based).
+    /// Column number within the parent scalar's content, measured as a
+    /// 1-based count of Unicode scalar values (characters), NOT bytes.
+    /// Composite-rule projection computes `anchor.col + inner.col - 1`,
+    /// so multi-byte UTF-8 inputs require character semantics here to
+    /// stay consistent with how editors and span sources count columns.
     pub col: u32,
 }
 

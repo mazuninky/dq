@@ -4,13 +4,15 @@ description: |
   generators emit empty SDKs and doc renderers display a blank page.
   If the spec is intentionally a stub (e.g. authoring scaffolding),
   add a `paths: { /healthz: { get: { responses: { "200": { ... } } } } }`
-  placeholder so consumers see at least one operation.
+  placeholder so consumers see at least one operation. OpenAPI 3.1
+  webhook-only documents (with a non-empty top-level `webhooks` field
+  and no `paths`) are explicitly allowed.
 severity: warn
 match:
   format: [yaml, json]
   filter: '.openapi != null and (.openapi | type == "string")'
 check:
-  jq: 'select((.paths // {}) | length == 0) | {summary: "no paths defined"}'
+  jq: 'select(((.paths // {}) | length == 0) and ((.webhooks // {}) | length == 0)) | {summary: "no paths defined"}'
   message: "OpenAPI document declares no paths"
 references:
-  - https://spec.openapis.org/oas/latest.html#paths-object
+  - https://spec.openapis.org/oas/v3.1.0.html#paths-object

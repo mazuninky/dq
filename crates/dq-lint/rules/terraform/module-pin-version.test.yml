@@ -39,3 +39,10 @@ tests:
       violations:
         - rule: terraform.module-pin-version
           message_contains: "x"
+  - name: git source pinned via ?ref= is exempt
+    input: |
+      module "vpc" {
+        source = "git::https://example.com/vpc.git?ref=v1.2.3"
+      }
+    expected:
+      violations: []

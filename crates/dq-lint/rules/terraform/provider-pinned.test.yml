@@ -36,3 +36,34 @@ tests:
       violations:
         - rule: terraform.provider-pinned
           message_contains: "kubernetes"
+  - name: required_providers entry exempts modern Terraform layout
+    input: |
+      terraform {
+        required_providers {
+          aws = {
+            source  = "hashicorp/aws"
+            version = "~> 5.0"
+          }
+        }
+      }
+      provider "aws" {
+        region = "us-east-1"
+      }
+    expected:
+      violations: []
+  - name: required_providers without version still fires
+    input: |
+      terraform {
+        required_providers {
+          aws = {
+            source = "hashicorp/aws"
+          }
+        }
+      }
+      provider "aws" {
+        region = "us-east-1"
+      }
+    expected:
+      violations:
+        - rule: terraform.provider-pinned
+          message_contains: "aws"

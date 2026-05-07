@@ -299,6 +299,39 @@ fn parse_invalid_xml_returns_parse_error_variant() {
 }
 
 #[test]
+fn parse_rejects_multiple_root_elements() {
+    // Well-formed XML requires exactly one root element. Multi-root inputs
+    // like `<a/><b/>` would otherwise silently lose the second root through
+    // the writer (which only emits the first non-conventional key).
+    let err = xml()
+        .parse(b"<a/><b/>")
+        .expect_err("multi-root XML must surface as a parse error");
+    let dq_core::Error::Parse { message, .. } = &err else {
+        panic!("expected Error::Parse, got {err:?}");
+    };
+    assert!(
+        message.contains("exactly one root element"),
+        "expected message about exactly one root element, got: {message}",
+    );
+}
+
+#[test]
+fn parse_rejects_zero_root_elements() {
+    // Empty top-level (only PI/comments, no element) must also fail with
+    // the same "exactly one root element" parse error.
+    let err = xml()
+        .parse(b"<!-- comment only --><?pi?>")
+        .expect_err("zero-root XML must surface as a parse error");
+    let dq_core::Error::Parse { message, .. } = &err else {
+        panic!("expected Error::Parse, got {err:?}");
+    };
+    assert!(
+        message.contains("exactly one root element"),
+        "expected message about exactly one root element, got: {message}",
+    );
+}
+
+#[test]
 fn write_top_level_non_map_is_format_error() {
     // The XML writer cannot serialise a non-map root — this surfaces as
     // `Error::Format { format: "xml", ... }`, not a panic.

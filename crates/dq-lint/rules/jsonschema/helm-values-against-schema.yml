@@ -6,7 +6,9 @@ description: |
   in production, users override `check.schema_file` to point at their own
   per-chart schema. Add `glob: '**/values.yaml'` (or your chart-specific
   pattern) to limit the rule to actual values files when authoring a
-  custom override.
+  custom override — without the glob the rule fires against every YAML
+  file in the project, which is intentional for the bundled fixture but
+  noisy in real Helm projects.
 severity: error
 match:
   format: yaml

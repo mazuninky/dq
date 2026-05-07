@@ -10,13 +10,28 @@ severity: error
 match:
   format: hcl
 check:
+  # cidr_blocks is scoped to an `ingress` block to avoid flagging the
+  # canonical aws_security_group egress = ["0.0.0.0/0"] pattern.
+  # source_ranges is searched anywhere — in google_compute_firewall it
+  # defines ingress sources by spec (destination_ranges is the egress
+  # counterpart), so a top-level source_ranges always implies ingress.
+  # IPv6 ::/0 is treated as equally permissive as IPv4 0.0.0.0/0.
   jq: |
-    [.. | objects | to_entries[]?
-      | select(.key == "cidr_blocks" or .key == "source_ranges")
-      | select(.value | type == "array")
-      | select(.value | any(. == "0.0.0.0/0"))
-      | {key: .key}][]
-  message: "{{ .key }} contains 0.0.0.0/0 — restrict to a private CIDR or named source"
+    [
+      ( .. | objects | .ingress? | objects | to_entries[]?
+        | select(.key == "cidr_blocks")
+        | select(.value | type == "array")
+        | select(.value | any(. == "0.0.0.0/0" or . == "::/0"))
+        | {key: .key}
+      ),
+      ( .. | objects | to_entries[]?
+        | select(.key == "source_ranges")
+        | select(.value | type == "array")
+        | select(.value | any(. == "0.0.0.0/0" or . == "::/0"))
+        | {key: .key}
+      )
+    ] | flatten | .[]
+  message: "{{ .key }} contains 0.0.0.0/0 (or ::/0) — restrict to a private CIDR or named source"
 references:
   - https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/security-group-rules.html
   - https://cloud.google.com/vpc/docs/firewalls

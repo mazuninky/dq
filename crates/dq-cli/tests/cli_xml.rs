@@ -129,11 +129,16 @@ fn smoke_convert_dockerfile_format_target_is_rejected_at_clap_layer() {
 }
 
 #[test]
-fn smoke_convert_xml_to_json_lossy_warning_is_not_emitted_for_xml_target() {
-    // The convert path's `maybe_warn_lossy` warns when *targeting* a format
-    // that drops YAML metadata. Selecting `-F xml` from a YAML source must
-    // emit the warning since XML cannot carry YAML comments. Pinning this
-    // protects the warning's coverage as the format set grows.
+fn smoke_convert_yaml_to_xml_exit_code() {
+    // Selecting `-F xml` from a YAML source goes through the XML writer;
+    // this smoke test pins the exit-code envelope (success or
+    // `Error::Format` mapped to GENERIC=1) so we don't accidentally
+    // regress to a panic / clap-rejection when the XML format set evolves.
+    //
+    // We deliberately do NOT assert on stderr `tracing::warn!` output —
+    // the subscriber is wired up via `tracing_subscriber::fmt`, but
+    // pinning its format (color codes, env-filter shape, line layout) is
+    // fragile. The exit-code envelope is the stable contract worth pinning.
     let out = dq()
         .args([
             "convert",
@@ -141,7 +146,8 @@ fn smoke_convert_xml_to_json_lossy_warning_is_not_emitted_for_xml_target() {
             "-F",
             "xml",
             "--no-color",
-            // Verbose to surface the tracing::warn! line in stderr.
+            // Verbose so any tracing::warn! lines (e.g. lossy-format
+            // notice) reach stderr — exit-code semantics are unchanged.
             "-v",
         ])
         .assert();

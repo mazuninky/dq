@@ -311,6 +311,39 @@ check:
 }
 
 #[test]
+fn inline_schema_honors_loc_file_override() {
+    // Phase 2 contract: schema diagnostics route `loc.file` through
+    // `resolve_loc_file`, the same helper jq diagnostics use. A rule
+    // that sets `loc.file` to a literal string must produce a
+    // diagnostic whose `file` reflects the override, not the input
+    // file path.
+    let yaml = r#"
+id: test.schema-loc-file
+description: x
+severity: error
+match:
+  format: yaml
+check:
+  schema:
+    type: object
+    required: [name]
+loc:
+  file: '"override.txt"'
+"#;
+    let eval = evaluator_from_yaml(yaml);
+    let value = serde_json::json!({});
+    let owned = ir_for(&value, "yaml");
+    let path = Utf8PathBuf::from("doc.yaml");
+    let diags = eval.evaluate_file(&path, &owned.to_borrowed(), "yaml");
+    assert_eq!(diags.len(), 1, "expected one diagnostic, got: {diags:?}");
+    assert_eq!(
+        diags[0].file.as_deref(),
+        Some(Utf8PathBuf::from("override.txt").as_path()),
+        "loc.file override must drive diagnostic file path",
+    );
+}
+
+#[test]
 fn embedded_std_jsonschema_kubernetes_crd_loads_and_evaluates() {
     // Pin the @std/jsonschema namespace ships and the
     // kubernetes-crd-shape rule emits a diagnostic for an

@@ -9,9 +9,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - M11 Phase 5 — extended rulesets `@std/terraform` and `@std/openapi`
-  land, raising the standard rule library to 8 namespaces and ≥ 57
-  embedded rules. Both namespaces ship in every build (no feature
-  gates).
+  land, raising the standard rule library to 8 namespaces (`k8s`,
+  `dockerfile`, `npm`, `github-actions`, `markdown`, `jsonschema`,
+  `terraform`, `openapi`) and 64 embedded rules. Both namespaces ship
+  in every build (no feature gates).
   - `@std/terraform` ships 8 rules covering common security, hygiene,
     and reproducibility footguns: `no-hardcoded-secrets` (literal
     `password = "..."` / `api_key = "..."` / `token = "..."`

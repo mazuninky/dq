@@ -12,7 +12,8 @@ check:
   jq: |
     [.variable // {} | to_entries[]
       | select(.value.description == null
-              or (.value.description | type == "string" and (. | length == 0)))
+              or (.value.description | type != "string")
+              or (.value.description | length == 0))
       | {name: .key}][]
   message: "Variable '{{ .name }}' has no description"
 references:

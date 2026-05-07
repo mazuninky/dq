@@ -1,9 +1,10 @@
 id: openapi.response-200-or-201-required
 description: |
-  Every operation should declare at least one success response
-  (`200`, `201`, or the wildcard `2XX`). Operations that only document
-  error responses confuse generated SDKs (the success-payload type is
-  unknown) and tests that expect a happy-path call to return a body.
+  Every operation should declare at least one success response — any
+  individual `2xx` status (e.g. `200`, `201`, `202`, `204`, `206`) or
+  the wildcard `2XX`. Operations that only document error responses
+  confuse generated SDKs (the success-payload type is unknown) and
+  tests that expect a happy-path call to return a body.
 severity: warn
 match:
   format: [yaml, json]
@@ -18,8 +19,8 @@ check:
       | .value
       | select((.responses // {})
               | keys
-              | any(. == "200" or . == "201" or . == "2XX") | not)
+              | any(test("^2([0-9]{2}|XX)$")) | not)
       | {path: $path, method: ($method | ascii_upcase)}][]
-  message: "Operation {{ .method }} {{ .path }} has no 200/201/2XX response"
+  message: "Operation {{ .method }} {{ .path }} has no 2xx success response"
 references:
-  - https://spec.openapis.org/oas/latest.html#responses-object
+  - https://spec.openapis.org/oas/v3.1.0.html#responses-object

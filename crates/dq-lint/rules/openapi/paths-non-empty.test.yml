@@ -31,3 +31,14 @@ tests:
       kind: ConfigMap
     expected:
       violations: []
+  - name: 3.1 webhook-only spec passes
+    input: |
+      openapi: "3.1.0"
+      info: { title: API, version: "1.0.0" }
+      webhooks:
+        userCreated:
+          post:
+            responses:
+              "200": { description: ok }
+    expected:
+      violations: []

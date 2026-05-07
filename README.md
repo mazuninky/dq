@@ -13,7 +13,7 @@ linter-engine — всё в одном single static binary.
 - **Composite rules (cross-format).** A rule can `extract:` substrings from one format (jq returns `[{value, format, anchor}]`), reparse each item as a different format, and run a `nested:` rule with diagnostics projected back to outer-file coordinates. Recursion bounded at `MAX_EXTRACT_DEPTH = 4`. Inner-format parse failures emit `<outer>.parse-failed` diagnostics. First reference rule: `@std/markdown/code-blocks-yaml-valid`.
 - **Inline-level position spans.** YAML block scalars (`|`, `>`, `|-`, `>-`) and markdown fenced code blocks now carry `Provenance::Original.inline_offset = Some(InlineBaseline { 0, 1, 1 })` so composite-rule projection has sub-line precision. `Ir::inline_offset_for(&pointer)` is the new public lookup.
 - **XML read+write.** `XmlFormat` via `quick-xml` 0.36 — element structure, attributes, comments, CDATA, processing instructions, namespace prefixes, and the XML declaration round-trip. Mixed content (text interleaved with child elements) folds into `"#text"` and emits a `tracing::warn!` on parse — that's the partial-round-trip contract for config-shaped XML.
-- **Two new standard rulesets.** `@std/terraform` (8 rules) and `@std/openapi` (6 rules). Standard rule library now ≥ 64 rules across 8 namespaces.
+- **Two new standard rulesets.** `@std/terraform` (8 rules) and `@std/openapi` (6 rules). Standard rule library now ships 64 rules across 8 namespaces (`k8s`, `dockerfile`, `npm`, `github-actions`, `markdown`, `jsonschema`, `terraform`, `openapi`).
 
 M10 adds the `dq fix` subcommand: rules carry an optional `fix.jq` whole-document transform that the engine applies to every matching file. The handler honours the same write-mode discipline as `dq set` / `dq del` (`-i` atomic write, `--diff` unified-diff to stdout, `--check` pre-commit gate exit 1, `--continue-on-error`, `--parallel`). `Fixer` enforces idempotency at runtime — applying `fix.jq` twice must yield the same value or the rule is skipped with a `tracing::warn!` log line (rule-author bug, never silently double-applied). Two existing `@std` rules (`@std/k8s/image-pull-policy-always`, `@std/npm/has-license`) ship `fix:` blocks as proof. **Comment preservation**: same trade-off as `dq set --jq` — re-emit goes through `Format::write_with_options` and drops comments. M12 lands the `dq-plugin` crate, the `dq:plugin@0.1.0` WIT schema, and a `--plugins <DIR>` global flag for `dq lint` / `dq fix`; feature-gated behind `--features plugins` so the default static binary stays small. See [Plugins (experimental)](#plugins-experimental) below for the contract and a Rust reference plugin.
 
@@ -104,7 +104,7 @@ dq query '.spec.containers[].image' deploy.yaml -F json
 dq set <FILE> --jq '.spec.replicas |= . + 1' -i
 dq set 'k8s/**/*.yaml' --jq '.image |= sub(":latest"; ":v1")' -i --parallel 4
 
-# M8 lint engine — 46 standard rules across @std/{k8s, dockerfile, github-actions, markdown, npm}
+# M8 lint engine — 64 standard rules across @std/{k8s, dockerfile, github-actions, markdown, npm, jsonschema, terraform, openapi}
 dq lint k8s/**/*.yaml                  # auto-binds @std/k8s + ./.dq/rules/*.yml
 dq lint --rules @std/k8s deploy.yaml   # explicit ruleset
 dq lint -F sarif file.yaml > lint.sarif # SARIF for GitHub Code Scanning

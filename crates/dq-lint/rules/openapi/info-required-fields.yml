@@ -11,4 +11,4 @@ match:
 check:
   schema_file: ./openapi-info.schema.json
 references:
-  - https://spec.openapis.org/oas/latest.html#info-object
+  - https://spec.openapis.org/oas/v3.1.0.html#info-object

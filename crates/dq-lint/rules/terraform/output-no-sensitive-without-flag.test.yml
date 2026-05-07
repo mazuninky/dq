@@ -40,3 +40,4 @@ tests:
     expected:
       violations:
         - rule: terraform.output-no-sensitive-without-flag
+          message_contains: "ssh_key"

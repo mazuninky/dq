@@ -375,6 +375,24 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
             Value::Array(top_comments.into_iter().map(Value::String).collect()),
         );
     }
+    // Well-formed XML requires exactly one root element. The writer
+    // (`render_xml`) silently emits only the first non-conventional key
+    // when more than one is present, so we fail loudly here during parse
+    // instead of accepting input we cannot round-trip. Conventional keys
+    // (`#xml`, `#pi`, `#comments`) are not "elements" and don't count.
+    let root_count: usize = top_children.values().map(Vec::len).sum();
+    if root_count != 1 {
+        let pos = reader.buffer_position() as usize;
+        let (line, col) = byte_pos_to_line_col(text, pos);
+        return Err(Error::Parse {
+            file: None,
+            line,
+            col,
+            span: pos..pos,
+            snippet: snippet_for_pos(text, pos),
+            message: format!("XML must have exactly one root element; found {root_count}",),
+        });
+    }
     for (name, group) in top_children {
         top.insert(name, Value::Array(group));
     }

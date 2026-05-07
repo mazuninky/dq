@@ -154,6 +154,20 @@ pub(crate) struct CompiledRule {
     pub(crate) fix_ops_engine: Option<JqEngine>,
 }
 
+impl CompiledRule {
+    /// Whether the rule declares a `loc.pointer` or `loc.line` override
+    /// that should drive the diagnostic's `(line, col)` instead of the
+    /// intrinsic span lookup.
+    ///
+    /// Used by [`run_schema_check`] to decide whether to fall back to
+    /// `Ir::line_col_for(instance_path)` when no override is set —
+    /// preserving the pre-Phase-2 schema behaviour for rules that did
+    /// not opt into the chain.
+    pub(crate) fn has_position_override(&self) -> bool {
+        self.loc_pointer_engine.is_some() || self.loc_line_engine.is_some()
+    }
+}
+
 impl std::fmt::Debug for CompiledRule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CompiledRule")
@@ -623,6 +637,13 @@ fn build_jq_diagnostic(
 /// `(line, col)` come from `Ir::line_col_for`. The message format is
 /// `<message_prefix><keyword_location>: <error>` so reporters can show
 /// both the schema location and the human-readable explanation.
+///
+/// `loc.file`, `loc.pointer`, and `loc.line` overrides on the rule are
+/// honored via the same [`resolve_loc_file`] / [`resolve_loc_position`]
+/// helpers that the jq path uses. The `violation` argument passed to
+/// those helpers is the JSON value at the schema error's
+/// `instance_path` (or `Null` when the pointer is unresolvable), so any
+/// jq expressions in the `loc.*` fields run against meaningful context.
 fn run_schema_check(
     rule: &CompiledRule,
     compiled: &CompiledSchemaCheck,
@@ -633,16 +654,35 @@ fn run_schema_check(
 ) {
     for error in compiled.validator.iter_errors(value) {
         let pointer_str = error.instance_path.as_str();
-        let (line, col) = match Pointer::parse(pointer_str) {
-            Ok(pointer) => ir.line_col_for(&pointer).unwrap_or((1, 1)),
-            Err(parse_err) => {
-                tracing::trace!(
-                    rule_id = %rule.rule.id,
-                    pointer = %pointer_str,
-                    error = %parse_err,
-                    "schema instance_path failed to parse as RFC 6901; defaulting to (1, 1)",
-                );
-                (1, 1)
+        // Lift the offending sub-value out of the document so any
+        // `loc.*` jq expressions run against the same shape an
+        // equivalent jq check would have produced. `serde_json::Value::pointer`
+        // accepts the same RFC 6901 string the validator produced.
+        let violation = value
+            .pointer(pointer_str)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let file = resolve_loc_file(rule, path, &violation);
+        let (line, col) = if rule.has_position_override() {
+            // The user opted into overrides; trust whatever the chain
+            // returned, including the (1, 1) default that signals an
+            // override miss.
+            resolve_loc_position(rule, ir, &violation)
+        } else {
+            // No override set — fall back to the intrinsic
+            // `instance_path → span` lookup the schema check used
+            // before Phase 2.
+            match Pointer::parse(pointer_str) {
+                Ok(pointer) => ir.line_col_for(&pointer).unwrap_or((1, 1)),
+                Err(parse_err) => {
+                    tracing::trace!(
+                        rule_id = %rule.rule.id,
+                        pointer = %pointer_str,
+                        error = %parse_err,
+                        "schema instance_path failed to parse as RFC 6901; defaulting to (1, 1)",
+                    );
+                    (1, 1)
+                }
             }
         };
         let prefix = compiled.message_prefix.as_deref().unwrap_or("");
@@ -652,7 +692,7 @@ fn run_schema_check(
             rule_id: rule.rule.id.clone(),
             severity: rule.rule.severity,
             message,
-            file: Some(path.to_path_buf()),
+            file,
             line,
             col,
             span: None,

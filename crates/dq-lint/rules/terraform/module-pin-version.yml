@@ -16,6 +16,7 @@ check:
       | select(.value.source != null)
       | select(.value.source | type == "string")
       | select(.value.source | startswith("./") or startswith("../") | not)
+      | select(.value.source | contains("?ref=") | not)
       | select(.value.version == null)
       | {name: .key, source: .value.source}][]
   message: "Module '{{ .name }}' (source: {{ .source }}) has no version pin"
