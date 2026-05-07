@@ -44,10 +44,18 @@ spec:
     // type rather than the exit code (the in-process `dq::run` returns
     // the marker error so the caller can route it).
     let result = dq::run(&cli, false, &mut out, &mut err);
+    // Pin the failure mode to the `LintFail` marker rather than just
+    // `is_err()`. Bare `is_err()` is implicitly coupled to
+    // `kubernetes-crd-shape` having `severity: error` — flipping that
+    // rule's severity to `warn` would make `dq lint` succeed without
+    // `--strict` and silently invert this assertion's meaning. Asserting
+    // on the marker type catches that regression.
+    let run_err = result
+        .expect_err("lint should fail because the schema rule fires on a missing metadata.name");
     assert!(
-        result.is_err(),
-        "lint should fail because the schema rule fires on a missing metadata.name; \
-         stdout={:?}, stderr={:?}",
+        run_err.downcast_ref::<dq::LintFail>().is_some(),
+        "expected LintFail marker (severity=error rule fires); \
+         stdout={:?}, stderr={:?}, err={run_err:?}",
         String::from_utf8_lossy(&out),
         String::from_utf8_lossy(&err),
     );

@@ -14,7 +14,7 @@ pub mod exit_code;
 pub mod output;
 
 pub use cli::{Cli, Command};
-pub use error::{SilentError, ValidateFail};
+pub use error::{LintFail, SilentError, ValidateFail};
 
 use std::io::Write;
 
