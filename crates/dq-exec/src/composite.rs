@@ -206,9 +206,9 @@ pub(crate) fn run_composite(
             return;
         }
     };
-    let array = match extract_outputs.first() {
-        Some(serde_json::Value::Array(items)) => items,
-        Some(other) => {
+    let array = match extract_outputs.as_slice() {
+        [serde_json::Value::Array(items)] => items,
+        [other] => {
             tracing::warn!(
                 rule_id = %outer_id,
                 shape = %describe_value_shape(other),
@@ -222,7 +222,7 @@ pub(crate) fn run_composite(
             ));
             return;
         }
-        None => {
+        [] => {
             tracing::warn!(
                 rule_id = %outer_id,
                 "composite extract produced empty stream; expected one array",
@@ -231,6 +231,21 @@ pub(crate) fn run_composite(
                 outer_rule,
                 path,
                 "composite extract produced no outputs (expected exactly one array)".to_owned(),
+                "composite-extract-not-array",
+            ));
+            return;
+        }
+        [_, _, ..] => {
+            let count = extract_outputs.len();
+            tracing::warn!(
+                rule_id = %outer_id,
+                count,
+                "composite extract produced multiple outputs; expected exactly one array",
+            );
+            out.push(error_diagnostic(
+                outer_rule,
+                path,
+                format!("composite extract produced {count} outputs (expected exactly one array)"),
                 "composite-extract-not-array",
             ));
             return;
@@ -676,6 +691,51 @@ check:
     }
 
     #[test]
+    fn extract_returning_multiple_outputs_emits_composite_error_diagnostic() {
+        // The contract is: extract must produce *exactly one* array. A jq
+        // filter that emits a stream of multiple outputs (comma-separated)
+        // is buggy — even if the first happens to be an array, dropping
+        // the rest would give the user falsely confident diagnostics. The
+        // runtime must surface this with a `composite-extract-not-array`
+        // diagnostic that names the count.
+        let yaml = r#"
+id: test.multi-extract
+description: x
+severity: error
+match:
+  format: yaml
+check:
+  extract: '[{value: "a", format: "yaml", anchor: ""}], [{value: "b", format: "yaml", anchor: ""}]'
+  nested:
+    id: test.multi-extract.inner
+    description: i
+    severity: warn
+    match:
+      format: yaml
+    check:
+      jq: '.'
+      message: m
+  message: 'outer'
+"#;
+        let eval = evaluator(yaml);
+        let value = json!({});
+        let owned = ir_for_test(&value);
+        let diags =
+            eval.evaluate_file(&Utf8PathBuf::from("doc.yaml"), &owned.to_borrowed(), "yaml");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(
+            diags[0].rule_id,
+            "test.multi-extract.composite-extract-not-array"
+        );
+        assert!(
+            diags[0].message.contains("2 outputs"),
+            "expected message to name the output count; got: {}",
+            diags[0].message
+        );
+        assert!(diags[0].message.contains("expected exactly one array"));
+    }
+
+    #[test]
     fn extract_item_missing_value_field_emits_malformed_diagnostic() {
         let eval = evaluator(PASSTHROUGH_COMPOSITE_RULE);
         let value = json!({
@@ -858,7 +918,7 @@ check:
     }
 
     #[test]
-    fn self_similar_composite_compile_trips_at_default_depth() {
+    fn self_similar_composite_compiles_cleanly_at_default_depth() {
         // The default `MAX_EXTRACT_DEPTH = 4` is bigger than any chain we
         // construct in this test file. To pin the compile-time depth
         // bound, build the same self-similar shape with a reduced depth.

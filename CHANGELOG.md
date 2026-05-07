@@ -41,7 +41,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `operationId` and emit one diagnostic per duplicated id with a
     count), `response-200-or-201-required` (every operation under
     `get|post|put|delete|patch|options|head|trace` declares at least
-    one of `200`, `201`, or the wildcard `2XX`), `no-trailing-slash`
+    one 2xx success response — any specific code from `200`–`299`
+    such as `200`/`201`/`202`/`204` or the wildcard `2XX`), `no-trailing-slash`
     (path keys other than the root `/` must not end with `/`), and
     `security-defined` (top-level `security:` is non-empty OR every
     operation has its own `security:` — operations can opt out
