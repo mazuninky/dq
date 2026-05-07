@@ -8,6 +8,124 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- M11 Phase 5 — extended rulesets `@std/terraform` and `@std/openapi`
+  land, raising the standard rule library to 8 namespaces and ≥ 57
+  embedded rules. Both namespaces ship in every build (no feature
+  gates).
+  - `@std/terraform` ships 8 rules covering common security, hygiene,
+    and reproducibility footguns: `no-hardcoded-secrets` (literal
+    `password = "..."` / `api_key = "..."` / `token = "..."`
+    assignments — variable and data-source references that the HCL
+    parser surfaces as `${...}` template strings are silently
+    allowed), `tag-required` (every `resource "aws_*"` block has a
+    top-level `tags` map), `provider-pinned` (every `provider` block
+    has `version = "..."`), `no-public-ingress` (`cidr_blocks` /
+    `source_ranges` containing `0.0.0.0/0` on AWS security groups
+    and GCP firewalls), `state-backend-required` (every `terraform`
+    block has a nested `backend "..." { ... }`), `module-pin-version`
+    (remote `module { source = "..." }` blocks have `version`;
+    local-path sources `./` and `../` are exempt),
+    `output-no-sensitive-without-flag` (output names matching
+    `secret|password|token|key|credential` must set
+    `sensitive = true`), and `variable-has-description` (every
+    `variable` block has a non-empty `description`). Fixtures cover
+    35 cases across the 8 rules.
+  - `@std/openapi` ships 6 rules — implemented entirely through plain
+    jq + JSON Schema over the YAML/JSON parser, with no `oas3`
+    dependency (see design D6 implementation note for the rationale):
+    `info-required-fields` (uses `check.schema_file:
+    ./openapi-info.schema.json` to require non-empty
+    `info.title`/`info.version`), `paths-non-empty` (the document
+    declares at least one path), `operation-id-unique` (group every
+    `operationId` and emit one diagnostic per duplicated id with a
+    count), `response-200-or-201-required` (every operation under
+    `get|post|put|delete|patch|options|head|trace` declares at least
+    one of `200`, `201`, or the wildcard `2XX`), `no-trailing-slash`
+    (path keys other than the root `/` must not end with `/`), and
+    `security-defined` (top-level `security:` is non-empty OR every
+    operation has its own `security:` — operations can opt out
+    explicitly with `security: []`). Each rule's `match.filter`
+    pins on `.openapi != null and (.openapi | type == "string")` so
+    non-OpenAPI YAML/JSON is silently skipped. Fixtures cover 28
+    cases across the 6 rules.
+  - HCL backend has **no span information** (see
+    `crates/dq-core/src/parsers/hcl.rs` doc-comment) — every Terraform
+    diagnostic resolves to `(line=1, col=1)`. The fixture runner
+    exercises rule logic; precise sub-line coordinates land when the
+    HCL parser grows a span-aware path. OpenAPI diagnostics, by
+    contrast, carry full YAML/JSON spans through the existing
+    `loc.pointer` lookup.
+  - New `dq_lint::std_schema_files(namespace)` accessor enumerates
+    every embedded JSON Schema sidecar for a namespace as
+    `(filename, contents)` pairs. The integration test runner uses
+    it to stage `helm-values-template.schema.json` and
+    `openapi-info.schema.json` next to the rule YAML so
+    `check.schema_file:` resolution works end-to-end against
+    tempdir-staged copies of the embedded namespaces.
+
+- M11 Phase 3 — `Rule.check` becomes a four-variant enum and JSON Schema
+  2020-12 lands as a first-class rule type. The `dq-exec::rule::Check`
+  enum now covers `Jq` (legacy), `Schema` (inline JSON Schema 2020-12),
+  `SchemaFile` (sibling-relative schema document), and `Composite`
+  (parser-side stub for Phase 4 cross-format checks). Existing
+  `check: { jq, message }` rules continue to parse unchanged through the
+  `RuleCheck` alias. Schema validators are compiled once at
+  `Evaluator::new` (via the new `dq-exec::schema_check` module) and
+  reused across every `evaluate_file` call. Each validation error
+  produces one `Diagnostic` with `pointer` recovered from
+  `error.instance_path` (RFC 6901), the `keyword_location` embedded in
+  the message, and `(line, col)` looked up through
+  `Ir::line_col_for(&pointer)` (or `(1, 1)` fallback when no span is
+  available). The `schema_file:` resolver canonicalises both the rule
+  directory and the schema path and rejects absolute paths
+  (`ExecError::SchemaFileAbsolutePath`) and `..`-escapes
+  (`ExecError::SchemaFileEscapesRuleDir`). External `$ref` targets
+  (`http://`, `https://`, `file://`, or any scheme other than internal
+  fragment refs) are rejected at compile time
+  (`ExecError::SchemaCompile`) — the validator runs with the default
+  `referencing::DefaultRetriever`, which performs no network or
+  filesystem reads. New `ExecError` variants:
+  `CheckMutuallyExclusive`, `CheckMissing`, `CompositeIncomplete`,
+  `CompositeExtractNotArray`, `CompositeExtractMalformed`,
+  `CompositeExtractUnknownFormat`, `CompositeDepthExceeded`,
+  `SchemaCompile`, `SchemaFileAbsolutePath`,
+  `SchemaFileEscapesRuleDir` — each with stable `kind_name()` strings
+  and CLI exit-code mappings (`composite_extract_*` /
+  `composite_depth_exceeded` → `GENERIC` (1); the rest →
+  `PARSE_ERROR` (3)). New `@std/jsonschema` ruleset shipping three
+  reference rules: `jsonschema.kubernetes-crd-shape` (inline schema
+  validating `apiVersion` / `kind` / `metadata.name`),
+  `jsonschema.helm-values-against-schema` (template using
+  `schema_file: ./helm-values-template.schema.json`), and
+  `jsonschema.openapi-3.1-shape` (inline schema for OpenAPI 3.1 root
+  structure). Each ships with a co-located `*.test.yml` fixture; new
+  `dq_lint::std_schema(namespace, file)` accessor exposes embedded
+  schema sidecars. Workspace dependency:
+  `jsonschema = { version = "0.34", default-features = false }` —
+  the `resolve-http` and `resolve-file` features stay off so no HTTP
+  or FS access leaks into the validator.
+
+- M11 Phase 1 — XML 1.0 read+write format. New `XmlFormat` (registered for
+  `.xml` extension; selectable via `-F xml`) backed by `quick-xml 0.36`
+  parses and serialises XML through a conventional-key mapping onto the
+  existing `Value` enum: `<tag>` becomes `Map { tag => Array<Map { ... }> }`
+  on the parent (multi-element same-tag children stored in a single Array
+  to preserve document order — even single occurrences are wrapped in a
+  one-element array so `Pointer` indexing is stable). Element attributes
+  live under `@attrs`; element text body under `#text`; comments under
+  `#comments`; CDATA blocks under `#cdata`; processing instructions under
+  `#pi`; the `<?xml ...?>` declaration under top-level `#xml`. Namespace
+  prefixes (`xmlns:foo`, `foo:tag`) are retained verbatim. Round-trip is
+  **partial**: structure, attributes, comments, CDATA, PIs, namespace
+  prefixes, and the XML declaration are preserved, but mixed content
+  (text interleaved with elements in the same parent — e.g.
+  `<p>Hello <b>world</b>!</p>`) is folded into `#text` and inner element
+  positions are lost. Mixed-content detection emits a `tracing::warn!`
+  line so users are aware. New `FormatTag::Xml` variant; `OutputFormat::Xml`
+  is wired into `dq convert -F xml`. XML query verbs (`get`, `paths`,
+  `keys`, …) work via the conventional-key tree like any other map-shaped
+  format. Textual-edit `set` / `del` operations are not supported on XML
+  documents — writes go through `Format::write` whole-document re-emission.
 - `loc.pointer` rule field (jq expression returning a JSON Pointer string).
   When set, the lint evaluator looks up the pointer in the input document's
   provenance map and resolves the diagnostic's `(line, col)` from the

@@ -1,0 +1,41 @@
+tests:
+  - name: registry module without version fires
+    input: |
+      module "vpc" {
+        source = "terraform-aws-modules/vpc/aws"
+      }
+    expected:
+      violations:
+        - rule: terraform.module-pin-version
+          message_contains: "vpc"
+  - name: registry module with version passes
+    input: |
+      module "vpc" {
+        source  = "terraform-aws-modules/vpc/aws"
+        version = "5.5.0"
+      }
+    expected:
+      violations: []
+  - name: local-path module is exempt
+    input: |
+      module "shared" {
+        source = "./modules/shared"
+      }
+    expected:
+      violations: []
+  - name: parent-relative path module is exempt
+    input: |
+      module "shared" {
+        source = "../modules/shared"
+      }
+    expected:
+      violations: []
+  - name: github source without version fires
+    input: |
+      module "x" {
+        source = "github.com/example/terraform-aws-x"
+      }
+    expected:
+      violations:
+        - rule: terraform.module-pin-version
+          message_contains: "x"

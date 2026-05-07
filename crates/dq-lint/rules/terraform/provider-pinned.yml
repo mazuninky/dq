@@ -1,0 +1,17 @@
+id: terraform.provider-pinned
+description: |
+  Provider blocks should pin a `version =` constraint so `terraform init`
+  installs the same provider version across machines and CI runs.
+  Unpinned providers can silently introduce breaking changes when a new
+  major release lands. Pin a `~> X.Y` range or an exact `X.Y.Z` version.
+severity: warn
+match:
+  format: hcl
+check:
+  jq: |
+    [.provider // {} | to_entries[]
+      | select(.value.version == null)
+      | {name: .key}][]
+  message: "Provider '{{ .name }}' has no version constraint"
+references:
+  - https://developer.hashicorp.com/terraform/language/providers/requirements

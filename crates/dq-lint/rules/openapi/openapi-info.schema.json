@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OpenAPI info envelope",
+  "description": "Validates that an OpenAPI document declares the mandatory `info.title` and `info.version` strings.",
+  "type": "object",
+  "required": ["info"],
+  "properties": {
+    "info": {
+      "type": "object",
+      "required": ["title", "version"],
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

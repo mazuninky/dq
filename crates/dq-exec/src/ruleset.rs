@@ -12,9 +12,10 @@
 
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::Deserialize;
+use serde_yml::Value as YamlValue;
 
 use crate::error::{ExecError, Result};
-use crate::rule::Rule;
+use crate::rule::{CheckParseError, Rule};
 
 /// Provenance marker for a [`RuleSet`].
 ///
@@ -66,14 +67,38 @@ impl RuleSet {
     /// document is deserialized as one [`Rule`]. The resulting `RuleSet`
     /// records `source` verbatim (callers usually pass [`RuleSource::Inline`]
     /// or [`RuleSource::Std`]).
+    ///
+    /// ## Sentinel-recovered structured errors (M11 Phase 3)
+    ///
+    /// `Deserialize for Check` cannot construct
+    /// [`ExecError::CheckMutuallyExclusive`] / [`ExecError::CheckMissing`]
+    /// / [`ExecError::CompositeIncomplete`] directly because those need
+    /// the rule id and the `Deserialize` impl runs while the id is still
+    /// being parsed. Instead, the impl encodes the structured payload
+    /// into a sentinel string and emits it through
+    /// `serde::de::Error::custom`. This loader runs the typed
+    /// deserialize first; on a sentinel-encoded failure it re-parses
+    /// the same document as a [`YamlValue`] (which allows it to recover
+    /// the rule id) and maps the error to the matching [`ExecError`]
+    /// variant. Non-sentinel errors fall through to [`ExecError::Parse`]
+    /// unchanged.
     pub fn from_str(yaml: &str, source: RuleSource) -> Result<Self> {
         let mut rules = Vec::new();
+        // Collect document spans in two parallel passes: the typed
+        // deserialize consumes the Deserializer iterator, so we need
+        // to re-iterate when recovering ids on failure. The
+        // serde_yml `Deserializer::from_str` borrows the YAML text and
+        // re-iteration is cheap.
         for de in serde_yml::Deserializer::from_str(yaml) {
-            let rule = Rule::deserialize(de).map_err(|err| {
-                let hint = format!("rule #{} failed to parse: {err}", rules.len() + 1);
-                ExecError::Parse { source: err, hint }
-            })?;
-            rules.push(rule);
+            let parsed: std::result::Result<Rule, serde_yml::Error> = Rule::deserialize(de);
+            match parsed {
+                Ok(rule) => rules.push(rule),
+                Err(err) => {
+                    let rule_index = rules.len() + 1;
+                    let rule_id = recover_rule_id_at_index(yaml, rule_index);
+                    return Err(map_rule_parse_error(err, rule_id, rule_index));
+                }
+            }
         }
         Ok(Self { source, rules })
     }
@@ -174,6 +199,82 @@ impl RuleSet {
             dq_lint::std_ruleset(static_name).expect("namespace verified by list_std_rulesets");
         Self::from_str(yaml, RuleSource::Std(static_name))
     }
+}
+
+/// Recover the `id:` field for the rule at `rule_index` (1-based) in
+/// the YAML document stream `yaml`.
+///
+/// Walks the same `serde_yml::Deserializer::from_str` iterator as
+/// `from_str` does, materialising each document into a [`YamlValue`]
+/// instead of a typed [`Rule`]. Returns `None` when the document is
+/// not a mapping, when `id` is missing / non-string, or when the index
+/// is out of range. The caller falls back to `"<unknown>"` in that case
+/// so the error message still has a placeholder.
+fn recover_rule_id_at_index(yaml: &str, rule_index: usize) -> Option<String> {
+    for (i, de) in serde_yml::Deserializer::from_str(yaml).enumerate() {
+        if i + 1 != rule_index {
+            // Skip preceding documents — we only need the failing one.
+            // `YamlValue::deserialize` consumes the deserializer
+            // unconditionally, which is fine: we ignore the result.
+            let _ = YamlValue::deserialize(de);
+            continue;
+        }
+        let value = YamlValue::deserialize(de).ok()?;
+        let mapping = value.as_mapping()?;
+        let id_value = mapping.get(YamlValue::String("id".to_owned()))?;
+        return id_value.as_str().map(str::to_owned);
+    }
+    None
+}
+
+/// Translate a `serde_yml::Error` produced by `Rule::deserialize` into
+/// the appropriate [`ExecError`] variant.
+///
+/// Sentinel-encoded [`CheckParseError`] payloads become structured
+/// [`ExecError::CheckMutuallyExclusive`] / [`ExecError::CheckMissing`]
+/// / [`ExecError::CompositeIncomplete`] errors. Everything else falls
+/// through to [`ExecError::Parse`].
+fn map_rule_parse_error(
+    err: serde_yml::Error,
+    rule_id: Option<String>,
+    rule_index: usize,
+) -> ExecError {
+    let formatted = format!("{err}");
+    if let Some(parsed) = extract_sentinel(&formatted) {
+        let rule_id = rule_id.unwrap_or_else(|| "<unknown>".to_owned());
+        return match parsed {
+            CheckParseError::MutuallyExclusive { present_fields } => {
+                ExecError::CheckMutuallyExclusive {
+                    rule_id,
+                    present_fields,
+                }
+            }
+            CheckParseError::Missing => ExecError::CheckMissing { rule_id },
+            CheckParseError::CompositeIncomplete { missing_field } => {
+                ExecError::CompositeIncomplete {
+                    rule_id,
+                    missing_field,
+                }
+            }
+        };
+    }
+    ExecError::Parse {
+        hint: format!("rule #{rule_index} failed to parse: {err}"),
+        source: err,
+    }
+}
+
+/// Scan a formatted serde error message for the `dq:check-error:` sentinel
+/// emitted by `Deserialize for Check`. Returns the structured payload
+/// if found, otherwise `None`.
+fn extract_sentinel(formatted: &str) -> Option<CheckParseError> {
+    let idx = formatted.find(CheckParseError::SENTINEL_PREFIX)?;
+    let tail = &formatted[idx..];
+    // The sentinel runs until the next whitespace character — serde
+    // typically appends source-position info on the same line after a
+    // space, so we cut there.
+    let end = tail.find(['\n', ' ']).unwrap_or(tail.len());
+    CheckParseError::from_sentinel(&tail[..end])
 }
 
 /// Returns `true` for `*.yml` / `*.yaml` files that aren't `*.test.yml`

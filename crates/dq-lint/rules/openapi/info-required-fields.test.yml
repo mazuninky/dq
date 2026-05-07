@@ -1,0 +1,44 @@
+tests:
+  - name: openapi document with title and version passes
+    input: |
+      openapi: "3.1.0"
+      info:
+        title: My API
+        version: "1.0.0"
+      paths: {}
+    expected:
+      violations: []
+  - name: openapi document missing info.title fires
+    input: |
+      openapi: "3.1.0"
+      info:
+        version: "1.0.0"
+      paths: {}
+    expected:
+      violations:
+        - rule: openapi.info-required-fields
+  - name: openapi document missing info entirely fires
+    input: |
+      openapi: "3.1.0"
+      paths: {}
+    expected:
+      violations:
+        - rule: openapi.info-required-fields
+  - name: non-openapi yaml is skipped (filter misses)
+    input: |
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: x
+    expected:
+      violations: []
+  - name: openapi with empty title string fires
+    input: |
+      openapi: "3.1.0"
+      info:
+        title: ""
+        version: "1.0.0"
+      paths: {}
+    expected:
+      violations:
+        - rule: openapi.info-required-fields

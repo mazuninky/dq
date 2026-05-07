@@ -46,10 +46,12 @@ use crate::Result;
 use crate::document::{Document, FormatTag, Value};
 use crate::error::Error;
 use crate::format::Format;
+use crate::ir::{InlineBaseline, Provenance, ProvenanceMap};
 use crate::parsers::frontmatter::{
     detect_json_frontmatter, detect_toml_frontmatter, detect_yaml_frontmatter,
 };
 use crate::parsers::{Json, Toml, Yaml};
+use crate::pointer::Pointer;
 
 /// Markdown format implementation.
 ///
@@ -71,10 +73,19 @@ impl Format for Markdown {
     fn parse(&self, bytes: &[u8]) -> Result<Document> {
         let original = bytes.to_vec();
         let value = parse_to_value(bytes)?;
-        Ok(Document::with_value_and_bytes(
+        // Build a provenance map enriched with inline-offset metadata for
+        // every fenced code block — Phase 2 of `add-validation-and-extended-formats`
+        // requires `inline_offset = Some(InlineBaseline { 0, 1, 1 })` so
+        // composite-rule evaluation can project inner-document line / column
+        // back to the outer-file with sub-line precision. Indented code
+        // blocks (CommonMark §4.4) get `None`; the spec is explicit that
+        // only fenced blocks opt in.
+        let provenance = build_provenance_for_fenced_code_blocks(&value);
+        Ok(Document::with_value_bytes_and_provenance(
             value,
             original,
             FormatTag::Markdown,
+            provenance,
         ))
     }
 
@@ -455,19 +466,119 @@ fn null_position() -> Value {
     Value::Map(out)
 }
 
-// `Document::with_value_and_bytes` is a small extension of the existing
-// `Document::with_spans` constructor: same shape, no spans. We define it
-// inline as a trait extension so we don't need to touch document/mod.rs for
-// every new parser. The compiler inlines the extension call.
-
-trait DocumentExt {
-    fn with_value_and_bytes(value: Value, bytes: Vec<u8>, format: FormatTag) -> Self;
+/// Walk `value` and build a [`ProvenanceMap`] that carries
+/// `inline_offset = Some(InlineBaseline { 0, 1, 1 })` for every fenced code
+/// block leaf's `value` field.
+///
+/// Phase 2 of `add-validation-and-extended-formats` requires the markdown
+/// parser to surface inline-offset metadata for fenced code blocks so
+/// composite-rule evaluation can project inner-document coordinates back
+/// to the outer markdown source. The pointer addressed is the leaf string
+/// holding the code body (`<parent>/value`) — that is where Phase 4's
+/// composite extract reads the inner content from.
+///
+/// `span` is `None` for every entry: the markdown parser does not yet
+/// participate in the write path (M9 contract — see [`Markdown::write`]),
+/// so there is no [`crate::document::ValueSpan`] to attach. Composite-rule
+/// evaluation falls back to the markdown node's `position` field for the
+/// anchor coordinates, which is the source-of-truth for fenced-block
+/// positions in the M9 AST.
+fn build_provenance_for_fenced_code_blocks(value: &Value) -> ProvenanceMap {
+    let mut map = ProvenanceMap::new();
+    let mut path: Vec<String> = Vec::new();
+    collect_fenced_code_block_provenance(value, &mut path, &mut map);
+    map
 }
 
-impl DocumentExt for Document {
-    fn with_value_and_bytes(value: Value, bytes: Vec<u8>, format: FormatTag) -> Self {
-        Document::with_spans(value, bytes, crate::document::SpanMap::new(), format)
+/// Recursively walk the markdown AST `value` tree, looking for nodes whose
+/// shape matches `Map { "type": "code_block", "fenced": Bool(true), ... }`
+/// and emitting an inline-offset-aware [`Provenance::Original`] entry for
+/// the leaf at `<this-node-path>/value`.
+fn collect_fenced_code_block_provenance(
+    value: &Value,
+    path: &mut Vec<String>,
+    map: &mut ProvenanceMap,
+) {
+    match value {
+        Value::Map(m) => {
+            if is_fenced_code_block(m) {
+                // Record the inline-offset entry for the `value` field —
+                // that is the body text the composite extract re-parses.
+                path.push("value".to_owned());
+                let pointer_canonical = canonical_pointer(path);
+                let pointer = Pointer::parse(&pointer_canonical)
+                    .expect("constructed canonical pointer must round-trip through Pointer::parse");
+                map.insert(
+                    pointer_canonical,
+                    Provenance::Original {
+                        pointer,
+                        span: None,
+                        inline_offset: Some(InlineBaseline {
+                            byte_start: 0,
+                            line: 1,
+                            col: 1,
+                        }),
+                    },
+                );
+                path.pop();
+            }
+            // Recurse into every field — code blocks can be nested inside
+            // list items, block quotes, table cells, etc.
+            for (k, v) in m {
+                path.push(pointer_escape(k));
+                collect_fenced_code_block_provenance(v, path, map);
+                path.pop();
+            }
+        }
+        Value::Array(items) => {
+            for (idx, item) in items.iter().enumerate() {
+                path.push(idx.to_string());
+                collect_fenced_code_block_provenance(item, path, map);
+                path.pop();
+            }
+        }
+        // Leaves: nothing further to enumerate.
+        Value::Null
+        | Value::Bool(_)
+        | Value::Int(_)
+        | Value::BigInt(_)
+        | Value::Float(_)
+        | Value::BigFloat(_)
+        | Value::String(_) => {}
     }
+}
+
+/// True iff `m` looks like the markdown AST's fenced-code-block node:
+/// `{"type": "code_block", "fenced": true, ...}`. Indented (non-fenced)
+/// code blocks have `fenced: false` and SHALL not carry an inline-offset
+/// per the spec.
+fn is_fenced_code_block(m: &IndexMap<String, Value>) -> bool {
+    matches!(m.get("type"), Some(Value::String(s)) if s == "code_block")
+        && matches!(m.get("fenced"), Some(Value::Bool(true)))
+}
+
+/// Build the canonical RFC 6901 pointer string from `segments`.
+/// Empty `segments` yields the empty string (root); otherwise the result
+/// is `/seg1/seg2/...`. Mirrors [`Pointer::as_canonical`] without
+/// allocating an intermediate `Pointer`.
+fn canonical_pointer(segments: &[String]) -> String {
+    if segments.is_empty() {
+        String::new()
+    } else {
+        let mut out = String::new();
+        for seg in segments {
+            out.push('/');
+            out.push_str(seg);
+        }
+        out
+    }
+}
+
+/// Apply RFC 6901 escaping to a single pointer segment: `~` → `~0`, `/` → `~1`.
+/// Order matters — `~` MUST be escaped before `/`, otherwise we double-escape
+/// the `~` we just emitted for `/`.
+fn pointer_escape(segment: &str) -> String {
+    segment.replace('~', "~0").replace('/', "~1")
 }
 
 #[cfg(test)]
@@ -848,9 +959,10 @@ mod tests {
             panic!()
         };
         m.insert("type".to_owned(), Value::String("not-a-document".into()));
-        let mutated = Document::with_value_and_bytes(
+        let mutated = Document::with_spans(
             Value::Map(m),
             doc.original_bytes().to_vec(),
+            crate::document::SpanMap::new(),
             FormatTag::Markdown,
         );
         let mut buf: Vec<u8> = Vec::new();
@@ -890,5 +1002,153 @@ mod tests {
         assert_eq!(first_whitespace_token("   "), None);
         assert_eq!(first_whitespace_token("rust"), Some("rust".into()));
         assert_eq!(first_whitespace_token("  rust extra"), Some("rust".into()));
+    }
+
+    // -- Phase 2 (`add-validation-and-extended-formats`) ------------------
+    //
+    // Inline-offset population for markdown fenced code blocks. Spec
+    // ("Markdown fenced code block carries inline-offset") requires every
+    // fenced code block leaf to surface
+    // `inline_offset = Some(InlineBaseline { byte_start: 0, line: 1, col: 1 })`
+    // on its `Provenance::Original` entry; indented code blocks (CommonMark
+    // §4.4) keep `inline_offset = None` because composite-rule extracts
+    // address only fenced blocks via the language tag.
+
+    /// Lookup helper: pattern-match the provenance entry at `pointer_str`
+    /// and return its `inline_offset` (or `None` if the entry is absent or
+    /// is `Synthetic`).
+    fn inline_offset_for(doc: &Document, pointer_str: &str) -> Option<InlineBaseline> {
+        let pointer = Pointer::parse(pointer_str).expect("pointer parses");
+        match doc.as_ir().provenance_for(&pointer) {
+            Some(Provenance::Original { inline_offset, .. }) => *inline_offset,
+            Some(Provenance::Synthetic { .. }) => None,
+            None => None,
+        }
+    }
+
+    #[test]
+    fn fenced_code_block_value_field_carries_inline_offset() {
+        // Single fenced code block with a YAML payload — composite-rule
+        // evaluation reads `/children/0/value` and re-parses the body as
+        // YAML. The inline-offset baseline lets it project the YAML's
+        // inner (line, col) back to the markdown source-file coordinates.
+        let src = "```yaml\nfoo: bar\n```\n";
+        let doc = Markdown.parse(src.as_bytes()).expect("parse");
+        assert_eq!(
+            inline_offset_for(&doc, "/children/0/value"),
+            Some(InlineBaseline {
+                byte_start: 0,
+                line: 1,
+                col: 1,
+            }),
+            "fenced code block's `value` MUST carry inline_offset = Some(0,1,1)",
+        );
+    }
+
+    #[test]
+    fn indented_code_block_value_field_has_no_inline_offset() {
+        // Four-space-indented code block (`fenced: false`). Spec is
+        // explicit: only fenced blocks opt in. A regression that started
+        // emitting an inline-offset for indented blocks would change the
+        // composite-rule extract surface.
+        let src = "    foo bar\n";
+        let doc = Markdown.parse(src.as_bytes()).expect("parse");
+        // The indented code block lives at `/children/0` but should NOT
+        // surface in the provenance map at all.
+        let pointer = Pointer::parse("/children/0/value").expect("pointer parses");
+        assert!(
+            doc.as_ir().provenance_for(&pointer).is_none(),
+            "indented code block MUST NOT carry inline-offset metadata",
+        );
+    }
+
+    #[test]
+    fn multiple_fenced_code_blocks_each_carry_inline_offset() {
+        // Two top-level fenced code blocks. Both must carry the baseline,
+        // addressed through their distinct child indices.
+        let src = "```yaml\nfoo: bar\n```\n\n```toml\nkey = 1\n```\n";
+        let doc = Markdown.parse(src.as_bytes()).expect("parse");
+        for pointer_str in ["/children/0/value", "/children/1/value"] {
+            assert_eq!(
+                inline_offset_for(&doc, pointer_str),
+                Some(InlineBaseline {
+                    byte_start: 0,
+                    line: 1,
+                    col: 1,
+                }),
+                "fenced code block at `{pointer_str}` MUST carry inline_offset",
+            );
+        }
+    }
+
+    #[test]
+    fn fenced_code_block_inside_list_item_carries_inline_offset() {
+        // The walker is recursive; a fenced block nested inside a list item
+        // must also surface inline-offset. The exact pointer depends on the
+        // markdown AST shape, so we walk the provenance map and assert at
+        // least one entry exists with the expected baseline.
+        let src = "- item\n\n  ```yaml\n  foo: bar\n  ```\n";
+        let doc = Markdown.parse(src.as_bytes()).expect("parse");
+        let baseline_count = doc
+            .as_ir()
+            .provenance()
+            .values()
+            .filter(|p| {
+                matches!(
+                    p,
+                    Provenance::Original {
+                        inline_offset: Some(InlineBaseline {
+                            byte_start: 0,
+                            line: 1,
+                            col: 1,
+                        }),
+                        ..
+                    },
+                )
+            })
+            .count();
+        assert!(
+            baseline_count >= 1,
+            "at least one fenced code block (nested or top-level) MUST surface \
+             inline-offset metadata; got {baseline_count} entries",
+        );
+    }
+
+    #[test]
+    fn fenced_code_block_inline_offset_via_ir_helper() {
+        // Cross-check that the public `Ir::inline_offset_for` helper
+        // returns the same baseline as direct provenance pattern-matching.
+        let src = "```yaml\nfoo: bar\n```\n";
+        let doc = Markdown.parse(src.as_bytes()).expect("parse");
+        let pointer = Pointer::parse("/children/0/value").expect("pointer");
+        let expected = InlineBaseline {
+            byte_start: 0,
+            line: 1,
+            col: 1,
+        };
+        assert_eq!(doc.as_ir().inline_offset_for(&pointer), Some(&expected));
+    }
+
+    #[test]
+    fn paragraph_text_carries_no_inline_offset() {
+        // Plain paragraphs / headings / etc. must NOT carry an inline-offset
+        // entry — only fenced code blocks opt in. The provenance map for
+        // a paragraph-only doc should be empty.
+        let src = "# Title\n\nSome text.\n";
+        let doc = Markdown.parse(src.as_bytes()).expect("parse");
+        let any_inline_offset = doc.as_ir().provenance().values().any(|p| {
+            matches!(
+                p,
+                Provenance::Original {
+                    inline_offset: Some(_),
+                    ..
+                },
+            )
+        });
+        assert!(
+            !any_inline_offset,
+            "paragraph-only / heading-only markdown documents MUST NOT \
+             carry inline-offset metadata",
+        );
     }
 }

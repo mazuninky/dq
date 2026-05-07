@@ -1,0 +1,32 @@
+id: jsonschema.openapi-3.1-shape
+description: |
+  OpenAPI 3.1 documents must declare the top-level envelope fields
+  (`openapi` version string, `info` with `title` and `version`, and a
+  `paths` object). This rule validates the root structure; per-path
+  validation requires a richer schema or composite rules.
+severity: error
+match:
+  format: [yaml, json]
+  filter: '.openapi != null and ((.openapi // "") | tostring | startswith("3.1"))'
+check:
+  schema:
+    type: object
+    required: [openapi, info, paths]
+    properties:
+      openapi:
+        type: string
+        pattern: "^3\\.1\\."
+      info:
+        type: object
+        required: [title, version]
+        properties:
+          title:
+            type: string
+            minLength: 1
+          version:
+            type: string
+            minLength: 1
+      paths:
+        type: object
+references:
+  - https://spec.openapis.org/oas/v3.1.0

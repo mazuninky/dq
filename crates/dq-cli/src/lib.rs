@@ -202,6 +202,12 @@ fn reporter_for_format(format: OutputFormat, use_color: bool) -> Box<dyn Reporte
         // verbs that select `-F markdown` get the same `BannedReporter` error
         // discipline as `frontmatter` / `hcl` / `csv` / etc.
         OutputFormat::Markdown => Box::new(BannedReporter::new("markdown")),
+        // M11: XML is supported as a `convert` write target. Query verbs
+        // that select `-F xml` follow the same `BannedReporter` discipline:
+        // the conventional-key shape doesn't map cleanly onto the
+        // single-value reporter contract (a query result is typically a
+        // scalar / array, not a top-level XML document map).
+        OutputFormat::Xml => Box::new(BannedReporter::new("xml")),
         // M6 §5: SARIF is wired here for `validate` and the future M8 lint
         // engine. Query verbs that select `-F sarif` get the
         // `BannedReporter`-equivalent error from inside `SarifReporter::report`

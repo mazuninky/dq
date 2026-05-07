@@ -84,6 +84,12 @@ pub enum OutputFormat {
     Frontmatter,
     /// CommonMark + GFM markdown (M9 — `convert -F markdown`).
     Markdown,
+    /// XML 1.0 (M11 — read+write). Round-trippable for element structure,
+    /// attributes, comments, CDATA, processing instructions, namespace
+    /// prefixes, and the XML declaration. Mixed content (text interleaved
+    /// with elements inside a single parent) is partial — see
+    /// `dq-core/src/parsers/xml.rs` for the full conventional-key contract.
+    Xml,
     /// SARIF 2.1.0 — Static Analysis Results Interchange Format.
     ///
     /// Output-only diagnostic format consumed by GitHub Code Scanning,
@@ -135,6 +141,7 @@ impl OutputFormat {
             Self::Tsv => Some("tsv"),
             Self::Frontmatter => Some("frontmatter"),
             Self::Markdown => Some("markdown"),
+            Self::Xml => Some("xml"),
             // M6: SARIF is a diagnostic *output* format with no source-side
             // parser. M8: Junit and Tap follow the same discipline.
             // Falling through to `None` keeps input detection on the

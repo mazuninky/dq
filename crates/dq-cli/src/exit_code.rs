@@ -145,6 +145,25 @@ pub fn exit_code_for_error(err: &anyhow::Error) -> i32 {
             // fine. PARSE_ERROR is the closest match (jq evaluator-side
             // failure).
             "fix_apply" => PARSE_ERROR,
+            // M11 Phase 3: rule-load-time errors (mutual exclusion,
+            // missing variant, schema compile / file-path safety) all
+            // share the PARSE_ERROR family — same as glob/jq compile
+            // failures: the rule YAML is structurally invalid.
+            "check_mutually_exclusive"
+            | "check_missing"
+            | "composite_incomplete"
+            | "schema_compile"
+            | "schema_file_absolute_path"
+            | "schema_file_escapes_rule_dir" => PARSE_ERROR,
+            // M11 Phase 4 (placeholder, runtime): composite extract
+            // semantic errors map to GENERIC (1) — the rule is
+            // structurally valid but the input + extract combination
+            // produced an evaluation failure, same family as `exists`
+            // returning false.
+            "composite_extract_not_array"
+            | "composite_extract_malformed"
+            | "composite_extract_unknown_format"
+            | "composite_depth_exceeded" => GENERIC,
             _ => GENERIC,
         };
     }
@@ -409,6 +428,103 @@ mod tests {
             message: "missing tests array".to_owned(),
         });
         assert_eq!(exit_code_for_error(&err), INVALID_INPUT);
+    }
+
+    // M11 Phase 3 — schema / mutual-exclusion / composite-incomplete
+    // variants all map to PARSE_ERROR (3), same family as rule_compile
+    // / glob_compile.
+
+    #[test]
+    fn maps_exec_check_mutually_exclusive_to_parse_error() {
+        let err = anyhow::Error::new(ExecError::CheckMutuallyExclusive {
+            rule_id: "a.b".to_owned(),
+            present_fields: vec!["jq".to_owned(), "schema".to_owned()],
+        });
+        assert_eq!(exit_code_for_error(&err), PARSE_ERROR);
+    }
+
+    #[test]
+    fn maps_exec_check_missing_to_parse_error() {
+        let err = anyhow::Error::new(ExecError::CheckMissing {
+            rule_id: "a.b".to_owned(),
+        });
+        assert_eq!(exit_code_for_error(&err), PARSE_ERROR);
+    }
+
+    #[test]
+    fn maps_exec_composite_incomplete_to_parse_error() {
+        let err = anyhow::Error::new(ExecError::CompositeIncomplete {
+            rule_id: "a.b".to_owned(),
+            missing_field: "nested".to_owned(),
+        });
+        assert_eq!(exit_code_for_error(&err), PARSE_ERROR);
+    }
+
+    #[test]
+    fn maps_exec_schema_compile_to_parse_error() {
+        let err = anyhow::Error::new(ExecError::SchemaCompile {
+            rule_id: "a.b".to_owned(),
+            message: "bad schema".to_owned(),
+        });
+        assert_eq!(exit_code_for_error(&err), PARSE_ERROR);
+    }
+
+    #[test]
+    fn maps_exec_schema_file_absolute_path_to_parse_error() {
+        let err = anyhow::Error::new(ExecError::SchemaFileAbsolutePath {
+            rule_id: "a.b".to_owned(),
+            path: camino::Utf8PathBuf::from("/etc/passwd"),
+        });
+        assert_eq!(exit_code_for_error(&err), PARSE_ERROR);
+    }
+
+    #[test]
+    fn maps_exec_schema_file_escapes_rule_dir_to_parse_error() {
+        let err = anyhow::Error::new(ExecError::SchemaFileEscapesRuleDir {
+            rule_id: "a.b".to_owned(),
+            path: camino::Utf8PathBuf::from("../../../secrets"),
+        });
+        assert_eq!(exit_code_for_error(&err), PARSE_ERROR);
+    }
+
+    // M11 Phase 4 placeholders — semantic / runtime errors map to
+    // GENERIC (1). These variants are wired in Phase 3 so the exit-code
+    // mapping is in place before the Phase 4 runtime arrives.
+
+    #[test]
+    fn maps_exec_composite_extract_not_array_to_generic() {
+        let err = anyhow::Error::new(ExecError::CompositeExtractNotArray {
+            rule_id: "a.b".to_owned(),
+        });
+        assert_eq!(exit_code_for_error(&err), GENERIC);
+    }
+
+    #[test]
+    fn maps_exec_composite_extract_malformed_to_generic() {
+        let err = anyhow::Error::new(ExecError::CompositeExtractMalformed {
+            rule_id: "a.b".to_owned(),
+            missing_field: "anchor".to_owned(),
+        });
+        assert_eq!(exit_code_for_error(&err), GENERIC);
+    }
+
+    #[test]
+    fn maps_exec_composite_extract_unknown_format_to_generic() {
+        let err = anyhow::Error::new(ExecError::CompositeExtractUnknownFormat {
+            rule_id: "a.b".to_owned(),
+            format: "klingon".to_owned(),
+        });
+        assert_eq!(exit_code_for_error(&err), GENERIC);
+    }
+
+    #[test]
+    fn maps_exec_composite_depth_exceeded_to_generic() {
+        let err = anyhow::Error::new(ExecError::CompositeDepthExceeded {
+            rule_id: "a.b".to_owned(),
+            depth: 5,
+            max: 4,
+        });
+        assert_eq!(exit_code_for_error(&err), GENERIC);
     }
 
     #[test]

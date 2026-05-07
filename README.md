@@ -7,7 +7,17 @@ linter-engine — всё в одном single static binary.
 
 ## Status
 
-**M10 alpha — adds `dq fix` autofix engine. M12 alpha (experimental) — WASM plugin ABI on WIT + wasmtime.** M1–M9 archived (see [openspec/changes/archive/](openspec/changes/archive/)). M10 adds the `dq fix` subcommand: rules carry an optional `fix.jq` whole-document transform that the engine applies to every matching file. The handler honours the same write-mode discipline as `dq set` / `dq del` (`-i` atomic write, `--diff` unified-diff to stdout, `--check` pre-commit gate exit 1, `--continue-on-error`, `--parallel`). `Fixer` enforces idempotency at runtime — applying `fix.jq` twice must yield the same value or the rule is skipped with a `tracing::warn!` log line (rule-author bug, never silently double-applied). Two existing `@std` rules (`@std/k8s/image-pull-policy-always`, `@std/npm/has-license`) ship `fix:` blocks as proof. **Comment preservation**: same trade-off as `dq set --jq` — re-emit goes through `Format::write_with_options` and drops comments. M12 lands the `dq-plugin` crate, the `dq:plugin@0.1.0` WIT schema, and a `--plugins <DIR>` global flag for `dq lint` / `dq fix`; feature-gated behind `--features plugins` so the default static binary stays small. See [Plugins (experimental)](#plugins-experimental) below for the contract and a Rust reference plugin. Anti-scope still deferred: composite rules / JSON Schema (M11), inline-level position spans (M11), community registry (M12+), `--quote-style` / `--flow-style` / `--strip-comments` (need comment-preserving emitter), XML write (M11+).
+**M11 alpha — JSON Schema validation + composite rules + extended formats. M10 — `dq fix` autofix engine. M12 alpha (experimental) — WASM plugin ABI on WIT + wasmtime.** M1–M10 archived (see [openspec/changes/archive/](openspec/changes/archive/)); M11 lands as [openspec/changes/add-validation-and-extended-formats/](openspec/changes/add-validation-and-extended-formats/) and brings:
+
+- **JSON Schema 2020-12 as a Rule type.** `Rule.check` is now a `oneOf` over `jq` / `schema` (inline) / `schema_file` (path resolved relative to the rule directory; absolute paths and `..` escapes rejected) / `extract`+`nested`. The `jsonschema` crate validates the document; `instancePath` becomes the diagnostic's `Pointer` and `keywordLocation` is included in the message. `$ref` is restricted to internal references — HTTP/file `$ref` is rejected at compile time. Three reference rules ship as `@std/jsonschema/{kubernetes-crd-shape, helm-values-against-schema, openapi-3.1-shape}`.
+- **Composite rules (cross-format).** A rule can `extract:` substrings from one format (jq returns `[{value, format, anchor}]`), reparse each item as a different format, and run a `nested:` rule with diagnostics projected back to outer-file coordinates. Recursion bounded at `MAX_EXTRACT_DEPTH = 4`. Inner-format parse failures emit `<outer>.parse-failed` diagnostics. First reference rule: `@std/markdown/code-blocks-yaml-valid`.
+- **Inline-level position spans.** YAML block scalars (`|`, `>`, `|-`, `>-`) and markdown fenced code blocks now carry `Provenance::Original.inline_offset = Some(InlineBaseline { 0, 1, 1 })` so composite-rule projection has sub-line precision. `Ir::inline_offset_for(&pointer)` is the new public lookup.
+- **XML read+write.** `XmlFormat` via `quick-xml` 0.36 — element structure, attributes, comments, CDATA, processing instructions, namespace prefixes, and the XML declaration round-trip. Mixed content (text interleaved with child elements) folds into `"#text"` and emits a `tracing::warn!` on parse — that's the partial-round-trip contract for config-shaped XML.
+- **Two new standard rulesets.** `@std/terraform` (8 rules) and `@std/openapi` (6 rules). Standard rule library now ≥ 64 rules across 8 namespaces.
+
+M10 adds the `dq fix` subcommand: rules carry an optional `fix.jq` whole-document transform that the engine applies to every matching file. The handler honours the same write-mode discipline as `dq set` / `dq del` (`-i` atomic write, `--diff` unified-diff to stdout, `--check` pre-commit gate exit 1, `--continue-on-error`, `--parallel`). `Fixer` enforces idempotency at runtime — applying `fix.jq` twice must yield the same value or the rule is skipped with a `tracing::warn!` log line (rule-author bug, never silently double-applied). Two existing `@std` rules (`@std/k8s/image-pull-policy-always`, `@std/npm/has-license`) ship `fix:` blocks as proof. **Comment preservation**: same trade-off as `dq set --jq` — re-emit goes through `Format::write_with_options` and drops comments. M12 lands the `dq-plugin` crate, the `dq:plugin@0.1.0` WIT schema, and a `--plugins <DIR>` global flag for `dq lint` / `dq fix`; feature-gated behind `--features plugins` so the default static binary stays small. See [Plugins (experimental)](#plugins-experimental) below for the contract and a Rust reference plugin.
+
+Anti-scope still deferred: community registry (M12+), `--quote-style` / `--flow-style` / `--strip-comments` (need comment-preserving emitter), XSD / RelaxNG / Schematron schema validators, OpenAPI runtime request/response validation, HCL spans (Terraform diagnostics currently report at line 1).
 
 ## Install
 
@@ -76,6 +86,10 @@ dq convert users.csv -F json           # CSV / TSV — array-of-records
 dq validate Dockerfile                 # Dockerfile — read-only, exit 4 on parse error
 dq paths .gitignore                    # .gitignore / .dockerignore — read-only flat array
 dq get post.md /title                  # Markdown frontmatter — YAML/TOML/JSON header
+
+# M11 XML (read+write, conventional-key mapping)
+dq get pom.xml /project/0/version/0/#text  # Maven `<version>` value
+dq convert app.json -F xml             # write XML; round-trip is partial (mixed content opaque)
 
 # M6 distribution
 dq completions <shell>                 # bash/zsh/fish/powershell/elvish completion script

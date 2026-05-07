@@ -1,0 +1,19 @@
+id: terraform.variable-has-description
+description: |
+  Every input variable should declare a `description = "..."` so the
+  module's `terraform-docs` output and `terraform plan` prompts make
+  sense to a future caller. A variable without documentation is hard
+  to reuse safely — even a one-line description (intent + units +
+  expected format) goes a long way.
+severity: info
+match:
+  format: hcl
+check:
+  jq: |
+    [.variable // {} | to_entries[]
+      | select(.value.description == null
+              or (.value.description | type == "string" and (. | length == 0)))
+      | {name: .key}][]
+  message: "Variable '{{ .name }}' has no description"
+references:
+  - https://developer.hashicorp.com/terraform/language/values/variables#input-variable-documentation

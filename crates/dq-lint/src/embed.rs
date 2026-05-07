@@ -16,16 +16,28 @@
 /// Names of every standard rule namespace shipped with `dq-lint`, in
 /// alphabetical order. Every entry here must have matching arms in
 /// [`std_ruleset`] and [`std_test_files`].
-pub const NAMESPACES: &[&str] = &["dockerfile", "github-actions", "k8s", "markdown", "npm"];
+pub const NAMESPACES: &[&str] = &[
+    "dockerfile",
+    "github-actions",
+    "jsonschema",
+    "k8s",
+    "markdown",
+    "npm",
+    "openapi",
+    "terraform",
+];
 
 /// Look up the concatenated rule YAML for namespace `name`.
 pub fn std_ruleset(name: &str) -> Option<&'static str> {
     match name {
         "dockerfile" => Some(DOCKERFILE_RULES),
         "github-actions" => Some(GITHUB_ACTIONS_RULES),
+        "jsonschema" => Some(JSONSCHEMA_RULES),
         "k8s" => Some(K8S_RULES),
         "markdown" => Some(MARKDOWN_RULES),
         "npm" => Some(NPM_RULES),
+        "openapi" => Some(OPENAPI_RULES),
+        "terraform" => Some(TERRAFORM_RULES),
         _ => None,
     }
 }
@@ -35,9 +47,12 @@ pub fn std_test_files(namespace: &str) -> Option<&'static [(&'static str, &'stat
     match namespace {
         "dockerfile" => Some(DOCKERFILE_TESTS),
         "github-actions" => Some(GITHUB_ACTIONS_TESTS),
+        "jsonschema" => Some(JSONSCHEMA_TESTS),
         "k8s" => Some(K8S_TESTS),
         "markdown" => Some(MARKDOWN_TESTS),
         "npm" => Some(NPM_TESTS),
+        "openapi" => Some(OPENAPI_TESTS),
+        "terraform" => Some(TERRAFORM_TESTS),
         _ => None,
     }
 }
@@ -53,10 +68,47 @@ pub fn std_rule_files(namespace: &str) -> Option<&'static [(&'static str, &'stat
     match namespace {
         "dockerfile" => Some(DOCKERFILE_RULE_FILES),
         "github-actions" => Some(GITHUB_ACTIONS_RULE_FILES),
+        "jsonschema" => Some(JSONSCHEMA_RULE_FILES),
         "k8s" => Some(K8S_RULE_FILES),
         "markdown" => Some(MARKDOWN_RULE_FILES),
         "npm" => Some(NPM_RULE_FILES),
+        "openapi" => Some(OPENAPI_RULE_FILES),
+        "terraform" => Some(TERRAFORM_RULE_FILES),
         _ => None,
+    }
+}
+
+/// Look up an embedded JSON Schema sidecar `file` under `namespace`.
+///
+/// The `file` argument matches the rule's `check.schema_file:` field
+/// verbatim (e.g. `helm-values-template.schema.json`). For now the
+/// embedding lives only under the `jsonschema` namespace; other
+/// namespaces return `None` to signal "no embedded schema lookup".
+pub fn std_schema(namespace: &str, file: &str) -> Option<&'static str> {
+    match namespace {
+        "jsonschema" => JSONSCHEMA_SCHEMA_FILES
+            .iter()
+            .find(|(name, _)| *name == file)
+            .map(|(_, contents)| *contents),
+        "openapi" => OPENAPI_SCHEMA_FILES
+            .iter()
+            .find(|(name, _)| *name == file)
+            .map(|(_, contents)| *contents),
+        _ => None,
+    }
+}
+
+/// Look up every embedded JSON Schema sidecar file for `namespace`, as
+/// `(filename, contents)` pairs. Returns an empty slice for namespaces
+/// without sidecar schemas.
+///
+/// Used by integration test runners that stage a namespace into a
+/// tempdir so the schema files land next to the rule YAML.
+pub fn std_schema_files(namespace: &str) -> &'static [(&'static str, &'static str)] {
+    match namespace {
+        "jsonschema" => JSONSCHEMA_SCHEMA_FILES,
+        "openapi" => OPENAPI_SCHEMA_FILES,
+        _ => &[],
     }
 }
 
@@ -386,13 +438,15 @@ static GITHUB_ACTIONS_RULE_FILES: &[(&str, &str)] = &[
 ];
 
 // ---------------------------------------------------------------------------
-// markdown — 18 rules
+// markdown — 19 rules (M11 Phase 4 added the composite `code-blocks-yaml-valid`)
 // ---------------------------------------------------------------------------
 
 static MARKDOWN_RULES: &str = concat!(
     include_str!("../rules/markdown/code-block-fenced.yml"),
     "\n---\n",
     include_str!("../rules/markdown/code-blocks-have-lang.yml"),
+    "\n---\n",
+    include_str!("../rules/markdown/code-blocks-yaml-valid.yml"),
     "\n---\n",
     include_str!("../rules/markdown/frontmatter-date-format.yml"),
     "\n---\n",
@@ -435,6 +489,10 @@ static MARKDOWN_TESTS: &[(&str, &str)] = &[
     (
         "code-blocks-have-lang.test.yml",
         include_str!("../rules/markdown/code-blocks-have-lang.test.yml"),
+    ),
+    (
+        "code-blocks-yaml-valid.test.yml",
+        include_str!("../rules/markdown/code-blocks-yaml-valid.test.yml"),
     ),
     (
         "frontmatter-date-format.test.yml",
@@ -512,6 +570,10 @@ static MARKDOWN_RULE_FILES: &[(&str, &str)] = &[
         include_str!("../rules/markdown/code-blocks-have-lang.yml"),
     ),
     (
+        "code-blocks-yaml-valid.yml",
+        include_str!("../rules/markdown/code-blocks-yaml-valid.yml"),
+    ),
+    (
         "frontmatter-date-format.yml",
         include_str!("../rules/markdown/frontmatter-date-format.yml"),
     ),
@@ -576,3 +638,236 @@ static MARKDOWN_RULE_FILES: &[(&str, &str)] = &[
         include_str!("../rules/markdown/table-pipes-aligned.yml"),
     ),
 ];
+
+// ---------------------------------------------------------------------------
+// jsonschema — 3 rules (M11 Phase 3)
+// ---------------------------------------------------------------------------
+
+static JSONSCHEMA_RULES: &str = concat!(
+    include_str!("../rules/jsonschema/helm-values-against-schema.yml"),
+    "\n---\n",
+    include_str!("../rules/jsonschema/kubernetes-crd-shape.yml"),
+    "\n---\n",
+    include_str!("../rules/jsonschema/openapi-3.1-shape.yml"),
+);
+
+static JSONSCHEMA_TESTS: &[(&str, &str)] = &[
+    (
+        "helm-values-against-schema.test.yml",
+        include_str!("../rules/jsonschema/helm-values-against-schema.test.yml"),
+    ),
+    (
+        "kubernetes-crd-shape.test.yml",
+        include_str!("../rules/jsonschema/kubernetes-crd-shape.test.yml"),
+    ),
+    (
+        "openapi-3.1-shape.test.yml",
+        include_str!("../rules/jsonschema/openapi-3.1-shape.test.yml"),
+    ),
+];
+
+static JSONSCHEMA_RULE_FILES: &[(&str, &str)] = &[
+    (
+        "helm-values-against-schema.yml",
+        include_str!("../rules/jsonschema/helm-values-against-schema.yml"),
+    ),
+    (
+        "kubernetes-crd-shape.yml",
+        include_str!("../rules/jsonschema/kubernetes-crd-shape.yml"),
+    ),
+    (
+        "openapi-3.1-shape.yml",
+        include_str!("../rules/jsonschema/openapi-3.1-shape.yml"),
+    ),
+];
+
+/// Sidecar JSON Schema files embedded alongside the `@std/jsonschema`
+/// rules. Keys must match the `check.schema_file:` strings authors
+/// write in the rule YAML (e.g. `helm-values-template.schema.json`).
+static JSONSCHEMA_SCHEMA_FILES: &[(&str, &str)] = &[(
+    "helm-values-template.schema.json",
+    include_str!("../rules/jsonschema/helm-values-template.schema.json"),
+)];
+
+// ---------------------------------------------------------------------------
+// terraform — 8 rules (M11 Phase 5)
+// ---------------------------------------------------------------------------
+//
+// HCL backend has NO span information (see
+// `crates/dq-core/src/parsers/hcl.rs` doc-comment) — every diagnostic
+// emitted by these rules anchors at `(line=1, col=1)`. Rule descriptions
+// document the limitation.
+
+static TERRAFORM_RULES: &str = concat!(
+    include_str!("../rules/terraform/module-pin-version.yml"),
+    "\n---\n",
+    include_str!("../rules/terraform/no-hardcoded-secrets.yml"),
+    "\n---\n",
+    include_str!("../rules/terraform/no-public-ingress.yml"),
+    "\n---\n",
+    include_str!("../rules/terraform/output-no-sensitive-without-flag.yml"),
+    "\n---\n",
+    include_str!("../rules/terraform/provider-pinned.yml"),
+    "\n---\n",
+    include_str!("../rules/terraform/state-backend-required.yml"),
+    "\n---\n",
+    include_str!("../rules/terraform/tag-required.yml"),
+    "\n---\n",
+    include_str!("../rules/terraform/variable-has-description.yml"),
+);
+
+static TERRAFORM_TESTS: &[(&str, &str)] = &[
+    (
+        "module-pin-version.test.yml",
+        include_str!("../rules/terraform/module-pin-version.test.yml"),
+    ),
+    (
+        "no-hardcoded-secrets.test.yml",
+        include_str!("../rules/terraform/no-hardcoded-secrets.test.yml"),
+    ),
+    (
+        "no-public-ingress.test.yml",
+        include_str!("../rules/terraform/no-public-ingress.test.yml"),
+    ),
+    (
+        "output-no-sensitive-without-flag.test.yml",
+        include_str!("../rules/terraform/output-no-sensitive-without-flag.test.yml"),
+    ),
+    (
+        "provider-pinned.test.yml",
+        include_str!("../rules/terraform/provider-pinned.test.yml"),
+    ),
+    (
+        "state-backend-required.test.yml",
+        include_str!("../rules/terraform/state-backend-required.test.yml"),
+    ),
+    (
+        "tag-required.test.yml",
+        include_str!("../rules/terraform/tag-required.test.yml"),
+    ),
+    (
+        "variable-has-description.test.yml",
+        include_str!("../rules/terraform/variable-has-description.test.yml"),
+    ),
+];
+
+static TERRAFORM_RULE_FILES: &[(&str, &str)] = &[
+    (
+        "module-pin-version.yml",
+        include_str!("../rules/terraform/module-pin-version.yml"),
+    ),
+    (
+        "no-hardcoded-secrets.yml",
+        include_str!("../rules/terraform/no-hardcoded-secrets.yml"),
+    ),
+    (
+        "no-public-ingress.yml",
+        include_str!("../rules/terraform/no-public-ingress.yml"),
+    ),
+    (
+        "output-no-sensitive-without-flag.yml",
+        include_str!("../rules/terraform/output-no-sensitive-without-flag.yml"),
+    ),
+    (
+        "provider-pinned.yml",
+        include_str!("../rules/terraform/provider-pinned.yml"),
+    ),
+    (
+        "state-backend-required.yml",
+        include_str!("../rules/terraform/state-backend-required.yml"),
+    ),
+    (
+        "tag-required.yml",
+        include_str!("../rules/terraform/tag-required.yml"),
+    ),
+    (
+        "variable-has-description.yml",
+        include_str!("../rules/terraform/variable-has-description.yml"),
+    ),
+];
+
+// ---------------------------------------------------------------------------
+// openapi — 6 rules (M11 Phase 5)
+// ---------------------------------------------------------------------------
+//
+// Phase 5 implementation took the no-`oas3` path (see
+// `openspec/changes/add-validation-and-extended-formats/design.md` D6
+// closing note) — every rule is authored with plain jq + JSON Schema
+// over the YAML/JSON parser, so the namespace ships unconditionally
+// without a feature gate.
+
+static OPENAPI_RULES: &str = concat!(
+    include_str!("../rules/openapi/info-required-fields.yml"),
+    "\n---\n",
+    include_str!("../rules/openapi/no-trailing-slash.yml"),
+    "\n---\n",
+    include_str!("../rules/openapi/operation-id-unique.yml"),
+    "\n---\n",
+    include_str!("../rules/openapi/paths-non-empty.yml"),
+    "\n---\n",
+    include_str!("../rules/openapi/response-200-or-201-required.yml"),
+    "\n---\n",
+    include_str!("../rules/openapi/security-defined.yml"),
+);
+
+static OPENAPI_TESTS: &[(&str, &str)] = &[
+    (
+        "info-required-fields.test.yml",
+        include_str!("../rules/openapi/info-required-fields.test.yml"),
+    ),
+    (
+        "no-trailing-slash.test.yml",
+        include_str!("../rules/openapi/no-trailing-slash.test.yml"),
+    ),
+    (
+        "operation-id-unique.test.yml",
+        include_str!("../rules/openapi/operation-id-unique.test.yml"),
+    ),
+    (
+        "paths-non-empty.test.yml",
+        include_str!("../rules/openapi/paths-non-empty.test.yml"),
+    ),
+    (
+        "response-200-or-201-required.test.yml",
+        include_str!("../rules/openapi/response-200-or-201-required.test.yml"),
+    ),
+    (
+        "security-defined.test.yml",
+        include_str!("../rules/openapi/security-defined.test.yml"),
+    ),
+];
+
+static OPENAPI_RULE_FILES: &[(&str, &str)] = &[
+    (
+        "info-required-fields.yml",
+        include_str!("../rules/openapi/info-required-fields.yml"),
+    ),
+    (
+        "no-trailing-slash.yml",
+        include_str!("../rules/openapi/no-trailing-slash.yml"),
+    ),
+    (
+        "operation-id-unique.yml",
+        include_str!("../rules/openapi/operation-id-unique.yml"),
+    ),
+    (
+        "paths-non-empty.yml",
+        include_str!("../rules/openapi/paths-non-empty.yml"),
+    ),
+    (
+        "response-200-or-201-required.yml",
+        include_str!("../rules/openapi/response-200-or-201-required.yml"),
+    ),
+    (
+        "security-defined.yml",
+        include_str!("../rules/openapi/security-defined.yml"),
+    ),
+];
+
+/// Sidecar JSON Schema files embedded alongside the `@std/openapi`
+/// rules. Keys must match the `check.schema_file:` strings authors
+/// write in the rule YAML (e.g. `openapi-info.schema.json`).
+static OPENAPI_SCHEMA_FILES: &[(&str, &str)] = &[(
+    "openapi-info.schema.json",
+    include_str!("../rules/openapi/openapi-info.schema.json"),
+)];

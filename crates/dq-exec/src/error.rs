@@ -113,15 +113,127 @@ pub enum ExecError {
         /// wrong-arity output, etc.).
         message: String,
     },
+
+    /// M11 Phase 3: rule `check` block contains more than one of the
+    /// mutually-exclusive variants (`jq`, `schema`, `schema_file`,
+    /// `extract`+`nested`). `present_fields` lists the offending field
+    /// names so the CLI can render an actionable error.
+    #[error("rule {rule_id} check has mutually exclusive fields: {}", present_fields.join(", "))]
+    CheckMutuallyExclusive {
+        /// The `id:` field of the offending rule.
+        rule_id: String,
+        /// Names of the discriminator fields that were all set.
+        present_fields: Vec<String>,
+    },
+
+    /// M11 Phase 3: rule `check` block declares none of the four
+    /// variants. The block must contain at least one of `jq`, `schema`,
+    /// `schema_file`, or `extract`+`nested`.
+    #[error("rule {rule_id} check is empty (need one of jq, schema, schema_file, extract+nested)")]
+    CheckMissing {
+        /// The `id:` field of the offending rule.
+        rule_id: String,
+    },
+
+    /// M11 Phase 3: composite check declares only one of `extract` /
+    /// `nested`. Both must be set together (per design D3).
+    #[error("rule {rule_id} composite check is missing `{missing_field}`")]
+    CompositeIncomplete {
+        /// The `id:` field of the offending rule.
+        rule_id: String,
+        /// Which of `extract` / `nested` is missing.
+        missing_field: String,
+    },
+
+    /// M11 Phase 4 (placeholder, runtime): composite `extract` jq did
+    /// not return an array.
+    #[error("rule {rule_id} composite extract did not return an array")]
+    CompositeExtractNotArray {
+        /// The `id:` field of the offending rule.
+        rule_id: String,
+    },
+
+    /// M11 Phase 4 (placeholder, runtime): composite extract item is
+    /// missing one of the required fields (`value`, `format`, `anchor`).
+    #[error("rule {rule_id} composite extract item missing field `{missing_field}`")]
+    CompositeExtractMalformed {
+        /// The `id:` field of the offending rule.
+        rule_id: String,
+        /// Name of the missing field.
+        missing_field: String,
+    },
+
+    /// M11 Phase 4 (placeholder, runtime): composite extract item
+    /// declared a `format` name that doesn't resolve to a known
+    /// [`dq_core::FormatTag`].
+    #[error("rule {rule_id} composite extract item names unknown format `{format}`")]
+    CompositeExtractUnknownFormat {
+        /// The `id:` field of the offending rule.
+        rule_id: String,
+        /// The unrecognized format name.
+        format: String,
+    },
+
+    /// M11 Phase 4 (placeholder, runtime): composite recursion exceeded
+    /// the configured depth bound (default `MAX_EXTRACT_DEPTH = 4`).
+    #[error("rule {rule_id} composite recursion exceeded depth bound (depth={depth}, max={max})")]
+    CompositeDepthExceeded {
+        /// The `id:` field of the offending rule.
+        rule_id: String,
+        /// Recursion depth reached when the bound tripped.
+        depth: usize,
+        /// Configured maximum depth.
+        max: usize,
+    },
+
+    /// M11 Phase 3: a rule's inline `check.schema` or sibling
+    /// `check.schema_file` failed to compile into a
+    /// `jsonschema::Validator`. Common causes: malformed schema,
+    /// unresolvable `$ref`, unsupported keyword. `message` carries the
+    /// upstream error rendered to a string.
+    #[error("rule {rule_id} schema failed to compile: {message}")]
+    SchemaCompile {
+        /// The `id:` field of the offending rule.
+        rule_id: String,
+        /// Stringified upstream `jsonschema::ValidationError`. Stored as
+        /// a plain `String` because `jsonschema::ValidationError`
+        /// borrows from the input by default; flattening to a string
+        /// at construction time keeps the variant `'static` and
+        /// `Send + Sync`.
+        message: String,
+    },
+
+    /// M11 Phase 3: `check.schema_file` resolved to an absolute path.
+    /// Schema-file paths must stay inside the rule directory tree
+    /// (per the spec scenario "Absolute path rejected").
+    #[error("rule {rule_id} schema_file path is absolute: {path}")]
+    SchemaFileAbsolutePath {
+        /// The `id:` field of the offending rule.
+        rule_id: String,
+        /// The offending path verbatim from the rule.
+        path: Utf8PathBuf,
+    },
+
+    /// M11 Phase 3: `check.schema_file` resolved (after canonicalisation)
+    /// to a path outside the rule directory. Per design D2 the schema
+    /// file must live as a sibling of the rule's `.yml` source — `..`
+    /// escape attempts are rejected.
+    #[error("rule {rule_id} schema_file escapes rule directory: {path}")]
+    SchemaFileEscapesRuleDir {
+        /// The `id:` field of the offending rule.
+        rule_id: String,
+        /// The offending path verbatim from the rule.
+        path: Utf8PathBuf,
+    },
 }
 
 impl ExecError {
     /// Stable, lowercase string identifying the error category.
     ///
     /// Used by the CLI's exit-code mapper and by JSON output formats that
-    /// want a stable key independent of the diagnostic message. Returns
-    /// one of `"parse"`, `"rule_compile"`, `"unknown_rule"`, `"io"`,
-    /// `"test_fixture"`, `"glob_compile"`, `"fix_apply"`.
+    /// want a stable key independent of the diagnostic message. Each
+    /// variant resolves to a snake-case identifier that is part of the
+    /// public CLI contract.
     #[must_use]
     pub fn kind_name(&self) -> &'static str {
         match self {
@@ -132,6 +244,16 @@ impl ExecError {
             Self::TestFixture { .. } => "test_fixture",
             Self::GlobCompile { .. } => "glob_compile",
             Self::FixApply { .. } => "fix_apply",
+            Self::CheckMutuallyExclusive { .. } => "check_mutually_exclusive",
+            Self::CheckMissing { .. } => "check_missing",
+            Self::CompositeIncomplete { .. } => "composite_incomplete",
+            Self::CompositeExtractNotArray { .. } => "composite_extract_not_array",
+            Self::CompositeExtractMalformed { .. } => "composite_extract_malformed",
+            Self::CompositeExtractUnknownFormat { .. } => "composite_extract_unknown_format",
+            Self::CompositeDepthExceeded { .. } => "composite_depth_exceeded",
+            Self::SchemaCompile { .. } => "schema_compile",
+            Self::SchemaFileAbsolutePath { .. } => "schema_file_absolute_path",
+            Self::SchemaFileEscapesRuleDir { .. } => "schema_file_escapes_rule_dir",
         }
     }
 }
@@ -237,6 +359,103 @@ mod tests {
             formatted.contains("fix"),
             "expected display to call out fix failure, got: {formatted}",
         );
+    }
+
+    #[test]
+    fn kind_name_covers_check_mutually_exclusive_variant() {
+        let err = ExecError::CheckMutuallyExclusive {
+            rule_id: "a.b".to_owned(),
+            present_fields: vec!["jq".to_owned(), "schema".to_owned()],
+        };
+        assert_eq!(err.kind_name(), "check_mutually_exclusive");
+        let formatted = format!("{err}");
+        assert!(formatted.contains("a.b"), "got: {formatted}");
+        assert!(formatted.contains("jq"), "got: {formatted}");
+        assert!(formatted.contains("schema"), "got: {formatted}");
+    }
+
+    #[test]
+    fn kind_name_covers_check_missing_variant() {
+        let err = ExecError::CheckMissing {
+            rule_id: "a.b".to_owned(),
+        };
+        assert_eq!(err.kind_name(), "check_missing");
+    }
+
+    #[test]
+    fn kind_name_covers_composite_incomplete_variant() {
+        let err = ExecError::CompositeIncomplete {
+            rule_id: "a.b".to_owned(),
+            missing_field: "nested".to_owned(),
+        };
+        assert_eq!(err.kind_name(), "composite_incomplete");
+        let formatted = format!("{err}");
+        assert!(formatted.contains("nested"), "got: {formatted}");
+    }
+
+    #[test]
+    fn kind_name_covers_composite_extract_not_array_variant() {
+        let err = ExecError::CompositeExtractNotArray {
+            rule_id: "a.b".to_owned(),
+        };
+        assert_eq!(err.kind_name(), "composite_extract_not_array");
+    }
+
+    #[test]
+    fn kind_name_covers_composite_extract_malformed_variant() {
+        let err = ExecError::CompositeExtractMalformed {
+            rule_id: "a.b".to_owned(),
+            missing_field: "anchor".to_owned(),
+        };
+        assert_eq!(err.kind_name(), "composite_extract_malformed");
+    }
+
+    #[test]
+    fn kind_name_covers_composite_extract_unknown_format_variant() {
+        let err = ExecError::CompositeExtractUnknownFormat {
+            rule_id: "a.b".to_owned(),
+            format: "klingon".to_owned(),
+        };
+        assert_eq!(err.kind_name(), "composite_extract_unknown_format");
+    }
+
+    #[test]
+    fn kind_name_covers_composite_depth_exceeded_variant() {
+        let err = ExecError::CompositeDepthExceeded {
+            rule_id: "a.b".to_owned(),
+            depth: 5,
+            max: 4,
+        };
+        assert_eq!(err.kind_name(), "composite_depth_exceeded");
+    }
+
+    #[test]
+    fn kind_name_covers_schema_compile_variant() {
+        let err = ExecError::SchemaCompile {
+            rule_id: "js.bad".to_owned(),
+            message: "unresolvable $ref".to_owned(),
+        };
+        assert_eq!(err.kind_name(), "schema_compile");
+        let formatted = format!("{err}");
+        assert!(formatted.contains("js.bad"), "got: {formatted}");
+    }
+
+    #[test]
+    fn kind_name_covers_schema_file_absolute_path_variant() {
+        let err = ExecError::SchemaFileAbsolutePath {
+            rule_id: "a.b".to_owned(),
+            path: Utf8PathBuf::from("/etc/passwd"),
+        };
+        assert_eq!(err.kind_name(), "schema_file_absolute_path");
+    }
+
+    #[test]
+    fn kind_name_covers_schema_file_escapes_rule_dir_variant() {
+        let err = ExecError::SchemaFileEscapesRuleDir {
+            rule_id: "a.b".to_owned(),
+            path: Utf8PathBuf::from("../../../etc/passwd"),
+        };
+        assert_eq!(err.kind_name(), "schema_file_escapes_rule_dir");
     }
 
     /// Sanity-check the `Display` impl carries the rule id so consumers

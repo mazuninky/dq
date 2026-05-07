@@ -52,6 +52,32 @@ pub fn std_rule_files(namespace: &str) -> Option<&'static [(&'static str, &'stat
     embed::std_rule_files(namespace)
 }
 
+/// Look up the embedded JSON Schema sidecar `file` under namespace
+/// `namespace`.
+///
+/// M11 Phase 3: rules in the `@std/jsonschema` namespace can declare
+/// `check.schema_file: ./shape.schema.json`. The sibling schema is
+/// embedded at compile time alongside the rule YAML; this function
+/// resolves the `(namespace, file)` tuple back to the embedded
+/// `&'static str` so `dq-exec`'s schema-compile path can read it
+/// without filesystem I/O.
+///
+/// Returns `None` for unknown namespaces or unknown filenames.
+#[must_use]
+pub fn std_schema(namespace: &str, file: &str) -> Option<&'static str> {
+    embed::std_schema(namespace, file)
+}
+
+/// List every embedded JSON Schema sidecar file for `namespace`.
+///
+/// Returns an empty slice for namespaces without sidecar schemas.
+/// Used by integration test runners that stage a namespace into a
+/// tempdir so the schema files land next to the rule YAML.
+#[must_use]
+pub fn std_schema_files(namespace: &str) -> &'static [(&'static str, &'static str)] {
+    embed::std_schema_files(namespace)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,16 +101,20 @@ mod tests {
 
     #[test]
     fn list_std_rulesets_contains_all_namespaces() {
-        // M9 added the `markdown` namespace; total is now 5. Subsequent
-        // milestones may add more — update the count and the per-namespace
-        // assertions together when that happens.
+        // M9 added `markdown`, M11 Phase 3 added `jsonschema`, M11
+        // Phase 5 added `terraform` and `openapi` — total is now 8.
+        // Subsequent milestones may add more; update the count and the
+        // per-namespace assertions together when that happens.
         let namespaces = list_std_rulesets();
-        assert_eq!(namespaces.len(), 5);
+        assert_eq!(namespaces.len(), 8);
         assert!(namespaces.contains(&"k8s"));
         assert!(namespaces.contains(&"dockerfile"));
         assert!(namespaces.contains(&"npm"));
         assert!(namespaces.contains(&"github-actions"));
         assert!(namespaces.contains(&"markdown"));
+        assert!(namespaces.contains(&"jsonschema"));
+        assert!(namespaces.contains(&"terraform"));
+        assert!(namespaces.contains(&"openapi"));
     }
 
     #[test]
@@ -155,6 +185,9 @@ mod tests {
             ("github-actions", 4),
             ("npm", 6),
             ("markdown", 18),
+            ("jsonschema", 3),
+            ("terraform", 8),
+            ("openapi", 6),
         ];
         for (ns, min) in expected {
             let yaml = std_ruleset(ns).expect("namespace yaml present");

@@ -1,0 +1,14 @@
+id: openapi.info-required-fields
+description: |
+  An OpenAPI document must declare a non-empty `info.title` and
+  `info.version`. These two fields drive the generated SDK package
+  name, the rendered docs heading, and the registry deduplication key
+  in most OpenAPI tooling.
+severity: error
+match:
+  format: [yaml, json]
+  filter: '.openapi != null and (.openapi | type == "string")'
+check:
+  schema_file: ./openapi-info.schema.json
+references:
+  - https://spec.openapis.org/oas/latest.html#info-object

@@ -1,0 +1,16 @@
+id: openapi.paths-non-empty
+description: |
+  An OpenAPI document with no operations is not useful — code
+  generators emit empty SDKs and doc renderers display a blank page.
+  If the spec is intentionally a stub (e.g. authoring scaffolding),
+  add a `paths: { /healthz: { get: { responses: { "200": { ... } } } } }`
+  placeholder so consumers see at least one operation.
+severity: warn
+match:
+  format: [yaml, json]
+  filter: '.openapi != null and (.openapi | type == "string")'
+check:
+  jq: 'select((.paths // {}) | length == 0) | {summary: "no paths defined"}'
+  message: "OpenAPI document declares no paths"
+references:
+  - https://spec.openapis.org/oas/latest.html#paths-object

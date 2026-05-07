@@ -37,6 +37,7 @@
 //!   value_range; replacement renders the value only. M3 will revisit if a
 //!   user reports a real-world case where this matters.
 
+use std::collections::HashSet;
 use std::ops::Range;
 
 use saphyr_parser::{Event, Parser as YamlParser, ScalarStyle, Span};
@@ -46,6 +47,8 @@ use crate::document::spans::{SpanContext, SpanMap, ValueSpan};
 use crate::document::{Document, FormatTag, Value};
 use crate::error::Error;
 use crate::format::Format;
+use crate::ir::{InlineBaseline, Provenance, ProvenanceMap};
+use crate::pointer::Pointer;
 use crate::textual_edit::{InsertionRenderer, ScalarRenderer};
 
 // ---------------------------------------------------------------------------
@@ -70,6 +73,26 @@ use crate::textual_edit::{InsertionRenderer, ScalarRenderer};
 ///   short snippet matching the failing line, so the CLI's diagnostic
 ///   formatting works without further introspection.
 pub fn parse_with_spans(bytes: &[u8]) -> Result<(Value, SpanMap)> {
+    let (value, spans, _block_scalars) = parse_with_spans_and_block_scalars(bytes)?;
+    Ok((value, spans))
+}
+
+/// Parse `bytes` as YAML and additionally surface the canonical pointer set of
+/// every leaf whose underlying scalar uses a block style ([`ScalarStyle::Literal`]
+/// or [`ScalarStyle::Folded`]).
+///
+/// Block-style scalars (`|`, `>`, `|-`, `>-`) are the YAML constructs that
+/// composite-rule evaluation re-parses as another format (Phase 4 of
+/// `add-validation-and-extended-formats`). The caller — [`parse_yaml_with_spans`]
+/// today — uses the returned set to attach `inline_offset = Some(InlineBaseline { 0, 1, 1 })`
+/// to each block-scalar leaf's [`Provenance::Original`] entry. Other parsers
+/// route through [`parse_with_spans`] when they only need the value tree and
+/// span map.
+///
+/// # Errors
+///
+/// Same as [`parse_with_spans`].
+fn parse_with_spans_and_block_scalars(bytes: &[u8]) -> Result<(Value, SpanMap, HashSet<String>)> {
     // Reuse the M1 read path verbatim for the value tree. Any divergence
     // between this parser's view and the spike-validated spans would cause
     // `Document::set_at` to splice into bytes that the in-memory tree does
@@ -84,41 +107,101 @@ pub fn parse_with_spans(bytes: &[u8]) -> Result<(Value, SpanMap)> {
     } else {
         read_doc.value().clone()
     };
-    let spans = build_span_map(bytes)?;
-    Ok((value, spans))
+    let (spans, block_scalars) = build_span_map_and_block_scalars(bytes)?;
+    Ok((value, spans, block_scalars))
 }
 
-/// Parse `bytes` as YAML and assemble a [`Document`] carrying both the value
-/// tree and the spans needed for the write path.
+/// Parse `bytes` as YAML and assemble a [`Document`] carrying the value tree,
+/// the spans needed for the write path, and an inline-offset-aware
+/// [`ProvenanceMap`].
 ///
 /// Always returns a single-document `Document` (`is_multi() == false`). For
 /// multi-document streams the value is a `Value::Array(documents)` and the
 /// span map keys use a `/{doc_idx}/...` prefix — that is the canonical
 /// shape `Document::set_at` walks.
 ///
+/// # Inline-offset population
+///
+/// Phase 2 of `add-validation-and-extended-formats` requires every YAML block
+/// scalar (`|`, `>`, `|-`, `>-`) to carry
+/// `inline_offset = Some(InlineBaseline { byte_start: 0, line: 1, col: 1 })`
+/// on its `Provenance::Original` entry — the body of a block scalar always
+/// starts at line 1 col 1 of its own content. Composite-rule evaluation
+/// projects inner-document line / column back to outer-file coordinates by
+/// reading this baseline. Plain, single-quoted, and double-quoted scalars
+/// keep `inline_offset = None`.
+///
 /// # Errors
 ///
 /// Forwards [`parse_with_spans`] errors verbatim.
 pub fn parse_yaml_with_spans(bytes: &[u8]) -> Result<Document> {
-    let (value, spans) = parse_with_spans(bytes)?;
-    Ok(Document::with_spans(
+    let (value, spans, block_scalars) = parse_with_spans_and_block_scalars(bytes)?;
+    let provenance = build_provenance_with_inline_offsets(&spans, &block_scalars);
+    Ok(Document::with_spans_and_provenance(
         value,
         bytes.to_vec(),
         spans,
         FormatTag::Yaml,
+        provenance,
     ))
+}
+
+/// Build a [`ProvenanceMap`] from `spans`, populating `inline_offset` for every
+/// canonical pointer in `block_scalar_pointers`.
+///
+/// Mirrors [`crate::document::provenance_from_spans`] behaviour for the
+/// non-inline-offset entries; the only difference is the
+/// `inline_offset = Some(InlineBaseline { 0, 1, 1 })` override for block
+/// scalars. Kept inside the YAML parser module so the contract — "block
+/// scalars start at offset 0, line 1, col 1 of their content" — lives next
+/// to the parser branch that detects them.
+fn build_provenance_with_inline_offsets(
+    spans: &SpanMap,
+    block_scalar_pointers: &HashSet<String>,
+) -> ProvenanceMap {
+    let mut map = ProvenanceMap::with_capacity(spans.len());
+    for (canonical, span) in spans {
+        let pointer = Pointer::parse(canonical)
+            .expect("canonical span keys are produced by Pointer::as_canonical");
+        let inline_offset = if block_scalar_pointers.contains(canonical) {
+            // YAML block-scalar contract: body starts at byte 0, line 1, col 1
+            // of the inner content (after the indicator + newline). The
+            // caller of composite-rule evaluation projects this baseline
+            // through `final_line = anchor_line + inner_line - 1` etc.
+            Some(InlineBaseline {
+                byte_start: 0,
+                line: 1,
+                col: 1,
+            })
+        } else {
+            None
+        };
+        map.insert(
+            canonical.clone(),
+            Provenance::Original {
+                pointer,
+                span: Some(span.clone()),
+                inline_offset,
+            },
+        );
+    }
+    map
 }
 
 // ---------------------------------------------------------------------------
 // Span builder — saphyr-parser event walk
 // ---------------------------------------------------------------------------
 
-/// Build a [`SpanMap`] from the YAML source.
+/// Build a [`SpanMap`] paired with the canonical-pointer set of every leaf
+/// whose underlying scalar uses a YAML block style ([`ScalarStyle::Literal`]
+/// or [`ScalarStyle::Folded`]).
 ///
 /// Implementation mirrors the spike's state machine (see file-level docs).
 /// Step 1 counts documents (so we know whether to namespace pointers under
 /// `/{doc_idx}`); step 2 walks events recording one [`ValueSpan`] per scalar
-/// value (not per scalar key).
+/// value (not per scalar key) and, alongside, recording the canonical pointer
+/// of every block-style leaf for the inline-offset enrichment in
+/// [`parse_yaml_with_spans`].
 ///
 /// # saphyr-parser char-vs-byte caveat
 ///
@@ -130,7 +213,7 @@ pub fn parse_yaml_with_spans(bytes: &[u8]) -> Result<Document> {
 /// constructing a [`Range<usize>`]. Without this, any non-ASCII byte before a
 /// span (em-dash in a comment, accented identifier, …) shifts every later
 /// span's `value_range` by `(utf8_len - 1)` bytes per multi-byte codepoint.
-fn build_span_map(bytes: &[u8]) -> Result<SpanMap> {
+fn build_span_map_and_block_scalars(bytes: &[u8]) -> Result<(SpanMap, HashSet<String>)> {
     let text = std::str::from_utf8(bytes).map_err(|err| Error::Parse {
         file: None,
         line: 0,
@@ -147,16 +230,17 @@ fn build_span_map(bytes: &[u8]) -> Result<SpanMap> {
     let char_to_byte = build_char_to_byte_map(text);
 
     let mut spans = SpanMap::new();
+    let mut block_scalars: HashSet<String> = HashSet::new();
     let mut state = State::new(bytes, multi_doc, &char_to_byte);
 
     let mut parser = YamlParser::new_from_str(text);
     while let Some(item) = parser.next_event() {
         let (event, span) =
             item.map_err(|scan_err| scan_to_parse_error(&scan_err, bytes, &char_to_byte))?;
-        state.observe(event, span, &mut spans)?;
+        state.observe(event, span, &mut spans, &mut block_scalars)?;
     }
 
-    Ok(spans)
+    Ok((spans, block_scalars))
 }
 
 /// Build a `Vec<usize>` whose entry `i` is the byte offset of the `i`-th
@@ -297,6 +381,7 @@ impl<'src> State<'src> {
         event: Event<'_>,
         span: Span,
         spans: &mut SpanMap,
+        block_scalars: &mut HashSet<String>,
     ) -> std::result::Result<(), Error> {
         match event {
             Event::StreamStart | Event::StreamEnd | Event::Nothing => {}
@@ -333,6 +418,18 @@ impl<'src> State<'src> {
                     let context = self.value_context();
                     let line_range = self.compute_line_range(&value_range, context, style);
                     let indent = u32::try_from(span.start.col()).unwrap_or(u32::MAX);
+                    if matches!(style, ScalarStyle::Literal | ScalarStyle::Folded) {
+                        // Record the canonical pointer alongside the span
+                        // so [`build_provenance_with_inline_offsets`] can
+                        // attach `inline_offset = Some(InlineBaseline { 0, 1, 1 })`
+                        // when it builds the `ProvenanceMap`. This covers
+                        // every block-style indicator: `|`, `>`, `|-`, `>-`
+                        // — saphyr-parser collapses the chomping/indent
+                        // suffixes into the same `Literal` / `Folded`
+                        // discriminant, which is the contract Phase 2 of
+                        // `add-validation-and-extended-formats` requires.
+                        block_scalars.insert(pointer.clone());
+                    }
                     spans.insert(
                         pointer,
                         ValueSpan {
@@ -1349,5 +1446,160 @@ mod tests {
         doc.set_at(&pointer, Value::String("Updated".into()))
             .expect("set_at");
         assert_eq!(doc.original_bytes(), b"title: \"Updated\"\n");
+    }
+
+    // -- Phase 2 (`add-validation-and-extended-formats`) ------------------
+    //
+    // Inline-offset population for YAML block scalars. Phase 2 spec
+    // ("YAML block scalar carries inline-offset") requires every leaf whose
+    // backing scalar uses `|`, `>`, `|-`, or `>-` to surface
+    // `inline_offset = Some(InlineBaseline { 0, 1, 1 })` on its
+    // `Provenance::Original` entry; every other style — plain, single-quoted,
+    // double-quoted — keeps `inline_offset = None`.
+
+    /// Helper: pull the `inline_offset` field out of the Original provenance
+    /// entry for `pointer_str`. Panics if the entry is missing or Synthetic
+    /// — the YAML write-aware path is supposed to emit Original for every
+    /// leaf, so a missing entry indicates a regression worth surfacing.
+    fn inline_offset_for(doc: &Document, pointer_str: &str) -> Option<InlineBaseline> {
+        let pointer = Pointer::parse(pointer_str).expect("pointer parses");
+        match doc.as_ir().provenance_for(&pointer) {
+            Some(Provenance::Original { inline_offset, .. }) => *inline_offset,
+            other => panic!("expected Original for `{pointer_str}`, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn yaml_literal_block_scalar_carries_inline_offset() {
+        // `|` indicator → ScalarStyle::Literal. The body starts at line 1
+        // col 1 of its own content — that is the contract every composite
+        // rule projection depends on.
+        let bytes = b"script: |\n  echo 1\n  echo 2\n";
+        let doc = parse_yaml_with_spans(bytes).expect("parse");
+        assert_eq!(
+            inline_offset_for(&doc, "/script"),
+            Some(InlineBaseline {
+                byte_start: 0,
+                line: 1,
+                col: 1,
+            }),
+            "literal block scalar (`|`) MUST carry inline_offset = Some(0,1,1)",
+        );
+    }
+
+    #[test]
+    fn yaml_folded_block_scalar_carries_inline_offset() {
+        // `>` indicator → ScalarStyle::Folded. Same contract as Literal —
+        // the projection treats every block-style as inline-content with
+        // baseline (0, 1, 1).
+        let bytes = b"description: >\n  multi-line\n  folded\n";
+        let doc = parse_yaml_with_spans(bytes).expect("parse");
+        assert_eq!(
+            inline_offset_for(&doc, "/description"),
+            Some(InlineBaseline {
+                byte_start: 0,
+                line: 1,
+                col: 1,
+            }),
+            "folded block scalar (`>`) MUST carry inline_offset = Some(0,1,1)",
+        );
+    }
+
+    #[test]
+    fn yaml_strip_chomping_block_scalar_carries_inline_offset() {
+        // `|-` and `>-` are block scalars with strip-chomping. saphyr-parser
+        // collapses them onto the same Literal/Folded discriminants, so the
+        // contract is identical.
+        for bytes in [
+            &b"script: |-\n  one\n  two\n"[..],
+            &b"script: >-\n  one\n  two\n"[..],
+        ] {
+            let doc = parse_yaml_with_spans(bytes).expect("parse");
+            assert_eq!(
+                inline_offset_for(&doc, "/script"),
+                Some(InlineBaseline {
+                    byte_start: 0,
+                    line: 1,
+                    col: 1,
+                }),
+                "strip-chomping block scalar variant MUST carry inline_offset = Some(0,1,1) \
+                 for input: {:?}",
+                std::str::from_utf8(bytes).unwrap_or("<non-utf8>"),
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_plain_scalar_carries_no_inline_offset() {
+        // ScalarStyle::Plain → no block-style → inline_offset = None. The
+        // negative case is just as load-bearing as the positive case: a
+        // regression that started populating inline_offset for plain scalars
+        // would corrupt every composite-rule coordinate projection.
+        let bytes = b"name: foo\n";
+        let doc = parse_yaml_with_spans(bytes).expect("parse");
+        assert_eq!(
+            inline_offset_for(&doc, "/name"),
+            None,
+            "plain scalar MUST NOT carry an inline-offset baseline",
+        );
+    }
+
+    #[test]
+    fn yaml_double_quoted_scalar_carries_no_inline_offset() {
+        let bytes = b"title: \"Hello\"\n";
+        let doc = parse_yaml_with_spans(bytes).expect("parse");
+        assert_eq!(
+            inline_offset_for(&doc, "/title"),
+            None,
+            "double-quoted scalar MUST NOT carry an inline-offset baseline",
+        );
+    }
+
+    #[test]
+    fn yaml_single_quoted_scalar_carries_no_inline_offset() {
+        let bytes = b"name: 'foo'\n";
+        let doc = parse_yaml_with_spans(bytes).expect("parse");
+        assert_eq!(
+            inline_offset_for(&doc, "/name"),
+            None,
+            "single-quoted scalar MUST NOT carry an inline-offset baseline",
+        );
+    }
+
+    #[test]
+    fn yaml_inline_offset_lookup_via_ir_helper_matches_provenance() {
+        // Cross-check the public lookup helper `Ir::inline_offset_for`
+        // against the underlying `Provenance::Original.inline_offset`
+        // field. A drift between the two would mean callers using the
+        // helper get different answers than callers pattern-matching
+        // directly — the kind of subtle bug a contract test pins down.
+        let bytes = b"script: |\n  echo 1\n";
+        let doc = parse_yaml_with_spans(bytes).expect("parse");
+        let pointer = Pointer::parse("/script").expect("pointer");
+        let helper = doc.as_ir().inline_offset_for(&pointer);
+        let expected = InlineBaseline {
+            byte_start: 0,
+            line: 1,
+            col: 1,
+        };
+        assert_eq!(helper, Some(&expected));
+    }
+
+    #[test]
+    fn yaml_block_scalar_inline_offset_in_nested_path() {
+        // Block scalars also live deep inside container structures. Pin
+        // that the canonical path is constructed correctly when the leaf
+        // is reached through nested mappings.
+        let bytes = b"jobs:\n  build:\n    script: |\n      cargo test\n";
+        let doc = parse_yaml_with_spans(bytes).expect("parse");
+        assert_eq!(
+            inline_offset_for(&doc, "/jobs/build/script"),
+            Some(InlineBaseline {
+                byte_start: 0,
+                line: 1,
+                col: 1,
+            }),
+            "block scalar inside nested mapping MUST still carry inline_offset",
+        );
     }
 }

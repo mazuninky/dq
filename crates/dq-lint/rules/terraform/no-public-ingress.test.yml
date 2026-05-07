@@ -1,0 +1,52 @@
+tests:
+  - name: aws security group with 0.0.0.0/0 fires
+    input: |
+      resource "aws_security_group" "web" {
+        ingress {
+          from_port   = 22
+          to_port     = 22
+          protocol    = "tcp"
+          cidr_blocks = ["0.0.0.0/0"]
+        }
+      }
+    expected:
+      violations:
+        - rule: terraform.no-public-ingress
+          message_contains: "cidr_blocks"
+  - name: gcp firewall with public source_ranges fires
+    input: |
+      resource "google_compute_firewall" "open" {
+        name          = "allow-all"
+        network       = "default"
+        source_ranges = ["0.0.0.0/0"]
+        allow {
+          protocol = "tcp"
+          ports    = ["80"]
+        }
+      }
+    expected:
+      violations:
+        - rule: terraform.no-public-ingress
+          message_contains: "source_ranges"
+  - name: private CIDR is allowed
+    input: |
+      resource "aws_security_group" "internal" {
+        ingress {
+          from_port   = 22
+          to_port     = 22
+          protocol    = "tcp"
+          cidr_blocks = ["10.0.0.0/8"]
+        }
+      }
+    expected:
+      violations: []
+  - name: mixed CIDR list with 0.0.0.0/0 still fires
+    input: |
+      resource "aws_security_group" "x" {
+        ingress {
+          cidr_blocks = ["10.0.0.0/8", "0.0.0.0/0"]
+        }
+      }
+    expected:
+      violations:
+        - rule: terraform.no-public-ingress

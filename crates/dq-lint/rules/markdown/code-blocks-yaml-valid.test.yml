@@ -1,0 +1,70 @@
+tests:
+  - name: invalid yaml in fenced block fires the parse-failed diagnostic
+    input: |
+      # Title
+
+      ```yaml
+      key: : invalid : yaml
+      ```
+    expected:
+      violations:
+        - rule: markdown.code-blocks-yaml-valid.parse-failed
+          message_contains: "yaml parse failed"
+  - name: valid yaml in fenced block stays silent
+    input: |
+      # Title
+
+      ```yaml
+      key: value
+      nested:
+        - one
+        - two
+      ```
+    expected:
+      violations: []
+  - name: non-yaml fenced block is ignored
+    input: |
+      # Title
+
+      ```rust
+      fn main() {}
+      ```
+    expected:
+      violations: []
+  - name: indented (non-fenced) yaml-looking block is ignored
+    input: |
+      # Title
+
+          key: : not actually yaml-flagged
+    expected:
+      violations: []
+  - name: multiple yaml blocks — only the invalid one fires
+    input: |
+      # Multi
+
+      ```yaml
+      ok: 1
+      ```
+
+      ```yaml
+      bad: : invalid
+      ```
+
+      ```yaml
+      also-ok: 2
+      ```
+    expected:
+      violations:
+        - rule: markdown.code-blocks-yaml-valid.parse-failed
+          message_contains: "yaml parse failed"
+  - name: no yaml blocks at all stays silent
+    input: |
+      # Just text
+
+      Some prose.
+
+      And a list:
+      - one
+      - two
+    expected:
+      violations: []

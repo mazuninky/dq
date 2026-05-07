@@ -1,0 +1,61 @@
+tests:
+  - name: operation with 200 response passes
+    input: |
+      openapi: "3.1.0"
+      info: { title: API, version: "1.0.0" }
+      paths:
+        /users:
+          get:
+            responses:
+              "200": { description: ok }
+    expected:
+      violations: []
+  - name: operation with only 4xx responses fires
+    input: |
+      openapi: "3.1.0"
+      info: { title: API, version: "1.0.0" }
+      paths:
+        /users:
+          get:
+            responses:
+              "404": { description: not found }
+    expected:
+      violations:
+        - rule: openapi.response-200-or-201-required
+          message_contains: "GET /users"
+  - name: operation with 201 passes
+    input: |
+      openapi: "3.1.0"
+      info: { title: API, version: "1.0.0" }
+      paths:
+        /users:
+          post:
+            responses:
+              "201": { description: created }
+    expected:
+      violations: []
+  - name: operation with 2XX wildcard passes
+    input: |
+      openapi: "3.1.0"
+      info: { title: API, version: "1.0.0" }
+      paths:
+        /users:
+          get:
+            responses:
+              "2XX": { description: success }
+    expected:
+      violations: []
+  - name: multiple operations, only the bad one fires
+    input: |
+      openapi: "3.1.0"
+      info: { title: API, version: "1.0.0" }
+      paths:
+        /users:
+          get:
+            responses: { "200": { description: ok } }
+          delete:
+            responses: { "404": { description: nf } }
+    expected:
+      violations:
+        - rule: openapi.response-200-or-201-required
+          message_contains: "DELETE /users"

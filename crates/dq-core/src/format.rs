@@ -131,7 +131,17 @@ mod tests {
 
     #[test]
     fn detect_returns_none_for_unknown_extension() {
-        assert!(detect(Utf8Path::new("a.xml")).is_none());
+        // M11 wired up XML as a registered format; pick an extension that
+        // genuinely has no parser to keep the negative-path coverage.
+        assert!(detect(Utf8Path::new("a.unknownext")).is_none());
+    }
+
+    #[test]
+    fn detect_resolves_xml_extension_to_xml_parser() {
+        // M11 contract: `pom.xml` (or any `.xml` file) resolves to the
+        // registered `XmlFormat` parser.
+        let f = detect(Utf8Path::new("pom.xml")).expect("xml registered");
+        assert_eq!(f.name(), "xml");
     }
 
     #[test]

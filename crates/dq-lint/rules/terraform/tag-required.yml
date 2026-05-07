@@ -1,0 +1,21 @@
+id: terraform.tag-required
+description: |
+  AWS resources should be tagged so cost allocation, ownership, and
+  lifecycle policies can target them. Every `resource "aws_*"` block
+  must carry a top-level `tags = { ... }` map. Resources that
+  legitimately do not support tagging (a small handful of AWS types)
+  can be excluded by overriding this rule's `match.filter`.
+severity: warn
+match:
+  format: hcl
+check:
+  jq: |
+    [.resource // {} | to_entries[]
+      | select(.key | tostring | startswith("aws_"))
+      | .key as $type
+      | .value | to_entries[]
+      | select(.value.tags == null)
+      | {type: $type, name: .key}][]
+  message: "Resource {{ .type }}.{{ .name }} has no tags"
+references:
+  - https://docs.aws.amazon.com/general/latest/gr/aws_tagging.html

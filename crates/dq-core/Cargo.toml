@@ -62,6 +62,11 @@ dockerfile-parser-rs = { workspace = true }
 # the `default-features = false` choice.
 comrak = { workspace = true }
 
+# M11 XML — `quick-xml` powers the read+write XmlFormat in `parsers/xml.rs`.
+# Event-based parser; `serialize` feature is enabled for `BytesDecl::new`
+# (used to re-emit the XML declaration on round-trip). License: MIT.
+quick-xml = { workspace = true }
+
 [dev-dependencies]
 insta = { workspace = true, features = ["redactions"] }
 pretty_assertions = { workspace = true }

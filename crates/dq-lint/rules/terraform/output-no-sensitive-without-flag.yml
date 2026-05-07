@@ -1,0 +1,19 @@
+id: terraform.output-no-sensitive-without-flag
+description: |
+  `output` blocks whose name suggests they expose a credential
+  (`*secret*`, `*password*`, `*token*`, `*key*`, `*credential*`) must
+  set `sensitive = true` so Terraform redacts the value in CLI output
+  and plan diffs. Without the flag the value lands in CI logs and
+  remote-state inspection commands in plain text.
+severity: error
+match:
+  format: hcl
+check:
+  jq: |
+    [.output // {} | to_entries[]
+      | select(.key | tostring | test("(?i)(secret|password|token|key|credential)"))
+      | select(.value.sensitive != true)
+      | {name: .key}][]
+  message: "Output '{{ .name }}' looks credential-like but is not marked sensitive = true"
+references:
+  - https://developer.hashicorp.com/terraform/language/values/outputs#sensitive-suppressing-values-in-cli-output

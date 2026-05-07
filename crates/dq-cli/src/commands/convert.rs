@@ -284,6 +284,7 @@ fn canonical_extension(output_format: OutputFormat) -> Option<&'static str> {
         OutputFormat::Tsv => Some("tsv"),
         OutputFormat::Frontmatter => Some("md"),
         OutputFormat::Markdown => Some("md"),
+        OutputFormat::Xml => Some("xml"),
         OutputFormat::Toon => None,
         OutputFormat::Console => None,
         // M6 / M8: SARIF / JUnit / TAP are diagnostic-only output formats and
@@ -307,6 +308,7 @@ fn output_format_label(output_format: OutputFormat) -> &'static str {
         OutputFormat::Tsv => "tsv",
         OutputFormat::Frontmatter => "frontmatter",
         OutputFormat::Markdown => "markdown",
+        OutputFormat::Xml => "xml",
         OutputFormat::Toon => "toon",
         OutputFormat::Console => "console",
         OutputFormat::Sarif => "sarif",
@@ -341,6 +343,7 @@ fn project_for_cross_format_render(doc: &Document, output_format: OutputFormat) 
         OutputFormat::DotEnv => Some(FormatTag::DotEnv),
         OutputFormat::Csv => Some(FormatTag::Csv),
         OutputFormat::Tsv => Some(FormatTag::Tsv),
+        OutputFormat::Xml => Some(FormatTag::Xml),
         // Console / Toon / Sarif / Junit / Tap / Markdown / Frontmatter
         // either render via reporters (no doc baseline) or have their own
         // explicit cross-format guard upstream.
@@ -437,6 +440,19 @@ fn render_to_format(
         }
         OutputFormat::Tsv => {
             let f = dq_core::by_name("tsv").expect("tsv format registered in M5");
+            f.write_with_options(doc, &mut buf, opts)
+                .map_err(anyhow::Error::new)?;
+        }
+        OutputFormat::Xml => {
+            // M11: XML write target. The XML writer demands a top-level
+            // map containing exactly one element-shaped key — when the
+            // source is JSON / YAML / TOML carrying an arbitrary tree,
+            // the value must already be in that shape (i.e. the caller
+            // has prepared a `{"root": [{"#text": "..."}]}` envelope).
+            // Documents that don't fit this contract surface a
+            // structured `Error::Format` from the writer, which the
+            // exit-code mapper routes to WRITE_FAILED.
+            let f = dq_core::by_name("xml").expect("xml format registered in M11");
             f.write_with_options(doc, &mut buf, opts)
                 .map_err(anyhow::Error::new)?;
         }
@@ -577,6 +593,7 @@ fn maybe_warn_lossy(input: &str, output: OutputFormat) {
         OutputFormat::DotEnv => "dotenv",
         OutputFormat::Csv => "CSV",
         OutputFormat::Tsv => "TSV",
+        OutputFormat::Xml => "XML",
     };
     if input == "yaml" {
         tracing::warn!(

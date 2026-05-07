@@ -1,0 +1,19 @@
+id: terraform.state-backend-required
+description: |
+  A `terraform { ... }` block without a nested `backend "..." { ... }`
+  defaults to local state (`terraform.tfstate` next to your `.tf` files).
+  Local state cannot be shared across teammates or CI runs and is easy
+  to commit to version control by accident. Configure a remote backend
+  (`s3`, `gcs`, `azurerm`, `remote`, etc.) for any non-throwaway root
+  module.
+severity: warn
+match:
+  format: hcl
+check:
+  jq: |
+    select(.terraform != null)
+    | select(.terraform.backend == null)
+    | {summary: "no backend configured"}
+  message: "terraform block has no backend — state will be local"
+references:
+  - https://developer.hashicorp.com/terraform/language/settings/backends/configuration

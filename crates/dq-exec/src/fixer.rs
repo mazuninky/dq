@@ -157,10 +157,24 @@ impl Fixer {
                 continue;
             }
 
-            // 3. Confirm there is at least one violation. Runtime
-            // errors here are tolerated (log + skip) — same contract
-            // as the lint evaluator.
-            match rule.check_engine.run(&value) {
+            // 3. Confirm there is at least one violation. Only the
+            // legacy `Check::Jq` variant carries a `fix:` block today —
+            // schema and composite checks ship without autofix support
+            // (an authoring-time limitation we'll lift in a follow-up).
+            // Runtime errors during the violation probe are tolerated
+            // (log + skip) — same contract as the lint evaluator.
+            let check_engine = match &rule.check {
+                crate::evaluator::CompiledCheck::Jq { engine, .. } => engine,
+                crate::evaluator::CompiledCheck::Schema { .. }
+                | crate::evaluator::CompiledCheck::Composite(_) => {
+                    tracing::warn!(
+                        rule_id = %rule.rule.id,
+                        "fix on non-jq check is not supported yet; skipping rule",
+                    );
+                    continue;
+                }
+            };
+            match check_engine.run(&value) {
                 Ok(violations) if violations.is_empty() => continue,
                 Ok(_) => {}
                 Err(err) => {
