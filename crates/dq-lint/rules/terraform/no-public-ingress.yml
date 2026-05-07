@@ -1,11 +1,12 @@
 id: terraform.no-public-ingress
 description: |
   Security-group ingress and GCP firewall rules opened to `0.0.0.0/0`
-  expose the workload to the entire internet. Restrict the source range
-  to a VPN CIDR, a load-balancer security group, or an IAM-authenticated
-  bastion. If you really do need a publicly reachable service, prefer a
-  managed CDN / load balancer in front of the workload and document the
-  intent on the resource so reviewers can override this rule.
+  (or the IPv6 equivalent `::/0`) expose the workload to the entire
+  internet. Restrict the source range to a VPN CIDR, a load-balancer
+  security group, or an IAM-authenticated bastion. If you really do
+  need a publicly reachable service, prefer a managed CDN / load
+  balancer in front of the workload and document the intent on the
+  resource so reviewers can override this rule.
 severity: error
 match:
   format: hcl

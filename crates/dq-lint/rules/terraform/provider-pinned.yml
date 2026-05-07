@@ -14,6 +14,15 @@ check:
   # Walk every provider block whose own `version` argument is unset and
   # whose name is also missing from terraform.required_providers (or has
   # no `version` field there). Either location satisfies the rule.
+  #
+  # Known limitation: dq's HCL parser merges multiple `provider "<name>"`
+  # blocks (e.g. aliased providers) into a single map keyed by name,
+  # last-wins per field. This means the rule cannot inspect each aliased
+  # block individually — if any aliased block sets `version`, the merged
+  # `version` field is non-null and the rule passes. For aliased
+  # providers, declare the version constraint in `terraform {
+  # required_providers { ... } }` (the modern Terraform >= 0.13 path)
+  # so the constraint applies to every alias uniformly.
   jq: |
     . as $root |
     [.provider // {} | to_entries[]

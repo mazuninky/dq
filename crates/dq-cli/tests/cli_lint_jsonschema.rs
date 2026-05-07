@@ -117,7 +117,13 @@ spec:
     // this test names: zero diagnostics with
     // `rule_id == "jsonschema.kubernetes-crd-shape"`. Other rules'
     // diagnostics, if any, pass through without affecting the assertion.
-    let _ = dq::run(&cli, false, &mut out, &mut err);
+    let run_result = dq::run(&cli, false, &mut out, &mut err);
+    assert!(
+        !out.is_empty(),
+        "dq::run produced no JSON output — infrastructure failure? \
+         run_result={run_result:?}, stderr={:?}",
+        String::from_utf8_lossy(&err),
+    );
     let parsed: serde_json::Value = serde_json::from_slice(&out)
         .unwrap_or_else(|jerr| panic!("expected valid JSON, got: {jerr}\n{out:?}"));
     let diagnostics = parsed

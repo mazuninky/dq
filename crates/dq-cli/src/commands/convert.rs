@@ -451,7 +451,7 @@ fn render_to_format(
             // has prepared a `{"root": [{"#text": "..."}]}` envelope).
             // Documents that don't fit this contract surface a
             // structured `Error::Format` from the writer, which the
-            // exit-code mapper routes to WRITE_FAILED.
+            // exit-code mapper routes to GENERIC (exit 1).
             let f = dq_core::by_name("xml").expect("xml format registered in M11");
             f.write_with_options(doc, &mut buf, opts)
                 .map_err(anyhow::Error::new)?;

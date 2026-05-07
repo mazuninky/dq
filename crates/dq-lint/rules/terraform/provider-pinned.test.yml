@@ -67,3 +67,17 @@ tests:
       violations:
         - rule: terraform.provider-pinned
           message_contains: "aws"
+  - name: aliased providers each pinned at block level pass
+    input: |
+      provider "aws" {
+        alias   = "us"
+        region  = "us-east-1"
+        version = "~> 5.0"
+      }
+      provider "aws" {
+        alias   = "eu"
+        region  = "eu-west-1"
+        version = "~> 5.0"
+      }
+    expected:
+      violations: []
