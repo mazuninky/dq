@@ -100,12 +100,34 @@ spec:
 
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
-    let result = dq::run(&cli, false, &mut out, &mut err);
+    // We intentionally do NOT assert on the overall `dq::run` result.
+    // `--rules @std/jsonschema` runs every rule in the namespace, so a
+    // future schema rule unrelated to `kubernetes-crd-shape` (e.g.
+    // `helm-values-against-schema`, `openapi-3.1-shape`) firing on this
+    // manifest would flip `result` to `Err(LintFail)` even though the
+    // rule under test stays correct. Scope the assertion to the rule
+    // this test names: zero diagnostics with
+    // `rule_id == "jsonschema.kubernetes-crd-shape"`. Other rules'
+    // diagnostics, if any, pass through without affecting the assertion.
+    let _ = dq::run(&cli, false, &mut out, &mut err);
+    let parsed: serde_json::Value = serde_json::from_slice(&out)
+        .unwrap_or_else(|jerr| panic!("expected valid JSON, got: {jerr}\n{out:?}"));
+    let diagnostics = parsed
+        .get("diagnostics")
+        .and_then(|v| v.as_array())
+        .unwrap_or_else(|| panic!("expected diagnostics array, got: {parsed}"));
+    let crd_diags: Vec<&serde_json::Value> = diagnostics
+        .iter()
+        .filter(|d| {
+            d.get("rule_id")
+                .and_then(|v| v.as_str())
+                .is_some_and(|id| id == "jsonschema.kubernetes-crd-shape")
+        })
+        .collect();
     assert!(
-        result.is_ok(),
-        "lint should succeed for a well-formed CRD manifest; \
-         stdout={:?}, stderr={:?}",
-        String::from_utf8_lossy(&out),
+        crd_diags.is_empty(),
+        "expected zero jsonschema.kubernetes-crd-shape diagnostics for a well-formed \
+         CRD manifest; got: {crd_diags:?}; stderr={:?}",
         String::from_utf8_lossy(&err),
     );
 }

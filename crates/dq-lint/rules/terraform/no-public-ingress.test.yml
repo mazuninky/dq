@@ -76,3 +76,52 @@ tests:
       violations:
         - rule: terraform.no-public-ingress
           message_contains: "cidr_blocks"
+  - name: aws ipv6_cidr_blocks ::/0 in ingress fires
+    input: |
+      resource "aws_security_group" "v6" {
+        ingress {
+          from_port        = 80
+          to_port          = 80
+          protocol         = "tcp"
+          ipv6_cidr_blocks = ["::/0"]
+        }
+      }
+    expected:
+      violations:
+        - rule: terraform.no-public-ingress
+          message_contains: "ipv6_cidr_blocks"
+  - name: gcp firewall with public ipv6 source_ranges fires
+    input: |
+      resource "google_compute_firewall" "v6" {
+        name          = "allow-all-v6"
+        network       = "default"
+        source_ranges = ["::/0"]
+        allow {
+          protocol = "tcp"
+          ports    = ["80"]
+        }
+      }
+    expected:
+      violations:
+        - rule: terraform.no-public-ingress
+          message_contains: "source_ranges"
+  - name: multiple ingress blocks — public one fires
+    input: |
+      resource "aws_security_group" "web" {
+        ingress {
+          from_port   = 22
+          to_port     = 22
+          protocol    = "tcp"
+          cidr_blocks = ["10.0.0.0/8"]
+        }
+        ingress {
+          from_port   = 443
+          to_port     = 443
+          protocol    = "tcp"
+          cidr_blocks = ["0.0.0.0/0"]
+        }
+      }
+    expected:
+      violations:
+        - rule: terraform.no-public-ingress
+          message_contains: "cidr_blocks"
