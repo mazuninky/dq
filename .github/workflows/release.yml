@@ -96,7 +96,7 @@ jobs:
 
       - name: Set up cross toolchain
         if: matrix.cross
-        uses: taiki-e/setup-cross-toolchain-action@d6092e98c6dd9b8d3e88aaad4a8434b884ec1573 # v1.30.0
+        uses: taiki-e/setup-cross-toolchain-action@4c366193ea262ae0c17c6b79c3edc3d4f1394263 # v1.30.0
         with:
           target: ${{ matrix.target }}
 
