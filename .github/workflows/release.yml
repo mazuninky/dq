@@ -94,33 +94,42 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
+      - name: Cache cargo registry and target (release)
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: release-${{ matrix.target }}
+
+      # Cross targets first build a host-runnable binary purely so we can invoke
+      # `dq generate-docs` to produce man pages / shell completions (output is
+      # identical regardless of build target). This MUST happen before the
+      # cross toolchain is set up, because taiki-e/setup-cross-toolchain-action
+      # exports CARGO_BUILD_TARGET globally for the job — after that, every
+      # plain `cargo build` cross-compiles, leaving `target/release/dq` empty
+      # and any attempt to execute the binary on the host runner crashes
+      # (exit 127, observed in run 25769046894).
+      - name: Build host binary and generate docs (cross targets only)
+        if: matrix.cross
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --bin dq
+          ./target/release/dq generate-docs --output-dir dist/_docs
+
       - name: Set up cross toolchain
         if: matrix.cross
         uses: taiki-e/setup-cross-toolchain-action@4c366193ea262ae0c17c6b79c3edc3d4f1394263 # v1.30.0
         with:
           target: ${{ matrix.target }}
 
-      - name: Cache cargo registry and target (release)
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          shared-key: release-${{ matrix.target }}
-
       - name: cargo build --release
         run: cargo build --release --locked --target ${{ matrix.target }} --bin dq
 
-      - name: Generate man pages and completions
+      - name: Generate docs (native targets only)
+        if: ${{ !matrix.cross }}
         shell: bash
         run: |
           set -euo pipefail
-          # For cross-compiled targets the produced binary is not runnable on
-          # the host. Fall back to a host-only release build solely to invoke
-          # `dq generate-docs` (output is identical regardless of target).
-          if [ "${{ matrix.cross }}" = "true" ]; then
-            cargo build --release --bin dq
-            ./target/release/dq generate-docs --output-dir dist/_docs
-          else
-            "target/${{ matrix.target }}/release/${{ matrix.bin }}" generate-docs --output-dir dist/_docs
-          fi
+          "target/${{ matrix.target }}/release/${{ matrix.bin }}" generate-docs --output-dir dist/_docs
 
       - name: Package (tar.gz)
         if: matrix.archive == 'tar.gz'
