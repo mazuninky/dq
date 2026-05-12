@@ -15,10 +15,11 @@ check:
       then { spec: .spec.template.spec, ptr: "/spec/template/spec" }
       else { spec: .spec,               ptr: "/spec" }
       end
-    | select((.spec.securityContext.runAsNonRoot // null) != true)
+    | . as $ctx
+    | select(($ctx.spec.securityContext.runAsNonRoot // null) != true)
     | { kind: "pod",
         name: ($doc.metadata.name // "<unnamed>"),
-        pointer: "/metadata/name" }
+        pointer: ($ctx.ptr + "/containers/0/name") }
   message: "Pod-spec '{{ .name }}' does not set securityContext.runAsNonRoot=true"
 loc:
   pointer: '.pointer'
