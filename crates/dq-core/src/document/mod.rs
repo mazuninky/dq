@@ -890,8 +890,14 @@ impl Document {
         // the value bytes. The scalar renderer here is the SAME renderer
         // already wired for in-span replacements, so it produces the exact
         // byte sequence that ends the spliced region.
-        let scalar_renderer = renderer_for_format(self.format)
-            .expect("scalar renderer must exist when insertion renderer does");
+        let Some(scalar_renderer) = renderer_for_format(self.format) else {
+            return Err(Error::WriteUnavailable {
+                reason: format!(
+                    "scalar renderer missing for format {}; insertion renderer is registered but scalar renderer is not",
+                    self.format.name()
+                ),
+            });
+        };
         let scalar_bytes =
             scalar_renderer.render_replacement(&value, sibling_span.context, &[] as &[u8]);
         let value_offset_in_splice = locate_value_in_fragment(&splice_bytes, &scalar_bytes);

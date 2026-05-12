@@ -193,7 +193,12 @@ impl EditScript {
                     // pointer surfaces the same structured
                     // `Path { MissingKey }` it used to, even though
                     // `Document::set_at` would now happily create it.
-                    path.resolve(doc.value())?;
+                    // Skip the pre-resolve on the read-only sentinel so
+                    // `set_at` returns `WriteUnavailable` instead of
+                    // `MissingKey` for those documents.
+                    if !doc.original_bytes().is_empty() {
+                        path.resolve(doc.value())?;
+                    }
                     doc.set_at(path, value.clone())?;
                 }
                 EditOp::Remove { path } => {

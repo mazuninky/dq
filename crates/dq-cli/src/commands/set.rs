@@ -201,7 +201,9 @@ impl<'a> FileOp for SetFileOp<'a> {
         //    document so a missing key surfaces the original
         //    `Path { MissingKey }` error rather than being silently created
         //    by the Bug #1 mkdir-p path.
-        if self.no_create {
+        // Skip pre-resolve on the read-only sentinel so `set_at` returns the
+        // more accurate `WriteUnavailable` instead of `MissingKey`.
+        if self.no_create && !document.original_bytes().is_empty() {
             self.pointer
                 .resolve(document.value())
                 .map_err(anyhow::Error::new)?;
