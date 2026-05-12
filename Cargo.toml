@@ -33,7 +33,7 @@ serde_yml = "0.0.12"
 # Pinned at the spike-validated 0.0.6 release; the high-level `saphyr` crate is
 # explicitly NOT used here (it does not surface byte spans).
 saphyr-parser = "0.0.6"
-toml = { version = "0.8", features = ["preserve_order"] }
+toml = { version = "1.1", features = ["preserve_order"] }
 # `toml_edit` is the textual-edit DOM used by the M2 §4 TOML round-trip path
 # (see `dq-core/src/parsers/toml.rs`). It exposes `Item::span()` byte ranges
 # for every parsed node, which the SpanMap builder records and the
