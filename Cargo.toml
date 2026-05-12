@@ -91,7 +91,7 @@ dockerfile-parser-rs = "3.3"
 # `ureq` is a lightweight blocking HTTP client used directly by `self check`
 # to hit the GitHub API without dragging in tokio. Both are MIT/Apache-2.0
 # dual-licensed so the default `cargo deny` policy passes without amendment.
-self_update = { version = "0.41", default-features = false, features = ["rustls", "compression-flate2", "archive-tar", "archive-zip"] }
+self_update = { version = "0.44", default-features = false, features = ["rustls", "compression-flate2", "archive-tar", "archive-zip"] }
 ureq = { version = "2.10", default-features = false, features = ["tls"] }
 
 # M9 markdown — `comrak` is the CommonMark+GFM parser used by
