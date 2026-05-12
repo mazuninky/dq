@@ -50,6 +50,13 @@ confidence-threshold = 0.8
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Intra-workspace `path = "../<crate>"` deps without an explicit `version = ...`
+# are reported as wildcards. That's intentional in this workspace — the member
+# crates (dq-core / dq-exec / dq-lint / dq-transform / dq-plugin) are not
+# published to crates.io, only consumed via path, so locking a SemVer range
+# would just churn on every CalVer bump. Allow wildcards specifically for
+# path-deps; deny everywhere else (e.g. external `foo = "*"`).
+allow-wildcard-paths = true
 deny = []
 skip = []
 skip-tree = []

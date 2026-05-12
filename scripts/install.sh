@@ -3,7 +3,7 @@
 #
 # Usage:
 #   curl -sSfL https://raw.githubusercontent.com/mazuninky/dq/main/scripts/install.sh | sh
-#   sh install.sh --version v0.6.0 --install-dir ~/.local/bin
+#   sh install.sh --version v2026.20.1 --install-dir ~/.local/bin
 #
 # Detects OS + arch, downloads the matching prebuilt tarball from a GitHub
 # Release, verifies its SHA256 against the published `dq-checksums.txt`,
@@ -48,7 +48,7 @@ usage() {
 Usage: install.sh [options]
 
 Options:
-  --version <VER>      Release tag to install (default: latest, e.g. v0.6.0).
+  --version <VER>      Release tag to install (default: latest, e.g. v2026.20.1).
   --install-dir <DIR>  Install destination (default: ~/.local/bin for non-root,
                        /usr/local/bin for root).
   --repo <OWNER/NAME>  GitHub repo to install from (default: mazuninky/dq).

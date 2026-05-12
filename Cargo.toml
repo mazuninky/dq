@@ -11,11 +11,17 @@ members = [
 exclude = ["spikes/*", "examples/*"]
 
 [workspace.package]
+version = "2026.20.1"
 edition = "2024"
 license = "MIT"
 authors = ["Mazunin Konstantin"]
 rust-version = "1.94"
 repository = "https://github.com/mazuninky/dq"
+# Workspace crates are not published to crates.io — dq is distributed via
+# GitHub Releases, Homebrew, GHCR, and `cargo install --git`. Declaring this
+# explicitly lets cargo-deny accept the intra-workspace path-only deps under
+# `allow-wildcard-paths = true` in deny.toml.
+publish = false
 
 [workspace.dependencies]
 # Core data / serialization
