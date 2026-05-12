@@ -8,7 +8,23 @@ match:
   format: yaml
   filter: '.kind == "Deployment" or .kind == "StatefulSet" or .kind == "DaemonSet" or .kind == "Pod"'
 check:
-  jq: '(.spec.template.spec.volumes // .spec.volumes // [])[] | select(.hostPath != null)'
+  jq: |
+    if (.spec.template // null) != null
+    then
+      (.spec.template.spec.volumes // [])
+      | to_entries[]
+      | select(.value.hostPath != null)
+      | { name: .value.name,
+          pointer: ("/spec/template/spec/volumes/" + (.key | tostring) + "/hostPath") }
+    else
+      (.spec.volumes // [])
+      | to_entries[]
+      | select(.value.hostPath != null)
+      | { name: .value.name,
+          pointer: ("/spec/volumes/" + (.key | tostring) + "/hostPath") }
+    end
   message: "Volume '{{ .name }}' is a hostPath volume"
+loc:
+  pointer: '.pointer'
 references:
   - https://kubernetes.io/docs/concepts/storage/volumes/#hostpath

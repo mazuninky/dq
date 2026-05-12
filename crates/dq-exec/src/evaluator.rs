@@ -48,6 +48,7 @@ use std::sync::Arc;
 use camino::{Utf8Path, Utf8PathBuf};
 use dq_core::Pointer;
 use globset::GlobMatcher;
+use indexmap::IndexSet;
 
 use crate::composite::{
     CompiledCompositeCheck, MAX_EXTRACT_DEPTH, compile_composite, run_composite,
@@ -652,8 +653,35 @@ fn run_schema_check(
     value: &serde_json::Value,
     out: &mut Vec<Diagnostic>,
 ) {
+    // Dedup key per `run_schema_check` invocation. JSON Schemas may
+    // declare the same constraint at multiple schema locations
+    // (e.g. a top-level `required` plus an `allOf`/`oneOf` subschema
+    // that repeats it), and the validator dutifully yields one error
+    // per location. To the user, two errors with the same
+    // `(rule_id, instance_path, error_text)` are indistinguishable —
+    // collapse them to one diagnostic while preserving emission order.
+    //
+    // Scope: one invocation only. Never share across files or rules,
+    // because two legitimately-distinct rules can produce the same
+    // `(instance_path, error_text)` against the same file.
+    let mut seen: IndexSet<(String, String, String)> = IndexSet::new();
     for error in compiled.validator.iter_errors(value) {
         let pointer_str = error.instance_path.as_str();
+        // The validator's error text (without the schema_path prefix)
+        // is what the user sees as the actual violation. Use it for
+        // dedup so duplicates at different `schema_path` locations
+        // collapse, while distinct violations at the same path
+        // (different `error_text`) are preserved.
+        let error_text = error.to_string();
+        let dedup_key = (
+            rule.rule.id.clone(),
+            pointer_str.to_owned(),
+            error_text.clone(),
+        );
+        if !seen.insert(dedup_key) {
+            continue;
+        }
+
         // Lift the offending sub-value out of the document so any
         // `loc.*` jq expressions run against the same shape an
         // equivalent jq check would have produced. `serde_json::Value::pointer`
@@ -687,7 +715,7 @@ fn run_schema_check(
         };
         let prefix = compiled.message_prefix.as_deref().unwrap_or("");
         let keyword = error.schema_path.as_str();
-        let message = format!("{prefix}{keyword}: {error}");
+        let message = format!("{prefix}{keyword}: {error_text}");
         out.push(Diagnostic {
             rule_id: rule.rule.id.clone(),
             severity: rule.rule.severity,
@@ -1455,6 +1483,51 @@ check:
             (diags[0].line, diags[0].col),
             (1, 1),
             "absent `loc:` block must default to (1, 1)",
+        );
+    }
+
+    #[test]
+    fn schema_check_deduplicates_identical_diagnostics_per_path() {
+        // Regression: jsonschema validators yield one error per schema
+        // location, so a schema that declares the same `required`
+        // constraint twice (once at the top level, once inside an
+        // `allOf` subschema) produced two duplicate diagnostics for a
+        // single missing-property violation — the user-visible bug
+        // reported as `jsonschema.kubernetes-crd-shape` emitting two
+        // identical "metadata is required" rows.
+        //
+        // After the fix, `run_schema_check` keys each emitted
+        // diagnostic by `(rule_id, instance_path, error_text)` per
+        // invocation and skips repeats, so the same violation yields
+        // exactly one diagnostic regardless of how many schema
+        // locations declared the constraint.
+        let yaml = r#"
+id: test.schema-dedup
+description: x
+severity: error
+match:
+  format: json
+check:
+  schema:
+    type: object
+    required: [metadata]
+    allOf:
+      - required: [metadata]
+"#;
+        let eval = evaluator_from_yaml(yaml);
+        let value = json!({});
+        let owned = ir_for_test(&value, "json");
+        let diags = eval.evaluate_file(&Utf8PathBuf::from("d.json"), &owned.to_borrowed(), "json");
+        assert_eq!(
+            diags.len(),
+            1,
+            "duplicate diagnostics for the same (instance_path, error_text) must collapse, got: {diags:?}",
+        );
+        assert_eq!(diags[0].rule_id, "test.schema-dedup");
+        assert!(
+            diags[0].message.to_lowercase().contains("metadata"),
+            "expected the surviving diagnostic to mention the missing property, got: {}",
+            diags[0].message,
         );
     }
 }

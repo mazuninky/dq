@@ -123,6 +123,10 @@ pub fn run(
         rules: args.rules.clone(),
         cwd,
         discovered_formats,
+        // `dq fix` mirrors `dq lint`'s "no `--rules` ⇒ auto-bind" behaviour:
+        // a user running `dq fix file.yaml` expects every applicable rule's
+        // autofix to run, not zero rules.
+        suppress_auto_bind: false,
     };
     let rulesets = RuleLoader::resolve(&loader_args).map_err(anyhow::Error::new)?;
     let evaluator = Evaluator::new(rulesets).map_err(anyhow::Error::new)?;

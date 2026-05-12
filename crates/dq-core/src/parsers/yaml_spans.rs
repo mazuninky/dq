@@ -340,9 +340,22 @@ enum Frame {
     Mapping {
         pending_key: Option<String>,
         style: ContextStyle,
+        /// Byte offset of the `MappingStart` event — used to record an
+        /// empty-container span when `MappingEnd` fires with no children.
+        start_byte: usize,
+        /// `true` once any key/value pair has been recorded inside this
+        /// frame, so `MappingEnd` can tell empty from non-empty without
+        /// re-walking the SpanMap.
+        saw_child: bool,
     },
     /// `index` is the position of the *next* item.
-    Sequence { index: usize, style: ContextStyle },
+    Sequence {
+        index: usize,
+        style: ContextStyle,
+        /// Byte offset of the `SequenceStart` event — mirrors
+        /// [`Frame::Mapping::start_byte`].
+        start_byte: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -409,8 +422,19 @@ impl<'src> State<'src> {
                 );
                 if is_key {
                     let key_str = pointer_escape(value.as_ref());
-                    if let Some(Frame::Mapping { pending_key, .. }) = self.stack.last_mut() {
+                    if let Some(Frame::Mapping {
+                        pending_key,
+                        saw_child,
+                        ..
+                    }) = self.stack.last_mut()
+                    {
                         *pending_key = Some(key_str);
+                        // A key event proves the mapping is non-empty, so
+                        // `MappingEnd` should NOT record an empty-container
+                        // span. Setting `saw_child` here keeps the
+                        // bookkeeping consistent even if the matching value
+                        // event turns out to be another container or scalar.
+                        *saw_child = true;
                     }
                 } else {
                     let pointer = self.value_pointer();
@@ -454,10 +478,15 @@ impl<'src> State<'src> {
                 let start_byte = char_index_to_byte(self.char_to_byte, span.start.index());
                 let style = detect_container_style(self.bytes, start_byte);
                 self.enter_container();
-                self.stack.push(Frame::Sequence { index: 0, style });
+                self.stack.push(Frame::Sequence {
+                    index: 0,
+                    style,
+                    start_byte,
+                });
             }
             Event::SequenceEnd => {
-                self.leave_container();
+                let end_byte = char_index_to_byte(self.char_to_byte, span.end.index());
+                self.leave_container_recording_empty(spans, end_byte);
             }
             Event::MappingStart(_anchor, _tag) => {
                 let start_byte = char_index_to_byte(self.char_to_byte, span.start.index());
@@ -466,10 +495,13 @@ impl<'src> State<'src> {
                 self.stack.push(Frame::Mapping {
                     pending_key: None,
                     style,
+                    start_byte,
+                    saw_child: false,
                 });
             }
             Event::MappingEnd => {
-                self.leave_container();
+                let end_byte = char_index_to_byte(self.char_to_byte, span.end.index());
+                self.leave_container_recording_empty(spans, end_byte);
             }
         }
         Ok(())
@@ -535,6 +567,75 @@ impl<'src> State<'src> {
         if self.path.len() > target_len {
             self.path.pop();
         }
+    }
+
+    /// Pop the top container frame; if it was empty, record an
+    /// empty-container [`ValueSpan`] keyed at the container's own pointer.
+    ///
+    /// Mirrors the JSON scanner's `record_empty_container` — the empty
+    /// `{}` / `[]` body is the splice anchor used by
+    /// [`crate::document::Document::set_at`]'s empty-parent mkdir-p path.
+    /// The pointer is read **before** popping `self.path` so we key the
+    /// span at the empty container itself, not at its parent.
+    fn leave_container_recording_empty(&mut self, spans: &mut SpanMap, end_byte: usize) {
+        let top = self.stack.last();
+        let (is_empty, start_byte, context) = match top {
+            Some(Frame::Mapping {
+                start_byte,
+                style,
+                saw_child,
+                ..
+            }) => (
+                !*saw_child,
+                *start_byte,
+                match style {
+                    ContextStyle::Block => SpanContext::BlockMapValue,
+                    ContextStyle::Flow => SpanContext::FlowMapValue,
+                },
+            ),
+            Some(Frame::Sequence {
+                start_byte,
+                style,
+                index,
+            }) => (
+                *index == 0,
+                *start_byte,
+                match style {
+                    ContextStyle::Block => SpanContext::BlockSeqItem,
+                    ContextStyle::Flow => SpanContext::FlowSeqItem,
+                },
+            ),
+            None => (false, 0, SpanContext::BlockMapValue),
+        };
+        if is_empty {
+            let pointer = if self.path.is_empty() {
+                String::new()
+            } else {
+                format!("/{}", self.path.join("/"))
+            };
+            // Don't clobber a span the scalar branch already recorded —
+            // saphyr-parser only emits Mapping/SequenceEnd for *container*
+            // frames, so collision should be unreachable; the guard
+            // documents the invariant.
+            if !spans.contains_key(&pointer) {
+                let value_range = start_byte.min(self.bytes.len())..end_byte.min(self.bytes.len());
+                let line_range = self.compute_line_range(&value_range, context, ScalarStyle::Plain);
+                // `indent` is the column of the container's opening byte,
+                // which mirrors the parser convention for scalar `indent`.
+                let indent =
+                    u32::try_from(start_to_col(self.bytes, start_byte)).unwrap_or(u32::MAX);
+                spans.insert(
+                    pointer,
+                    ValueSpan {
+                        value_range,
+                        line_range,
+                        indent,
+                        context,
+                    },
+                );
+            }
+        }
+        self.leave_container();
     }
 
     fn doc_prefix_len(&self) -> usize {
@@ -617,6 +718,19 @@ fn detect_container_style(bytes: &[u8], start: usize) -> ContextStyle {
         Some(b'{' | b'[') => ContextStyle::Flow,
         _ => ContextStyle::Block,
     }
+}
+
+/// Compute the 1-indexed column of a byte offset by counting characters
+/// from the previous `\n`. Used as the `indent` field of an empty-container
+/// span — matches the convention saphyr-parser reports for scalar `indent`
+/// (1-indexed column).
+fn start_to_col(bytes: &[u8], byte_idx: usize) -> usize {
+    let cap = bytes.len();
+    let mut line_start = byte_idx.min(cap);
+    while line_start > 0 && bytes[line_start - 1] != b'\n' {
+        line_start -= 1;
+    }
+    byte_idx.saturating_sub(line_start).saturating_add(1)
 }
 
 fn pointer_escape(segment: &str) -> String {
@@ -1446,6 +1560,68 @@ mod tests {
         doc.set_at(&pointer, Value::String("Updated".into()))
             .expect("set_at");
         assert_eq!(doc.original_bytes(), b"title: \"Updated\"\n");
+    }
+
+    // -- mkdir-p (Bug #1) -----------------------------------------------
+
+    #[test]
+    fn insertion_renderer_inserts_with_correct_block_indent() {
+        // Bug #1: nested map mkdir-p must produce well-formed YAML with
+        // the children's indent matching the existing siblings (not the
+        // siblings' value column, which is what `ValueSpan::indent`
+        // records — `Document::try_single_level_mkdir_p` re-derives the
+        // key column by scanning back through the source line).
+        let bytes = b"a:\n  b: 1\n";
+        let mut doc = parse_yaml_with_spans(bytes).expect("parse");
+        let pointer = Pointer::parse("/a/c").expect("pointer");
+        doc.set_at(&pointer, Value::Int(42))
+            .expect("mkdir-p set_at must succeed");
+        // The rendered bytes must re-parse to a tree containing both /a/b
+        // and the newly-inserted /a/c with the right indent (otherwise
+        // YAML's "mapping values are not allowed" error fires on re-parse).
+        let reparsed = parse_yaml_with_spans(doc.original_bytes()).expect("re-parse");
+        let c = pointer
+            .resolve(reparsed.value())
+            .expect("reparsed has /a/c");
+        assert_eq!(c, &Value::Int(42));
+        let b = Pointer::parse("/a/b")
+            .unwrap()
+            .resolve(reparsed.value())
+            .expect("reparsed still has /a/b");
+        assert_eq!(b, &Value::Int(1));
+    }
+
+    #[test]
+    fn insertion_renderer_into_empty_yaml_map_succeeds() {
+        // Empty parent (`a: {}`) → `set_at(/a/b, 42)` must splice the new
+        // key inside the empty flow map. Pre-fix this returned MissingKey;
+        // the YAML span builder now records an empty-container span at
+        // the parent's pointer so the splicer can anchor between the `{`
+        // and `}`. The reparse round-trips both keys.
+        let bytes = b"a: {}\n";
+        let mut doc = parse_yaml_with_spans(bytes).expect("parse");
+        let pointer = Pointer::parse("/a/b").expect("pointer");
+        doc.set_at(&pointer, Value::Int(42))
+            .expect("empty-parent mkdir-p on `a: {}` must succeed");
+        let reparsed = parse_yaml_with_spans(doc.original_bytes()).expect("re-parse");
+        let added = pointer
+            .resolve(reparsed.value())
+            .expect("reparsed has /a/b");
+        assert_eq!(added, &Value::Int(42));
+    }
+
+    #[test]
+    fn insertion_renderer_into_root_yaml_map_succeeds() {
+        // Root-level mkdir-p — same shape as the nested case but parent
+        // is the implicit root mapping.
+        let bytes = b"a: 1\n";
+        let mut doc = parse_yaml_with_spans(bytes).expect("parse");
+        let pointer = Pointer::parse("/b").expect("pointer");
+        doc.set_at(&pointer, Value::Int(42))
+            .expect("root mkdir-p set_at must succeed");
+        let reparsed = parse_yaml_with_spans(doc.original_bytes()).expect("re-parse");
+        let b = pointer.resolve(reparsed.value()).expect("reparsed has /b");
+        assert_eq!(b, &Value::Int(42));
     }
 
     // -- Phase 2 (`add-validation-and-extended-formats`) ------------------

@@ -179,7 +179,26 @@ impl EditScript {
     pub fn apply(&self, doc: &mut Document) -> Result<()> {
         for op in &self.0 {
             match op {
-                EditOp::Add { path, value } | EditOp::Replace { path, value } => {
+                EditOp::Add { path, value } => {
+                    // RFC 6902 §4.1 `add` is the mkdir-p door: an existing
+                    // target is replaced; a missing target is created when
+                    // its parent exists (single-level baseline, see
+                    // `Document::set_at`'s doc comment).
+                    doc.set_at(path, value.clone())?;
+                }
+                EditOp::Replace { path, value } => {
+                    // RFC 6902 §4.3 `replace` requires the target to exist —
+                    // it is NOT a synonym for `add` and must never mkdir-p.
+                    // Pre-check via the read-side resolve so a missing
+                    // pointer surfaces the same structured
+                    // `Path { MissingKey }` it used to, even though
+                    // `Document::set_at` would now happily create it.
+                    // Skip the pre-resolve on the read-only sentinel so
+                    // `set_at` returns `WriteUnavailable` instead of
+                    // `MissingKey` for those documents.
+                    if !doc.original_bytes().is_empty() {
+                        path.resolve(doc.value())?;
+                    }
                     doc.set_at(path, value.clone())?;
                 }
                 EditOp::Remove { path } => {

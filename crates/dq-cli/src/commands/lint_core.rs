@@ -36,17 +36,24 @@ use crate::output::Reporter;
 
 /// Run the lint pipeline once a caller has produced the input rulesets.
 ///
-/// `rules_args` is the user-facing `--rules` list. When empty *and* `extra`
-/// is empty, the loader falls back to auto-binding `@std/*` namespaces
-/// matching the discovered file formats and `<cwd>/.dq/rules/`.
+/// `rules_args` is the user-facing `--rules` list. When empty *and* the
+/// caller has not opted out via `suppress_auto_bind`, the loader falls back
+/// to auto-binding `@std/*` namespaces matching the discovered file formats
+/// plus `<cwd>/.dq/rules/`.
 ///
 /// `extra` carries any pre-built rulesets the caller already resolved
-/// (e.g. `--inline` YAML for `check`); they are appended to whatever the
-/// loader produces from `rules_args`. A non-empty `extra` does NOT suppress
-/// the auto-bind path — callers that want a single-rule run should pass
-/// `rules_args` such that the loader either resolves to that rule (path) or
-/// supply a non-empty `extra` while keeping `rules_args` empty (the typical
-/// `--inline` path uses both: `extra = vec![inline_set]`, `rules_args = []`).
+/// (e.g. `--inline` YAML or the single-rule [`RuleSet`] for `check`); they
+/// are appended to whatever the loader produces from `rules_args`. A
+/// non-empty `extra` does NOT, by itself, suppress the auto-bind path:
+/// callers must set `suppress_auto_bind = true` to skip it. The current
+/// subcommand wiring is:
+///
+/// - [`crate::commands::lint::run`] → `suppress_auto_bind = false`
+///   (preserves the user-facing "no `--rules` ⇒ pick sensible defaults"
+///   behaviour).
+/// - [`crate::commands::check::run`] → `suppress_auto_bind = true` (the
+///   user has already named exactly one rule via `--rule` / `--inline`;
+///   auto-binding would silently run unrelated `@std/*` rules alongside).
 ///
 /// # Errors
 ///
@@ -55,11 +62,19 @@ use crate::output::Reporter;
 /// - `dq_core::Error::*` for the usual file-load failures.
 /// - [`LintFail`] (exit 4) when any error-severity diagnostic is emitted.
 /// - [`LintWarnStrict`] (exit 1) when warnings are emitted under `--strict`.
+// 8 args is one over clippy's default `too_many_arguments` threshold. The
+// alternative would be introducing a `RulesetSpec { rules_args, extra,
+// suppress_auto_bind }` struct purely for this internal `pub(crate)` helper
+// that only `lint::run` / `check::run` / `fix::run` call. Not worth the
+// indirection — `suppress_auto_bind` carries enough behavioural weight on
+// its own that callers should see it spelled out at the call site.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_with_rulesets(
     cli: &Cli,
     files: &[Utf8PathBuf],
     rules_args: Vec<String>,
     extra: Vec<RuleSet>,
+    suppress_auto_bind: bool,
     input_format: Option<&str>,
     reporter: &dyn Reporter,
     out: &mut dyn Write,
@@ -92,6 +107,7 @@ pub(crate) fn run_with_rulesets(
         rules: rules_args,
         cwd,
         discovered_formats: discovered_formats.clone(),
+        suppress_auto_bind,
     };
     let mut rulesets = RuleLoader::resolve(&loader_args).map_err(anyhow::Error::new)?;
     rulesets.extend(extra);

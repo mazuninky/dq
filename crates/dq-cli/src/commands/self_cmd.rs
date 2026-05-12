@@ -49,14 +49,31 @@ pub enum CheckOutcome {
 /// Run `dq self check` — query GitHub for the latest release and render the
 /// outcome to `out`.
 ///
+/// Thin wrapper around [`run_check_with_url`] that hardcodes the production
+/// GitHub Releases endpoint. The inner function takes the URL as a parameter
+/// so unit tests can stand up a local mock server and exercise the full
+/// HTTP-response → error-mapping path without touching the network.
+///
 /// # Errors
 ///
-/// - Network errors are wrapped in [`dq_core::Error::Io`] so the exit-code
-///   mapper picks 5 (`IO_ERROR`).
+/// - Network errors and HTTP 4xx/5xx responses are wrapped in
+///   [`dq_core::Error::Io`] so the exit-code mapper picks 5 (`IO_ERROR`).
 /// - HTTP 403 + `X-RateLimit-Remaining: 0` produces a [`dq_core::Error::Io`]
 ///   carrying a `GITHUB_TOKEN` hint — same exit code, more helpful message.
 pub fn run_check(out: &mut dyn Write) -> anyhow::Result<()> {
-    let response = ureq::get(GITHUB_RELEASES_LATEST_URL)
+    run_check_with_url(out, GITHUB_RELEASES_LATEST_URL)
+}
+
+/// Inner implementation of [`run_check`] with the releases URL injected.
+///
+/// Exposed at crate visibility so the unit test in this module can point it
+/// at a mock HTTP server. Production callers should go through [`run_check`].
+///
+/// # Errors
+///
+/// Same as [`run_check`].
+pub(crate) fn run_check_with_url(out: &mut dyn Write, releases_url: &str) -> anyhow::Result<()> {
+    let response = ureq::get(releases_url)
         .set("User-Agent", USER_AGENT)
         .set("Accept", "application/vnd.github+json")
         .call();
@@ -491,25 +508,110 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // `run_check` and `run_update` are gated behind `#[ignore]` because they
-    // hit the network (api.github.com) and the release artifact host. They
-    // are NOT part of the default test run — opt in with
-    // `cargo test --package dq-cli -- --ignored self_cmd`.
+    // `run_update` and the live-API smoke test for `run_check` are gated
+    // behind `#[ignore]` because they hit the network (api.github.com and
+    // the release artifact host). They are NOT part of the default test
+    // run — opt in with `cargo test --package dq-cli -- --ignored self_cmd`.
     //
-    // Test gap: `run_check` currently hard-codes `GITHUB_RELEASES_LATEST_URL`
-    // with no DI seam. The pure-function split (`compare_versions` +
-    // `render_check_outcome`) covers the business logic; the network path is
-    // a thin wrapper. A future refactor that takes a `&dyn HttpClient`
-    // parameter would let us write a unit test with a fake; coordinate via
-    // the writer agent.
+    // `run_check` itself now has a hermetic test (`run_check_returns_io_error_on_404`
+    // above): the URL is injected via [`run_check_with_url`] so the test
+    // can point it at a local `TcpListener`-backed mock returning a
+    // specific status code. The live-API test is retained as a pre-release
+    // smoke check that confirms the GitHub API contract hasn't drifted.
     //
-    // Test gap: `run_update` similarly wraps `self_update::backends::github`
+    // Test gap: `run_update` still wraps `self_update::backends::github`
     // with no seam. The `ensure_writable_install_dir` helper IS unit-testable
     // (covered indirectly by the integration test below) but the
     // `Update::configure` invocation cannot be observed without launching a
     // real download. The trait-based seam asked for in spec §4.5 was not
     // implemented in the production-code pass — flagged as a follow-up.
     // ---------------------------------------------------------------------
+
+    /// Minimal one-shot HTTP server backed by a `TcpListener`. Reads the
+    /// inbound request bytes through the end of the request headers
+    /// (`\r\n\r\n`) and writes a single fixed response back.
+    ///
+    /// Hand-rolled instead of pulling in `httpmock` / `mockito` / `wiremock`
+    /// (each of which drags in a full async runtime plus an HTTP server
+    /// stack) because all the regression test actually needs is a server
+    /// that returns one specific status code so the error-mapping branch
+    /// of `run_check_with_url` is reachable from a unit test.
+    fn spawn_one_shot_http(response_bytes: &'static [u8]) -> String {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener
+            .local_addr()
+            .expect("local_addr after successful bind");
+        std::thread::spawn(move || {
+            // Accept exactly one connection — the unit test sends exactly
+            // one request. Errors are swallowed: if the test client never
+            // connects (e.g. it panicked first), there is nothing useful
+            // the helper thread can do.
+            let Ok((mut socket, _)) = listener.accept() else {
+                return;
+            };
+            // Drain the request headers so the client doesn't see a
+            // connection reset before it can read the response. A 1 KiB
+            // scratch buffer is plenty for the one-line GET produced by
+            // `ureq::get(url).call()` plus the User-Agent / Accept headers
+            // set in `run_check_with_url`.
+            let mut buf = [0u8; 1024];
+            let mut total = Vec::new();
+            loop {
+                match socket.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        total.extend_from_slice(&buf[..n]);
+                        if total.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = socket.write_all(response_bytes);
+        });
+        format!("http://{addr}/releases/latest")
+    }
+
+    #[test]
+    fn run_check_returns_io_error_on_404() {
+        // Regression for the "exit 0 on HTTP 4xx/5xx" bug: stand up a local
+        // mock server that returns HTTP 404 (the symptom a fresh repo
+        // without a published GitHub release exhibits) and confirm
+        // `run_check_with_url` surfaces the failure as `dq_core::Error::Io`.
+        //
+        // The downstream contract this guards: `exit_code_for_error` maps
+        // `Error::Io` to exit 5 (`IO_ERROR`), so as long as the error is
+        // returned in the `Io` shape, the CLI binary exits 5 — which is
+        // the behaviour documented in README.md and required by the bug
+        // report. A regression that swallows the error (returns `Ok(())`)
+        // would silently let the binary exit 0; this test fails fast in
+        // that case.
+        let url = spawn_one_shot_http(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let mut buf: Vec<u8> = Vec::new();
+        let result = run_check_with_url(&mut buf, &url);
+        let err = result.expect_err("HTTP 404 must produce an error, not a silent Ok");
+        let domain = err
+            .downcast_ref::<dq_core::Error>()
+            .expect("error must downcast to dq_core::Error for exit-code mapping");
+        assert_eq!(
+            domain.kind_name(),
+            "io",
+            "404 must map to Error::Io (exit 5), got: {domain:?}",
+        );
+        // The mock server returns 0 bytes of body, so nothing should reach
+        // the writer — but assert it explicitly so future refactors that
+        // accidentally print partial output before erroring out get caught.
+        assert!(
+            buf.is_empty(),
+            "no output should be written on 404; got: {buf:?}",
+        );
+    }
 
     #[test]
     #[ignore = "hits api.github.com — opt-in via `cargo test -- --ignored`"]

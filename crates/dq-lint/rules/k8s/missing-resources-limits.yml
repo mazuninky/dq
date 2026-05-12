@@ -9,7 +9,25 @@ match:
   format: yaml
   filter: '.kind == "Deployment" or .kind == "StatefulSet" or .kind == "DaemonSet" or .kind == "Pod"'
 check:
-  jq: '(.spec.template.spec.containers // .spec.containers // [])[] | select((.resources.limits.cpu // null) == null or (.resources.limits.memory // null) == null)'
+  jq: |
+    if (.spec.template // null) != null
+    then
+      (.spec.template.spec.containers // [])
+      | to_entries[]
+      | select((.value.resources.limits.cpu // null) == null
+               or (.value.resources.limits.memory // null) == null)
+      | { name: .value.name,
+          pointer: ("/spec/template/spec/containers/" + (.key | tostring) + "/name") }
+    else
+      (.spec.containers // [])
+      | to_entries[]
+      | select((.value.resources.limits.cpu // null) == null
+               or (.value.resources.limits.memory // null) == null)
+      | { name: .value.name,
+          pointer: ("/spec/containers/" + (.key | tostring) + "/name") }
+    end
   message: "Container '{{ .name }}' is missing resources.limits (cpu and/or memory)"
+loc:
+  pointer: '.pointer'
 references:
   - https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/

@@ -28,11 +28,17 @@ pub fn run(
     reporter: &dyn Reporter,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
+    // `suppress_auto_bind = false` keeps the existing `dq lint` UX: when
+    // the user passes no `--rules`, the loader auto-binds every `@std/<ns>`
+    // matching a discovered file format plus `<cwd>/.dq/rules/`. The
+    // companion `dq check` handler passes `true` instead — see
+    // [`crate::commands::check::run`] for why.
     run_with_rulesets(
         cli,
         &args.files,
         args.rules.clone(),
         Vec::new(),
+        false,
         input_format,
         reporter,
         out,

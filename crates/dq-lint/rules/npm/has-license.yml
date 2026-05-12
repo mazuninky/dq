@@ -16,21 +16,24 @@ fix:
   # so the autofix preserves comments and surrounding bytes — this is
   # the reference comment-preserving rule for the @std/* library.
   #
-  # The patch is emitted only when `/license` already exists in the
-  # document (with an empty-string value). The missing-field case
-  # (no `license` key at all) is currently NOT covered because the
-  # M2 `Document::set_at` baseline does not yet support mkdir-p
-  # insertion of new keys (it returns `Error::Path { MissingKey }`).
-  # Tracking: a follow-up change will land mkdir-p so the `add` branch
-  # can take over the missing-field case; until then this rule is a
-  # no-op for newly-created `package.json` files that omit `license`.
+  # Two branches:
+  #   * `/license` is `""` → emit `replace` to set it to "UNLICENSED".
+  #   * `/license` is missing entirely → emit `add` so mkdir-p (Bug #1
+  #     fix) creates the key. Both branches are guarded by the
+  #     `.private != true` check so private packages stay untouched.
   #
-  # The rule is idempotent: once `/license` is `"UNLICENSED"`, the
-  # `if`-guard collapses to `else []` (the empty patch), so a second
+  # The rule is idempotent: once `/license` is `"UNLICENSED"`, both
+  # guards collapse to `else []` (the empty patch), so a second
   # application is a clean no-op.
   ops: |
-    if (.private // false) != true and (has("license") and (.license // "") == "")
-    then [{"op": "replace", "path": "/license", "value": "UNLICENSED"}]
+    if (.private // false) != true
+    then
+      if has("license") and (.license // "") == ""
+      then [{"op": "replace", "path": "/license", "value": "UNLICENSED"}]
+      elif (has("license") | not)
+      then [{"op": "add", "path": "/license", "value": "UNLICENSED"}]
+      else []
+      end
     else []
     end
 references:

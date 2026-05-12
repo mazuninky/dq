@@ -8,7 +8,25 @@ match:
   format: yaml
   filter: '.kind == "Deployment" or .kind == "StatefulSet" or .kind == "DaemonSet" or .kind == "Pod"'
 check:
-  jq: '.spec.template.spec.containers[]? // .spec.containers[]? | select(.image | tostring | test(":latest$") or (test(":") | not))'
+  jq: |
+    if (.spec.template // null) != null
+    then
+      (.spec.template.spec.containers // [])
+      | to_entries[]
+      | select(.value.image | tostring | test(":latest$") or (test(":") | not))
+      | { name: .value.name,
+          image: .value.image,
+          pointer: ("/spec/template/spec/containers/" + (.key | tostring) + "/image") }
+    else
+      (.spec.containers // [])
+      | to_entries[]
+      | select(.value.image | tostring | test(":latest$") or (test(":") | not))
+      | { name: .value.name,
+          image: .value.image,
+          pointer: ("/spec/containers/" + (.key | tostring) + "/image") }
+    end
   message: "Container '{{ .name }}' uses :latest tag (image: {{ .image }})"
+loc:
+  pointer: '.pointer'
 references:
   - https://kubernetes.io/docs/concepts/containers/images/#image-names

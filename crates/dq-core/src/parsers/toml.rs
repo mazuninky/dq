@@ -320,6 +320,13 @@ fn walk_inline_array(
     path: &mut Vec<String>,
     spans: &mut SpanMap,
 ) -> Value {
+    if arr.is_empty() {
+        // Record an empty-container span for the empty inline array `[]`
+        // so the empty-parent mkdir-p path in
+        // [`crate::document::Document::set_at`] can locate the `[]` body.
+        record_empty_container(arr.span(), bytes, path, SpanContext::FlowSeqItem, spans);
+        return Value::Array(Vec::new());
+    }
     let mut out: Vec<Value> = Vec::with_capacity(arr.len());
     for (idx, item) in arr.iter().enumerate() {
         path.push(idx.to_string());
@@ -337,6 +344,12 @@ fn walk_inline_table(
     path: &mut Vec<String>,
     spans: &mut SpanMap,
 ) -> Value {
+    if it.is_empty() {
+        // Empty inline table `{}` — see [`walk_inline_array`] for the
+        // rationale. The splicer uses the recorded span as its anchor.
+        record_empty_container(it.span(), bytes, path, SpanContext::FlowMapValue, spans);
+        return Value::Map(IndexMap::new());
+    }
     let mut out: IndexMap<String, Value> = IndexMap::new();
     for (key, value) in it.iter() {
         path.push(pointer_escape(key));
@@ -345,6 +358,34 @@ fn walk_inline_table(
         path.pop();
     }
     Value::Map(out)
+}
+
+/// Record an empty-container [`ValueSpan`] at the current `path`'s pointer.
+///
+/// Mirrors [`record_scalar`] but is invoked for empty `{}` / `[]` literals.
+/// The span's `value_range` covers the literal **including** both
+/// delimiters; the empty-parent splicer in
+/// [`crate::document::Document::set_at`] anchors the new key inside it.
+fn record_empty_container(
+    span: Option<Range<usize>>,
+    bytes: &[u8],
+    path: &[String],
+    context: SpanContext,
+    spans: &mut SpanMap,
+) {
+    let Some(value_range) = span else { return };
+    let pointer = pointer_for(path);
+    let line_range = compute_line_range(bytes, &value_range, context);
+    let indent = compute_indent(bytes, value_range.start);
+    spans.insert(
+        pointer,
+        ValueSpan {
+            value_range,
+            line_range,
+            indent,
+            context,
+        },
+    );
 }
 
 fn walk_value_with_context(
@@ -1051,5 +1092,26 @@ mod tests {
         let r = TomlInsertionRenderer;
         let out = r.render_insertion("with space", &Value::Int(1), 0, SpanContext::BlockMapValue);
         assert_eq!(out, b"\"with space\" = 1\n");
+    }
+
+    // -- mkdir-p (Bug #1) -----------------------------------------------
+
+    #[test]
+    fn insertion_renderer_inserts_new_root_key() {
+        // Bug #1: root-level mkdir-p must append a new `key = value` line
+        // after the last existing sibling.
+        let bytes = b"a = 1\nb = 2\n";
+        let mut doc = Toml.parse(bytes).expect("parse");
+        let pointer = Pointer::parse("/c").expect("pointer");
+        doc.set_at(&pointer, Value::Int(42))
+            .expect("mkdir-p set_at must succeed");
+        let reparsed = Toml.parse(doc.original_bytes()).expect("re-parse");
+        let c = pointer.resolve(reparsed.value()).expect("reparsed has /c");
+        assert_eq!(c, &Value::Int(42));
+        let a = Pointer::parse("/a")
+            .unwrap()
+            .resolve(reparsed.value())
+            .expect("reparsed still has /a");
+        assert_eq!(a, &Value::Int(1));
     }
 }

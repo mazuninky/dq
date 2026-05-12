@@ -625,15 +625,41 @@ fn render_xml(top: &Value) -> Result<Vec<u8>> {
             message: format!("XML write: root element '{root_tag}' must be a Map"),
         });
     };
-    write_element(&mut writer, root_tag, root_body)?;
+    write_element(&mut writer, root_tag, root_body, 0)?;
 
     Ok(writer.into_inner().into_inner())
+}
+
+/// Indent width for pretty-printed XML output (2 spaces per level).
+///
+/// Hardcoded — the value tree does not carry the original inter-element
+/// whitespace, so on `parse → write` we always synthesise this layout.
+const XML_INDENT_WIDTH: usize = 2;
+
+/// Emit `\n` + `indent_level * XML_INDENT_WIDTH` spaces as a text event.
+///
+/// We pass the whitespace through `BytesText::from_escaped` so `quick-xml`
+/// writes it verbatim (no entity escaping — there is nothing to escape).
+/// Pure-whitespace text between element siblings parses back into
+/// `Frame::text` but is discarded during `Frame::finalise` (because
+/// `has_text` only flips on non-whitespace text), so round-trip stays
+/// structurally stable.
+fn write_indent_break(writer: &mut Writer<Cursor<Vec<u8>>>, indent_level: usize) -> Result<()> {
+    let mut s = String::with_capacity(1 + indent_level * XML_INDENT_WIDTH);
+    s.push('\n');
+    for _ in 0..(indent_level * XML_INDENT_WIDTH) {
+        s.push(' ');
+    }
+    writer
+        .write_event(Event::Text(BytesText::from_escaped(s)))
+        .map_err(map_write_err)
 }
 
 fn write_element(
     writer: &mut Writer<Cursor<Vec<u8>>>,
     tag: &str,
     body: &IndexMap<String, Value>,
+    indent_level: usize,
 ) -> Result<()> {
     let mut start = BytesStart::new(tag);
     if let Some(Value::Map(attrs)) = body.get(KEY_ATTRS) {
@@ -677,6 +703,20 @@ fn write_element(
         return Ok(());
     }
 
+    // Pretty-print only when this element has child elements AND no text
+    // content of its own. Leaf elements (`<name>Alice</name>`) stay inline,
+    // and mixed-content elements (text + children, which are documented as
+    // round-trip-lossy already) keep the existing compact layout so we
+    // don't widen the lossy surface area.
+    //
+    // CDATA, PIs, and comments without element children also stay inline:
+    // adding whitespace around them would still round-trip cleanly (pure
+    // whitespace text events get dropped on re-parse), but the current
+    // tests pin their inline form and there is no user-visible win from
+    // changing it.
+    let pretty = has_children && !has_text;
+    let child_indent = indent_level + 1;
+
     writer
         .write_event(Event::Start(start))
         .map_err(map_write_err)?;
@@ -687,6 +727,9 @@ fn write_element(
     if let Some(Value::Array(items)) = body.get(KEY_COMMENTS) {
         for it in items {
             if let Value::String(s) = it {
+                if pretty {
+                    write_indent_break(writer, child_indent)?;
+                }
                 writer
                     .write_event(Event::Comment(BytesText::new(s.as_str())))
                     .map_err(map_write_err)?;
@@ -696,6 +739,9 @@ fn write_element(
     if let Some(Value::Array(items)) = body.get(KEY_PI) {
         for it in items {
             if let Value::String(s) = it {
+                if pretty {
+                    write_indent_break(writer, child_indent)?;
+                }
                 writer
                     .write_event(Event::PI(BytesPI::new(s.as_str())))
                     .map_err(map_write_err)?;
@@ -730,9 +776,12 @@ fn write_element(
             });
         };
         for child in items {
+            if pretty {
+                write_indent_break(writer, child_indent)?;
+            }
             match child {
                 Value::Map(child_body) => {
-                    write_element(writer, k, child_body)?;
+                    write_element(writer, k, child_body, child_indent)?;
                 }
                 Value::String(s) => {
                     // String-shaped child: best-effort emit as
@@ -741,32 +790,32 @@ fn write_element(
                     // `<name>Alice</name>`.
                     let mut tmp = IndexMap::new();
                     tmp.insert(KEY_TEXT.to_owned(), Value::String(s.clone()));
-                    write_element(writer, k, &tmp)?;
+                    write_element(writer, k, &tmp, child_indent)?;
                 }
                 Value::Null => {
                     // Empty child element.
                     let tmp = IndexMap::new();
-                    write_element(writer, k, &tmp)?;
+                    write_element(writer, k, &tmp, child_indent)?;
                 }
                 Value::Bool(b) => {
                     let mut tmp = IndexMap::new();
                     tmp.insert(KEY_TEXT.to_owned(), Value::String(b.to_string()));
-                    write_element(writer, k, &tmp)?;
+                    write_element(writer, k, &tmp, child_indent)?;
                 }
                 Value::Int(i) => {
                     let mut tmp = IndexMap::new();
                     tmp.insert(KEY_TEXT.to_owned(), Value::String(i.to_string()));
-                    write_element(writer, k, &tmp)?;
+                    write_element(writer, k, &tmp, child_indent)?;
                 }
                 Value::Float(f) => {
                     let mut tmp = IndexMap::new();
                     tmp.insert(KEY_TEXT.to_owned(), Value::String(f.to_string()));
-                    write_element(writer, k, &tmp)?;
+                    write_element(writer, k, &tmp, child_indent)?;
                 }
                 Value::BigInt(s) | Value::BigFloat(s) => {
                     let mut tmp = IndexMap::new();
                     tmp.insert(KEY_TEXT.to_owned(), Value::String(s.clone()));
-                    write_element(writer, k, &tmp)?;
+                    write_element(writer, k, &tmp, child_indent)?;
                 }
                 Value::Array(_) => {
                     return Err(Error::Format {
@@ -778,6 +827,13 @@ fn write_element(
                 }
             }
         }
+    }
+
+    // Close on its own line, indented to this element's level, when we
+    // pretty-printed the body. Inline-emitted bodies (leaves, mixed content)
+    // close immediately after the last inner event.
+    if pretty {
+        write_indent_break(writer, indent_level)?;
     }
 
     writer
@@ -1004,6 +1060,100 @@ mod tests {
         assert!(
             p.contains_key("b"),
             "inner <b> element must still be recorded"
+        );
+    }
+
+    #[test]
+    fn write_xml_indents_nested_elements() {
+        // Bug #9 regression: the writer must pretty-print nested element
+        // structure with a `\n` + 2-space indent per level so that
+        // `dq fmt` on a multi-line XML file no longer collapses to a
+        // single line. Pin the literal layout of the indent markers for
+        // the deepest leaf (`<c>`) to avoid silently regressing back to
+        // back-to-back tag emission.
+        let v = parse("<a><b><c>v</c></b></a>");
+        let out = render(&v);
+        assert!(
+            out.contains("\n  <b>"),
+            "child `<b>` of root must be on its own line indented 2 spaces; got: {out:?}",
+        );
+        assert!(
+            out.contains("\n    <c>v</c>"),
+            "leaf `<c>` must sit one level deeper (4 spaces) and stay inline; got: {out:?}",
+        );
+        assert!(
+            out.contains("\n  </b>"),
+            "closing `</b>` must align with its opening tag at depth 1; got: {out:?}",
+        );
+        assert!(
+            out.ends_with("</a>") || out.ends_with("</a>\n"),
+            "root close must end the document; got: {out:?}",
+        );
+    }
+
+    #[test]
+    fn write_xml_leaf_element_stays_inline() {
+        // Leaf elements (#text only, no child elements) must NOT get
+        // synthetic indentation. `<name>Alice</name>` round-trips with no
+        // whitespace inserted between the open tag, the text, and the
+        // close tag — anything else would corrupt the text body.
+        //
+        // We synthesise the value directly rather than parsing because
+        // `<name>...</name>` alone is a complete document — exactly the
+        // shape the writer's leaf branch handles.
+        let mut top = IndexMap::new();
+        let mut leaf = IndexMap::new();
+        leaf.insert(KEY_TEXT.to_owned(), Value::String("Alice".into()));
+        top.insert("name".into(), Value::Array(vec![Value::Map(leaf)]));
+        let out = render(&Value::Map(top));
+        assert!(
+            out.contains("<name>Alice</name>"),
+            "leaf element must stay inline with no inter-tag whitespace; got: {out:?}",
+        );
+        assert!(
+            !out.contains("\n  Alice") && !out.contains("Alice\n"),
+            "no newline/indent must surround the leaf text body; got: {out:?}",
+        );
+    }
+
+    #[test]
+    fn write_xml_root_with_two_children() {
+        // Two same-tag children of the root must each land on their own
+        // line, indented 2 spaces, with the closing root tag flush-left.
+        let v = parse("<list><item>A</item><item>B</item></list>");
+        let out = render(&v);
+        assert!(
+            out.contains("\n  <item>A</item>"),
+            "first child must start on a fresh line indented 2 spaces; got: {out:?}",
+        );
+        assert!(
+            out.contains("\n  <item>B</item>"),
+            "second child must start on a fresh line indented 2 spaces; got: {out:?}",
+        );
+        assert!(
+            out.contains("\n</list>"),
+            "closing `</list>` must sit on its own line at depth 0; got: {out:?}",
+        );
+    }
+
+    #[test]
+    fn write_xml_mixed_attributes_and_children() {
+        // Attributes on a parent element must coexist with the pretty-
+        // printed child layout — the attribute stays on the open tag and
+        // the self-closing child still goes on its own indented line.
+        let v = parse(r#"<a id="1"><b/></a>"#);
+        let out = render(&v);
+        assert!(
+            out.contains(r#"<a id="1">"#),
+            "attribute must survive on the open tag; got: {out:?}",
+        );
+        assert!(
+            out.contains("\n  <b/>") || out.contains("\n  <b />"),
+            "self-closing child `<b/>` must be indented 2 spaces on its own line; got: {out:?}",
+        );
+        assert!(
+            out.contains("\n</a>"),
+            "closing `</a>` must be flush-left on its own line; got: {out:?}",
         );
     }
 }

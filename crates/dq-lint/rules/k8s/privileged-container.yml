@@ -8,7 +8,23 @@ match:
   format: yaml
   filter: '.kind == "Deployment" or .kind == "StatefulSet" or .kind == "DaemonSet" or .kind == "Pod"'
 check:
-  jq: '(.spec.template.spec.containers // .spec.containers // [])[] | select(.securityContext.privileged == true)'
+  jq: |
+    if (.spec.template // null) != null
+    then
+      (.spec.template.spec.containers // [])
+      | to_entries[]
+      | select(.value.securityContext.privileged == true)
+      | { name: .value.name,
+          pointer: ("/spec/template/spec/containers/" + (.key | tostring) + "/securityContext/privileged") }
+    else
+      (.spec.containers // [])
+      | to_entries[]
+      | select(.value.securityContext.privileged == true)
+      | { name: .value.name,
+          pointer: ("/spec/containers/" + (.key | tostring) + "/securityContext/privileged") }
+    end
   message: "Container '{{ .name }}' runs as privileged"
+loc:
+  pointer: '.pointer'
 references:
   - https://kubernetes.io/docs/concepts/security/pod-security-standards/

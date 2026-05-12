@@ -515,7 +515,7 @@ fn resolve_anchor_position(
     };
     let span = outer_ir.line_col_for(&pointer);
     if span.is_none() {
-        tracing::warn!(
+        tracing::debug!(
             rule_id = %outer_rule_id,
             anchor = %anchor_str,
             "composite rule: anchor span lookup failed; retaining inner coordinates",
