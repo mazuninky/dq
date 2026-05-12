@@ -1,6 +1,6 @@
 [package]
 name = "dq-transform"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -13,7 +13,7 @@ repository.workspace = true
 # domain types the IR-aware variants of the value adapter (`ir_to_val`,
 # `val_to_owned_ir`) operate on. These are always-on types in dq-core, so the
 # dependency is unconditional rather than gated behind `embedded-jq`.
-dq-core = { path = "../dq-core", version = "0.1" }
+dq-core = { path = "../dq-core" }
 
 # `jaq-*` crates are gated behind the `embedded-jq` feature so consumers can
 # opt out of the heavy jq stack (e.g. minimal CI builds). With the feature

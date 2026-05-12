@@ -1,6 +1,6 @@
 [package]
 name = "dq-cli"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -19,23 +19,23 @@ name = "dq"
 path = "src/main.rs"
 
 [dependencies]
-dq-core = { path = "../dq-core", version = "0.1" }
+dq-core = { path = "../dq-core" }
 # M7: embedded jq engine, consumed by `dq query` and `dq set --jq`. Defaults
 # to the `embedded-jq` feature, which links jaq-core / jaq-std / jaq-json.
-dq-transform = { path = "../dq-transform", version = "0.1" }
+dq-transform = { path = "../dq-transform" }
 # M8: rule runtime (Evaluator, RuleLoader, RuleSet, RuleTester) consumed by
 # the lint / check / test / explain / rules subcommands.
-dq-exec = { path = "../dq-exec", version = "0.1" }
+dq-exec = { path = "../dq-exec" }
 # M8: embedded standard rule library (`@std/<ns>`) consumed by `rules list /
 # add` and `explain` for std-namespace rule discovery.
-dq-lint = { path = "../dq-lint", version = "0.1" }
+dq-lint = { path = "../dq-lint" }
 # Phase 5 of `add-ir-foundation`: WASM plugin runtime. The crate is linked
 # unconditionally — its own `plugins` feature gates the wasmtime-backed
 # implementation. Without the feature, `PluginRuntime::new()` returns
 # `PluginError::FeatureDisabled` and the CLI surfaces a structured
 # `InvalidInput` (exit 6) when the user passes `--plugins <DIR>` against a
 # directory that contains at least one `*.wasm` file.
-dq-plugin = { path = "../dq-plugin", version = "0.1" }
+dq-plugin = { path = "../dq-plugin" }
 
 clap = { workspace = true }
 clap_complete = { workspace = true }
@@ -88,4 +88,4 @@ pretty_assertions = { workspace = true }
 proptest = { workspace = true }
 serde_json = { workspace = true }
 indexmap = { workspace = true }
-dq-core = { path = "../dq-core", version = "0.1" }
+dq-core = { path = "../dq-core" }

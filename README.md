@@ -53,7 +53,7 @@ cargo install --locked --git https://github.com/mazuninky/dq dq-cli
 ```sh
 dq self check                  # is a newer release available?
 dq self update                 # download + verify SHA256 + atomic replace
-dq self update --to v0.5.0     # pin to a specific version
+dq self update --to v2026.20.1 # pin to a specific YYYY.WW.BUILD release
 ```
 
 ## Команды (M8)
@@ -227,6 +227,31 @@ Pre-commit hook entries shipped at the repo root (`pre-commit-hooks.yaml`) cover
 - **[spikes/saphyr/RESULTS.md](spikes/saphyr/RESULTS.md)** — результаты спайка
   по textual-edit подходу для YAML round-trip.
 - **[skill/SKILL.md](skill/SKILL.md)** — Claude Code skill: install + common patterns + format coverage + exit codes.
+
+## Releases & versioning
+
+`dq` uses **calendar versioning** in the form `YYYY.WW.BUILD`:
+
+- `YYYY` — ISO year.
+- `WW` — ISO week number (zero-padded, `01`–`53`).
+- `BUILD` — monotonic build counter within that week, starting at `1`.
+
+The version lives in the workspace root `[workspace.package].version`; every member crate inherits it via `version.workspace = true`. Git tag `vYYYY.WW.BUILD` is the source of truth.
+
+**Cutting a release:**
+
+```sh
+scripts/bump-version.sh              # computes next version, updates Cargo.toml + lock, commits, tags
+scripts/bump-version.sh --dry-run    # print the next version without side effects
+git push origin master && git push origin v$(scripts/bump-version.sh --dry-run)
+```
+
+The push of a `vYYYY.WW.BUILD` tag triggers [.github/workflows/release.yml](.github/workflows/release.yml):
+
+1. `verify-version` — asserts the tag matches `cargo pkgid -p dq-cli`.
+2. `build` (matrix: `x86_64-linux-gnu`, `aarch64-linux-gnu`, `aarch64-apple-darwin`) — release binary + `dq generate-docs` man/completions, packaged as tar.gz with per-target `.sha256` sidecars.
+3. `release` — combined `dq-checksums.txt`, [build provenance attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations), optional cosign signing (only when `COSIGN_PRIVATE_KEY` is set), GitHub Release with auto-generated notes.
+4. `bump-homebrew-tap` — opens a PR against [mazuninky/homebrew-tap](https://github.com/mazuninky/homebrew-tap) updating `Formula/dq.rb` (skipped without `HOMEBREW_TAP_TOKEN`).
 
 ## License
 

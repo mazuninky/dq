@@ -1,6 +1,6 @@
 [package]
 name = "dq-exec"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -12,12 +12,12 @@ repository.workspace = true
 # error type that the rule schema diagnostics quote; `dq-transform`'s
 # `JqEngine` is the load-bearing primitive every rule's `match.filter` and
 # `check.jq` is compiled into.
-dq-core = { path = "../dq-core", version = "0.1" }
-dq-transform = { path = "../dq-transform", version = "0.1" }
+dq-core = { path = "../dq-core" }
+dq-transform = { path = "../dq-transform" }
 # `dq-lint` ships the embedded `@std/<namespace>` rule library that
 # `RuleSet::from_std` resolves against. Zero-runtime-dep crate; the only
 # cost is the `include_str!` rule files at compile time.
-dq-lint = { path = "../dq-lint", version = "0.1" }
+dq-lint = { path = "../dq-lint" }
 
 # Core data / serialization. `serde_yml` parses the rule schema; `serde_json`
 # is the lingua franca for diagnostic envelopes (matches the SARIF reporter
