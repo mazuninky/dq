@@ -109,7 +109,7 @@ comrak = { version = "0.52", default-features = false }
 # crate's `BytesDecl::new` constructor is available for re-emitting the
 # XML declaration on the write path; the parse path uses only the core
 # event-reader API. License: MIT.
-quick-xml = { version = "0.36", features = ["serialize"] }
+quick-xml = { version = "0.40", features = ["serialize"] }
 
 # M11 Phase 3 — JSON Schema 2020-12 validator used by `dq-exec` for the
 # `Check::Schema` / `Check::SchemaFile` rule variants. `default-features =
