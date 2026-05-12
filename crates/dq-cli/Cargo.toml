@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+publish.workspace = true
 
 # Both a library and a binary target — the library exposes `dq::run` so
 # integration tests can drive the CLI in-process (no `assert_cmd` spawn) while

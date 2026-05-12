@@ -97,6 +97,13 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - uses: EmbarkStudios/cargo-deny-action@34899fc7ba81ca6268d5947a7a16b4649013fea1 # v2.0.4
+      - uses: EmbarkStudios/cargo-deny-action@0105f7c440bc8084c17cad47fe92e63049519458 # v2.0.18
         with:
           command: check
+          # The bundled cargo-deny 0.19.5 (via rustsec crate) cannot parse
+          # CVSS 4.0 vectors and crashes on RUSTSEC advisories that use them
+          # (see EmbarkStudios/cargo-deny#804). Restrict the deny job to
+          # license / source / ban policies — advisories are covered daily
+          # by audit.yml via rustsec/audit-check, which uses an independent
+          # parser path.
+          command-arguments: "bans licenses sources"
