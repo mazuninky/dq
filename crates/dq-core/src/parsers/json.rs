@@ -1430,6 +1430,55 @@ mod tests {
         assert_eq!(doc.original_bytes(), b"{\"title\": \"Updated\"}");
     }
 
+    // -- mkdir-p (Bug #1) -----------------------------------------------
+
+    #[test]
+    fn insertion_renderer_inserts_into_populated_map() {
+        // End-to-end mkdir-p smoke: parse `{"a": 1}`, set `/b` to 42 via
+        // `Document::set_at`, and assert the rendered bytes re-parse as
+        // `{"a": 1, "b": 42}`. The renderer + splice path is wired in
+        // `document::Document::try_single_level_mkdir_p`.
+        let bytes = br#"{"a": 1}"#;
+        let mut doc = Json.parse(bytes).expect("parse");
+        let pointer = Pointer::parse("/b").expect("pointer");
+        doc.set_at(&pointer, Value::Int(42))
+            .expect("mkdir-p set_at must succeed");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(doc.original_bytes()).expect("rendered bytes are valid JSON");
+        assert_eq!(parsed.pointer("/a"), Some(&serde_json::json!(1)));
+        assert_eq!(parsed.pointer("/b"), Some(&serde_json::json!(42)));
+    }
+
+    #[test]
+    fn insertion_renderer_inserts_into_nested_map() {
+        // Bug #1 main scenario: `dq set FILE /a/c 42` on `{"a":{"b":1}}`
+        // must produce `{"a":{"b":1,"c":42}}`-equivalent JSON.
+        let bytes = br#"{"a":{"b":1}}"#;
+        let mut doc = Json.parse(bytes).expect("parse");
+        let pointer = Pointer::parse("/a/c").expect("pointer");
+        doc.set_at(&pointer, Value::Int(42))
+            .expect("mkdir-p set_at must succeed");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(doc.original_bytes()).expect("rendered bytes are valid JSON");
+        assert_eq!(parsed.pointer("/a/b"), Some(&serde_json::json!(1)));
+        assert_eq!(parsed.pointer("/a/c"), Some(&serde_json::json!(42)));
+    }
+
+    #[test]
+    fn insertion_renderer_into_empty_map_falls_through() {
+        // Empty parent (`{"a":{}}`) has no sibling to anchor against, so
+        // the single-level baseline returns `MissingKey`. Pinning the
+        // expected failure mode so a future multi-level / empty-parent
+        // enhancement has a failing test to flip.
+        let bytes = br#"{"a":{}}"#;
+        let mut doc = Json.parse(bytes).expect("parse");
+        let pointer = Pointer::parse("/a/b").expect("pointer");
+        let err = doc
+            .set_at(&pointer, Value::Int(42))
+            .expect_err("empty-parent mkdir-p must fail in the baseline");
+        assert_eq!(err.kind_name(), "path");
+    }
+
     // -- M2 §5 indent style detection ----------------------------------
 
     #[test]

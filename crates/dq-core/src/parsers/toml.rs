@@ -1052,4 +1052,25 @@ mod tests {
         let out = r.render_insertion("with space", &Value::Int(1), 0, SpanContext::BlockMapValue);
         assert_eq!(out, b"\"with space\" = 1\n");
     }
+
+    // -- mkdir-p (Bug #1) -----------------------------------------------
+
+    #[test]
+    fn insertion_renderer_inserts_new_root_key() {
+        // Bug #1: root-level mkdir-p must append a new `key = value` line
+        // after the last existing sibling.
+        let bytes = b"a = 1\nb = 2\n";
+        let mut doc = Toml.parse(bytes).expect("parse");
+        let pointer = Pointer::parse("/c").expect("pointer");
+        doc.set_at(&pointer, Value::Int(42))
+            .expect("mkdir-p set_at must succeed");
+        let reparsed = Toml.parse(doc.original_bytes()).expect("re-parse");
+        let c = pointer.resolve(reparsed.value()).expect("reparsed has /c");
+        assert_eq!(c, &Value::Int(42));
+        let a = Pointer::parse("/a")
+            .unwrap()
+            .resolve(reparsed.value())
+            .expect("reparsed still has /a");
+        assert_eq!(a, &Value::Int(1));
+    }
 }

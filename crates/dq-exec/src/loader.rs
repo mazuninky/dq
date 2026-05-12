@@ -13,11 +13,18 @@
 //! - Otherwise → [`crate::error::ExecError::UnknownRule`] with a
 //!   Levenshtein-2 suggestion list against `@std/*` namespaces.
 //!
-//! When `args.rules` is empty, the loader auto-binds:
+//! When `args.rules` is empty and [`LoaderArgs::suppress_auto_bind`] is
+//! `false`, the loader auto-binds:
 //!
 //! - Every `@std/<ns>` whose rules apply to at least one of the
 //!   discovered formats.
 //! - Project-local rules under `<cwd>/.dq/rules/`, when present.
+//!
+//! Setting [`LoaderArgs::suppress_auto_bind`] to `true` short-circuits this
+//! fallback: an empty `args.rules` resolves to an empty `Vec<RuleSet>`. Used
+//! by `dq check`, where the caller has already resolved the single requested
+//! rule outside the loader (via `--rule` / `--inline`) and appends it to the
+//! pipeline through a separate `extra` channel.
 
 use camino::{Utf8Path, Utf8PathBuf};
 use indexmap::IndexSet;
@@ -38,6 +45,14 @@ pub struct LoaderArgs {
     /// used by the implicit auto-bind path to pick which `@std/*`
     /// namespaces to load. Insertion order is preserved.
     pub discovered_formats: IndexSet<String>,
+    /// When `true`, an empty `rules` list does NOT trigger the implicit
+    /// auto-bind fallback: the loader returns an empty `Vec<RuleSet>` so
+    /// the caller's own rulesets (passed alongside via `extra` in the
+    /// CLI pipeline) are the only rules that fire. Used by `dq check`
+    /// (which resolves exactly one rule out-of-band) to avoid running
+    /// every `@std/<ns>` rule that happens to match the discovered
+    /// formats.
+    pub suppress_auto_bind: bool,
 }
 
 /// Stateless namespace for the resolution helper.
@@ -46,6 +61,15 @@ pub struct RuleLoader;
 
 impl RuleLoader {
     /// Resolve `args` into the rulesets the evaluator should run.
+    ///
+    /// When `args.rules` is empty and `args.suppress_auto_bind` is `false`,
+    /// the loader falls back to the implicit auto-bind path
+    /// ([`resolve_implicit`]) — every `@std/<ns>` ruleset whose rules
+    /// overlap [`LoaderArgs::discovered_formats`] plus the project-local
+    /// `<cwd>/.dq/rules/` directory. Setting `suppress_auto_bind` to `true`
+    /// short-circuits this fallback: callers that have already resolved
+    /// exactly the rules they want to run (e.g. `dq check --rule <id>`)
+    /// can pass an empty `rules` list without triggering auto-bind.
     ///
     /// # Errors
     ///
@@ -57,6 +81,12 @@ impl RuleLoader {
     pub fn resolve(args: &LoaderArgs) -> Result<Vec<RuleSet>> {
         if !args.rules.is_empty() {
             return resolve_explicit(args);
+        }
+        if args.suppress_auto_bind {
+            // The caller (e.g. `dq check`) supplies its own ruleset via
+            // the `extra` channel in the CLI pipeline; auto-binding would
+            // run unrelated `@std/*` rules in addition.
+            return Ok(Vec::new());
         }
         resolve_implicit(args)
     }
@@ -225,6 +255,7 @@ check:
             rules: vec![rule_path.to_string()],
             cwd: dir.clone(),
             discovered_formats: IndexSet::new(),
+            suppress_auto_bind: false,
         };
         let sets = RuleLoader::resolve(&args).expect("resolve");
         assert_eq!(sets.len(), 1);
@@ -241,6 +272,7 @@ check:
             rules: vec!["alpha.yml".to_owned()],
             cwd: dir.clone(),
             discovered_formats: IndexSet::new(),
+            suppress_auto_bind: false,
         };
         let sets = RuleLoader::resolve(&args).expect("resolve");
         assert_eq!(sets.len(), 1);
@@ -258,6 +290,7 @@ check:
             rules: vec![rules_dir.to_string()],
             cwd: dir.clone(),
             discovered_formats: IndexSet::new(),
+            suppress_auto_bind: false,
         };
         let sets = RuleLoader::resolve(&args).expect("resolve");
         assert_eq!(sets.len(), 1);
@@ -271,6 +304,7 @@ check:
             rules: vec!["@std/k8z".to_owned()],
             cwd: dir,
             discovered_formats: IndexSet::new(),
+            suppress_auto_bind: false,
         };
         let err = RuleLoader::resolve(&args).expect_err("expected UnknownRule");
         match err {
@@ -293,6 +327,7 @@ check:
             rules: vec!["nonexistent-rules.yml".to_owned()],
             cwd: dir,
             discovered_formats: IndexSet::new(),
+            suppress_auto_bind: false,
         };
         let err = RuleLoader::resolve(&args).expect_err("expected UnknownRule");
         match err {
@@ -317,6 +352,7 @@ check:
             rules: Vec::new(),
             cwd: dir,
             discovered_formats: formats,
+            suppress_auto_bind: false,
         };
         let sets = RuleLoader::resolve(&args).expect("resolve");
         // With dq-lint wired in, std namespaces that match yaml may also
@@ -338,6 +374,7 @@ check:
             // No discovered formats → no std namespace overlaps → no
             // project rules dir → empty result.
             discovered_formats: IndexSet::new(),
+            suppress_auto_bind: false,
         };
         let sets = RuleLoader::resolve(&args).expect("resolve");
         assert!(sets.is_empty(), "expected zero rulesets, got: {sets:?}");
@@ -378,6 +415,7 @@ check:
             rules: Vec::new(),
             cwd: dir,
             discovered_formats: formats,
+            suppress_auto_bind: false,
         };
         let sets = RuleLoader::resolve(&args).expect("resolve");
         assert!(
@@ -398,8 +436,66 @@ check:
             rules: Vec::new(),
             cwd: dir,
             discovered_formats: formats,
+            suppress_auto_bind: false,
         };
         let sets = RuleLoader::resolve(&args).expect("resolve");
         assert!(sets.is_empty(), "expected no @std namespaces to bind");
+    }
+
+    /// `suppress_auto_bind = true` MUST short-circuit the implicit fallback:
+    /// an empty `rules` list with discovered formats that would otherwise
+    /// trigger an `@std/<ns>` auto-bind returns an empty `Vec<RuleSet>`. The
+    /// `<cwd>/.dq/rules/` directory is also skipped — the caller is signalling
+    /// "I already supplied the rules I want through `extra`, don't add more".
+    /// This is the load-bearing contract behind the `dq check --rule <id>`
+    /// fix: without it, `check` would silently run every auto-bound `@std`
+    /// rule on top of the explicit one.
+    #[test]
+    fn loader_resolve_with_suppress_auto_bind_returns_only_explicit() {
+        let (_t, dir) = tempdir_utf8();
+        // Plant a project-local rules dir so we can also assert it's
+        // skipped — without `suppress_auto_bind`, this would normally
+        // appear in the resolved rulesets (see
+        // `implicit_picks_up_project_local_rules_dir`).
+        let project = dir.join(".dq").join("rules");
+        std::fs::create_dir_all(&project).expect("mkdir");
+        std::fs::write(project.join("local.yml"), SAMPLE_RULE).expect("write rule");
+
+        let mut formats = IndexSet::new();
+        formats.insert("yaml".to_owned());
+
+        let args = LoaderArgs {
+            rules: Vec::new(),
+            cwd: dir,
+            discovered_formats: formats,
+            suppress_auto_bind: true,
+        };
+        let sets = RuleLoader::resolve(&args).expect("resolve");
+        assert!(
+            sets.is_empty(),
+            "suppress_auto_bind must skip both @std auto-bind and the \
+             project-local .dq/rules dir, got: {sets:?}",
+        );
+    }
+
+    /// `suppress_auto_bind` MUST NOT affect the explicit-rules path: when
+    /// `rules` is non-empty the loader still resolves every entry as it
+    /// normally would. This guards against a regression where the new flag
+    /// short-circuits the wrong branch.
+    #[test]
+    fn loader_resolve_with_suppress_auto_bind_still_honours_explicit_rules() {
+        let (_t, dir) = tempdir_utf8();
+        let rule_path = dir.join("alpha.yml");
+        std::fs::write(&rule_path, SAMPLE_RULE).expect("write rule");
+
+        let args = LoaderArgs {
+            rules: vec![rule_path.to_string()],
+            cwd: dir.clone(),
+            discovered_formats: IndexSet::new(),
+            suppress_auto_bind: true,
+        };
+        let sets = RuleLoader::resolve(&args).expect("resolve");
+        assert_eq!(sets.len(), 1, "explicit rule must still resolve");
+        assert_eq!(sets[0].rules[0].id, "a.one");
     }
 }

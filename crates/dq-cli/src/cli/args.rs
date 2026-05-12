@@ -368,7 +368,9 @@ pub enum Command {
     Select(SelectArgs),
     /// Convert between formats.
     Convert(ConvertArgs),
-    /// Re-emit the file through its native writer (canonical formatting).
+    /// Re-emit FILE through its native writer. Without --sort-keys or
+    /// --indent this is a no-op pass — only structural normalisation runs.
+    /// Pass --indent N to canonicalise JSON whitespace.
     Fmt(FmtArgs),
     /// Parse the file and report parse errors.
     Validate(ValidateArgs),

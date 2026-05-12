@@ -55,8 +55,11 @@ use crate::error::InvalidInput;
 /// - [`dq_core::Error::TemplatedFile`] (exit 3) when the file contains Go
 ///   template syntax and neither escape-hatch flag is set.
 /// - [`dq_core::Error::Path`] (exit 2) when the pointer addresses a missing
-///   node and `--no-create` is set (or when the M2 baseline insertion path
-///   declines to mkdir-p — see [`Document::set_at`] for the inline TODO).
+///   node and one of the following holds: `--no-create` is set (blocks every
+///   mkdir-p variant); multiple intermediate keys are missing (multi-level
+///   mkdir-p is deferred); or the immediate parent is an empty container
+///   (`{}` / `[]`, also deferred). The single-level case — parent exists,
+///   one leaf key missing — is created automatically via [`Document::set_at`].
 /// - [`dq_core::Error::WriteIo`] / [`dq_core::Error::WriteUnavailable`]
 ///   (exit 7) on write failure.
 /// - [`crate::error::CheckPending`] (exit 1) when `--check` finds at least
@@ -122,19 +125,18 @@ pub fn run(
     // Parse the pointer ONCE — every file uses the same pointer.
     let pointer = Pointer::parse(pointer_str).map_err(anyhow::Error::new)?;
 
-    // NOTE: `--no-create` is honored automatically by the M2 baseline
-    // because `Document::set_at` returns `Path { kind: MissingKey }` for any
-    // pointer that needs an intermediate node. Once mkdir-p lands in M2 §12,
-    // we'll need to gate the insertion on `args.no_create == false` inside
-    // `SetFileOp::apply`.
-    let _no_create_will_matter_post_mkdirp = args.no_create;
-
+    // `--no-create` is enforced inside `SetFileOp::apply`: when the flag
+    // is set we pre-resolve the pointer against the parsed document and
+    // return `Path { MissingKey }` if it doesn't exist, so mkdir-p (the
+    // Bug #1 fix in `Document::set_at`) does NOT silently create new keys
+    // when the user explicitly asked to keep the document shape unchanged.
     let op = SetFileOp {
         cli,
         input_format,
         use_color,
         pointer: &pointer,
         value: &value,
+        no_create: args.no_create,
     };
 
     let files = bulk::expand_glob(&args.file)?;
@@ -150,6 +152,10 @@ struct SetFileOp<'a> {
     use_color: bool,
     pointer: &'a Pointer,
     value: &'a Value,
+    /// When `true`, fail (exit 2) instead of creating missing keys via
+    /// the mkdir-p path in `Document::set_at`. Mirrors `--no-create` on
+    /// the CLI.
+    no_create: bool,
 }
 
 impl<'a> FileOp for SetFileOp<'a> {
@@ -190,6 +196,16 @@ impl<'a> FileOp for SetFileOp<'a> {
         //    `set_at` consumes a `Value` (the engine takes ownership of the
         //    new node); we cannot share `&self.value` across worker threads
         //    that all call `set_at`.
+        //
+        //    `--no-create` gate: pre-resolve the pointer against the parsed
+        //    document so a missing key surfaces the original
+        //    `Path { MissingKey }` error rather than being silently created
+        //    by the Bug #1 mkdir-p path.
+        if self.no_create {
+            self.pointer
+                .resolve(document.value())
+                .map_err(anyhow::Error::new)?;
+        }
         document
             .set_at(self.pointer, self.value.clone())
             .map_err(anyhow::Error::new)?;

@@ -8,7 +8,23 @@ match:
   format: yaml
   filter: '.kind == "Deployment" or .kind == "StatefulSet" or .kind == "DaemonSet" or .kind == "Pod"'
 check:
-  jq: '(.spec.template.spec.containers // .spec.containers // [])[] | select(.securityContext.allowPrivilegeEscalation != false)'
+  jq: |
+    if (.spec.template // null) != null
+    then
+      (.spec.template.spec.containers // [])
+      | to_entries[]
+      | select(.value.securityContext.allowPrivilegeEscalation != false)
+      | { name: .value.name,
+          pointer: ("/spec/template/spec/containers/" + (.key | tostring) + "/name") }
+    else
+      (.spec.containers // [])
+      | to_entries[]
+      | select(.value.securityContext.allowPrivilegeEscalation != false)
+      | { name: .value.name,
+          pointer: ("/spec/containers/" + (.key | tostring) + "/name") }
+    end
   message: "Container '{{ .name }}' does not set allowPrivilegeEscalation=false"
+loc:
+  pointer: '.pointer'
 references:
   - https://kubernetes.io/docs/concepts/security/pod-security-standards/

@@ -1448,6 +1448,64 @@ mod tests {
         assert_eq!(doc.original_bytes(), b"title: \"Updated\"\n");
     }
 
+    // -- mkdir-p (Bug #1) -----------------------------------------------
+
+    #[test]
+    fn insertion_renderer_inserts_with_correct_block_indent() {
+        // Bug #1: nested map mkdir-p must produce well-formed YAML with
+        // the children's indent matching the existing siblings (not the
+        // siblings' value column, which is what `ValueSpan::indent`
+        // records — `Document::try_single_level_mkdir_p` re-derives the
+        // key column by scanning back through the source line).
+        let bytes = b"a:\n  b: 1\n";
+        let mut doc = parse_yaml_with_spans(bytes).expect("parse");
+        let pointer = Pointer::parse("/a/c").expect("pointer");
+        doc.set_at(&pointer, Value::Int(42))
+            .expect("mkdir-p set_at must succeed");
+        // The rendered bytes must re-parse to a tree containing both /a/b
+        // and the newly-inserted /a/c with the right indent (otherwise
+        // YAML's "mapping values are not allowed" error fires on re-parse).
+        let reparsed = parse_yaml_with_spans(doc.original_bytes()).expect("re-parse");
+        let c = pointer
+            .resolve(reparsed.value())
+            .expect("reparsed has /a/c");
+        assert_eq!(c, &Value::Int(42));
+        let b = Pointer::parse("/a/b")
+            .unwrap()
+            .resolve(reparsed.value())
+            .expect("reparsed still has /a/b");
+        assert_eq!(b, &Value::Int(1));
+    }
+
+    #[test]
+    fn insertion_renderer_into_empty_yaml_map_falls_through() {
+        // Empty parent (`{}`) → falls through to MissingKey in the
+        // single-level baseline. Test pins the expected behaviour so a
+        // future enhancement that handles empty parents has a failing
+        // test to flip.
+        let bytes = b"a: {}\n";
+        let mut doc = parse_yaml_with_spans(bytes).expect("parse");
+        let pointer = Pointer::parse("/a/b").expect("pointer");
+        let err = doc
+            .set_at(&pointer, Value::Int(42))
+            .expect_err("empty-parent mkdir-p must fail");
+        assert_eq!(err.kind_name(), "path");
+    }
+
+    #[test]
+    fn insertion_renderer_into_root_yaml_map_succeeds() {
+        // Root-level mkdir-p — same shape as the nested case but parent
+        // is the implicit root mapping.
+        let bytes = b"a: 1\n";
+        let mut doc = parse_yaml_with_spans(bytes).expect("parse");
+        let pointer = Pointer::parse("/b").expect("pointer");
+        doc.set_at(&pointer, Value::Int(42))
+            .expect("root mkdir-p set_at must succeed");
+        let reparsed = parse_yaml_with_spans(doc.original_bytes()).expect("re-parse");
+        let b = pointer.resolve(reparsed.value()).expect("reparsed has /b");
+        assert_eq!(b, &Value::Int(42));
+    }
+
     // -- Phase 2 (`add-validation-and-extended-formats`) ------------------
     //
     // Inline-offset population for YAML block scalars. Phase 2 spec

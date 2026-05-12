@@ -8,7 +8,9 @@ match:
   format: yaml
   filter: '.kind == "Deployment" or .kind == "StatefulSet" or .kind == "DaemonSet" or .kind == "Service" or .kind == "Job" or .kind == "CronJob"'
 check:
-  jq: 'select((.metadata.labels // {})["app.kubernetes.io/name"] == null) | {kind: .kind, name: (.metadata.name // "<unnamed>")}'
+  jq: 'select((.metadata.labels // {})["app.kubernetes.io/name"] == null) | {kind: .kind, name: (.metadata.name // "<unnamed>"), pointer: "/metadata/name"}'
   message: "{{ .kind }} '{{ .name }}' is missing label app.kubernetes.io/name"
+loc:
+  pointer: '.pointer'
 references:
   - https://kubernetes.io/docs/concepts/overview/working-with-objects/common-labels/

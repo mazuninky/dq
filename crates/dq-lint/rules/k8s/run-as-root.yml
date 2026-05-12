@@ -9,7 +9,18 @@ match:
   format: yaml
   filter: '.kind == "Deployment" or .kind == "StatefulSet" or .kind == "DaemonSet" or .kind == "Pod"'
 check:
-  jq: '. as $doc | (.spec.template.spec // .spec) | select((.securityContext.runAsNonRoot // null) != true) | {kind: "pod", name: ($doc.metadata.name // "<unnamed>")}'
+  jq: |
+    . as $doc
+    | if (.spec.template // null) != null
+      then { spec: .spec.template.spec, ptr: "/spec/template/spec" }
+      else { spec: .spec,               ptr: "/spec" }
+      end
+    | select((.spec.securityContext.runAsNonRoot // null) != true)
+    | { kind: "pod",
+        name: ($doc.metadata.name // "<unnamed>"),
+        pointer: "/metadata/name" }
   message: "Pod-spec '{{ .name }}' does not set securityContext.runAsNonRoot=true"
+loc:
+  pointer: '.pointer'
 references:
   - https://kubernetes.io/docs/concepts/security/pod-security-standards/

@@ -48,11 +48,19 @@ pub fn run(
 
     let extra = resolve_rule(args)?;
 
+    // `suppress_auto_bind = true` is the whole point of `check`: the user
+    // named exactly one rule via `--rule` / `--inline`, so the auto-bind
+    // fallback in [`RuleLoader::resolve`] would silently run every
+    // `@std/<ns>` rule matching the file's format alongside it (e.g. asking
+    // for `k8s.no-latest-tag` against a YAML file would also fire every
+    // other `@std/k8s` and `@std/dockerfile` rule). See
+    // [`crate::commands::lint_core::run_with_rulesets`] for the contract.
     run_with_rulesets(
         cli,
         &args.files,
         Vec::new(),
         extra,
+        true,
         input_format,
         reporter,
         out,
@@ -286,5 +294,87 @@ check:
         assert_eq!(levenshtein("", ""), 0);
         assert_eq!(levenshtein("abc", "abc"), 0);
         assert_eq!(levenshtein("kitten", "sitting"), 3);
+    }
+
+    /// Regression test for Bug #2: `dq check --rule <id>` must run ONLY the
+    /// explicitly-named rule, not also every `@std/<ns>` rule the loader
+    /// would have auto-bound for the discovered file format.
+    ///
+    /// Pipeline:
+    /// - Fixture: a Deployment YAML with `image: nginx:latest`. The k8s
+    ///   namespace's auto-bind would normally run `no-latest-tag` plus
+    ///   ~10 other `@std/k8s` rules (missing-resources-limits,
+    ///   privileged-container, run-as-root, etc.) against this document.
+    /// - `--rule k8s.no-latest-tag` resolves the single rule via
+    ///   `lookup_std_rule` and the pipeline must NOT auto-bind anything
+    ///   else.
+    /// - We parse the JSON output and assert every emitted diagnostic
+    ///   carries `rule_id = "k8s.no-latest-tag"` AND that there's exactly
+    ///   one diagnostic (one container with `:latest`).
+    #[test]
+    fn check_with_explicit_rule_runs_only_that_rule() {
+        // A minimal Deployment with one `:latest` container. Several other
+        // @std/k8s rules (missing-resources-limits, missing-liveness-probe,
+        // run-as-root, etc.) would also fire on this payload if auto-bind
+        // weren't suppressed — that's exactly the bug we're regressing.
+        let fixture = r#"apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    spec:
+      containers:
+        - name: a
+          image: nginx:latest
+"#;
+        let doc_tmp = write_yaml(fixture);
+        let path = Utf8PathBuf::from_path_buf(doc_tmp.to_path_buf()).expect("UTF-8 path");
+
+        let cli =
+            Cli::try_parse_from(["dq", "check", "--rule", "k8s.no-latest-tag", path.as_str()])
+                .expect("clap parse");
+        let args = CheckArgs {
+            rule: Some("k8s.no-latest-tag".to_owned()),
+            inline: None,
+            files: vec![path],
+        };
+        let reporter = JsonReporter;
+        let mut out: Vec<u8> = Vec::new();
+
+        // `k8s.no-latest-tag` is error severity, so the pipeline returns
+        // `LintFail`; the diagnostics envelope is still written to `out`.
+        let err = run(&cli, &args, None, &reporter, &mut out)
+            .expect_err("error-severity rule must produce LintFail");
+        assert!(
+            err.downcast_ref::<LintFail>().is_some(),
+            "expected LintFail, got: {err:?}",
+        );
+
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&out).expect("reporter must emit JSON envelope");
+        let diagnostics = parsed
+            .get("diagnostics")
+            .and_then(serde_json::Value::as_array)
+            .expect("envelope must carry a `diagnostics` array");
+
+        // The core assertion: every diagnostic is for the requested rule.
+        // Without the `suppress_auto_bind` fix, this fails because the
+        // loader auto-binds every `@std/k8s` rule and also fires
+        // `no-latest-tag` twice (once from `--rule`, once from auto-bind).
+        let foreign: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.get("rule_id").and_then(|v| v.as_str()) != Some("k8s.no-latest-tag"))
+            .collect();
+        assert!(
+            foreign.is_empty(),
+            "check --rule must not run any other rule, got foreign diagnostics: {foreign:?}",
+        );
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "expected exactly one `k8s.no-latest-tag` diagnostic (one offending container), \
+             got: {diagnostics:?}",
+        );
     }
 }

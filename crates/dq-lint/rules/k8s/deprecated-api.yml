@@ -8,7 +8,9 @@ match:
   format: yaml
   filter: 'has("apiVersion")'
 check:
-  jq: 'select(.apiVersion as $av | $av == "extensions/v1beta1" or $av == "apps/v1beta1" or $av == "apps/v1beta2" or $av == "policy/v1beta1") | {api: .apiVersion, kind: (.kind // "<unknown>")}'
+  jq: 'select(.apiVersion as $av | $av == "extensions/v1beta1" or $av == "apps/v1beta1" or $av == "apps/v1beta2" or $av == "policy/v1beta1") | {api: .apiVersion, kind: (.kind // "<unknown>"), pointer: "/apiVersion"}'
   message: "Resource of kind '{{ .kind }}' uses deprecated apiVersion '{{ .api }}'"
+loc:
+  pointer: '.pointer'
 references:
   - https://kubernetes.io/docs/reference/using-api/deprecation-guide/
