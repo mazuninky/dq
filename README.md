@@ -20,23 +20,49 @@ Agent-friendly Rust CLI for structured data files (YAML, JSON, TOML, HCL, INI, .
 
 ## Installation
 
-### curl-pipe-sh (Linux / macOS)
+### From GitHub Releases with attestation verification (recommended)
+
+Every `dq-*.tar.gz` published to GitHub Releases is signed via [SLSA build provenance](https://slsa.dev/). The attestation proves the archive was built by this repo's `release.yml` workflow at a specific tag, signed by a Sigstore short-lived certificate tied to GitHub's OIDC identity. Download and verify before installing:
 
 ```sh
-curl -sSfL https://raw.githubusercontent.com/mazuninky/dq/main/scripts/install.sh | sh
+# Download the artifact for your platform from the latest release
+gh release download --repo mazuninky/dq --pattern 'dq-*-x86_64-unknown-linux-gnu.tar.gz'
+
+# Verify the SLSA provenance (fails if the archive was not built by this repo)
+gh attestation verify dq-*-x86_64-unknown-linux-gnu.tar.gz --repo mazuninky/dq
+
+# Extract and install
+tar -xzf dq-*-x86_64-unknown-linux-gnu.tar.gz
+sudo install -m 0755 dq-*/dq /usr/local/bin/dq
 ```
 
-By default the script installs to `~/.local/bin` (non-root) or `/usr/local/bin` (root). Override with `--install-dir DIR` or `--version vYYYY.WW.BUILD`. Pin to a specific release for reproducible setups:
+Prebuilt artifacts are available for Linux (x86_64, aarch64) and macOS (aarch64). On platforms without a prebuilt asset, build from source — see below.
 
-```sh
-curl -sSfL https://raw.githubusercontent.com/mazuninky/dq/main/scripts/install.sh | sh -s -- --version v2026.20.1
-```
+### Homebrew (macOS arm64, Linux x86_64 + aarch64)
 
-### Homebrew (macOS / Linux)
+A Homebrew tap is published at [`mazuninky/homebrew-tap`](https://github.com/mazuninky/homebrew-tap). The formula installs the binary, man pages, and shell completions for `bash`, `zsh`, and `fish`:
 
 ```sh
 brew install mazuninky/tap/dq
 ```
+
+The formula tracks the latest release and is bumped automatically by the release workflow.
+
+### Quick install via the install script
+
+For convenience on a trusted workstation, [`scripts/install.sh`](scripts/install.sh) automates download + checksum verification + extraction. **Note:** this pattern pipes a remote shell script into `sh` and executes it with your user's privileges. Pin to a specific version, or review the script first, before running on any machine that handles secrets:
+
+```sh
+# Recommended: pin to a specific release
+curl -sSfL https://raw.githubusercontent.com/mazuninky/dq/master/scripts/install.sh | sh -s -- --version v2026.20.1
+```
+
+```sh
+# Latest (unpinned)
+curl -sSfL https://raw.githubusercontent.com/mazuninky/dq/master/scripts/install.sh | sh
+```
+
+The script installs to `~/.local/bin` (non-root) or `/usr/local/bin` (root); use `--install-dir DIR` to override. It verifies SHA256 against the published `dq-checksums.txt` but does **not** run `gh attestation verify` — for full supply-chain assurance use the verified path above.
 
 ### Docker
 
