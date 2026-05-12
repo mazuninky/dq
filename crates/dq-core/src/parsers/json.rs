@@ -214,9 +214,16 @@ pub fn parse_json_with_spans(bytes: &[u8]) -> Result<Document> {
 ///
 /// The scanner walks `bytes` directly (no AST allocation), tracks a path
 /// stack of pointer segments, and records one [`ValueSpan`] per scalar leaf
-/// keyed by canonical RFC 6901 pointer. Container values (objects /
-/// arrays) do not get their own span entry — only their leaf scalars do —
-/// matching the §3 / §4 contract.
+/// keyed by canonical RFC 6901 pointer. Non-empty container values
+/// (objects / arrays) do not get their own span entry — only their leaf
+/// scalars do — matching the §3 / §4 contract.
+///
+/// **Empty** containers (`{}` / `[]`) are the one exception: they DO produce
+/// a span entry keyed at the container's own pointer. The empty-parent
+/// mkdir-p path in [`crate::document::Document::set_at`] uses that span as
+/// the splice anchor — there is no sibling to anchor against, but the
+/// `{`/`}` byte range is recorded here so the splicer can insert the first
+/// key inside them.
 ///
 /// JSONC (`//` line / `/* */` block comments) is rejected at this layer
 /// with a structured [`Error::Parse`] before the value tree parse runs.
@@ -309,8 +316,11 @@ impl<'a> Scanner<'a> {
     }
 
     /// Scan one JSON value at `self.pos`, recording a [`ValueSpan`] entry
-    /// for scalars at the canonical pointer for `path`. Containers recurse;
-    /// they themselves do not produce a span entry.
+    /// for scalars at the canonical pointer for `path`. Non-empty containers
+    /// recurse without producing a span entry; **empty** containers (`{}` /
+    /// `[]`) DO produce a span keyed at the container's own pointer so
+    /// [`crate::document::Document::set_at`]'s empty-parent mkdir-p path
+    /// can splice into them.
     fn scan_value(
         &mut self,
         path: &mut Vec<String>,
@@ -322,11 +332,23 @@ impl<'a> Scanner<'a> {
         match self.peek() {
             Some(b'{') => {
                 self.bump();
-                self.scan_object(path, spans)?;
+                let was_empty = self.scan_object(path, spans)?;
+                if was_empty {
+                    // Record an empty-container span for the parent's
+                    // pointer so `Document::set_at` can locate the `{}`
+                    // body when inserting the first key. `value_range`
+                    // covers the literal `{ ... }` including any internal
+                    // whitespace; `context` is the parent's context, which
+                    // is what the empty-parent splicer keys off.
+                    self.record_empty_container(path, spans, start, self.pos, context);
+                }
             }
             Some(b'[') => {
                 self.bump();
-                self.scan_array(path, spans)?;
+                let was_empty = self.scan_array(path, spans)?;
+                if was_empty {
+                    self.record_empty_container(path, spans, start, self.pos, context);
+                }
             }
             Some(b'"') => {
                 let end = self.scan_string()?;
@@ -358,12 +380,14 @@ impl<'a> Scanner<'a> {
         Ok(())
     }
 
-    fn scan_object(&mut self, path: &mut Vec<String>, spans: &mut SpanMap) -> Result<()> {
+    /// Returns `true` when the object turned out to be empty (`{}`), so the
+    /// caller can record a container span for the empty-parent mkdir-p path.
+    fn scan_object(&mut self, path: &mut Vec<String>, spans: &mut SpanMap) -> Result<bool> {
         // The `{` was already consumed.
         self.skip_ws_and_check_jsonc()?;
         if matches!(self.peek(), Some(b'}')) {
             self.bump();
-            return Ok(());
+            return Ok(true);
         }
         loop {
             self.skip_ws_and_check_jsonc()?;
@@ -395,7 +419,7 @@ impl<'a> Scanner<'a> {
                 }
                 Some(b'}') => {
                     self.bump();
-                    return Ok(());
+                    return Ok(false);
                 }
                 _ => {
                     return Err(self.parse_error(self.pos, "expected ',' or '}' in object"));
@@ -404,12 +428,14 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    fn scan_array(&mut self, path: &mut Vec<String>, spans: &mut SpanMap) -> Result<()> {
+    /// Returns `true` when the array turned out to be empty (`[]`). Mirrors
+    /// [`Self::scan_object`] — see its docs.
+    fn scan_array(&mut self, path: &mut Vec<String>, spans: &mut SpanMap) -> Result<bool> {
         // The `[` was already consumed.
         self.skip_ws_and_check_jsonc()?;
         if matches!(self.peek(), Some(b']')) {
             self.bump();
-            return Ok(());
+            return Ok(true);
         }
         let mut idx: usize = 0;
         loop {
@@ -424,7 +450,7 @@ impl<'a> Scanner<'a> {
                 }
                 Some(b']') => {
                     self.bump();
-                    return Ok(());
+                    return Ok(false);
                 }
                 _ => {
                     return Err(self.parse_error(self.pos, "expected ',' or ']' in array"));
@@ -537,6 +563,38 @@ impl<'a> Scanner<'a> {
 
     /// Record a [`ValueSpan`] for the scalar at `[start..end)`.
     fn record_scalar(
+        &self,
+        path: &[String],
+        spans: &mut SpanMap,
+        start: usize,
+        end: usize,
+        context: SpanContext,
+    ) {
+        let pointer = pointer_for(path);
+        let value_range = start..end;
+        let line_range = compute_line_range(self.bytes, &value_range);
+        let indent = compute_indent(self.bytes, start);
+        spans.insert(
+            pointer,
+            ValueSpan {
+                value_range,
+                line_range,
+                indent,
+                context,
+            },
+        );
+    }
+
+    /// Record a [`ValueSpan`] for an **empty** `{}` / `[]` container at
+    /// `[start..end)`.
+    ///
+    /// Mirrors [`Self::record_scalar`] but keys the span at the container's
+    /// own pointer (i.e. the parent's pointer from the splicer's
+    /// perspective). The `value_range` spans the empty literal **including**
+    /// both braces; the empty-parent splicer in
+    /// [`crate::document::Document::set_at`] uses that range to anchor the
+    /// new key between the `{` and `}`.
+    fn record_empty_container(
         &self,
         path: &[String],
         spans: &mut SpanMap,
@@ -1465,18 +1523,21 @@ mod tests {
     }
 
     #[test]
-    fn insertion_renderer_into_empty_map_falls_through() {
-        // Empty parent (`{"a":{}}`) has no sibling to anchor against, so
-        // the single-level baseline returns `MissingKey`. Pinning the
-        // expected failure mode so a future multi-level / empty-parent
-        // enhancement has a failing test to flip.
+    fn insertion_renderer_into_empty_map_succeeds() {
+        // Empty parent (`{"a":{}}`) → `set_at(/a/b, 42)` must splice the
+        // new key inside the empty `{}` body. Pre-fix this returned
+        // MissingKey because the JSON scanner didn't record container
+        // spans; the scanner now emits an empty-container span at the
+        // parent's pointer and the splicer anchors between the `{` and
+        // `}`. The rendered bytes re-parse as a well-formed JSON object.
         let bytes = br#"{"a":{}}"#;
         let mut doc = Json.parse(bytes).expect("parse");
         let pointer = Pointer::parse("/a/b").expect("pointer");
-        let err = doc
-            .set_at(&pointer, Value::Int(42))
-            .expect_err("empty-parent mkdir-p must fail in the baseline");
-        assert_eq!(err.kind_name(), "path");
+        doc.set_at(&pointer, Value::Int(42))
+            .expect("empty-parent mkdir-p must succeed on `{\"a\":{}}`");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(doc.original_bytes()).expect("re-parses as JSON");
+        assert_eq!(parsed.pointer("/a/b"), Some(&serde_json::json!(42)));
     }
 
     // -- M2 §5 indent style detection ----------------------------------

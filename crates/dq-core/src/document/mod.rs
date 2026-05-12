@@ -655,14 +655,21 @@ impl Document {
     ///
     /// When `pointer`'s leaf segment does not yet exist but its parent
     /// container does, `set_at` inserts the missing key via the format's
-    /// [`InsertionRenderer`]. The single-level case (parent exists, exactly
-    /// one missing key, parent has at least one sibling with a recorded
-    /// span) is covered. Multi-level mkdir-p chains
-    /// (`/a/missing1/missing2/key`) and empty-parent mkdir-p
-    /// (`/empty_map/k` where `empty_map` is `{}`) fall through to
-    /// [`Error::Path`] with `kind = MissingKey` — they need richer span
-    /// data (container ranges, not just leaf scalar spans) which the
-    /// parsers do not yet record.
+    /// [`InsertionRenderer`]. Two single-level cases are covered:
+    ///
+    /// 1. **Sibling-anchored** — parent has at least one existing direct
+    ///    child whose scalar span was recorded by the parser. The new key
+    ///    is spliced next to that sibling.
+    /// 2. **Empty-parent** — parent is a recorded empty container
+    ///    (`{}` / `[]`) with no children. The new key is spliced inside
+    ///    the parent's `{}` / `[]` body. Required by RFC 7396 §2 (merging
+    ///    `{}` with `{"a":1}` must yield `{"a":1}`); the parsers now
+    ///    record an empty-container span at the parent's pointer
+    ///    specifically so this path can fire.
+    ///
+    /// Multi-level mkdir-p chains (`/a/missing1/missing2/key` where every
+    /// `missingN` also needs creating) remain out of scope and fall
+    /// through to [`Error::Path`] with `kind = MissingKey`.
     ///
     /// Formats whose [`Format::insertion_renderer`] returns `None` (XML,
     /// CSV, INI, .env, Dockerfile, ignore-list, markdown body) remain
@@ -753,8 +760,15 @@ impl Document {
     }
 
     /// Try to insert `value` at `pointer` when the pointer's parent exists
-    /// and has at least one recorded sibling span. Falls back to
-    /// `Error::Path { MissingKey }` on any unsupported shape.
+    /// and is either:
+    ///
+    /// 1. A non-empty map with at least one recorded sibling span (the
+    ///    sibling-anchored branch); or
+    /// 2. An empty map whose `{}` body has a recorded container span (the
+    ///    empty-parent branch, added to close the RFC 7396 §2 conformance
+    ///    gap around merging `{}` with `{"a":1}`).
+    ///
+    /// Falls back to `Error::Path { MissingKey }` on any unsupported shape.
     ///
     /// # Strategy
     ///
@@ -763,25 +777,29 @@ impl Document {
     ///    this single-level baseline handles. Array mkdir-p (`/arr/3`
     ///    where `arr.len() == 3` is the boundary case) is intentionally
     ///    out of scope.
-    /// 2. Locate the rightmost sibling span — the existing scalar under
-    ///    the same parent whose `value_range.end` is largest. That's our
-    ///    splice anchor.
-    /// 3. Pull the format's [`InsertionRenderer`] and produce the
-    ///    `key: value` (or `"key": value` / `key = value`) fragment.
-    /// 4. Splice format-specific bytes (JSON wants a leading `,`; YAML
-    ///    wants the leading `\n` stripped and the splice after the
-    ///    sibling's line; TOML appends after the sibling's line).
-    /// 5. Refresh `original_bytes`, shift spans through `apply_delta`,
-    ///    record a best-effort span for the new leaf, and rebuild the
+    /// 2. **Sibling-anchored**: locate the rightmost sibling span — the
+    ///    existing scalar under the same parent whose `value_range.end` is
+    ///    largest. That's our splice anchor. The new key is rendered via
+    ///    the format's [`InsertionRenderer`] and spliced after the sibling
+    ///    using [`format_specific_splice`].
+    /// 3. **Empty-parent**: when no siblings exist but the parent's `{}` /
+    ///    `[]` body has a recorded span (parsers record one for every
+    ///    empty container), the new key is rendered inline and spliced
+    ///    between the parent's `{` and `}` (or `[` and `]`) via
+    ///    [`format_specific_empty_parent_splice`].
+    /// 4. Refresh `original_bytes`, shift spans through `apply_delta`,
+    ///    record a best-effort span for the new leaf, drop the
+    ///    now-non-empty parent's container span, and rebuild the
     ///    provenance side-channel.
     ///
     /// # Errors
     ///
     /// Returns `Error::Path { MissingKey }` whenever the single-level
-    /// path cannot be taken (multi-level missing chain, empty parent,
-    /// array parent, format without an `InsertionRenderer`). The pointer
-    /// and `matched_prefix` mirror the original baseline so callers see
-    /// the same structured diagnostic as before.
+    /// path cannot be taken (multi-level missing chain, array parent,
+    /// format without an `InsertionRenderer`, or empty parent whose
+    /// container span was not recorded by the parser). The pointer and
+    /// `matched_prefix` mirror the original baseline so callers see the
+    /// same structured diagnostic as before.
     fn try_single_level_mkdir_p(
         &mut self,
         pointer: &Pointer,
@@ -844,21 +862,50 @@ impl Document {
             return Err(missing_key());
         }
 
-        // Need at least one existing sibling to anchor the splice. The
-        // empty-parent case (parent_map is empty / parent is `{}`) is
-        // out of scope: parsers don't record container-level spans, so
-        // we can't locate the parent's opening/closing brace.
+        // Pick a splice anchor. Two acceptable shapes:
+        //
+        // 1. Sibling-anchored: parent has at least one direct child whose
+        //    scalar span was recorded by the parser. Splice next to it.
+        // 2. Empty-parent: parent is an empty map whose `{}` body the
+        //    parser recorded as a container span. Splice between the
+        //    `{` and `}`. This branch was added to close RFC 7396 §2 —
+        //    merging `{}` with `{"a":1}` must yield `{"a":1}`.
+        //
+        // The two branches diverge enough that we route through different
+        // helpers, but they share the renderer dispatch and the post-splice
+        // span recompute so the contract is identical from the caller's
+        // perspective.
         let parent_canonical = parent_ptr.as_canonical();
         let sibling_prefix = if parent_canonical.is_empty() {
             "/".to_owned()
         } else {
             format!("{parent_canonical}/")
         };
-        let Some((_sibling_key, sibling_span)) = self
+        let sibling = self
             .rightmost_direct_sibling(&sibling_prefix)
-            .map(|(k, span)| (k.to_owned(), span.clone()))
-        else {
-            return Err(missing_key());
+            .map(|(k, span)| (k.to_owned(), span.clone()));
+        let Some((_sibling_key, sibling_span)) = sibling else {
+            // No sibling — try the empty-parent path. The parent's `{}` /
+            // `[]` body must have a recorded container span for this branch
+            // to succeed; if it doesn't, fall through to MissingKey.
+            //
+            // Pre-materialize the structured error so the empty-parent
+            // helper can take a borrow-free fallback (the closure
+            // `missing_key` captures `self.value` via
+            // `longest_existing_value_prefix` and so cannot coexist with
+            // the `&mut self` we need for the splice).
+            let parent_is_empty_map = parent_map.is_empty();
+            let fallback_err = missing_key();
+            return self.try_empty_parent_mkdir_p(
+                pointer,
+                canonical,
+                &parent_canonical,
+                parent_is_empty_map,
+                new_key,
+                value,
+                insertion_renderer,
+                fallback_err,
+            );
         };
 
         // Render the new key/value pair via the format's InsertionRenderer.
@@ -935,6 +982,133 @@ impl Document {
         set_value_at(&mut self.value, pointer, value)?;
 
         // Re-sync the provenance side-channel.
+        self.provenance = provenance_from_spans(&self.spans);
+        Ok(())
+    }
+
+    /// Empty-parent splice: insert `value` at `pointer` when the parent
+    /// container is empty (`{}` / `[]`) and has a recorded container span
+    /// in `self.spans`.
+    ///
+    /// The parsers (JSON, YAML, TOML) record a [`ValueSpan`] at the empty
+    /// container's own pointer specifically so this path can fire. The
+    /// recorded span's `value_range` covers the literal `{}` / `[]`
+    /// (or in YAML's block-empty form `parent:` followed by no children),
+    /// and we splice the new key-value pair inside the delimiters via
+    /// [`format_specific_empty_parent_splice`].
+    ///
+    /// `parent_is_empty_map` is the in-memory tree's view (`parent_map.is_empty()`)
+    /// passed in by the caller — we trust that over the SpanMap for the
+    /// emptiness decision because the SpanMap could in theory still carry
+    /// a stale empty-container entry after an out-of-tree mutation.
+    ///
+    /// Returns `Err(missing_key())` when:
+    /// - the parent is not actually empty in the in-memory tree, OR
+    /// - the parent's container span is missing from `self.spans`
+    ///   (read-only format, or parser that doesn't record empty
+    ///   containers).
+    #[allow(clippy::too_many_arguments)]
+    fn try_empty_parent_mkdir_p(
+        &mut self,
+        pointer: &Pointer,
+        canonical: &str,
+        parent_canonical: &str,
+        parent_is_empty_map: bool,
+        new_key: String,
+        value: Value,
+        insertion_renderer: &dyn crate::textual_edit::InsertionRenderer,
+        fallback_err: Error,
+    ) -> Result<()> {
+        if !parent_is_empty_map {
+            return Err(fallback_err);
+        }
+        // The parser must have recorded a container span for this empty
+        // parent. If it didn't (read-only format, or a multi-level missing
+        // chain where the parent itself doesn't exist), fall through.
+        let Some(parent_span) = self.spans.get(parent_canonical).cloned() else {
+            return Err(fallback_err);
+        };
+
+        // Render the new key/value pair. The insertion-renderer trait
+        // interprets `parent_indent` differently per format (see each
+        // impl's docs), so we precompute the right column-vs-space
+        // representation here:
+        //
+        // - JSON: parent's leading-space count. `parent_span.indent` is
+        //   the 1-indexed column of `{`, so we subtract 1.
+        // - YAML: 1-indexed column of children's keys. The flow-form
+        //   splicer ignores leading whitespace anyway, so `indent + 2`
+        //   is a safe default; the block-form path inherits it as
+        //   children indent.
+        // - TOML: ignored by [`TomlInsertionRenderer`].
+        let renderer_indent = match self.format {
+            FormatTag::Json => parent_span.indent.saturating_sub(1),
+            FormatTag::Yaml => parent_span.indent.saturating_add(2),
+            _ => parent_span.indent,
+        };
+        let children_indent = parent_span.indent.saturating_add(2);
+        let fragment = insertion_renderer.render_insertion(
+            &new_key,
+            &value,
+            renderer_indent,
+            parent_span.context,
+        );
+
+        let (splice_at, splice_bytes) = format_specific_empty_parent_splice(
+            self.format,
+            &fragment,
+            &parent_span,
+            &self.original_bytes,
+        );
+
+        // Resolve the scalar renderer so we can locate the value bytes
+        // inside the spliced fragment — mirrors the sibling-anchored path
+        // so a follow-up `set_at(pointer, ...)` routes through the
+        // in-span replace path.
+        let Some(scalar_renderer) = renderer_for_format(self.format) else {
+            return Err(Error::WriteUnavailable {
+                reason: format!(
+                    "scalar renderer missing for format {}; insertion renderer is registered but scalar renderer is not",
+                    self.format.name()
+                ),
+            });
+        };
+        let scalar_bytes =
+            scalar_renderer.render_replacement(&value, parent_span.context, &[] as &[u8]);
+        let value_offset_in_splice = locate_value_in_fragment(&splice_bytes, &scalar_bytes);
+
+        let inserted_len = splice_bytes.len();
+        let delta = SpanRecomputeDelta {
+            at: splice_at,
+            old_len: 0,
+            new_len: inserted_len,
+        };
+        self.original_bytes
+            .splice(splice_at..splice_at, splice_bytes.iter().copied());
+        apply_delta(&mut self.spans, delta);
+
+        // The parent's container span is now stale (it covered the
+        // `{}` body; after the splice the body is non-empty and the
+        // recorded range no longer carries the `..key: value..` content).
+        // Drop it so subsequent reads through `span_at(parent_ptr)` don't
+        // hand out a span that points at bytes that have shifted under
+        // them. The in-memory tree update below restores the parent's
+        // entry as a Map.
+        self.spans.shift_remove(parent_canonical);
+
+        // Record the new leaf's span — same shape as the sibling-anchored
+        // path so idempotency holds.
+        let value_abs_start = splice_at + value_offset_in_splice;
+        let value_abs_end = value_abs_start + scalar_bytes.len();
+        let new_span = ValueSpan {
+            value_range: value_abs_start..value_abs_end,
+            line_range: splice_at..(splice_at + inserted_len),
+            indent: children_indent,
+            context: parent_span.context,
+        };
+        self.spans.insert(canonical.to_owned(), new_span);
+
+        set_value_at(&mut self.value, pointer, value)?;
         self.provenance = provenance_from_spans(&self.spans);
         Ok(())
     }
@@ -1228,6 +1402,177 @@ fn format_specific_splice(
             (sibling_span.line_range.end, trimmed.to_vec())
         }
     }
+}
+
+/// Translate the per-format [`InsertionRenderer`] fragment into a final
+/// `(splice_at, splice_bytes)` pair anchored against the parent's
+/// **empty-container** span (i.e. the recorded `{}` / `[]` body).
+///
+/// Mirrors [`format_specific_splice`] but for the empty-parent mkdir-p
+/// branch where there is no sibling to anchor against. The new key is
+/// spliced inside the parent's delimiters so the result is well-formed:
+///
+/// - **JSON** (`{}` body): splice between the `{` and `}` at
+///   `parent.value_range.start + 1` (or scan inside for the position just
+///   before the closing `}` if there's interior whitespace). The renderer
+///   produces `\n  "k": v` (no leading comma, no trailing newline); the
+///   empty body has no preceding sibling so no leading comma is needed.
+///   We append a trailing `\n` (with the closing `}`'s indent) so the
+///   result reads as a single-key formatted object.
+/// - **YAML** (flow-style `{}` / `[]`, or block-empty `parent:`):
+///   - Flow form (parent value starts with `{` or `[`): splice just before
+///     the closing `}` / `]`, emitting the fragment without its leading
+///     `\n` because we're inside a single-line literal.
+///   - Block form (parent value is empty / `~` / null on its own line):
+///     splice at the end of the parent's line, emitting the fragment
+///     as-is.
+/// - **TOML** (inline `{}` / `[]`): splice just before the closing `}` /
+///   `]`. The renderer emits `key = value\n` which we strip the trailing
+///   `\n` from for inline contexts.
+fn format_specific_empty_parent_splice(
+    format: FormatTag,
+    fragment: &[u8],
+    parent_span: &ValueSpan,
+    original_bytes: &[u8],
+) -> (usize, Vec<u8>) {
+    match format {
+        FormatTag::Json => json_empty_parent_splice(fragment, parent_span, original_bytes),
+        FormatTag::Yaml => yaml_empty_parent_splice(fragment, parent_span, original_bytes),
+        FormatTag::Toml => toml_empty_parent_splice(fragment, parent_span, original_bytes),
+        // Read-only formats don't reach here — callers gate on the
+        // insertion-renderer factory which returns `None` for them.
+        // Defensive fallback: splice at parent_span.value_range.end (the
+        // safest "append after" anchor) with the unmodified fragment.
+        FormatTag::Jsonl
+        | FormatTag::Hcl
+        | FormatTag::Ini
+        | FormatTag::DotEnv
+        | FormatTag::Csv
+        | FormatTag::Tsv
+        | FormatTag::Dockerfile
+        | FormatTag::IgnoreList
+        | FormatTag::Frontmatter
+        | FormatTag::Markdown
+        | FormatTag::Xml => (parent_span.value_range.end, fragment.to_vec()),
+    }
+}
+
+/// JSON empty-parent splice. Parent's `value_range` covers `{}` (or `{}` with
+/// interior whitespace like `{ }` / `{\n}`). We splice between the `{` and
+/// `}` so the result is `{<fragment>\n}` (or analog).
+fn json_empty_parent_splice(
+    fragment: &[u8],
+    parent_span: &ValueSpan,
+    original_bytes: &[u8],
+) -> (usize, Vec<u8>) {
+    // Find the closing `}` (or `]`) inside the parent's body, scanning
+    // back from `value_range.end - 1`. The literal `{}` has the closing
+    // brace at exactly `value_range.end - 1`; flexibility for `{ }` etc.
+    // The trailing fragment must keep the `}` on its own line at the
+    // parent's column for readability.
+    let close_pos = parent_span
+        .value_range
+        .end
+        .saturating_sub(1)
+        .min(original_bytes.len());
+    // The fragment already starts with `\n` + indent + `"k": v`; we append
+    // `\n` + parent_indent_spaces + `}` worth of suffix. Actually we just
+    // need to ensure the closing brace ends up on its own line at the
+    // parent's column. Easier: append `\n` + (parent_indent - 1) spaces
+    // before splicing; the existing `}` stays put. parent_span.indent is
+    // 1-indexed column of the opening `{`, so the closing `}` lands at the
+    // same column. Children are at indent + 2 (which the renderer used).
+    let parent_col = parent_span.indent.saturating_sub(1) as usize;
+    let mut out = Vec::with_capacity(fragment.len() + parent_col + 1);
+    out.extend_from_slice(fragment);
+    out.push(b'\n');
+    out.extend(std::iter::repeat_n(b' ', parent_col));
+    (close_pos, out)
+}
+
+/// YAML empty-parent splice. The parent's recorded `value_range` either
+/// covers `{}` / `[]` (flow form) or is the empty range after `parent:`
+/// (block form, where the parent has no children).
+fn yaml_empty_parent_splice(
+    fragment: &[u8],
+    parent_span: &ValueSpan,
+    original_bytes: &[u8],
+) -> (usize, Vec<u8>) {
+    let body_first = original_bytes.get(parent_span.value_range.start).copied();
+    match body_first {
+        Some(b'{' | b'[') => {
+            // Flow form: splice before the closing `}` / `]`. Strip the
+            // fragment's leading `\n` so we stay on a single line, and
+            // surround the fragment with `,` if needed. Empty body → no
+            // leading comma. The flow renderer would emit something like
+            // `\n  k: v\n`; we want `k: v` instead.
+            let close_pos = parent_span.value_range.end.saturating_sub(1);
+            let trimmed: &[u8] = fragment.strip_prefix(b"\n").unwrap_or(fragment);
+            // Strip leading spaces (renderer indented for block context).
+            let mut start = 0_usize;
+            while start < trimmed.len() && trimmed[start] == b' ' {
+                start += 1;
+            }
+            let trimmed = &trimmed[start..];
+            // Strip trailing newline if any.
+            let trimmed_end = trimmed.strip_suffix(b"\n").unwrap_or(trimmed);
+            (close_pos, trimmed_end.to_vec())
+        }
+        _ => {
+            // Block form: the parent's value_range is the empty range
+            // after the colon. Splice at line_range.end (start of the
+            // line after the parent's `parent:` line). The fragment is
+            // emitted as-is (the renderer already produced
+            // `\n  key: value\n` which we want to strip the leading `\n`
+            // from because we're already on a fresh line).
+            let trimmed: &[u8] = fragment.strip_prefix(b"\n").unwrap_or(fragment);
+            let mut splice_at = parent_span.line_range.end;
+            let mut out = Vec::with_capacity(trimmed.len() + 1);
+            if splice_at == 0 || original_bytes.get(splice_at - 1) != Some(&b'\n') {
+                out.push(b'\n');
+            }
+            out.extend_from_slice(trimmed);
+            if splice_at > original_bytes.len() {
+                splice_at = original_bytes.len();
+            }
+            (splice_at, out)
+        }
+    }
+}
+
+/// TOML empty-parent splice. The parent's recorded span covers an empty
+/// inline `{}` or `[]`. Splice between the delimiters, on a single line.
+fn toml_empty_parent_splice(
+    fragment: &[u8],
+    parent_span: &ValueSpan,
+    original_bytes: &[u8],
+) -> (usize, Vec<u8>) {
+    let close_pos = parent_span.value_range.end.saturating_sub(1);
+    // TomlInsertionRenderer emits `key = value\n`. For inline contexts we
+    // want `key = value` (no trailing newline). Add a single space margin
+    // inside the braces so the result reads as `{ key = value }` rather
+    // than `{key = value}`.
+    let trimmed = fragment.strip_suffix(b"\n").unwrap_or(fragment);
+    // If the parent body is currently `{}` (adjacent braces) we need a
+    // space before AND after the inserted key; if it's `{ }` (already
+    // spaced), one side already has whitespace. Check the byte just before
+    // the close.
+    let needs_leading_space = !matches!(
+        original_bytes.get(close_pos.saturating_sub(1)),
+        Some(b' ' | b'\t')
+    );
+    let needs_trailing_space = !matches!(original_bytes.get(close_pos), Some(b' ' | b'\t'));
+    let mut out = Vec::with_capacity(
+        trimmed.len() + needs_leading_space as usize + needs_trailing_space as usize,
+    );
+    if needs_leading_space {
+        out.push(b' ');
+    }
+    out.extend_from_slice(trimmed);
+    if needs_trailing_space {
+        out.push(b' ');
+    }
+    (close_pos, out)
 }
 
 /// Walk `pointer` through the in-memory `Value` tree and return the canonical
@@ -1999,25 +2344,98 @@ mod tests {
     }
 
     #[test]
-    fn set_at_mkdir_p_fails_for_empty_parent() {
-        // Empty parent (`{}`) has no sibling to anchor against. Out of
-        // scope for the single-level baseline; fall through to
-        // `MissingKey`.
+    fn set_at_mkdir_p_creates_key_in_empty_json_nested() {
+        // Nested empty-parent case: `{"a":{}}` → `set_at(/a/b, 42)` →
+        // `{"a":{ ... "b": 42 ... }}`. Pre-fix this returned MissingKey
+        // because the JSON scanner only recorded scalar leaf spans; the
+        // fix added empty-container span recording so the splicer can
+        // anchor inside the parent's `{}` body. RFC 7396 §2 conformance
+        // (merging a non-empty object into an empty target) depends on
+        // this path firing.
         let bytes = br#"{"a":{}}"#;
         let mut doc = crate::parsers::json::Json.parse(bytes).expect("parse JSON");
         let pointer = Pointer::parse("/a/b").unwrap();
-        let err = doc
-            .set_at(&pointer, Value::Int(42))
-            .expect_err("empty-parent mkdir-p must fail in the baseline");
+        doc.set_at(&pointer, Value::Int(42))
+            .expect("empty-parent mkdir-p on nested `{}` must succeed");
+        let rendered = doc.original_bytes();
+        let parsed: serde_json::Value =
+            serde_json::from_slice(rendered).expect("rendered bytes must re-parse as JSON");
+        assert_eq!(parsed.pointer("/a/b"), Some(&serde_json::json!(42)));
+        // Tree mirrors the bytes.
+        let added = pointer.resolve(doc.value()).expect("Value tree has /a/b");
+        assert_eq!(added, &Value::Int(42));
         assert!(
-            matches!(
-                err,
-                Error::Path {
-                    kind: PathErrorKind::MissingKey,
-                    ..
-                }
-            ),
-            "expected Path/MissingKey for empty-parent mkdir-p, got: {err:?}",
+            doc.span_at(&pointer).is_some(),
+            "mkdir-p must record a SpanMap entry for the new pointer so a follow-up set_at routes through the in-span replace path",
+        );
+    }
+
+    #[test]
+    fn set_at_mkdir_p_creates_key_in_empty_json_root() {
+        // Root-level empty-parent case: `{}` → `set_at(/a, 42)` →
+        // `{"a": 42}`. This is the common merge-into-empty target case
+        // that RFC 7396 §2 requires; pre-fix this returned MissingKey
+        // with `matched_prefix = ''`.
+        let bytes = b"{}";
+        let mut doc = crate::parsers::json::Json.parse(bytes).expect("parse JSON");
+        let pointer = Pointer::parse("/a").unwrap();
+        doc.set_at(&pointer, Value::Int(42))
+            .expect("empty-root mkdir-p must succeed");
+        let rendered = doc.original_bytes();
+        let parsed: serde_json::Value =
+            serde_json::from_slice(rendered).expect("rendered bytes must re-parse as JSON");
+        assert_eq!(parsed.pointer("/a"), Some(&serde_json::json!(42)));
+        let added = pointer.resolve(doc.value()).expect("Value tree has /a");
+        assert_eq!(added, &Value::Int(42));
+        assert!(
+            doc.span_at(&pointer).is_some(),
+            "mkdir-p must record a SpanMap entry for the new pointer",
+        );
+    }
+
+    #[test]
+    fn set_at_mkdir_p_creates_key_in_empty_yaml_root() {
+        // YAML root-empty case: `{}` (flow-style root) → `set_at(/a, 42)`
+        // must succeed. Mirror of `set_at_mkdir_p_creates_key_in_empty_json_root`
+        // exercised through the YAML span builder.
+        let bytes = b"{}\n";
+        let mut doc = crate::parsers::yaml_spans::parse_yaml_with_spans(bytes).expect("parse YAML");
+        let pointer = Pointer::parse("/a").unwrap();
+        doc.set_at(&pointer, Value::Int(42))
+            .expect("empty-root YAML mkdir-p must succeed");
+        let reparsed = crate::parsers::yaml_spans::parse_yaml_with_spans(doc.original_bytes())
+            .expect("re-parse YAML");
+        let added = pointer
+            .resolve(reparsed.value())
+            .expect("reparsed tree has /a");
+        assert_eq!(added, &Value::Int(42));
+        let added_in_doc = pointer.resolve(doc.value()).expect("doc tree has /a");
+        assert_eq!(added_in_doc, &Value::Int(42));
+        assert!(
+            doc.span_at(&pointer).is_some(),
+            "mkdir-p must record a SpanMap entry for the new pointer",
+        );
+    }
+
+    #[test]
+    fn set_at_mkdir_p_empty_parent_is_idempotent() {
+        // Idempotency: running the same empty-parent set twice must yield
+        // byte-identical output. The first call goes through the empty-
+        // parent splice path; the second routes through the in-span
+        // replace path because the first inserted a SpanMap entry for the
+        // new leaf.
+        let bytes = b"{}";
+        let mut doc = crate::parsers::json::Json.parse(bytes).expect("parse JSON");
+        let pointer = Pointer::parse("/a").unwrap();
+        doc.set_at(&pointer, Value::Int(42))
+            .expect("first empty-root mkdir-p");
+        let after_first = doc.original_bytes().to_vec();
+        doc.set_at(&pointer, Value::Int(42))
+            .expect("second set_at on now-existing key");
+        assert_eq!(
+            doc.original_bytes(),
+            after_first.as_slice(),
+            "idempotency: empty-parent set followed by in-span replace of same value must produce identical bytes",
         );
     }
 

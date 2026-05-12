@@ -86,6 +86,7 @@ fn merge_into(doc: &mut Document, base: &Pointer, patch: &Value) -> Result<()> {
 mod tests {
     use super::*;
     use crate::document::{FormatTag, SpanContext, SpanMap, ValueSpan};
+    use crate::format::Format;
     use indexmap::IndexMap;
     use pretty_assertions::assert_eq;
 
@@ -220,6 +221,57 @@ mod tests {
         match doc.value() {
             Value::Map(m) => {
                 assert_eq!(m.get("a"), Some(&inner));
+            }
+            other => panic!("expected map, got {other:?}"),
+        }
+    }
+
+    // ---- RFC 7396 §2 conformance: merge into empty target ----
+    //
+    // The spec pseudocode reads: "if Target is not an Object, Target = {}";
+    // "for each Name/Value pair in Patch, Target[Name] = MergePatch(Target[Name], Value)".
+    // So merging `{}` with `{"a":1}` must yield `{"a":1}`. Pre-fix this
+    // failed with `Error::Path { MissingKey }` because the JSON span scanner
+    // didn't record container spans for empty `{}`. The empty-parent
+    // mkdir-p path now consumes those spans.
+
+    #[test]
+    fn apply_merge_into_empty_root_creates_key() {
+        let mut doc = crate::parsers::json::Json
+            .parse(b"{}")
+            .expect("parse empty JSON object");
+        let patch = map_one("a", Value::Int(1));
+        apply_merge(&mut doc, &patch).expect("RFC 7396 §2: merge `{}` + `{\"a\":1}` must succeed");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(doc.original_bytes()).expect("re-parses as JSON");
+        assert_eq!(parsed.pointer("/a"), Some(&serde_json::json!(1)));
+        match doc.value() {
+            Value::Map(m) => assert_eq!(m.get("a"), Some(&Value::Int(1))),
+            other => panic!("expected map, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_merge_nested_into_empty_target() {
+        // Empty root + nested-object patch — the engine descends into the
+        // patch's `/a` and creates the whole subtree at once. The current
+        // implementation routes through `set_at(/a, {"b":2})` because the
+        // target has no /a; that exercises the empty-parent splicer with
+        // a non-scalar value.
+        let mut doc = crate::parsers::json::Json
+            .parse(b"{}")
+            .expect("parse empty JSON object");
+        let mut inner = IndexMap::new();
+        inner.insert("b".into(), Value::Int(2));
+        let patch = map_one("a", Value::Map(inner.clone()));
+        apply_merge(&mut doc, &patch)
+            .expect("merge `{}` + nested `{\"a\":{\"b\":2}}` must succeed");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(doc.original_bytes()).expect("re-parses as JSON");
+        assert_eq!(parsed.pointer("/a/b"), Some(&serde_json::json!(2)));
+        match doc.value() {
+            Value::Map(m) => {
+                assert_eq!(m.get("a"), Some(&Value::Map(inner)));
             }
             other => panic!("expected map, got {other:?}"),
         }
