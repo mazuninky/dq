@@ -64,13 +64,15 @@ curl -sSfL https://raw.githubusercontent.com/mazuninky/dq/master/scripts/install
 
 The script installs to `~/.local/bin` (non-root) or `/usr/local/bin` (root); use `--install-dir DIR` to override. It verifies SHA256 against the published `dq-checksums.txt` but does **not** run `gh attestation verify` — for full supply-chain assurance use the verified path above.
 
-### Docker
+### Docker (GHCR)
+
+Each release publishes a multi-arch image (`linux/amd64`, `linux/arm64`) to GHCR with build provenance and SBOM attached:
 
 ```sh
-docker run --rm -v "$PWD:/work" mazuninky/dq:latest get config.yaml /name
+docker run --rm -v "$PWD:/work" ghcr.io/mazuninky/dq:latest get config.yaml /name
 ```
 
-A FROM-scratch (~5 MiB) variant is also published as `mazuninky/dq:scratch`.
+Pin to a specific release tag (`v2026.20.1`) or to a digest (`@sha256:…`) for reproducibility. See [Use in GitHub Actions](#use-in-github-actions) below.
 
 ### From source
 
@@ -301,6 +303,34 @@ See [examples/plugin-rust/](examples/plugin-rust/) for a minimal Rust reference 
 
 Pre-commit hooks shipped at the repo root ([`.pre-commit-hooks.yaml`](.pre-commit-hooks.yaml)) cover `dq fmt --check` and `dq validate` for fast local feedback.
 
+## Use in GitHub Actions
+
+The release-time Docker workflow publishes a multi-arch image (`linux/amd64`, `linux/arm64`) to `ghcr.io/mazuninky/dq` with build provenance and SBOM attached, plus a separate signed [build provenance attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations) issued through GitHub. Pin by digest for reproducibility:
+
+```yaml
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint manifests
+        uses: docker://ghcr.io/mazuninky/dq@sha256:<digest>
+        with:
+          args: lint 'k8s/**/*.yaml' -F sarif
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: dq-results.sarif
+```
+
+Get the digest from the [Docker workflow run summary](https://github.com/mazuninky/dq/actions/workflows/docker.yml) for the release you want to pin, or via `docker buildx imagetools inspect ghcr.io/mazuninky/dq:<version>`. Verify the attestation:
+
+```sh
+gh attestation verify oci://ghcr.io/mazuninky/dq:<version> --owner mazuninky
+```
+
+For non-containerised runners, install with the script and run `dq` directly — the SARIF integration in [CI integration](#ci-integration) above shows the script-based path.
+
 ## Claude Code skill
 
 A `dq` skill for [Claude Code](https://claude.ai/code) is shipped under [`skill/SKILL.md`](skill/SKILL.md) with install instructions, common patterns, format coverage, and exit codes — so Claude can use `dq` as a tool without re-deriving its surface.
@@ -315,8 +345,15 @@ dq man                                # troff man page on stdout
 dq man lint                           # per-subcommand page
 ```
 
+## Contributing
+
+Contributions are welcome. Start with [`.github/CONTRIBUTING.md`](.github/CONTRIBUTING.md) for build instructions, testing, and the pull-request workflow. Please report security issues privately — see [`.github/SECURITY.md`](.github/SECURITY.md).
+
+For an overview of the source tree, conventions, and explicit anti-scope, see [`CLAUDE.md`](CLAUDE.md).
+
 ## Documentation
 
+- **[CLAUDE.md](CLAUDE.md)** — repo orientation for contributors and Claude Code: crate layout, conventions, anti-scope, how to extend.
 - **[skill/SKILL.md](skill/SKILL.md)** — Claude Code skill: install + common patterns + format coverage + exit codes.
 - **[openspec/changes/](openspec/changes/)** — active and archived OpenSpec changes (specs + design + tasks).
 - **[dq-plan.md](dq-plan.md)** — design doc: architecture, roadmap, anti-scope.
