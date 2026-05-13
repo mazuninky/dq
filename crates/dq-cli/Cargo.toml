@@ -66,7 +66,7 @@ tempfile = { workspace = true }
 # Default features cover the line-based unified-diff use case; `inline` /
 # `text` features would only matter if we exposed character-level diffs,
 # which the spec does not require.
-similar = "2"
+similar = "3"
 
 [features]
 default = []

@@ -13,12 +13,6 @@ ignore = [
     # is post-M2 work; until that change lands this advisory ignore stays.
     # See openspec/changes/archive/2026-05-03-add-safe-writes/design.md D1+D13.
     { id = "RUSTSEC-2025-0068", reason = "serde_yml read-pat dep; write-pat uses saphyr-parser (no Serializer access)" },
-    # number_prefix is unmaintained, pulled transitively by indicatif (a
-    # progress-bar lib used by `self_update` for the `dq self update` flow).
-    # The recommended replacement is `unit-prefix`; switching requires an
-    # upstream PR to indicatif. Low risk — it formats human-readable byte
-    # sizes during binary download, no security surface.
-    { id = "RUSTSEC-2025-0119", reason = "number_prefix via indicatif via self_update; formatting only, no security surface" },
 ]
 
 [licenses]
