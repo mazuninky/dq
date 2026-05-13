@@ -16,7 +16,8 @@ examples/        plugin-rust reference plugin
 spikes/          throwaway investigations (saphyr/, etc.)
 openspec/        OpenSpec changes — active under changes/, shipped under changes/archive/
 docs/archive/    historical docs
-skills/dq/       Claude Code skill bundle (SKILL.md + skill.json)
+skills/dq/       Claude Code skill bundle published to skills.sh (SKILL.md + skill.json)
+.claude/skills/  contributor-only skills (openspec-*) — see "Skills" convention below
 dq-plan.md       architecture + roadmap (treat as design doc, not as truth about current state)
 ```
 
@@ -75,6 +76,7 @@ cd ../.. && cargo run --features plugins -- lint \
 - **`@std` rule namespacing**: `@std/<namespace>/<rule-id>` — namespace is the directory under `crates/dq-lint/rules/std/`. User rules under `./.dq/rules/` are bound automatically without a namespace prefix.
 - **Composite rules**: `extract:` returns `[{value, format, anchor}]`; each item is reparsed in a different format and run through a `nested:` rule. Recursion bounded at `MAX_EXTRACT_DEPTH = 4`. Inner-format parse failures emit `<outer>.parse-failed`. Inline position spans live in `Provenance::Original.inline_offset`; the public lookup is `Ir::inline_offset_for(&pointer)`.
 - **Schema rules**: `$ref` restricted to internal references — HTTP/file `$ref` rejected at compile time. `schema_file` paths resolved relative to the rule directory; absolute paths and `..` escapes rejected.
+- **Skills**: the only skill published to [skills.sh](https://skills.sh) is `skills/dq/`. The `npx skills add mazuninky/dq` CLI also scans `<repo>/.claude/skills/` as one of its priority paths (see [vercel-labs/skills/src/skills.ts](https://github.com/vercel-labs/skills/blob/main/src/skills.ts) — `parseSkillMd`), so any SKILL.md committed under `.claude/skills/` MUST carry `metadata.internal: true` in its frontmatter, or it will surface to end users on install. Claude Code itself ignores the flag and continues to load these skills for contributors.
 
 ## How to extend
 
