@@ -4,13 +4,17 @@ description: |
   in `skill/evals/evals.json`. The bundled schema sidecar
   (`evals.schema.json`) describes the canonical shape — `skill_name`,
   `evals[].{id, prompt, expected_output, assertions[].{text, type}}`,
-  with `additionalProperties: false`. The rule is pinned to files
-  literally named `evals.json` via `match.glob` so unrelated JSON
-  payloads in the workspace are not flagged.
+  with `additionalProperties: false`. The shape filter
+  (`has("skill_name") and has("evals")`) gates the rule so unrelated
+  JSON payloads in the workspace are not flagged — only files that
+  carry the canonical skill-eval top-level keys are validated.
+
+  Note: this is an informal community convention, not part of the
+  public Anthropic skill spec; the schema mirrors what the Anthropic
+  `skill-creator` workflow expects.
 severity: error
 match:
   format: json
-  glob: '**/evals.json'
   filter: 'has("skill_name") and has("evals")'
 check:
   schema_file: ./evals.schema.json

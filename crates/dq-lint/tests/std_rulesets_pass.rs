@@ -107,3 +107,9 @@ fn std_terraform_fixtures_pass() {
 fn std_openapi_fixtures_pass() {
     assert_all_fixtures_pass("openapi");
 }
+
+/// Smoke test for `@std/skills` fixtures (Anthropic skill spec rules).
+#[test]
+fn std_skills_fixtures_pass() {
+    assert_all_fixtures_pass("skills");
+}

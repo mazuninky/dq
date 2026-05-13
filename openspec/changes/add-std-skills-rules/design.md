@@ -4,7 +4,7 @@
 
 Те же правила нужны минимум двум собственным репо (`mazuninky/dq`, `mazuninky/atl`) и понятно нужны любому стороннему скилл-репо. Промотать их через `@std` решает три проблемы:
 
-1. Один источник правды для контракта Anthropic'овского skill-loader'a. Если они поднимут лимит description с 1024 до, скажем, 2048 — фиксить в одном месте.
+1. Один источник правды для контракта Anthropic'овского skill-loader'a. Если они поднимут лимит description с 1,536 до, скажем, 2048 — фиксить в одном месте.
 2. Distribution бесплатный: уже встроено в бинарь, не требует `dq rules add` или сторонней инфраструктуры.
 3. Discoverability — `dq rules list` показывает namespace явно, типового потребителя не нужно учить, какой именно репо/файл откуда вендорить.
 
@@ -22,30 +22,44 @@
 
 В atl правила назывались `atl.skill-frontmatter` / `atl.skill-evals-schema` — префикс `skill-` дублирует namespace, в core он redundant. Дроп.
 
-## Auto-bind boundary — `match.glob` constraint
+## Rule logic — что валидируем, что НЕ валидируем
 
-Auto-bind в dq работает по format overlap ([crates/dq-exec/src/loader.rs:132](../../../crates/dq-exec/src/loader.rs:132)): `@std/skills` подтягивается если в discovered_formats есть `markdown` или `json` (то есть в дефолтной массе случаев). Без дополнительного фильтра `skills.frontmatter` цеплял бы каждый блог-пост с frontmatter, а `skills.evals-schema` — потенциально `package.json`'ы (мы отфильтровываем shape через `match.filter`, но evaluation всё равно происходит на каждом файле).
+Первая итерация правила (миграция из atl as-is) содержала несколько багов, выявленных при сверке с [официальной спекой Claude Code skills](https://code.claude.com/docs/en/skills#frontmatter-reference). Финальная семантика после исправлений:
 
-Решение: тайтнем `RuleMatch.glob` ([crates/dq-exec/src/rule.rs:149](../../../crates/dq-exec/src/rule.rs:149)):
+### `skills.frontmatter`
 
-- `skills.frontmatter`: `glob: '**/SKILL.md'` — фронтматтер-проверка только на канонично-названных файлах.
-- `skills.evals-schema`: `glob: '**/evals.json'` — schema-проверка только на файлах с именем `evals.json` (стандартная локация — `skill/evals/evals.json`).
+| Что проверяем | Источник | Severity |
+|---|---|---|
+| Если `name` присутствует — должен матчить `^[a-z0-9][a-z0-9-]*$` (lowercase, digits, hyphens) | Spec: "Lowercase letters, numbers, and hyphens only" | error |
+| Если `name` присутствует — длина ≤ 64 chars | Spec: "max 64 characters" | error |
+| Combined `description` + `when_to_use` (если есть) ≤ 1,536 chars | Spec: "combined `description` and `when_to_use` text is truncated at 1,536 characters" | error |
 
-Это аналог того, как `@std/dockerfile` бы цеплял только `Dockerfile`/`*.dockerfile` через format detection: glob — это explicit narrowing для рулсетов, чьи правила технически могут читать любой файл соответствующего формата.
+**Что НЕ проверяем (исправление багов первой итерации):**
 
-Если у кого-то путь не канонический (`skill/Skill.md`, `evals/data.json`) — правило не сработает auto-bind'ом, но можно явно: `dq lint --rules @std/skills <path>`. Эту особенность зафиксируем в rule description.
+- `name` и `description` обязательны: **нет**. Per spec, `name` опционален (fallback на directory name), `description` опционален (fallback на первый параграф markdown).
+- Underscore в `name`: **нет** (был в atl regex `^[a-z0-9][a-z0-9_-]*$`). Spec явно запрещает.
+- 1,024-char limit на `description` после `gsub("\\s+"; " ")`: **нет** (тоже из atl). Реальный cap — 1,536 на **combined** `description + when_to_use`. Whitespace folding не описан в спеке как часть truncation-логики; считаем raw post-YAML-parse length.
+- Валидация типов / enum-значений остальных 13 полей фронтматтера (`disable-model-invocation`, `allowed-tools`, `model`, `effort`, `context`, `agent`, `hooks`, `paths`, `shell`, etc.): **отложена** до follow-up'a. Спека эволюционирует (особенно `model`/`effort` enum'ы); лучше оставить правила минимальными.
 
-## Description-length check — folded scalars
+### `skills.evals-schema`
 
-Anthropic skill-loader делает `' '.join(description.split())` перед truncation на 1024 — то есть folding запускающихся пробельных run'ов в один space. Если в SKILL.md фронтматтер описан как folded scalar (`description: >`), YAML парсер уже сделает эту нормализацию; но если автор написал block-scalar literal (`description: |`) с newline'ами, fold не произойдёт, а лоадер всё равно фолданёт.
+JSON Schema 2020-12 валидация поверх shape'a `{skill_name, evals[].{id, prompt, expected_output, assertions[].{text, type}}}` с `additionalProperties: false`. Source-of-truth — Anthropic-овский skill-creator плагин (см. dq's own `evals.json` подобный shape; формальной публичной спецификации evals.json нет, но Anthropic ships ровно этот shape во всех publicly-distributed skill repos).
 
-Поэтому в jq:
+Note: это **informal upstream convention**, не часть публичной skill spec. Description правила это явно фиксирует, чтобы downstream'ы понимали стабильность контракта.
 
-```jq
-($fm.description // "") | tostring | gsub("\\s+"; " ") | length
-```
+## Auto-bind boundary — почему не используем `match.glob`
 
-— мы зеркалим folding-семантику лоадера независимо от выбора скаляр-стиля автором. Это делает правило корректным для обоих случаев и единообразным с тем, что делает upstream.
+Изначально я планировал тайтнуть `match.glob: '**/SKILL.md'` и `'**/evals.json'` чтобы правила не цепляли неродственные markdown / JSON файлы при auto-bind'е по format-overlap'у. **Это не сработало** по причине ограничения test-runner'a:
+
+`crates/dq-exec/src/test_runner.rs:308` — runner передаёт в `evaluator.evaluate_file()` путь самой `.test.yml` фикстуры, а не виртуальное имя типа `SKILL.md`. Поэтому `match.glob` промахивается на всех фикстурных кейсах → правило не срабатывает → 8 из 14 фикстур ломаются с "missing diagnostic".
+
+Существующие `@std` правила (например, [`@std/jsonschema/helm-values-against-schema.yml`](../../../crates/dq-lint/rules/jsonschema/helm-values-against-schema.yml)) обходят это: в самих правилах `glob` отсутствует, описание лишь рекомендует пользователям добавить `glob` локально при override'е. Я следую той же конвенции.
+
+**Trade-off:** правила фигурируют при auto-bind'е на всех markdown/json файлах в проекте. Mitigation:
+- `skills.frontmatter` — `match.filter: '.frontmatter != null'` исключает markdown без frontmatter'a. Дополнительно: rule firings только на specific bad inputs (regex/length cap для `name`, 1,536-cap для description+when_to_use). Hugo/Jekyll-blog с `title`/`date`/`tags` не использует поля, которые мы проверяем, и тихо проходит.
+- `skills.evals-schema` — `match.filter: 'has("skill_name") and has("evals")'` shape-discriminating. JSON файл без обоих ключей не валидируется. Это сильнее, чем glob, потому что охватывает любой путь.
+
+**Follow-up:** добавить `path:` поле в `RuleTestCase` (`crates/dq-exec/src/test_runner.rs:44`) чтобы фикстуры могли симулировать виртуальный путь файла, и тогда `match.glob` станет тестируемым. Это отдельный change — не блокирует текущий.
 
 ## Schema sidecar embedding
 
@@ -62,13 +76,16 @@ static SKILLS_SCHEMA_FILES: &[(&str, &str)] = &[(
 
 ## Test fixtures
 
-Тесты у atl уже хорошие (5 случаев для frontmatter, 5 для evals). Мигрируем 1:1, меняя только rule id в `expected.violations[].rule`. Existing `cargo test -p dq-lint` тест-раннер автоматически подхватит новые `*.test.yml` через `std_test_files("skills")` (см. [crates/dq-lint/tests/](../../../crates/dq-lint/tests/)).
+14 фикстур (9 для `frontmatter`, 5 для `evals-schema`). Существующий `cargo test -p dq-lint --test std_rulesets_pass` прогоняет их через `RuleTester` после того, как тест-функция `std_skills_fixtures_pass` была добавлена в [`crates/dq-lint/tests/std_rulesets_pass.rs`](../../../crates/dq-lint/tests/std_rulesets_pass.rs).
 
-Один edge case: тест с oversized description у atl использует 1500 chars в quoted scalar — это сохраняем, потому что YAML folded-block parser quirks в комментарии у atl были выяснены опытным путём.
+### Известный edge case при автогенерации фикстур
+
+Quoted YAML scalar (`"AAA..."`) сохраняет длину строки литерально — не сворачивает whitespace. Это удобно для тестов на длину, но требует точного подсчёта символов. При первой версии фикстуры на «oversized description» содержали 1,240 символов вместо ≥1,536, поэтому правило не фейлило (а это правильный результат для 1,240 < 1,536). Финальные фикстуры используют python-сгенерированные строки 1,700 / 900+900 chars для гарантированного overflow'a.
 
 ## Anti-scope decisions
 
 - **Не делаем правило на «SKILL.md должен существовать в skill/»** — формат skill-репо разнообразный (плагины Claude Code, system-prompts, и т.д.); requiring SKILL.md выходит за scope `@std`.
 - **Не делаем правило на references/, scripts/ обязательности** — это бизнес-конвенция конкретного автора, не upstream-контракт.
-- **Не делаем `keyword`-проверку из новой Anthropic skill spec** — если она появится в апстриме как обязательное поле, добавим в follow-up; сейчас опциональное.
+- **Не валидируем enum-значения `model`/`effort`/`context`** — эти enum'ы эволюционируют чаще, чем сам skill spec. Лучше fallback на runtime validation в loader'е.
 - **Не парсим SKILL.md description на пустоту/качество** — слишком субъективно; rule-author может добавить через локальное правило с jq.
+- **Не валидируем `evals[].files[]` пути** — это runtime concern.
