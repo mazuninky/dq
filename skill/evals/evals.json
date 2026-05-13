@@ -1,0 +1,97 @@
+{
+  "skill_name": "dq",
+  "evals": [
+    {
+      "id": 1,
+      "name": "k8s-bump-replicas-preserving-comments",
+      "prompt": "у меня есть deployment.yaml где сверху есть комментарий '# managed by argocd' и куча annotations с комментариями. нужно сменить spec.replicas с 3 на 5 — но КОММЕНТАРИИ ДОЛЖНЫ ОСТАТЬСЯ НА МЕСТЕ. используй dq.",
+      "expected_output": "Uses `dq set deployment.yaml /spec/replicas 5 -i` (textual-edit splice — preserves comments). MUST NOT use `dq set --jq ...` (re-emits via native writer, drops comments). Should ideally preview with `--diff` first.",
+      "assertions": [
+        {"text": "Uses dq set with pointer syntax (/spec/replicas), not --jq", "type": "output"},
+        {"text": "Uses -i to write in place", "type": "output"},
+        {"text": "Does NOT use dq fmt or dq convert (they drop comments)", "type": "output"},
+        {"text": "Mentions or shows --diff before -i as the safer agent flow", "type": "output"}
+      ],
+      "files": []
+    },
+    {
+      "id": 2,
+      "name": "escape-slash-in-label-pointer",
+      "prompt": "в файле deploy.yaml есть метка metadata.labels[\"app.kubernetes.io/name\"]: api-gateway. покажи её значение через dq, плюс выведи тип. результат потом пойдёт мне в контекст для следующего шага.",
+      "expected_output": "Uses `dq get deploy.yaml /metadata/labels/app.kubernetes.io~1name` with `/` escaped as `~1` per RFC 6901. Uses `-F toon` (agent reads output, save tokens) or `-F json` for portability. Follow-up `dq type` with same escaped pointer.",
+      "assertions": [
+        {"text": "Escapes the '/' in 'app.kubernetes.io/name' as ~1 (not left as literal '/')", "type": "output"},
+        {"text": "Uses JSON Pointer (dq get) not JSONPath or jq for this single-key read", "type": "output"},
+        {"text": "Uses -F toon (preferred — fewer tokens for agent context) or -F json (not -F json upstream that would override input)", "type": "output"},
+        {"text": "Does not put -F BEFORE the file path with a value that disagrees with the .yaml extension", "type": "output"}
+      ],
+      "files": []
+    },
+    {
+      "id": 3,
+      "name": "ci-sarif-upload-stderr-redirect",
+      "prompt": "напиши шаг для GitHub Actions: пробежаться dq lint по всем k8s/**/*.yaml и залить SARIF в Code Scanning через github/codeql-action/upload-sarif. parse errors не должны проваливать сборку до upload-шага.",
+      "expected_output": "Uses `dq lint -F sarif 'k8s/**/*.yaml' 2> lint.sarif` (NOT `> lint.sarif`). Sets `continue-on-error: true` on the lint step so exit 4 doesn't skip upload. Uses `if: always()` on the upload step. Mentions the SARIF-to-stderr contract.",
+      "assertions": [
+        {"text": "Redirects with 2> (stderr) to capture SARIF, NOT > (stdout)", "type": "output"},
+        {"text": "Sets continue-on-error: true on the lint step", "type": "output"},
+        {"text": "Uses if: always() on the upload-sarif step", "type": "output"},
+        {"text": "Uses dq lint (not dq validate) — lint produces rule diagnostics; validate is parse-only", "type": "output"}
+      ],
+      "files": []
+    },
+    {
+      "id": 4,
+      "name": "helm-values-with-templates",
+      "prompt": "values.yaml в чарте содержит '{{ .Values.image.repository }}:{{ .Values.image.tag }}' и обычный yaml-ключ image.tag: latest. мне надо поменять image.tag на v2.4.1 не сломав template-блоки. вот пример куска:\n\n```\nimage:\n  repository: \"{{ .Values.image.repo | default \\\"nginx\\\" }}\"\n  tag: latest\n```",
+      "expected_output": "Uses `dq set values.yaml /image/tag v2.4.1 -i --raw-template-strings`. The --raw-template-strings flag substitutes {{ ... }} blocks with opaque placeholders for parse-time and restores them on write. MUST NOT use --allow-templates (laxer; only works if file already parses without substitution).",
+      "assertions": [
+        {"text": "Passes --raw-template-strings to handle Helm templates", "type": "output"},
+        {"text": "Uses dq set with pointer (textual-edit, preserves the templates verbatim)", "type": "output"},
+        {"text": "Does NOT use --allow-templates as the primary option", "type": "output"},
+        {"text": "Suggests --diff first to verify the templates survive round-trip", "type": "output"}
+      ],
+      "files": []
+    },
+    {
+      "id": 5,
+      "name": "bulk-set-image-pull-policy-jq",
+      "prompt": "у меня в k8s/ лежит ~80 манифестов. нужно во всех Deployment-ах прописать spec.template.spec.imagePullPolicy=IfNotPresent для контейнеров где этого поля нет. комментарии в yaml-ах не критичны — это сгенерированные манифесты.",
+      "expected_output": "Uses jq-driven transform via `dq set 'k8s/**/*.yaml' --jq '...' -i --parallel <N>` (since comments don't matter, jq is the right tool for the conditional). The jq expression walks containers and sets imagePullPolicy if missing. Or uses `dq fix --rules @std/k8s -i` since `@std/k8s/image-pull-policy-always` ships a fix.jq. Should preview with --diff or --check first.",
+      "assertions": [
+        {"text": "Uses dq set --jq OR dq fix (not pointer-edit, since the condition is per-container)", "type": "output"},
+        {"text": "Acknowledges --jq / fix drop comments (and that's acceptable here)", "type": "output"},
+        {"text": "Uses --parallel N for the ~80-file bulk", "type": "output"},
+        {"text": "Previews with --check or --diff before -i", "type": "output"},
+        {"text": "If using --jq, the expression returns exactly one value (not a stream)", "type": "output"}
+      ],
+      "files": []
+    },
+    {
+      "id": 6,
+      "name": "extract-markdown-frontmatter-title",
+      "prompt": "в blog-posts/ лежит ~30 .md файлов с YAML frontmatter (title, date, tags). выведи мне title каждого поста в CSV: filename,title. результат я скормлю в excel.",
+      "expected_output": "Uses `dq query` or `dq get post.md /frontmatter/value/title` per file. The frontmatter pointer prefix is `/frontmatter/value/<key>` (not just `/<key>`). Iterates over files (shell loop or xargs). Output goes to CSV — use `-F json` or plain string output. Should use bash for loop + printf, since dq doesn't aggregate across files in a single invocation for query.",
+      "assertions": [
+        {"text": "Uses the /frontmatter/value/<key> pointer prefix (not /<key>, /frontmatter/<key>, or /title)", "type": "output"},
+        {"text": "Iterates over files via shell loop or find -exec (dq operates per-file for reads)", "type": "output"},
+        {"text": "Produces CSV-like output (filename,title pairs)", "type": "output"},
+        {"text": "Does NOT try to use dq convert .md -F csv (frontmatter conversion produces JSON, not multi-file CSV aggregation)", "type": "output"}
+      ],
+      "files": []
+    },
+    {
+      "id": 7,
+      "name": "json-patch-rollback-on-test-fail",
+      "prompt": "у меня есть config.yaml с feature_flags.beta_ui: false. напиши json patch (RFC 6902) который сначала проверяет что текущее значение false, потом меняет на true, и применяет через dq. если test провалится — изменения не должны записаться на диск.",
+      "expected_output": "Creates a JSON Patch ops.json with a `test` op followed by a `replace` op. Applies via `dq patch config.yaml @ops.json -i`. Mentions that `patch` is atomic and that a failed `test` op rolls back the whole patch with exit 1 (no partial write). Should preview with --diff first.",
+      "assertions": [
+        {"text": "Uses dq patch FILE @ops.json (not dq merge, not dq set --jq)", "type": "output"},
+        {"text": "The ops.json includes both a 'test' op and a 'replace' op", "type": "output"},
+        {"text": "Mentions atomic semantics — failed test op aborts the whole patch (exit 1, no write)", "type": "output"},
+        {"text": "Path in JSON Patch uses RFC 6901 (e.g. '/feature_flags/beta_ui')", "type": "output"}
+      ],
+      "files": []
+    }
+  ]
+}
