@@ -333,7 +333,15 @@ For non-containerised runners, install with the script and run `dq` directly —
 
 ## Claude Code skill
 
-A `dq` skill for [Claude Code](https://claude.ai/code) is shipped under [`skill/SKILL.md`](skill/SKILL.md) with install instructions, common patterns, format coverage, and exit codes — so Claude can use `dq` as a tool without re-deriving its surface.
+A `dq` skill for [Claude Code](https://claude.ai/code) is shipped under [`skills/dq/SKILL.md`](skills/dq/SKILL.md), giving Claude deep knowledge of all `dq` commands, flags, output formats, and common workflows — so Claude can use `dq` as a tool without re-deriving its surface.
+
+Install from [skills.sh](https://skills.sh):
+
+```sh
+npx skills add mazuninky/dq
+```
+
+The skill covers reads, in-place edits with round-trip preservation, format conversion, JSON Patch / Merge Patch, lint + autofix, SARIF / JUnit / TAP reporters, and CI integration patterns.
 
 ## Shell completions
 
@@ -354,7 +362,7 @@ For an overview of the source tree, conventions, and explicit anti-scope, see [`
 ## Documentation
 
 - **[CLAUDE.md](CLAUDE.md)** — repo orientation for contributors and Claude Code: crate layout, conventions, anti-scope, how to extend.
-- **[skill/SKILL.md](skill/SKILL.md)** — Claude Code skill: install + common patterns + format coverage + exit codes.
+- **[skills/dq/SKILL.md](skills/dq/SKILL.md)** — Claude Code skill: install + common patterns + format coverage + exit codes.
 - **[openspec/changes/](openspec/changes/)** — active and archived OpenSpec changes (specs + design + tasks).
 - **[dq-plan.md](dq-plan.md)** — design doc: architecture, roadmap, anti-scope.
 - **[CHANGELOG.md](CHANGELOG.md)** — release notes.
