@@ -28,3 +28,7 @@ openspec/changes/.openspec.cache/
 # /local-fix per-pass artefacts (review findings + thread payloads)
 .claude/local-fix-*.jsonl
 .claude/local-fix-*.json
+
+# Skill eval runner — workspace + staging dirs are per-run artefacts, not source.
+**/*-workspace/
+/plugins/
