@@ -1,0 +1,69 @@
+id: skills.frontmatter
+description: |
+  Anthropic-style `SKILL.md` files may declare YAML frontmatter to
+  control skill behavior. The skill loader (per the Claude Code skills
+  spec — see references below) defines two hard constraints worth
+  catching statically:
+
+  - `name` (optional; falls back to the skill's directory name) must
+    be lowercase letters, digits, or hyphens only, max 64 characters
+    (regex `^[a-z0-9][a-z0-9-]*$`). Underscores and uppercase are
+    rejected by the loader.
+  - Combined `description` + `when_to_use` is truncated at 1,536
+    characters in the skill listing (i.e. anything beyond is silently
+    invisible to Claude when it decides whether to invoke the skill).
+
+  This rule does NOT enforce presence of `name` or `description` —
+  both fields are explicitly optional per spec (`name` falls back to
+  the directory name; `description` falls back to the first markdown
+  paragraph). It only validates them when they ARE present.
+
+  Fires on any markdown file with frontmatter, but the checks are
+  shape-discriminating: a Hugo/Jekyll/Obsidian post that doesn't use
+  the Anthropic-skill fields (`name`, `when_to_use`) silently passes.
+  If you want to narrow further to e.g. `**/SKILL.md`, override the
+  rule locally with a `match.glob:` entry under `.dq/rules/`.
+severity: error
+match:
+  format: markdown
+  filter: '.frontmatter != null'
+check:
+  jq: |
+    . as $doc
+    | ($doc.frontmatter.value // {}) as $fm
+    | (
+        (
+          if ($fm | has("name")) and (($fm.name | type) == "string")
+          then
+            $fm.name as $n
+            | (
+                (if ($n | test("^[a-z0-9][a-z0-9-]*$") | not)
+                 then [{ msg: "`name` must match ^[a-z0-9][a-z0-9-]*$ (lowercase letters, digits, hyphens only)" }]
+                 else []
+                 end)
+                +
+                (if ($n | length) > 64
+                 then [{ msg: ("`name` is " + (($n | length) | tostring) + " chars, exceeds 64") }]
+                 else []
+                 end)
+              )
+          else []
+          end
+        )
+        +
+        (
+          (if (($fm.description | type) == "string") then $fm.description else "" end) as $d
+          | (if (($fm.when_to_use | type) == "string") then $fm.when_to_use else "" end) as $w
+          | ($d + $w | length) as $len
+          | if $len > 1536
+            then [{ msg: ("combined `description` + `when_to_use` is " + ($len | tostring) + " chars, exceeds 1,536 (will be truncated in the skill listing)") }]
+            else []
+            end
+        )
+      )[]
+  message: "SKILL.md frontmatter: {{ .msg }}"
+references:
+  - https://code.claude.com/docs/en/skills#frontmatter-reference
+  - https://agentskills.io
+loc:
+  line: 1

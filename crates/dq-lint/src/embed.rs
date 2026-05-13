@@ -24,6 +24,7 @@ pub const NAMESPACES: &[&str] = &[
     "markdown",
     "npm",
     "openapi",
+    "skills",
     "terraform",
 ];
 
@@ -37,6 +38,7 @@ pub fn std_ruleset(name: &str) -> Option<&'static str> {
         "markdown" => Some(MARKDOWN_RULES),
         "npm" => Some(NPM_RULES),
         "openapi" => Some(OPENAPI_RULES),
+        "skills" => Some(SKILLS_RULES),
         "terraform" => Some(TERRAFORM_RULES),
         _ => None,
     }
@@ -52,6 +54,7 @@ pub fn std_test_files(namespace: &str) -> Option<&'static [(&'static str, &'stat
         "markdown" => Some(MARKDOWN_TESTS),
         "npm" => Some(NPM_TESTS),
         "openapi" => Some(OPENAPI_TESTS),
+        "skills" => Some(SKILLS_TESTS),
         "terraform" => Some(TERRAFORM_TESTS),
         _ => None,
     }
@@ -73,6 +76,7 @@ pub fn std_rule_files(namespace: &str) -> Option<&'static [(&'static str, &'stat
         "markdown" => Some(MARKDOWN_RULE_FILES),
         "npm" => Some(NPM_RULE_FILES),
         "openapi" => Some(OPENAPI_RULE_FILES),
+        "skills" => Some(SKILLS_RULE_FILES),
         "terraform" => Some(TERRAFORM_RULE_FILES),
         _ => None,
     }
@@ -94,6 +98,10 @@ pub fn std_schema(namespace: &str, file: &str) -> Option<&'static str> {
             .iter()
             .find(|(name, _)| *name == file)
             .map(|(_, contents)| *contents),
+        "skills" => SKILLS_SCHEMA_FILES
+            .iter()
+            .find(|(name, _)| *name == file)
+            .map(|(_, contents)| *contents),
         _ => None,
     }
 }
@@ -108,6 +116,7 @@ pub fn std_schema_files(namespace: &str) -> &'static [(&'static str, &'static st
     match namespace {
         "jsonschema" => JSONSCHEMA_SCHEMA_FILES,
         "openapi" => OPENAPI_SCHEMA_FILES,
+        "skills" => SKILLS_SCHEMA_FILES,
         _ => &[],
     }
 }
@@ -870,4 +879,44 @@ static OPENAPI_RULE_FILES: &[(&str, &str)] = &[
 static OPENAPI_SCHEMA_FILES: &[(&str, &str)] = &[(
     "openapi-info.schema.json",
     include_str!("../rules/openapi/openapi-info.schema.json"),
+)];
+
+// ---------------------------------------------------------------------------
+// skills — 2 rules (frontmatter + evals-schema)
+// ---------------------------------------------------------------------------
+
+static SKILLS_RULES: &str = concat!(
+    include_str!("../rules/skills/evals-schema.yml"),
+    "\n---\n",
+    include_str!("../rules/skills/frontmatter.yml"),
+);
+
+static SKILLS_TESTS: &[(&str, &str)] = &[
+    (
+        "evals-schema.test.yml",
+        include_str!("../rules/skills/evals-schema.test.yml"),
+    ),
+    (
+        "frontmatter.test.yml",
+        include_str!("../rules/skills/frontmatter.test.yml"),
+    ),
+];
+
+static SKILLS_RULE_FILES: &[(&str, &str)] = &[
+    (
+        "evals-schema.yml",
+        include_str!("../rules/skills/evals-schema.yml"),
+    ),
+    (
+        "frontmatter.yml",
+        include_str!("../rules/skills/frontmatter.yml"),
+    ),
+];
+
+/// Sidecar JSON Schema files embedded alongside the `@std/skills`
+/// rules. Keys must match the `check.schema_file:` strings authors
+/// write in the rule YAML (e.g. `evals.schema.json`).
+static SKILLS_SCHEMA_FILES: &[(&str, &str)] = &[(
+    "evals.schema.json",
+    include_str!("../rules/skills/evals.schema.json"),
 )];
