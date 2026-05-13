@@ -241,6 +241,36 @@ jobs:
             dist/dq-*.sig
           fail_on_unmatched_files: false
 
+  post-release-smoke:
+    name: post-release smoke (${{ matrix.os }})
+    needs: [verify-version, release]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    # End-to-end check: install the just-published release via the public
+    # setup-dq action, then assert the binary runs and reports the expected
+    # version. Catches broken release uploads, missing platform assets, and
+    # setup-dq regressions against new tag formats — in one shot.
+    steps:
+      - name: Install dq via setup-dq
+        id: setup
+        uses: mazuninky/setup-dq@v1
+        with:
+          version: ${{ needs.verify-version.outputs.version }}
+
+      - name: Verify installed version
+        shell: bash
+        env:
+          EXPECTED: ${{ needs.verify-version.outputs.version }}
+          REPORTED: ${{ steps.setup.outputs.version }}
+        run: |
+          set -euo pipefail
+          test "$REPORTED" = "$EXPECTED"
+          dq --version | grep -F "$EXPECTED"
+          dq --help > /dev/null
+
   bump-homebrew-tap:
     name: bump-homebrew-tap
     needs: [verify-version, release]
