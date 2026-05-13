@@ -2,7 +2,7 @@
 # install.sh — POSIX installer for `dq` (https://github.com/mazuninky/dq).
 #
 # Usage:
-#   curl -sSfL https://raw.githubusercontent.com/mazuninky/dq/main/scripts/install.sh | sh
+#   curl -sSfL https://raw.githubusercontent.com/mazuninky/dq/master/scripts/install.sh | sh
 #   sh install.sh --version v2026.20.1 --install-dir ~/.local/bin
 #
 # Detects OS + arch, downloads the matching prebuilt tarball from a GitHub
@@ -209,10 +209,14 @@ resolve_latest_version() {
 if [ "${VERSION}" = "latest" ]; then
     VERSION="$(resolve_latest_version)"
 fi
+# `VERSION` is the git tag (with leading `v`, used in the release URL path).
+# `VERSION_BARE` is the bare semver (no `v`, embedded in asset filenames by the
+# release workflow — see `.github/workflows/release.yml` where `VERSION="${TAG#v}"`).
 case "${VERSION}" in
     v*) ;;
     *)  VERSION="v${VERSION}" ;;
 esac
+VERSION_BARE="${VERSION#v}"
 log "installing version: ${VERSION}"
 
 # -----------------------------------------------------------------------------
@@ -224,7 +228,7 @@ case "${TARGET}" in
     *)         ARCHIVE_EXT="tar.gz" ;;
 esac
 
-ARCHIVE_NAME="dq-${VERSION}-${TARGET}.${ARCHIVE_EXT}"
+ARCHIVE_NAME="dq-${VERSION_BARE}-${TARGET}.${ARCHIVE_EXT}"
 CHECKSUMS_NAME="dq-checksums.txt"
 ARCHIVE_URL="https://github.com/${REPO}/releases/download/${VERSION}/${ARCHIVE_NAME}"
 CHECKSUMS_URL="https://github.com/${REPO}/releases/download/${VERSION}/${CHECKSUMS_NAME}"
@@ -283,7 +287,7 @@ esac
 EXTRACTED_BIN=""
 for candidate in \
     "${TMP_DIR}/${BIN_NAME}" \
-    "${TMP_DIR}/dq-${VERSION}-${TARGET}/${BIN_NAME}" \
+    "${TMP_DIR}/dq-${VERSION_BARE}-${TARGET}/${BIN_NAME}" \
     "${TMP_DIR}/dq/${BIN_NAME}"
 do
     if [ -f "${candidate}" ]; then

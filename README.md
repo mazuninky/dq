@@ -289,7 +289,7 @@ See [examples/plugin-rust/](examples/plugin-rust/) for a minimal Rust reference 
 ```yaml
 # .github/workflows/lint.yml
 - name: Install dq
-  run: curl -sSfL https://raw.githubusercontent.com/mazuninky/dq/main/scripts/install.sh | sh
+  run: curl -sSfL https://raw.githubusercontent.com/mazuninky/dq/master/scripts/install.sh | sh
 
 - name: Validate manifests
   continue-on-error: true   # exit 4 on parse errors must not skip upload-sarif below
