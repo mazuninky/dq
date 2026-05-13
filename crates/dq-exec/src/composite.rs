@@ -47,6 +47,8 @@
 //! 6. Prefix every projected diagnostic's message with the outer
 //!    `message` template so users see `<outer message>: <inner message>`.
 
+use std::sync::Arc;
+
 use camino::Utf8Path;
 
 use dq_core::{FormatTag, Pointer};
@@ -54,7 +56,7 @@ use dq_transform::JqEngine;
 
 use crate::diagnostic::{Diagnostic, Severity};
 use crate::error::{ExecError, Result};
-use crate::evaluator::{CompiledRule, compile_rule_to_depth};
+use crate::evaluator::{CompiledRule, JqCache, compile_rule_to_depth};
 use crate::rule::Rule;
 use crate::ruleset::RuleSource;
 
@@ -76,8 +78,10 @@ pub(crate) const MAX_EXTRACT_DEPTH: usize = 4;
 /// [`Arc`] so the runtime never needs to clone the box itself.
 pub(crate) struct CompiledCompositeCheck {
     /// Compiled `extract` jq expression — produced once at
-    /// [`crate::Evaluator::new`].
-    pub(crate) extract: JqEngine,
+    /// [`crate::Evaluator::new`]. Shared via [`Arc`] so two composite
+    /// rules with the same `extract` expression amortise one compile,
+    /// driven by the [`crate::evaluator::JqCache`].
+    pub(crate) extract: Arc<JqEngine>,
     /// Recursively compiled inner rule. May itself be a `Jq` / `Schema` /
     /// `SchemaFile` / `Composite` — recursion is bounded by
     /// [`MAX_EXTRACT_DEPTH`] at compile time as well as at runtime.
@@ -109,6 +113,7 @@ impl std::fmt::Debug for CompiledCompositeCheck {
 /// `nested` rule of a top-level composite; …); when it equals or exceeds
 /// `max_depth` the function returns
 /// [`ExecError::CompositeDepthExceeded`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compile_composite(
     outer_rule_id: &str,
     extract: &str,
@@ -117,6 +122,7 @@ pub(crate) fn compile_composite(
     source: &RuleSource,
     current_depth: usize,
     max_depth: usize,
+    cache: &mut JqCache,
 ) -> Result<CompiledCompositeCheck> {
     if current_depth >= max_depth {
         return Err(ExecError::CompositeDepthExceeded {
@@ -125,17 +131,31 @@ pub(crate) fn compile_composite(
             max: max_depth,
         });
     }
-    let extract_engine = JqEngine::compile(extract).map_err(|err| ExecError::RuleCompile {
-        rule_id: outer_rule_id.to_owned(),
-        source: err,
-    })?;
+    // Cache the `extract` jq expression alongside the rest of the
+    // rule's filters — two composite rules with the same `extract`
+    // share one `JqEngine` instance via Arc-refcount.
+    let extract_engine = {
+        if let Some(engine) = cache.get(extract) {
+            Arc::clone(engine)
+        } else {
+            let engine =
+                Arc::new(
+                    JqEngine::compile(extract).map_err(|err| ExecError::RuleCompile {
+                        rule_id: outer_rule_id.to_owned(),
+                        source: err,
+                    })?,
+                );
+            cache.insert(extract.to_string(), Arc::clone(&engine));
+            engine
+        }
+    };
     // Recursively compile the nested rule. The depth+1 here mirrors the
     // runtime depth counter: the outer compile reaches `nested` at
     // `current_depth + 1`. If the nested rule is itself composite,
     // `compile_composite` runs again with the bumped depth and the same
     // `max_depth`, so the entire chain is bounded by a single threshold.
     let compiled_nested =
-        compile_rule_to_depth(nested.clone(), source, current_depth + 1, max_depth)?;
+        compile_rule_to_depth(nested.clone(), source, current_depth + 1, max_depth, cache)?;
     Ok(CompiledCompositeCheck {
         extract: extract_engine,
         nested: Box::new(compiled_nested),
