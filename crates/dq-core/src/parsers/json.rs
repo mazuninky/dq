@@ -30,8 +30,8 @@
 //! indent step than the surrounding source. Existing keys are byte-spliced
 //! so their indent is byte-preserved.
 
+use std::cell::OnceCell;
 use std::io::Write;
-use std::ops::Range;
 use std::str::FromStr;
 
 use indexmap::IndexMap;
@@ -238,7 +238,8 @@ fn build_span_map(bytes: &[u8]) -> Result<SpanMap> {
             message: "source is not valid UTF-8".to_owned(),
         });
     }
-    let mut scanner = Scanner::new(bytes);
+    let lines = LineIndex::new(bytes);
+    let mut scanner = Scanner::new(bytes, lines);
     let mut spans = SpanMap::new();
     scanner.skip_ws_and_check_jsonc()?;
     if scanner.eof() {
@@ -252,11 +253,16 @@ fn build_span_map(bytes: &[u8]) -> Result<SpanMap> {
 struct Scanner<'a> {
     bytes: &'a [u8],
     pos: usize,
+    lines: LineIndex,
 }
 
 impl<'a> Scanner<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, pos: 0 }
+    fn new(bytes: &'a [u8], lines: LineIndex) -> Self {
+        Self {
+            bytes,
+            pos: 0,
+            lines,
+        }
     }
 
     fn eof(&self) -> bool {
@@ -572,8 +578,8 @@ impl<'a> Scanner<'a> {
     ) {
         let pointer = pointer_for(path);
         let value_range = start..end;
-        let line_range = compute_line_range(self.bytes, &value_range);
-        let indent = compute_indent(self.bytes, start);
+        let line_range = self.lines.line_start(start)..self.lines.line_end(end, self.bytes.len());
+        let indent = self.lines.indent_for(self.bytes, start);
         spans.insert(
             pointer,
             ValueSpan {
@@ -604,8 +610,8 @@ impl<'a> Scanner<'a> {
     ) {
         let pointer = pointer_for(path);
         let value_range = start..end;
-        let line_range = compute_line_range(self.bytes, &value_range);
-        let indent = compute_indent(self.bytes, start);
+        let line_range = self.lines.line_start(start)..self.lines.line_end(end, self.bytes.len());
+        let indent = self.lines.indent_for(self.bytes, start);
         spans.insert(
             pointer,
             ValueSpan {
@@ -618,39 +624,119 @@ impl<'a> Scanner<'a> {
     }
 }
 
-/// Compute the physical line range covering `value_range`, including the
-/// trailing newline so `del_at` removes the whole line.
-fn compute_line_range(bytes: &[u8], value_range: &Range<usize>) -> Range<usize> {
-    let mut start = value_range.start.min(bytes.len());
-    while start > 0 && bytes[start - 1] != b'\n' {
-        start -= 1;
-    }
-    let mut end = value_range.end.min(bytes.len());
-    while end < bytes.len() && bytes[end] != b'\n' {
-        end += 1;
-    }
-    if end < bytes.len() {
-        end += 1;
-    }
-    start..end
+/// Precomputed line table over the source bytes, used by the [`Scanner`] to
+/// resolve line-relative span attributes (`line_range`, `indent`) in
+/// `O(log L)` per scalar instead of the naive `O(line_width)` backward scan.
+///
+/// The pre-fix code called `compute_line_range` and `compute_indent` helpers
+/// that each performed a linear backward scan from the scalar's byte offset
+/// to the nearest preceding `\n`. For a single-line JSON array of N elements
+/// the per-element scan distance grew linearly with the element index,
+/// yielding total `O(N²)` work — observable as a 14-second parse on a
+/// 10 000-element flat array vs. ~50 ms for the equivalent YAML.
+///
+/// `LineIndex` is built once before the scan loop and replaces both
+/// helpers with `slice::partition_point` lookups against a precomputed
+/// table of newline offsets. Indents are cached per line via `OnceCell`,
+/// so the first lookup on a line pays the indent-width scan and every
+/// subsequent lookup on the same line is `O(1)`.
+///
+/// This type is module-local on purpose: only the JSON parser needs it,
+/// and exposing it as a public utility would require a wider refactor of
+/// the other parsers' span builders. See the perf-json-parse-linear
+/// OpenSpec change for the full design rationale.
+struct LineIndex {
+    /// Sorted byte offsets of every `\n` in the source. Line 0 starts at
+    /// offset 0; line `i` (`i ≥ 1`) starts at `newline_offsets[i-1] + 1`.
+    newline_offsets: Vec<usize>,
+    /// Lazily computed indent (spaces + tabs from line start) per line.
+    /// Indexed by line number — same length as `newline_offsets.len() + 1`
+    /// to account for the implicit final line that may not end with a `\n`.
+    indents: Vec<OnceCell<u32>>,
 }
 
-/// Compute the indent (in source bytes) of the line containing `index`.
-fn compute_indent(bytes: &[u8], index: usize) -> u32 {
-    let cap = bytes.len();
-    let mut line_start = index.min(cap);
-    while line_start > 0 && bytes[line_start - 1] != b'\n' {
-        line_start -= 1;
-    }
-    let mut indent = 0_u32;
-    for &b in &bytes[line_start..cap.min(index)] {
-        if b == b' ' || b == b'\t' {
-            indent = indent.saturating_add(1);
-        } else {
-            break;
+impl LineIndex {
+    /// Build the line table for `bytes` in a single forward pass.
+    ///
+    /// Intentionally does **not** depend on the `memchr` crate as a direct
+    /// dependency — see the OpenSpec design doc §2.1 — even though it is
+    /// already pulled in transitively by `serde_json` / `regex`. On top of
+    /// the unavoidable `serde_json::from_slice` cost the linear scan here
+    /// is negligible.
+    fn new(bytes: &[u8]) -> Self {
+        let newline_offsets: Vec<usize> = bytes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &b)| (b == b'\n').then_some(i))
+            .collect();
+        let indents = (0..newline_offsets.len() + 1)
+            .map(|_| OnceCell::new())
+            .collect();
+        Self {
+            newline_offsets,
+            indents,
         }
     }
-    indent
+
+    /// Return the byte offset of the start of the line containing `offset`.
+    ///
+    /// Matches the old `compute_line_range`'s `start` semantics: the byte
+    /// immediately after the most recent `\n` strictly before `offset`, or
+    /// `0` when no such `\n` exists. `O(log L)` where `L` is the number of
+    /// lines.
+    fn line_start(&self, offset: usize) -> usize {
+        let line = self.newline_offsets.partition_point(|&n| n < offset);
+        if line == 0 {
+            0
+        } else {
+            self.newline_offsets[line - 1] + 1
+        }
+    }
+
+    /// Return the byte offset of the start of the line *after* the one
+    /// containing `offset`, or `total` if `offset` is on the last line.
+    ///
+    /// Matches the old `compute_line_range`'s `end` semantics: the trailing
+    /// `\n` of the containing line is included in the returned range
+    /// (the byte at the returned offset is the first byte of the next
+    /// line, mirroring the old `end += 1` post-clamp adjustment). `O(log
+    /// L)`.
+    fn line_end(&self, offset: usize, total: usize) -> usize {
+        let offset = offset.min(total);
+        let line = self.newline_offsets.partition_point(|&n| n < offset);
+        if line < self.newline_offsets.len() {
+            // `+ 1` to include the `\n` byte itself, matching the
+            // post-clamp `end += 1` from the old helper.
+            self.newline_offsets[line] + 1
+        } else {
+            total
+        }
+    }
+
+    /// Return the indent (spaces + tabs from line start) of the line
+    /// containing `offset`. `O(log L)` on the first call per line and
+    /// `O(1)` thereafter via `OnceCell` caching.
+    ///
+    /// The indent predicate is identical to the old `compute_indent`:
+    /// count consecutive `b' '` / `b'\t'` from the line start, break on
+    /// any other byte. Since JSON scalars never start with whitespace,
+    /// the indent count is identical regardless of where on the line
+    /// `offset` falls.
+    fn indent_for(&self, bytes: &[u8], offset: usize) -> u32 {
+        let line = self.newline_offsets.partition_point(|&n| n < offset);
+        *self.indents[line].get_or_init(|| {
+            let start = self.line_start(offset);
+            let mut indent = 0_u32;
+            for &b in &bytes[start..] {
+                if b == b' ' || b == b'\t' {
+                    indent = indent.saturating_add(1);
+                } else {
+                    break;
+                }
+            }
+            indent
+        })
+    }
 }
 
 /// Derive a 1-indexed `(line, col)` for byte offset `idx`.
