@@ -333,7 +333,15 @@ For non-containerised runners, install with the script and run `dq` directly —
 
 ## Claude Code skill
 
-A `dq` skill for [Claude Code](https://claude.ai/code) is shipped under [`skill/SKILL.md`](skill/SKILL.md) with install instructions, common patterns, format coverage, and exit codes — so Claude can use `dq` as a tool without re-deriving its surface.
+A `dq` skill for [Claude Code](https://claude.ai/code) is shipped under [`skill/SKILL.md`](skill/SKILL.md), giving Claude deep knowledge of all `dq` commands, flags, output formats, and common workflows — so Claude can use `dq` as a tool without re-deriving its surface.
+
+Install from [skills.sh](https://skills.sh):
+
+```sh
+npx skills add mazuninky/dq
+```
+
+The skill covers reads, in-place edits with round-trip preservation, format conversion, JSON Patch / Merge Patch, lint + autofix, SARIF / JUnit / TAP reporters, and CI integration patterns.
 
 ## Shell completions
 
