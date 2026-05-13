@@ -294,12 +294,14 @@ fn ensure_writable_install_dir(current_exe: &std::path::Path) -> anyhow::Result<
 
 fn map_self_update_error(err: self_update::errors::Error) -> anyhow::Error {
     use self_update::errors::Error as SuError;
-    // Both `Network` and `Reqwest` variants represent failed HTTP traffic;
-    // collapse them onto the same `Io`-shape so `exit_code_for_error`
-    // produces 5 (`IO_ERROR`) and the user sees the GITHUB_TOKEN hint.
+    // Both `Network` and the active HTTP-backend variant (`Ureq` under the
+    // 0.44 `ureq` feature) represent failed HTTP traffic; collapse them onto
+    // the same `Io`-shape so `exit_code_for_error` produces 5 (`IO_ERROR`)
+    // and the user sees the GITHUB_TOKEN hint. The `Reqwest` variant is
+    // compiled out under our feature set so we don't enumerate it here.
     let network_msg = match &err {
         SuError::Network(msg) => Some(msg.clone()),
-        SuError::Reqwest(req) => Some(req.to_string()),
+        SuError::Ureq(req) => Some(req.to_string()),
         _ => None,
     };
     if let Some(msg) = network_msg {

@@ -44,10 +44,12 @@ use std::io::{Cursor, Write};
 
 use camino::Utf8PathBuf;
 use indexmap::IndexMap;
-use quick_xml::Writer;
 use quick_xml::events::attributes::Attribute;
-use quick_xml::events::{BytesCData, BytesDecl, BytesEnd, BytesPI, BytesStart, BytesText, Event};
+use quick_xml::events::{
+    BytesCData, BytesDecl, BytesEnd, BytesPI, BytesRef, BytesStart, BytesText, Event,
+};
 use quick_xml::reader::Reader;
+use quick_xml::{Writer, XmlVersion};
 
 use crate::Result;
 use crate::document::{Document, FormatTag, Value};
@@ -358,6 +360,23 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                 // CDATA at top level is unusual; ignore (well-formed
                 // XML cannot contain it outside an element).
             }
+            Ok(Event::GeneralRef(r)) => {
+                // quick-xml 0.38+ reports `&amp;`, `&lt;`, etc. as a separate
+                // event instead of expanding them inside `Event::Text`. Resolve
+                // the reference here and append to the current frame's text so
+                // the parsed `Value` matches the pre-0.38 behaviour (entities
+                // are folded into the surrounding text body).
+                let s = resolve_general_ref(&r, text, reader.buffer_position() as usize)?;
+                if let Some(frame) = stack.last_mut() {
+                    if frame.saw_element {
+                        frame.saw_mixed = true;
+                    }
+                    frame.has_text = true;
+                    frame.text.push_str(&s);
+                }
+                // GeneralRef outside any element would be a malformed document;
+                // quick-xml reports the structural error separately.
+            }
         }
     }
 
@@ -420,7 +439,13 @@ fn build_start_frame(start: &BytesStart<'_>) -> Result<Frame> {
 }
 
 fn decode_text(t: &BytesText<'_>) -> Result<String> {
-    t.unescape()
+    // quick-xml 0.38+ split entity resolution out of `Event::Text`: text events
+    // now carry the raw (un-entity-expanded) bytes and entities are reported as
+    // a separate `Event::GeneralRef`. `xml_content` still applies EOL
+    // normalisation per the XML 1.0 spec, which matches the pre-0.38 behaviour
+    // for everything except entities (those are handled in the `GeneralRef`
+    // arm above).
+    t.xml_content(XmlVersion::Implicit1_0)
         .map(|c| c.into_owned())
         .map_err(|e| Error::Parse {
             file: None,
@@ -433,7 +458,11 @@ fn decode_text(t: &BytesText<'_>) -> Result<String> {
 }
 
 fn decode_attr(attr: &Attribute<'_>) -> Result<String> {
-    attr.unescape_value()
+    // `unescape_value` was deprecated in quick-xml 0.38 in favour of
+    // `normalized_value`, which does the same predefined-entity resolution
+    // plus the spec-mandated whitespace normalisation. The wire-level output
+    // is the same for the predefined-entity set we care about.
+    attr.normalized_value(XmlVersion::Implicit1_0)
         .map(|c| c.into_owned())
         .map_err(|e| Error::Parse {
             file: None,
@@ -443,6 +472,45 @@ fn decode_attr(attr: &Attribute<'_>) -> Result<String> {
             snippet: String::new(),
             message: format!("XML parse error: malformed attribute value: {e}"),
         })
+}
+
+/// Resolve an `Event::GeneralRef(&entity;)` payload into its textual
+/// replacement.
+///
+/// Handles the five predefined XML entities (`amp`, `lt`, `gt`, `quot`,
+/// `apos`) plus numeric character references (`&#48;` / `&#x30;`). Anything
+/// else is an undeclared entity — without a DTD we cannot resolve it, so we
+/// surface a `Error::Parse` rather than silently swallowing the reference.
+fn resolve_general_ref(r: &BytesRef<'_>, text: &str, pos: usize) -> Result<String> {
+    let make_parse_err = |msg: String| {
+        let (line, col) = byte_pos_to_line_col(text, pos);
+        Error::Parse {
+            file: None,
+            line,
+            col,
+            span: pos..pos,
+            snippet: snippet_for_pos(text, pos),
+            message: msg,
+        }
+    };
+    let name = r
+        .decode()
+        .map_err(|e| make_parse_err(format!("XML parse error: malformed entity reference: {e}")))?;
+    if r.is_char_ref() {
+        // Numeric character reference — `&#48;` or `&#x30;`.
+        let ch = r.resolve_char_ref().map_err(|e| {
+            make_parse_err(format!(
+                "XML parse error: malformed character reference: {e}",
+            ))
+        })?;
+        return Ok(ch.map_or_else(String::new, |c| c.to_string()));
+    }
+    if let Some(resolved) = quick_xml::escape::resolve_predefined_entity(&name) {
+        return Ok(resolved.to_owned());
+    }
+    Err(make_parse_err(format!(
+        "XML parse error: undeclared entity reference '&{name};'",
+    )))
 }
 
 fn bytes_to_string(b: &[u8]) -> String {
@@ -853,7 +921,14 @@ fn non_empty_array(v: &Value) -> bool {
     matches!(v, Value::Array(items) if !items.is_empty())
 }
 
-fn map_write_err(e: quick_xml::Error) -> Error {
+fn map_write_err(e: std::io::Error) -> Error {
+    // quick-xml 0.37 changed `Writer::write_event` to return
+    // `std::io::Result<()>` instead of its own error type, so the closures
+    // passed to `.map_err` now see a `std::io::Error`. We render the same
+    // `XML write error: ...` text regardless — the only XML-write path that
+    // can fail in practice is the `Cursor<Vec<u8>>` underneath, and surfacing
+    // it as `Error::Format` keeps the error category stable for downstream
+    // consumers.
     Error::Format {
         format: "xml",
         message: format!("XML write error: {e}"),
@@ -977,6 +1052,40 @@ mod tests {
         assert!(
             out.contains("<![CDATA[if (a < b) {}]]>"),
             "cdata block must round-trip byte-identically inside; got: {out:?}",
+        );
+    }
+
+    #[test]
+    fn parse_predefined_entity_references_are_resolved_into_text() {
+        // quick-xml 0.38+ surfaces `&amp;` / `&lt;` / `&gt;` / `&quot;` /
+        // `&apos;` as separate `Event::GeneralRef` events instead of
+        // expanding them inside the surrounding `Event::Text`. Pin the
+        // pre-0.38 behaviour: the entities must be folded back into the
+        // element body so callers see the resolved text in `#text`.
+        let v = parse("<msg>A &amp; B &lt; C &gt; D &quot;E&quot; &apos;F&apos;</msg>");
+        let body = root_element_body(&v, "msg");
+        let Some(Value::String(text)) = body.get(KEY_TEXT) else {
+            panic!("expected #text on <msg>")
+        };
+        assert_eq!(
+            text, "A & B < C > D \"E\" 'F'",
+            "predefined entities must be resolved into the text body",
+        );
+    }
+
+    #[test]
+    fn parse_numeric_character_reference_is_resolved() {
+        // Numeric character refs (`&#48;` decimal, `&#x30;` hex) take the
+        // separate `GeneralRef::is_char_ref` branch of the resolver. Both
+        // forms must resolve to the same ASCII '0'.
+        let v = parse("<m>x&#48;y&#x30;z</m>");
+        let body = root_element_body(&v, "m");
+        let Some(Value::String(text)) = body.get(KEY_TEXT) else {
+            panic!("expected #text on <m>")
+        };
+        assert_eq!(
+            text, "x0y0z",
+            "decimal and hex character refs must resolve to '0'",
         );
     }
 
