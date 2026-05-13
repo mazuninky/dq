@@ -160,8 +160,8 @@ fn jsonl_sort_keys_per_line() {
 
 #[test]
 fn yaml_sort_keys_round_trip() {
-    // YAML keys are sorted by `canonicalize_keys` before serde_yml emits.
-    // The output is whatever shape serde_yml produces (no comments,
+    // YAML keys are sorted by `canonicalize_keys` before serde_norway emits.
+    // The output is whatever shape serde_norway produces (no comments,
     // canonical block style); the only invariant we pin is the order of
     // the top-level keys.
     let doc = parse("yaml", "z: 1\na: 2\nm: 3\n");
@@ -228,7 +228,7 @@ fn json_sort_keys_preserves_big_int() {
 
 #[test]
 fn yaml_write_with_options_default_matches_write() {
-    // YAML default-equivalence: M2's `serde_yml` emitter must keep producing
+    // YAML default-equivalence: M2's `serde_norway` emitter must keep producing
     // identical bytes when no options are set. The CLI dispatch layer relies
     // on this when threading WriteOptions through every write command.
     let doc = parse("yaml", "name: dq\nversion: 1\n");

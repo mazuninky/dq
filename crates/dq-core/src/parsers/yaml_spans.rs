@@ -1,6 +1,6 @@
 //! YAML write-pat span builder + textual-edit renderers.
 //!
-//! Read-pat YAML stays on `serde_yml` ([`crate::parsers::yaml`]). This module
+//! Read-pat YAML stays on `serde_norway` ([`crate::parsers::yaml`]). This module
 //! is the **parallel** parser used by the M2 write path: it walks the same
 //! source bytes through the low-level `saphyr-parser` event API to record a
 //! [`SpanMap`] (canonical RFC 6901 pointer → [`ValueSpan`]) keyed off the
@@ -14,7 +14,7 @@
 //! # Public surface
 //!
 //! - [`parse_with_spans`] — `(Value, SpanMap)` from a byte slice. The `Value`
-//!   is built by reusing the existing `serde_yml`-based [`crate::parsers::Yaml`]
+//!   is built by reusing the existing `serde_norway`-based [`crate::parsers::Yaml`]
 //!   read path; spans come from a fresh `saphyr-parser` walk. The double
 //!   parse trades ~2× CPU for a much simpler implementation — see
 //!   [`parse_with_spans`] docs for the cost analysis.
@@ -60,7 +60,7 @@ use crate::textual_edit::{InsertionRenderer, ScalarRenderer};
 ///
 /// The `Value` and the `SpanMap` are byte-equivalent views of the same source.
 /// Callers that need both — primarily [`parse_yaml_with_spans`] — pay the cost
-/// of two parses (one through `serde_yml`, one through `saphyr-parser`). For
+/// of two parses (one through `serde_norway`, one through `saphyr-parser`). For
 /// the document sizes M2 targets (≤ 1 MB human-edited config files) the spike
 /// measured ~46 ms total at 1 MB, well under the 100 ms budget; the
 /// simplicity vs. building a single parser that produces both is the

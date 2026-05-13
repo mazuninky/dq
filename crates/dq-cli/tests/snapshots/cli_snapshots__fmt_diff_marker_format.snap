@@ -13,5 +13,5 @@ expression: normalized
 +++ b/<TMP>/bravo.yaml
 @@ -0,0 +1,2 @@
 +x: 1
-+'y': 2
++y: 2
 Modified: 2, Skipped: 0, Failed: 0

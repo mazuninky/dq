@@ -148,9 +148,10 @@ fn fmt_check_exits_zero_on_canonical_file() {
 fn fmt_check_exits_one_on_non_canonical_file() {
     // Spec: when re-emitted bytes differ from source, `--check` errors with
     // a `CheckPending` marker that the exit-code mapper translates to 1.
-    // We use a YAML reserved word (`y`) the writer always quotes — source
-    // says `y:` (unquoted), writer produces `'y':`, so they cannot match.
-    let original = "z: 1\ny: 2\n";
+    // We use 4-space indented nested mapping — `serde_norway` emits 2-space
+    // block indent, so source `a:\n    b: 1\n` normalises to
+    // `a:\n  b: 1\n`, which cannot match the source.
+    let original = "a:\n    b: 1\n";
     let tmp = write_yaml(original);
     let path = tmp.to_str().unwrap();
     let cli = Cli::try_parse_from(["dq", "--check", "fmt", path]).unwrap();

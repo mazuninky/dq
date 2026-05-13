@@ -63,7 +63,7 @@ enum Command {
     BenchSpanBuild(SpanBuildArgs),
     /// Synthesise an insertion of `/spec/strategy/type RollingUpdate` into
     /// FIXTURE (only `a_k8s_with_comments.yaml` is supported), parse the
-    /// result via `serde_yml::Value`, PASS iff parse succeeds.
+    /// result via `serde_norway::Value`, PASS iff parse succeeds.
     InsertTest(SpanBuildArgs),
 }
 
@@ -609,7 +609,7 @@ fn stddev_ms(samples: &[f64]) -> f64 {
 /// 4. Find the byte position at which the parent's last child line ends —
 ///    naive scan of the remaining lines until an indent ≤ parent's is
 ///    encountered (or EOF).
-/// 5. Splice and validate via `serde_yml::from_slice::<serde_yml::Value>`.
+/// 5. Splice and validate via `serde_norway::from_slice::<serde_norway::Value>`.
 fn run_insert_test(args: &SpanBuildArgs) -> Result<ExitCode> {
     let bytes = read_bytes(&args.fixture)?;
     let text = std::str::from_utf8(&bytes).context("fixture is not valid UTF-8")?;
@@ -661,7 +661,7 @@ fn run_insert_test(args: &SpanBuildArgs) -> Result<ExitCode> {
     out.extend_from_slice(&bytes[parent_block_end..]);
 
     // Validate: the result must parse as YAML.
-    match serde_yml::from_slice::<serde_yml::Value>(&out) {
+    match serde_norway::from_slice::<serde_norway::Value>(&out) {
         Ok(_) => {
             println!("PASS insert-test");
             // Echo the result on stdout for human inspection.

@@ -307,7 +307,7 @@ fn insertion_renderer_nested_map_output_is_parsable() {
     // appends it after an existing line, so the parser sees the full
     // fragment minus the leading `\n`.
     let parsable = &fragment[1..];
-    let parsed: serde_yml::Value = serde_yml::from_slice(parsable).unwrap_or_else(|e| {
+    let parsed: serde_norway::Value = serde_norway::from_slice(parsable).unwrap_or_else(|e| {
         panic!(
             "renderer output must be valid YAML; got error: {e}\nbytes: {:?}",
             String::from_utf8_lossy(parsable)

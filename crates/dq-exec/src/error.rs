@@ -25,12 +25,12 @@ pub enum ExecError {
     /// A rule YAML document failed to deserialize against the [`crate::rule::Rule`]
     /// schema (typo in a field name, missing required field, type mismatch).
     /// `hint` is a short human-readable summary; `source` is the underlying
-    /// `serde_yml` error for callers that want the parser-level details.
+    /// `serde_norway` error for callers that want the parser-level details.
     #[error("rule parse error: {hint}")]
     Parse {
-        /// Underlying `serde_yml` deserialization error.
+        /// Underlying `serde_norway` deserialization error.
         #[source]
-        source: serde_yml::Error,
+        source: serde_norway::Error,
         /// Short human-readable summary of what went wrong.
         hint: String,
     },
@@ -263,13 +263,13 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
 
-    /// Force a `serde_yml::Error` so the Parse variant can be constructed
+    /// Force a `serde_norway::Error` so the Parse variant can be constructed
     /// without coupling tests to private parser internals.
-    fn sample_yaml_error() -> serde_yml::Error {
+    fn sample_yaml_error() -> serde_norway::Error {
         // Parsing a non-mapping into a mapping-shaped target produces a
         // typed error — the exact wording is irrelevant; we just need the
         // value.
-        serde_yml::from_str::<std::collections::BTreeMap<String, String>>("- not a map\n")
+        serde_norway::from_str::<std::collections::BTreeMap<String, String>>("- not a map\n")
             .expect_err("parse should fail")
     }
 

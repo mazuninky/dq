@@ -39,14 +39,14 @@ pub(crate) struct CompiledSchemaCheck {
     pub(crate) message_prefix: Option<String>,
 }
 
-/// Compile an inline `serde_yml::Value` schema into a
+/// Compile an inline `serde_norway::Value` schema into a
 /// [`CompiledSchemaCheck`].
 ///
 /// `rule_id` flows into the [`ExecError::SchemaCompile`] payload so the
 /// error message names the offending rule.
 pub(crate) fn compile_inline(
     rule_id: &str,
-    schema_yaml: &serde_yml::Value,
+    schema_yaml: &serde_norway::Value,
     message_prefix: Option<String>,
 ) -> Result<CompiledSchemaCheck> {
     let schema_json = yaml_to_serde_json(schema_yaml).map_err(|err| ExecError::SchemaCompile {
@@ -266,21 +266,24 @@ fn canonicalize_utf8(path: &Utf8Path) -> std::io::Result<Utf8PathBuf> {
     })
 }
 
-/// Convert a `serde_yml::Value` to a `serde_json::Value`.
+/// Convert a `serde_norway::Value` to a `serde_json::Value`.
 ///
-/// `serde_yml`'s `Value` is YAML-shaped: it carries tagged variants and
+/// `serde_norway`'s `Value` is YAML-shaped: it carries tagged variants and
 /// allows non-string mapping keys. The `jsonschema` crate consumes
-/// `serde_json::Value`, so we round-trip through `serde_yml::to_string`
-/// then `serde_yml::from_str::<serde_json::Value>` — which mirrors
+/// `serde_json::Value`, so we round-trip through `serde_norway::to_string`
+/// then `serde_norway::from_str::<serde_json::Value>` — which mirrors
 /// what the test runner does for fixture inputs and gives us identical
 /// key-coercion semantics.
-fn yaml_to_serde_json(value: &serde_yml::Value) -> std::result::Result<serde_json::Value, String> {
+fn yaml_to_serde_json(
+    value: &serde_norway::Value,
+) -> std::result::Result<serde_json::Value, String> {
     // Round-trip via the YAML serializer to handle tagged values and
-    // non-string keys cleanly. `serde_yml::from_str::<serde_json::Value>`
+    // non-string keys cleanly. `serde_norway::from_str::<serde_json::Value>`
     // accepts the YAML text and emits a JSON-shaped value (or fails
     // with a typed error if a non-string key sneaks through).
-    let yaml_text = serde_yml::to_string(value).map_err(|err| format!("yaml serialize: {err}"))?;
-    serde_yml::from_str::<serde_json::Value>(&yaml_text)
+    let yaml_text =
+        serde_norway::to_string(value).map_err(|err| format!("yaml serialize: {err}"))?;
+    serde_norway::from_str::<serde_json::Value>(&yaml_text)
         .map_err(|err| format!("yaml→json transcode: {err}"))
 }
 
@@ -292,7 +295,7 @@ mod tests {
 
     #[test]
     fn compile_inline_with_valid_schema_succeeds() {
-        let yaml: serde_yml::Value = serde_yml::from_str(
+        let yaml: serde_norway::Value = serde_norway::from_str(
             r#"
 type: object
 required: [name]
@@ -317,7 +320,7 @@ properties:
         // schema that declares `$ref: https://...` must fail compile
         // because no HTTP resolver is wired up (resolve-http feature
         // is off in our `default-features = false` configuration).
-        let yaml: serde_yml::Value = serde_yml::from_str(
+        let yaml: serde_norway::Value = serde_norway::from_str(
             r#"
 $ref: "https://json-schema.org/draft/2020-12/schema"
 "#,

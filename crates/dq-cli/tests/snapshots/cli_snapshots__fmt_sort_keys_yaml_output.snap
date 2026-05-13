@@ -4,6 +4,6 @@ expression: stdout
 ---
 a:
   b: 3
-  'y': 2
+  y: 2
 m: 4
 z: 1

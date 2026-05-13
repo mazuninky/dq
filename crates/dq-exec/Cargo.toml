@@ -20,11 +20,11 @@ dq-transform = { path = "../dq-transform" }
 # cost is the `include_str!` rule files at compile time.
 dq-lint = { path = "../dq-lint" }
 
-# Core data / serialization. `serde_yml` parses the rule schema; `serde_json`
+# Core data / serialization. `serde_norway` parses the rule schema; `serde_json`
 # is the lingua franca for diagnostic envelopes (matches the SARIF reporter
 # contract in `dq-cli/src/output/sarif.rs`).
 serde = { workspace = true }
-serde_yml = { workspace = true }
+serde_norway = { workspace = true }
 serde_json = { workspace = true }
 
 # Errors / logging.

@@ -11,7 +11,7 @@ use std::str::FromStr;
 
 use indexmap::IndexMap;
 use serde::Deserialize;
-use serde_yml::Value as YamlValue;
+use serde_norway::Value as YamlValue;
 
 use crate::Result;
 use crate::WriteOptions;
@@ -35,7 +35,7 @@ impl Format for Yaml {
 
     fn parse(&self, bytes: &[u8]) -> Result<Document> {
         let mut documents: Vec<Value> = Vec::new();
-        for de_result in serde_yml::Deserializer::from_slice(bytes) {
+        for de_result in serde_norway::Deserializer::from_slice(bytes) {
             let yaml: YamlValue = YamlValue::deserialize(de_result).map_err(map_yaml_err)?;
             documents.push(yaml_value_to_value(yaml));
         }
@@ -76,8 +76,8 @@ impl Format for Yaml {
         w: &mut dyn Write,
         opts: &WriteOptions,
     ) -> Result<()> {
-        // YAML ignores `opts.indent` in M4 (per design D6 — the legacy
-        // `serde_yml` emitter does not expose an indent knob and the
+        // YAML ignores `opts.indent` in M4 (per design D6 — the
+        // `serde_norway` emitter does not expose an indent knob and the
         // event-API rewrite that would land it is deferred to M5+). The CLI
         // dispatch layer is responsible for emitting a `tracing::warn!`
         // when a user passes `--indent` with a YAML output; we keep the
@@ -102,11 +102,11 @@ impl Format for Yaml {
 }
 
 fn write_one(v: &Value, w: &mut dyn Write) -> Result<()> {
-    let s = serde_yml::to_string(v).map_err(map_yaml_err)?;
+    let s = serde_norway::to_string(v).map_err(map_yaml_err)?;
     write_io(w, s.as_bytes())
 }
 
-fn map_yaml_err(e: serde_yml::Error) -> Error {
+fn map_yaml_err(e: serde_norway::Error) -> Error {
     let location = e.location();
     Error::Parse {
         file: None,
@@ -154,7 +154,7 @@ fn stringify_key(k: YamlValue) -> String {
     }
 }
 
-fn yaml_number_to_value(n: &serde_yml::Number) -> Value {
+fn yaml_number_to_value(n: &serde_norway::Number) -> Value {
     if let Some(i) = n.as_i64() {
         return Value::Int(i);
     }

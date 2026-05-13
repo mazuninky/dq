@@ -11,9 +11,9 @@ publish.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yml = { workspace = true }
+serde_norway = { workspace = true }
 # Low-level event-API YAML parser used by the M2 textual-edit write path
-# (see `parsers/yaml_spans.rs`). Read-pat M1 still uses `serde_yml`; the two
+# (see `parsers/yaml_spans.rs`). Read-pat M1 still uses `serde_norway`; the two
 # coexist deliberately — they parse the same fixtures and any divergence in
 # `Value` produced from byte-equal input would surface as a test failure.
 saphyr-parser = { workspace = true }

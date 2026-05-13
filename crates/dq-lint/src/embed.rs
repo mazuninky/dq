@@ -10,7 +10,7 @@
 //! silently disappearing. Convention: keep the rule lists alphabetised so
 //! diffs are easy to read. The very last `include_str!` in each
 //! `concat!` block MUST NOT be followed by a `"\n---\n"` separator —
-//! `serde_yml::Deserializer::from_str` treats a trailing separator as an
+//! `serde_norway::Deserializer::from_str` treats a trailing separator as an
 //! empty document and rejects it.
 
 /// Names of every standard rule namespace shipped with `dq-lint`, in
