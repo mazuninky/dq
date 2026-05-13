@@ -11,7 +11,7 @@ members = [
 exclude = ["spikes/*", "examples/*"]
 
 [workspace.package]
-version = "2026.20.1"
+version = "2026.20.2"
 edition = "2024"
 license = "MIT"
 authors = ["Mazunin Konstantin"]
