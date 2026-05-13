@@ -77,3 +77,33 @@ serde = { workspace = true }
 # scalar substitutions must keep the YAML buffer well-formed and leave
 # unrelated bytes untouched. Workspace-pinned at proptest 1.x.
 proptest = { workspace = true }
+# Criterion benchmark harness. Each file under `benches/` is opted in
+# below via a `[[bench]]` entry with `harness = false`; without that
+# attribute cargo would build the file under the default test harness
+# and `criterion_main!` would not run.
+criterion = { workspace = true }
+# Seeded RNG for deterministic synthetic workload generation inside
+# bench files (`StdRng::seed_from_u64(42)`).
+rand = { workspace = true }
+
+# Bench files. `harness = false` is mandatory — cargo wires
+# `criterion_main!` only when the default libtest harness is disabled.
+[[bench]]
+name = "parse"
+harness = false
+
+[[bench]]
+name = "write"
+harness = false
+
+[[bench]]
+name = "pointer"
+harness = false
+
+[[bench]]
+name = "transform"
+harness = false
+
+[[bench]]
+name = "textual_edit"
+harness = false

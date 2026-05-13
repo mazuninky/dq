@@ -139,6 +139,16 @@ tempfile = "3"
 insta = { version = "1", features = ["yaml"] }
 pretty_assertions = "1"
 proptest = "1"
+# Criterion is the de-facto Rust benchmark harness. Per-crate `benches/`
+# directories opt in via `criterion = { workspace = true }` in
+# `[dev-dependencies]` plus `[[bench]] harness = false` entries. The
+# `html_reports` feature emits `target/criterion/<bench>/report/index.html`
+# for offline inspection (cargo already ignores `target/`).
+criterion = { version = "0.5", features = ["html_reports"] }
+# Deterministic workload generation inside bench files. Each `synth_*`
+# helper seeds an `StdRng::seed_from_u64(42)` so numbers are reproducible
+# across runs and machines.
+rand = "0.8"
 
 [profile.release]
 lto = true

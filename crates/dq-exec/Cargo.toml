@@ -49,3 +49,14 @@ jsonschema = { workspace = true }
 [dev-dependencies]
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
+# Criterion benchmark harness for `benches/evaluate.rs`. The `[[bench]]`
+# entry below opts the file out of the default libtest harness so its
+# `criterion_main!` macro runs at `cargo bench` time.
+criterion = { workspace = true }
+# Seeded RNG for deterministic k8s-shaped workload generation inside
+# the bench file (`StdRng::seed_from_u64(42)`).
+rand = { workspace = true }
+
+[[bench]]
+name = "evaluate"
+harness = false

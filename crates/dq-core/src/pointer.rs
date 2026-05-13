@@ -58,11 +58,36 @@ impl Pointer {
     /// Used by the `transform::merge` recursion to walk children without
     /// mutating the parent pointer. The original pointer is left untouched
     /// and a new owning `Pointer` is returned.
+    ///
+    /// This call clones the internal `Vec<Segment>`, so each invocation is
+    /// O(current depth). Prefer [`Pointer::push_segment`] /
+    /// [`Pointer::pop_segment`] when walking a tree recursively — those keep
+    /// the cost linear in the walk's depth rather than quadratic.
     #[must_use]
     pub fn with_segment(&self, seg: Segment) -> Self {
         let mut segs = self.0.clone();
         segs.push(seg);
         Self(segs)
+    }
+
+    /// Append a segment in place. O(1) amortized.
+    ///
+    /// Prefer this in recursive tree walks (e.g. `transform::diff`,
+    /// `transform::merge_into`) that need to extend the pointer for descent
+    /// and shrink it afterwards — pair with [`Pointer::pop_segment`]. For the
+    /// one-shot "build a new owned pointer" use case (where the parent
+    /// pointer must stay untouched and a fresh owning value is needed),
+    /// see [`Pointer::with_segment`].
+    pub fn push_segment(&mut self, seg: Segment) {
+        self.0.push(seg);
+    }
+
+    /// Remove and return the last segment in place. O(1).
+    ///
+    /// Returns `None` when called on a root pointer. Pairs with
+    /// [`Pointer::push_segment`] to unwind one level of recursion.
+    pub fn pop_segment(&mut self) -> Option<Segment> {
+        self.0.pop()
     }
 
     /// Parse an RFC 6901 pointer string.
@@ -452,6 +477,66 @@ mod tests {
         assert_eq!(child.as_canonical(), "/a/b");
         // The original must be untouched — `with_segment` must clone.
         assert_eq!(base.as_canonical(), "/a");
+    }
+
+    #[test]
+    fn push_then_pop_round_trips() {
+        // Round-trip property: pushing a segment onto a default pointer and
+        // then popping it must return the pointer to its original state. This
+        // is the invariant that lets `transform::diff` push at the top of a
+        // loop iteration and pop at the bottom without leaking state across
+        // iterations.
+        let mut p = Pointer::default();
+        p.push_segment(Segment::Key("foo".into()));
+        let popped = p.pop_segment();
+        assert_eq!(popped, Some(Segment::Key("foo".into())));
+        assert_eq!(p, Pointer::default());
+    }
+
+    #[test]
+    fn pop_on_empty_returns_none() {
+        // Defensive: `pop_segment` mirrors `Vec::pop`, which is a no-op on an
+        // empty backing store rather than a panic. Recursive walks rely on
+        // this — if an over-pop ever surfaces it should manifest as a
+        // structural bug downstream, not as a midwalk crash.
+        let mut p = Pointer::default();
+        assert_eq!(p.pop_segment(), None);
+        assert_eq!(p, Pointer::default());
+    }
+
+    #[test]
+    fn push_segment_extends_segments() {
+        // After `push_segment`, the segments slice ends with the pushed value
+        // and grows by exactly one element. Pairs with the round-trip test
+        // above as a positive-direction check.
+        let mut p = Pointer::parse("/a").unwrap();
+        p.push_segment(Segment::Key("b".into()));
+        assert_eq!(p.segments().len(), 2);
+        assert_eq!(p.segments().last(), Some(&Segment::Key("b".into())));
+        // And the canonical render reflects the new tail segment.
+        assert_eq!(p.as_canonical(), "/a/b");
+    }
+
+    #[test]
+    fn push_pop_balanced_walk_returns_to_default() {
+        // Models the diff/merge loop pattern: push at top, recurse, pop at
+        // bottom. After a balanced walk through several siblings, the
+        // pointer must be observably identical to where the walk started.
+        let mut p = Pointer::default();
+        for key in ["spec", "template", "spec"] {
+            p.push_segment(Segment::Key(key.into()));
+            // Simulate an `Add` / `Remove` emit while the path is extended:
+            // the patch op clones the current pointer (its own owned copy)
+            // and the walk pops it after, so the original pointer doesn't
+            // retain the segment.
+            let _emit = p.clone();
+            p.pop_segment();
+        }
+        assert_eq!(
+            p,
+            Pointer::default(),
+            "balanced push/pop must restore state"
+        );
     }
 
     #[test]

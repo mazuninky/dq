@@ -39,3 +39,21 @@ embedded-jq = ["dep:jaq-core", "dep:jaq-std", "dep:jaq-json"]
 [dev-dependencies]
 serde_json = { workspace = true }
 pretty_assertions = { workspace = true }
+# Criterion benchmark harness. The `[[bench]]` entry below opts the
+# `benches/jq.rs` file out of the default libtest harness so its
+# `criterion_main!` macro runs at `cargo bench` time.
+criterion = { workspace = true }
+# Seeded RNG for deterministic synthetic workloads inside the bench
+# file (`StdRng::seed_from_u64(42)`).
+rand = { workspace = true }
+
+[[bench]]
+name = "jq"
+harness = false
+# Bench only meaningful when `embedded-jq` is on (off-state stubs return
+# `JqError::FeatureDisabled` immediately, which is uninteresting). The
+# default feature set already includes `embedded-jq`, so plain
+# `cargo bench -p dq-transform` exercises the real engine; the bench
+# itself guards every jq call against `cfg(feature = "embedded-jq")`
+# so a `--no-default-features` `cargo bench --no-run` still compiles.
+required-features = ["embedded-jq"]

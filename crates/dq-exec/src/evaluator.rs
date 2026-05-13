@@ -78,6 +78,62 @@ pub struct Evaluator {
     max_extract_depth: usize,
 }
 
+/// Per-[`Evaluator::new`] cache for compiled jq filters.
+///
+/// `Evaluator::new` walks every rule's six potential jq-bearing fields
+/// (`match.filter`, `loc.pointer`, `loc.file`, `loc.line`, `fix.jq`,
+/// `fix.ops`) plus each `check.jq` / composite `extract` and pays
+/// `JqEngine::compile` per occurrence. In real rulesets the same
+/// expression repeats — `@std/k8s` has ~10 unique `match.filter`s shared
+/// across 28 rules — so a per-`Evaluator::new` cache hashed on the
+/// expression string deduplicates those compiles down to one
+/// `JqEngine` per unique expression, shared through `Arc`.
+///
+/// ## Invariants
+///
+/// - **Per-`Evaluator::new`, not global.** The cache is allocated at the
+///   start of [`Evaluator::new`] and dropped when it returns; the
+///   resulting [`Evaluator`] holds onto its [`Arc<JqEngine>`]s
+///   independently. Two consecutive [`Evaluator::new`] calls with the
+///   same expression therefore produce *different* `Arc` instances —
+///   intentional: a global cache would leak in long-lived processes and
+///   would have to thread test isolation through every fixture that
+///   pokes at a bad expression on purpose. See
+///   [`openspec/changes/perf-jq-compile-cache/design.md`] §3 for the
+///   full rationale.
+/// - **Exact-string cache key.** No hashing, no whitespace
+///   normalisation — `". + 1"` and ".+1" are different keys. The miss
+///   cost is one compile; the hit cost is an `Arc::clone` (refcount
+///   bump). We do not normalise because two superficially-identical
+///   strings could compile against different `defs` chains in the
+///   future, and a normalisation step would mask that.
+/// - **Concurrent `run()` is safe.** `JqEngine` is `Send + Sync` (the
+///   `sync` feature on `jaq-json` swaps the internal `Rc` for `Arc`),
+///   so an `Arc<JqEngine>` shared across multiple [`CompiledRule`]s is
+///   safe to invoke concurrently from rayon workers.
+pub(crate) type JqCache = std::collections::HashMap<String, Arc<JqEngine>>;
+
+/// Look `expr` up in `cache`; compile-on-miss and store; return
+/// the (cached-or-fresh) [`Arc<JqEngine>`].
+///
+/// On compile failure the error is wrapped in [`ExecError::RuleCompile`]
+/// tagged with `rule_id` so the caller can surface a useful diagnostic
+/// to the user. The cache key is the raw `expr` string; see
+/// [`JqCache`] for the invariants this helper enforces.
+fn compile_or_cached(cache: &mut JqCache, expr: &str, rule_id: &str) -> Result<Arc<JqEngine>> {
+    if let Some(engine) = cache.get(expr) {
+        return Ok(Arc::clone(engine));
+    }
+    let engine = Arc::new(
+        JqEngine::compile(expr).map_err(|err| ExecError::RuleCompile {
+            rule_id: rule_id.to_string(),
+            source: err,
+        })?,
+    );
+    cache.insert(expr.to_string(), Arc::clone(&engine));
+    Ok(engine)
+}
+
 /// Pre-compiled `check` block, dispatched on at evaluate-time.
 ///
 /// Each variant of [`Check`] turns into the matching variant here:
@@ -89,8 +145,10 @@ pub(crate) enum CompiledCheck {
     /// Variant 1 — jq-driven check. The legacy path; existing rules
     /// continue to use this.
     Jq {
-        /// Compiled jq evaluator for `check.jq`.
-        engine: JqEngine,
+        /// Compiled jq evaluator for `check.jq`. Shared via [`Arc`] so
+        /// two rules with the same `check.jq` expression amortise one
+        /// compile — see [`JqCache`].
+        engine: Arc<JqEngine>,
         /// Message template — substitution happens via
         /// [`crate::template::render`].
         message: String,
@@ -132,27 +190,27 @@ impl std::fmt::Debug for CompiledCheck {
 /// path) is cheap.
 pub(crate) struct CompiledRule {
     pub(crate) rule: Rule,
-    pub(crate) filter_engine: Option<JqEngine>,
+    pub(crate) filter_engine: Option<Arc<JqEngine>>,
     pub(crate) check: CompiledCheck,
     pub(crate) glob_matcher: Option<GlobMatcher>,
-    pub(crate) loc_file_engine: Option<JqEngine>,
-    pub(crate) loc_line_engine: Option<JqEngine>,
+    pub(crate) loc_file_engine: Option<Arc<JqEngine>>,
+    pub(crate) loc_line_engine: Option<Arc<JqEngine>>,
     /// Phase 2 of `add-ir-foundation`: pre-compiled `loc.pointer` jq
     /// expression. Populated when the rule's `loc:` block declares a
     /// `pointer:` field. Consumed by [`resolve_loc_position`] which
     /// walks the new `loc.pointer → loc.line → intrinsic` chain.
-    pub(crate) loc_pointer_engine: Option<JqEngine>,
+    pub(crate) loc_pointer_engine: Option<Arc<JqEngine>>,
     /// M10 — pre-compiled `fix.jq` engine. Populated when the rule
     /// declares a `fix:` block with a `jq:` field; consumed by
     /// [`crate::Fixer`] as the legacy whole-document transform path.
-    pub(crate) fix_engine: Option<JqEngine>,
+    pub(crate) fix_engine: Option<Arc<JqEngine>>,
     /// Phase 4 — pre-compiled `fix.ops` engine. Populated when the rule
     /// declares a `fix:` block with an `ops:` field; consumed by
     /// [`crate::Fixer`] as the per-violation [`dq_core::EditScript`]
     /// vocabulary path. When both `fix.jq` and `fix.ops` are set, the
     /// fixer prefers `fix.ops` and logs a `tracing::warn!` shadowing
     /// notice. See `data-query-exec` Requirement "`Fixer` runtime".
-    pub(crate) fix_ops_engine: Option<JqEngine>,
+    pub(crate) fix_ops_engine: Option<Arc<JqEngine>>,
 }
 
 impl CompiledRule {
@@ -200,6 +258,13 @@ impl Evaluator {
     ///   compile.
     pub fn new(rulesets: Vec<RuleSet>) -> Result<Self> {
         let mut compiled = Vec::new();
+        // Per-invocation jq compile cache. Lives only for the duration
+        // of this `Evaluator::new` call so that two consecutive calls
+        // don't share state (see [`JqCache`] for the full rationale).
+        // Rules within a single ruleset OR across rulesets in the same
+        // call get deduplication; rules across separate evaluators do
+        // not.
+        let mut cache: JqCache = JqCache::new();
         for set in rulesets {
             // Each ruleset's source flows into per-rule compilation so
             // schema_file resolution and embedded-schema lookups can
@@ -211,6 +276,7 @@ impl Evaluator {
                     &source,
                     0,
                     MAX_EXTRACT_DEPTH,
+                    &mut cache,
                 )?));
             }
         }
@@ -333,17 +399,13 @@ pub(crate) fn compile_rule_to_depth(
     source: &RuleSource,
     current_depth: usize,
     max_depth: usize,
+    cache: &mut JqCache,
 ) -> Result<CompiledRule> {
     let filter_engine = match rule.match_.filter.as_deref() {
-        Some(expr) => Some(
-            JqEngine::compile(expr).map_err(|err| ExecError::RuleCompile {
-                rule_id: rule.id.clone(),
-                source: err,
-            })?,
-        ),
+        Some(expr) => Some(compile_or_cached(cache, expr, &rule.id)?),
         None => None,
     };
-    let check = compile_check(&rule, source, current_depth, max_depth)?;
+    let check = compile_check(&rule, source, current_depth, max_depth, cache)?;
     let glob_matcher = match rule.match_.glob.as_deref() {
         Some(pattern) => {
             let glob = globset::Glob::new(pattern).map_err(|err| ExecError::GlobCompile {
@@ -357,36 +419,15 @@ pub(crate) fn compile_rule_to_depth(
     let (loc_pointer_engine, loc_file_engine, loc_line_engine) = match rule.loc.as_ref() {
         Some(loc) => {
             let pointer = match loc.pointer.as_deref() {
-                Some(expr) => {
-                    Some(
-                        JqEngine::compile(expr).map_err(|err| ExecError::RuleCompile {
-                            rule_id: rule.id.clone(),
-                            source: err,
-                        })?,
-                    )
-                }
+                Some(expr) => Some(compile_or_cached(cache, expr, &rule.id)?),
                 None => None,
             };
             let file = match loc.file.as_deref() {
-                Some(expr) => {
-                    Some(
-                        JqEngine::compile(expr).map_err(|err| ExecError::RuleCompile {
-                            rule_id: rule.id.clone(),
-                            source: err,
-                        })?,
-                    )
-                }
+                Some(expr) => Some(compile_or_cached(cache, expr, &rule.id)?),
                 None => None,
             };
             let line = match loc.line.as_deref() {
-                Some(expr) => {
-                    Some(
-                        JqEngine::compile(expr).map_err(|err| ExecError::RuleCompile {
-                            rule_id: rule.id.clone(),
-                            source: err,
-                        })?,
-                    )
-                }
+                Some(expr) => Some(compile_or_cached(cache, expr, &rule.id)?),
                 None => None,
             };
             (pointer, file, line)
@@ -398,21 +439,11 @@ pub(crate) fn compile_rule_to_depth(
     // re-compilation cost. Compile-time failures surface here as the
     // same `RuleCompile` shape the lint runtime uses.
     let fix_engine = match rule.fix.as_ref().and_then(|f| f.jq.as_deref()) {
-        Some(expr) => Some(
-            JqEngine::compile(expr).map_err(|err| ExecError::RuleCompile {
-                rule_id: rule.id.clone(),
-                source: err,
-            })?,
-        ),
+        Some(expr) => Some(compile_or_cached(cache, expr, &rule.id)?),
         None => None,
     };
     let fix_ops_engine = match rule.fix.as_ref().and_then(|f| f.ops.as_deref()) {
-        Some(expr) => Some(
-            JqEngine::compile(expr).map_err(|err| ExecError::RuleCompile {
-                rule_id: rule.id.clone(),
-                source: err,
-            })?,
-        ),
+        Some(expr) => Some(compile_or_cached(cache, expr, &rule.id)?),
         None => None,
     };
 
@@ -440,13 +471,11 @@ fn compile_check(
     source: &RuleSource,
     current_depth: usize,
     max_depth: usize,
+    cache: &mut JqCache,
 ) -> Result<CompiledCheck> {
     match &rule.check {
         Check::Jq { jq, message } => {
-            let engine = JqEngine::compile(jq).map_err(|err| ExecError::RuleCompile {
-                rule_id: rule.id.clone(),
-                source: err,
-            })?;
+            let engine = compile_or_cached(cache, jq, &rule.id)?;
             Ok(CompiledCheck::Jq {
                 engine,
                 message: message.clone(),
@@ -502,6 +531,7 @@ fn compile_check(
                 source,
                 current_depth,
                 max_depth,
+                cache,
             )?;
             Ok(CompiledCheck::Composite(Box::new(compiled)))
         }
@@ -1528,6 +1558,138 @@ check:
             diags[0].message.to_lowercase().contains("metadata"),
             "expected the surviving diagnostic to mention the missing property, got: {}",
             diags[0].message,
+        );
+    }
+
+    // --- perf-jq-compile-cache regression tests ----------------------------
+    //
+    // The cache is invisible from `Evaluator`'s public API; we reach into
+    // `compiled_rules()` (a crate-internal accessor already in use by the
+    // `Fixer`) and use `Arc::ptr_eq` to assert the cache identity contract:
+    //
+    //   - Two rules with the *same* `match.filter` share one `JqEngine`
+    //     instance (cache hit).
+    //   - Two rules with *different* `match.filter`s have distinct
+    //     instances (cache key is exact-string).
+    //   - Two `Evaluator::new` calls do not share state (per-invocation
+    //     cache lifetime — see `JqCache` doc-comment).
+
+    #[test]
+    fn cache_dedupes_identical_filters() {
+        // Two rules with byte-identical `match.filter` strings must
+        // resolve to the same `Arc<JqEngine>` instance after compile —
+        // this is the headline cache hit case.
+        let yaml = r#"
+id: rule_a
+description: a
+severity: warn
+match:
+  format: yaml
+  filter: '.kind == "Deployment"'
+check:
+  jq: 'true'
+  message: 'a'
+---
+id: rule_b
+description: b
+severity: warn
+match:
+  format: yaml
+  filter: '.kind == "Deployment"'
+check:
+  jq: 'true'
+  message: 'b'
+"#;
+        let eval = evaluator_from_yaml(yaml);
+        let compiled = eval.compiled_rules();
+        assert_eq!(compiled.len(), 2, "expected two compiled rules");
+        let a = compiled[0]
+            .filter_engine
+            .as_ref()
+            .expect("rule_a has filter_engine");
+        let b = compiled[1]
+            .filter_engine
+            .as_ref()
+            .expect("rule_b has filter_engine");
+        assert!(
+            Arc::ptr_eq(a, b),
+            "identical match.filter expressions must share one Arc<JqEngine> instance",
+        );
+    }
+
+    #[test]
+    fn cache_does_not_collapse_different_filters() {
+        // Sanity: two rules with *different* filter strings get distinct
+        // `Arc<JqEngine>` instances. Pins that the cache key is the
+        // exact-string and does not, e.g., glob-collapse.
+        let yaml = r#"
+id: rule_a
+description: a
+severity: warn
+match:
+  format: yaml
+  filter: '.kind == "Deployment"'
+check:
+  jq: 'true'
+  message: 'a'
+---
+id: rule_b
+description: b
+severity: warn
+match:
+  format: yaml
+  filter: '.kind == "Service"'
+check:
+  jq: 'true'
+  message: 'b'
+"#;
+        let eval = evaluator_from_yaml(yaml);
+        let compiled = eval.compiled_rules();
+        assert_eq!(compiled.len(), 2, "expected two compiled rules");
+        let a = compiled[0]
+            .filter_engine
+            .as_ref()
+            .expect("rule_a has filter_engine");
+        let b = compiled[1]
+            .filter_engine
+            .as_ref()
+            .expect("rule_b has filter_engine");
+        assert!(
+            !Arc::ptr_eq(a, b),
+            "different match.filter expressions must NOT share an Arc<JqEngine> instance",
+        );
+    }
+
+    #[test]
+    fn cache_does_not_persist_across_evaluator_news() {
+        // Two `Evaluator::new` calls with the same filter must produce
+        // distinct `Arc<JqEngine>` instances — the cache is lexically
+        // scoped to a single `Evaluator::new`, not global per-process.
+        // This pins the design decision documented in `JqCache`.
+        let yaml = r#"
+id: rule_a
+description: a
+severity: warn
+match:
+  format: yaml
+  filter: '.kind == "Deployment"'
+check:
+  jq: 'true'
+  message: 'a'
+"#;
+        let eval_one = evaluator_from_yaml(yaml);
+        let eval_two = evaluator_from_yaml(yaml);
+        let a = eval_one.compiled_rules()[0]
+            .filter_engine
+            .as_ref()
+            .expect("first evaluator has filter_engine");
+        let b = eval_two.compiled_rules()[0]
+            .filter_engine
+            .as_ref()
+            .expect("second evaluator has filter_engine");
+        assert!(
+            !Arc::ptr_eq(a, b),
+            "cache must not persist across two `Evaluator::new` invocations",
         );
     }
 }
