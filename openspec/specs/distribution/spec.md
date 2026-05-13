@@ -92,12 +92,12 @@ The `pkgver` field is a placeholder rewritten by the AUR submission automation o
 
 ### Requirement: Claude Code skill manifest in repo
 
-`skill/SKILL.md` and `skill/skill.json` SHALL be present and conform to the Anthropic skill manifest schema (front-matter with `name`, `description`, `version`, `triggers`; body with sections covering install, common patterns, format coverage, exit codes, anti-scope).
+`skills/dq/SKILL.md` and `skills/dq/skill.json` SHALL be present and conform to the Anthropic skill manifest schema (front-matter with `name`, `description`, `version`, `triggers`; body with sections covering install, common patterns, format coverage, exit codes, anti-scope).
 
 The skill is installable via the standard Claude Code skill workflow once the repo is published. Submitting `mazuninky/dq` to the public `skills.sh` registry is a post-release administrative step tracked alongside the v0.1 announcement.
 
 #### Scenario: Skill manifest parses
-- **WHEN** the skill creator skill or any standard YAML-frontmatter parser reads `skill/SKILL.md`
+- **WHEN** the skill creator skill or any standard YAML-frontmatter parser reads `skills/dq/SKILL.md`
 - **THEN** the front-matter parses successfully and exposes `name`, `description`, `version`, `triggers` fields
 
 ### Requirement: GitHub Actions release workflow

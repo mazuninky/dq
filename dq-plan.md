@@ -44,7 +44,7 @@ dq-workspace/
 │   ├── dq-lint/         # standard rule library (k8s, markdown, npm)
 │   └── dq-cli/          # binary, all command logic
 ├── rules/               # standard ruleset definitions (YAML files)
-├── skill/               # Claude Code skill content
+├── skills/dq/           # Claude Code skill content
 ├── scripts/             # install.sh, release helpers
 └── docs/
 ```

@@ -16,7 +16,7 @@ examples/        plugin-rust reference plugin
 spikes/          throwaway investigations (saphyr/, etc.)
 openspec/        OpenSpec changes — active under changes/, shipped under changes/archive/
 docs/archive/    historical docs
-skill/SKILL.md   Claude Code skill bundle
+skills/dq/       Claude Code skill bundle (SKILL.md + skill.json)
 dq-plan.md       architecture + roadmap (treat as design doc, not as truth about current state)
 ```
 
