@@ -1,0 +1,44 @@
+id: skills.frontmatter
+description: |
+  Anthropic-style `SKILL.md` files must declare a YAML frontmatter block
+  with `name` and `description`. The skill loader matches `name` against
+  `^[a-z0-9][a-z0-9_-]*$` and truncates descriptions longer than 1024
+  characters (after folding consecutive whitespace to a single space),
+  so the rule mirrors both constraints. Pinned to files literally named
+  `SKILL.md` via `match.glob` — arbitrary markdown notes elsewhere in
+  the repo (`references/*.md`, READMEs, blog posts) are unaffected.
+severity: error
+match:
+  format: markdown
+  glob: '**/SKILL.md'
+  filter: '.frontmatter != null'
+check:
+  jq: |
+    . as $doc
+    | ($doc.frontmatter.value // {}) as $fm
+    | (
+        (
+          (["name", "description"] - ($fm | keys))
+          | map({ msg: ("missing required field `" + . + "`") })
+        )
+        +
+        (
+          if ($fm | has("name")) and (($fm.name // "") | type == "string" and test("^[a-z0-9][a-z0-9_-]*$") | not)
+          then [{ msg: "`name` must match ^[a-z0-9][a-z0-9_-]*$" }]
+          else []
+          end
+        )
+        +
+        (
+          (($fm.description // "") | tostring | gsub("\\s+"; " ") | length) as $len
+          | if $len > 1024
+            then [{ msg: ("`description` is " + ($len | tostring) + " chars, exceeds 1024 (will be truncated)") }]
+            else []
+            end
+        )
+      )[]
+  message: "SKILL.md frontmatter: {{ .msg }}"
+references:
+  - https://docs.claude.com/en/docs/claude-code/skills
+loc:
+  line: 1

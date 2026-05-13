@@ -102,11 +102,12 @@ mod tests {
     #[test]
     fn list_std_rulesets_contains_all_namespaces() {
         // M9 added `markdown`, M11 Phase 3 added `jsonschema`, M11
-        // Phase 5 added `terraform` and `openapi` — total is now 8.
-        // Subsequent milestones may add more; update the count and the
-        // per-namespace assertions together when that happens.
+        // Phase 5 added `terraform` and `openapi`, `add-std-skills-rules`
+        // added `skills` — total is now 9. Subsequent milestones may add
+        // more; update the count and the per-namespace assertions
+        // together when that happens.
         let namespaces = list_std_rulesets();
-        assert_eq!(namespaces.len(), 8);
+        assert_eq!(namespaces.len(), 9);
         assert!(namespaces.contains(&"k8s"));
         assert!(namespaces.contains(&"dockerfile"));
         assert!(namespaces.contains(&"npm"));
@@ -115,6 +116,7 @@ mod tests {
         assert!(namespaces.contains(&"jsonschema"));
         assert!(namespaces.contains(&"terraform"));
         assert!(namespaces.contains(&"openapi"));
+        assert!(namespaces.contains(&"skills"));
     }
 
     #[test]

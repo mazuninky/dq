@@ -1,0 +1,18 @@
+id: skills.evals-schema
+description: |
+  Anthropic-style skill repos commonly track Claude-side eval scenarios
+  in `skill/evals/evals.json`. The bundled schema sidecar
+  (`evals.schema.json`) describes the canonical shape — `skill_name`,
+  `evals[].{id, prompt, expected_output, assertions[].{text, type}}`,
+  with `additionalProperties: false`. The rule is pinned to files
+  literally named `evals.json` via `match.glob` so unrelated JSON
+  payloads in the workspace are not flagged.
+severity: error
+match:
+  format: json
+  glob: '**/evals.json'
+  filter: 'has("skill_name") and has("evals")'
+check:
+  schema_file: ./evals.schema.json
+references:
+  - https://json-schema.org/draft/2020-12

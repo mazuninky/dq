@@ -11,7 +11,7 @@ Agent-friendly Rust CLI for structured data files (YAML, JSON, TOML, HCL, INI, .
 - **In-place edit** preserving comments, key order, and quote style for YAML/TOML.
 - **Convert** between any pair of supported formats; `dq fmt` canonicalizes & sorts keys.
 - **Patch** with RFC 6902 JSON Patch and RFC 7396 Merge Patch.
-- **Lint** with 64 standard rules across `@std/{k8s, dockerfile, github-actions, markdown, npm, jsonschema, terraform, openapi}`, plus user rules in `.dq/rules/`.
+- **Lint** with 66 standard rules across `@std/{k8s, dockerfile, github-actions, markdown, npm, jsonschema, terraform, openapi, skills}`, plus user rules in `.dq/rules/`.
 - **Autofix** via `dq fix` — rules carry `fix.jq` whole-document transforms; idempotency enforced at runtime.
 - **Schema validation** with JSON Schema 2020-12 (inline or file-based) as a first-class rule type.
 - **Composite rules** that extract one format embedded in another (e.g. YAML inside Markdown code blocks) and lint it with diagnostics projected back.
