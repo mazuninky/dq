@@ -6,7 +6,7 @@
 //!    succeeds.
 //! 2. For each scalar pointer the parser recorded a span for, replacing
 //!    the value via `Document::set_at` with a same-typed value succeeds.
-//! 3. After the splice, `original_bytes` is still parsable by `serde_yml`.
+//! 3. After the splice, `original_bytes` is still parsable by `serde_norway`.
 //! 4. Bytes outside the touched span are byte-equal to the input —
 //!    proving the splice is local and doesn't disturb comments, indent,
 //!    or sibling values.
@@ -123,9 +123,9 @@ proptest! {
 
             let after = doc.original_bytes().to_vec();
             // (3) the post-edit buffer must still parse as YAML.
-            serde_yml::from_slice::<serde_yml::Value>(&after).unwrap_or_else(|e| {
+            serde_norway::from_slice::<serde_norway::Value>(&after).unwrap_or_else(|e| {
                 panic!(
-                    "post-edit buffer must remain valid YAML; serde_yml error: {e}\nbuffer: {:?}",
+                    "post-edit buffer must remain valid YAML; serde_norway error: {e}\nbuffer: {:?}",
                     String::from_utf8_lossy(&after),
                 )
             });

@@ -27,7 +27,7 @@ publish = false
 # Core data / serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
-serde_yml = "0.0.12"
+serde_norway = "0.9.42"
 # saphyr-parser exposes the low-level event API (with byte spans) that the M2
 # textual-edit YAML write path consumes — see `dq-core/src/parsers/yaml_spans.rs`.
 # Pinned at the spike-validated 0.0.6 release; the high-level `saphyr` crate is

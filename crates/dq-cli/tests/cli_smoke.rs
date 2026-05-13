@@ -77,7 +77,7 @@ fn smoke_paths_helm_values() {
 #[test]
 fn smoke_convert_package_json_to_yaml() {
     // Scenario 3: convert package.json to YAML. We don't pin the exact YAML
-    // output bytes (formatting depends on serde_yml) — just that it parses
+    // output bytes (formatting depends on serde_norway) — just that it parses
     // back as valid YAML and contains the original keys.
     let out = dq()
         .args([
@@ -598,13 +598,15 @@ fn smoke_fmt_sort_keys_in_place_glob_normalizes_all_files() {
 fn smoke_fmt_check_exits_one_on_non_canonical() {
     // M4 DoD §6.1: `dq fmt --check broken-file.yaml` on a file whose
     // re-emitted bytes differ from source returns a `CheckPending` error
-    // that the exit-code mapper translates to 1. We use a YAML reserved
-    // word (`y`) to guarantee the writer reformats — source has `y:`,
-    // writer emits `'y':`.
+    // that the exit-code mapper translates to 1. We use 4-space indented
+    // nested mapping to guarantee the writer reformats — `serde_norway`
+    // emits 2-space block indent, so source `a:\n    b: 1\n` normalises
+    // to `a:\n  b: 1\n`.
     use clap::Parser;
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("non_canonical.yaml");
-    std::fs::write(&path, b"z: 1\ny: 2\n").unwrap();
+    let source: &[u8] = b"a:\n    b: 1\n";
+    std::fs::write(&path, source).unwrap();
     let cli = dq::Cli::try_parse_from(["dq", "--check", "fmt", path.to_str().unwrap()])
         .expect("clap parse");
     let mut out: Vec<u8> = Vec::new();
@@ -622,7 +624,7 @@ fn smoke_fmt_check_exits_one_on_non_canonical() {
     // File on disk untouched.
     assert_eq!(
         std::fs::read(&path).unwrap(),
-        b"z: 1\ny: 2\n",
+        source,
         "--check must not modify the file",
     );
 }

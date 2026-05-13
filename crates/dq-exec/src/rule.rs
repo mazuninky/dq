@@ -167,7 +167,7 @@ pub struct RuleMatch {
 /// id in hand.
 ///
 /// `PartialEq` is intentionally NOT derived: `Rule` itself has no
-/// `PartialEq` impl, and the `serde_yml::Value` carried by `Schema`
+/// `PartialEq` impl, and the `serde_norway::Value` carried by `Schema`
 /// already provides one if a caller ever needs structural comparison.
 #[derive(Debug, Clone)]
 pub enum Check {
@@ -186,7 +186,7 @@ pub enum Check {
     /// `jsonschema::Validator` at `Evaluator::new`.
     Schema {
         /// Inline JSON Schema 2020-12 document.
-        schema: serde_yml::Value,
+        schema: serde_norway::Value,
         /// Optional message prefix — when set, prepended to the
         /// auto-generated `keywordLocation`-based message.
         message: Option<String>,
@@ -305,7 +305,7 @@ struct RawCheck {
     #[serde(default)]
     jq: Option<String>,
     #[serde(default)]
-    schema: Option<serde_yml::Value>,
+    schema: Option<serde_norway::Value>,
     #[serde(default)]
     schema_file: Option<Utf8PathBuf>,
     #[serde(default)]
@@ -453,7 +453,7 @@ pub struct RuleLoc {
 
 /// Deserialize `format:` accepting either a single string or an array.
 ///
-/// `serde_yml`'s native enum deserializer can't cleanly express
+/// `serde_norway`'s native enum deserializer can't cleanly express
 /// "string-or-list" in a single field, so we hand-roll a `Visitor` that
 /// accepts both shapes.
 fn deserialize_format_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
@@ -515,17 +515,18 @@ check:
 "#;
 
     fn parse(yaml: &str) -> Rule {
-        serde_yml::from_str(yaml).unwrap_or_else(|err| panic!("parse failed: {err}\n----\n{yaml}"))
+        serde_norway::from_str(yaml)
+            .unwrap_or_else(|err| panic!("parse failed: {err}\n----\n{yaml}"))
     }
 
-    fn parse_err(yaml: &str) -> serde_yml::Error {
-        serde_yml::from_str::<Rule>(yaml).expect_err("expected parse failure")
+    fn parse_err(yaml: &str) -> serde_norway::Error {
+        serde_norway::from_str::<Rule>(yaml).expect_err("expected parse failure")
     }
 
     /// Extract a [`CheckParseError`] from a serde error message that
     /// embeds a sentinel string. Returns `None` if the error is not
     /// sentinel-encoded (i.e. it's a regular YAML / serde error).
-    fn check_parse_error_from(err: &serde_yml::Error) -> Option<CheckParseError> {
+    fn check_parse_error_from(err: &serde_norway::Error) -> Option<CheckParseError> {
         let formatted = format!("{err}");
         // The formatted error usually wraps the custom message in extra
         // context; scan for the sentinel prefix anywhere in the string.

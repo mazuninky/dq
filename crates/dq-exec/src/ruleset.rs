@@ -12,7 +12,7 @@
 
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::Deserialize;
-use serde_yml::Value as YamlValue;
+use serde_norway::Value as YamlValue;
 
 use crate::error::{ExecError, Result};
 use crate::rule::{CheckParseError, Rule};
@@ -63,7 +63,7 @@ const TEST_FIXTURE_SUFFIXES: &[&str] = &[".test.yml", ".test.yaml"];
 impl RuleSet {
     /// Parse `yaml` as a single rule **or** a `---`-separated YAML stream.
     ///
-    /// `serde_yml::Deserializer::from_str` walks the document stream; each
+    /// `serde_norway::Deserializer::from_str` walks the document stream; each
     /// document is deserialized as one [`Rule`]. The resulting `RuleSet`
     /// records `source` verbatim (callers usually pass [`RuleSource::Inline`]
     /// or [`RuleSource::Std`]).
@@ -87,10 +87,10 @@ impl RuleSet {
         // Collect document spans in two parallel passes: the typed
         // deserialize consumes the Deserializer iterator, so we need
         // to re-iterate when recovering ids on failure. The
-        // serde_yml `Deserializer::from_str` borrows the YAML text and
+        // serde_norway `Deserializer::from_str` borrows the YAML text and
         // re-iteration is cheap.
-        for de in serde_yml::Deserializer::from_str(yaml) {
-            let parsed: std::result::Result<Rule, serde_yml::Error> = Rule::deserialize(de);
+        for de in serde_norway::Deserializer::from_str(yaml) {
+            let parsed: std::result::Result<Rule, serde_norway::Error> = Rule::deserialize(de);
             match parsed {
                 Ok(rule) => rules.push(rule),
                 Err(err) => {
@@ -204,14 +204,14 @@ impl RuleSet {
 /// Recover the `id:` field for the rule at `rule_index` (1-based) in
 /// the YAML document stream `yaml`.
 ///
-/// Walks the same `serde_yml::Deserializer::from_str` iterator as
+/// Walks the same `serde_norway::Deserializer::from_str` iterator as
 /// `from_str` does, materialising each document into a [`YamlValue`]
 /// instead of a typed [`Rule`]. Returns `None` when the document is
 /// not a mapping, when `id` is missing / non-string, or when the index
 /// is out of range. The caller falls back to `"<unknown>"` in that case
 /// so the error message still has a placeholder.
 fn recover_rule_id_at_index(yaml: &str, rule_index: usize) -> Option<String> {
-    for (i, de) in serde_yml::Deserializer::from_str(yaml).enumerate() {
+    for (i, de) in serde_norway::Deserializer::from_str(yaml).enumerate() {
         if i + 1 != rule_index {
             // Skip preceding documents — we only need the failing one.
             // `YamlValue::deserialize` consumes the deserializer
@@ -227,7 +227,7 @@ fn recover_rule_id_at_index(yaml: &str, rule_index: usize) -> Option<String> {
     None
 }
 
-/// Translate a `serde_yml::Error` produced by `Rule::deserialize` into
+/// Translate a `serde_norway::Error` produced by `Rule::deserialize` into
 /// the appropriate [`ExecError`] variant.
 ///
 /// Sentinel-encoded [`CheckParseError`] payloads become structured
@@ -235,7 +235,7 @@ fn recover_rule_id_at_index(yaml: &str, rule_index: usize) -> Option<String> {
 /// / [`ExecError::CompositeIncomplete`] errors. Everything else falls
 /// through to [`ExecError::Parse`].
 fn map_rule_parse_error(
-    err: serde_yml::Error,
+    err: serde_norway::Error,
     rule_id: Option<String>,
     rule_index: usize,
 ) -> ExecError {
@@ -326,7 +326,7 @@ mod tests {
     #[test]
     fn from_str_propagates_parse_error_with_hint() {
         // A rule with an unknown top-level field — `deny_unknown_fields`
-        // turns this into a `serde_yml::Error` that `from_str` wraps in
+        // turns this into a `serde_norway::Error` that `from_str` wraps in
         // the `Parse` variant. The `hint` field must surface the rule
         // index so authors with a 40-rule file know which entry failed.
         let bad = format!("{RULE_A}---\n{RULE_B}---\nbogus_field: 1\n");

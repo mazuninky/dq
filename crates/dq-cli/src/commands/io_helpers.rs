@@ -68,7 +68,7 @@ pub(crate) fn load_document_with_path(
 /// `Ir::line_col_for(&Pointer)`, which only resolves to a `(line, col)`
 /// when the parser populated `Provenance::Original { span: Some(_), .. }`
 /// for the value at that pointer. The default `Format::parse` for YAML and
-/// JSON is span-LESS — it routes through `serde_yml` / `serde_json`'s
+/// JSON is span-LESS — it routes through `serde_norway` / `serde_json`'s
 /// `Deserializer::from_slice` and produces a `Document` whose `spans` map
 /// is empty, which collapses every `loc.pointer` resolution to `(1, 1)`.
 /// The write-mode commands (`set`, `del`, `patch`, `merge`) already

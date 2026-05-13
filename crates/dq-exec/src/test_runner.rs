@@ -205,7 +205,7 @@ fn run_fixture(fixture: &Utf8Path) -> Vec<TestOutcome> {
             }];
         }
     };
-    let fixture_file: RuleTestFile = match serde_yml::from_str(&fixture_yaml) {
+    let fixture_file: RuleTestFile = match serde_norway::from_str(&fixture_yaml) {
         Ok(f) => f,
         Err(err) => {
             return vec![TestOutcome::Error {
@@ -297,7 +297,7 @@ fn run_case(
         }
     };
     // The fixture path doesn't carry spans — fixtures parse via
-    // `serde_yml`/`serde_json`/markdown which give us a bare
+    // `serde_norway`/`serde_json`/markdown which give us a bare
     // `serde_json::Value` with no provenance metadata. Build a fresh
     // `OwnedIr` with an empty provenance map so the evaluator sees the
     // new IR signature; rules that use `loc.pointer` simply fall through
@@ -315,14 +315,14 @@ fn run_case(
 }
 
 /// Parse a fixture's `input:` text under `format`. `yaml` and `json` are
-/// wired through `serde_yml` / `serde_json` directly; `markdown` (M9 — the
+/// wired through `serde_norway` / `serde_json` directly; `markdown` (M9 — the
 /// CommonMark + GFM AST format) routes through `dq_core::by_name("markdown")`
 /// so the fixture sees the same typed-discriminator-Map shape that the
 /// `@std/markdown` rules check.dispatch against. Other formats yield an
 /// `Err(message)` for the caller to surface as a [`TestOutcome::Error`].
 fn parse_input(input: &str, format: &str) -> std::result::Result<serde_json::Value, String> {
     match format {
-        "yaml" => serde_yml::from_str::<serde_json::Value>(input)
+        "yaml" => serde_norway::from_str::<serde_json::Value>(input)
             .map_err(|err| format!("yaml parse error: {err}")),
         "json" => serde_json::from_str::<serde_json::Value>(input)
             .map_err(|err| format!("json parse error: {err}")),
