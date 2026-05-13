@@ -933,7 +933,7 @@ checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
 name = "dq-cli"
-version = "2026.20.1"
+version = "2026.20.2"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -970,7 +970,7 @@ dependencies = [
 
 [[package]]
 name = "dq-core"
-version = "2026.20.1"
+version = "2026.20.2"
 dependencies = [
  "camino",
  "comrak",
@@ -1000,7 +1000,7 @@ dependencies = [
 
 [[package]]
 name = "dq-exec"
-version = "2026.20.1"
+version = "2026.20.2"
 dependencies = [
  "camino",
  "criterion",
@@ -1023,7 +1023,7 @@ dependencies = [
 
 [[package]]
 name = "dq-lint"
-version = "2026.20.1"
+version = "2026.20.2"
 dependencies = [
  "camino",
  "dq-exec",
@@ -1033,7 +1033,7 @@ dependencies = [
 
 [[package]]
 name = "dq-plugin"
-version = "2026.20.1"
+version = "2026.20.2"
 dependencies = [
  "camino",
  "dq-core",
@@ -1051,7 +1051,7 @@ dependencies = [
 
 [[package]]
 name = "dq-transform"
-version = "2026.20.1"
+version = "2026.20.2"
 dependencies = [
  "criterion",
  "dq-core",
