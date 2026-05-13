@@ -36,15 +36,29 @@ use super::patch::read_value_at;
 /// `null` against a missing key is intentionally NOT an error (RFC 7396 §1).
 pub fn apply_merge(doc: &mut Document, patch: &Value) -> Result<()> {
     let mut working = doc.clone();
-    merge_into(&mut working, &Pointer::default(), patch)?;
+    // The recursive worker mutates `base` in place via push/pop rather than
+    // cloning a new child pointer per key. See the
+    // `perf-pointer-recursive-walks` change for the rationale and bench
+    // numbers — without this, deep patches paid an O(depth²) toll on
+    // pointer construction alone.
+    let mut base = Pointer::default();
+    merge_into(&mut working, &mut base, patch)?;
     *doc = working;
     Ok(())
 }
 
-/// Recursive worker. `base` is the pointer of the current target subtree;
-/// callers start with [`Pointer::default`] (root) and the recursion extends
-/// it one segment at a time.
-fn merge_into(doc: &mut Document, base: &Pointer, patch: &Value) -> Result<()> {
+/// Recursive worker. `base` is the pointer of the current target subtree,
+/// mutated in place: each loop iteration pushes the next key segment before
+/// the per-key step (recurse / set / del) and pops it afterwards. Callers
+/// start with [`Pointer::default`] (root).
+///
+/// Invariant: every caller observes `base` in the same state on return as
+/// on entry. Each `push_segment` call is paired with a `pop_segment` along
+/// every exit path — including the error path bubbled out of the recursive
+/// `merge_into` call below. The early-return `?` after the pop preserves
+/// this; do NOT inline the `?` into the recursive call site or `base` will
+/// retain the pushed segment across the propagated error.
+fn merge_into(doc: &mut Document, base: &mut Pointer, patch: &Value) -> Result<()> {
     let Value::Map(patch_map) = patch else {
         // Non-map patch replaces the addressed subtree wholesale. Root case
         // (base.is_root()) won't be reached here in practice because callers
@@ -55,29 +69,37 @@ fn merge_into(doc: &mut Document, base: &Pointer, patch: &Value) -> Result<()> {
     };
 
     for (k, v) in patch_map {
-        let child = base.with_segment(Segment::Key(k.clone()));
-        if matches!(v, Value::Null) {
+        base.push_segment(Segment::Key(k.clone()));
+
+        // Decide what to do at this key, mutating `doc` while `base` is
+        // extended. We capture the result before popping so the pop runs
+        // regardless of whether the step succeeded — this keeps the
+        // push/pop balanced on every control-flow path, including `?`
+        // propagation from the recursive call.
+        let step = if matches!(v, Value::Null) {
             // RFC 7396 §1: missing key under `null` is a silent NOP.
-            match doc.del_at(&child) {
-                Ok(()) => {}
+            match doc.del_at(base) {
+                Ok(()) => Ok(()),
                 Err(Error::Path {
                     kind: PathErrorKind::MissingKey,
                     ..
-                }) => {}
-                Err(other) => return Err(other),
+                }) => Ok(()),
+                Err(other) => Err(other),
             }
-            continue;
-        }
-
-        // Recurse only when both the existing target and the patch are maps.
-        // Any other shape (target missing, target scalar, target array, or
-        // patch non-map) replaces the whole subtree.
-        let target_is_map = matches!(read_value_at(doc, &child), Ok(Value::Map(_)));
-        if target_is_map && matches!(v, Value::Map(_)) {
-            merge_into(doc, &child, v)?;
         } else {
-            doc.set_at(&child, v.clone())?;
-        }
+            // Recurse only when both the existing target and the patch are
+            // maps. Any other shape (target missing, target scalar, target
+            // array, or patch non-map) replaces the whole subtree.
+            let target_is_map = matches!(read_value_at(doc, base), Ok(Value::Map(_)));
+            if target_is_map && matches!(v, Value::Map(_)) {
+                merge_into(doc, base, v)
+            } else {
+                doc.set_at(base, v.clone())
+            }
+        };
+
+        base.pop_segment();
+        step?;
     }
     Ok(())
 }

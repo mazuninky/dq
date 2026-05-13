@@ -58,13 +58,24 @@ use crate::pointer::{Pointer, Segment};
 #[must_use]
 pub fn diff(a: &Value, b: &Value) -> Vec<PatchOp> {
     let mut ops = Vec::new();
-    diff_into(&Pointer::default(), a, b, &mut ops);
+    // The recursive worker walks via `&mut Pointer` (push/pop) instead of
+    // building owned child pointers for each step — that keeps the per-walk
+    // cost O(N × depth) rather than O(N × depth²). See the
+    // `perf-pointer-recursive-walks` change for the bench numbers behind
+    // this choice.
+    let mut path = Pointer::default();
+    diff_into(&mut path, a, b, &mut ops);
     ops
 }
 
-/// Recursive worker. `path` is the pointer of the current subtree; `ops`
-/// accumulates emitted operations across the whole walk.
-fn diff_into(path: &Pointer, a: &Value, b: &Value, ops: &mut Vec<PatchOp>) {
+/// Recursive worker. `path` is the pointer of the current subtree, mutated
+/// in place as the recursion descends and unwinds; `ops` accumulates emitted
+/// operations across the whole walk.
+///
+/// Invariant: every caller of `diff_into` observes `path` in the same state
+/// it was in on entry. Internal helpers preserve this by pairing each
+/// `push_segment` with a matching `pop_segment`.
+fn diff_into(path: &mut Pointer, a: &Value, b: &Value, ops: &mut Vec<PatchOp>) {
     if a == b {
         return;
     }
@@ -82,7 +93,7 @@ fn diff_into(path: &Pointer, a: &Value, b: &Value, ops: &mut Vec<PatchOp>) {
 }
 
 fn diff_maps(
-    path: &Pointer,
+    path: &mut Pointer,
     am: &indexmap::IndexMap<String, Value>,
     bm: &indexmap::IndexMap<String, Value>,
     ops: &mut Vec<PatchOp>,
@@ -91,37 +102,45 @@ fn diff_maps(
     //    insertion order. Documented at module level.
     for k in am.keys() {
         if !bm.contains_key(k) {
-            ops.push(PatchOp::Remove {
-                path: path.with_segment(Segment::Key(k.clone())),
-            });
+            // Push, clone the fully-extended pointer into the emitted op,
+            // then pop. The clone produces the same owned `Pointer` shape
+            // the prior `with_segment(...)`-based code produced, so the
+            // emitted op is byte-identical.
+            path.push_segment(Segment::Key(k.clone()));
+            ops.push(PatchOp::Remove { path: path.clone() });
+            path.pop_segment();
         }
     }
     // 2) Adds — keys in `b` but not in `a`. Iteration order: `b`'s order
     //    (the target wins).
     for (k, v) in bm {
         if !am.contains_key(k) {
+            path.push_segment(Segment::Key(k.clone()));
             ops.push(PatchOp::Add {
-                path: path.with_segment(Segment::Key(k.clone())),
+                path: path.clone(),
                 value: v.clone(),
             });
+            path.pop_segment();
         }
     }
     // 3) Common keys — recurse, walking `b` in order so the resulting patch
     //    reflects the target document's key order.
     for (k, bv) in bm {
         if let Some(av) = am.get(k) {
-            let child = path.with_segment(Segment::Key(k.clone()));
-            diff_into(&child, av, bv, ops);
+            path.push_segment(Segment::Key(k.clone()));
+            diff_into(path, av, bv, ops);
+            path.pop_segment();
         }
     }
 }
 
-fn diff_arrays(path: &Pointer, av: &[Value], bv: &[Value], ops: &mut Vec<PatchOp>) {
+fn diff_arrays(path: &mut Pointer, av: &[Value], bv: &[Value], ops: &mut Vec<PatchOp>) {
     let common = av.len().min(bv.len());
     // Index-aligned recursion over the shared prefix.
     for i in 0..common {
-        let child = path.with_segment(Segment::Index(i));
-        diff_into(&child, &av[i], &bv[i], ops);
+        path.push_segment(Segment::Index(i));
+        diff_into(path, &av[i], &bv[i], ops);
+        path.pop_segment();
     }
     if av.len() > bv.len() {
         // Shrink: remove tail indices in REVERSE order so each remove keeps
@@ -129,19 +148,21 @@ fn diff_arrays(path: &Pointer, av: &[Value], bv: &[Value], ops: &mut Vec<PatchOp
         // applies sequentially. E.g. shrink [0,1,2,3] → [0,1] emits
         // remove /3 then remove /2 — both indices stay valid mid-apply.
         for i in (bv.len()..av.len()).rev() {
-            ops.push(PatchOp::Remove {
-                path: path.with_segment(Segment::Index(i)),
-            });
+            path.push_segment(Segment::Index(i));
+            ops.push(PatchOp::Remove { path: path.clone() });
+            path.pop_segment();
         }
     } else if bv.len() > av.len() {
         // Grow: add tail indices in forward order. Concrete numeric indices,
         // never `/-` — `/-` is RFC 6902 syntactic sugar for hand-written
         // patches; diff produces explicit positions for determinism.
         for (i, value) in bv.iter().enumerate().skip(av.len()) {
+            path.push_segment(Segment::Index(i));
             ops.push(PatchOp::Add {
-                path: path.with_segment(Segment::Index(i)),
+                path: path.clone(),
                 value: value.clone(),
             });
+            path.pop_segment();
         }
     }
 }
