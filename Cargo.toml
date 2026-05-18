@@ -148,7 +148,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 # Deterministic workload generation inside bench files. Each `synth_*`
 # helper seeds an `StdRng::seed_from_u64(42)` so numbers are reproducible
 # across runs and machines.
-rand = "0.8"
+rand = "0.9"
 
 [profile.release]
 lto = true
