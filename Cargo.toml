@@ -56,7 +56,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # CLI
 clap = { version = "4", features = ["derive", "wrap_help"] }
 clap_complete = "4"
-clap_mangen = "0.2"
+clap_mangen = "0.3"
 
 # Query / format
 jsonpath-rust = "0.7"
