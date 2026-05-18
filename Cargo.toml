@@ -39,7 +39,7 @@ toml = { version = "1.1", features = ["preserve_order"] }
 # for every parsed node, which the SpanMap builder records and the
 # `Document::set_at` splice path consumes — the same way `cargo` mutates
 # `Cargo.toml` while preserving comments, key order, and formatting.
-toml_edit = "0.22"
+toml_edit = "0.25"
 indexmap = { version = "2", features = ["serde"] }
 
 # Paths
