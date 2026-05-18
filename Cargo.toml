@@ -117,7 +117,7 @@ quick-xml = { version = "0.40", features = ["serialize"] }
 # `$ref` resolution stays in-schema (no network calls, no filesystem reads
 # from the validator) — this is the contract `data-query-jsonschema`
 # requires. License: MIT.
-jsonschema = { version = "0.34", default-features = false }
+jsonschema = { version = "0.46", default-features = false }
 
 # M7 transform — `dq-transform` embeds a jq evaluator via the `jaq` family
 # (jaq-core 3.0 + jaq-std 3.0 + jaq-json 2.0). The `sync` feature on
