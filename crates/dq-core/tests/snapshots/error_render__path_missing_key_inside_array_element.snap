@@ -1,0 +1,11 @@
+---
+source: crates/dq-core/tests/error_render.rs
+assertion_line: 198
+expression: view(&err)
+---
+kind: path
+pointer: /users/0/profile/bio
+matched_prefix: /users/0
+path_kind:
+  kind: MissingKey
+did_you_mean: []

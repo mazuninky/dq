@@ -1,0 +1,17 @@
+tests:
+  - name: single blank line passes
+    input: |
+      First paragraph.
+
+      Second paragraph.
+    expected:
+      violations: []
+  - name: tight document passes
+    input: |
+      # Title
+
+      ## Section
+
+      Body.
+    expected:
+      violations: []

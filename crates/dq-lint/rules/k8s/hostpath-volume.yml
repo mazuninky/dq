@@ -1,0 +1,30 @@
+id: k8s.hostpath-volume
+description: |
+  Pods should not mount hostPath volumes in production. hostPath
+  exposes the node's filesystem to the container, breaks portability
+  between nodes, and is a common privilege-escalation vector.
+severity: warn
+match:
+  format: yaml
+  filter: '.kind == "Deployment" or .kind == "StatefulSet" or .kind == "DaemonSet" or .kind == "Pod"'
+check:
+  jq: |
+    if (.spec.template // null) != null
+    then
+      (.spec.template.spec.volumes // [])
+      | to_entries[]
+      | select(.value.hostPath != null)
+      | { name: .value.name,
+          pointer: ("/spec/template/spec/volumes/" + (.key | tostring) + "/hostPath") }
+    else
+      (.spec.volumes // [])
+      | to_entries[]
+      | select(.value.hostPath != null)
+      | { name: .value.name,
+          pointer: ("/spec/volumes/" + (.key | tostring) + "/hostPath") }
+    end
+  message: "Volume '{{ .name }}' is a hostPath volume"
+loc:
+  pointer: '.pointer'
+references:
+  - https://kubernetes.io/docs/concepts/storage/volumes/#hostpath

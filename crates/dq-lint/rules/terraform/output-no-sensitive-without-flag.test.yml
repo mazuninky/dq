@@ -1,0 +1,43 @@
+tests:
+  - name: output named db_password without sensitive flag fires
+    input: |
+      output "db_password" {
+        value = aws_db_instance.default.password
+      }
+    expected:
+      violations:
+        - rule: terraform.output-no-sensitive-without-flag
+          message_contains: "db_password"
+  - name: output with sensitive = true passes
+    input: |
+      output "db_password" {
+        value     = aws_db_instance.default.password
+        sensitive = true
+      }
+    expected:
+      violations: []
+  - name: output with non-sensitive name is exempt
+    input: |
+      output "instance_id" {
+        value = aws_instance.web.id
+      }
+    expected:
+      violations: []
+  - name: output named api_token fires
+    input: |
+      output "api_token" {
+        value = module.api.token
+      }
+    expected:
+      violations:
+        - rule: terraform.output-no-sensitive-without-flag
+          message_contains: "api_token"
+  - name: output named ssh_key fires
+    input: |
+      output "ssh_key" {
+        value = tls_private_key.ssh.private_key_pem
+      }
+    expected:
+      violations:
+        - rule: terraform.output-no-sensitive-without-flag
+          message_contains: "ssh_key"

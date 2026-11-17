@@ -1,0 +1,49 @@
+tests:
+  - name: deployment without limits fires
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: app
+      spec:
+        template:
+          spec:
+            containers:
+              - name: app
+                image: app:v1
+    expected:
+      violations:
+        - rule: k8s.missing-resources-limits
+          message_contains: "missing resources.limits"
+  - name: deployment with both limits passes
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+      spec:
+        template:
+          spec:
+            containers:
+              - name: app
+                image: app:v1
+                resources:
+                  limits:
+                    cpu: 500m
+                    memory: 256Mi
+    expected:
+      violations: []
+  - name: only cpu limit set still fires (memory missing)
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+      spec:
+        template:
+          spec:
+            containers:
+              - name: app
+                image: app:v1
+                resources:
+                  limits:
+                    cpu: 500m
+    expected:
+      violations:
+        - rule: k8s.missing-resources-limits

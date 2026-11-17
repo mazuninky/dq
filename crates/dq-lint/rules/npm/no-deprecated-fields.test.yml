@@ -1,0 +1,20 @@
+tests:
+  - name: preferGlobal fires
+    input: '{"name":"foo","version":"1.0.0","preferGlobal":true}'
+    format: json
+    expected:
+      violations:
+        - rule: npm.no-deprecated-fields
+          message_contains: "preferGlobal"
+  - name: engineStrict fires
+    input: '{"name":"foo","version":"1.0.0","engineStrict":true}'
+    format: json
+    expected:
+      violations:
+        - rule: npm.no-deprecated-fields
+          message_contains: "engineStrict"
+  - name: clean package passes
+    input: '{"name":"foo","version":"1.0.0","license":"MIT"}'
+    format: json
+    expected:
+      violations: []

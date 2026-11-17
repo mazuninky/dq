@@ -1,0 +1,20 @@
+---
+source: crates/dq-cli/tests/golden.rs
+expression: combined
+---
+exit_code: 0
+--- stdout ---
+: object
+/apiVersion: string
+/kind: string
+/resources: array
+/resources/0: string
+/resources/1: string
+/namePrefix: string
+/commonLabels: object
+/commonLabels/app: string
+/images: array
+/images/0: object
+/images/0/name: string
+/images/0/newTag: string
+--- stderr ---

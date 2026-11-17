@@ -1,0 +1,26 @@
+---
+source: crates/dq-cli/tests/golden.rs
+expression: combined
+---
+exit_code: 0
+--- stdout ---
+: object
+/apiVersion: string
+/kind: string
+/metadata: object
+/metadata/name: string
+/spec: object
+/spec/replicas: int
+/spec/selector: object
+/spec/selector/matchLabels: object
+/spec/selector/matchLabels/app: string
+/spec/template: object
+/spec/template/metadata: object
+/spec/template/metadata/labels: object
+/spec/template/metadata/labels/app: string
+/spec/template/spec: object
+/spec/template/spec/containers: array
+/spec/template/spec/containers/0: object
+/spec/template/spec/containers/0/name: string
+/spec/template/spec/containers/0/image: string
+--- stderr ---

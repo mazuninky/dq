@@ -1,0 +1,40 @@
+id: npm.has-license
+description: |
+  Packages should declare a SPDX license identifier so consumers can
+  evaluate redistribution rights at install time. Missing the field
+  triggers npm's "UNLICENSED" warning and blocks publishing in some
+  internal registries.
+severity: warn
+match:
+  format: json
+  filter: 'has("name") and has("version")'
+check:
+  jq: 'select((.private // false) != true and ((.license // "") == ""))'
+  message: "package.json is missing the 'license' field"
+fix:
+  # Phase 4 (`add-ir-foundation`): migrated from `fix.jq` to `fix.ops`
+  # so the autofix preserves comments and surrounding bytes — this is
+  # the reference comment-preserving rule for the @std/* library.
+  #
+  # Two branches:
+  #   * `/license` is `""` → emit `replace` to set it to "UNLICENSED".
+  #   * `/license` is missing entirely → emit `add` so mkdir-p (Bug #1
+  #     fix) creates the key. Both branches are guarded by the
+  #     `.private != true` check so private packages stay untouched.
+  #
+  # The rule is idempotent: once `/license` is `"UNLICENSED"`, both
+  # guards collapse to `else []` (the empty patch), so a second
+  # application is a clean no-op.
+  ops: |
+    if (.private // false) != true
+    then
+      if has("license") and (.license // "") == ""
+      then [{"op": "replace", "path": "/license", "value": "UNLICENSED"}]
+      elif (has("license") | not)
+      then [{"op": "add", "path": "/license", "value": "UNLICENSED"}]
+      else []
+      end
+    else []
+    end
+references:
+  - https://docs.npmjs.com/cli/v10/configuring-npm/package-json#license

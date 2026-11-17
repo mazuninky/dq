@@ -1,0 +1,38 @@
+tests:
+  - name: loose date fires
+    input: |
+      ---
+      title: Hello
+      date: May 4, 2026
+      ---
+      # Body
+    expected:
+      violations:
+        - rule: markdown.frontmatter-date-format
+          message_contains: "May 4"
+  - name: ISO date passes
+    input: |
+      ---
+      title: Hello
+      date: 2026-05-04
+      ---
+      # Body
+    expected:
+      violations: []
+  - name: RFC 3339 timestamp passes
+    input: |
+      ---
+      title: Hello
+      date: 2026-05-04T12:00:00Z
+      ---
+      # Body
+    expected:
+      violations: []
+  - name: missing date does not fire
+    input: |
+      ---
+      title: Hello
+      ---
+      # Body
+    expected:
+      violations: []

@@ -1,0 +1,20 @@
+id: markdown.link-text-not-here
+description: |
+  Generic link text like "click here" or "this page" is unhelpful for
+  screen readers and degrades the document outline. Make the link
+  text describe its target.
+severity: info
+match:
+  format: markdown
+check:
+  jq: |
+    [.. | objects | select(.type? == "link")][]
+    | . as $l
+    | ([$l | recurse(.children?[]?) | select(.type == "text") | .value] | join("") | gsub("^\\s+|\\s+$"; "") | ascii_downcase)
+    | select(. == "click here" or . == "this page" or . == "this link" or . == "here" or . == "this")
+    | { text: ., url: $l.url }
+  message: "Link text '{{ .text }}' is generic; describe the target instead"
+references:
+  - https://www.w3.org/WAI/WCAG21/Techniques/general/G91
+loc:
+  line: 1

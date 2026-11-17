@@ -1,0 +1,24 @@
+tests:
+  - name: job without timeout fires
+    input: |
+      name: ci
+      on: [push]
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps: [{ uses: actions/checkout@v4 }]
+    expected:
+      violations:
+        - rule: github-actions.has-timeout
+          message_contains: "build"
+  - name: job with timeout-minutes passes
+    input: |
+      name: ci
+      on: [push]
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          timeout-minutes: 15
+          steps: [{ uses: actions/checkout@v4 }]
+    expected:
+      violations: []

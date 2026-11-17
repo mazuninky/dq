@@ -1,0 +1,8 @@
+{
+  "ascii": "hello",
+  "cyrillic": "привет",
+  "japanese": "こんにちは",
+  "emoji": "👋🌍",
+  "escapes": "tab\there\nnewline",
+  "unicode_escape": "éèê"
+}

@@ -1,0 +1,6 @@
+---
+source: crates/dq-cli/tests/cli_snapshots.rs
+expression: stderr
+---
+file contains Go template syntax (line [NUM]): pullPolicy: {{ .Values.image.pullPolicy | default "IfNotPresent" }}
+  hint: use --allow-templates to parse anyway (formatting may break) or --raw-template-strings to preserve template values as opaque strings

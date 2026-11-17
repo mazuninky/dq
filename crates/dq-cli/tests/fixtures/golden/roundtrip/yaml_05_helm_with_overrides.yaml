@@ -1,0 +1,17 @@
+replicaCount: 3
+image:
+  repository: ghcr.io/example/app
+  pullPolicy: IfNotPresent
+  tag: ""  # explicit empty string for "use default"
+nameOverride: ""
+fullnameOverride: ""
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+podAnnotations: {}
+podSecurityContext: {}
+securityContext: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

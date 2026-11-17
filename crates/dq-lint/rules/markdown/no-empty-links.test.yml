@@ -1,0 +1,13 @@
+tests:
+  - name: empty link text fires
+    input: |
+      See [](https://example.com) for details.
+    expected:
+      violations:
+        - rule: markdown.no-empty-links
+          message_contains: "https://example.com"
+  - name: non-empty link passes
+    input: |
+      See [the docs](https://example.com) for details.
+    expected:
+      violations: []

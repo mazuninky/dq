@@ -1,0 +1,13 @@
+server:
+  port: 8080
+  host: localhost
+  tls:
+    enabled: true
+    cert: /etc/ssl/cert.pem
+users:
+  - id: 1
+    name: alice
+  - id: 2
+    name: bob
+  - id: 3
+    name: carol

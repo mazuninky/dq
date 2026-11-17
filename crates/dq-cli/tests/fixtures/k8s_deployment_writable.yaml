@@ -1,0 +1,25 @@
+# Writable k8s manifest fixture for `dq set` integration tests.
+# Hand-written original — not copied from any external source.
+# Kept separate from `k8s_deployment.yaml` so write-tests can mutate freely
+# without affecting read-only fixtures shared by other tests.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: default
+  annotations:
+    foo: keep-me
+    bar: also-keep
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: ghcr.io/example/web:1.2.3

@@ -1,0 +1,20 @@
+---
+source: crates/dq-cli/tests/golden.rs
+expression: combined
+---
+exit_code: 0
+--- stdout ---
+: object
+/package: object
+/package/name: string
+/package/version: string
+/package/edition: string
+/dependencies: object
+/dependencies/serde: object
+/dependencies/serde/version: string
+/dependencies/serde/features: array
+/dependencies/serde/features/0: string
+/dependencies/anyhow: string
+/dev-dependencies: object
+/dev-dependencies/proptest: string
+--- stderr ---

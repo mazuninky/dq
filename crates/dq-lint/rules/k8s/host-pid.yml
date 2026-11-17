@@ -1,0 +1,22 @@
+id: k8s.host-pid
+description: |
+  Pods should not request host PID namespace access. hostPID=true lets
+  the pod see and signal every process on the node, which makes it
+  trivial for a compromised container to escalate to node-level access.
+severity: error
+match:
+  format: yaml
+  filter: '.kind == "Deployment" or .kind == "StatefulSet" or .kind == "DaemonSet" or .kind == "Pod"'
+check:
+  jq: |
+    if (.spec.template // null) != null
+    then { spec: .spec.template.spec, ptr: "/spec/template/spec" }
+    else { spec: .spec,               ptr: "/spec" }
+    end
+    | select(.spec.hostPID == true)
+    | { pointer: (.ptr + "/hostPID") }
+  message: "Pod uses hostPID: true"
+loc:
+  pointer: '.pointer'
+references:
+  - https://kubernetes.io/docs/concepts/security/pod-security-standards/

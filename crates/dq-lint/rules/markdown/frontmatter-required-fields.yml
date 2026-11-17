@@ -1,0 +1,21 @@
+id: markdown.frontmatter-required-fields
+description: |
+  Static-site generators (Hugo, Jekyll, Obsidian, MkDocs) require
+  certain frontmatter fields to render a page. The default required
+  set is `title` and `date`. The rule fires only when frontmatter
+  is present — files without frontmatter are skipped.
+severity: error
+match:
+  format: markdown
+  filter: '.frontmatter != null'
+check:
+  jq: |
+    . as $doc
+    | ($doc.frontmatter.value // {}) as $fm
+    | (["title", "date"] - ($fm | keys))[]
+    | { field: . }
+  message: "Frontmatter is missing required field '{{ .field }}'"
+references:
+  - https://gohugo.io/content-management/front-matter/
+loc:
+  line: 1

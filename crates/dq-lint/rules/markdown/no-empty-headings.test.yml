@@ -1,0 +1,21 @@
+tests:
+  - name: empty heading fires
+    input: |
+      # Title
+
+      ##
+
+      Body.
+    expected:
+      violations:
+        - rule: markdown.no-empty-headings
+          message_contains: "empty text"
+  - name: non-empty headings pass
+    input: |
+      # Title
+
+      ## Section
+
+      Body.
+    expected:
+      violations: []

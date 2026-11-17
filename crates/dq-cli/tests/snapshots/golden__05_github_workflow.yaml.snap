@@ -1,0 +1,22 @@
+---
+source: crates/dq-cli/tests/golden.rs
+expression: combined
+---
+exit_code: 0
+--- stdout ---
+: object
+/name: string
+/on: object
+/on/push: object
+/on/push/branches: array
+/on/push/branches/0: string
+/on/pull_request: null
+/jobs: object
+/jobs/build: object
+/jobs/build/runs-on: string
+/jobs/build/steps: array
+/jobs/build/steps/0: object
+/jobs/build/steps/0/uses: string
+/jobs/build/steps/1: object
+/jobs/build/steps/1/run: string
+--- stderr ---

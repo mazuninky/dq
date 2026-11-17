@@ -1,0 +1,51 @@
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "Zlib",
+    "CC0-1.0",
+    # webpki-roots ships under CDLA-Permissive-2.0 (Mozilla's CA bundle is
+    # licensed by Mozilla under this license; rustls/ureq vendor the bundle
+    # via webpki-roots). It's a permissive data-licensing scheme — see
+    # https://cdla.dev/permissive-2-0/.
+    "CDLA-Permissive-2.0",
+    # M11: borrow-or-share (transitive via fluent-uri → referencing →
+    # jsonschema 0.34) is licensed under MIT-0 (MIT No Attribution) — a
+    # strictly more permissive variant of MIT that drops the attribution
+    # requirement. See https://opensource.org/license/mit-0.
+    "MIT-0",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Intra-workspace `path = "../<crate>"` deps without an explicit `version = ...`
+# are reported as wildcards. That's intentional in this workspace — the member
+# crates (dq-core / dq-exec / dq-lint / dq-transform / dq-plugin) are not
+# published to crates.io, only consumed via path, so locking a SemVer range
+# would just churn on every CalVer bump. Allow wildcards specifically for
+# path-deps; deny everywhere else (e.g. external `foo = "*"`).
+allow-wildcard-paths = true
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

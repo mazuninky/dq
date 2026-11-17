@@ -1,0 +1,23 @@
+tests:
+  - name: extensions/v1beta1 fires
+    input: |
+      apiVersion: extensions/v1beta1
+      kind: Deployment
+    expected:
+      violations:
+        - rule: k8s.deprecated-api
+          message_contains: "extensions/v1beta1"
+  - name: apps/v1 passes
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+    expected:
+      violations: []
+  - name: policy/v1beta1 fires
+    input: |
+      apiVersion: policy/v1beta1
+      kind: PodDisruptionBudget
+    expected:
+      violations:
+        - rule: k8s.deprecated-api
+          message_contains: "policy/v1beta1"

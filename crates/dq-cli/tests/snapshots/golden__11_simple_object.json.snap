@@ -1,0 +1,17 @@
+---
+source: crates/dq-cli/tests/golden.rs
+expression: combined
+---
+exit_code: 0
+--- stdout ---
+: object
+/a: int
+/b: string
+/c: array
+/c/0: int
+/c/1: int
+/c/2: int
+/d: object
+/d/e: null
+/d/f: bool
+--- stderr ---

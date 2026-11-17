@@ -1,0 +1,21 @@
+id: markdown.table-pipes-aligned
+description: |
+  Every row in a GFM table should have the same number of cells. Mismatched
+  cell counts often indicate a missing pipe character and produce broken
+  table rendering.
+severity: warn
+match:
+  format: markdown
+check:
+  jq: |
+    [.. | objects | select(.type? == "table")][]
+    | . as $t
+    | ($t.children[0].children | length) as $expected
+    | $t.children[1:][]
+    | select((.children | length) != $expected)
+    | { expected: $expected, actual: (.children | length), position: .position }
+  message: "Table row has {{ .actual }} cells but header row has {{ .expected }}"
+references:
+  - https://github.github.com/gfm/#tables-extension-
+loc:
+  line: '.position.start.line // 1'

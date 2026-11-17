@@ -1,0 +1,13 @@
+tests:
+  - name: "'click here' fires"
+    input: |
+      [click here](https://example.com) for the docs.
+    expected:
+      violations:
+        - rule: markdown.link-text-not-here
+          message_contains: "click here"
+  - name: descriptive link passes
+    input: |
+      Read [the API reference](https://example.com) before filing a bug.
+    expected:
+      violations: []

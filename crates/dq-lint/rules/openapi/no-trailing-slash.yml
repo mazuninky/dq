@@ -1,0 +1,19 @@
+id: openapi.no-trailing-slash
+description: |
+  Path templates should not end with `/`. Trailing slashes are
+  semantically distinct from the slashless variant under most HTTP
+  routers, and OpenAPI's path-templating rules do not formally allow
+  them. Rename `/users/` → `/users`. The single root path `/` is
+  exempt because it has no slashless equivalent.
+severity: warn
+match:
+  format: [yaml, json]
+  filter: '.openapi != null and (.openapi | type == "string")'
+check:
+  jq: |
+    [.paths // {} | keys[]
+      | select(. != "/" and (endswith("/")))
+      | {path: .}][]
+  message: "Path '{{ .path }}' ends with a trailing slash"
+references:
+  - https://spec.openapis.org/oas/latest.html#path-templating

@@ -1,0 +1,21 @@
+id: markdown.no-multiple-blank-lines
+description: |
+  At most one blank line should separate two block-level elements.
+  Multiple blank lines have no semantic effect in CommonMark and
+  often indicate a botched merge.
+severity: warn
+match:
+  format: markdown
+check:
+  jq: |
+    [.children[]? | select(.position != null)] as $bs
+    | range(1; $bs | length) as $i
+    | $bs[$i-1].position.end.line as $prev_end
+    | $bs[$i].position.start.line as $cur_start
+    | select(($cur_start - $prev_end) > 2)
+    | { gap: ($cur_start - $prev_end - 1), position: $bs[$i].position }
+  message: "More than one blank line above this block ({{ .gap }} blank lines)"
+references:
+  - https://commonmark.org/help/
+loc:
+  line: '.position.start.line // 1'

@@ -1,0 +1,45 @@
+tests:
+  - name: paths without trailing slash pass
+    input: |
+      openapi: "3.1.0"
+      info: { title: API, version: "1.0.0" }
+      paths:
+        /users:
+          get:
+            responses: { "200": { description: ok } }
+    expected:
+      violations: []
+  - name: trailing-slash path fires
+    input: |
+      openapi: "3.1.0"
+      info: { title: API, version: "1.0.0" }
+      paths:
+        /users/:
+          get:
+            responses: { "200": { description: ok } }
+    expected:
+      violations:
+        - rule: openapi.no-trailing-slash
+          message_contains: "/users/"
+  - name: root path / is exempt
+    input: |
+      openapi: "3.1.0"
+      info: { title: API, version: "1.0.0" }
+      paths:
+        /:
+          get:
+            responses: { "200": { description: ok } }
+    expected:
+      violations: []
+  - name: nested templated path with trailing slash fires
+    input: |
+      openapi: "3.1.0"
+      info: { title: API, version: "1.0.0" }
+      paths:
+        /users/{id}/comments/:
+          get:
+            responses: { "200": { description: ok } }
+    expected:
+      violations:
+        - rule: openapi.no-trailing-slash
+          message_contains: "/users/{id}/comments/"

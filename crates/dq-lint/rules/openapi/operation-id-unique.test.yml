@@ -1,0 +1,74 @@
+tests:
+  - name: unique operationIds pass
+    input: |
+      openapi: "3.1.0"
+      info: { title: API, version: "1.0.0" }
+      paths:
+        /users:
+          get:
+            operationId: listUsers
+            responses: { "200": { description: ok } }
+        /users/{id}:
+          get:
+            operationId: getUser
+            responses: { "200": { description: ok } }
+    expected:
+      violations: []
+  - name: duplicate operationIds fire
+    input: |
+      openapi: "3.1.0"
+      info: { title: API, version: "1.0.0" }
+      paths:
+        /users:
+          get:
+            operationId: listUsers
+            responses: { "200": { description: ok } }
+        /admin/users:
+          get:
+            operationId: listUsers
+            responses: { "200": { description: ok } }
+    expected:
+      violations:
+        - rule: openapi.operation-id-unique
+          message_contains: "listUsers"
+  - name: missing operationIds are silent (a different rule should flag)
+    input: |
+      openapi: "3.1.0"
+      info: { title: API, version: "1.0.0" }
+      paths:
+        /a:
+          get:
+            responses: { "200": { description: ok } }
+        /b:
+          get:
+            responses: { "200": { description: ok } }
+    expected:
+      violations: []
+  - name: triplicate operationId fires once with count 3
+    input: |
+      openapi: "3.1.0"
+      info: { title: API, version: "1.0.0" }
+      paths:
+        /a:
+          get:
+            operationId: shared
+            responses: { "200": { description: ok } }
+        /b:
+          get:
+            operationId: shared
+            responses: { "200": { description: ok } }
+        /c:
+          get:
+            operationId: shared
+            responses: { "200": { description: ok } }
+    expected:
+      violations:
+        - rule: openapi.operation-id-unique
+          message_contains: "3 times"
+  - name: non-openapi yaml is skipped
+    input: |
+      kind: ConfigMap
+      metadata:
+        name: x
+    expected:
+      violations: []

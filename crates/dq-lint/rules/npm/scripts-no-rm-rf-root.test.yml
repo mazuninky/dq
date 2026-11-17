@@ -1,0 +1,19 @@
+tests:
+  - name: rm -rf / fires
+    input: '{"name":"foo","version":"1.0.0","scripts":{"clean":"rm -rf /"}}'
+    format: json
+    expected:
+      violations:
+        - rule: npm.scripts-no-rm-rf-root
+          message_contains: "clean"
+  - name: rm -rf $HOME fires
+    input: '{"name":"foo","version":"1.0.0","scripts":{"reset":"rm -rf $HOME"}}'
+    format: json
+    expected:
+      violations:
+        - rule: npm.scripts-no-rm-rf-root
+  - name: rm -rf ./build passes
+    input: '{"name":"foo","version":"1.0.0","scripts":{"clean":"rm -rf ./build"}}'
+    format: json
+    expected:
+      violations: []

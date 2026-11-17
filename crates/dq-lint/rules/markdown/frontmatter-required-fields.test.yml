@@ -1,0 +1,43 @@
+tests:
+  - name: missing title fires
+    input: |
+      ---
+      date: 2026-05-04
+      ---
+      # Body
+
+      Body.
+    expected:
+      violations:
+        - rule: markdown.frontmatter-required-fields
+          message_contains: "title"
+  - name: missing date fires
+    input: |
+      ---
+      title: Hello
+      ---
+      # Body
+
+      Body.
+    expected:
+      violations:
+        - rule: markdown.frontmatter-required-fields
+          message_contains: "date"
+  - name: complete frontmatter passes
+    input: |
+      ---
+      title: Hello
+      date: 2026-05-04
+      ---
+      # Body
+
+      Body.
+    expected:
+      violations: []
+  - name: no frontmatter does not fire
+    input: |
+      # Body
+
+      Body.
+    expected:
+      violations: []

@@ -1,0 +1,30 @@
+id: jsonschema.kubernetes-crd-shape
+description: |
+  Kubernetes resource manifests must declare the basic identity fields
+  (`apiVersion`, `kind`, and `metadata.name`) so kubectl and the API
+  server can identify and route them. This rule validates the
+  envelope only — workload-specific shape lives in CRD-specific schemas.
+severity: error
+match:
+  format: [yaml, json]
+  filter: '.kind != null and .apiVersion != null'
+check:
+  schema:
+    type: object
+    required: [apiVersion, kind, metadata]
+    properties:
+      apiVersion:
+        type: string
+        minLength: 1
+      kind:
+        type: string
+        minLength: 1
+      metadata:
+        type: object
+        required: [name]
+        properties:
+          name:
+            type: string
+            minLength: 1
+references:
+  - https://kubernetes.io/docs/concepts/overview/working-with-objects/kubernetes-objects/

@@ -1,0 +1,9 @@
+---
+source: crates/dq-core/tests/error_render.rs
+assertion_line: 270
+expression: view(&err)
+---
+kind: templated_file
+line: 7
+snippet: "tag: {{ .Values.image.tag }}"
+hint: use --allow-templates to parse anyway (formatting may break) or --raw-template-strings to preserve template values as opaque strings

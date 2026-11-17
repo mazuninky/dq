@@ -1,0 +1,12 @@
+tests:
+  - name: missing engines.node fires
+    input: '{"name":"foo","version":"1.0.0","license":"MIT"}'
+    format: json
+    expected:
+      violations:
+        - rule: npm.has-engines
+  - name: with engines.node passes
+    input: '{"name":"foo","version":"1.0.0","engines":{"node":">=18"}}'
+    format: json
+    expected:
+      violations: []

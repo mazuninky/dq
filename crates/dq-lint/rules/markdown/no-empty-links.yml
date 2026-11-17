@@ -1,0 +1,22 @@
+id: markdown.no-empty-links
+description: |
+  Every link should have non-empty inline text. Empty link text
+  collapses to the URL in many renderers and is unreadable for
+  screen-reader users.
+severity: error
+match:
+  format: markdown
+check:
+  jq: |
+    [.. | objects | select(.type? == "paragraph" or .type? == "heading" or .type? == "list_item" or .type? == "table_cell" or .type? == "block_quote")][]
+    | . as $block
+    | [$block | recurse(.children?[]?) | select(.type? == "link")][]
+    | . as $l
+    | ([$l | recurse(.children?[]?) | select(.type == "text") | .value] | join("") | gsub("^\\s+|\\s+$"; ""))
+    | select(. == "")
+    | { url: $l.url, position: $block.position }
+  message: "Link to '{{ .url }}' has empty text"
+references:
+  - https://www.w3.org/WAI/tutorials/page-structure/links/
+loc:
+  line: '.position.start.line // 1'

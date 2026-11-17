@@ -1,0 +1,21 @@
+id: markdown.no-bare-urls
+description: |
+  Bare URLs in plain text are fragile — many CommonMark consumers
+  do not auto-link them, and the surrounding line wraps awkwardly.
+  Use autolink syntax `<https://…>` or a labeled link `[text](url)`.
+severity: warn
+match:
+  format: markdown
+check:
+  jq: |
+    [.. | objects | select(.type? == "paragraph" or .type? == "heading" or .type? == "list_item" or .type? == "table_cell" or .type? == "block_quote")][]
+    | . as $block
+    | .children[]?
+    | select(.type == "text")
+    | select(.value | tostring | test("https?://[^\\s<>)\\]\"]+"))
+    | { snippet: (.value | tostring), position: $block.position }
+  message: "Bare URL in plain text: '{{ .snippet }}' (use autolink or labeled link)"
+references:
+  - https://commonmark.org/help/
+loc:
+  line: '.position.start.line // 1'

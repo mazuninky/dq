@@ -1,0 +1,28 @@
+tests:
+  - name: minimal openapi 3.1 document passes
+    input: |
+      openapi: "3.1.0"
+      info:
+        title: My API
+        version: "1.0.0"
+      paths: {}
+    expected:
+      violations: []
+  - name: openapi 3.1 missing info.title fails
+    input: |
+      openapi: "3.1.0"
+      info:
+        version: "1.0.0"
+      paths: {}
+    expected:
+      violations:
+        - rule: jsonschema.openapi-3.1-shape
+  - name: openapi 3.0 is skipped (filter misses)
+    input: |
+      openapi: "3.0.3"
+      info:
+        title: Other
+        version: "1.0.0"
+      paths: {}
+    expected:
+      violations: []

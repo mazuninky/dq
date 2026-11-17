@@ -1,0 +1,25 @@
+id: openapi.security-defined
+description: |
+  An OpenAPI document should declare authentication requirements
+  either at the document root (`security:` non-empty array, applied
+  to every operation) or per-operation. A spec without any security
+  requirement implies all operations are unauthenticated — usually a
+  copy-paste mistake. Set `security: []` explicitly at the operation
+  level to opt out (the empty array is the spec-blessed "no auth"
+  marker).
+severity: warn
+match:
+  format: [yaml, json]
+  filter: '.openapi != null and (.openapi | type == "string")'
+check:
+  jq: |
+    select(((.security // []) | length) == 0)
+    | [.paths // {} | to_entries[]
+        | .key as $path
+        | .value | to_entries[]
+        | select(.key | test("^(get|post|put|delete|patch|options|head|trace)$"))
+        | select(.value.security == null)
+        | {path: $path, method: (.key | ascii_upcase)}][]
+  message: "Operation {{ .method }} {{ .path }} has no security requirement and no document-level security applies"
+references:
+  - https://spec.openapis.org/oas/latest.html#security-requirement-object

@@ -1,0 +1,26 @@
+# Fixture (b): Helm-style values.yaml — no Go templates (those are
+# tested separately under --raw-template-strings substitution).
+# Comments above keys, blank lines between groups, mixed scalar styles.
+# Original — not copied from any chart.
+
+image:
+  repository: registry.example.test/svc
+  tag: stable
+  # pullPolicy controls when the kubelet pulls. Always for :latest, IfNotPresent for tags.
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 80
+
+# Resource budget. Adjust per environment.
+resources:
+  limits:
+    cpu: "500m"        # quoted to preserve string type
+    memory: 256Mi
+  requests:
+    cpu: "100m"
+    memory: 64Mi
+
+# Optional node selector. Empty by default.
+nodeSelector: {}

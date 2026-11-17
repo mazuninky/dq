@@ -1,0 +1,28 @@
+tests:
+  - name: pod with hostNetwork fires
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+      spec:
+        template:
+          spec:
+            hostNetwork: true
+            containers:
+              - name: app
+                image: app:v1
+    expected:
+      violations:
+        - rule: k8s.host-network
+          message_contains: "hostNetwork"
+  - name: pod without hostNetwork passes
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+      spec:
+        template:
+          spec:
+            containers:
+              - name: app
+                image: app:v1
+    expected:
+      violations: []

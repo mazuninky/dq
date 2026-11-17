@@ -1,0 +1,19 @@
+tests:
+  - name: HTML block fires
+    input: |
+      Some text.
+
+      <div>raw html</div>
+
+      End.
+    expected:
+      violations:
+        - rule: markdown.no-inline-html
+          message_contains: "Inline HTML"
+  - name: pure markdown passes
+    input: |
+      Some text.
+
+      More text.
+    expected:
+      violations: []

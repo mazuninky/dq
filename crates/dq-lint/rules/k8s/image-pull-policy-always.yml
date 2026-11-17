@@ -1,0 +1,48 @@
+id: k8s.image-pull-policy-always
+description: |
+  Containers using imagePullPolicy=Always force the kubelet to contact
+  the registry on every pod start. For pinned (non-:latest) tags this
+  wastes bandwidth and latency without buying anything. Prefer
+  IfNotPresent for pinned tags; Always is appropriate only for :latest.
+severity: info
+match:
+  format: yaml
+  filter: '.kind == "Deployment" or .kind == "StatefulSet" or .kind == "DaemonSet" or .kind == "Pod"'
+check:
+  # Phase 2 of `add-ir-foundation`: emit `{name, image, pointer}` per
+  # offending container so `loc.pointer` resolves to the exact
+  # `(line, col)` in the source bytes. The pointer prefix differs
+  # between Pod-shaped (`/spec/containers/<idx>`) and workload-shaped
+  # (`/spec/template/spec/containers/<idx>`) inputs — the `if` guard
+  # picks the right branch.
+  jq: |
+    if (.spec.template // null) != null
+    then
+      (.spec.template.spec.containers // [])
+      | to_entries[]
+      | select(.value.imagePullPolicy == "Always"
+               and (.value.image | tostring | test(":latest$") | not))
+      | { name: .value.name,
+          image: .value.image,
+          pointer: ("/spec/template/spec/containers/" + (.key | tostring) + "/name") }
+    else
+      (.spec.containers // [])
+      | to_entries[]
+      | select(.value.imagePullPolicy == "Always"
+               and (.value.image | tostring | test(":latest$") | not))
+      | { name: .value.name,
+          image: .value.image,
+          pointer: ("/spec/containers/" + (.key | tostring) + "/name") }
+    end
+  message: "Container '{{ .name }}' uses imagePullPolicy=Always with a pinned tag"
+loc:
+  pointer: '.pointer'
+fix:
+  # Walk every node; on container-shaped objects with the offending
+  # combination, swap `imagePullPolicy: Always` for `IfNotPresent`. The
+  # fix is idempotent: after the rewrite the predicate
+  # `.imagePullPolicy == "Always"` no longer holds on those containers,
+  # so a second application is a no-op.
+  jq: 'walk(if type == "object" and .imagePullPolicy == "Always" and (.image // "" | tostring | test(":latest$") | not) then .imagePullPolicy = "IfNotPresent" else . end)'
+references:
+  - https://kubernetes.io/docs/concepts/containers/images/#updating-images

@@ -1,0 +1,19 @@
+tests:
+  - name: values.yaml with valid image shape passes
+    input: |
+      image:
+        repository: nginx
+        tag: "1.25"
+      replicas: 2
+    format: yaml
+    expected:
+      violations: []
+  - name: values.yaml with empty image.repository fails
+    input: |
+      image:
+        repository: ""
+        tag: "1.25"
+    format: yaml
+    expected:
+      violations:
+        - rule: jsonschema.helm-values-against-schema

@@ -1,0 +1,6 @@
+---
+source: crates/dq-cli/tests/cli_snapshots.rs
+assertion_line: 150
+expression: stderr
+---
+write-mode flag --in-place is not accepted by this read-only subcommand (use `set`/`del` for in-place edits)

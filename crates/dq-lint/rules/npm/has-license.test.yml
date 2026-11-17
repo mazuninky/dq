@@ -1,0 +1,17 @@
+tests:
+  - name: missing license fires
+    input: '{"name":"foo","version":"1.0.0"}'
+    format: json
+    expected:
+      violations:
+        - rule: npm.has-license
+  - name: license MIT passes
+    input: '{"name":"foo","version":"1.0.0","license":"MIT"}'
+    format: json
+    expected:
+      violations: []
+  - name: private package is exempt
+    input: '{"name":"foo","version":"1.0.0","private":true}'
+    format: json
+    expected:
+      violations: []

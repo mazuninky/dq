@@ -1,0 +1,13 @@
+id: npm.has-repository
+description: |
+  Packages should declare a repository URL so consumers can find the
+  source code, file issues, and verify provenance.
+severity: info
+match:
+  format: json
+  filter: 'has("name") and has("version")'
+check:
+  jq: 'select((.private // false) != true and (.repository // null) == null)'
+  message: "package.json is missing the 'repository' field"
+references:
+  - https://docs.npmjs.com/cli/v10/configuring-npm/package-json#repository

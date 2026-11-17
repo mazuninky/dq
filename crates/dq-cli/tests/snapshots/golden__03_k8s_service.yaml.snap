@@ -1,0 +1,20 @@
+---
+source: crates/dq-cli/tests/golden.rs
+expression: combined
+---
+exit_code: 0
+--- stdout ---
+: object
+/apiVersion: string
+/kind: string
+/metadata: object
+/metadata/name: string
+/spec: object
+/spec/selector: object
+/spec/selector/app: string
+/spec/ports: array
+/spec/ports/0: object
+/spec/ports/0/port: int
+/spec/ports/0/targetPort: int
+/spec/type: string
+--- stderr ---

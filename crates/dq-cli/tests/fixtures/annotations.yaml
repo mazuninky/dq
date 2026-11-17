@@ -1,0 +1,7 @@
+# Hand-written fixture for `dq del` smoke testing on annotation maps.
+metadata:
+  name: my-resource
+  annotations:
+    foo: drop-me
+    bar: keep-me
+    baz: also-keep

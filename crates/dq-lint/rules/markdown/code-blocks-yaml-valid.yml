@@ -1,0 +1,42 @@
+id: markdown.code-blocks-yaml-valid
+description: |
+  Every fenced code block tagged as YAML in a markdown document must
+  parse as valid YAML. Invalid YAML inside a fenced block is an
+  authoring bug — readers will paste the snippet expecting it to work.
+  This is the first composite rule in the standard library: the outer
+  rule extracts every yaml-tagged fenced block via jq, the runtime
+  re-parses each block as YAML, and any YAML parse failure becomes a
+  `markdown.code-blocks-yaml-valid.parse-failed` diagnostic anchored at
+  the block's position in the markdown source.
+
+  Known limitation: markdown AST nodes carry block-level `position`
+  but no per-character `ValueSpan`, so `Ir::line_col_for(<anchor>)`
+  resolves to the default `(1, 1)` for the projected diagnostic. The
+  composite runtime emits a `tracing::warn!` per missing anchor span
+  and degrades gracefully (the diagnostic still fires, just without
+  precise inner-coordinate projection). Sub-line precision lands when
+  the markdown parser populates `ValueSpan` for code-block leaves.
+severity: error
+match:
+  format: markdown
+check:
+  extract: |
+    [paths(objects | select(.type == "code_block" and .fenced == true and .lang == "yaml")) as $p |
+     getpath($p) as $node |
+     {value: $node.value, format: "yaml", anchor: ($p | map("/" + tostring) | add // "")}]
+  nested:
+    id: markdown.code-blocks-yaml-valid.inner
+    description: |
+      Inner parse-only check. The outer composite rule's parse-failed
+      branch is the actual violation surface — this nested rule never
+      fires; YAML that parses successfully is silently accepted.
+    severity: error
+    match:
+      format: yaml
+    check:
+      jq: 'empty'
+      message: "YAML inner-check produced violations (should never fire)"
+  message: "YAML code block invalid"
+references:
+  - https://yaml.org/spec/1.2.2/
+  - https://github.github.com/gfm/#fenced-code-blocks

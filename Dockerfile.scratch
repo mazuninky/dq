@@ -1,0 +1,31 @@
+# Multi-stage scratch build for `dq` — minimal image (~5 MiB).
+#
+# Static-musl link so the runtime stage needs nothing — not even libc.
+# No shell, no `apk`, no debugging affordances. For size-sensitive
+# consumers; use the default `Dockerfile` (alpine) for everything else.
+#
+# Build:   docker build -f Dockerfile.scratch -t dq:scratch .
+# Run:     docker run --rm -v $(pwd):/work dq:scratch get config.yaml /name
+
+FROM rust:1.94-alpine AS builder
+
+RUN apk add --no-cache musl-dev
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY clippy.toml deny.toml ./
+COPY crates ./crates
+
+ENV RUSTFLAGS='-C target-feature=+crt-static'
+RUN cargo build --release --locked --bin dq --target x86_64-unknown-linux-musl
+
+FROM scratch
+
+COPY --from=builder /src/target/x86_64-unknown-linux-musl/release/dq /dq
+
+LABEL org.opencontainers.image.source="https://github.com/mazuninky/dq" \
+      org.opencontainers.image.description="Agent-friendly Rust CLI for structured data + linter platform (scratch image)" \
+      org.opencontainers.image.licenses="MIT"
+
+ENTRYPOINT ["/dq"]
+CMD ["--help"]

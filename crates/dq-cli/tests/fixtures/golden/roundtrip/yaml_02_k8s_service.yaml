@@ -1,0 +1,17 @@
+# k8s Service with comments at multiple positions.
+# Source: hand-written.
+apiVersion: v1
+kind: Service
+# A namespaced service in `default`.
+metadata:
+  name: web
+  namespace: default
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      # backend port differs from frontend
+      targetPort: 8080
+      protocol: TCP
+  selector:
+    app: web

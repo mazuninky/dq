@@ -1,0 +1,56 @@
+schema: spec-driven
+
+context: |
+  Project: `dq` — Rust CLI для работы со структурированными данными и платформа для
+  линтеров поверх произвольных форматов. Полное описание и roadmap M1–M12 — в
+  [dq-plan.md](../dq-plan.md). Текущий статус: M0 (план готов, кода нет, репо чистый
+  — есть только dq-plan.md и пустой README.md).
+
+  Целевая аудитория: разработчики, DevOps-инженеры **и AI-агенты в CI/CD**. Третья
+  категория — главный differentiator; все ошибки структурированные с line/col/span/
+  suggestions, JSON-вывод первого класса, JSON Pointer вместо своего DSL.
+
+  Архитектура: cargo workspace из 5 крейтов:
+    - `dq-core`     — Document model, Format trait, parsers, writers, JSON Pointer, Error
+    - `dq-transform`— атомарные операции set/del/merge/patch + jaq adapter (M7+)
+    - `dq-exec`     — runtime для линтеров: Rule/RuleSet/Evaluator/Diagnostic/Reporter (M8+)
+    - `dq-lint`     — стандартная библиотека правил (k8s/markdown/npm/github-actions, M8+)
+    - `dq-cli`      — бинарь, тонкая обёртка над всеми слоями
+
+  Tech stack (Rust): edition 2024 (lang minimum 1.85), pinned channel 1.94.0 in
+  rust-toolchain.toml (matches the atl reference project; not a true MSRV — we
+  don't currently target older toolchains), clap v4 derive, camino::Utf8PathBuf,
+  thiserror (per-module domain enums) + anyhow (command handlers), tracing +
+  tracing-subscriber + EnvFilter, serde/toml/serde_json, saphyr (YAML round-trip M2+),
+  toml_edit, comrak (M9), jaq-core+jaq-std (M7+), globset, rayon, tempfile (atomic
+  writes + tests), insta (snapshots), proptest (round-trip), criterion (bench),
+  toon-format (TOON output), clap_complete, clap_mangen.
+
+  Конвенции `/rust-cli` (skill rust-cli) обязательны:
+    - Тонкий main.rs, SIGPIPE → SIG_DFL на Unix, IoStreams/Reporter с DI
+    - `--verbose`/`-v` (count), `--quiet` (conflicts_with verbose), все global=true
+    - Exit codes как named constants в `pub mod exit_code`
+    - Non-interactive: ноль prompts, ноль spinners, identical под `| cat` и в CI
+    - Логирование строго `tracing::*!`, никогда `println!`/`eprintln!`/`log` крейт
+    - Output: handler возвращает Value, отдаёт `&dyn Reporter`, никогда не пишет сам
+    - `pub type Result<T>` alias per crate, anyhow в handlers
+    - Release profile: lto=true, codegen-units=1, strip=true
+    - Тесты: `tracing_subscriber::fmt().try_init()` (не `.init()`), `Registry::with_items`
+      test-constructor, никаких `pub(crate)` / `#[cfg(test)] pub fn __test_*`
+      escape-hatches, никакого `std::env::set_var("NO_COLOR", ...)` (use `use_color:
+      bool` параметром)
+
+  Делегирование Rust-правок: ЛЮБАЯ правка `*.rs` или `Cargo.toml` идёт через subagent
+  `rust-cli-writer` (production) или `rust-cli-test-writer` (тесты). Правило в
+  `.claude/rules/rust-delegation.md`. Orchestrator не редактирует Rust-файлы напрямую.
+
+rules:
+  proposal:
+    - Ссылайся на конкретные секции dq-plan.md (по якорю или строке) при цитировании scope.
+    - Принципы из skill `/rust-cli` принимаются как baseline и не пересогласовываются.
+    - Antiscope из dq-plan.md ("Чего не будет никогда") — твёрдая граница.
+  tasks:
+    - Каждая Rust-задача формулируется так, чтобы её можно было отдать в rust-cli-writer
+      или rust-cli-test-writer одним промптом — указывай файл, цель, ограничения.
+    - Не объединяй "написать код" и "написать тесты" в одну задачу — это разные agents.
+    - Каждая задача под 2 часа реальной работы или меньше, иначе дроби.

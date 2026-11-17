@@ -1,0 +1,14 @@
+id: npm.has-engines
+description: |
+  Packages should declare a Node version range in `engines.node` so
+  consumers see compatibility expectations at install time and CI
+  matrices test the right versions.
+severity: info
+match:
+  format: json
+  filter: 'has("name") and has("version")'
+check:
+  jq: 'select((.private // false) != true and (.engines.node // null) == null)'
+  message: "package.json is missing engines.node"
+references:
+  - https://docs.npmjs.com/cli/v10/configuring-npm/package-json#engines

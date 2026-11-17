@@ -1,0 +1,15 @@
+id: github-actions.has-permissions
+description: |
+  Workflows should declare an explicit `permissions:` block (typically
+  `contents: read`) to scope down GITHUB_TOKEN. Without it the token
+  inherits the repo-default scope, which is often write — making
+  every step potentially destructive if compromised.
+severity: warn
+match:
+  format: yaml
+  filter: 'has("jobs")'
+check:
+  jq: 'select(.permissions == null and ((.jobs // {}) | to_entries | all(.value.permissions == null)))'
+  message: "Workflow has no top-level or per-job 'permissions:' (defaults to repo-wide scope)"
+references:
+  - https://docs.github.com/en/actions/using-jobs/assigning-permissions-to-jobs

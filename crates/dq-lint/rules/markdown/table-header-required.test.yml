@@ -1,0 +1,13 @@
+tests:
+  - name: table with header passes
+    input: |
+      | a | b |
+      |---|---|
+      | 1 | 2 |
+    expected:
+      violations: []
+  - name: no table no fire
+    input: |
+      Body without tables.
+    expected:
+      violations: []

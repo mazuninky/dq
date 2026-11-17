@@ -1,0 +1,59 @@
+[package]
+name = "dq-transform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Sibling crate: dq-core provides the IR types (`Ir`, `OwnedIr`, `FormatTag`,
+# `ProvenanceMap`, `Provenance`, `SyntheticReason`) and the `Value`/`Pointer`
+# domain types the IR-aware variants of the value adapter (`ir_to_val`,
+# `val_to_owned_ir`) operate on. These are always-on types in dq-core, so the
+# dependency is unconditional rather than gated behind `embedded-jq`.
+dq-core = { path = "../dq-core" }
+
+# `jaq-*` crates are gated behind the `embedded-jq` feature so consumers can
+# opt out of the heavy jq stack (e.g. minimal CI builds). With the feature
+# off, every method on `JqEngine` returns `JqError::FeatureDisabled` rather
+# than failing to link.
+jaq-core = { workspace = true, optional = true }
+jaq-std = { workspace = true, optional = true }
+jaq-json = { workspace = true, optional = true }
+
+# Always-available deps: `serde_json` is the lingua franca for the value
+# adapter (callers convert their domain value to `serde_json::Value` first);
+# `thiserror` powers the `JqError` enum; `tracing` is wired in for any future
+# diagnostic emission (currently used only by the compile-error helpers).
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+default = ["embedded-jq"]
+embedded-jq = ["dep:jaq-core", "dep:jaq-std", "dep:jaq-json"]
+
+[dev-dependencies]
+serde_json = { workspace = true }
+pretty_assertions = { workspace = true }
+# Criterion benchmark harness. The `[[bench]]` entry below opts the
+# `benches/jq.rs` file out of the default libtest harness so its
+# `criterion_main!` macro runs at `cargo bench` time.
+criterion = { workspace = true }
+# Seeded RNG for deterministic synthetic workloads inside the bench
+# file (`StdRng::seed_from_u64(42)`).
+rand = { workspace = true }
+
+[[bench]]
+name = "jq"
+harness = false
+# Bench only meaningful when `embedded-jq` is on (off-state stubs return
+# `JqError::FeatureDisabled` immediately, which is uninteresting). The
+# default feature set already includes `embedded-jq`, so plain
+# `cargo bench -p dq-transform` exercises the real engine; the bench
+# itself guards every jq call against `cfg(feature = "embedded-jq")`
+# so a `--no-default-features` `cargo bench --no-run` still compiles.
+required-features = ["embedded-jq"]

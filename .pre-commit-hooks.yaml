@@ -1,0 +1,12 @@
+- id: dq-fmt-check
+  name: dq fmt --check
+  description: Verify files are canonically formatted (run `dq fmt -i` to fix).
+  entry: dq fmt --check
+  language: system
+  files: '\.(yaml|yml|json|toml|jsonl)$'
+- id: dq-validate
+  name: dq validate
+  description: Verify files parse without syntax errors.
+  entry: dq validate
+  language: system
+  files: '\.(yaml|yml|json|toml|jsonl)$'

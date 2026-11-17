@@ -1,0 +1,24 @@
+id: terraform.module-pin-version
+description: |
+  `module { source = "..." }` blocks pulling from a remote source
+  (registry, git, github, http, s3, gcs) must declare `version = "..."`
+  so subsequent `terraform init` runs do not silently pick up new
+  releases. Local-path sources (`./modules/*`, `../modules/*`) are
+  exempt — the local filesystem is the version source. To pin a git
+  source without the registry's `version` argument, embed `?ref=<tag>`
+  in the URL and add a description in the rule override.
+severity: warn
+match:
+  format: hcl
+check:
+  jq: |
+    [.module // {} | to_entries[]
+      | select(.value.source != null)
+      | select(.value.source | type == "string")
+      | select(.value.source | startswith("./") or startswith("../") | not)
+      | select(.value.source | contains("?ref=") | not)
+      | select(.value.version == null)
+      | {name: .key, source: .value.source}][]
+  message: "Module '{{ .name }}' (source: {{ .source }}) has no version pin"
+references:
+  - https://developer.hashicorp.com/terraform/language/modules/sources

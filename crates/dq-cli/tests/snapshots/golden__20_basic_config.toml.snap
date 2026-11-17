@@ -1,0 +1,22 @@
+---
+source: crates/dq-cli/tests/golden.rs
+expression: combined
+---
+exit_code: 0
+--- stdout ---
+: object
+/owner: object
+/owner/name: string
+/server: object
+/server/ip: string
+/server/ports: array
+/server/ports/0: int
+/server/ports/1: int
+/server/ports/2: int
+/server/connection_max: int
+/server/enabled: bool
+/clients: object
+/clients/hosts: array
+/clients/hosts/0: string
+/clients/hosts/1: string
+--- stderr ---

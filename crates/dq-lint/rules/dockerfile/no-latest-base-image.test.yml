@@ -1,0 +1,23 @@
+tests:
+  - name: FROM with :latest fires
+    input: |
+      - { instruction: FROM, arguments: "alpine:latest", line: 1 }
+      - { instruction: RUN, arguments: "apk add curl", line: 2 }
+    format: yaml
+    expected:
+      violations:
+        - rule: dockerfile.no-latest-base-image
+          message_contains: ":latest"
+  - name: FROM with pinned tag passes
+    input: |
+      - { instruction: FROM, arguments: "alpine:3.19", line: 1 }
+    format: yaml
+    expected:
+      violations: []
+  - name: FROM with no tag fires (defaults to :latest)
+    input: |
+      - { instruction: FROM, arguments: "alpine", line: 1 }
+    format: yaml
+    expected:
+      violations:
+        - rule: dockerfile.no-latest-base-image

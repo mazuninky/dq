@@ -1,0 +1,20 @@
+# Kubernetes Deployment with YAML anchors and inline comments.
+# Hand-written original — inspired by upstream k8s docs.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  labels: &common-labels
+    app: web
+    tier: frontend
+spec:
+  replicas: 3  # default for staging; bump in prod
+  selector:
+    matchLabels: *common-labels
+  template:
+    metadata:
+      labels: *common-labels
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.25  # pinned to specific minor

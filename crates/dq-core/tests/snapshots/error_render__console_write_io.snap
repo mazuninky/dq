@@ -1,0 +1,6 @@
+---
+source: crates/dq-core/tests/error_render.rs
+assertion_line: 284
+expression: rendered
+---
+I/O error writing '/tmp/x.yaml': perm denied

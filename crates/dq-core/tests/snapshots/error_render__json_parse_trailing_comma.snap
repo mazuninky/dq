@@ -1,0 +1,13 @@
+---
+source: crates/dq-core/tests/error_render.rs
+assertion_line: 240
+expression: view(&err)
+---
+kind: parse
+file: ~
+line: 1
+col: 11
+span_start: 10
+span_end: 11
+snippet: "{ \"x\": 1, }"
+message: "[serde_json message]"

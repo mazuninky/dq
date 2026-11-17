@@ -1,0 +1,83 @@
+tests:
+  - name: provider without version fires
+    input: |
+      provider "aws" {
+        region = "us-east-1"
+      }
+    expected:
+      violations:
+        - rule: terraform.provider-pinned
+          message_contains: "aws"
+  - name: provider with exact version passes
+    input: |
+      provider "aws" {
+        region  = "us-east-1"
+        version = "5.31.0"
+      }
+    expected:
+      violations: []
+  - name: provider with pessimistic constraint passes
+    input: |
+      provider "google" {
+        version = "~> 5.0"
+        project = "my-project"
+      }
+    expected:
+      violations: []
+  - name: multiple providers — only unpinned fires
+    input: |
+      provider "aws" {
+        version = "~> 5.0"
+      }
+      provider "kubernetes" {
+        host = "https://k8s.example.com"
+      }
+    expected:
+      violations:
+        - rule: terraform.provider-pinned
+          message_contains: "kubernetes"
+  - name: required_providers entry exempts modern Terraform layout
+    input: |
+      terraform {
+        required_providers {
+          aws = {
+            source  = "hashicorp/aws"
+            version = "~> 5.0"
+          }
+        }
+      }
+      provider "aws" {
+        region = "us-east-1"
+      }
+    expected:
+      violations: []
+  - name: required_providers without version still fires
+    input: |
+      terraform {
+        required_providers {
+          aws = {
+            source = "hashicorp/aws"
+          }
+        }
+      }
+      provider "aws" {
+        region = "us-east-1"
+      }
+    expected:
+      violations:
+        - rule: terraform.provider-pinned
+          message_contains: "aws"
+  - name: aliased providers each pinned at block level pass
+    input: |
+      provider "aws" {
+        alias   = "us"
+        region  = "us-east-1"
+        version = "~> 5.0"
+      }
+      provider "aws" {
+        alias   = "eu"
+        region  = "eu-west-1"
+        version = "~> 5.0"
+      }
+    expected:
+      violations: []

@@ -1,0 +1,22 @@
+---
+source: crates/dq-cli/tests/golden.rs
+expression: combined
+---
+exit_code: 0
+--- stdout ---
+: object
+/app: object
+/app/name: string
+/app/log_level: string
+/app/features: object
+/app/features/auth: bool
+/app/features/metrics: bool
+/app/features/tracing: bool
+/listeners: array
+/listeners/0: object
+/listeners/0/port: int
+/listeners/0/host: string
+/listeners/1: object
+/listeners/1/port: int
+/listeners/1/host: string
+--- stderr ---

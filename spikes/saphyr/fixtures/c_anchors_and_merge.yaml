@@ -1,0 +1,18 @@
+# Fixture (c): YAML with anchor declaration, alias reference, and merge key.
+# Spec: https://yaml.org/type/merge.html
+# Original — not copied.
+defaults: &base
+  retries: 3
+  timeout: 30
+  log_level: info
+
+# service inherits via merge key, then overrides log_level
+service:
+  <<: *base
+  name: api
+  log_level: debug
+
+# worker also inherits, no override
+worker:
+  <<: *base
+  name: bg-worker

@@ -1,0 +1,21 @@
+tests:
+  - name: ADD with local path fires
+    input: |
+      - { instruction: ADD, arguments: "./app /app", line: 5 }
+    format: yaml
+    expected:
+      violations:
+        - rule: dockerfile.no-add-use-copy
+          message_contains: "line 5"
+  - name: ADD with URL passes
+    input: |
+      - { instruction: ADD, arguments: "https://example.com/foo.tar.gz /tmp/", line: 5 }
+    format: yaml
+    expected:
+      violations: []
+  - name: COPY passes
+    input: |
+      - { instruction: COPY, arguments: "./app /app", line: 5 }
+    format: yaml
+    expected:
+      violations: []

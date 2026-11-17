@@ -1,0 +1,28 @@
+# Sample Kubernetes Deployment used by dq-core component tests.
+# Original — not copied from any external project.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: default
+  annotations:
+    deploy.dq.test/owner: "platform-team"  # inline comment must not break parsing
+    deploy.dq.test/version: "v1"
+  labels:
+    app.kubernetes.io/name: web
+    app.kubernetes.io/component: server
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: ghcr.io/example/web:1.2.3
+          ports:
+            - containerPort: 8080

@@ -1,0 +1,23 @@
+tests:
+  - name: indented block fires
+    input: |
+      Body.
+
+          plain code
+
+      End.
+    expected:
+      violations:
+        - rule: markdown.code-block-fenced
+          message_contains: "fenced"
+  - name: fenced block passes
+    input: |
+      Body.
+
+      ```text
+      plain code
+      ```
+
+      End.
+    expected:
+      violations: []

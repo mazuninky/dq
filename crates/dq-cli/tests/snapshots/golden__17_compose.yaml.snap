@@ -1,0 +1,20 @@
+---
+source: crates/dq-cli/tests/golden.rs
+expression: combined
+---
+exit_code: 0
+--- stdout ---
+: object
+/version: string
+/services: object
+/services/web: object
+/services/web/image: string
+/services/web/ports: array
+/services/web/ports/0: string
+/services/db: object
+/services/db/image: string
+/services/db/environment: object
+/services/db/environment/POSTGRES_PASSWORD: string
+/volumes: object
+/volumes/data: object
+--- stderr ---

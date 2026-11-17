@@ -1,0 +1,12 @@
+---
+source: crates/dq-core/tests/error_render.rs
+assertion_line: 169
+expression: view(&err)
+---
+kind: path
+pointer: /server/prot
+matched_prefix: /server
+path_kind:
+  kind: MissingKey
+did_you_mean:
+  - port

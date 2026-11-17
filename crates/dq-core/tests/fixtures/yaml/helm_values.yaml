@@ -1,0 +1,27 @@
+# Helm values.yaml-style fixture for dq-core component tests.
+# Original — not copied from any chart.
+image:
+  repository: registry.example.test/svc
+  tag: stable
+  pullPolicy: IfNotPresent
+service:
+  type: ClusterIP
+  port: 80
+resources:
+  limits:
+    cpu: "500m"
+    memory: 256Mi
+  requests:
+    cpu: "100m"
+    memory: 64Mi
+nodeSelector:
+  role: worker
+tolerations:
+  - key: workload
+    operator: Equal
+    value: web
+    effect: NoSchedule
+extraEnv:
+  - LOG_LEVEL=info
+  - METRICS_PORT=9090
+  - SHUTDOWN_GRACE=30s

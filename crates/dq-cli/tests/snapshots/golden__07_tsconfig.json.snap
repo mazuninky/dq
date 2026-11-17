@@ -1,0 +1,18 @@
+---
+source: crates/dq-cli/tests/golden.rs
+expression: combined
+---
+exit_code: 0
+--- stdout ---
+: object
+/compilerOptions: object
+/compilerOptions/target: string
+/compilerOptions/module: string
+/compilerOptions/strict: bool
+/compilerOptions/outDir: string
+/include: array
+/include/0: string
+/exclude: array
+/exclude/0: string
+/exclude/1: string
+--- stderr ---

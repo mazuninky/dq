@@ -1,0 +1,18 @@
+id: markdown.table-header-required
+description: |
+  Every GFM table should have a header row. Tables without headers
+  are non-standard CommonMark+GFM and rendering varies between
+  consumers.
+severity: warn
+match:
+  format: markdown
+check:
+  jq: |
+    [.. | objects | select(.type? == "table")][]
+    | select((.children[0].header? // false) == false)
+    | { position: .position }
+  message: "Table has no header row"
+references:
+  - https://github.github.com/gfm/#tables-extension-
+loc:
+  line: '.position.start.line // 1'

@@ -1,0 +1,41 @@
+tests:
+  - name: pinned tag with Always fires
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+      spec:
+        template:
+          spec:
+            containers:
+              - name: app
+                image: app:v1.2.3
+                imagePullPolicy: Always
+    expected:
+      violations:
+        - rule: k8s.image-pull-policy-always
+  - name: latest tag with Always passes
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+      spec:
+        template:
+          spec:
+            containers:
+              - name: app
+                image: app:latest
+                imagePullPolicy: Always
+    expected:
+      violations: []
+  - name: pinned tag with IfNotPresent passes
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+      spec:
+        template:
+          spec:
+            containers:
+              - name: app
+                image: app:v1.2.3
+                imagePullPolicy: IfNotPresent
+    expected:
+      violations: []

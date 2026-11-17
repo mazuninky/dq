@@ -1,0 +1,41 @@
+tests:
+  - name: terraform block without backend fires
+    input: |
+      terraform {
+        required_version = ">= 1.6"
+      }
+    expected:
+      violations:
+        - rule: terraform.state-backend-required
+          message_contains: "no backend"
+  - name: terraform block with s3 backend passes
+    input: |
+      terraform {
+        required_version = ">= 1.6"
+        backend "s3" {
+          bucket = "tfstate"
+          key    = "prod/terraform.tfstate"
+          region = "us-east-1"
+        }
+      }
+    expected:
+      violations: []
+  - name: file with no terraform block at all is silent
+    input: |
+      resource "aws_instance" "x" {
+        ami = "ami-1"
+      }
+    expected:
+      violations: []
+  - name: terraform block with remote backend passes
+    input: |
+      terraform {
+        backend "remote" {
+          organization = "my-org"
+          workspaces {
+            name = "prod"
+          }
+        }
+      }
+    expected:
+      violations: []

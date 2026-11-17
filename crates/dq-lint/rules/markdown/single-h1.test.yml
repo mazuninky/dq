@@ -1,0 +1,32 @@
+tests:
+  - name: two H1 headings fires
+    input: |
+      # First
+
+      Body.
+
+      # Second
+
+      Body.
+    expected:
+      violations:
+        - rule: markdown.single-h1
+          message_contains: "more than one H1"
+  - name: single H1 passes
+    input: |
+      # Only
+
+      ## Section
+
+      ## Another section
+
+      Body.
+    expected:
+      violations: []
+  - name: no H1 passes
+    input: |
+      ## Just an H2
+
+      Body.
+    expected:
+      violations: []

@@ -1,0 +1,21 @@
+tests:
+  - name: curl pipe bash fires
+    input: |
+      - { instruction: RUN, arguments: "curl -sSL https://example.com/install | bash", line: 3 }
+    format: yaml
+    expected:
+      violations:
+        - rule: dockerfile.no-curl-pipe-bash
+  - name: wget pipe sh fires
+    input: |
+      - { instruction: RUN, arguments: "wget -qO- https://example.com/install.sh | sh", line: 3 }
+    format: yaml
+    expected:
+      violations:
+        - rule: dockerfile.no-curl-pipe-bash
+  - name: download to file then verify passes
+    input: |
+      - { instruction: RUN, arguments: "curl -fsSL -o /tmp/install.sh https://example.com/install.sh && sha256sum -c /tmp/install.sha256 && bash /tmp/install.sh", line: 3 }
+    format: yaml
+    expected:
+      violations: []

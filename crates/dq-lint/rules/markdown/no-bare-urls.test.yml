@@ -1,0 +1,11 @@
+tests:
+  - name: autolink passes
+    input: |
+      See <https://example.com> for details.
+    expected:
+      violations: []
+  - name: labeled link passes
+    input: |
+      See [the docs](https://example.com) for details.
+    expected:
+      violations: []

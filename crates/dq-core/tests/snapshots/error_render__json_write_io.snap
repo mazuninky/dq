@@ -1,0 +1,8 @@
+---
+source: crates/dq-core/tests/error_render.rs
+assertion_line: 295
+expression: view(&err)
+---
+kind: write_io
+path: /tmp/x.yaml
+message: perm denied
