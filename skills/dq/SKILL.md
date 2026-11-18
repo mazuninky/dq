@@ -230,7 +230,7 @@ Full matrix, write-mode semantics, and pointer prefixes per format: [references/
 | Code | Meaning                                                                 |
 |-----:|-------------------------------------------------------------------------|
 |    0 | Success.                                                                |
-|    1 | Generic failure (`--check` saw pending changes; JSON Patch `test` op failed; `lint --strict` saw a warn; the output format cannot hold a value, e.g. NaN/Infinity in JSON). |
+|    1 | Generic failure (`--check` saw pending changes; JSON Patch `test` op failed; `lint --strict` saw a warn; `convert` cannot write a value in the target format, e.g. NaN/Infinity in JSON). |
 |    2 | NOT_FOUND — JSON Pointer addressed a node that does not exist.          |
 |    3 | PARSE_ERROR — input failed format parsing (or templated file without `--raw-template-strings`). |
 |    4 | LINT_FAIL / VALIDATE_FAIL — `lint` produced an error-severity diagnostic, or `validate` saw a parse error. |
