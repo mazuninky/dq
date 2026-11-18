@@ -323,7 +323,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   null key: `"": 1` in YAML, `{"": 1}` in JSON, `"" = 1` in TOML,
   `f: {? &a}` in YAML. `set` of a new key next to an empty key that is
   its map's only key writes it after that key; it used to fail with
-  "not found".
+  "not found". `del` of a key in a compact list entry before an empty
+  key (`- a: 1` + `  "": 2`, `del /0/a`) works; it used to fail with
+  exit 7.
+- YAML `del` of an explicit key with no value (`? k` + `? j`, `del /k`)
+  removes only that key; it used to fail with exit 7.
 - YAML `.nan` / `.inf` / `-.inf`: `convert -F json` fails, as it already
   did for TOML `nan`, since JSON has no such number; it used to print
   `.nan` into the JSON. `convert -F yaml` writes them as floats again (it
@@ -379,15 +383,24 @@ Textual edits — `set` and `del` on YAML, JSON and TOML:
   with "not found" though `get` found the path. A JSON value, a TOML
   inline table or array and a YAML flow collection are replaced between
   their brackets; a YAML block collection loses its lines, the key
-  keeping its comment and anchor (`a: &x 5 # c`). An anchored node
+  keeping its comment and anchor (`a: &x 5 # c`). Comment lines inside
+  the collection go with it, as do those after it that are indented as
+  deep as its entries; they used to stay behind under the new value. A
+  core tag goes with the collection, so `a: !!map` + `  b: 1`,
+  `set /a 5` gives `a: 5`; it used to fail with exit 7. The same holds
+  for `!<tag:yaml.org,2002:map>` and a `%TAG` handle for the core
+  schema, which used to stay on the new scalar and leave a file PyYAML
+  rejects. An
+  anchored node
   replaced this way stays anchored, so its aliases change with it: with
   `a: &m {x: 1}` and `b: *m`, `set /a 42` makes `b` read 42 too. A TOML
   `[table]` or dotted table is removed and the key written anew among
   the keys of its table; when no other key or section makes its parent
   table, the parent is written inline (`[a.b]` + `c = 1`, `set /a/b 5`
   gives `a = { b = 5 }`). When another section still makes the parent
-  (`[a.b]` next to `[a.d]`), there is no header to write the key under
-  and the edit fails with exit 7.
+  (`[a.b]` next to `[a.d]`), the key goes under a new `[a]` header
+  before the parent's first section. A dotted table is written where its
+  first line was (`a.b.c = 1`, `set /a/b 5` gives `a.b = 5`).
 - `del` of an entry that shares its line with others — any JSON member
   or item, a YAML flow collection, a TOML inline table or array —
   removes the entry and one comma: `{"a": 1, "b": 2}` `del /a` gives
@@ -495,7 +508,15 @@ TOML:
   item of an array of tables leaves `arr = []`, and `del` of `key = {}`
   removes the line instead of leaving `key = `.
 - `del` of the only key under a dotted key (`a.b = 1`) writes `a = {}`;
-  it used to remove `a` with it. Inside an inline table, the last key
+  it used to remove `a` with it. A parent table left empty stays where
+  it was: `a.b.c = 1` + `a.b.d = 2` + `e = 1`, `del /a/b` gives
+  `a = {}` before `e = 1` instead of after it, and an emptied `[a.b]`
+  section leaves an `[a]` header in its place.
+- `set` of a new key in a TOML table that has no header of its own
+  (`[a.d]` + `x = 1`, `set /a/z 3`) writes `[a]` + `z = 3` before the
+  table's first section, or `a.z = 3` after its last dotted line; inside
+  an `[[array]]` item it writes `[t.a]` among that item's sections. It
+  used to fail with "not found". Inside an inline table, the last key
   under a dotted key that comes first leaves `{x = {}, b = 2}`; it used
   to lose the comma.
 

@@ -1195,8 +1195,17 @@ impl<'src> State<'src> {
                         };
                         layout.empty_values.insert(pointer.clone(), start..end);
                     }
+                    // An empty plain node without properties after an
+                    // explicit key with no `:` (`? k` + `? j`) gets the
+                    // span of the next `? ` token: its entry is an empty
+                    // node's, not that token's line.
+                    let line_basis = if style == ScalarStyle::Plain && value.is_empty() {
+                        value_range.start..value_range.start
+                    } else {
+                        value_range.clone()
+                    };
                     let line_range =
-                        self.compute_line_range(&value_range, context, style, entry, node_end);
+                        self.compute_line_range(&line_basis, context, style, entry, node_end);
                     let indent = u32::try_from(col).unwrap_or(u32::MAX);
                     if matches!(style, ScalarStyle::Literal | ScalarStyle::Folded) {
                         // Record the canonical pointer alongside the span

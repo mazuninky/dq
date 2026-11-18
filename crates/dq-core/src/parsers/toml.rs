@@ -54,7 +54,7 @@ use toml_edit::{
 use crate::Result;
 use crate::WriteOptions;
 use crate::document::spans::{SpanContext, SpanMap, ValueSpan};
-use crate::document::{Document, FormatTag, Value};
+use crate::document::{Document, FormatTag, Value, bom_end, line_start};
 use crate::error::Error;
 use crate::format::Format;
 use crate::textual_edit::{InsertionRenderer, ScalarRenderer};
@@ -431,10 +431,7 @@ fn collect_dotted_lines(
         match item {
             Item::Value(value) => {
                 if let Some(span) = value.span() {
-                    let start = bytes[..span.start]
-                        .iter()
-                        .rposition(|&b| b == b'\n')
-                        .map_or(0, |i| i + 1);
+                    let start = line_start(bytes, span.start);
                     out.push((pointer_for(path), start..past_line_break(bytes, span.end)));
                 }
             }
@@ -450,15 +447,9 @@ fn collect_dotted_lines(
 /// Start of the line holding `header`, or of the comment lines right
 /// above it.
 fn section_start(bytes: &[u8], header: usize) -> usize {
-    let mut at = bytes[..header]
-        .iter()
-        .rposition(|&b| b == b'\n')
-        .map_or(0, |i| i + 1);
-    while at > 0 {
-        let prev = bytes[..at - 1]
-            .iter()
-            .rposition(|&b| b == b'\n')
-            .map_or(0, |i| i + 1);
+    let mut at = line_start(bytes, header);
+    while at > bom_end(bytes) {
+        let prev = line_start(bytes, at - 1);
         if bytes[prev..at].trim_ascii_start().starts_with(b"#") {
             at = prev;
         } else {
@@ -791,10 +782,7 @@ fn compute_line_range(
     ) {
         return value_range.clone();
     }
-    let mut start = value_range.start.min(bytes.len());
-    while start > 0 && bytes[start - 1] != b'\n' {
-        start -= 1;
-    }
+    let start = line_start(bytes, value_range.start);
     let mut end = value_range.end.min(bytes.len());
     while end < bytes.len() && bytes[end] != b'\n' {
         end += 1;
@@ -810,12 +798,8 @@ fn compute_line_range(
 /// inserted siblings at the same column.
 fn compute_indent(bytes: &[u8], index: usize) -> u32 {
     let cap = bytes.len();
-    let mut line_start = index.min(cap);
-    while line_start > 0 && bytes[line_start - 1] != b'\n' {
-        line_start -= 1;
-    }
     let mut indent = 0_u32;
-    for &b in &bytes[line_start..cap.min(index)] {
+    for &b in &bytes[line_start(bytes, index)..cap.min(index)] {
         if b == b' ' || b == b'\t' {
             indent = indent.saturating_add(1);
         } else {
@@ -984,7 +968,7 @@ impl InsertionRenderer for TomlInsertionRenderer {
 
 /// Render a TOML key. Bare keys are `[A-Za-z0-9_-]+`; anything else is
 /// quoted as a basic string.
-fn toml_key_token(key: &str) -> String {
+pub(crate) fn toml_key_token(key: &str) -> String {
     if key.is_empty()
         || !key
             .chars()

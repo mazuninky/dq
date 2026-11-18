@@ -188,14 +188,13 @@ const REFUSALS: &[Refusal] = &[
         message: "cannot set '/l/0': it holds an anchor that the alias on line 4 refers to; ",
     },
     Refusal {
-        // `a.b` and `a.d` share `a`, which has no header to write
-        // `b = …` under.
+        // An `[[t]]` item is a table by its header: a scalar cannot take
+        // its place in the array.
         name: "doc.toml",
-        src: "[a.b]\nc = 1\n[a.d]\ne = 1\n",
+        src: "[[t]]\nx = 1\n",
         command: "set",
-        args: &["/a/b", "5"],
-        message: "cannot set '/a/b': dq cannot write the key anew in a table with no header \
-                  of its own; ",
+        args: &["/t/0", "5"],
+        message: "cannot set '/t/0': dq cannot write this value here as a textual edit; ",
     },
 ];
 

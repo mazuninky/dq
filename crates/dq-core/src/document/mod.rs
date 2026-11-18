@@ -848,9 +848,10 @@ impl Document {
         {
             // An empty node (`key:`, `- &a`) has no text to replace; its
             // recorded span sits on the token after it.
+            let tags = CoreTags::at(&self.original_bytes, at.start);
             let rendered = renderer.render_replacement(&value, span.context, &[]);
             let (mut replacement, mut value_offset) =
-                empty_node_replacement(&self.original_bytes[at.clone()], &rendered);
+                empty_node_replacement(&self.original_bytes[at.clone()], &rendered, &tags);
             // `? key` with no `:` line: the value needs its indicator, on
             // a line of its own at the `?` column.
             let explicit_key = self
@@ -925,19 +926,17 @@ impl Document {
                     (span.value_range.clone(), rendered, value_len)
                 }
             };
-            // A `!!` tag fixes the type of what follows it (`!!int`,
-            // `!!binary`): the new value is written untagged, typed by what
-            // it is. dq's tree carries no tags; local tags (`!Ref`) and
-            // anchors stay.
+            // A core-schema tag fixes the type of what follows it
+            // (`!!int`, `!!binary`): the new value is written untagged,
+            // typed by what it is. dq's tree carries no tags; local tags
+            // (`!Ref`) and anchors stay.
             let mut value_start = replaced.start;
             if self.format == FormatTag::Yaml {
+                let tags = CoreTags::at(&self.original_bytes, replaced.start);
                 let props_start = yaml_properties_start(&self.original_bytes, replaced.start);
                 let props = &self.original_bytes[props_start..replaced.start];
-                if props
-                    .split(u8::is_ascii_whitespace)
-                    .any(|token| token.starts_with(b"!!"))
-                {
-                    let mut kept = kept_properties(props);
+                if tags.any_in(props) {
+                    let mut kept = kept_properties(props, &tags);
                     value_start = props_start + kept.len();
                     kept.append(&mut rendered);
                     rendered = kept;
@@ -1158,6 +1157,17 @@ impl Document {
                         reason: "the document does not parse".to_owned(),
                     });
                 }
+                // A table with no header: made by dotted keys or by the
+                // headers of the tables under it.
+                if let Some((at, inserted)) = self.toml_implicit_table_insertion(
+                    &parent_ptr,
+                    &new_key,
+                    &value,
+                    insertion_renderer,
+                ) {
+                    self.original_bytes.splice(at..at, inserted);
+                    return self.adopt_reparse("set", canonical);
+                }
             }
             let parent_is_empty_map = parent_map.is_empty();
             let fallback_err = missing_key();
@@ -1359,7 +1369,7 @@ impl Document {
             FormatTag::Json => crate::parsers::json::json_container_ranges(&self.original_bytes)
                 .ok()
                 .and_then(|mut ranges| ranges.remove(canonical))
-                .map(|range| (range, SpanContext::BlockMapValue)),
+                .map(|range| (range, SpanContext::BlockMapValue, Vec::new())),
             FormatTag::Toml => crate::parsers::toml::toml_inline_collections(&self.original_bytes)
                 .and_then(|mut ranges| ranges.remove(canonical))
                 .map(|(range, in_flow)| {
@@ -1368,7 +1378,7 @@ impl Document {
                         (true, false) => SpanContext::FlowSeqItem,
                         (false, _) => SpanContext::BlockMapValue,
                     };
-                    (range, context)
+                    (range, context, Vec::new())
                 }),
             FormatTag::Yaml => {
                 let collection = self
@@ -1399,18 +1409,35 @@ impl Document {
                     {
                         return Err(err);
                     }
-                    Some((brackets, context))
+                    // A `!!map` / `!!seq` tag before the brackets goes with
+                    // them: it would retype the new value.
+                    let tags = CoreTags::at(&self.original_bytes, brackets.start);
+                    match core_tag_removal(&self.original_bytes, brackets.start, &tags) {
+                        Some((props, kept)) => Some((
+                            props.start..brackets.end,
+                            context,
+                            kept_properties(kept, &tags),
+                        )),
+                        None => Some((brackets, context, Vec::new())),
+                    }
                 } else {
-                    // Its children go; the key or `-`, its properties and
-                    // any comment on that line stay as an empty node.
+                    // Its children go, with the comment lines among them
+                    // and those after the last one indented as deep; the
+                    // key or `-`, its properties and any comment on that
+                    // line stay as an empty node.
                     let marker = collection.empty_marker_at.ok_or_else(rejected)?;
                     let first = collection.first_child_line.ok_or_else(rejected)?;
+                    let end = self.edit_layout(layout).map_or(collection.end, |layout| {
+                        self.yaml_trailing_comments_end(layout, canonical, collection.end)
+                    });
                     let children = if first >= marker {
-                        first..collection.end
+                        // From the line after the one the empty node is on:
+                        // a comment line before the first child goes too.
+                        past_line_break(&self.original_bytes, marker).min(first)..end
                     } else {
                         // `- key: …` / `- - …`: the first child shares the
                         // line with the `-`.
-                        let mut end = collection.end;
+                        let mut end = end;
                         while end > marker && self.original_bytes[end - 1].is_ascii_whitespace() {
                             end -= 1;
                         }
@@ -1422,6 +1449,33 @@ impl Document {
                         return Err(err);
                     }
                     self.original_bytes.drain(children);
+                    // A `!!map` / `!!seq` tag goes with the collection: on
+                    // the empty node it would retype the new value. Before
+                    // the children, so their removal leaves it in place.
+                    let tags = CoreTags::at(&self.original_bytes, marker);
+                    if let Some((props, kept)) =
+                        core_tag_removal(&self.original_bytes, marker, &tags)
+                    {
+                        let kept = kept_properties(kept, &tags);
+                        let kept = kept.trim_ascii_end();
+                        let (mut from, mut to) = (props.start, props.end);
+                        if kept.is_empty() {
+                            while from > 0 && matches!(self.original_bytes[from - 1], b' ' | b'\t')
+                            {
+                                from -= 1;
+                            }
+                            // Properties on a line of their own: the line goes.
+                            let line_end = past_line_break(&self.original_bytes, to);
+                            if from == line_start(&self.original_bytes, from)
+                                && self.original_bytes[to..line_end]
+                                    .iter()
+                                    .all(u8::is_ascii_whitespace)
+                            {
+                                to = line_end;
+                            }
+                        }
+                        self.original_bytes.splice(from..to, kept.iter().copied());
+                    }
                     self.adopt_reparse("set", canonical)?;
                     if !matches!(pointer.resolve(&self.value), Ok(Value::Null)) {
                         return Err(rejected());
@@ -1431,24 +1485,41 @@ impl Document {
             }
             _ => None,
         };
-        if let Some((range, context)) = brackets {
-            let rendered = renderer.render_replacement(&value, context, &[]);
-            self.original_bytes.splice(range, rendered);
+        if let Some((range, context, mut replacement)) = brackets {
+            replacement.extend(renderer.render_replacement(&value, context, &[]));
+            self.original_bytes.splice(range, replacement);
             return set_value_at(&mut self.value, pointer, value);
         }
         if self.format == FormatTag::Toml {
-            let ranges = crate::parsers::toml::toml_tables(&self.original_bytes)
-                .map(|tables| tables.ranges_of(canonical))
-                .unwrap_or_default();
-            if ranges.is_empty() {
+            let tables =
+                crate::parsers::toml::toml_tables(&self.original_bytes).unwrap_or_default();
+            let ranges = tables.ranges_of(canonical);
+            let Some(first) = ranges.first().map(|range| range.start) else {
                 return Err(rejected());
-            }
+            };
+            // A table written under a dotted key (`a.b.c = 1`): the value
+            // goes where its first line was, under the key cut down to it.
+            let dotted = tables
+                .dotted_lines
+                .iter()
+                .find(|(_, line)| line.start == first)
+                .and_then(|(at, line)| {
+                    toml_dotted_key_prefix(&self.original_bytes[line.clone()], at, pointer)
+                });
             for range in ranges.into_iter().rev() {
                 self.original_bytes.drain(range);
             }
             self.adopt_reparse("set", canonical)?;
             if pointer.resolve(&self.value).is_ok() {
                 return Err(rejected());
+            }
+            if let Some(mut line) = dotted {
+                line.extend_from_slice(b" = ");
+                line.extend(renderer.render_replacement(&value, SpanContext::BlockMapValue, &[]));
+                line.push(b'\n');
+                let line = with_line_ending_at(&self.original_bytes, first, line);
+                self.original_bytes.splice(first..first, line);
+                return self.adopt_reparse("set", canonical);
             }
             // A parent only the removed sections made (`[a.b]` alone makes
             // `a`) is gone with them: write the value at the first missing
@@ -2193,7 +2264,14 @@ impl Document {
             .filter(|_| target_is_collection)
             .and_then(|layout| layout.containers.get(&canonical));
         let collection_entry = collection.and_then(|collection| {
-            collection.entry.clone().or_else(|| {
+            let entry = collection.entry.clone().map(|entry| match layout.as_ref() {
+                // With the comment lines inside it after its last entry.
+                Some(layout) if collection.block => {
+                    entry.start..self.yaml_trailing_comments_end(layout, &canonical, entry.end)
+                }
+                _ => entry,
+            });
+            entry.or_else(|| {
                 collection.flow_value.as_ref().and_then(|value| {
                     flow_entry_removal(&self.original_bytes, value, in_map, self.format)
                 })
@@ -2229,10 +2307,17 @@ impl Document {
         if self.format == FormatTag::Toml
             && target_is_collection
             && toml_collection_entry.is_none()
-            && let Some(ranges) = crate::parsers::toml::toml_tables(&self.original_bytes)
-                .map(|tables| tables.ranges_of(&canonical))
-                .filter(|ranges| !ranges.is_empty())
+            && let Some(tables) = crate::parsers::toml::toml_tables(&self.original_bytes)
+            && let ranges = tables.ranges_of(&canonical)
+            && let Some(first) = ranges.first().map(|range| range.start)
         {
+            // How a parent made only by the removed bytes is written again
+            // where they began, in the line ending of the file as it is
+            // before they go.
+            let respelled = (parent_loses_last_child && in_map)
+                .then(|| self.toml_emptied_table(&tables, first, &parent_ptr))
+                .flatten()
+                .map(|line| with_line_ending_at(&self.original_bytes, first, line));
             for range in ranges.into_iter().rev() {
                 self.original_bytes.drain(range);
             }
@@ -2241,6 +2326,10 @@ impl Document {
             // with no header of its own: the parent goes with it unless
             // written as `key = []` / `key = {}`.
             if parent_loses_last_child && parent_ptr.resolve(&self.value).is_err() {
+                if let Some(line) = respelled {
+                    self.original_bytes.splice(first..first, line);
+                    return self.adopt_reparse("delete", &canonical);
+                }
                 let empty = if in_map {
                     Value::Map(IndexMap::new())
                 } else {
@@ -2385,6 +2474,22 @@ impl Document {
                 _ => b"",
             });
         }
+        // Lines removed from the top of the file: the blank lines after
+        // them go too, rather than open what follows.
+        if self.format != FormatTag::Json
+            && inserted.is_empty()
+            && matches!(
+                &self.original_bytes[..line_range.start],
+                b"" | b"\xef\xbb\xbf"
+            )
+            && line_range.end > line_range.start
+            && self.original_bytes[line_range.end - 1] == b'\n'
+        {
+            let past = past_blank_lines(&self.original_bytes, line_range.end);
+            if past < self.original_bytes.len() {
+                line_range.end = past;
+            }
+        }
         let removed = line_range.clone();
         // An alias elsewhere would dangle — or resolve to an earlier
         // definition of its anchor name — once the bytes defining its anchor
@@ -2434,6 +2539,118 @@ impl Document {
         Ok(())
     }
 
+    /// `end`, where the YAML block collection at `canonical` ends, moved
+    /// past the comment lines right after it that are indented as deep as
+    /// its entries and deeper than its own key or `-`: they are inside it,
+    /// and an edit that removes its entries takes them too.
+    fn yaml_trailing_comments_end(
+        &self,
+        layout: &crate::parsers::yaml_spans::EditLayout,
+        canonical: &str,
+        end: usize,
+    ) -> usize {
+        let bytes = &self.original_bytes;
+        let column = |at: usize| at - line_start(bytes, at);
+        let Some(own) = layout.entries.get(canonical).map(|entry| column(entry.at)) else {
+            return end;
+        };
+        let prefix = format!("{canonical}/");
+        let first_child = layout
+            .entries
+            .iter()
+            .filter(|(pointer, _)| {
+                pointer
+                    .strip_prefix(&prefix)
+                    .is_some_and(|tail| !tail.contains('/'))
+            })
+            .map(|(_, entry)| entry.at)
+            .min();
+        match first_child {
+            Some(child) => past_comment_lines(bytes, end, column(child).max(own + 1)),
+            None => end,
+        }
+    }
+
+    /// The line that writes the TOML table at `parent` again, empty, where
+    /// the bytes removed from `first` on began — the bytes that alone made
+    /// it: the dotted key of the line there cut down to the table
+    /// (`a.b.c = 1` → `a = {}`), or a `[header]` of its own in place of a
+    /// removed section. `None` when neither can be spelled.
+    fn toml_emptied_table(
+        &self,
+        tables: &crate::parsers::toml::TomlTables,
+        first: usize,
+        parent: &Pointer,
+    ) -> Option<Vec<u8>> {
+        if let Some((pointer, line)) = tables
+            .dotted_lines
+            .iter()
+            .find(|(_, line)| line.start == first)
+        {
+            let mut out =
+                toml_dotted_key_prefix(&self.original_bytes[line.clone()], pointer, parent)?;
+            out.extend_from_slice(b" = {}\n");
+            return Some(out);
+        }
+        tables
+            .sections
+            .iter()
+            .any(|(_, section)| section.start == first)
+            .then(|| toml_header(&self.value, parent))
+            .flatten()
+    }
+
+    /// Where `key = value` goes, and its bytes, in the TOML table at
+    /// `parent` that has no header of its own and no key of its own to
+    /// follow — made only by dotted keys (`a.d.x = 1`) or by the headers of
+    /// tables under it (`[a.d]`): under the same dotted key after the last
+    /// of its lines, or under a `[header]` of its own written before the
+    /// first of those tables. `None` when neither fits.
+    fn toml_implicit_table_insertion(
+        &self,
+        parent: &Pointer,
+        key: &str,
+        value: &Value,
+        renderer: &dyn crate::textual_edit::InsertionRenderer,
+    ) -> Option<(usize, Vec<u8>)> {
+        let bytes = &self.original_bytes;
+        let tables = crate::parsers::toml::toml_tables(bytes)?;
+        let prefix = format!("{}/", parent.as_canonical());
+        let entry = renderer.render_insertion(key, value, 1, SpanContext::BlockMapValue);
+        // After the last dotted key that spells the table out, when it
+        // reaches up to it (`a.d.x = 1` for `/a`, not `[a.d]`'s `x.y = 1`).
+        if let Some((line, key)) = tables
+            .dotted_lines
+            .iter()
+            .filter(|(pointer, _)| pointer.starts_with(&prefix))
+            .max_by_key(|(_, line)| line.end)
+            .and_then(|(pointer, line)| {
+                toml_dotted_key_prefix(&bytes[line.clone()], pointer, parent).map(|key| (line, key))
+            })
+        {
+            let mut out = Vec::new();
+            if line.end > 0 && bytes[line.end - 1] != b'\n' {
+                out.push(b'\n');
+            }
+            out.extend(key);
+            out.push(b'.');
+            out.extend(&entry);
+            return Some((line.end, with_line_ending_at(bytes, line.end, out)));
+        }
+        // Otherwise a header of its own, before the first section under it
+        // — among the sections of the array item it is under, if any.
+        let at = tables
+            .sections
+            .iter()
+            .filter(|(pointer, _)| pointer.starts_with(&prefix))
+            .map(|(_, section)| section.start)
+            .min()?;
+        let mut out = toml_header(&self.value, parent)?;
+        out.extend(entry);
+        out.push(b'\n');
+        Some((at, with_line_ending_at(bytes, at, out)))
+    }
+
     /// The bytes `del` removes for the YAML value at `canonical` when its
     /// entry shares its line with its parent's `-` (`- key: v`, `- - v`):
     /// from the entry up to the next entry of the same parent, so that one
@@ -2465,18 +2682,24 @@ impl Document {
             .entries
             .iter()
             .filter(|(pointer, start)| {
+                // An empty tail is the empty key `""`, a sibling too.
                 pointer
                     .strip_prefix(&siblings)
-                    .is_some_and(|tail| !tail.is_empty() && !tail.contains('/'))
+                    .is_some_and(|tail| !tail.contains('/'))
                     && start.at > entry.at
             })
             .map(|(_, start)| start.at)
             .min();
         let value_end = if target_is_collection {
-            layout
-                .containers
-                .get(canonical)
-                .map(|collection| collection.end)
+            // A block collection with the comment lines inside it after its
+            // last entry, as `set` over it takes them.
+            layout.containers.get(canonical).map(|collection| {
+                if collection.block {
+                    self.yaml_trailing_comments_end(layout, canonical, collection.end)
+                } else {
+                    collection.end
+                }
+            })
         } else if let Some(empty) = layout.empty_values.get(canonical) {
             Some(empty.end)
         } else {
@@ -2719,6 +2942,16 @@ fn yaml_properties_start(bytes: &[u8], start: usize) -> usize {
         {
             token -= 1;
         }
+        // A verbatim tag (`!<tag:yaml.org,2002:map>`) may hold a `,`.
+        if end > 0
+            && bytes[end - 1] == b'>'
+            && let Some(open) = bytes[..end]
+                .windows(2)
+                .rposition(|pair| pair == b"!<")
+                .filter(|&open| !bytes[open..end].iter().any(u8::is_ascii_whitespace))
+        {
+            token = open;
+        }
         if token < end && matches!(bytes[token], b'&' | b'!') {
             start = token;
         } else {
@@ -2761,7 +2994,8 @@ fn skip_blanks_back(bytes: &[u8], pos: usize) -> usize {
 
 /// Pointer (below `at`) of the first place `expected` and `actual`
 /// differ, `None` when they are the same tree. Map order does not count,
-/// and NaN equals NaN.
+/// NaN equals NaN, and finite floats compare by bits — so a writer that
+/// drops the sign of `-0.0` is caught ([`Value::same_data`]).
 fn first_difference(expected: &Value, actual: &Value, at: &str) -> Option<String> {
     match (expected, actual) {
         (Value::Map(want), Value::Map(got)) => {
@@ -2786,15 +3020,9 @@ fn first_difference(expected: &Value, actual: &Value, at: &str) -> Option<String
                 .enumerate()
                 .find_map(|(i, (want, got))| first_difference(want, got, &format!("{at}/{i}")))
         }
-        // NaN equals no float, and YAML holds `.nan` / `.inf` as literals
-        // a TOML `nan` / `inf` reads back as floats.
-        (want, got)
-            if let (Some(want), Some(got)) = (want.non_finite_float(), got.non_finite_float())
-                && (want == got || (want.is_nan() && got.is_nan())) =>
-        {
-            None
-        }
-        (want, got) if want == got => None,
+        // NaN equals no float, YAML holds `.nan` / `.inf` as literals a
+        // TOML `nan` / `inf` reads back as floats, and `-0.0 == 0.0`.
+        (want, got) if want.same_data(got) => None,
         _ => Some(at.to_owned()),
     }
 }
@@ -2999,15 +3227,15 @@ fn format_specific_splice(
 
 /// What replaces the node properties `props` of an empty node (empty
 /// without any) when it gets the value `rendered`, and the offset of the
-/// value in it. Anchors stay; `!!` tags of the core schema go, as they
-/// would retype the new value (`!!str` turns `5` into `"5"`). Without
+/// value in it. Anchors stay; tags of the core schema go, as they would
+/// retype the new value (`!!str` turns `5` into `"5"`). Without
 /// properties a blank separates the value from the `:` / `-` before it.
-fn empty_node_replacement(props: &[u8], rendered: &[u8]) -> (Vec<u8>, usize) {
+fn empty_node_replacement(props: &[u8], rendered: &[u8], tags: &CoreTags) -> (Vec<u8>, usize) {
     let mut out = Vec::with_capacity(props.len() + rendered.len() + 1);
     if props.is_empty() {
         out.push(b' ');
     }
-    out.append(&mut kept_properties(props));
+    out.append(&mut kept_properties(props, tags));
     let offset = out.len();
     out.extend_from_slice(rendered);
     (out, offset)
@@ -3073,6 +3301,79 @@ fn with_line_ending_at(bytes: &[u8], at: usize, inserted: Vec<u8>) -> Vec<u8> {
     out
 }
 
+/// Offsets of the dots between the segments of the TOML key that `text`
+/// begins with (blanks first allowed), which ends at the first `=` or `]`
+/// outside quotes. `None` without that end.
+fn toml_key_dots(text: &[u8]) -> Option<Vec<usize>> {
+    let mut quote = None;
+    let mut dots = Vec::new();
+    let mut escaped = false;
+    for (i, &b) in text.iter().enumerate() {
+        if std::mem::take(&mut escaped) {
+            continue;
+        }
+        match (quote, b) {
+            (Some(q), _) if b == q => quote = None,
+            // In a basic string `\"` is no closing quote.
+            (Some(b'"'), b'\\') => escaped = true,
+            (Some(_), _) => {}
+            (None, b'"' | b'\'') => quote = Some(b),
+            (None, b'.') => dots.push(i),
+            (None, b'=' | b']') => return Some(dots),
+            (None, b'#' | b'\n' | b'[' | b'{') => return None,
+            (None, _) => {}
+        }
+    }
+    None
+}
+
+/// The TOML line `line` that writes the value at `pointer` under a dotted
+/// key, cut down to the part of the key that names the table at `parent`
+/// (`  a.b.c = 1`, `/a/b/c`, `/a` → `  a`), its indentation kept. `None`
+/// when the key does not reach up to `parent` within the line.
+fn toml_dotted_key_prefix(line: &[u8], pointer: &str, parent: &Pointer) -> Option<Vec<u8>> {
+    let dots = toml_key_dots(line)?;
+    // Segments of the canonical pointer, an empty key (`a."".x`) included,
+    // which `Pointer::parse` rejects.
+    let depth = pointer.matches('/').count();
+    let below = depth.checked_sub(parent.segments().len())?;
+    // The key's last `below` segments lie under `parent`.
+    let kept = (dots.len() + 1).checked_sub(below)?;
+    let end = skip_blanks_back(line, *dots.get(kept.checked_sub(1)?)?);
+    Some(line[..end].to_vec())
+}
+
+/// The `[header]` line of the TOML table at `table`, each segment a key
+/// of a table or an index into an array of tables. A header names no
+/// index — `[t.a]` is under the `[[t]]` item last opened above it — so
+/// it is right only where it goes among that item's own sections. `None`
+/// for the root and a path through anything else.
+fn toml_header(root: &Value, table: &Pointer) -> Option<Vec<u8>> {
+    let segments = table.segments();
+    let mut keys = Vec::with_capacity(segments.len());
+    let mut node = root;
+    // An array item's own header is `[[t]]`, which opens a new one: the
+    // path ends with a key.
+    let mut ends_with_key = false;
+    for segment in segments {
+        (node, ends_with_key) = match (node, segment) {
+            (Value::Map(map), Segment::Key(key)) => {
+                keys.push(crate::parsers::toml::toml_key_token(key));
+                (map.get(key)?, true)
+            }
+            (Value::Array(items), Segment::Index(index)) => (items.get(*index)?, false),
+            (Value::Array(items), Segment::Key(index)) => {
+                (items.get(index.parse::<usize>().ok()?)?, false)
+            }
+            _ => return None,
+        };
+    }
+    if !ends_with_key {
+        return None;
+    }
+    Some(format!("[{}]\n", keys.join(".")).into_bytes())
+}
+
 /// For the TOML line `line` holding a dotted key (`  a."b.c".d = 1`), the
 /// key without its last part (`  a."b.c"`); `None` for a key of one part
 /// or a line that is not `key = value`.
@@ -3100,16 +3401,167 @@ fn toml_dotted_key_parent(line: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// The anchor and local tags of the node properties `props`, each followed
-/// by a space; `!!` tags are dropped.
-fn kept_properties(props: &[u8]) -> Vec<u8> {
+/// The anchor and other tags of the node properties `props`, each
+/// followed by a space; the core-schema tags `tags` names are dropped.
+fn kept_properties(props: &[u8], tags: &CoreTags) -> Vec<u8> {
     let mut out = Vec::with_capacity(props.len());
     for token in props
         .split(u8::is_ascii_whitespace)
-        .filter(|token| !token.is_empty() && !token.starts_with(b"!!"))
+        .filter(|token| !token.is_empty() && !tags.retypes(token))
     {
         out.extend_from_slice(token);
         out.push(b' ');
+    }
+    out
+}
+
+/// The YAML node properties right before `end` when one of them is a tag
+/// of the core schema — which would retype a new value written after
+/// them — and their bytes; `None` otherwise.
+fn core_tag_removal<'a>(
+    bytes: &'a [u8],
+    end: usize,
+    tags: &CoreTags,
+) -> Option<(std::ops::Range<usize>, &'a [u8])> {
+    let start = yaml_properties_start(bytes, end);
+    let props = &bytes[start..end];
+    tags.any_in(props).then_some((start..end, props))
+}
+
+/// The tags of a YAML document that name a type of the core schema
+/// (`tag:yaml.org,2002:`), which a new value must not inherit: `!!map`,
+/// the verbatim `!<tag:yaml.org,2002:map>`, a `%TAG` handle bound to that
+/// prefix (`!e!map`), and the non-specific `!`, which makes `5` a string.
+struct CoreTags {
+    /// The `%TAG` directives of the document: handle, prefix.
+    directives: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+impl CoreTags {
+    const PREFIX: &'static [u8] = b"tag:yaml.org,2002:";
+
+    /// The core tags of the document of the stream `bytes` that holds
+    /// byte `at`: a `%TAG` directive binds its handle for the one document
+    /// that follows it.
+    fn at(bytes: &[u8], at: usize) -> Self {
+        let start = bom_end(bytes);
+        // Directives read since the last document began, and those of the
+        // document `at` is in.
+        let mut pending = Vec::new();
+        let mut directives = Vec::new();
+        for line in bytes[start..at.clamp(start, bytes.len())].split(|&b| b == b'\n') {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            let marker = |marker: &[u8]| {
+                line.strip_prefix(marker)
+                    .is_some_and(|rest| rest.first().is_none_or(u8::is_ascii_whitespace))
+            };
+            if marker(b"---") {
+                directives = std::mem::take(&mut pending);
+            } else if marker(b"...") {
+                directives.clear();
+            } else if marker(b"%TAG") {
+                let mut fields = line[4..]
+                    .split(u8::is_ascii_whitespace)
+                    .filter(|field| !field.is_empty());
+                if let (Some(handle), Some(prefix)) = (fields.next(), fields.next()) {
+                    pending.push((handle.to_vec(), prefix.to_vec()));
+                }
+            }
+        }
+        Self { directives }
+    }
+
+    /// Whether the node property `token` is a tag that retypes the node.
+    fn retypes(&self, token: &[u8]) -> bool {
+        if token == b"!" {
+            return true;
+        }
+        if let Some(uri) = token.strip_prefix(b"!<") {
+            return uri.starts_with(Self::PREFIX);
+        }
+        if !token.starts_with(b"!") {
+            return false;
+        }
+        // `!!x`, `!e!x`: the handle ends at the second `!`; `!x` has the
+        // primary handle `!`.
+        let handle = match token[1..].iter().position(|&b| b == b'!') {
+            Some(i) => &token[..i + 2],
+            None => b"!".as_slice(),
+        };
+        let prefix = self
+            .directives
+            .iter()
+            .rev()
+            .find(|(bound, _)| bound == handle)
+            .map(|(_, prefix)| prefix.as_slice())
+            .or_else(|| (handle == b"!!").then_some(Self::PREFIX));
+        prefix.is_some_and(|prefix| prefix.starts_with(Self::PREFIX))
+    }
+
+    /// Whether any of the node properties `props` is such a tag.
+    fn any_in(&self, props: &[u8]) -> bool {
+        props
+            .split(u8::is_ascii_whitespace)
+            .any(|token| self.retypes(token))
+    }
+}
+
+/// Past the blank lines from the line start `at` on.
+fn past_blank_lines(bytes: &[u8], mut at: usize) -> usize {
+    while let Some(end) = bytes[at..].iter().position(|&b| b == b'\n')
+        && bytes[at..at + end].iter().all(u8::is_ascii_whitespace)
+    {
+        at += end + 1;
+    }
+    at
+}
+
+/// Start of the line holding byte `pos`; on the first line, past a
+/// byte-order mark — so that columns count from the first character, and
+/// bytes removed or inserted at a line start leave the mark first.
+/// The offset just past a leading UTF-8 byte order mark, or 0.
+pub(crate) fn bom_end(bytes: &[u8]) -> usize {
+    if bytes.starts_with("\u{feff}".as_bytes()) {
+        "\u{feff}".len()
+    } else {
+        0
+    }
+}
+
+pub(crate) fn line_start(bytes: &[u8], pos: usize) -> usize {
+    const BOM: &[u8] = "\u{feff}".as_bytes();
+    let pos = pos.min(bytes.len());
+    bytes[..pos].iter().rposition(|&b| b == b'\n').map_or_else(
+        || {
+            if bytes.starts_with(BOM) {
+                BOM.len().min(pos)
+            } else {
+                0
+            }
+        },
+        |i| i + 1,
+    )
+}
+
+/// `end`, the start of a line, moved past the comment-only lines that
+/// follow it with their `#` at column `column` (0-based) or deeper, and the
+/// blank lines between them; blank lines after the last such comment stay.
+fn past_comment_lines(bytes: &[u8], end: usize, column: usize) -> usize {
+    let mut out = end;
+    let mut pos = end;
+    while pos < bytes.len() {
+        let next = bytes[pos..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(bytes.len(), |at| pos + at + 1);
+        let line = &bytes[pos..next];
+        let indent = line.iter().take_while(|&&b| b == b' ').count();
+        match line[indent..].first() {
+            None | Some(b'\n' | b'\r') => {}
+            Some(b'#') if indent >= column => out = next,
+            Some(_) => break,
+        }
+        pos = next;
     }
     out
 }
@@ -4685,6 +5137,268 @@ mod tests {
             first_difference(&Value::Int(1), &Value::Float(1.0), "/x"),
             Some("/x".to_owned())
         );
+    }
+
+    #[test]
+    fn first_difference_tells_negative_zero_from_zero() {
+        assert_eq!(
+            first_difference(&Value::Float(-0.0), &Value::Float(0.0), "/x"),
+            Some("/x".to_owned())
+        );
+        assert_eq!(
+            first_difference(&Value::Float(-0.0), &Value::Float(-0.0), "/x"),
+            None
+        );
+        assert_eq!(
+            first_difference(&Value::Float(f64::NAN), &Value::BigFloat(".nan".into()), ""),
+            None
+        );
+    }
+
+    /// The bytes after `edit` on `src` parsed as `format`.
+    fn edited(format: &str, src: &str, edit: impl FnOnce(&mut Document) -> Result<()>) -> String {
+        // The YAML `Format` parses read-only; edits go through spans.
+        let mut doc = match format {
+            "yaml" => crate::parsers::parse_yaml_with_spans(src.as_bytes()),
+            _ => crate::format::by_name(format)
+                .expect("format")
+                .parse(src.as_bytes()),
+        }
+        .expect("parse");
+        edit(&mut doc).unwrap_or_else(|err| panic!("edit on {src:?}: {err}"));
+        String::from_utf8(doc.original_bytes().to_vec()).expect("UTF-8")
+    }
+
+    fn del_edit(pointer: &str) -> impl FnOnce(&mut Document) -> Result<()> {
+        let pointer = Pointer::parse(pointer).unwrap();
+        move |doc| doc.del_at(&pointer)
+    }
+
+    fn set_edit(pointer: &str, value: Value) -> impl FnOnce(&mut Document) -> Result<()> {
+        let pointer = Pointer::parse(pointer).unwrap();
+        move |doc| doc.set_at(&pointer, value)
+    }
+
+    #[test]
+    fn del_of_an_explicit_key_without_a_value_keeps_the_next_one() {
+        assert_eq!(edited("yaml", "? k\n? j\n", del_edit("/k")), "? j\n");
+        assert_eq!(
+            edited("yaml", "? k\n? j\n? l\n", del_edit("/j")),
+            "? k\n? l\n"
+        );
+    }
+
+    #[test]
+    fn del_of_a_compact_entry_before_an_empty_key() {
+        assert_eq!(
+            edited("yaml", "- a: 1\n  \"\": 2\n- b: 3\n", del_edit("/0/a")),
+            "- \"\": 2\n- b: 3\n"
+        );
+    }
+
+    #[test]
+    fn del_of_a_compact_entry_takes_its_trailing_comments() {
+        assert_eq!(
+            edited(
+                "yaml",
+                "- a:\n    b: 1\n    # c\n  d: 2\n",
+                del_edit("/0/a")
+            ),
+            "- d: 2\n"
+        );
+    }
+
+    #[test]
+    fn del_at_the_top_of_the_file_leaves_no_blank_line_first() {
+        assert_eq!(
+            edited("yaml", "a:\n  b: 1\n  # tail\n\nd: 3\n", del_edit("/a")),
+            "d: 3\n"
+        );
+        assert_eq!(
+            edited("yaml", "x: 0\na: 1\n\nd: 3\n", del_edit("/a")),
+            "x: 0\n\nd: 3\n"
+        );
+    }
+
+    #[test]
+    fn comment_lines_count_columns_past_a_byte_order_mark() {
+        let src = "\u{feff}a:\n  b: 1\n  # c\nd: 2\n";
+        assert_eq!(edited("yaml", src, del_edit("/a")), "\u{feff}d: 2\n");
+        assert_eq!(
+            edited("yaml", src, set_edit("/a", Value::Int(5))),
+            "\u{feff}a: 5\nd: 2\n"
+        );
+        assert_eq!(
+            edited(
+                "yaml",
+                "\u{feff}- a:\n    b: 1\n    # c\n  d: 2\n",
+                del_edit("/0/a")
+            ),
+            "\u{feff}- d: 2\n"
+        );
+        assert_eq!(line_start("\u{feff}ab".as_bytes(), 4), 3);
+        assert_eq!(line_start("\u{feff}ab".as_bytes(), 0), 0);
+    }
+
+    #[test]
+    fn toml_del_keeps_the_byte_order_mark_and_line_endings() {
+        assert_eq!(
+            edited("toml", "\u{feff}a=1\r\n\r\nb=2\r\n", del_edit("/a")),
+            "\u{feff}b=2\r\n"
+        );
+        assert_eq!(
+            edited("toml", "\u{feff}[a.b]\r\nc=1\r\n", del_edit("/a/b")),
+            "\u{feff}[a]\r\n"
+        );
+    }
+
+    #[test]
+    fn set_over_a_tagged_yaml_collection_drops_the_core_tag() {
+        let five = || Value::Int(5);
+        assert_eq!(
+            edited("yaml", "a: !!map\n  b: 1\nc: 2\n", set_edit("/a", five())),
+            "a: 5\nc: 2\n"
+        );
+        assert_eq!(
+            edited("yaml", "a: !!map {b: 1}\nc: 2\n", set_edit("/a", five())),
+            "a: 5\nc: 2\n"
+        );
+        // An anchor stays.
+        assert_eq!(
+            edited(
+                "yaml",
+                "a: &x !!map\n  b: 1\nc: 2\n",
+                set_edit("/a", five())
+            ),
+            "a: &x 5\nc: 2\n"
+        );
+    }
+
+    #[test]
+    fn core_tags_are_spelled_three_ways() {
+        let hello = || Value::String("hello".into());
+        for src in [
+            "a: !<tag:yaml.org,2002:map> {b: 1}\nc: 2\n",
+            "a: !<tag:yaml.org,2002:seq>\n  - 1\nc: 2\n",
+        ] {
+            assert_eq!(
+                edited("yaml", src, set_edit("/a", hello())),
+                "a: hello\nc: 2\n"
+            );
+        }
+        assert_eq!(
+            edited(
+                "yaml",
+                "%TAG !e! tag:yaml.org,2002:\n---\na: !e!map {b: 1}\n",
+                set_edit("/a", hello())
+            ),
+            "%TAG !e! tag:yaml.org,2002:\n---\na: hello\n"
+        );
+        let src = b"%TAG !e! tag:example.com,2000:\n--- a\n";
+        let tags = CoreTags::at(src, src.len());
+        assert!(tags.retypes(b"!!str") && tags.retypes(b"!"));
+        assert!(!tags.retypes(b"!e!x") && !tags.retypes(b"!<tag:example.com,2000:x>"));
+        // A directive binds its handle for the next document only.
+        let src = b"%TAG !e! tag:yaml.org,2002:\n--- a\n...\n%TAG !e! tag:x,1:\n--- b\n";
+        assert!(CoreTags::at(src, "%TAG !e! tag:yaml.org,2002:\n--- ".len()).retypes(b"!e!map"));
+        assert!(!CoreTags::at(src, src.len()).retypes(b"!e!map"));
+        // `!!` can be bound elsewhere, and `!` to the core prefix.
+        let src = b"%TAG !! tag:x,1:\n%TAG ! tag:yaml.org,2002:\n--- a\n";
+        let tags = CoreTags::at(src, src.len());
+        assert!(!tags.retypes(b"!!str") && tags.retypes(b"!str"));
+        // A directive on the first line counts after a byte order mark.
+        let src = "\u{feff}%TAG !e! tag:yaml.org,2002:\n--- a\n".as_bytes();
+        assert!(CoreTags::at(src, src.len()).retypes(b"!e!map"));
+        assert_eq!(yaml_properties_start(b"a: !<tag:x,1:y> {", 16), 3);
+    }
+
+    #[test]
+    fn set_over_a_yaml_collection_takes_its_comment_lines() {
+        let src = "a:\n  # note\n  b: 1\n  # tail\n# after\nd: 3\n";
+        assert_eq!(
+            edited("yaml", src, set_edit("/a", Value::Int(5))),
+            "a: 5\n# after\nd: 3\n"
+        );
+    }
+
+    #[test]
+    fn set_of_a_new_key_in_a_toml_table_with_no_header() {
+        assert_eq!(
+            edited("toml", "[a.d]\nx = 1\n", set_edit("/a/z", Value::Int(3))),
+            "[a]\nz = 3\n\n[a.d]\nx = 1\n"
+        );
+        assert_eq!(
+            edited("toml", "a.d.x = 1\n", set_edit("/a/z", Value::Int(3))),
+            "a.d.x = 1\na.z = 3\n"
+        );
+        // A dotted key that does not reach up to the table: a header.
+        assert_eq!(
+            edited("toml", "[a.d]\ne.f = 1\n", set_edit("/a/z", Value::Int(3))),
+            "[a]\nz = 3\n\n[a.d]\ne.f = 1\n"
+        );
+        // After a byte-order mark, not before it.
+        assert_eq!(
+            edited(
+                "toml",
+                "\u{feff}[a.d]\nx=1\n",
+                set_edit("/a/z", Value::Int(3))
+            ),
+            "\u{feff}[a]\nz = 3\n\n[a.d]\nx=1\n"
+        );
+        // The comment lines above the section, up to the byte-order mark.
+        assert_eq!(
+            edited(
+                "toml",
+                "\u{feff}# c\n[a.d]\nx=1\n",
+                set_edit("/a/z", Value::Int(3))
+            ),
+            "\u{feff}[a]\nz = 3\n\n# c\n[a.d]\nx=1\n"
+        );
+    }
+
+    #[test]
+    fn toml_dotted_key_prefix_cuts_the_key_down_to_the_table() {
+        let a = Pointer::parse("/a").unwrap();
+        assert_eq!(
+            toml_dotted_key_prefix(b"  a . \"b.c\".d = 1\n", "/a/b.c/d", &a),
+            Some(b"  a".to_vec())
+        );
+        // The key does not reach up to `/a` inside `[a]`.
+        assert_eq!(toml_dotted_key_prefix(b"d = 1\n", "/a/d", &a), None);
+        assert_eq!(toml_key_dots(b"a.'x.y'.b]"), Some(vec![1, 7]));
+        assert_eq!(toml_key_dots(b"a.b # no end"), None);
+        assert_eq!(toml_key_dots(b"a.\"b\\\".c\".d ="), Some(vec![1, 9]));
+        assert_eq!(
+            toml_dotted_key_prefix(b"a.\"\".x = 1\n", "/a//x", &a),
+            Some(b"a".to_vec())
+        );
+    }
+
+    #[test]
+    fn toml_header_spells_a_path_of_tables() {
+        let root = Value::from_serde_json(&serde_json::json!({"a": {"b c": {}}, "t": [{}]}));
+        assert_eq!(
+            toml_header(&root, &Pointer::parse("/a/b c").unwrap()),
+            Some(b"[a.\"b c\"]\n".to_vec())
+        );
+        assert_eq!(toml_header(&root, &Pointer::parse("/t/0").unwrap()), None);
+        let root = Value::from_serde_json(&serde_json::json!({"t": [{"a": {}}]}));
+        assert_eq!(
+            toml_header(&root, &Pointer::parse("/t/0/a").unwrap()),
+            Some(b"[t.a]\n".to_vec())
+        );
+        assert_eq!(toml_header(&root, &Pointer::default()), None);
+    }
+
+    #[test]
+    fn past_comment_lines_stops_at_a_shallower_comment() {
+        let src = b"  # deep\n\n    # deeper\n\n# shallow\n";
+        // Past the deeper comment; the blank line after it stays.
+        assert_eq!(
+            past_comment_lines(src, 0, 2),
+            "  # deep\n\n    # deeper\n".len()
+        );
+        assert_eq!(past_comment_lines(b"x: 1\n", 0, 0), 0);
     }
 
     /// Byte offset of the first occurrence of `needle` in `src`.

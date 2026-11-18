@@ -198,8 +198,9 @@ fn set_over_a_toml_table_writes_the_key_anew() {
         "a = 5\n[e]\nf = 1\n"
     );
     assert_eq!(
+        // A dotted table: where its first line was.
         set("toml", "a.b = 1\na.c = 2\nz = 1\n", "/a", Value::Int(5)),
-        "z = 1\na = 5\n"
+        "a = 5\nz = 1\n"
     );
     assert_eq!(
         set(
@@ -225,7 +226,7 @@ fn set_over_a_toml_table_whose_parent_it_alone_makes_writes_the_parent_inline() 
             "/a/b",
             json(serde_json::json!({"z": 1}))
         ),
-        "e = 1\na = { b = { z = 1 } }\n"
+        "a.b = { z = 1 }\ne = 1\n"
     );
     assert_eq!(
         set("toml", "[a.b.c]\nk = 1\n", "/a/b/c", Value::Int(5)),
@@ -242,18 +243,17 @@ fn set_over_a_toml_table_whose_parent_it_alone_makes_writes_the_parent_inline() 
 }
 
 #[test]
-fn set_over_a_toml_table_under_a_parent_with_no_header_is_refused() {
-    // `a` stays, made by `[a.d]`, with no header for `b` to go under.
-    let src = "[a.b]\nc = 1\n[a.d]\ne = 1\n";
-    let mut doc = doc("toml", src);
-    match doc.set_at(&ptr("/a/b"), Value::Int(5)) {
-        Err(Error::EditRejected { reason, .. }) => {
-            assert!(reason.contains("no header of its own"), "{reason}");
-            assert!(reason.contains("`dq set --jq`"), "{reason}");
-        }
-        other => panic!("expected EditRejected, got {other:?}"),
-    }
-    assert_eq!(doc.original_bytes(), src.as_bytes(), "bytes untouched");
+fn set_over_a_toml_table_under_a_parent_with_no_header_writes_one() {
+    // `a` stays, made by `[a.d]`: `b` goes under a header `[a]` of its own.
+    assert_eq!(
+        set(
+            "toml",
+            "[a.b]\nc = 1\n[a.d]\ne = 1\n",
+            "/a/b",
+            Value::Int(5)
+        ),
+        "[a]\nb = 5\n\n[a.d]\ne = 1\n"
+    );
 }
 
 #[test]
@@ -316,7 +316,14 @@ fn del_of_the_last_toml_table_under_another_keeps_it_empty() {
         del("toml", "z = 1\n[[arr]]\nx = 1\n[u]\n", "/arr/0"),
         "z = 1\narr = []\n[u]\n"
     );
-    assert_eq!(del("toml", "[a.b]\nk = 1\n", "/a/b"), "a = {}\n");
+    // A header of its own where the removed section was.
+    assert_eq!(del("toml", "[a.b]\nk = 1\n", "/a/b"), "[a]\n");
+    assert_eq!(del("toml", "[a.b.c]\nk = 1\n", "/a/b/c"), "[a.b]\n");
+    // Under a dotted key: the key cut down to the emptied table.
+    assert_eq!(
+        del("toml", "a.b.c = 1\na.b.d = 2\ne = 1\n", "/a/b"),
+        "a = {}\ne = 1\n"
+    );
 }
 
 #[test]
@@ -344,8 +351,6 @@ fn del_of_a_dotted_key_inside_an_inline_table() {
 #[test]
 fn del_of_a_toml_collection_dq_cannot_locate_is_refused() {
     let reason = del_refused("toml", "a = {x.p = 1, x.q = 2}\n", "/a/x");
-    assert!(reason.contains("`dq set --jq`"), "{reason}");
-    let reason = del_refused("toml", "[a.b.c]\nk = 1\n", "/a/b/c");
     assert!(reason.contains("`dq set --jq`"), "{reason}");
 }
 
