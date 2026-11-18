@@ -252,6 +252,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   The BOM is kept on write.
 - Some YAML documents that saphyr-parser 0.0.6 rejected with a parse
   error now parse.
+- Plugins: the 64 MiB memory limit applies to all of a plugin's memories
+  together, and a plugin stopped by it reports `exceeded memory limit`.
 
 ### Security
 
