@@ -34,6 +34,10 @@ impl Format for Yaml {
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<Document> {
+        // A byte order mark is not content. serde_norway's scanner reads a
+        // leading one as part of the first line, and a second top-level key
+        // then fails with "did not find expected <document start>".
+        let bytes = bytes.strip_prefix("\u{feff}".as_bytes()).unwrap_or(bytes);
         let mut documents: Vec<Value> = Vec::new();
         for de_result in serde_norway::Deserializer::from_slice(bytes) {
             let yaml: YamlValue = YamlValue::deserialize(de_result).map_err(map_yaml_err)?;
@@ -200,6 +204,14 @@ mod tests {
         let Value::Map(m) = doc.value() else { panic!() };
         let keys: Vec<&str> = m.keys().map(String::as_str).collect();
         assert_eq!(keys, vec!["z", "a", "m"]);
+    }
+
+    #[test]
+    fn parse_skips_a_byte_order_mark_before_several_keys() {
+        let doc = parse("\u{feff}a: 1\nb: 2\n");
+        let Value::Map(m) = doc.value() else { panic!() };
+        let keys: Vec<&str> = m.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["a", "b"]);
     }
 
     #[test]

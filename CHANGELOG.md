@@ -290,6 +290,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   nothing and leave the file alone; they used to write the damaged
   output. An edit under a YAML anchor also changes its aliases (`<<:
   *base`), as YAML defines.
+- A YAML file with a UTF-8 BOM and more than one top-level key parses; it
+  used to fail with "did not find expected <document start>".
 
 ### Security
 
