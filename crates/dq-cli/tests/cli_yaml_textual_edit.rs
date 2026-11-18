@@ -97,3 +97,10 @@ fn set_new_key_after_a_block_scalar_keeps_the_scalar() {
         "o:\n  a: |\n    x\n  zz: 1\n"
     );
 }
+
+#[test]
+fn set_after_an_alias_edits_the_addressed_node() {
+    let src = "a: &x 1\nb: *x\nc: 2\n";
+    assert_eq!(edit(src, &["set", "/b", "9"]), "a: &x 1\nb: 9\nc: 2\n");
+    assert_eq!(edit(src, &["set", "/c", "7"]), "a: &x 1\nb: *x\nc: 7\n");
+}

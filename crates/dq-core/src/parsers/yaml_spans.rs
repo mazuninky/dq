@@ -30,9 +30,10 @@
 //!   downgrades any literal/folded scalar to double-quoted on replacement; the
 //!   original bytes for unrelated values are byte-preserved so the cost is
 //!   localized to the edited line. Round-tripping `|` / `>` lands in M3.
-//! - Alias rewrites. `Event::Alias` is logged at debug level and skipped — no
-//!   span is recorded, so `set_at` on an alias surfaces the missing-pointer
-//!   path. The spike report covers this finding.
+//! - Alias rewrites through the anchor. An alias value gets the span of its
+//!   own `*name`: `set_at` replaces the alias with the new value and leaves
+//!   the anchored node alone; nodes under an alias of a collection have no
+//!   spans.
 //! - Tagged scalars. The tag is preserved by virtue of being outside the
 //!   value_range; replacement renders the value only. M3 will revisit if a
 //!   user reports a real-world case where this matters.
@@ -722,6 +723,9 @@ struct State<'src> {
     /// 0.0.6 span start of each block scalar with node properties, keyed by
     /// event ordinal — see [`replay_block_scalar_body_starts`].
     block_body_starts: &'src HashMap<usize, usize>,
+    /// Text of every anchored scalar, keyed by anchor id, so an alias used
+    /// as a mapping key resolves to the key the value tree holds.
+    anchored_scalars: HashMap<usize, String>,
     /// Number of flow frames on `self.stack`.
     flow_depth: usize,
 }
@@ -744,6 +748,7 @@ impl<'src> State<'src> {
             path: Vec::new(),
             next_ordinal: 0,
             block_body_starts,
+            anchored_scalars: HashMap::new(),
             flow_depth: 0,
         }
     }
@@ -878,6 +883,9 @@ impl<'src> State<'src> {
             }
             Event::Scalar(value, style, anchor, tag) => {
                 let n_properties = usize::from(anchor != 0) + usize::from(tag.is_some());
+                if anchor != 0 {
+                    self.anchored_scalars.insert(anchor, value.to_string());
+                }
                 if self.expects_key() {
                     let key_str =
                         pointer_escape(legacy_key_text(value.as_ref(), style, n_properties));
@@ -919,13 +927,37 @@ impl<'src> State<'src> {
                     self.complete_value();
                 }
             }
-            Event::Alias(_) => {
-                tracing::debug!(
-                    line = span.start.line(),
-                    col = span.start.col(),
-                    "skipping alias span (aliases are not editable in M2)",
-                );
-                self.complete_value();
+            Event::Alias(anchor) => {
+                // An alias is a node like any other: as a key it names the
+                // entry (the value tree keys it by the anchored scalar's
+                // text), as a value it is a span `set` can overwrite.
+                let range = span_to_range(span, self.char_to_byte);
+                if self.expects_key() {
+                    // An alias of a collection keys the value tree by its
+                    // debug rendering, which no pointer can spell; the
+                    // empty segment keeps the entry unaddressable.
+                    let key = self
+                        .anchored_scalars
+                        .get(&anchor)
+                        .map_or_else(String::new, |text| pointer_escape(text));
+                    self.set_pending_key(key, range);
+                } else {
+                    let entry = self.entry_anchor(range.start);
+                    let pointer = self.value_pointer();
+                    let context = self.value_context();
+                    let line_range =
+                        self.compute_line_range(&range, context, ScalarStyle::Plain, entry);
+                    spans.insert(
+                        pointer,
+                        ValueSpan {
+                            value_range: range,
+                            line_range,
+                            indent: u32::try_from(span.start.col()).unwrap_or(u32::MAX),
+                            context,
+                        },
+                    );
+                    self.complete_value();
+                }
             }
             Event::SequenceStart(anchor, tag) => {
                 let n_properties = usize::from(anchor != 0) + usize::from(tag.is_some());

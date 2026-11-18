@@ -78,3 +78,41 @@ fn del_of_a_block_scalar_removes_its_whole_entry() {
     assert_eq!(del("a:\n  x y\nb: 1\n", "/a"), "b: 1\n");
     assert_eq!(del("l:\n  - |\n    x\n  - 2\n", "/l/0"), "l:\n  - 2\n");
 }
+
+// --- aliases -----------------------------------------------------------------
+
+#[test]
+fn set_on_an_alias_value_rewrites_only_that_value() {
+    let src = "a: &x 1\nb: *x\nc: 2\n";
+    assert_eq!(set(src, "/b", Value::Int(9)), "a: &x 1\nb: 9\nc: 2\n");
+    assert_eq!(set(src, "/c", Value::Int(7)), "a: &x 1\nb: *x\nc: 7\n");
+}
+
+#[test]
+fn set_after_an_alias_sequence_item_addresses_the_next_item() {
+    let src = "a: &x 1\nl:\n  - *x\n  - 2\nz: 3\n";
+    assert_eq!(
+        set(src, "/l/1", Value::Int(9)),
+        "a: &x 1\nl:\n  - *x\n  - 9\nz: 3\n"
+    );
+}
+
+#[test]
+fn alias_key_and_merge_key_keep_later_pointers_in_place() {
+    assert_eq!(
+        set("a: &x 1\n*x : 2\nc: 3\n", "/c", Value::Int(9)),
+        "a: &x 1\n*x : 2\nc: 9\n"
+    );
+    assert_eq!(
+        set(
+            "b: &b\n  x: 1\nd:\n  <<: *b\n  y: 2\n",
+            "/d/y",
+            Value::Int(9)
+        ),
+        "b: &b\n  x: 1\nd:\n  <<: *b\n  y: 9\n"
+    );
+    assert_eq!(
+        set("a: &x 1\nm: {k: *x, z: 3}\n", "/m/z", Value::Int(9)),
+        "a: &x 1\nm: {k: *x, z: 9}\n"
+    );
+}

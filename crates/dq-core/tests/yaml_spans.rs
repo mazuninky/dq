@@ -13,17 +13,9 @@
 //! - lock in span byte positions on a real-world fixture (a Kubernetes
 //!   `Deployment`) so a refactor that drifts span semantics can't pass
 //!   silently;
-//! - assert how the parser behaves on YAML 1.2 features the M2 baseline
-//!   does *not* support (anchors / aliases) — preventing a future
-//!   "look, set_at on `*base` works!" regression that would actually be
-//!   modifying the wrong span.
-//!
-//! # Documented baseline (M2)
-//!
-//! - `Event::Alias` is skipped; **no span is recorded** for the alias
-//!   reference. `Document::set_at` on the alias path therefore surfaces
-//!   `Error::Path { kind: MissingKey }` instead of mutating the anchored
-//!   value. This is intentional — see `parsers/yaml_spans.rs` module docs.
+//! - assert how the parser records anchors / aliases: an alias value gets
+//!   the span of its own `*name`, so `set_at` on it rewrites the alias,
+//!   never the anchored value.
 
 use dq_core::document::FormatTag;
 use dq_core::document::spans::SpanContext;
@@ -174,35 +166,25 @@ fn block_sequence_items_are_tagged_as_block_seq() {
 }
 
 // -----------------------------------------------------------------------
-// 4. anchor + alias — alias has NO span recorded (M2 baseline)
+// 4. anchor + alias — an alias value has its own span
 // -----------------------------------------------------------------------
 
 #[test]
-fn alias_event_is_skipped_no_span_recorded() {
-    // YAML anchors (`&`) and aliases (`*`) are a known M2 limitation: the
-    // span builder skips `Event::Alias`. We pin the baseline behaviour so
-    // a future change that flips this (e.g. M3 anchor support) MUST also
-    // update this test rather than silently changing the contract.
-    //
-    // `&base ...` defines an anchor; `*base` would normally substitute the
-    // anchored value at parse time. The span builder only records spans
-    // for resolved scalar values it observes — never for the alias event
-    // itself.
-    let bytes = b"defaults: &base 100\nactual: *base\n";
+fn alias_value_gets_a_span_and_keeps_later_pointers_in_place() {
+    // An alias is a node: as a value it gets the span of `*name`, and the
+    // entries after it keep their own pointers. The builder used to skip
+    // the alias event without consuming its key, which shifted every later
+    // key/value pairing by one.
+    let bytes = b"defaults: &base 100\nactual: *base\nnext: 2\n";
     let (_, spans) = parse_with_spans(bytes).expect("parse must succeed");
 
-    // The anchored scalar `100` has a span on the line where it's defined.
     let defaults = spans.get("/defaults").expect("/defaults span");
     assert_eq!(&bytes[defaults.value_range.clone()], b"100");
-
-    // The alias reference at `/actual` does NOT get a span — the
-    // implementation logs at debug level and skips the event. Pin this
-    // explicitly so the absence is observable, not silent.
-    assert!(
-        spans.get("/actual").is_none(),
-        "M2 baseline: alias references must NOT have a span recorded; got: {:?}",
-        spans.get("/actual"),
-    );
+    let actual = spans.get("/actual").expect("/actual span");
+    assert_eq!(&bytes[actual.value_range.clone()], b"*base");
+    assert_eq!(&bytes[actual.line_range.clone()], b"actual: *base\n");
+    let next = spans.get("/next").expect("/next span");
+    assert_eq!(&bytes[next.value_range.clone()], b"2");
 }
 
 // -----------------------------------------------------------------------
