@@ -1074,14 +1074,30 @@ mod tests {
 
     #[test]
     fn map_self_update_error_other_is_write_failure() {
-        let (code, kind, msg) = mapped(self_update::errors::Error::no_release_found_for_target(
-            "x86_64-unknown-linux-gnu",
+        // An error with no 0.44 text to keep is rendered with its own
+        // `Display`.
+        let (code, kind, msg) = mapped(self_update::errors::Error::missing_asset_field(
+            "browser_download_url",
         ));
         assert_eq!(code, crate::exit_code::WRITE_FAILED);
         assert_eq!(kind, "write_io");
-        assert!(
-            msg.starts_with("self-update failed: "),
-            "unexpected: {msg:?}"
+        assert_eq!(
+            msg,
+            "self-update failed: ReleaseError: release/asset payload missing `browser_download_url`"
+        );
+    }
+
+    #[test]
+    fn map_self_update_error_no_release_without_target_keeps_its_own_text() {
+        // Only `NoReleaseFound` *with* a target gets the 0.44 text; an empty
+        // release listing falls through to self_update's own `Display`
+        // (0.44's GitHub backend said "ReleaseError: No releases found").
+        let (code, kind, msg) = mapped(self_update::errors::Error::no_release_found());
+        assert_eq!(code, crate::exit_code::WRITE_FAILED);
+        assert_eq!(kind, "write_io");
+        assert_eq!(
+            msg,
+            "self-update failed: ReleaseError: no release was found"
         );
     }
 

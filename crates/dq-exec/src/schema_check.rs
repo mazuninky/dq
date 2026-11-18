@@ -1345,6 +1345,45 @@ $defs:
     }
 
     #[test]
+    fn compile_inline_reports_the_first_unretrievable_meta_schema_in_crawl_order() {
+        // jsonschema 0.34 kept unretrievable meta-schemas in a hash set and
+        // reported whichever came out first, so with two of them the error
+        // varied between runs. The emulation reports the first one met by
+        // the breadth-first crawl, every time.
+        let a = "https://a.example/m";
+        let b = "https://b.example/m";
+        for (schema, first) in [
+            // Siblings: the first property's meta-schema wins, whichever URI
+            // it names.
+            (
+                serde_json::json!({"properties": {"p": {"$schema": a}, "q": {"$schema": b}}}),
+                a,
+            ),
+            (
+                serde_json::json!({"properties": {"p": {"$schema": b}, "q": {"$schema": a}}}),
+                b,
+            ),
+            // Breadth first: a shallow meta-schema wins over a deeper one
+            // under an earlier key.
+            (
+                serde_json::json!({"properties": {
+                    "p": {"properties": {"x": {"$schema": a}}},
+                    "q": {"$schema": b},
+                }}),
+                b,
+            ),
+        ] {
+            for _ in 0..32 {
+                assert_eq!(
+                    compile_error_message(schema.clone()),
+                    http_meta_schema_error(first),
+                    "for {schema}"
+                );
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "bug: find_external_ref walks data positions, so a `$ref` key inside \
                 `const`/`enum`/`default`/`examples` is rejected as an external $ref \
                 (pre-existing, same in the jsonschema 0.34 build)"]
