@@ -61,14 +61,16 @@ clap_complete = "4"
 clap_mangen = "0.3"
 
 # Query / format
-# Both are held on their old majors on purpose: each newer release changes
-# user-visible output, which needs its own OpenSpec change. jsonpath-rust 1.0
-# rewrote the evaluator for strict RFC 9535 (`$..*` order, `?@` filters,
-# functions, rejected `@.x` / `in` / `.length()`), changing `dq select`.
-# toon-format 0.6+ encodes TOON spec v4 (`[]` for empty arrays, nested
-# tabular headers, new quoting), changing `-F toon`.
-jsonpath-rust = "0.7"
-toon-format = { version = "0.4", default-features = false }
+# Both changed user-visible output on their last bump, accepted as upstream
+# behaviour. jsonpath-rust 1.0 is a strict RFC 9535 evaluator (`$..*` order,
+# `?@` filters, functions, negative indices; `.length()` / `.['x']` / `=~`
+# rejected), which is the grammar `dq select` documents. Its grammar keeps
+# blanks inside a member name, so `$.a b` looks up the key `"a b"` and
+# `@.x in [..]` matches nothing instead of failing to parse. toon-format 0.7
+# encodes TOON spec v4 (`[]` for empty arrays, nested tabular headers, new
+# quoting) for `-F toon`. `default-features = false` drops its CLI.
+jsonpath-rust = "1.0"
+toon-format = { version = "0.7", default-features = false }
 
 # Regex — used by dq-core's template_guard to detect Helm/Go-template
 # expressions before they reach the YAML/JSON parser.
@@ -113,12 +115,11 @@ ureq = { version = "3.5", default-features = false, features = ["rustls"] }
 # the default feature set entirely; the parser API and `format_commonmark`
 # renderer are part of the crate's core and require no opt-in features.
 # Comrak is BSD-2-Clause-licensed (matches the existing `cargo deny` allow
-# list) and edition-2024 / Rust 1.94 clean as of 0.52. Held at 0.52 on
-# purpose: 0.56 moved the end of indented code blocks and 1.0 ends list /
-# list-item nodes at their last child instead of the following blank line,
-# so `position.end` in the markdown IR would change; that needs its own
-# OpenSpec change.
-comrak = { version = "0.52", default-features = false }
+# list). The 1.0 bump changed `position.end` in the markdown IR, accepted as
+# upstream behaviour: an indented code block ends at its last character, not
+# at the start of the next line, and a list / list item ends at its last
+# child, not at the blank line after it.
+comrak = { version = "1.0", default-features = false }
 
 # M11 XML — `quick-xml` is the event-based XML parser/writer consumed by
 # `dq-core/src/parsers/xml.rs`. The `serialize` feature is enabled so the

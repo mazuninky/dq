@@ -39,4 +39,16 @@ mod tests {
         assert!(out.contains("name"), "expected key in toon output: {out:?}");
         assert!(out.ends_with('\n'));
     }
+
+    #[test]
+    fn encodes_toon_spec_v4_empty_arrays_and_quoting() {
+        let mut buf: Vec<u8> = Vec::new();
+        ToonReporter
+            .report(&serde_json::json!({"roles": [], "tag": "#bob"}), &mut buf)
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "roles: []\ntag: \"#bob\"\n"
+        );
+    }
 }

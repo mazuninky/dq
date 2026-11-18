@@ -308,7 +308,7 @@ fn node_fields<'a>(
             fields.insert("children".to_owned(), children_of(node));
             ("list_item", fields, true)
         }
-        NodeValue::ThematicBreak => ("thematic_break", fields, true),
+        NodeValue::ThematicBreak(_) => ("thematic_break", fields, true),
         NodeValue::HtmlBlock(h) => {
             fields.insert("value".to_owned(), Value::String(h.literal.clone()));
             ("html_block", fields, true)
@@ -317,8 +317,8 @@ fn node_fields<'a>(
             fields.insert("children".to_owned(), children_of(node));
             ("table", fields, true)
         }
-        NodeValue::TableRow(is_header) => {
-            fields.insert("header".to_owned(), Value::Bool(*is_header));
+        NodeValue::TableRow(row) => {
+            fields.insert("header".to_owned(), Value::Bool(row.header));
             fields.insert("children".to_owned(), children_of(node));
             ("table_row", fields, true)
         }
@@ -346,15 +346,15 @@ fn node_fields<'a>(
             fields.insert("value".to_owned(), Value::String(s.clone()));
             ("html_inline", fields, false)
         }
-        NodeValue::Emph => {
+        NodeValue::Emph(_) => {
             fields.insert("children".to_owned(), children_of(node));
             ("emphasis", fields, false)
         }
-        NodeValue::Strong => {
+        NodeValue::Strong(_) => {
             fields.insert("children".to_owned(), children_of(node));
             ("strong", fields, false)
         }
-        NodeValue::Strikethrough => {
+        NodeValue::Strikethrough(_) => {
             fields.insert("children".to_owned(), children_of(node));
             ("strikethrough", fields, false)
         }
@@ -685,6 +685,22 @@ mod tests {
         assert_eq!(node_type(cb), "code_block");
         assert_eq!(field(cb, "fenced"), &Value::Bool(false));
         assert_eq!(field(cb, "lang"), &Value::Null);
+    }
+
+    #[test]
+    fn indented_code_block_position_ends_at_its_last_character() {
+        // comrak 1.0: the block ends on its last line, not at the start of
+        // the next one.
+        let doc = Markdown.parse(b"    code\n    more\n").expect("parse");
+        let position = field(&doc_children(&doc)[0], "position");
+        let point = |key: &str| {
+            (
+                field(field(position, key), "line").clone(),
+                field(field(position, key), "column").clone(),
+            )
+        };
+        assert_eq!(point("start"), (Value::Int(1), Value::Int(5)));
+        assert_eq!(point("end"), (Value::Int(2), Value::Int(8)));
     }
 
     #[test]
