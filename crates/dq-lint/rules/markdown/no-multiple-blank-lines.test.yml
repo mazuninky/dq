@@ -15,3 +15,11 @@ tests:
       Body.
     expected:
       violations: []
+  - name: link reference definition after one blank line passes
+    input: |
+      # Title
+
+      [ref]: http://r
+      See [here](x).
+    expected:
+      violations: []

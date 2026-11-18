@@ -159,6 +159,7 @@ fn parse_to_value(bytes: &[u8]) -> Result<Value> {
         message: format!("invalid UTF-8 in Markdown input: {e}"),
     })?;
     let root = parse_document(&arena, body_str, &opts);
+    restore_link_definition_starts(root, body_str);
 
     // 3. Walk the AST. The comrak top-level node is always `NodeValue::Document`;
     //    we want a `{ "type": "document", "frontmatter": …, "children": [...] }`
@@ -174,6 +175,106 @@ fn parse_to_value(bytes: &[u8]) -> Result<Value> {
     doc_map.insert("position".to_owned(), sourcepos_to_value(pos));
 
     Ok(Value::Map(doc_map))
+}
+
+/// Move the start of every paragraph / setext heading that was preceded by
+/// consumed link reference definitions back onto the first definition line.
+///
+/// comrak strips leading `[label]: url` definitions out of a paragraph, and
+/// since 1.0 the paragraph's `sourcepos.start` points at the first line left
+/// after them; 0.52 reported the line of the first definition. The M9 IR has
+/// no node for a definition, so keeping the 1.0 value would make the
+/// definition lines look like blank lines to rules that measure gaps between
+/// blocks (`@std/markdown/no-multiple-blank-lines`).
+///
+/// The consumed definitions are recovered from the source: they are exactly
+/// the non-blank lines between the previous sibling's end (or the parent's
+/// first line, or line 1 under the document) and the node's start, because
+/// nothing but a consumed definition can sit there without being a node of
+/// its own. Only the start is touched; `end` is left as comrak reports it.
+fn restore_link_definition_starts<'a>(root: &'a AstNode<'a>, source: &str) {
+    let lines: Vec<&str> = source.lines().collect();
+    for node in root.descendants() {
+        let restorable = match &node.data.borrow().value {
+            NodeValue::Paragraph => true,
+            // ATX headings interrupt a paragraph, so a definition above one
+            // is a standalone block and not part of the heading.
+            NodeValue::Heading(h) => h.setext,
+            _ => false,
+        };
+        if !restorable {
+            continue;
+        }
+        let Some(parent) = node.parent() else {
+            continue;
+        };
+        let start = node.data.borrow().sourcepos.start;
+        let top_level = matches!(parent.data.borrow().value, NodeValue::Document);
+        let lower_bound = match node.previous_sibling() {
+            Some(prev) => prev.data.borrow().sourcepos.end.line + 1,
+            None if top_level => 1,
+            None => parent.data.borrow().sourcepos.start.line,
+        };
+        let Some(first) = first_definition_line(&lines, lower_bound, start.line) else {
+            continue;
+        };
+        // Top level: the definition's own indentation. Nested: the
+        // container prefix (`> `, list indent) is not tracked here, so the
+        // block's own column stands in for the definition's.
+        let column = if top_level {
+            lines[first - 1]
+                .find(|c: char| c != ' ' && c != '\t')
+                .map_or(start.column, |i| i + 1)
+        } else {
+            start.column
+        };
+        let mut data = node.data.borrow_mut();
+        data.sourcepos.start.line = first;
+        data.sourcepos.start.column = column;
+    }
+}
+
+/// 1-based line of the first consumed link reference definition directly
+/// above a block starting on `start_line`, scanning no further up than
+/// `lower_bound`. `None` when the line above is blank or is not a definition.
+fn first_definition_line(lines: &[&str], lower_bound: usize, start_line: usize) -> Option<usize> {
+    let mut first = None;
+    let mut line = start_line;
+    while line > lower_bound.max(1) {
+        let Some(text) = lines.get(line - 2) else {
+            break;
+        };
+        // A container-only line (`>`) is blank for this purpose.
+        if text.chars().all(|c| matches!(c, ' ' | '\t' | '>')) {
+            break;
+        }
+        first = Some(line - 1);
+        line -= 1;
+    }
+    let first = first?;
+    // The topmost line must open a definition; otherwise the span belongs to
+    // a previous block whose `end` comrak under-reported.
+    strip_container_prefix(lines[first - 1])
+        .starts_with('[')
+        .then_some(first)
+}
+
+/// Drop leading blockquote markers, indentation and one list marker
+/// (`-`, `+`, `*`, `1.`, `1)`) from a source line.
+fn strip_container_prefix(line: &str) -> &str {
+    let mut rest = line.trim_start_matches([' ', '\t', '>']);
+    let marker_len = match rest.as_bytes() {
+        [b'-' | b'+' | b'*', b' ' | b'\t', ..] => 1,
+        bytes => {
+            let digits = bytes.iter().take_while(|b| b.is_ascii_digit()).count();
+            match bytes.get(digits..digits + 2) {
+                Some([b'.' | b')', b' ' | b'\t']) if digits > 0 => digits + 1,
+                _ => 0,
+            }
+        }
+    };
+    rest = rest[marker_len..].trim_start_matches([' ', '\t', '>']);
+    rest
 }
 
 /// Build the `comrak::Options` configuration shared by every parse.
@@ -701,6 +802,67 @@ mod tests {
         };
         assert_eq!(point("start"), (Value::Int(1), Value::Int(5)));
         assert_eq!(point("end"), (Value::Int(2), Value::Int(8)));
+    }
+
+    /// `(line, column)` of `position.start` for the block child at `index`.
+    fn start_of(doc: &Document, index: usize) -> (Value, Value) {
+        let start = field(field(&doc_children(doc)[index], "position"), "start");
+        (field(start, "line").clone(), field(start, "column").clone())
+    }
+
+    #[test]
+    fn paragraph_start_points_at_first_consumed_link_definition() {
+        // comrak 1.0 reports the line after the definitions; 0.52 reported
+        // the first definition. The IR has no definition node, so the gap to
+        // the heading must stay one blank line.
+        let doc = Markdown
+            .parse(b"# T\n\n[a]: http://a\n[b]: http://b\nSee [here](x).\n")
+            .expect("parse");
+        assert_eq!(start_of(&doc, 1), (Value::Int(3), Value::Int(1)));
+        let doc = Markdown.parse(b"[ref]: http://r\nSee x.\n").expect("parse");
+        assert_eq!(start_of(&doc, 0), (Value::Int(1), Value::Int(1)));
+    }
+
+    #[test]
+    fn paragraph_start_ignores_definitions_separated_by_a_blank_line() {
+        let doc = Markdown.parse(b"[a]: http://a\n\nSee x.\n").expect("parse");
+        assert_eq!(start_of(&doc, 0), (Value::Int(3), Value::Int(1)));
+    }
+
+    #[test]
+    fn paragraph_start_after_definition_keeps_indentation_and_crlf() {
+        let doc = Markdown
+            .parse(b"# T\r\n\r\n  [a]: http://a\r\nSee x.\r\n")
+            .expect("parse");
+        assert_eq!(start_of(&doc, 1), (Value::Int(3), Value::Int(3)));
+    }
+
+    #[test]
+    fn nested_paragraph_start_points_at_consumed_link_definition() {
+        let doc = Markdown
+            .parse(b"> [a]: http://a\n> See x.\n")
+            .expect("parse");
+        let quote = &doc_children(&doc)[0];
+        let Value::Array(items) = field(quote, "children") else {
+            panic!("block_quote children must be an array");
+        };
+        let start = field(field(&items[0], "position"), "start");
+        assert_eq!(field(start, "line"), &Value::Int(1));
+        assert_eq!(field(start, "column"), &Value::Int(3));
+    }
+
+    #[test]
+    fn setext_heading_start_points_at_first_consumed_link_definition() {
+        let doc = Markdown
+            .parse(b"[a]: http://a\nTitle\n=====\n")
+            .expect("parse");
+        assert_eq!(start_of(&doc, 0), (Value::Int(1), Value::Int(1)));
+    }
+
+    #[test]
+    fn atx_heading_start_is_not_moved_onto_a_preceding_definition() {
+        let doc = Markdown.parse(b"[a]: http://a\n# H\n").expect("parse");
+        assert_eq!(start_of(&doc, 0), (Value::Int(2), Value::Int(1)));
     }
 
     #[test]
