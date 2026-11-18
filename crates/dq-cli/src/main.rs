@@ -24,7 +24,10 @@ fn restore_sigpipe() {
 #[cfg(not(unix))]
 fn restore_sigpipe() {}
 
-fn init_tracing(verbose: u8, quiet: bool) {
+/// Install the `tracing` subscriber. Logs go to stderr — stdout carries the
+/// command's output — with ANSI escapes only when `ansi` is set (see
+/// `dq::output::resolve_log_color`).
+fn init_tracing(verbose: u8, quiet: bool, ansi: bool) {
     let default_directive = if quiet {
         "error"
     } else {
@@ -39,6 +42,8 @@ fn init_tracing(verbose: u8, quiet: bool) {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_directive));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(env_filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(ansi)
         .with_target(false)
         .try_init();
 }
@@ -46,7 +51,11 @@ fn init_tracing(verbose: u8, quiet: bool) {
 fn main() {
     restore_sigpipe();
     let cli = Cli::parse();
-    init_tracing(cli.verbose, cli.quiet);
+    init_tracing(
+        cli.verbose,
+        cli.quiet,
+        dq::output::resolve_log_color(cli.no_color),
+    );
     let use_color = dq::output::resolve_color(cli.no_color);
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
