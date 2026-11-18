@@ -117,6 +117,20 @@ fn alias_key_and_merge_key_keep_later_pointers_in_place() {
     );
 }
 
+// --- a collection where a scalar was ------------------------------------------
+
+#[test]
+fn set_of_a_collection_over_a_scalar_writes_it_in_flow_style() {
+    let nested = Value::from_serde_json(&serde_json::json!({"nested": 1, "l": ["x"]}));
+    assert_eq!(
+        set("a: 3\nb: 4\n", "/a", nested.clone()),
+        "a: {\"nested\":1,\"l\":[\"x\"]}\nb: 4\n"
+    );
+    let mut doc = doc("a: 3\nb: 4\n");
+    doc.set_at(&ptr("/a"), nested.clone()).expect("set_at /a");
+    assert_eq!(ptr("/a").resolve(doc.value()).expect("/a"), &nested);
+}
+
 // --- del leaves an empty collection ------------------------------------------
 
 #[test]

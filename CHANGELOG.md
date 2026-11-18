@@ -281,6 +281,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   refers to fails with exit 7 and leaves the file alone; it used to leave
   the alias dangling, so the file no longer parsed. `lint --fix` skips
   such a fix with a warning.
+- YAML `set` of an object or array where a scalar was writes it in flow
+  style (`a: {"x":1}`); it used to write `null`.
 
 ### Security
 

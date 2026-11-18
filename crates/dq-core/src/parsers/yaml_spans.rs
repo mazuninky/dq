@@ -2027,14 +2027,12 @@ impl ScalarRenderer for YamlScalarRenderer {
             Value::Float(f) => render_float(*f),
             Value::BigFloat(s) => s.clone().into_bytes(),
             Value::String(s) => render_string_in_style(s, original_style, context),
-            // Replacing a scalar span with a structural value is
-            // intentionally out of scope for the M2 baseline: the mkdir-p /
-            // structural-edit path lives in §3.3+ for individual leaves, and
-            // wholesale tree replacement at a scalar position would require
-            // re-running the parser to refresh spans. We render a bare value
-            // that keeps the splice well-formed (`null`) so callers see the
-            // anomaly downstream rather than a panic mid-write.
-            Value::Array(_) | Value::Map(_) => render_null(original_style),
+            // A collection at a scalar's position is written in flow style
+            // — as JSON, which YAML 1.2 reads as flow collections, on the
+            // scalar's line. `Document::set_at` reads the edit back, so a
+            // value JSON cannot spell (a NaN) is refused, not written.
+            Value::Array(_) | Value::Map(_) => serde_json::to_vec(&value.to_serde_json())
+                .unwrap_or_else(|_| render_null(original_style)),
         }
     }
 }
