@@ -31,7 +31,9 @@
 //! so their indent is byte-preserved.
 
 use std::cell::OnceCell;
+use std::collections::HashMap;
 use std::io::Write;
+use std::ops::Range;
 use std::str::FromStr;
 
 use indexmap::IndexMap;
@@ -228,6 +230,26 @@ pub fn parse_json_with_spans(bytes: &[u8]) -> Result<Document> {
 /// JSONC (`//` line / `/* */` block comments) is rejected at this layer
 /// with a structured [`Error::Parse`] before the value tree parse runs.
 fn build_span_map(bytes: &[u8]) -> Result<SpanMap> {
+    Ok(scan(bytes, false)?.0)
+}
+
+/// What [`json_container_ranges`] returns.
+pub(crate) type ContainerRanges = HashMap<String, Range<usize>>;
+
+/// Bytes of every non-empty object and array, brackets included, keyed by
+/// canonical pointer — what the span map leaves out. The edits that remove
+/// or insert next to a whole collection need them.
+///
+/// # Errors
+///
+/// Same as [`build_span_map`].
+pub(crate) fn json_container_ranges(bytes: &[u8]) -> Result<ContainerRanges> {
+    Ok(scan(bytes, true)?.1.unwrap_or_default())
+}
+
+/// The span map, and with `containers` the ranges
+/// [`json_container_ranges`] returns.
+fn scan(bytes: &[u8], containers: bool) -> Result<(SpanMap, Option<ContainerRanges>)> {
     if std::str::from_utf8(bytes).is_err() {
         return Err(Error::Parse {
             file: None,
@@ -240,20 +262,23 @@ fn build_span_map(bytes: &[u8]) -> Result<SpanMap> {
     }
     let lines = LineIndex::new(bytes);
     let mut scanner = Scanner::new(bytes, lines);
+    scanner.containers = containers.then(HashMap::new);
     let mut spans = SpanMap::new();
     scanner.skip_ws_and_check_jsonc()?;
     if scanner.eof() {
         // Empty input — let the value tree parser surface its error.
-        return Ok(spans);
+        return Ok((spans, scanner.containers));
     }
     scanner.scan_value(&mut Vec::new(), &mut spans, SpanContext::BlockMapValue)?;
-    Ok(spans)
+    Ok((spans, scanner.containers))
 }
 
 struct Scanner<'a> {
     bytes: &'a [u8],
     pos: usize,
     lines: LineIndex,
+    /// Non-empty collections seen so far, when collecting them.
+    containers: Option<ContainerRanges>,
 }
 
 impl<'a> Scanner<'a> {
@@ -262,6 +287,14 @@ impl<'a> Scanner<'a> {
             bytes,
             pos: 0,
             lines,
+            containers: None,
+        }
+    }
+
+    /// Note the non-empty collection at `path` spanning `range`.
+    fn note_container(&mut self, path: &[String], range: Range<usize>) {
+        if let Some(containers) = self.containers.as_mut() {
+            containers.insert(pointer_for(path), range);
         }
     }
 
@@ -339,6 +372,9 @@ impl<'a> Scanner<'a> {
             Some(b'{') => {
                 self.bump();
                 let was_empty = self.scan_object(path, spans)?;
+                if !was_empty {
+                    self.note_container(path, start..self.pos);
+                }
                 if was_empty {
                     // Record an empty-container span for the parent's
                     // pointer so `Document::set_at` can locate the `{}`
@@ -354,6 +390,8 @@ impl<'a> Scanner<'a> {
                 let was_empty = self.scan_array(path, spans)?;
                 if was_empty {
                     self.record_empty_container(path, spans, start, self.pos, context);
+                } else {
+                    self.note_container(path, start..self.pos);
                 }
             }
             Some(b'"') => {

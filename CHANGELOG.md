@@ -301,8 +301,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   used to remove the whole line (an empty file for single-line JSON), or
   leave `{x: , y: 2}` / `[, 2]` behind; `del` of the last member of a
   multi-line JSON object left a trailing comma. A collection inside a
-  YAML flow collection can be deleted too; it used to fail with "not
-  found".
+  YAML flow collection or a JSON value can be deleted too; it used to
+  fail with "not found".
 - YAML `set` on a `|` / `>` block scalar replaces it, header included,
   with an inline value: `k: |` + `  x` set to `42` gives `k: 42`. It used
   to keep the header and glue the value to the next line (`k: |` +

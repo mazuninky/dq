@@ -1531,7 +1531,15 @@ impl Document {
                 })
             })
         });
-        let collection_entry = compact_entry.or(collection_entry);
+        // JSON records no span for a non-empty collection.
+        let json_collection_entry = (self.format == FormatTag::Json && target_is_collection)
+            .then(|| crate::parsers::json::json_container_ranges(&self.original_bytes).ok())
+            .flatten()
+            .and_then(|mut ranges| ranges.remove(&canonical))
+            .and_then(|value| {
+                flow_entry_removal(&self.original_bytes, &value, in_map, self.format)
+            });
+        let collection_entry = compact_entry.or(collection_entry).or(json_collection_entry);
         if collection.is_some_and(|collection| !collection.top_level) && collection_entry.is_none()
         {
             // `- key: {…}`, or a flow entry with a comment in between: the

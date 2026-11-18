@@ -187,3 +187,36 @@ fn del_of_an_empty_toml_inline_value_removes_its_line() {
         "r0 = {a = 1}\n"
     );
 }
+
+#[test]
+fn del_of_a_json_collection_removes_the_member_and_a_comma() {
+    assert_eq!(
+        del("json", r#"{"a": {"x": 1}, "b": 2}"#, "/a"),
+        r#"{"b": 2}"#
+    );
+    assert_eq!(
+        del("json", r#"{"b": 2, "a": {"x": 1}}"#, "/a"),
+        r#"{"b": 2}"#
+    );
+    assert_eq!(
+        del("json", r#"{"a": [1, [2, 3]], "b": 2}"#, "/a/1"),
+        r#"{"a": [1], "b": 2}"#
+    );
+    assert_eq!(del("json", r#"[{"x": 1}]"#, "/0"), "[]");
+    assert_eq!(
+        del(
+            "json",
+            "{\n  \"a\": {\n    \"x\": 1\n  },\n  \"b\": 2\n}\n",
+            "/a"
+        ),
+        "{\n  \"b\": 2\n}\n"
+    );
+    assert_eq!(
+        del(
+            "json",
+            "{\n  \"b\": 2,\n  \"a\": {\n    \"x\": 1\n  }\n}\n",
+            "/a"
+        ),
+        "{\n  \"b\": 2\n}\n"
+    );
+}
