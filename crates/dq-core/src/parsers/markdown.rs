@@ -35,10 +35,11 @@
 //! `comrak::format_commonmark` would silently strip trailing whitespace,
 //! flip fence characters, and reorder reference-link definitions.
 
+use std::collections::HashMap;
 use std::io::Write;
 
 use camino::Utf8PathBuf;
-use comrak::nodes::{AstNode, NodeValue, Sourcepos};
+use comrak::nodes::{AstNode, LineColumn, NodeValue, Sourcepos};
 use comrak::{Arena, Options, parse_document};
 use indexmap::IndexMap;
 
@@ -159,7 +160,7 @@ fn parse_to_value(bytes: &[u8]) -> Result<Value> {
         message: format!("invalid UTF-8 in Markdown input: {e}"),
     })?;
     let root = parse_document(&arena, body_str, &opts);
-    restore_link_definition_starts(root, body_str);
+    restore_link_definition_starts(root, body_str, &opts);
 
     // 3. Walk the AST. The comrak top-level node is always `NodeValue::Document`;
     //    we want a `{ "type": "document", "frontmatter": …, "children": [...] }`
@@ -195,29 +196,81 @@ fn parse_to_value(bytes: &[u8]) -> Result<Value> {
 /// because nothing but a consumed definition can sit there without being a
 /// node of its own. Only the start is touched; `end` is left as comrak
 /// reports it.
-fn restore_link_definition_starts<'a>(root: &'a AstNode<'a>, source: &str) {
+///
+/// comrak moves every referenced footnote definition to the end of the
+/// document and drops the unreferenced ones, so in `root` a footnote neither
+/// sits in the containers it was written in nor, when dropped, claims its
+/// lines. When the source can hold a footnote, the scan runs on a second
+/// parse that leaves the definitions where they were written, and its
+/// results are carried over to `root` by the nodes' unchanged comrak
+/// positions.
+fn restore_link_definition_starts<'a>(root: &'a AstNode<'a>, source: &str, opts: &Options<'_>) {
     let lines = split_lines(source);
-    let cover = block_cover(root, lines.len());
+    let restored = if source.contains("[^") {
+        let arena = Arena::new();
+        let mut in_place = opts.clone();
+        in_place.parse.leave_footnote_definitions = true;
+        restored_starts(parse_document(&arena, source, &in_place), &lines)
+    } else {
+        restored_starts(root, &lines)
+    };
+    if restored.is_empty() {
+        return;
+    }
     for node in root.descendants() {
-        let restorable = match &node.data.borrow().value {
-            NodeValue::Paragraph => true,
-            // ATX headings interrupt a paragraph, so a definition above one
-            // is a standalone block and not part of the heading.
-            NodeValue::Heading(h) => h.setext,
-            _ => false,
-        };
-        if !restorable {
+        let mut data = node.data.borrow_mut();
+        if !is_restorable(&data.value) {
             continue;
         }
-        let start_line = node.data.borrow().sourcepos.start.line;
+        if let Some(&(line, column)) = restored.get(&position_key(data.sourcepos)) {
+            data.sourcepos.start.line = line;
+            data.sourcepos.start.column = column;
+        }
+    }
+}
+
+/// Paragraphs and setext headings can open with consumed definitions. ATX
+/// headings interrupt a paragraph, so a definition above one is a standalone
+/// block and not part of the heading.
+fn is_restorable(value: &NodeValue) -> bool {
+    match value {
+        NodeValue::Paragraph => true,
+        NodeValue::Heading(h) => h.setext,
+        _ => false,
+    }
+}
+
+/// A node's comrak position as a map key.
+fn position_key(pos: Sourcepos) -> (usize, usize, usize, usize) {
+    (
+        pos.start.line,
+        pos.start.column,
+        pos.end.line,
+        pos.end.column,
+    )
+}
+
+/// The restored `(line, column)` start of every restorable node under `root`
+/// that opens with consumed definitions, keyed by its comrak position.
+fn restored_starts<'a>(
+    root: &'a AstNode<'a>,
+    lines: &[&str],
+) -> HashMap<(usize, usize, usize, usize), (usize, usize)> {
+    let cover = block_cover(root, lines.len());
+    let mut restored = HashMap::new();
+    for node in root.descendants() {
+        let pos = node.data.borrow().sourcepos;
+        if !is_restorable(&node.data.borrow().value) {
+            continue;
+        }
         let scope = ContainerScope::of(node);
-        let Some((line, column)) = first_definition(&lines, &cover, &scope, start_line) else {
+        let Some((line, column)) = first_definition(lines, &cover, &scope, pos.start.line) else {
             continue;
         };
-        let mut data = node.data.borrow_mut();
-        data.sourcepos.start.line = line;
-        data.sourcepos.start.column = column;
+        let column = column + task_box_width(node, pos.start);
+        restored.insert(position_key(pos), (line, column));
     }
+    restored
 }
 
 /// Split `source` into lines the way comrak does: `\n`, `\r\n` and a lone
@@ -254,9 +307,6 @@ fn split_lines(source: &str) -> Vec<&str> {
 
 /// For every 1-based line, the number of block nodes (the document aside)
 /// whose source range covers it, as comrak reported the ranges.
-///
-/// Ranges are source ranges, so a footnote definition that comrak moved to
-/// the end of the tree still covers the lines it was written on.
 fn block_cover<'a>(root: &'a AstNode<'a>, line_count: usize) -> Vec<usize> {
     let mut delta = vec![0_isize; line_count + 2];
     for node in root.descendants().skip(1) {
@@ -282,15 +332,41 @@ fn block_cover<'a>(root: &'a AstNode<'a>, line_count: usize) -> Vec<usize> {
     cover
 }
 
+/// Width of the task box (`[x] `) comrak found on the first line left after
+/// the consumed definitions of a task item's paragraph, or 0.
+///
+/// comrak 0.52 shifted such a paragraph's start column right by the width of
+/// the box even though the box sat on a later line than the definition the
+/// start pointed at; keep that so columns match 0.52.
+fn task_box_width<'a>(node: &'a AstNode<'a>, start: LineColumn) -> usize {
+    let Some(item) = node.parent() else {
+        return 0;
+    };
+    let is_first_child = item
+        .first_child()
+        .is_some_and(|first| first.same_node(node));
+    let NodeValue::TaskItem(task) = &item.data.borrow().value else {
+        return 0;
+    };
+    let symbol = task.symbol_sourcepos.start;
+    if !is_first_child || symbol.line != start.line || symbol.column < 2 {
+        return 0;
+    }
+    // The box opens one byte before the symbol; comrak starts the paragraph
+    // right after the box and its trailing blank.
+    start.column.saturating_sub(symbol.column - 1)
+}
+
 /// A container whose marker or indentation prefixes the source lines of the
 /// blocks inside it.
 #[derive(Debug, Clone, Copy)]
 enum Container {
     BlockQuote,
-    /// A list item opened on `line`; a task item also carries its `[ ]` box.
+    /// A list item (task item or not) whose marker sits on `line`. A task
+    /// box is never stripped: it always sits on the first line comrak left
+    /// in the paragraph, which the scan does not reach.
     Item {
         line: usize,
-        task: bool,
     },
     /// A footnote definition whose `[^label]:` sits on `line`.
     Footnote {
@@ -308,27 +384,33 @@ struct ContainerScope {
     first_line: usize,
 }
 
+impl Container {
+    fn of<'a>(node: &'a AstNode<'a>) -> Option<Self> {
+        let data = node.data.borrow();
+        let line = data.sourcepos.start.line;
+        match &data.value {
+            NodeValue::BlockQuote => Some(Self::BlockQuote),
+            NodeValue::Item(_) | NodeValue::TaskItem(_) => Some(Self::Item { line }),
+            NodeValue::FootnoteDefinition(_) => Some(Self::Footnote { line }),
+            _ => None,
+        }
+    }
+}
+
 impl ContainerScope {
     fn of<'a>(node: &'a AstNode<'a>) -> Self {
         let mut containers = Vec::new();
         let mut depth = 0;
         let mut first_line = 1;
         for ancestor in node.ancestors().skip(1) {
-            let data = ancestor.data.borrow();
-            let line = data.sourcepos.start.line;
-            let container = match &data.value {
-                NodeValue::Document => break,
-                NodeValue::BlockQuote => Some(Container::BlockQuote),
-                NodeValue::Item(_) => Some(Container::Item { line, task: false }),
-                NodeValue::TaskItem(_) => Some(Container::Item { line, task: true }),
-                NodeValue::FootnoteDefinition(_) => Some(Container::Footnote { line }),
-                _ => None,
-            };
+            if matches!(ancestor.data.borrow().value, NodeValue::Document) {
+                break;
+            }
             if depth == 0 {
-                first_line = line.max(1);
+                first_line = ancestor.data.borrow().sourcepos.start.line.max(1);
             }
             depth += 1;
-            containers.extend(container);
+            containers.extend(Container::of(ancestor));
         }
         containers.reverse();
         Self {
@@ -351,8 +433,9 @@ fn first_definition(
     let mut first = None;
     for line in (scope.first_line..start_line).rev() {
         // A line claimed by a block outside the node's containers — the
-        // previous sibling, or a footnote definition comrak moved to the end
-        // of the tree — is not one of the node's definitions.
+        // previous sibling or a footnote definition — is not one of the
+        // node's definitions. A `[^label]: url` line inside the run is: comrak
+        // consumes it as a link reference definition with label `^label`.
         if cover.get(line).copied().unwrap_or(0) > scope.depth {
             break;
         }
@@ -366,8 +449,8 @@ fn first_definition(
     }
     let (line, offset) = first?;
     // The topmost line must open a definition; otherwise the span belongs to
-    // a previous block whose `end` comrak under-reported. `[^label]:` opens
-    // a footnote definition, never a link reference definition.
+    // a previous block whose `end` comrak under-reported. A `[^label]:` that
+    // opens a block is a footnote definition, not a link reference one.
     let rest = &lines[line - 1][offset..];
     (rest.starts_with('[') && !rest.starts_with("[^")).then_some((line, offset + 1))
 }
@@ -392,11 +475,8 @@ fn content_offset(text: &str, line_no: usize, containers: &[Container]) -> Optio
                 }
                 pos += 1;
             }
-            Container::Item { line, task } if line == line_no => {
+            Container::Item { line } if line == line_no => {
                 pos = skip_list_marker(bytes, pos);
-                if task {
-                    pos = skip_task_box(text, skip_blanks(bytes, pos));
-                }
             }
             Container::Footnote { line } if line == line_no => {
                 pos = skip_footnote_label(bytes, pos);
@@ -429,18 +509,6 @@ fn skip_list_marker(bytes: &[u8], pos: usize) -> usize {
                 _ => pos,
             }
         }
-    }
-}
-
-/// Skip a task box (`[ ]`, `[x]`, any one character between the brackets).
-fn skip_task_box(text: &str, pos: usize) -> usize {
-    let Some(rest) = text.get(pos..) else {
-        return pos;
-    };
-    let mut chars = rest.char_indices();
-    match (chars.next(), chars.next(), chars.next()) {
-        (Some((_, '[')), Some(_), Some((close, ']'))) => pos + close + 1,
-        _ => pos,
     }
 }
 
@@ -1133,6 +1201,48 @@ mod tests {
         );
         // The definition is indented past the item's content column.
         assert_eq!(start_at(b"- x\n\n   [a]: /u\n  p\n", &[0, 0, 1]), (3, 4));
+    }
+
+    // comrak drops a footnote definition nothing references, so the parsed
+    // tree has no node over its lines.
+
+    #[test]
+    fn paragraph_after_unreferenced_footnote_keeps_its_start() {
+        assert_eq!(start_at(b"[a]: /u\n[^m]: # h\nb\n", &[0]), (3, 1));
+        assert_eq!(start_at(b"[a]: /u\n[^m]: ***\nb\n", &[0]), (3, 1));
+        // The footnote's lazy continuation lines are not definitions either.
+        let src = b"[^m]:\t[x] y\r  [e]: <a b>\r\t<!-- c -->\r\nx\n";
+        assert_eq!(start_at(src, &[0]), (4, 1));
+    }
+
+    #[test]
+    fn paragraph_after_unreferenced_footnote_starts_at_its_definition() {
+        assert_eq!(start_at(b"[^m]: # h\n[a]: /u\nb\n", &[0]), (2, 1));
+    }
+
+    #[test]
+    fn caret_label_inside_a_definition_run_is_a_consumed_definition() {
+        // Inside a paragraph `[^1]: f` cannot open a footnote, so comrak
+        // consumes it as a link reference definition labelled `^1`.
+        let src = b"> [h]: /h\n\t[^1]: f\n>\t\t---\n\nx[^1]\n";
+        assert_eq!(start_at(src, &[0, 0]), (1, 3));
+    }
+
+    #[test]
+    fn task_item_paragraph_starts_at_the_definition_above_its_box() {
+        // 0.52 shifted the column right by the width of the box (`[x] `).
+        assert_eq!(start_at(b"- [a]: /u\n[x] y\n", &[0, 0, 0]), (1, 7));
+        assert_eq!(start_at(b"- [a]: /u\n  [x] y\n", &[0, 0, 0]), (1, 7));
+        assert_eq!(start_at(b"> - [a]: /u\n[x] y\n", &[0, 0, 0, 0]), (1, 9));
+    }
+
+    #[test]
+    fn footnote_written_in_a_container_strips_the_container_prefix() {
+        // comrak moves the footnote definition to the document root.
+        let src = b"> [^1]: [a]: /u\n>     b\n\nx[^1]\n";
+        assert_eq!(start_at(src, &[2, 0]), (1, 9));
+        let src = b"- [^1]: [a]: /u\n      b\n\nx[^1]\n";
+        assert_eq!(start_at(src, &[2, 0]), (1, 9));
     }
 
     #[test]
