@@ -487,6 +487,43 @@ fn del_of_the_first_entry_of_a_compact_item_hands_the_dash_on() {
 }
 
 #[test]
+fn del_of_the_first_entry_of_a_compact_item_keeps_the_comments_after_it() {
+    assert_eq!(
+        del("l:\n  - a: 1\n    # mid\n    b: 2\n", "/l/0/a"),
+        "l:\n  - # mid\n    b: 2\n"
+    );
+    assert_eq!(
+        del("l:\n  - a: 1\n    # m1\n    # m2\n    b: 2\n", "/l/0/a"),
+        "l:\n  - # m1\n    # m2\n    b: 2\n"
+    );
+    assert_eq!(
+        del("l:\n  - a: 1\n\n    # mid\n\n    b: 2\n", "/l/0/a"),
+        "l:\n  - # mid\n\n    b: 2\n"
+    );
+    // Blank lines alone go with the entry.
+    assert_eq!(
+        del("l:\n  - a: 1\n\n    b: 2\n", "/l/0/a"),
+        "l:\n  - b: 2\n"
+    );
+    // After a collection or a block scalar; a `#` inside it is content.
+    assert_eq!(
+        del("l:\n  - a:\n      x: 1\n    # mid\n    b: 2\n", "/l/0/a"),
+        "l:\n  - # mid\n    b: 2\n"
+    );
+    assert_eq!(
+        del(
+            "l:\n  - a: |\n      t\n      # text\n    # mid\n    b: 2\n",
+            "/l/0/a"
+        ),
+        "l:\n  - # mid\n    b: 2\n"
+    );
+    assert_eq!(
+        del("l:\r\n  - a: 1\r\n    # mid\r\n    b: 2\r\n", "/l/0/a"),
+        "l:\r\n  - # mid\r\n    b: 2\r\n"
+    );
+}
+
+#[test]
 fn del_of_the_only_entry_of_a_compact_item_leaves_an_empty_collection() {
     assert_eq!(del("- a: 1\n- b: 2\n", "/0/a"), "- {}\n- b: 2\n");
     assert_eq!(del("- a: {x: 1}\n", "/0/a"), "- {}\n");

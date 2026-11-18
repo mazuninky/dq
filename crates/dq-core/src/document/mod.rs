@@ -1991,12 +1991,7 @@ impl Document {
             })
             .map(|(_, start)| start.at)
             .min();
-        if let Some(next) = next {
-            return Ok(Some(entry.at..next));
-        }
-        let end = if !only_child {
-            None
-        } else if target_is_collection {
+        let value_end = if target_is_collection {
             layout
                 .containers
                 .get(canonical)
@@ -2006,6 +2001,14 @@ impl Document {
         } else {
             self.spans.get(canonical).map(|span| span.value_range.end)
         };
+        if let Some(next) = next {
+            // A comment line before the next key stays: the item's `-`
+            // goes on to it (`- # mid`), the key on its own line below.
+            let comment = value_end
+                .and_then(|end| first_comment_line(&self.original_bytes, end.max(entry.at), next));
+            return Ok(Some(entry.at..comment.unwrap_or(next)));
+        }
+        let end = if only_child { value_end } else { None };
         let Some(mut end) = end.filter(|&end| end > entry.at) else {
             return Err(Error::EditRejected {
                 action: "delete",
@@ -2520,6 +2523,35 @@ fn empty_node_replacement(props: &[u8], rendered: &[u8]) -> (Vec<u8>, usize) {
     let offset = out.len();
     out.extend_from_slice(rendered);
     (out, offset)
+}
+
+/// The `#` of the first line between the line holding `from` and `to`
+/// that holds only a comment; `None` when there is none.
+fn first_comment_line(bytes: &[u8], from: usize, to: usize) -> Option<usize> {
+    let line_start = bytes[..from]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |i| i + 1);
+    // A span can end inside the next line's indentation.
+    let mut line = if bytes[line_start..from]
+        .iter()
+        .all(|&b| matches!(b, b' ' | b'\t'))
+    {
+        line_start
+    } else {
+        from + bytes[from..to].iter().position(|&b| b == b'\n')? + 1
+    };
+    while line < to {
+        let content = line
+            + bytes[line..to]
+                .iter()
+                .position(|&b| !matches!(b, b' ' | b'\t'))?;
+        if bytes[content] == b'#' {
+            return Some(content);
+        }
+        line = content + bytes[content..to].iter().position(|&b| b == b'\n')? + 1;
+    }
+    None
 }
 
 /// Byte offset of `pos` from the start of its line.

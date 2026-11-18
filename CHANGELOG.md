@@ -360,7 +360,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - YAML `del` of the first key of a compact sequence item (`- name: web`
   over `  image: x`) hands the `-` on to the next key: `- image: x`. It
   used to remove the line with the `-`, merging the item's other keys
-  into the item before it. The only key leaves `- {}`, the only item of
+  into the item before it. A comment line between the two keys stays,
+  with the `-` before it (`- # note`). The only key leaves `- {}`, the only item of
   `- - 1` leaves `- []`. A new key of such an item lines up with its keys
   instead of with the `-`.
 - `set` of a new key in YAML or JSON goes after the map's last child,
