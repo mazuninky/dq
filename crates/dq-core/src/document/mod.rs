@@ -1360,6 +1360,11 @@ impl Document {
                         (false, true) => SpanContext::BlockMapValue,
                         (false, false) => SpanContext::BlockSeqItem,
                     };
+                    if let Some(err) =
+                        self.anchor_removal_refused(layout, &brackets, "set", canonical)
+                    {
+                        return Err(err);
+                    }
                     Some((brackets, context))
                 } else {
                     // Its children go; the key or `-`, its properties and
@@ -1377,6 +1382,11 @@ impl Document {
                         }
                         marker..end
                     };
+                    if let Some(err) =
+                        self.anchor_removal_refused(layout, &children, "set", canonical)
+                    {
+                        return Err(err);
+                    }
                     self.original_bytes.drain(children);
                     self.adopt_reparse("set", canonical)?;
                     if !matches!(pointer.resolve(&self.value), Ok(Value::Null)) {
@@ -1944,6 +1954,33 @@ impl Document {
         })
     }
 
+    /// The refusal of an edit that removes the YAML bytes `removed` when
+    /// they define an anchor an alias outside them refers to: the alias
+    /// would dangle, or resolve to an earlier definition of the name.
+    fn anchor_removal_refused(
+        &self,
+        cache: &LayoutCache,
+        removed: &std::ops::Range<usize>,
+        action: &'static str,
+        canonical: &str,
+    ) -> Option<Error> {
+        if !self.original_bytes.contains(&b'*') {
+            return None;
+        }
+        let alias = self.edit_layout(cache)?.aliases.iter().find(|alias| {
+            removed.contains(&alias.anchor_at) && !removed.contains(&alias.alias_at)
+        })?;
+        let line = 1 + self.original_bytes[..alias.alias_at]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count();
+        Some(Error::EditRejected {
+            action,
+            pointer: canonical.to_owned(),
+            reason: format!("it holds an anchor that the alias on line {line} refers to"),
+        })
+    }
+
     /// The refusal of an edit at `pointer`, below a YAML alias, whose
     /// target (or, for `set`, its parent) the value tree resolves — the
     /// bytes there are the anchored node's.
@@ -2317,25 +2354,8 @@ impl Document {
         // An alias elsewhere would dangle — or resolve to an earlier
         // definition of its anchor name — once the bytes defining its anchor
         // are gone.
-        let aliases = if self.original_bytes.contains(&b'*') {
-            self.edit_layout(cache)
-        } else {
-            None
-        };
-        if let Some(alias) = aliases.and_then(|layout| {
-            layout.aliases.iter().find(|alias| {
-                removed.contains(&alias.anchor_at) && !removed.contains(&alias.alias_at)
-            })
-        }) {
-            let line = 1 + self.original_bytes[..alias.alias_at]
-                .iter()
-                .filter(|&&b| b == b'\n')
-                .count();
-            return Err(Error::EditRejected {
-                action: "delete",
-                pointer: canonical,
-                reason: format!("it holds an anchor that the alias on line {line} refers to"),
-            });
+        if let Some(err) = self.anchor_removal_refused(cache, &removed, "delete", &canonical) {
+            return Err(err);
         }
         // The line break the removed bytes end with, if any: `\r\n` or `\n`.
         let removed_line_break: &'static [u8] = match &self.original_bytes[removed.clone()] {

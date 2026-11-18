@@ -348,3 +348,34 @@ fn del_of_a_toml_collection_dq_cannot_locate_is_refused() {
     let reason = del_refused("toml", "[a.b.c]\nk = 1\n", "/a/b/c");
     assert!(reason.contains("`dq set --jq`"), "{reason}");
 }
+
+#[test]
+fn set_over_a_yaml_collection_that_holds_an_anchor_in_use_is_refused() {
+    for (src, pointer, line) in [
+        ("a:\n  x: &q 1\n  y: 2\nb: *q\n", "/a", 4),
+        ("a: {x: &q 1}\nb: *q\n", "/a", 2),
+        ("l:\n  - x: &q 1\n    y: 2\nb: *q\n", "/l/0", 4),
+    ] {
+        let mut doc = doc("yaml", src);
+        match doc.set_at(&ptr(pointer), Value::Int(5)) {
+            Err(Error::EditRejected { reason, .. }) => assert!(
+                reason.starts_with(&format!(
+                    "it holds an anchor that the alias on line {line} refers to; "
+                )),
+                "{src:?}: {reason}"
+            ),
+            other => panic!("{src:?}: expected EditRejected, got {other:?}"),
+        }
+        assert_eq!(doc.original_bytes(), src.as_bytes(), "bytes untouched");
+    }
+    // An alias inside the collection goes with its anchor.
+    assert_eq!(
+        set(
+            "yaml",
+            "a:\n  x: &q 1\n  y: *q\nb: 2\n",
+            "/a",
+            Value::Int(5)
+        ),
+        "a: 5\nb: 2\n"
+    );
+}

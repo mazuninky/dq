@@ -376,7 +376,8 @@ YAML:
 - `del` of a node that holds an anchor (`&name`) an alias elsewhere
   refers to fails with exit 7 and leaves the file alone; it used to
   leave the alias dangling, so the file no longer parsed. `lint --fix`
-  skips such a fix with a warning.
+  skips such a fix with a warning. `set` over a collection that holds
+  such an anchor fails the same way and names the alias's line.
 
 TOML:
 
