@@ -724,6 +724,9 @@ struct ContainerFrame {
     /// Largest `line_range.end` among the spans and entries recorded inside
     /// the container so far — where a block container's last line ends.
     content_end: usize,
+    /// Where the first child's entry begins (its line start), once a child
+    /// was seen: `Some(None)` when that entry could not be located.
+    first_entry: Option<Option<usize>>,
 }
 
 impl Frame {
@@ -754,6 +757,10 @@ struct EntryAnchor {
     /// Where an inline value would go: just past the key's `:` or the
     /// item's `-`. `None` if the indicator could not be located.
     indicator_end: Option<usize>,
+    /// Where the value's own text can begin: [`EntryAnchor::indicator_end`]
+    /// when located, else the end of the key (an explicit `? key` without a
+    /// `:`) or the item's start.
+    value_from: usize,
 }
 
 /// Layout of one collection node, as [`container_layout`] reports it.
@@ -773,6 +780,9 @@ pub(crate) struct ContainerLayout {
     /// child: past its node properties, else past its key's `:` or its
     /// `-`. `None` for a top-level collection and when not located.
     pub(crate) empty_marker_at: Option<usize>,
+    /// Start of the line the first child's entry (its key or `-`) begins
+    /// on. `None` without children and when not located.
+    pub(crate) first_child_line: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -870,6 +880,18 @@ impl<'src> State<'src> {
     ///
     /// Takes the pending key's range, so it must run once per value.
     fn entry_anchor(&mut self, item_start: usize) -> Option<EntryAnchor> {
+        let anchor = self.locate_entry(item_start);
+        if let Some(frame) = self.stack.last_mut() {
+            let container = frame.container_mut();
+            if container.first_entry.is_none() {
+                container.first_entry = Some(anchor.map(|anchor| anchor.line_start));
+            }
+        }
+        anchor
+    }
+
+    /// [`State::entry_anchor`] without the bookkeeping.
+    fn locate_entry(&mut self, item_start: usize) -> Option<EntryAnchor> {
         let bytes = self.bytes;
         let in_flow = self.flow_depth > 0;
         match self.stack.last_mut()? {
@@ -881,10 +903,12 @@ impl<'src> State<'src> {
                     return None;
                 }
                 let colon = skip_separation(bytes, key.end);
+                let indicator_end = (bytes.get(colon) == Some(&b':')).then_some(colon + 1);
                 Some(EntryAnchor {
                     line_start: line_start_at(bytes, key.start),
                     owns_line: starts_line_after_bom(bytes, key.start),
-                    indicator_end: (bytes.get(colon) == Some(&b':')).then_some(colon + 1),
+                    indicator_end,
+                    value_from: indicator_end.unwrap_or(key.end),
                 })
             }
             Frame::Sequence { .. } if in_flow => None,
@@ -895,6 +919,7 @@ impl<'src> State<'src> {
                         line_start,
                         owns_line: starts_line_after_bom(bytes, dash),
                         indicator_end: Some(dash + 1),
+                        value_from: dash + 1,
                     })
                 } else {
                     let dash = dash_before(bytes, item_start);
@@ -902,6 +927,7 @@ impl<'src> State<'src> {
                         line_start: line_start_at(bytes, item_start),
                         owns_line: dash.is_some_and(|dash| starts_line_after_bom(bytes, dash)),
                         indicator_end: dash.map(|dash| dash + 1),
+                        value_from: dash.map_or(item_start, |dash| dash + 1),
                     })
                 }
             }
@@ -941,6 +967,7 @@ impl<'src> State<'src> {
             entry,
             props_end,
             content_end: 0,
+            first_entry: None,
         };
         if style == ContextStyle::Flow {
             self.flow_depth += 1;
@@ -1010,7 +1037,9 @@ impl<'src> State<'src> {
                         self.legacy_scalar_span(span, style, is_empty_node, n_properties, ordinal)
                     };
                     let context = self.value_context();
-                    let line_range = self.compute_line_range(&value_range, context, style, entry);
+                    let node_end = char_index_to_byte(self.char_to_byte, span.end.index());
+                    let line_range =
+                        self.compute_line_range(&value_range, context, style, entry, node_end);
                     let indent = u32::try_from(col).unwrap_or(u32::MAX);
                     if matches!(style, ScalarStyle::Literal | ScalarStyle::Folded) {
                         // Record the canonical pointer alongside the span
@@ -1055,8 +1084,13 @@ impl<'src> State<'src> {
                     let entry = self.entry_anchor(range.start);
                     let pointer = self.value_pointer();
                     let context = self.value_context();
-                    let line_range =
-                        self.compute_line_range(&range, context, ScalarStyle::Plain, entry);
+                    let line_range = self.compute_line_range(
+                        &range,
+                        context,
+                        ScalarStyle::Plain,
+                        entry,
+                        range.end,
+                    );
                     self.note_child_end(line_range.end);
                     spans.insert(
                         pointer,
@@ -1316,10 +1350,13 @@ impl<'src> State<'src> {
         };
         let style = frame.style();
         let in_flow_parent = self.flow_depth > usize::from(style == ContextStyle::Flow);
-        let (entry, props_end, content_end) = match frame {
-            Frame::Mapping { container, .. } | Frame::Sequence { container, .. } => {
-                (container.entry, container.props_end, container.content_end)
-            }
+        let (entry, props_end, content_end, first_entry) = match frame {
+            Frame::Mapping { container, .. } | Frame::Sequence { container, .. } => (
+                container.entry,
+                container.props_end,
+                container.content_end,
+                container.first_entry,
+            ),
         };
         let end = match style {
             ContextStyle::Block => content_end,
@@ -1356,6 +1393,7 @@ impl<'src> State<'src> {
                     } else {
                         None
                     },
+                    first_child_line: first_entry.flatten(),
                 },
             );
         }
@@ -1427,8 +1465,13 @@ impl<'src> State<'src> {
             // documents the invariant.
             if !spans.contains_key(&pointer) {
                 let value_range = start_byte.min(self.bytes.len())..end_byte.min(self.bytes.len());
-                let line_range =
-                    self.compute_line_range(&value_range, context, ScalarStyle::Plain, None);
+                let line_range = self.compute_line_range(
+                    &value_range,
+                    context,
+                    ScalarStyle::Plain,
+                    None,
+                    value_range.end,
+                );
                 // `indent` is the column of the container's opening byte,
                 // which mirrors the parser convention for scalar `indent`.
                 let indent =
@@ -1482,14 +1525,21 @@ impl<'src> State<'src> {
     /// ([`State::entry_anchor`]). A value can start on a later line than its
     /// key or `-` — always for a block scalar, whose content follows the
     /// `|` / `>` line, and for any node written on the next line — so the
-    /// range starts on the entry's line, not the value's. An empty node
-    /// keeps the line of its (0.0.6-shaped) span.
+    /// range starts on the entry's line, not the value's.
+    ///
+    /// An empty `value_range` — an empty node, with or without properties,
+    /// or a block scalar with no content lines — sits on the token after
+    /// the node, often the next entry's line. Its entry ends with the line
+    /// of the last thing the node does have (its properties, its `|` / `>`
+    /// header): [`empty_node_end`] scans for them from the entry's
+    /// indicator up to `node_end`, where the parser's event span ends.
     fn compute_line_range(
         &self,
         value_range: &Range<usize>,
         context: SpanContext,
         scalar_style: ScalarStyle,
         entry: Option<EntryAnchor>,
+        node_end: usize,
     ) -> Range<usize> {
         // For flow contexts a single value is part of `{a: 1, b: 2}` on one
         // line — there is no "delete this physical line" semantics. Returning
@@ -1503,6 +1553,12 @@ impl<'src> State<'src> {
         }
 
         let bytes = self.bytes;
+        if value_range.is_empty()
+            && let Some(anchor) = entry
+        {
+            let end = empty_node_end(bytes, anchor.value_from, node_end);
+            return anchor.line_start..line_end_after(bytes, end);
+        }
         let value_line_start = line_start_at(bytes, value_range.start);
         let start = match entry {
             Some(anchor) if !value_range.is_empty() => anchor.line_start.min(value_line_start),
@@ -1631,6 +1687,35 @@ fn skip_property(bytes: &[u8], pos: usize) -> usize {
             end
         }
         _ => pos,
+    }
+}
+
+/// End of what an empty node has, scanning from `from` (where its text can
+/// begin) over separation and the tokens the node can be made of — node
+/// properties and a `|` / `>` header with its indicators — that start
+/// before `limit`. `from` when there are none.
+fn empty_node_end(bytes: &[u8], from: usize, limit: usize) -> usize {
+    let mut last = from;
+    loop {
+        let start = skip_separation(bytes, last);
+        if start >= limit {
+            return last;
+        }
+        let end = match bytes[start] {
+            b'&' | b'!' => skip_property(bytes, start),
+            b'|' | b'>' => {
+                let mut end = start + 1;
+                while matches!(bytes.get(end), Some(b'1'..=b'9' | b'+' | b'-')) {
+                    end += 1;
+                }
+                end
+            }
+            _ => start,
+        };
+        if end == start {
+            return last;
+        }
+        last = end;
     }
 }
 

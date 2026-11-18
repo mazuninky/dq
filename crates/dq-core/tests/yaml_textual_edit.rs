@@ -151,6 +151,33 @@ fn del_of_a_collection_value_removes_the_whole_entry() {
 }
 
 #[test]
+fn del_of_a_collection_ending_in_an_empty_node_keeps_the_next_entry() {
+    // The last child has no content of its own — an empty block scalar, an
+    // empty node with properties — and must not take the next line along.
+    for last_child in [
+        "  s: |\n",
+        "  x: !!str\n",
+        "  x: &q\n",
+        "  - &m\n",
+        "  s: >-\n",
+    ] {
+        let src = format!("k: 0\na:\n{last_child}b: 1\nc: 2\n");
+        assert_eq!(del(&src, "/a"), "k: 0\nb: 1\nc: 2\n", "{src:?}");
+    }
+    assert_eq!(del("b: &q\n  - &m\ng: 1\nw: ~\n", "/b"), "g: 1\nw: ~\n");
+    assert_eq!(del("? v\n  t\nb: 1\n", "/v t"), "b: 1\n");
+}
+
+#[test]
+fn del_of_an_empty_node_removes_only_its_entry() {
+    assert_eq!(del("a:\n  s: |\nb: 1\n", "/a/s"), "a: {}\nb: 1\n");
+    assert_eq!(del("f:\n  - &m\n", "/f/0"), "f: []\n");
+    assert_eq!(del("c: !!str\n\n", "/c"), "{}\n\n");
+    assert_eq!(del("e: |\n# c\n", "/e"), "{}\n# c\n");
+    assert_eq!(del("? v\n  t\n", "/v t"), "{}\n");
+}
+
+#[test]
 fn del_of_a_collection_under_a_compact_sequence_entry_is_refused() {
     // `- name: {…}`: the key shares its line with the item's `-`, and
     // removing the line would take the item with it.

@@ -1319,8 +1319,9 @@ impl Document {
     /// properties; where the child was for a document root — and record the
     /// empty-container span a fresh parse would.
     ///
-    /// Leaves the bytes alone for a flow collection (its brackets stay) and
-    /// when the marker position is unknown or was removed with the child
+    /// Leaves the bytes alone for a flow collection (its brackets stay),
+    /// when the removed bytes do not hold the child's whole entry, and when
+    /// the marker position is unknown or was removed with the child
     /// (`- key: value`, the child on its parent's `-` line).
     fn mark_emptied_yaml_collection(
         &mut self,
@@ -1334,7 +1335,13 @@ impl Document {
             Ok(Value::Array(items)) if items.is_empty() => false,
             _ => return,
         };
-        if !parent.block {
+        // Only once the child's whole entry is gone: the removed bytes must
+        // start at or before the line its key or `-` is on.
+        let entry_removed = !removed.is_empty()
+            && parent
+                .first_child_line
+                .is_some_and(|line| removed.start <= line);
+        if !parent.block || !entry_removed {
             return;
         }
         let marker: &[u8] = if is_map { b"{}" } else { b"[]" };

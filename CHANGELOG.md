@@ -274,6 +274,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - YAML `del` of a key whose value is a collection removes the whole entry
   instead of failing with "not found" (block collections) or leaving the
   key with a `null` value (`{}` / `[]`).
+- YAML `del` of an empty value — `key: |` with no lines, `key: !!str`,
+  `key: &a`, `- &a` — removes its own entry; it used to remove the entry
+  after it and keep its own.
 
 ### Security
 
