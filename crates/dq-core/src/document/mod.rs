@@ -695,14 +695,41 @@ impl Document {
     ///   check.
     pub fn set_at(&mut self, pointer: &Pointer, value: Value) -> Result<()> {
         let before = self.clone();
-        let result = self.set_at_unchecked(pointer, value.clone());
-        self.check_edit(before, result, "set", pointer, |tree, at| {
+        let layout = LayoutCache::new();
+        let result = self.set_at_unchecked(pointer, value.clone(), &layout);
+        self.check_edit(before, result, "set", pointer, &layout, |tree, at| {
             set_value_at(tree, at, value.clone())
         })
     }
 
+    /// The YAML edit layout of the bytes as they were before the edit
+    /// under way, worked out once per edit through `cache`; `None` for
+    /// other formats or bytes saphyr rejects. Call it only before the
+    /// edit splices.
+    fn edit_layout<'a>(
+        &self,
+        cache: &'a LayoutCache,
+    ) -> Option<&'a crate::parsers::yaml_spans::EditLayout> {
+        cache
+            .get_or_init(|| {
+                (self.format == FormatTag::Yaml)
+                    .then(|| {
+                        crate::parsers::yaml_spans::edit_layout(&self.original_bytes)
+                            .inspect_err(|err| tracing::debug!(%err, "YAML edit layout failed"))
+                            .ok()
+                    })
+                    .flatten()
+            })
+            .as_ref()
+    }
+
     /// [`Document::set_at`] without the read-back check.
-    fn set_at_unchecked(&mut self, pointer: &Pointer, value: Value) -> Result<()> {
+    fn set_at_unchecked(
+        &mut self,
+        pointer: &Pointer,
+        value: Value,
+        layout: &LayoutCache,
+    ) -> Result<()> {
         // "Read-only" really means "no source bytes captured" — read-only
         // parsers go through `value_only` / `multi_value_only` and leave
         // `original_bytes` empty. A document with bytes but an empty
@@ -735,9 +762,9 @@ impl Document {
                 _ => false,
             }
             && let Some(span) = self.spans.get(&canonical).cloned()
-            && let Some(at) = crate::parsers::yaml_spans::edit_layout(&self.original_bytes)
-                .ok()
-                .and_then(|mut layout| layout.empty_values.remove(&canonical))
+            && let Some(at) = self
+                .edit_layout(layout)
+                .and_then(|layout| layout.empty_values.get(&canonical).cloned())
         {
             // An empty node (`key:`, `- &a`) has no text to replace; its
             // recorded span sits on the token after it.
@@ -855,7 +882,7 @@ impl Document {
             // and empty-parent inserts fall through to the structured Path
             // error — the parsers do not yet record container-level spans
             // we'd need to splice into an empty `{}` body.
-            self.try_single_level_mkdir_p(pointer, &canonical, value)
+            self.try_single_level_mkdir_p(pointer, &canonical, value, layout)
         }
     }
 
@@ -905,6 +932,7 @@ impl Document {
         pointer: &Pointer,
         canonical: &str,
         value: Value,
+        layout: &LayoutCache,
     ) -> Result<()> {
         // Bail-out helper — every unsupported shape funnels through here so
         // callers continue to see the structured Path diagnostic they
@@ -981,7 +1009,7 @@ impl Document {
         } else {
             format!("{parent_canonical}/")
         };
-        let sibling = self.last_direct_child(&sibling_prefix);
+        let sibling = self.last_direct_child(&sibling_prefix, self.edit_layout(layout));
         let Some((sibling_key, mut sibling_span)) = sibling else {
             // No sibling — try the empty-parent path. The parent's `{}` /
             // `[]` body must have a recorded container span for this branch
@@ -1356,7 +1384,11 @@ impl Document {
     /// A non-empty collection has no recorded span: its span is made up of
     /// its entry's bytes (YAML) or its brackets (JSON), with `value_range`
     /// empty at its end for a YAML block entry.
-    fn last_direct_child(&self, sibling_prefix: &str) -> Option<(String, ValueSpan)> {
+    fn last_direct_child(
+        &self,
+        sibling_prefix: &str,
+        layout: Option<&crate::parsers::yaml_spans::EditLayout>,
+    ) -> Option<(String, ValueSpan)> {
         let direct = |pointer: &str| {
             pointer
                 .strip_prefix(sibling_prefix)
@@ -1368,8 +1400,7 @@ impl Document {
         };
         match self.format {
             FormatTag::Yaml => {
-                let Ok(layout) = crate::parsers::yaml_spans::edit_layout(&self.original_bytes)
-                else {
+                let Some(layout) = layout else {
                     return scalar();
                 };
                 let last_entry = layout
@@ -1501,8 +1532,9 @@ impl Document {
     ///   bytes fail the read-back check [`Document::set_at`] describes.
     pub fn del_at(&mut self, pointer: &Pointer) -> Result<()> {
         let before = self.clone();
-        let result = self.del_at_unchecked(pointer);
-        self.check_edit(before, result, "delete", pointer, delete_value_at)
+        let layout = LayoutCache::new();
+        let result = self.del_at_unchecked(pointer, &layout);
+        self.check_edit(before, result, "delete", pointer, &layout, delete_value_at)
     }
 
     /// Finish an edit of `pointer` whose unchecked step returned `result`:
@@ -1515,6 +1547,7 @@ impl Document {
         result: Result<()>,
         action: &'static str,
         pointer: &Pointer,
+        layout: &LayoutCache,
         apply: impl Fn(&mut Value, &Pointer) -> Result<()>,
     ) -> Result<()> {
         if let Err(err) = result {
@@ -1533,11 +1566,22 @@ impl Document {
         };
         let reason = match reparsed {
             Ok(fresh) => {
-                let expected = before.expected_after_edit(pointer, &apply);
-                match expected
-                    .as_ref()
-                    .map(|tree| first_difference(tree, &fresh.value, ""))
+                // The edit alone first: only when that does not read back
+                // does the YAML alias layout, a parse of its own, get
+                // worked out to expect the edit under the aliases too.
+                let compare = |aliases: Option<&LayoutCache>| {
+                    before
+                        .expected_after_edit(pointer, aliases, &apply)
+                        .map(|tree| first_difference(&tree, &fresh.value, ""))
+                };
+                let mut difference = compare(None);
+                if difference != Some(None)
+                    && before.format == FormatTag::Yaml
+                    && before.original_bytes.contains(&b'*')
                 {
+                    difference = compare(Some(layout));
+                }
+                match difference {
                     Some(None) => {
                         self.value = fresh.value;
                         self.spans = fresh.spans;
@@ -1589,36 +1633,47 @@ impl Document {
     }
 
     /// The value tree after applying an edit (`apply`) at `pointer` and,
-    /// in YAML, at the copy of it under every alias of an anchored node at
-    /// or above it — nested aliases included. `None` if `apply` fails at
-    /// one of them.
+    /// with the YAML alias `layout`, at the copy of it under every alias
+    /// of an anchored node at or above it — nested aliases included.
+    /// `None` if `apply` fails at one of them.
     fn expected_after_edit(
         &self,
         pointer: &Pointer,
+        layout: Option<&LayoutCache>,
         apply: &impl Fn(&mut Value, &Pointer) -> Result<()>,
     ) -> Option<Value> {
         let mut targets = vec![pointer.as_canonical()];
-        if self.format == FormatTag::Yaml && self.original_bytes.contains(&b'*') {
-            let aliases = crate::parsers::yaml_spans::edit_layout(&self.original_bytes)
-                .map(|layout| layout.aliases)
+        if let Some(layout) = layout {
+            let aliases = self
+                .edit_layout(layout)
+                .map(|layout| layout.aliases.as_slice())
                 .unwrap_or_default();
+            // Alias pointers by the pointer of the anchored node they copy.
+            let mut copies: std::collections::HashMap<&str, Vec<&str>> =
+                std::collections::HashMap::new();
+            for alias in aliases {
+                if let (Some(alias_at), Some(anchor_at)) =
+                    (&alias.alias_pointer, &alias.anchor_pointer)
+                {
+                    copies
+                        .entry(anchor_at.as_str())
+                        .or_default()
+                        .push(alias_at.as_str());
+                }
+            }
+            let mut seen: std::collections::HashSet<String> = targets.iter().cloned().collect();
             let mut i = 0;
             while i < targets.len() {
-                for alias in &aliases {
-                    let (Some(alias_at), Some(anchor_at)) =
-                        (&alias.alias_pointer, &alias.anchor_pointer)
-                    else {
-                        continue;
-                    };
-                    let Some(rest) = targets[i].strip_prefix(anchor_at.as_str()) else {
-                        continue;
-                    };
-                    if !(rest.is_empty() || rest.starts_with('/')) {
-                        continue;
-                    }
-                    let copy = format!("{alias_at}{rest}");
-                    if !targets.contains(&copy) {
-                        targets.push(copy);
+                let target = targets[i].clone();
+                // Every node at or above the target: cut at each `/`.
+                let cuts = target.match_indices('/').map(|(at, _)| at);
+                for cut in cuts.chain(std::iter::once(target.len())) {
+                    let (anchor_at, rest) = target.split_at(cut);
+                    for alias_at in copies.get(anchor_at).into_iter().flatten() {
+                        let copy = format!("{alias_at}{rest}");
+                        if seen.insert(copy.clone()) {
+                            targets.push(copy);
+                        }
                     }
                 }
                 i += 1;
@@ -1633,7 +1688,7 @@ impl Document {
     }
 
     /// [`Document::del_at`] without the read-back check.
-    fn del_at_unchecked(&mut self, pointer: &Pointer) -> Result<()> {
+    fn del_at_unchecked(&mut self, pointer: &Pointer, layout: &LayoutCache) -> Result<()> {
         // "Read-only" is signalled by empty `original_bytes` (`value_only`
         // constructor); an all-container document with zero leaf scalars
         // has an empty SpanMap but populated bytes — its del would
@@ -1669,13 +1724,7 @@ impl Document {
             Ok(Value::Array(items)) => items.len() == 1,
             _ => false,
         };
-        let layout = if self.format == FormatTag::Yaml {
-            crate::parsers::yaml_spans::edit_layout(&self.original_bytes)
-                .inspect_err(|err| tracing::debug!(%err, "YAML re-parse for del failed"))
-                .ok()
-        } else {
-            None
-        };
+        let layout = self.edit_layout(layout);
         let in_map = matches!(parent_ptr.resolve(&self.value), Ok(Value::Map(_)));
         // What takes the place of the removed bytes: `{}` / `[]` for the
         // only entry of a compact collection.
@@ -2488,6 +2537,10 @@ fn last_by_start(
         (scalar, None) => scalar,
     }
 }
+
+/// The YAML edit layout of a document before an edit, worked out at most
+/// once per edit — see [`Document::edit_layout`].
+type LayoutCache = std::cell::OnceCell<Option<crate::parsers::yaml_spans::EditLayout>>;
 
 /// The way around an edit the read-back check refuses.
 const JQ_REWRITE_HINT: &str =
@@ -3946,7 +3999,7 @@ mod tests {
         let pointer = Pointer::parse("/b").unwrap();
         // The bytes are a synthetic layout that does not read back as the
         // tree: exercise the splice without the read-back check.
-        doc.del_at_unchecked(&pointer)
+        doc.del_at_unchecked(&pointer, &LayoutCache::new())
             .expect("del_at /b must succeed");
 
         let span_a = doc
