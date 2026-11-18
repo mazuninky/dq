@@ -236,7 +236,7 @@ Full matrix, write-mode semantics, and pointer prefixes per format: [references/
 |    4 | LINT_FAIL / VALIDATE_FAIL — `lint` produced an error-severity diagnostic, or `validate` saw a parse error. |
 |    5 | IO_ERROR — read failed; `self check`/`update` network failure.          |
 |    6 | INVALID_INPUT — bad CLI flag combo, unknown format, read cmd + write flag. |
-|    7 | WRITE_FAILED — atomic write failed; bulk partial-failure mode; self-update replace failed. |
+|    7 | WRITE_FAILED — atomic write failed; `edit_rejected` (a `set`/`del` that would change other parts of the file is refused, file untouched); bulk partial-failure mode; self-update replace failed. |
 
 `--strict` promotes `warn`-severity lint findings to exit 1; error-severity always exits 4 regardless of `--strict`.
 
