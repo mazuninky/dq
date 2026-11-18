@@ -103,10 +103,10 @@ fn read_back(bytes: &[u8]) -> serde_json::Value {
 fn del_removes_key_whose_multiline_plain_value_starts_on_the_next_line() {
     // The 0.0.6 build, and this one before the fix, left `root:\n  inner:\n`:
     // the value was gone, the key stayed and read back as `null`. Now the
-    // whole entry goes; the emptied `root` reads back as `null`.
+    // whole entry goes, and the emptied `root` is written as `{}`.
     let file = write_yaml(MULTILINE_PLAIN);
     let out = stdout_of(&["del"], &file, &["/root/inner"]);
-    assert_eq!(read_back(&out), serde_json::json!({"root": null}));
+    assert_eq!(read_back(&out), serde_json::json!({"root": {}}));
 }
 
 #[test]

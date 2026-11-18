@@ -266,6 +266,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - YAML `set` / `del` after an alias (`*name`) edit the node you point at;
   they used to edit the node after it, or fail with "not found". Lint
   diagnostics on such files point at the right line instead of line 1.
+- YAML `del` of the last key or item writes `a: {}` / `a: []` instead of
+  leaving `a:`, which reads as `null`; an emptied document becomes `{}`.
+- YAML `del` of a key whose value is a collection removes the whole entry
+  instead of failing with "not found" (block collections) or leaving the
+  key with a `null` value (`{}` / `[]`).
 
 ### Security
 

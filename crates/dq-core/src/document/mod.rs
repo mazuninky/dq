@@ -1186,6 +1186,16 @@ impl Document {
     /// Remove the value at `pointer`, splicing out its physical line(s) and
     /// dropping every span beneath it.
     ///
+    /// YAML adds two cases the span map alone cannot serve, both from one
+    /// re-parse of the current bytes ([`crate::parsers::yaml_spans::container_layout`]):
+    ///
+    /// - a collection value outside flow collections is removed with its
+    ///   whole entry — the key (or `-`) line down to the collection's last
+    ///   line;
+    /// - a block collection left without children gets an explicit `{}` /
+    ///   `[]` (`key: {}`), so it stays a collection instead of reading back
+    ///   as `null`.
+    ///
     /// # Errors
     ///
     /// - [`Error::WriteUnavailable`] when the document was loaded
@@ -1193,7 +1203,7 @@ impl Document {
     /// - [`Error::Path`] with `kind = TypeMismatch` when `pointer` is
     ///   the root (the root is never deletable — it would empty the file).
     /// - [`Error::Path`] with `kind = MissingKey` when no span exists for
-    ///   the pointer.
+    ///   the pointer (and, for YAML, it is no removable collection).
     pub fn del_at(&mut self, pointer: &Pointer) -> Result<()> {
         // "Read-only" is signalled by empty `original_bytes` (`value_only`
         // constructor); an all-container document with zero leaf scalars
@@ -1219,20 +1229,53 @@ impl Document {
             });
         }
         let canonical = pointer.as_canonical();
-        let span = self
-            .spans
-            .get(&canonical)
-            .cloned()
-            .ok_or_else(|| Error::Path {
-                pointer: canonical.clone(),
-                // SpanMap only records scalar leaves; walk the in-memory
-                // Value tree so the diagnostic surfaces the longest matching
-                // container chain.
-                matched_prefix: longest_existing_value_prefix(&self.value, pointer),
-                kind: PathErrorKind::MissingKey,
-                did_you_mean: Vec::new(),
-            })?;
-        let line_range = span.line_range.clone();
+        let parent_ptr = Pointer::new(pointer.segments()[..pointer.segments().len() - 1].to_vec());
+        let target_is_collection = matches!(
+            pointer.resolve(&self.value),
+            Ok(Value::Map(_) | Value::Array(_))
+        );
+        let parent_loses_last_child = match parent_ptr.resolve(&self.value) {
+            Ok(Value::Map(map)) => map.len() == 1,
+            Ok(Value::Array(items)) => items.len() == 1,
+            _ => false,
+        };
+        let layout = if self.format == FormatTag::Yaml
+            && (target_is_collection || parent_loses_last_child)
+        {
+            crate::parsers::yaml_spans::container_layout(&self.original_bytes)
+                .inspect_err(|err| tracing::debug!(%err, "YAML re-parse for del failed"))
+                .ok()
+        } else {
+            None
+        };
+        let collection_entry = layout
+            .as_ref()
+            .filter(|_| target_is_collection)
+            .and_then(|layout| layout.get(&canonical))
+            .and_then(|collection| collection.entry.clone());
+        let line_range = match collection_entry {
+            Some(entry) => entry,
+            None => self
+                .spans
+                .get(&canonical)
+                .map(|span| span.line_range.clone())
+                .ok_or_else(|| Error::Path {
+                    pointer: canonical.clone(),
+                    // SpanMap only records scalar leaves; walk the in-memory
+                    // Value tree so the diagnostic surfaces the longest
+                    // matching container chain.
+                    matched_prefix: longest_existing_value_prefix(&self.value, pointer),
+                    kind: PathErrorKind::MissingKey,
+                    did_you_mean: Vec::new(),
+                })?,
+        };
+        let removed = line_range.clone();
+        // The line break the removed bytes end with, if any: `\r\n` or `\n`.
+        let removed_line_break: &'static [u8] = match &self.original_bytes[removed.clone()] {
+            [.., b'\r', b'\n'] => b"\r\n",
+            [.., b'\n'] => b"\n",
+            _ => b"",
+        };
         let delta = SpanRecomputeDelta {
             at: line_range.start,
             old_len: line_range.end - line_range.start,
@@ -1256,10 +1299,87 @@ impl Document {
         }
         apply_delta(&mut self.spans, delta);
         delete_value_at(&mut self.value, pointer)?;
+        if parent_loses_last_child
+            && let Some(parent) = layout
+                .as_ref()
+                .and_then(|layout| layout.get(&parent_ptr.as_canonical()))
+        {
+            self.mark_emptied_yaml_collection(&parent_ptr, parent, &removed, removed_line_break);
+        }
         // Mirror `set_at`: regenerate provenance from the post-edit span
         // map so the IR view stays consistent across writes.
         self.provenance = provenance_from_spans(&self.spans);
         Ok(())
+    }
+
+    /// After `del_at` removed the bytes `removed` (ending in the line break
+    /// `removed_line_break`, empty if none) holding the last child of the
+    /// YAML block collection at `parent_ptr`, write an explicit `{}` / `[]`
+    /// for it — past its key's `:` (`key: {}`), its `-`, or its node
+    /// properties; where the child was for a document root — and record the
+    /// empty-container span a fresh parse would.
+    ///
+    /// Leaves the bytes alone for a flow collection (its brackets stay) and
+    /// when the marker position is unknown or was removed with the child
+    /// (`- key: value`, the child on its parent's `-` line).
+    fn mark_emptied_yaml_collection(
+        &mut self,
+        parent_ptr: &Pointer,
+        parent: &crate::parsers::yaml_spans::ContainerLayout,
+        removed: &std::ops::Range<usize>,
+        removed_line_break: &[u8],
+    ) {
+        let is_map = match parent_ptr.resolve(&self.value) {
+            Ok(Value::Map(map)) if map.is_empty() => true,
+            Ok(Value::Array(items)) if items.is_empty() => false,
+            _ => return,
+        };
+        if !parent.block {
+            return;
+        }
+        let marker: &[u8] = if is_map { b"{}" } else { b"[]" };
+        let (at, inserted) = if parent.top_level {
+            let mut inserted = marker.to_vec();
+            inserted.extend_from_slice(removed_line_break);
+            (removed.start, inserted)
+        } else {
+            match parent.empty_marker_at {
+                Some(at) if at < removed.start => {
+                    let mut inserted = b" ".to_vec();
+                    inserted.extend_from_slice(marker);
+                    (at, inserted)
+                }
+                _ => return,
+            }
+        };
+        self.original_bytes.splice(at..at, inserted.iter().copied());
+        apply_delta(
+            &mut self.spans,
+            SpanRecomputeDelta {
+                at,
+                old_len: 0,
+                new_len: inserted.len(),
+            },
+        );
+        // Past the separating space, if one was inserted.
+        let marker_start = if parent.top_level { at } else { at + 1 };
+        let marker_range = marker_start..marker_start + marker.len();
+        let line_start = self.original_bytes[..marker_start]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |i| i + 1);
+        self.spans
+            .entry(parent_ptr.as_canonical())
+            .or_insert_with(|| ValueSpan {
+                value_range: marker_range.clone(),
+                line_range: marker_range,
+                indent: u32::try_from(marker_start - line_start + 1).unwrap_or(u32::MAX),
+                context: if is_map {
+                    SpanContext::FlowMapValue
+                } else {
+                    SpanContext::FlowSeqItem
+                },
+            });
     }
 }
 

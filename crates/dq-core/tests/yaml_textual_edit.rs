@@ -116,3 +116,45 @@ fn alias_key_and_merge_key_keep_later_pointers_in_place() {
         "a: &x 1\nm: {k: *x, z: 9}\n"
     );
 }
+
+// --- del leaves an empty collection ------------------------------------------
+
+#[test]
+fn del_of_the_last_child_leaves_an_empty_collection() {
+    assert_eq!(del("a:\n  x: 1\nb: 2\n", "/a/x"), "a: {}\nb: 2\n");
+    assert_eq!(del("a:\n  - 1\nb: 2\n", "/a/0"), "a: []\nb: 2\n");
+    assert_eq!(del("x: 1\n", "/x"), "{}\n");
+}
+
+#[test]
+fn emptied_root_keeps_the_byte_order_mark_and_the_line_break() {
+    assert_eq!(del("\u{feff}x: 1\n", "/x"), "\u{feff}{}\n");
+    assert_eq!(
+        del("x: 1\r\n---\r\ny: 2\r\n", "/0/x"),
+        "{}\r\n---\r\ny: 2\r\n"
+    );
+}
+
+// --- del of a collection value -----------------------------------------------
+
+#[test]
+fn del_of_a_collection_value_removes_the_whole_entry() {
+    assert_eq!(del("a:\n  x: 1\nb: 2\n", "/a"), "b: 2\n");
+    assert_eq!(del("k: v\na:\n  x: 1\nb: 2\n", "/a"), "k: v\nb: 2\n");
+    assert_eq!(del("a:\n  - 1\nb: 2\n", "/a"), "b: 2\n");
+    assert_eq!(del("a: {}\nb: 2\n", "/a"), "b: 2\n");
+    // A comment after the collection belongs to what follows it.
+    assert_eq!(
+        del("a:\n  x: 1\n# about b\nb: 2\n", "/a"),
+        "# about b\nb: 2\n"
+    );
+}
+
+#[test]
+fn del_of_a_collection_under_a_compact_sequence_entry_is_refused() {
+    // `- name: {…}`: the key shares its line with the item's `-`, and
+    // removing the line would take the item with it.
+    let mut doc = doc("l:\n  - name: {n: 1}\n    age: 2\n");
+    assert!(doc.del_at(&ptr("/l/0/name")).is_err());
+    assert_eq!(doc.original_bytes(), b"l:\n  - name: {n: 1}\n    age: 2\n");
+}

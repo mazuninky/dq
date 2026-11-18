@@ -104,3 +104,21 @@ fn set_after_an_alias_edits_the_addressed_node() {
     assert_eq!(edit(src, &["set", "/b", "9"]), "a: &x 1\nb: 9\nc: 2\n");
     assert_eq!(edit(src, &["set", "/c", "7"]), "a: &x 1\nb: *x\nc: 7\n");
 }
+
+#[test]
+fn del_of_the_last_child_keeps_the_collection_type() {
+    assert_eq!(
+        edit("a:\n  x: 1\nb: 2\n", &["del", "/a/x"]),
+        "a: {}\nb: 2\n"
+    );
+    assert_eq!(edit("a:\n  - 1\nb: 2\n", &["del", "/a/0"]), "a: []\nb: 2\n");
+}
+
+#[test]
+fn del_of_a_key_holding_a_block_collection_removes_the_entry() {
+    assert_eq!(
+        edit("k: v\na:\n  x: 1\nb: 2\n", &["del", "/a"]),
+        "k: v\nb: 2\n"
+    );
+    assert_eq!(edit("a:\n  - 1\nb: 2\n", &["del", "/a"]), "b: 2\n");
+}

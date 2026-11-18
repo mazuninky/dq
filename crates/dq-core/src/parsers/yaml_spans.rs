@@ -224,13 +224,32 @@ fn build_provenance_with_inline_offsets(
 /// span (em-dash in a comment, accented identifier, …) shifts every later
 /// span's `value_range` by `(utf8_len - 1)` bytes per multi-byte codepoint.
 fn build_span_map_and_block_scalars(bytes: &[u8]) -> Result<(SpanMap, HashSet<String>)> {
-    let built = build_span_map_with_stats(bytes)?;
+    let built = build_span_map_with_stats(bytes, false)?;
     tracing::trace!(
         parser_passes = built.parser_passes,
         spans = built.spans.len(),
         "built YAML span map",
     );
     Ok((built.spans, built.block_scalars))
+}
+
+/// The [`ContainerLayout`] of every collection in `bytes`, keyed by the
+/// canonical pointer the [`SpanMap`] uses.
+///
+/// [`crate::document::Document::del_at`] re-parses the current bytes with
+/// this when it removes a whole collection or empties one: the span map
+/// keeps scalar leaves only, and a collection's entry (its key line down to
+/// its last line) is not derivable from them. The walk is the same single
+/// span-building pass `parse_yaml_with_spans` makes.
+///
+/// # Errors
+///
+/// Same as [`parse_with_spans`]; on bytes a write produced this only fails
+/// if that write broke the document.
+pub(crate) fn container_layout(bytes: &[u8]) -> Result<HashMap<String, ContainerLayout>> {
+    Ok(build_span_map_with_stats(bytes, true)?
+        .layout
+        .unwrap_or_default())
 }
 
 /// The edit that keeps a block scalar's value when a line is appended after
@@ -335,6 +354,8 @@ struct BuiltSpans {
     /// of it). Two without block scalars carrying node properties, three
     /// with them — independent of how many there are.
     parser_passes: usize,
+    /// Layout of every collection, when asked for.
+    layout: Option<HashMap<String, ContainerLayout>>,
 }
 
 /// [`build_span_map_and_block_scalars`], also reporting how many parser
@@ -342,8 +363,9 @@ struct BuiltSpans {
 ///
 /// The passes are: [`prescan`] (document count, block scalars with node
 /// properties, aliases), at most one [`replay_block_scalar_body_starts`]
-/// over a blanked copy, and the main [`State`] walk.
-fn build_span_map_with_stats(bytes: &[u8]) -> Result<BuiltSpans> {
+/// over a blanked copy, and the main [`State`] walk, which also collects
+/// the [`ContainerLayout`] of every collection when `collect_layout` is set.
+fn build_span_map_with_stats(bytes: &[u8], collect_layout: bool) -> Result<BuiltSpans> {
     let text = std::str::from_utf8(bytes).map_err(|err| Error::Parse {
         file: None,
         line: 0,
@@ -365,6 +387,9 @@ fn build_span_map_with_stats(bytes: &[u8]) -> Result<BuiltSpans> {
     let mut spans = SpanMap::new();
     let mut block_scalars: HashSet<String> = HashSet::new();
     let mut state = State::new(text, multi_doc, &char_to_byte, &body_starts);
+    if collect_layout {
+        state.layout = Some(HashMap::new());
+    }
 
     parser_passes += 1;
     let mut parser = YamlParser::new_from_str(text);
@@ -378,6 +403,7 @@ fn build_span_map_with_stats(bytes: &[u8]) -> Result<BuiltSpans> {
         spans,
         block_scalars,
         parser_passes,
+        layout: state.layout,
     })
 }
 
@@ -667,6 +693,8 @@ enum Frame {
         /// frame, so `MappingEnd` can tell empty from non-empty without
         /// re-walking the SpanMap.
         saw_child: bool,
+        /// Where this container sits in its parent; see [`ContainerFrame`].
+        container: ContainerFrame,
     },
     /// `index` is the position of the *next* item.
     Sequence {
@@ -680,10 +708,31 @@ enum Frame {
         /// 0.0.6 scanner opens no indentation level for it; see
         /// [`State::block_indent`].
         indentless: bool,
+        /// Where this container sits in its parent; see [`ContainerFrame`].
+        container: ContainerFrame,
     },
 }
 
+/// Layout bookkeeping a container frame carries for [`ContainerLayout`].
+#[derive(Debug)]
+struct ContainerFrame {
+    /// The entry the container is the value of, `None` for a top-level
+    /// container or one inside a flow collection.
+    entry: Option<EntryAnchor>,
+    /// End of the container's node properties, if it has any.
+    props_end: Option<usize>,
+    /// Largest `line_range.end` among the spans and entries recorded inside
+    /// the container so far — where a block container's last line ends.
+    content_end: usize,
+}
+
 impl Frame {
+    fn container_mut(&mut self) -> &mut ContainerFrame {
+        match self {
+            Self::Mapping { container, .. } | Self::Sequence { container, .. } => container,
+        }
+    }
+
     fn style(&self) -> ContextStyle {
         match self {
             Self::Mapping { style, .. } | Self::Sequence { style, .. } => *style,
@@ -697,6 +746,33 @@ impl Frame {
 struct EntryAnchor {
     /// Start of the line the entry begins on.
     line_start: usize,
+    /// `true` if the entry is the first thing on its line, so that the
+    /// lines from `line_start` hold this entry and nothing of its parent's.
+    /// `false` for a key of a compact mapping (`- key: …`) or an item of a
+    /// compact sequence (`- - item`).
+    owns_line: bool,
+    /// Where an inline value would go: just past the key's `:` or the
+    /// item's `-`. `None` if the indicator could not be located.
+    indicator_end: Option<usize>,
+}
+
+/// Layout of one collection node, as [`container_layout`] reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContainerLayout {
+    /// `true` for a block collection, `false` for a flow one (`{…}` / `[…]`).
+    pub(crate) block: bool,
+    /// `true` for the root collection of a document.
+    pub(crate) top_level: bool,
+    /// Bytes of the whole entry holding the collection, from the start of
+    /// the line its key or `-` is on to the end of its last line — what
+    /// `del` removes. `None` for a top-level collection, one inside a flow
+    /// collection, one whose key or `-` shares its line with its parent's
+    /// `-` (`- key:` / `- -`), and one whose key or `-` could not be located.
+    pub(crate) entry: Option<Range<usize>>,
+    /// Where ` {}` / ` []` goes once a block collection loses its last
+    /// child: past its node properties, else past its key's `:` or its
+    /// `-`. `None` for a top-level collection and when not located.
+    pub(crate) empty_marker_at: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -728,6 +804,9 @@ struct State<'src> {
     anchored_scalars: HashMap<usize, String>,
     /// Number of flow frames on `self.stack`.
     flow_depth: usize,
+    /// Layout of every collection, keyed by canonical pointer — collected
+    /// only for [`container_layout`].
+    layout: Option<HashMap<String, ContainerLayout>>,
 }
 
 impl<'src> State<'src> {
@@ -750,6 +829,7 @@ impl<'src> State<'src> {
             block_body_starts,
             anchored_scalars: HashMap::new(),
             flow_depth: 0,
+            layout: None,
         }
     }
 
@@ -800,19 +880,40 @@ impl<'src> State<'src> {
                 if in_flow {
                     return None;
                 }
+                let colon = skip_separation(bytes, key.end);
                 Some(EntryAnchor {
                     line_start: line_start_at(bytes, key.start),
+                    owns_line: starts_line_after_bom(bytes, key.start),
+                    indicator_end: (bytes.get(colon) == Some(&b':')).then_some(colon + 1),
                 })
             }
             Frame::Sequence { .. } if in_flow => None,
             Frame::Sequence { .. } => {
-                let line_start = if starts_line(bytes, item_start) {
-                    dash_line_above(bytes, item_start)?
+                if starts_line(bytes, item_start) {
+                    let (line_start, dash) = dash_line_above(bytes, item_start)?;
+                    Some(EntryAnchor {
+                        line_start,
+                        owns_line: starts_line_after_bom(bytes, dash),
+                        indicator_end: Some(dash + 1),
+                    })
                 } else {
-                    line_start_at(bytes, item_start)
-                };
-                Some(EntryAnchor { line_start })
+                    let dash = dash_before(bytes, item_start);
+                    Some(EntryAnchor {
+                        line_start: line_start_at(bytes, item_start),
+                        owns_line: dash.is_some_and(|dash| starts_line_after_bom(bytes, dash)),
+                        indicator_end: dash.map(|dash| dash + 1),
+                    })
+                }
             }
+        }
+    }
+
+    /// Fold a recorded child's line end into the innermost container's
+    /// [`ContainerFrame::content_end`].
+    fn note_child_end(&mut self, end: usize) {
+        if let Some(frame) = self.stack.last_mut() {
+            let container = frame.container_mut();
+            container.content_end = container.content_end.max(end);
         }
     }
 
@@ -832,9 +933,15 @@ impl<'src> State<'src> {
                 })
             )
             && !starts_line(self.bytes, start_byte);
-        // The parent's pending key belongs to this container.
-        let _ = self.entry_anchor(event_start);
+        let entry = self.entry_anchor(event_start);
+        let props_end = (n_properties > 0)
+            .then(|| skip_node_properties(self.bytes, event_start, n_properties).0);
         self.enter_container();
+        let container = ContainerFrame {
+            entry,
+            props_end,
+            content_end: 0,
+        };
         if style == ContextStyle::Flow {
             self.flow_depth += 1;
         }
@@ -845,6 +952,7 @@ impl<'src> State<'src> {
                 style,
                 start_byte,
                 saw_child: false,
+                container,
             }
         } else {
             Frame::Sequence {
@@ -852,6 +960,7 @@ impl<'src> State<'src> {
                 style,
                 start_byte,
                 indentless,
+                container,
             }
         });
     }
@@ -915,6 +1024,7 @@ impl<'src> State<'src> {
                         // `add-validation-and-extended-formats` requires.
                         block_scalars.insert(pointer.clone());
                     }
+                    self.note_child_end(line_range.end);
                     spans.insert(
                         pointer,
                         ValueSpan {
@@ -947,6 +1057,7 @@ impl<'src> State<'src> {
                     let context = self.value_context();
                     let line_range =
                         self.compute_line_range(&range, context, ScalarStyle::Plain, entry);
+                    self.note_child_end(line_range.end);
                     spans.insert(
                         pointer,
                         ValueSpan {
@@ -1190,6 +1301,66 @@ impl<'src> State<'src> {
         }
     }
 
+    /// At the end event of the innermost container (`end_byte` is where the
+    /// event span ends): work out where its entry ends, fold that into the
+    /// parent's [`ContainerFrame::content_end`], and record its
+    /// [`ContainerLayout`] when collecting.
+    ///
+    /// A block collection ends with the last line of its last child — not
+    /// at its end event, which sits on the next token, past any comments in
+    /// between. A flow collection ends at its closing bracket; in a block
+    /// parent its entry runs to the end of that line.
+    fn record_container_end(&mut self, end_byte: usize) {
+        let Some(frame) = self.stack.last() else {
+            return;
+        };
+        let style = frame.style();
+        let in_flow_parent = self.flow_depth > usize::from(style == ContextStyle::Flow);
+        let (entry, props_end, content_end) = match frame {
+            Frame::Mapping { container, .. } | Frame::Sequence { container, .. } => {
+                (container.entry, container.props_end, container.content_end)
+            }
+        };
+        let end = match style {
+            ContextStyle::Block => content_end,
+            ContextStyle::Flow if in_flow_parent => end_byte,
+            ContextStyle::Flow => line_end_after(self.bytes, end_byte),
+        };
+        if let Some(parent) = self
+            .stack
+            .len()
+            .checked_sub(2)
+            .and_then(|i| self.stack.get_mut(i))
+        {
+            let container = parent.container_mut();
+            container.content_end = container.content_end.max(end);
+        }
+        if let Some(layout) = self.layout.as_mut() {
+            let top_level = self.stack.len() == 1;
+            let block = style == ContextStyle::Block;
+            let pointer = if self.path.is_empty() {
+                String::new()
+            } else {
+                format!("/{}", self.path.join("/"))
+            };
+            layout.insert(
+                pointer,
+                ContainerLayout {
+                    block,
+                    top_level,
+                    entry: entry
+                        .filter(|anchor| anchor.owns_line && end > anchor.line_start)
+                        .map(|anchor| anchor.line_start..end),
+                    empty_marker_at: if block {
+                        props_end.or(entry.and_then(|anchor| anchor.indicator_end))
+                    } else {
+                        None
+                    },
+                },
+            );
+        }
+    }
+
     fn leave_container(&mut self) {
         if self
             .stack
@@ -1213,6 +1384,7 @@ impl<'src> State<'src> {
     /// The pointer is read **before** popping `self.path` so we key the
     /// span at the empty container itself, not at its parent.
     fn leave_container_recording_empty(&mut self, spans: &mut SpanMap, end_byte: usize) {
+        self.record_container_end(end_byte);
         let top = self.stack.last();
         let (is_empty, start_byte, context) = match top {
             Some(Frame::Mapping {
@@ -1530,6 +1702,14 @@ fn starts_line(bytes: &[u8], pos: usize) -> bool {
         .all(|&b| matches!(b, b' ' | b'\t'))
 }
 
+/// `true` if only blanks (and, on the first line, a byte-order mark) come
+/// before byte `pos` on its line.
+fn starts_line_after_bom(bytes: &[u8], pos: usize) -> bool {
+    let pos = pos.min(bytes.len());
+    let start = line_start_at(bytes, pos);
+    bytes[start..pos].iter().all(|&b| matches!(b, b' ' | b'\t'))
+}
+
 /// Start of the line holding byte `pos`: just past the previous `\n`. On the
 /// first line that is past a byte-order mark, so that removing a whole line
 /// never takes the mark with it.
@@ -1577,9 +1757,9 @@ fn block_scalar_line_end(bytes: &[u8], value_range: &Range<usize>) -> Option<usi
 /// For a sequence item whose node starts its own line (`pos`), the line of
 /// the item's `-`: the nearest line above holding a `-` indicator, with
 /// only blank, comment, node-property and block-scalar-header lines in
-/// between. Returns the start of that line, or `None` when another line
-/// comes first.
-fn dash_line_above(bytes: &[u8], pos: usize) -> Option<usize> {
+/// between. Returns `(line start, byte offset of the -)`, or `None` when
+/// another line comes first.
+fn dash_line_above(bytes: &[u8], pos: usize) -> Option<(usize, usize)> {
     let mut line_start = line_start_at(bytes, pos);
     while line_start > 0 && bytes[line_start - 1] == b'\n' {
         let prev_start = line_start_at(bytes, line_start - 1);
@@ -1593,13 +1773,23 @@ fn dash_line_above(bytes: &[u8], pos: usize) -> Option<usize> {
         };
         match line[first] {
             b'-' if matches!(line.get(first + 1), None | Some(b' ' | b'\t' | b'\r')) => {
-                return Some(prev_start);
+                return Some((prev_start, prev_start + first));
             }
             b'#' | b'&' | b'!' | b'|' | b'>' => {}
             _ => return None,
         }
     }
     None
+}
+
+/// Byte offset of the `-` indicator that precedes `pos` on its line, past
+/// blanks only.
+fn dash_before(bytes: &[u8], pos: usize) -> Option<usize> {
+    let pos = pos.min(bytes.len());
+    let dash = bytes[..pos]
+        .iter()
+        .rposition(|&b| !matches!(b, b' ' | b'\t'))?;
+    (bytes[dash] == b'-').then_some(dash)
 }
 
 /// Byte offset of `pos` from the start of its line.
@@ -2679,7 +2869,7 @@ mod tests {
             ));
         }
         src.push_str("last: *a0\n");
-        let built = build_span_map_with_stats(src.as_bytes()).expect("parse");
+        let built = build_span_map_with_stats(src.as_bytes(), false).expect("parse");
         assert_eq!(
             built.parser_passes, 3,
             "prescan + one combined replay + main walk"
@@ -2691,7 +2881,7 @@ mod tests {
     #[test]
     fn span_build_without_propertied_block_scalars_skips_the_replay() {
         let bytes = b"a: &x 1\nb: |\n  body\nc: *x\n";
-        let built = build_span_map_with_stats(bytes).expect("parse");
+        let built = build_span_map_with_stats(bytes, false).expect("parse");
         assert_eq!(built.parser_passes, 2, "prescan + main walk only");
     }
 
