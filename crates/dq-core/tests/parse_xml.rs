@@ -345,3 +345,55 @@ fn write_top_level_non_map_is_format_error() {
         "expected Error::Format with format=xml, got {err:?}",
     );
 }
+
+// --- input encoding (quick-xml 0.40 → 0.42 regression pins) ---------------
+//
+// `parse_xml` validates UTF-8 itself before quick-xml sees the bytes, so the
+// reader's own encoding handling (0.42 decodes to `str` and validates UTF-8
+// per event) must not leak into the result. Values pinned against the
+// quick-xml 0.40 build.
+
+#[test]
+fn parse_utf8_bom_is_skipped_and_dropped_on_write() {
+    let with_bom = parse(b"\xEF\xBB\xBF<a b=\"1\">x</a>");
+    let without_bom = parse(b"<a b=\"1\">x</a>");
+    assert_eq!(with_bom.value(), without_bom.value());
+    let mut buf: Vec<u8> = Vec::new();
+    xml().write(&with_bom, &mut buf).expect("write");
+    assert_eq!(buf, b"<a b=\"1\">x</a>");
+}
+
+#[test]
+fn parse_declared_non_utf8_encoding_with_ascii_body_is_accepted() {
+    let doc = parse(b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><a>cafe</a>");
+    let Value::Map(root) = doc.value() else {
+        panic!("expected map root, got {:?}", doc.value());
+    };
+    let Some(Value::Map(decl)) = root.get("#xml") else {
+        panic!("expected #xml declaration map, got {root:?}");
+    };
+    assert_eq!(
+        decl.get("encoding"),
+        Some(&Value::String("ISO-8859-1".into()))
+    );
+}
+
+#[test]
+fn parse_non_utf8_input_is_a_parse_error_naming_the_offset() {
+    for (bytes, offset) in [
+        (&b"<a>caf\xE9</a>"[..], 6),               // Latin-1 é
+        (&b"\xFF\xFE<\x00a\x00/\x00>\x00"[..], 0), // UTF-16LE with BOM
+        (&b"<a>\xC3\x28</a>"[..], 3),              // truncated UTF-8 sequence
+    ] {
+        let err = xml().parse(bytes).expect_err("non-UTF-8 must be rejected");
+        let dq_core::Error::Parse { message, .. } = &err else {
+            panic!("expected Error::Parse, got {err:?}");
+        };
+        assert_eq!(
+            message,
+            &format!(
+                "invalid UTF-8 in XML input: invalid utf-8 sequence of 1 bytes from index {offset}"
+            ),
+        );
+    }
+}

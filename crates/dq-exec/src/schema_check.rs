@@ -3,10 +3,13 @@
 //!
 //! The compiled validator is built once at `Evaluator::new` and stored on
 //! the [`crate::evaluator::CompiledRule`] so per-file `evaluate_file`
-//! calls reuse it without recompilation. The `$ref` resolver is the
-//! crate's default registry (no HTTP / file resolvers wired up): per
-//! design D2 the schema validates in isolation, with no network or
-//! filesystem reads beyond the rule's own sibling `*.schema.json`.
+//! calls reuse it without recompilation. External `$ref` is closed off
+//! three ways: [`find_external_ref`] rejects any non-fragment `$ref` before
+//! the validator is built, the validator is built `offline()` (a retriever
+//! that refuses every URI outside the registry), and the `resolve-http` /
+//! `resolve-file` features are off. Per design D2 the schema validates in
+//! isolation, with no network or filesystem reads beyond the rule's own
+//! sibling `*.schema.json`.
 //!
 //! ## Path safety for `schema_file`
 //!
@@ -75,8 +78,26 @@ fn compile_json(
             message: format!("external $ref is not supported: {uri}"),
         });
     }
-    let validator =
-        jsonschema::draft202012::new(schema_json).map_err(|err| ExecError::SchemaCompile {
+    // A `$schema` naming a meta-schema the validator does not bundle is
+    // an external reference too. jsonschema ≤ 0.34 tried to retrieve it
+    // while building the registry and failed the compile; 0.61 with an
+    // explicit draft never looks it up and validates as 2020-12 instead.
+    // Keep the compile-time rejection — and its wording — here.
+    if let Some(message) = find_unresolvable_meta_schema(schema_json) {
+        return Err(ExecError::SchemaCompile {
+            rule_id: rule_id.to_owned(),
+            message,
+        });
+    }
+    // Second layer, independent of Cargo features: `offline()` swaps the
+    // default retriever for one that refuses every URI not already in
+    // the registry, so even if `resolve-http` / `resolve-file` were ever
+    // unified on by another crate in the graph, the validator still
+    // cannot reach the network or the filesystem.
+    let validator = jsonschema::draft202012::options()
+        .offline()
+        .build(schema_json)
+        .map_err(|err| ExecError::SchemaCompile {
             rule_id: rule_id.to_owned(),
             message: format!("{err}"),
         })?;
@@ -145,6 +166,193 @@ fn find_external_ref(schema: &serde_json::Value) -> Option<&str> {
         }
         _ => None,
     }
+}
+
+/// Find a `$schema` URI that jsonschema 0.34 could not resolve offline and
+/// return the compile error it reported for it.
+///
+/// 0.34 resolved every `$schema` in the document against its registry:
+/// URIs under `https://json-schema.org/draft/` / `http://json-schema.org/draft-`
+/// (the bundled meta-schemas) and the document's own `$id`s resolve; any
+/// other URI went to the retriever, which had no HTTP or file support.
+fn find_unresolvable_meta_schema(schema: &serde_json::Value) -> Option<String> {
+    let mut ids = Vec::new();
+    collect_ids(schema, None, &mut ids);
+    let uri = find_meta_schema_uri(schema, None, &|raw, resolved| {
+        !(raw.starts_with("https://json-schema.org/draft/")
+            || raw.starts_with("http://json-schema.org/draft-")
+            || resolved.is_empty()
+            || ids.iter().any(|id| id == resolved))
+    })?;
+    let (normalized, scheme) = normalize_uri(&uri);
+    let reason = match scheme.as_deref() {
+        Some("http" | "https") => {
+            "`resolve-http` feature or a custom resolver is required to resolve external \
+             schemas via HTTP"
+                .to_owned()
+        }
+        Some("file") => "`resolve-file` feature or a custom resolver is required to resolve \
+                         external schemas via files"
+            .to_owned(),
+        Some(other) => format!("Unknown scheme {other}"),
+        None => "No base URI is available".to_owned(),
+    };
+    Some(format!(
+        "Resource '{normalized}' is not present in a registry and retrieving it failed: {reason}"
+    ))
+}
+
+/// Every `$id` of `schema` and its subschemas, resolved against the
+/// enclosing `$id` and fragment stripped.
+fn collect_ids(schema: &serde_json::Value, base: Option<&str>, out: &mut Vec<String>) {
+    let serde_json::Value::Object(map) = schema else {
+        return;
+    };
+    let own = map
+        .get("$id")
+        .and_then(serde_json::Value::as_str)
+        .map(|id| resolve_reference(base, strip_fragment(id)));
+    if let Some(id) = &own {
+        out.push(id.clone());
+    }
+    let base = own.as_deref().or(base);
+    subschemas(map).for_each(|child| collect_ids(child, base, out));
+}
+
+/// The first `$schema` of `schema` and its subschemas, resolved against the
+/// enclosing `$id`, for which `unresolvable(raw, resolved)` holds.
+fn find_meta_schema_uri(
+    schema: &serde_json::Value,
+    base: Option<&str>,
+    unresolvable: &dyn Fn(&str, &str) -> bool,
+) -> Option<String> {
+    let serde_json::Value::Object(map) = schema else {
+        return None;
+    };
+    let own = map
+        .get("$id")
+        .and_then(serde_json::Value::as_str)
+        .map(|id| resolve_reference(base, strip_fragment(id)));
+    let base = own.as_deref().or(base);
+    if let Some(raw) = map.get("$schema").and_then(serde_json::Value::as_str) {
+        let resolved = resolve_reference(base, strip_fragment(raw));
+        if unresolvable(raw, &resolved) {
+            return Some(resolved);
+        }
+    }
+    subschemas(map).find_map(|child| find_meta_schema_uri(child, base, unresolvable))
+}
+
+/// Resolve `reference` against `base` (RFC 3986 § 5.2, without
+/// dot-segment removal); a reference with a scheme, or no base, is
+/// returned as is.
+fn resolve_reference(base: Option<&str>, reference: &str) -> String {
+    let Some(base) = base else {
+        return reference.to_owned();
+    };
+    if reference.is_empty() {
+        return base.to_owned();
+    }
+    if uri_scheme(reference).is_some() {
+        return reference.to_owned();
+    }
+    let Some(scheme) = uri_scheme(base) else {
+        return reference.to_owned();
+    };
+    let after_scheme = &base[scheme.len() + 1..];
+    if let Some(network_path) = reference.strip_prefix("//") {
+        return format!("{scheme}://{network_path}");
+    }
+    let (authority, path) = match after_scheme.strip_prefix("//") {
+        Some(rest) => {
+            let end = rest.find('/').unwrap_or(rest.len());
+            (format!("//{}", &rest[..end]), &rest[end..])
+        }
+        None => (String::new(), after_scheme),
+    };
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    if reference.starts_with('/') {
+        return format!("{scheme}:{authority}{reference}");
+    }
+    let directory = path.rfind('/').map_or("", |idx| &path[..=idx]);
+    let directory = if directory.is_empty() && !authority.is_empty() {
+        "/"
+    } else {
+        directory
+    };
+    format!("{scheme}:{authority}{directory}{reference}")
+}
+
+/// The scheme of `uri` when it starts with a valid RFC 3986 scheme.
+fn uri_scheme(uri: &str) -> Option<&str> {
+    let (scheme, _) = uri.split_once(':')?;
+    let valid = scheme
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    valid.then_some(scheme)
+}
+
+fn strip_fragment(uri: &str) -> &str {
+    uri.split_once('#').map_or(uri, |(base, _)| base)
+}
+
+/// `uri` with the scheme and authority lowercased (RFC 3986 § 6.2.2.1),
+/// plus the lowercased scheme when there is one.
+fn normalize_uri(uri: &str) -> (String, Option<String>) {
+    let Some(scheme) = uri_scheme(uri) else {
+        return (uri.to_owned(), None);
+    };
+    let rest = &uri[scheme.len() + 1..];
+    let scheme = scheme.to_ascii_lowercase();
+    let rest = match rest.strip_prefix("//") {
+        Some(after) => {
+            let end = after.find('/').unwrap_or(after.len());
+            format!("//{}{}", after[..end].to_ascii_lowercase(), &after[end..])
+        }
+        None => rest.to_owned(),
+    };
+    (format!("{scheme}:{rest}"), Some(scheme))
+}
+
+/// The direct subschemas of a schema object — the keyword table the 0.34
+/// registry crawled (`referencing` 0.34 `subresources::object_iter`), and
+/// nothing else: data positions (`enum`, `const`, `default`,
+/// `examples`, unknown keywords) are not schemas and are skipped.
+fn subschemas(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> impl Iterator<Item = &serde_json::Value> {
+    map.iter().flat_map(|(keyword, value)| {
+        let children: Box<dyn Iterator<Item = &serde_json::Value>> = match (keyword.as_str(), value)
+        {
+            (
+                "additionalProperties"
+                | "contains"
+                | "contentSchema"
+                | "else"
+                | "if"
+                | "items"
+                | "not"
+                | "propertyNames"
+                | "then"
+                | "unevaluatedItems"
+                | "unevaluatedProperties",
+                _,
+            ) => Box::new(std::iter::once(value)),
+            ("allOf" | "anyOf" | "oneOf" | "prefixItems", serde_json::Value::Array(items)) => {
+                Box::new(items.iter())
+            }
+            (
+                "$defs" | "definitions" | "dependentSchemas" | "patternProperties" | "properties",
+                serde_json::Value::Object(children),
+            ) => Box::new(children.values()),
+            _ => Box::new(std::iter::empty()),
+        };
+        children
+    })
 }
 
 /// Compile a `schema_file:` path into a [`CompiledSchemaCheck`].
@@ -333,6 +541,143 @@ $ref: "https://json-schema.org/draft/2020-12/schema"
             }
             other => panic!("expected SchemaCompile error, got {other:?}"),
         }
+    }
+
+    /// Compile `schema` inline and return the `SchemaCompile` message,
+    /// panicking on any other outcome.
+    fn compile_error_message(schema: serde_json::Value) -> String {
+        let yaml: serde_norway::Value =
+            serde_norway::from_str(&schema.to_string()).expect("json is valid yaml");
+        match compile_inline("test.bad", &yaml, None) {
+            Err(ExecError::SchemaCompile { rule_id, message }) => {
+                assert_eq!(rule_id, "test.bad");
+                message
+            }
+            other => panic!("expected SchemaCompile error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compile_inline_rejects_external_refs_with_stable_message() {
+        // http / file / relative-file `$ref` are all rejected at compile
+        // time by our own pre-walk, with a message that does not depend
+        // on the jsonschema crate's wording.
+        for uri in [
+            "https://json-schema.org/draft/2020-12/schema",
+            "file:///etc/passwd",
+            "./other.schema.json",
+            "other.schema.json#/$defs/x",
+        ] {
+            let message = compile_error_message(serde_json::json!({
+                "type": "object",
+                "properties": {"a": {"$ref": uri}},
+            }));
+            assert_eq!(message, format!("external $ref is not supported: {uri}"));
+        }
+    }
+
+    #[test]
+    fn compile_inline_rejects_unknown_meta_schema_with_0_34_message() {
+        for (uri, expected) in [
+            (
+                "https://example.com/custom-meta",
+                "Resource 'https://example.com/custom-meta' is not present in a registry and \
+                 retrieving it failed: `resolve-http` feature or a custom resolver is required \
+                 to resolve external schemas via HTTP",
+            ),
+            (
+                "file:///tmp/meta.json",
+                "Resource 'file:///tmp/meta.json' is not present in a registry and retrieving \
+                 it failed: `resolve-file` feature or a custom resolver is required to resolve \
+                 external schemas via files",
+            ),
+            (
+                "meta.json",
+                "Resource 'meta.json' is not present in a registry and retrieving it failed: \
+                 No base URI is available",
+            ),
+            (
+                "urn:x:y",
+                "Resource 'urn:x:y' is not present in a registry and retrieving it failed: \
+                 Unknown scheme urn",
+            ),
+        ] {
+            let message = compile_error_message(serde_json::json!({
+                "properties": {"a": {"$schema": uri, "type": "string"}},
+            }));
+            assert_eq!(message, expected, "for $schema {uri}");
+        }
+    }
+
+    #[test]
+    fn compile_inline_ignores_meta_schema_lookalikes_in_data_positions() {
+        for schema in [
+            serde_json::json!({"enum": [{"$schema": "https://example.com/m"}]}),
+            serde_json::json!({"const": {"$schema": "https://example.com/m"}}),
+            serde_json::json!({"default": {"$schema": "https://example.com/m"}}),
+            serde_json::json!({"x-ext": {"$schema": "https://example.com/m"}}),
+        ] {
+            let yaml: serde_norway::Value =
+                serde_norway::from_str(&schema.to_string()).expect("json is valid yaml");
+            assert!(
+                compile_inline("test.ok", &yaml, None).is_ok(),
+                "{schema} should compile"
+            );
+        }
+    }
+
+    #[test]
+    fn compile_inline_accepts_bundled_and_self_identified_meta_schemas() {
+        for schema in [
+            serde_json::json!({"$schema": "https://json-schema.org/draft/2020-12/schema"}),
+            serde_json::json!({"$schema": "http://json-schema.org/draft-07/schema#"}),
+            serde_json::json!({"$id": "https://example.com/m", "$schema": "https://example.com/m#"}),
+        ] {
+            let yaml: serde_norway::Value =
+                serde_norway::from_str(&schema.to_string()).expect("json is valid yaml");
+            assert!(
+                compile_inline("test.ok", &yaml, None).is_ok(),
+                "{schema} should compile"
+            );
+        }
+    }
+
+    #[test]
+    fn compile_inline_accepts_internal_ref() {
+        let yaml: serde_norway::Value = serde_norway::from_str(
+            r##"
+properties:
+  code: {$ref: "#/$defs/code"}
+$defs:
+  code: {enum: [AA, BB]}
+"##,
+        )
+        .expect("yaml parse");
+        let compiled = compile_inline("test.rule", &yaml, None).expect("internal $ref compiles");
+        assert!(
+            compiled
+                .validator
+                .is_valid(&serde_json::json!({"code": "AA"}))
+        );
+        assert!(
+            !compiled
+                .validator
+                .is_valid(&serde_json::json!({"code": "CC"}))
+        );
+    }
+
+    #[test]
+    fn compile_inline_rejects_external_dynamic_ref_at_compile_time() {
+        // `$dynamicRef` is not covered by the `$ref` pre-walk; the
+        // validator itself must still refuse it at compile time instead
+        // of deferring to validate-time or reaching the network.
+        let message = compile_error_message(serde_json::json!({
+            "$dynamicRef": "https://example.com/remote.json",
+        }));
+        assert!(
+            message.contains("https://example.com/remote.json"),
+            "message should name the refused URI, got: {message}"
+        );
     }
 
     #[test]

@@ -12,8 +12,9 @@
 //! see a re-emitted buffer whose span map has been regenerated and the
 //! numbers would drift.
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use dq_core::{Document, Pointer, Value};
+use std::hint::black_box;
 
 /// Hand-written k8s deployment fixture — same shape as
 /// `crates/dq-cli/tests/fixtures/k8s_deployment_writable.yaml` but

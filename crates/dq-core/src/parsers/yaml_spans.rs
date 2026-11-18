@@ -231,7 +231,7 @@ fn build_span_map_and_block_scalars(bytes: &[u8]) -> Result<(SpanMap, HashSet<St
 
     let mut spans = SpanMap::new();
     let mut block_scalars: HashSet<String> = HashSet::new();
-    let mut state = State::new(bytes, multi_doc, &char_to_byte);
+    let mut state = State::new(text, multi_doc, &char_to_byte);
 
     let mut parser = YamlParser::new_from_str(text);
     while let Some(item) = parser.next_event() {
@@ -355,6 +355,11 @@ enum Frame {
         /// Byte offset of the `SequenceStart` event — mirrors
         /// [`Frame::Mapping::start_byte`].
         start_byte: usize,
+        /// `true` for an indentless block sequence — a mapping value whose
+        /// `-` entries sit at the key's column (`key:` then `- item`). The
+        /// 0.0.6 scanner opens no indentation level for it; see
+        /// [`State::block_indent`].
+        indentless: bool,
     },
 }
 
@@ -365,6 +370,8 @@ enum ContextStyle {
 }
 
 struct State<'src> {
+    /// The source text; `bytes` is the same buffer viewed as bytes.
+    text: &'src str,
     bytes: &'src [u8],
     /// Map from `Marker::index()` (character offset) to byte offset. See
     /// [`build_char_to_byte_map`] for the rationale.
@@ -374,18 +381,24 @@ struct State<'src> {
     seen_first_doc: bool,
     stack: Vec<Frame>,
     path: Vec<String>,
+    /// Position of the next event in the parser's stream (`StreamStart` is
+    /// 0). [`State::block_scalar_body_start`] replays the stream up to this
+    /// position.
+    next_ordinal: usize,
 }
 
 impl<'src> State<'src> {
-    fn new(bytes: &'src [u8], multi_doc: bool, char_to_byte: &'src [usize]) -> Self {
+    fn new(text: &'src str, multi_doc: bool, char_to_byte: &'src [usize]) -> Self {
         Self {
-            bytes,
+            text,
+            bytes: text.as_bytes(),
             char_to_byte,
             multi_doc,
             doc_index: 0,
             seen_first_doc: false,
             stack: Vec::new(),
             path: Vec::new(),
+            next_ordinal: 0,
         }
     }
 
@@ -396,6 +409,8 @@ impl<'src> State<'src> {
         spans: &mut SpanMap,
         block_scalars: &mut HashSet<String>,
     ) -> std::result::Result<(), Error> {
+        let ordinal = self.next_ordinal;
+        self.next_ordinal += 1;
         match event {
             Event::StreamStart | Event::StreamEnd | Event::Nothing => {}
             Event::DocumentStart(_) => {
@@ -412,7 +427,8 @@ impl<'src> State<'src> {
                     self.path.pop();
                 }
             }
-            Event::Scalar(value, style, _anchor, _tag) => {
+            Event::Scalar(value, style, anchor, tag) => {
+                let n_properties = usize::from(anchor != 0) + usize::from(tag.is_some());
                 let is_key = matches!(
                     self.stack.last(),
                     Some(Frame::Mapping {
@@ -421,7 +437,8 @@ impl<'src> State<'src> {
                     })
                 );
                 if is_key {
-                    let key_str = pointer_escape(value.as_ref());
+                    let key_str =
+                        pointer_escape(legacy_key_text(value.as_ref(), style, n_properties));
                     if let Some(Frame::Mapping {
                         pending_key,
                         saw_child,
@@ -438,10 +455,15 @@ impl<'src> State<'src> {
                     }
                 } else {
                     let pointer = self.value_pointer();
-                    let value_range = span_to_range(span, self.char_to_byte);
+                    let (value_range, col) = if n_properties == 0 {
+                        (span_to_range(span, self.char_to_byte), span.start.col())
+                    } else {
+                        let is_empty_node = style == ScalarStyle::Plain && value.is_empty();
+                        self.legacy_scalar_span(span, style, is_empty_node, n_properties, ordinal)
+                    };
                     let context = self.value_context();
                     let line_range = self.compute_line_range(&value_range, context, style);
-                    let indent = u32::try_from(span.start.col()).unwrap_or(u32::MAX);
+                    let indent = u32::try_from(col).unwrap_or(u32::MAX);
                     if matches!(style, ScalarStyle::Literal | ScalarStyle::Folded) {
                         // Record the canonical pointer alongside the span
                         // so [`build_provenance_with_inline_offsets`] can
@@ -474,22 +496,34 @@ impl<'src> State<'src> {
                 );
                 self.complete_value();
             }
-            Event::SequenceStart(_anchor, _tag) => {
-                let start_byte = char_index_to_byte(self.char_to_byte, span.start.index());
+            Event::SequenceStart(anchor, tag) => {
+                let n_properties = usize::from(anchor != 0) + usize::from(tag.is_some());
+                let start_byte = self.legacy_container_start(span, n_properties);
                 let style = detect_container_style(self.bytes, start_byte);
+                let indentless = style == ContextStyle::Block
+                    && matches!(
+                        self.stack.last(),
+                        Some(Frame::Mapping {
+                            style: ContextStyle::Block,
+                            ..
+                        })
+                    )
+                    && !starts_line(self.bytes, start_byte);
                 self.enter_container();
                 self.stack.push(Frame::Sequence {
                     index: 0,
                     style,
                     start_byte,
+                    indentless,
                 });
             }
             Event::SequenceEnd => {
                 let end_byte = char_index_to_byte(self.char_to_byte, span.end.index());
                 self.leave_container_recording_empty(spans, end_byte);
             }
-            Event::MappingStart(_anchor, _tag) => {
-                let start_byte = char_index_to_byte(self.char_to_byte, span.start.index());
+            Event::MappingStart(anchor, tag) => {
+                let n_properties = usize::from(anchor != 0) + usize::from(tag.is_some());
+                let start_byte = self.legacy_container_start(span, n_properties);
                 let style = detect_container_style(self.bytes, start_byte);
                 self.enter_container();
                 self.stack.push(Frame::Mapping {
@@ -505,6 +539,203 @@ impl<'src> State<'src> {
             }
         }
         Ok(())
+    }
+
+    /// Byte range and 0-based character column of a scalar that carries
+    /// `n_properties` (> 0) node properties, in the saphyr-parser 0.0.6 shape.
+    /// See the "saphyr-parser 0.0.6 span compatibility" section below.
+    fn legacy_scalar_span(
+        &self,
+        span: Span,
+        style: ScalarStyle,
+        is_empty_node: bool,
+        n_properties: usize,
+        ordinal: usize,
+    ) -> (Range<usize>, usize) {
+        let props_start = char_index_to_byte(self.char_to_byte, span.start.index());
+        let end = char_index_to_byte(self.char_to_byte, span.end.index());
+        let (props_end, content_start) =
+            skip_node_properties(self.bytes, props_start, n_properties);
+        let range = if is_empty_node {
+            // 0.0.6 reported the span of the token that follows the
+            // properties.
+            return self.legacy_empty_node_span(content_start);
+        } else if matches!(style, ScalarStyle::Literal | ScalarStyle::Folded) {
+            self.block_scalar_body_start(props_start..props_end, ordinal)
+                .unwrap_or(content_start)..end
+        } else {
+            content_start..end
+        };
+        let col = char_column(self.text, range.start);
+        (range, col)
+    }
+
+    /// Start byte of a container that carries `n_properties` node properties,
+    /// in the saphyr-parser 0.0.6 shape: the start of the container's first
+    /// token.
+    ///
+    /// Since 0.1 the event span runs from the first property to the end of
+    /// that token. A flow container's first token is the indicator plus the
+    /// blanks after it, so its start is the `{` / `[` itself. The block
+    /// tokens (`BlockMappingStart`, `BlockSequenceStart`, and the
+    /// `BlockEntry` that opens an indentless sequence) are zero-width, so the
+    /// end of the span is their start — for an indentless sequence that is
+    /// past the `- `, not at the `-`.
+    fn legacy_container_start(&self, span: Span, n_properties: usize) -> usize {
+        let start = char_index_to_byte(self.char_to_byte, span.start.index());
+        if n_properties == 0 {
+            return start;
+        }
+        let content_start = skip_node_properties(self.bytes, start, n_properties).1;
+        if matches!(self.bytes.get(content_start), Some(b'{' | b'[')) {
+            content_start
+        } else {
+            char_index_to_byte(self.char_to_byte, span.end.index())
+        }
+    }
+
+    /// Byte range and 0-based character column saphyr-parser 0.0.6 reported
+    /// for an empty node with properties: the span of the token that follows
+    /// the properties. `pos` is where the scanner resumes after them (past
+    /// separating blanks, line breaks and comments); the parent container is
+    /// the top of `self.stack`.
+    ///
+    /// Mirrors the 0.0.6 scanner's token spans (unchanged in 0.3, which no
+    /// longer exposes them):
+    ///
+    /// - end of input (`StreamEnd`, or a `BlockEnd` emitted there): empty at
+    ///   the end, column forced to 0;
+    /// - a token left of the innermost block indentation is preceded by a
+    ///   `BlockEnd`, empty at `pos`;
+    /// - `-` (`BlockEntry`): empty, past the `-` and the blanks / comment
+    ///   that follow it on the line;
+    /// - `,` `]` `}` (`FlowEntry`, flow end): the indicator plus the blanks /
+    ///   comment after it — unless an implicit flow mapping (`[a: &x, …]`)
+    ///   ends first, which is an empty `FlowMappingEnd` at `pos`;
+    /// - `?` (`Key`): the indicator plus the whitespace, line breaks and
+    ///   comments after it;
+    /// - `---` / `...` after a root node: the 3-byte marker;
+    /// - anything else — `:` (`Value`), an implicit key, a `BlockEnd`: empty
+    ///   at `pos`.
+    fn legacy_empty_node_span(&self, pos: usize) -> (Range<usize>, usize) {
+        let bytes = self.bytes;
+        let Some(&first) = bytes.get(pos) else {
+            return (bytes.len()..bytes.len(), 0);
+        };
+        let followed_by_blank = matches!(
+            bytes.get(pos + 1),
+            None | Some(b' ' | b'\t' | b'\n' | b'\r')
+        );
+        let in_flow = self.stack.iter().any(|frame| {
+            matches!(
+                frame,
+                Frame::Mapping {
+                    style: ContextStyle::Flow,
+                    ..
+                } | Frame::Sequence {
+                    style: ContextStyle::Flow,
+                    ..
+                }
+            )
+        });
+        let end = match self.stack.last() {
+            None => {
+                let is_document_marker = line_offset(bytes, pos) == 0
+                    && matches!(bytes.get(pos..pos + 3), Some(b"---" | b"..."))
+                    && matches!(
+                        bytes.get(pos + 3),
+                        None | Some(b' ' | b'\t' | b'\n' | b'\r')
+                    );
+                if is_document_marker { pos + 3 } else { pos }
+            }
+            Some(top) if in_flow => {
+                // A block-styled mapping inside a flow collection is an
+                // implicit flow mapping (`[a: b]`); `,` and `]` end it first.
+                let implicit_mapping = matches!(
+                    top,
+                    Frame::Mapping {
+                        style: ContextStyle::Block,
+                        ..
+                    }
+                );
+                match first {
+                    b',' | b']' if implicit_mapping => pos,
+                    b',' | b']' | b'}' => skip_ws_to_eol(bytes, pos + 1),
+                    b'?' => skip_yaml_whitespace(bytes, pos + 1),
+                    _ => pos,
+                }
+            }
+            Some(_) if line_offset(bytes, pos) < self.block_indent() => pos,
+            Some(_) => match first {
+                b'-' if followed_by_blank => {
+                    // `BlockEntry` is empty, at the end of what it skips.
+                    let end = skip_ws_to_eol(bytes, pos + 1);
+                    return (end..end, char_column(self.text, end));
+                }
+                b'?' if followed_by_blank => skip_yaml_whitespace(bytes, pos + 1),
+                _ => pos,
+            },
+        };
+        (pos..end, char_column(self.text, pos))
+    }
+
+    /// Byte column of the innermost block indentation level the 0.0.6
+    /// scanner tracks: a block mapping's first key, or a block sequence's
+    /// first `-`. An indentless sequence (`key:` followed by `- item` at the
+    /// key's column) opens no level of its own.
+    fn block_indent(&self) -> usize {
+        for frame in self.stack.iter().rev() {
+            match frame {
+                Frame::Sequence {
+                    indentless: true, ..
+                } => {}
+                Frame::Mapping { start_byte, .. } | Frame::Sequence { start_byte, .. } => {
+                    return line_offset(self.bytes, *start_byte);
+                }
+            }
+        }
+        0
+    }
+
+    /// Byte offset where saphyr-parser 0.0.6 started the span of the block
+    /// scalar whose node properties occupy `props` — the first content line,
+    /// not the `|` / `>` indicator.
+    ///
+    /// The scanner's block-scalar rules (indentation auto-detection, explicit
+    /// indentation indicators, leading blank lines) are not re-implemented
+    /// here. Instead the stream is replayed with the properties blanked out
+    /// (line breaks kept, so character indices and lines stay put): without
+    /// properties saphyr-parser reports the 0.0.6 start as it is. Events
+    /// before `ordinal` are unaffected by the blanking, so the replay can stop
+    /// there — an alias of the blanked anchor can only come later.
+    ///
+    /// Costs one extra parse per block scalar with properties. `None` only if
+    /// the replay diverges, which would be a parser bug.
+    fn block_scalar_body_start(&self, props: Range<usize>, ordinal: usize) -> Option<usize> {
+        let text = self.text;
+        let mut blanked = String::with_capacity(text.len());
+        blanked.push_str(text.get(..props.start)?);
+        for ch in text.get(props.clone())?.chars() {
+            blanked.push(if matches!(ch, '\n' | '\r') { ch } else { ' ' });
+        }
+        blanked.push_str(text.get(props.end..)?);
+
+        let mut parser = YamlParser::new_from_str(&blanked);
+        for _ in 0..ordinal {
+            parser.next_event()?.ok()?;
+        }
+        match parser.next_event()?.ok()? {
+            (Event::Scalar(_, ScalarStyle::Literal | ScalarStyle::Folded, _, _), span) => {
+                Some(char_index_to_byte(self.char_to_byte, span.start.index()))
+            }
+            (other, _) => {
+                tracing::debug!(
+                    ?other,
+                    "block-scalar span replay diverged; using the indicator position",
+                );
+                None
+            }
+        }
     }
 
     fn value_pointer(&mut self) -> String {
@@ -597,6 +828,7 @@ impl<'src> State<'src> {
                 start_byte,
                 style,
                 index,
+                ..
             }) => (
                 *index == 0,
                 *start_byte,
@@ -750,6 +982,170 @@ fn span_to_range(span: Span, char_to_byte: &[usize]) -> Range<usize> {
     let start = char_index_to_byte(char_to_byte, span.start.index());
     let end = char_index_to_byte(char_to_byte, span.end.index());
     start..end
+}
+
+// ---------------------------------------------------------------------------
+// saphyr-parser 0.0.6 span compatibility
+// ---------------------------------------------------------------------------
+//
+// The span builder was validated against saphyr-parser 0.0.6. Later releases
+// changed two things the `SpanMap` depends on; the helpers below map the new
+// events back to the 0.0.6 shape so spans stay byte-identical:
+//
+// 1. Since 0.1 a node's span starts at its first node property (`&anchor`,
+//    `!tag`), not at its content. 0.0.6 started it at the content token: the
+//    first non-separation byte for flow scalars and containers, the first
+//    content line for block scalars. An empty node with properties
+//    (`key: &a` followed by a newline) got the span of the token after the
+//    properties; 0.3 gives the span of the properties themselves.
+// 2. Since 0.1 an empty node (`: value`, `key:`) is the scalar `""`; 0.0.6
+//    reported `~`. Only keys use the scalar text.
+
+/// Key text in the saphyr-parser 0.0.6 shape: an empty key node without
+/// properties was reported as `~` (pointer segment `~0`).
+fn legacy_key_text(value: &str, style: ScalarStyle, n_properties: usize) -> &str {
+    // A plain scalar token is never empty, so a plain `""` is an empty node.
+    if value.is_empty() && style == ScalarStyle::Plain && n_properties == 0 {
+        "~"
+    } else {
+        value
+    }
+}
+
+/// Skip `n_properties` node properties starting at byte `pos` (the first
+/// property). Returns `(end of the last property, start of the content
+/// token)`; the content start is past any separating whitespace, line breaks
+/// and comments.
+fn skip_node_properties(bytes: &[u8], pos: usize, n_properties: usize) -> (usize, usize) {
+    let mut pos = pos;
+    for i in 0..n_properties {
+        if i > 0 {
+            pos = skip_separation(bytes, pos);
+        }
+        pos = skip_property(bytes, pos);
+    }
+    (pos, skip_separation(bytes, pos))
+}
+
+/// Skip one `&anchor`, `!tag` or `!<verbatim>` property at byte `pos`.
+/// Anchor and tag characters end at whitespace, a line break or a flow
+/// indicator (YAML 1.2 `ns-anchor-char` / `ns-tag-char`); a verbatim tag ends
+/// after its `>`.
+fn skip_property(bytes: &[u8], pos: usize) -> usize {
+    let ends_property = |b: u8| {
+        matches!(
+            b,
+            b' ' | b'\t' | b'\n' | b'\r' | b',' | b'[' | b']' | b'{' | b'}'
+        )
+    };
+    match (bytes.get(pos), bytes.get(pos + 1)) {
+        (Some(b'!'), Some(b'<')) => bytes[pos..]
+            .iter()
+            .position(|&b| b == b'>')
+            .map_or(bytes.len(), |off| pos + off + 1),
+        (Some(b'&' | b'!'), _) => {
+            let mut end = pos + 1;
+            while end < bytes.len() && !ends_property(bytes[end]) {
+                end += 1;
+            }
+            end
+        }
+        _ => pos,
+    }
+}
+
+/// Skip whitespace, line breaks and comments starting at byte `pos`.
+fn skip_separation(bytes: &[u8], pos: usize) -> usize {
+    let mut pos = pos;
+    while let Some(&b) = bytes.get(pos) {
+        match b {
+            b' ' | b'\t' | b'\n' | b'\r' => pos += 1,
+            b'#' => {
+                while pos < bytes.len() && !matches!(bytes[pos], b'\n' | b'\r') {
+                    pos += 1;
+                }
+            }
+            _ => break,
+        }
+    }
+    pos
+}
+
+/// Skip the blanks and the comment that follow a token on its line, the way
+/// the 0.0.6 scanner's `skip_ws_to_eol` does: spaces and tabs, then a `#`
+/// comment if blanks preceded it. Stops before the line break.
+fn skip_ws_to_eol(bytes: &[u8], pos: usize) -> usize {
+    let mut pos = pos;
+    let mut saw_blank = false;
+    while let Some(&b) = bytes.get(pos) {
+        match b {
+            b' ' | b'\t' => {
+                saw_blank = true;
+                pos += 1;
+            }
+            b'#' if saw_blank => {
+                while pos < bytes.len() && !matches!(bytes[pos], b'\n' | b'\r') {
+                    pos += 1;
+                }
+            }
+            _ => break,
+        }
+    }
+    pos
+}
+
+/// Skip spaces, line breaks and comments the way the 0.0.6 scanner's
+/// `skip_yaml_whitespace` does after a `?` indicator. Tabs end the skip.
+fn skip_yaml_whitespace(bytes: &[u8], pos: usize) -> usize {
+    let mut pos = pos;
+    while let Some(&b) = bytes.get(pos) {
+        match b {
+            b' ' | b'\n' | b'\r' => pos += 1,
+            b'#' => {
+                while pos < bytes.len() && !matches!(bytes[pos], b'\n' | b'\r') {
+                    pos += 1;
+                }
+            }
+            _ => break,
+        }
+    }
+    pos
+}
+
+/// `true` if only spaces and tabs precede byte `pos` on its line.
+fn starts_line(bytes: &[u8], pos: usize) -> bool {
+    let pos = pos.min(bytes.len());
+    bytes[..pos]
+        .iter()
+        .rev()
+        .take_while(|&&b| !matches!(b, b'\n' | b'\r'))
+        .all(|&b| matches!(b, b' ' | b'\t'))
+}
+
+/// Byte offset of `pos` from the start of its line.
+fn line_offset(bytes: &[u8], pos: usize) -> usize {
+    let pos = pos.min(bytes.len());
+    let line_start = bytes[..pos]
+        .iter()
+        .rposition(|&b| matches!(b, b'\n' | b'\r'))
+        .map_or(0, |i| i + 1);
+    pos - line_start
+}
+
+/// 0-based character column of byte `pos`, counted the way saphyr-parser
+/// counts `Marker::col()`: a byte-order mark opening the stream is not a
+/// column.
+fn char_column(text: &str, pos: usize) -> usize {
+    let pos = pos.min(text.len());
+    let mut line_start = text.as_bytes()[..pos]
+        .iter()
+        .rposition(|&b| matches!(b, b'\n' | b'\r'))
+        .map_or(0, |i| i + 1);
+    if line_start == 0 && text.starts_with('\u{feff}') {
+        line_start = '\u{feff}'.len_utf8();
+    }
+    text.get(line_start..pos)
+        .map_or(0, |line| line.chars().count())
 }
 
 // ---------------------------------------------------------------------------

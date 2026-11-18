@@ -47,7 +47,8 @@ use std::ops::Range;
 
 use indexmap::IndexMap;
 use toml_edit::{
-    Array as TomlArray, ArrayOfTables, ImDocument, InlineTable, Item, Table, Value as TomlValue,
+    Array as TomlArray, ArrayOfTables, Document as TomlDocument, InlineTable, Item, Table,
+    Value as TomlValue,
 };
 
 use crate::Result;
@@ -81,15 +82,15 @@ impl Format for Toml {
             snippet: String::new(),
             message: format!("invalid UTF-8 in TOML input: {e}"),
         })?;
-        // We parse via `ImDocument` (immutable) rather than `DocumentMut`
-        // because only `ImDocument::parse` preserves the byte spans on
-        // every node (see toml_edit 0.22 docs — `DocumentMut::from_str`
-        // explicitly drops span information). The §4 baseline never
-        // mutates the parsed DOM — splices land in `original_bytes` —
-        // so the lack of mutation API is no constraint.
-        let doc = ImDocument::parse(text).map_err(|e| {
+        // We parse via the immutable `toml_edit::Document` (named
+        // `ImDocument` before 0.23) rather than `DocumentMut` because only
+        // `Document::parse` preserves the byte spans on every node
+        // (`DocumentMut::from_str` explicitly drops span information). The
+        // §4 baseline never mutates the parsed DOM — splices land in
+        // `original_bytes` — so the lack of mutation API is no constraint.
+        let doc = TomlDocument::parse(text).map_err(|e| {
             // `toml_edit::TomlError::span()` returns the byte range of the
-            // failing construct. The 0.22 API does not expose a `line_col`
+            // failing construct. The 0.25 API does not expose a `line_col`
             // helper, so we re-derive the 1-indexed position by counting
             // newlines up to the span's start. `message()` is the canonical
             // human-friendly summary the CLI's diagnostic renderer expects.
@@ -202,7 +203,7 @@ impl Format for Toml {
 /// Walk the parsed document, populating `spans` with one [`ValueSpan`] per
 /// scalar leaf and returning the equivalent [`Value`] tree.
 fn build_value_and_spans<S: AsRef<str>>(
-    doc: &ImDocument<S>,
+    doc: &TomlDocument<S>,
     bytes: &[u8],
     spans: &mut SpanMap,
 ) -> Value {
@@ -289,7 +290,7 @@ fn walk_value(
 }
 
 /// Record a scalar's `ValueSpan` if `toml_edit` reported a byte span. The
-/// 0.22 API guarantees `span()` is `Some` for parsed values; the `None`
+/// 0.25 API guarantees `span()` is `Some` for parsed values; the `None`
 /// branch only fires for synthesized values produced by mutation, which
 /// cannot occur here because we only walk freshly-parsed documents.
 fn record_scalar(

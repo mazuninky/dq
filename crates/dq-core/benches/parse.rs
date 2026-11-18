@@ -11,8 +11,9 @@
 //! statistics stabilise without pushing into >10s runs even on slower
 //! hardware.
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
+use std::hint::black_box;
 
 /// Three input sizes per format. `xml` overrides with a smaller ladder
 /// because its conventional-key shape (`@attrs` / `#text`) bloats the
@@ -27,9 +28,9 @@ fn synth_record(rng: &mut StdRng, idx: usize) -> (String, i32, String, bool) {
     let names = [
         "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
     ];
-    let name = names[rng.gen_range(0..names.len())];
-    let age = rng.gen_range(18..90);
-    let active = rng.r#gen::<bool>();
+    let name = names[rng.random_range(0..names.len())];
+    let age = rng.random_range(18..90);
+    let active = rng.random::<bool>();
     let email = format!("{name}{idx}@example.com");
     (name.to_owned(), age, email, active)
 }

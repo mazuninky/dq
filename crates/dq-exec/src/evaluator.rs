@@ -696,7 +696,7 @@ fn run_schema_check(
     // `(instance_path, error_text)` against the same file.
     let mut seen: IndexSet<(String, String, String)> = IndexSet::new();
     for error in compiled.validator.iter_errors(value) {
-        let pointer_str = error.instance_path.as_str();
+        let pointer_str = error.instance_path().as_str();
         // The validator's error text (without the schema_path prefix)
         // is what the user sees as the actual violation. Use it for
         // dedup so duplicates at different `schema_path` locations
@@ -744,7 +744,12 @@ fn run_schema_check(
             }
         };
         let prefix = compiled.message_prefix.as_deref().unwrap_or("");
-        let keyword = error.schema_path.as_str();
+        // `evaluation_path()` is the dynamic path *including* `$ref`
+        // traversals (`/properties/x/$ref/enum`) — what jsonschema
+        // ≤ 0.38 exposed as `schema_path`. Since 0.39 `schema_path()` is
+        // the canonical location without `$ref` (`/$defs/codes/enum`);
+        // using it would silently change every diagnostic under a `$ref`.
+        let keyword = error.evaluation_path().as_str();
         let message = format!("{prefix}{keyword}: {error_text}");
         out.push(Diagnostic {
             rule_id: rule.rule.id.clone(),
@@ -1558,6 +1563,40 @@ check:
             diags[0].message.to_lowercase().contains("metadata"),
             "expected the surviving diagnostic to mention the missing property, got: {}",
             diags[0].message,
+        );
+    }
+
+    #[test]
+    fn schema_check_message_keyword_location_keeps_ref_traversal() {
+        // Pins the `<keyword_location>: <error>` message shape for an
+        // error reached through `$ref`. jsonschema ≥ 0.39 split the old
+        // `schema_path` (which included `$ref`) into `evaluation_path()`
+        // (still includes it) and `schema_path()` (canonical target,
+        // `/$defs/code/enum`). The diagnostic must keep the former.
+        let yaml = r##"
+id: test.schema-ref-location
+description: x
+severity: error
+match:
+  format: json
+check:
+  schema:
+    type: object
+    properties:
+      code:
+        $ref: "#/$defs/code"
+    $defs:
+      code:
+        enum: [AA, BB]
+"##;
+        let eval = evaluator_from_yaml(yaml);
+        let value = json!({"code": "CC"});
+        let owned = ir_for_test(&value, "json");
+        let diags = eval.evaluate_file(&Utf8PathBuf::from("d.json"), &owned.to_borrowed(), "json");
+        assert_eq!(diags.len(), 1, "expected one diagnostic, got: {diags:?}");
+        assert_eq!(
+            diags[0].message,
+            r#"/properties/code/$ref/enum: "CC" is not one of "AA" or "BB""#,
         );
     }
 
