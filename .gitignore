@@ -25,6 +25,17 @@ openspec/changes/.openspec.cache/
 # Subagent scratch memory (rust-cli-writer / rust-cli-test-writer)
 .claude/agent-memory/
 
+# Local-only Claude Code agent setup (agents, delegation rules, conventions) — not published
+.claude/agents/
+.claude/conventions/
+.claude/rules/rust-cli-delegation.md
+.claude/rules/agent-delegation.md
+.claude/settings.local.json
+.worktreeinclude
+
+# Claude Code worktrees
+.claude/worktrees/
+
 # /local-fix per-pass artefacts (review findings + thread payloads)
 .claude/local-fix-*.jsonl
 .claude/local-fix-*.json
