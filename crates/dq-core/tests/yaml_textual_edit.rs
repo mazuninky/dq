@@ -238,6 +238,31 @@ fn alias_key_and_merge_key_keep_later_pointers_in_place() {
     );
 }
 
+// --- a tagged scalar -------------------------------------------------------------
+
+#[test]
+fn set_of_a_scalar_drops_its_core_tag_and_keeps_the_rest() {
+    let hi = || Value::String("hi".into());
+    assert_eq!(
+        set("b: !!binary |\n  aGVsbG8=\nc: 1\n", "/b", hi()),
+        "b: hi\nc: 1\n"
+    );
+    assert_eq!(set("b: !!int 5\n", "/b", hi()), "b: hi\n");
+    assert_eq!(set("b: !!str 5\n", "/b", Value::Int(7)), "b: 7\n");
+    assert_eq!(
+        set("l: [!!str 1, 2]\n", "/l/0", Value::Int(3)),
+        "l: [3, 2]\n"
+    );
+    assert_eq!(
+        set("b: &a !!float 5\nc: *a\n", "/b", Value::Int(7)),
+        "b: &a 7\nc: *a\n"
+    );
+    assert_eq!(
+        set("b: !custom x\n", "/b", Value::String("y".into())),
+        "b: !custom y\n"
+    );
+}
+
 // --- a collection where a scalar was ------------------------------------------
 
 #[test]

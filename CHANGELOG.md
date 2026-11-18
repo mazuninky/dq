@@ -294,6 +294,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `.nan`, `.inf`, `0x10`, `0o17`, `~`, `Null`, `+1` — writes it quoted;
   it used to write it plain, so it read back as a number or `null`. The
   same goes for a new key such as `null`.
+- YAML `set` of a scalar with a `!!` tag (`!!binary |`, `!!int 5`) drops
+  the tag, so the new value is typed by what it is; it used to keep it,
+  and `!!binary hi` no longer parses. Anchors and local tags (`!Ref`)
+  stay.
 - `set` / `del` on YAML, JSON and TOML check that the edited file reads
   back as the requested change. When it does not, they fail with exit 7,
   print nothing and leave the file alone; they used to write the damaged

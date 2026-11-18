@@ -777,7 +777,7 @@ impl Document {
                 && matches!(pointer.resolve(&self.value), Ok(Value::String(_))))
             .then(|| crate::parsers::yaml_spans::block_scalar_extent(&self.original_bytes, &span))
             .flatten();
-            let (replaced, rendered, value_len) = match block_scalar {
+            let (mut replaced, mut rendered, value_len) = match block_scalar {
                 Some((extent, keep)) => {
                     let mut rendered = renderer.render_replacement(&value, span.context, &[]);
                     let value_len = rendered.len();
@@ -792,6 +792,25 @@ impl Document {
                     (span.value_range.clone(), rendered, value_len)
                 }
             };
+            // A `!!` tag fixes the type of what follows it (`!!int`,
+            // `!!binary`): the new value is written untagged, typed by what
+            // it is. dq's tree carries no tags; local tags (`!Ref`) and
+            // anchors stay.
+            let mut value_start = replaced.start;
+            if self.format == FormatTag::Yaml {
+                let props_start = yaml_properties_start(&self.original_bytes, replaced.start);
+                let props = &self.original_bytes[props_start..replaced.start];
+                if props
+                    .split(u8::is_ascii_whitespace)
+                    .any(|token| token.starts_with(b"!!"))
+                {
+                    let mut kept = kept_properties(props);
+                    value_start = props_start + kept.len();
+                    kept.append(&mut rendered);
+                    rendered = kept;
+                    replaced.start = props_start;
+                }
+            }
             let delta = SpanRecomputeDelta {
                 at: replaced.start,
                 old_len: replaced.end - replaced.start,
@@ -812,9 +831,9 @@ impl Document {
             // Patch span metadata in place: keep `at` and `line_range.start`
             // anchored to the original byte position, but extend the end to
             // the new length.
-            let new_end = replaced.start + value_len;
+            let new_end = value_start + value_len;
             if let Some(updated) = self.spans.get_mut(&canonical) {
-                updated.value_range = replaced.start..new_end;
+                updated.value_range = value_start..new_end;
                 // For single-line scalars `line_range` typically equals
                 // `value_range` plus the trailing newline. Conservatively
                 // extend by the same delta so the line range stays anchored.
@@ -2314,16 +2333,24 @@ fn empty_node_replacement(props: &[u8], rendered: &[u8]) -> (Vec<u8>, usize) {
     if props.is_empty() {
         out.push(b' ');
     }
+    out.append(&mut kept_properties(props));
+    let offset = out.len();
+    out.extend_from_slice(rendered);
+    (out, offset)
+}
+
+/// The anchor and local tags of the node properties `props`, each followed
+/// by a space; `!!` tags are dropped.
+fn kept_properties(props: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(props.len());
     for token in props
-        .split(|b| b.is_ascii_whitespace())
+        .split(u8::is_ascii_whitespace)
         .filter(|token| !token.is_empty() && !token.starts_with(b"!!"))
     {
         out.extend_from_slice(token);
         out.push(b' ');
     }
-    let offset = out.len();
-    out.extend_from_slice(rendered);
-    (out, offset)
+    out
 }
 
 /// Of the recorded `scalar` child and the `collection` child spanning its
