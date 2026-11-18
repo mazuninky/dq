@@ -196,9 +196,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - JSON Schema rules whose root `$schema` names draft-04, draft-06 or
   draft-07 now validate (jsonschema 0.34 → 0.61). jsonschema 0.34 skipped
   the root keywords of such schemas, so these rules reported nothing.
-  dq applies 2020-12 semantics to them, so draft-07-only syntax such as
-  array-form `items` fails to compile. Schemas copied from SchemaStore
-  often declare draft-07 and may start reporting violations.
+  dq applies 2020-12 semantics to them, so syntax from the older drafts
+  fails to compile: array-form `items` (draft-07) and a boolean
+  `exclusiveMinimum` (draft-04) are rejected. Schemas copied from
+  SchemaStore often declare draft-07 and may start reporting violations.
 - Some JSON Schema messages read differently. `pattern` messages quote
   the regex as written in the schema (`\w+@\w+`) instead of a rewritten
   form, a `type` list is printed in a different order (`"null",
