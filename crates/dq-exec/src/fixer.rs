@@ -27,7 +27,10 @@
 //!    failures (notably [`dq_core::Error::WriteUnavailable`] when a
 //!    prior `fix.jq` rule replaced the document with a value-only one)
 //!    are logged and the rule is skipped — they are non-fatal because
-//!    the legacy path is the cause, not the offending rule.
+//!    the legacy path is the cause, not the offending rule. So is
+//!    [`dq_core::Error::EditRejected`]: the textual-edit writer cannot
+//!    make the edit without changing other parts of the file, which
+//!    leaves the finding for the user to fix.
 //! 5. Idempotency: re-eval `fix.ops` against the post-apply
 //!    `working`'s value **before** doing any byte comparison. If the
 //!    second `EditScript` is non-empty (`!is_noop()`), the rule is
@@ -231,7 +234,7 @@ impl Fixer {
 /// OPS branch of `Fixer::apply` — see module-level docs for the
 /// pipeline. Pushes the rule id into either `applied_rules` or
 /// `skipped_non_idempotent` (or neither, on a clean no-op or a
-/// non-fatal `WriteUnavailable`).
+/// non-fatal `WriteUnavailable` / `EditRejected`).
 fn apply_ops_branch(
     rule: &CompiledRule,
     path: &Utf8Path,
@@ -274,6 +277,17 @@ fn apply_ops_branch(
                 rule_id = %rule.rule.id,
                 error = %err,
                 "fix.ops cannot apply: doc is no longer write-aware (likely after a prior fix.jq); skipping",
+            );
+            return Ok(());
+        }
+        // The edit is sound but dq cannot write it without changing other
+        // parts of the file (a YAML anchor an alias still refers to, …):
+        // leave the file to the user, like any other unfixable finding.
+        if matches!(err, dq_core::Error::EditRejected { .. }) {
+            tracing::warn!(
+                rule_id = %rule.rule.id,
+                error = %err,
+                "fix.ops cannot be applied without changing other parts of the file; skipping",
             );
             return Ok(());
         }
@@ -775,6 +789,35 @@ fix:
         // Comment-preservation property: byte-level edit, surrounding
         // bytes (the trailing newline) preserved.
         assert!(doc.original_bytes().ends_with(b"\n"));
+    }
+
+    #[test]
+    fn fixer_skips_fix_ops_the_writer_rejects() {
+        // Removing `/a` would leave the alias `*m` dangling: the edit is
+        // rejected, the rule skipped, and the document left alone.
+        let yaml = r#"
+id: test.ops-remove-a
+description: no /a
+severity: warn
+match:
+  format: yaml
+check:
+  jq: 'select(has("a"))'
+  message: 'has a'
+fix:
+  ops: 'if has("a") then [{"op":"remove","path":"/a"}] else [] end'
+"#;
+        let eval = evaluator_from_yaml(yaml);
+        let fixer = Fixer::new(&eval);
+        let path = Utf8PathBuf::from("doc.yaml");
+        let src = b"a: &m 1\nb: *m\n";
+        let mut doc = parse_yaml(src);
+        let out = fixer
+            .apply(&path, &mut doc, "yaml")
+            .expect("a rejected edit is not an error");
+        assert!(!out.fixed);
+        assert!(out.applied_rules.is_empty());
+        assert_eq!(doc.original_bytes(), src);
     }
 
     #[test]

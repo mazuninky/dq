@@ -233,20 +233,22 @@ fn build_span_map_and_block_scalars(bytes: &[u8]) -> Result<(SpanMap, HashSet<St
     Ok((built.spans, built.block_scalars))
 }
 
-/// The [`ContainerLayout`] of every collection in `bytes`, keyed by the
-/// canonical pointer the [`SpanMap`] uses.
+/// What an edit of `bytes` needs to know beyond the span map: the
+/// [`ContainerLayout`] of every collection and every alias with the anchor
+/// it refers to.
 ///
 /// [`crate::document::Document::del_at`] re-parses the current bytes with
-/// this when it removes a whole collection or empties one: the span map
+/// this when it removes a whole collection or empties one — the span map
 /// keeps scalar leaves only, and a collection's entry (its key line down to
-/// its last line) is not derivable from them. The walk is the same single
-/// span-building pass `parse_yaml_with_spans` makes.
+/// its last line) is not derivable from them — and when the bytes hold an
+/// alias. The walk is the same single span-building pass
+/// `parse_yaml_with_spans` makes.
 ///
 /// # Errors
 ///
 /// Same as [`parse_with_spans`]; on bytes a write produced this only fails
 /// if that write broke the document.
-pub(crate) fn container_layout(bytes: &[u8]) -> Result<HashMap<String, ContainerLayout>> {
+pub(crate) fn edit_layout(bytes: &[u8]) -> Result<EditLayout> {
     Ok(build_span_map_with_stats(bytes, true)?
         .layout
         .unwrap_or_default())
@@ -354,8 +356,8 @@ struct BuiltSpans {
     /// of it). Two without block scalars carrying node properties, three
     /// with them — independent of how many there are.
     parser_passes: usize,
-    /// Layout of every collection, when asked for.
-    layout: Option<HashMap<String, ContainerLayout>>,
+    /// Layout of every collection and alias, when asked for.
+    layout: Option<EditLayout>,
 }
 
 /// [`build_span_map_and_block_scalars`], also reporting how many parser
@@ -388,7 +390,7 @@ fn build_span_map_with_stats(bytes: &[u8], collect_layout: bool) -> Result<Built
     let mut block_scalars: HashSet<String> = HashSet::new();
     let mut state = State::new(text, multi_doc, &char_to_byte, &body_starts);
     if collect_layout {
-        state.layout = Some(HashMap::new());
+        state.layout = Some(EditLayout::default());
     }
 
     parser_passes += 1;
@@ -763,7 +765,40 @@ struct EntryAnchor {
     value_from: usize,
 }
 
-/// Layout of one collection node, as [`container_layout`] reports it.
+/// What [`edit_layout`] reports.
+#[derive(Debug, Default)]
+pub(crate) struct EditLayout {
+    /// Layout of every collection, keyed by canonical pointer.
+    pub(crate) containers: HashMap<String, ContainerLayout>,
+    /// Every alias, in document order.
+    pub(crate) aliases: Vec<AliasRef>,
+}
+
+/// An alias and the anchored node it refers to. A redefined anchor name
+/// refers to its latest definition before the alias, as YAML resolves it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AliasRef {
+    /// Byte offset of the alias (its `*`).
+    pub(crate) alias_at: usize,
+    /// Canonical pointer of the alias node; `None` for an alias used as a
+    /// mapping key, which the value tree holds as a key's text.
+    pub(crate) alias_pointer: Option<String>,
+    /// Byte offset where the anchored node starts: its first node
+    /// property, so the `&anchor` lies in any range that holds the node.
+    pub(crate) anchor_at: usize,
+    /// Canonical pointer of the anchored node; `None` for an anchored
+    /// mapping key.
+    pub(crate) anchor_pointer: Option<String>,
+}
+
+/// Where an anchored node is, for [`AliasRef`].
+#[derive(Debug, Clone)]
+struct AnchorDef {
+    at: usize,
+    pointer: Option<String>,
+}
+
+/// Layout of one collection node, as [`edit_layout`] reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ContainerLayout {
     /// `true` for a block collection, `false` for a flow one (`{…}` / `[…]`).
@@ -814,9 +849,13 @@ struct State<'src> {
     anchored_scalars: HashMap<usize, String>,
     /// Number of flow frames on `self.stack`.
     flow_depth: usize,
-    /// Layout of every collection, keyed by canonical pointer — collected
-    /// only for [`container_layout`].
-    layout: Option<HashMap<String, ContainerLayout>>,
+    /// Layout of every collection and alias — collected only for
+    /// [`edit_layout`].
+    layout: Option<EditLayout>,
+    /// Every anchored node seen so far, keyed by anchor id — collected
+    /// with `layout`. saphyr-parser gives each definition its own id, a
+    /// redefinition included.
+    anchor_defs: HashMap<usize, AnchorDef>,
 }
 
 impl<'src> State<'src> {
@@ -840,6 +879,7 @@ impl<'src> State<'src> {
             anchored_scalars: HashMap::new(),
             flow_depth: 0,
             layout: None,
+            anchor_defs: HashMap::new(),
         }
     }
 
@@ -1025,11 +1065,13 @@ impl<'src> State<'src> {
                 if self.expects_key() {
                     let key_str =
                         pointer_escape(legacy_key_text(value.as_ref(), style, n_properties));
+                    self.note_anchor(anchor, span, None);
                     self.set_pending_key(key_str, span_to_range(span, self.char_to_byte));
                 } else {
                     let entry = self
                         .entry_anchor(char_index_to_byte(self.char_to_byte, span.start.index()));
                     let pointer = self.value_pointer();
+                    self.note_anchor(anchor, span, Some(pointer.clone()));
                     let (value_range, col) = if n_properties == 0 {
                         (span_to_range(span, self.char_to_byte), span.start.col())
                     } else {
@@ -1072,6 +1114,7 @@ impl<'src> State<'src> {
                 // text), as a value it is a span `set` can overwrite.
                 let range = span_to_range(span, self.char_to_byte);
                 if self.expects_key() {
+                    self.note_alias(anchor, range.start, None);
                     // An alias of a collection keys the value tree by its
                     // debug rendering, which no pointer can spell; the
                     // empty segment keeps the entry unaddressable.
@@ -1083,6 +1126,7 @@ impl<'src> State<'src> {
                 } else {
                     let entry = self.entry_anchor(range.start);
                     let pointer = self.value_pointer();
+                    self.note_alias(anchor, range.start, Some(pointer.clone()));
                     let context = self.value_context();
                     let line_range = self.compute_line_range(
                         &range,
@@ -1107,6 +1151,7 @@ impl<'src> State<'src> {
             Event::SequenceStart(anchor, tag) => {
                 let n_properties = usize::from(anchor != 0) + usize::from(tag.is_some());
                 self.open_container(span, n_properties, false);
+                self.note_container_anchor(anchor, span);
             }
             Event::SequenceEnd => {
                 let end_byte = char_index_to_byte(self.char_to_byte, span.end.index());
@@ -1115,6 +1160,7 @@ impl<'src> State<'src> {
             Event::MappingStart(anchor, tag) => {
                 let n_properties = usize::from(anchor != 0) + usize::from(tag.is_some());
                 self.open_container(span, n_properties, true);
+                self.note_container_anchor(anchor, span);
             }
             Event::MappingEnd => {
                 let end_byte = char_index_to_byte(self.char_to_byte, span.end.index());
@@ -1122,6 +1168,44 @@ impl<'src> State<'src> {
             }
         }
         Ok(())
+    }
+
+    /// Record the node whose event span is `span` as the definition of
+    /// `anchor` (0: none), when collecting the [`EditLayout`].
+    fn note_anchor(&mut self, anchor: usize, span: Span, pointer: Option<String>) {
+        if anchor != 0 && self.layout.is_some() {
+            let at = char_index_to_byte(self.char_to_byte, span.start.index());
+            self.anchor_defs.insert(anchor, AnchorDef { at, pointer });
+        }
+    }
+
+    /// [`State::note_anchor`] for the collection just opened: its pointer
+    /// is the current path.
+    fn note_container_anchor(&mut self, anchor: usize, span: Span) {
+        if anchor != 0 && self.layout.is_some() {
+            let pointer = if self.path.is_empty() {
+                String::new()
+            } else {
+                format!("/{}", self.path.join("/"))
+            };
+            self.note_anchor(anchor, span, Some(pointer));
+        }
+    }
+
+    /// Record an alias of `anchor` at byte `at`, when collecting the
+    /// [`EditLayout`].
+    fn note_alias(&mut self, anchor: usize, at: usize, pointer: Option<String>) {
+        let Some(layout) = self.layout.as_mut() else {
+            return;
+        };
+        if let Some(def) = self.anchor_defs.get(&anchor) {
+            layout.aliases.push(AliasRef {
+                alias_at: at,
+                alias_pointer: pointer,
+                anchor_at: def.at,
+                anchor_pointer: def.pointer.clone(),
+            });
+        }
     }
 
     /// Byte range and 0-based character column of a scalar that carries
@@ -1372,7 +1456,7 @@ impl<'src> State<'src> {
             let container = parent.container_mut();
             container.content_end = container.content_end.max(end);
         }
-        if let Some(layout) = self.layout.as_mut() {
+        if let Some(layout) = self.layout.as_mut().map(|layout| &mut layout.containers) {
             let top_level = self.stack.len() == 1;
             let block = style == ContextStyle::Block;
             let pointer = if self.path.is_empty() {

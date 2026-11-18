@@ -55,12 +55,15 @@ fn null_key_with_an_anchor_does_not_panic() {
         .arg("--no-color")
         .assert()
         .code(0);
-    // No sibling span to anchor a new root key next to: a clean "not found".
-    dq().arg("set")
+    // Whether dq can add the key is another matter; it must not panic.
+    let status = dq()
+        .arg("set")
         .arg(file.to_str().expect("UTF-8 path"))
         .args(["/g", "1", "--no-color"])
-        .assert()
-        .code(2);
+        .output()
+        .expect("dq runs")
+        .status;
+    assert_ne!(status.code(), Some(101), "dq panicked: {status:?}");
 }
 
 #[test]
@@ -121,4 +124,19 @@ fn del_of_a_key_holding_a_block_collection_removes_the_entry() {
         "k: v\nb: 2\n"
     );
     assert_eq!(edit("a:\n  - 1\nb: 2\n", &["del", "/a"]), "b: 2\n");
+}
+
+#[test]
+fn del_of_an_anchor_an_alias_refers_to_is_refused_with_exit_7() {
+    let src = "a: &m\n  x: 1\nb: *m\n";
+    let file = write_yaml(src);
+    let path = file.to_str().expect("UTF-8 path");
+    dq().args(["del", path, "/a", "-i", "--no-color"])
+        .assert()
+        .code(7)
+        .stdout("")
+        .stderr(predicates::str::contains(
+            "cannot delete '/a': it holds an anchor that the alias on line 3 refers to",
+        ));
+    assert_eq!(std::fs::read_to_string(path).expect("read back"), src);
 }

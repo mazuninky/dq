@@ -277,6 +277,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - YAML `del` of an empty value — `key: |` with no lines, `key: !!str`,
   `key: &a`, `- &a` — removes its own entry; it used to remove the entry
   after it and keep its own.
+- YAML `del` of a node that holds an anchor (`&name`) an alias elsewhere
+  refers to fails with exit 7 and leaves the file alone; it used to leave
+  the alias dangling, so the file no longer parsed. `lint --fix` skips
+  such a fix with a warning.
 
 ### Security
 

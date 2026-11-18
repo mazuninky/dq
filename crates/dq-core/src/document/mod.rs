@@ -1186,15 +1186,18 @@ impl Document {
     /// Remove the value at `pointer`, splicing out its physical line(s) and
     /// dropping every span beneath it.
     ///
-    /// YAML adds two cases the span map alone cannot serve, both from one
-    /// re-parse of the current bytes ([`crate::parsers::yaml_spans::container_layout`]):
+    /// YAML adds three cases the span map alone cannot serve, all from one
+    /// re-parse of the current bytes ([`crate::parsers::yaml_spans::edit_layout`]):
     ///
     /// - a collection value outside flow collections is removed with its
     ///   whole entry — the key (or `-`) line down to the collection's last
     ///   line;
     /// - a block collection left without children gets an explicit `{}` /
     ///   `[]` (`key: {}`), so it stays a collection instead of reading back
-    ///   as `null`.
+    ///   as `null`;
+    /// - removing bytes that define an anchor an alias outside them refers
+    ///   to is refused: the alias would dangle, or resolve to an earlier
+    ///   definition of the same name.
     ///
     /// # Errors
     ///
@@ -1204,6 +1207,8 @@ impl Document {
     ///   the root (the root is never deletable — it would empty the file).
     /// - [`Error::Path`] with `kind = MissingKey` when no span exists for
     ///   the pointer (and, for YAML, it is no removable collection).
+    /// - [`Error::EditRejected`] when the YAML bytes to remove define an
+    ///   anchor that an alias outside them refers to.
     pub fn del_at(&mut self, pointer: &Pointer) -> Result<()> {
         // "Read-only" is signalled by empty `original_bytes` (`value_only`
         // constructor); an all-container document with zero leaf scalars
@@ -1240,9 +1245,11 @@ impl Document {
             _ => false,
         };
         let layout = if self.format == FormatTag::Yaml
-            && (target_is_collection || parent_loses_last_child)
+            && (target_is_collection
+                || parent_loses_last_child
+                || self.original_bytes.contains(&b'*'))
         {
-            crate::parsers::yaml_spans::container_layout(&self.original_bytes)
+            crate::parsers::yaml_spans::edit_layout(&self.original_bytes)
                 .inspect_err(|err| tracing::debug!(%err, "YAML re-parse for del failed"))
                 .ok()
         } else {
@@ -1251,7 +1258,7 @@ impl Document {
         let collection_entry = layout
             .as_ref()
             .filter(|_| target_is_collection)
-            .and_then(|layout| layout.get(&canonical))
+            .and_then(|layout| layout.containers.get(&canonical))
             .and_then(|collection| collection.entry.clone());
         let line_range = match collection_entry {
             Some(entry) => entry,
@@ -1270,6 +1277,24 @@ impl Document {
                 })?,
         };
         let removed = line_range.clone();
+        // An alias elsewhere would dangle — or resolve to an earlier
+        // definition of its anchor name — once the bytes defining its anchor
+        // are gone.
+        if let Some(alias) = layout.as_ref().and_then(|layout| {
+            layout.aliases.iter().find(|alias| {
+                removed.contains(&alias.anchor_at) && !removed.contains(&alias.alias_at)
+            })
+        }) {
+            let line = 1 + self.original_bytes[..alias.alias_at]
+                .iter()
+                .filter(|&&b| b == b'\n')
+                .count();
+            return Err(Error::EditRejected {
+                action: "delete",
+                pointer: canonical,
+                reason: format!("it holds an anchor that the alias on line {line} refers to"),
+            });
+        }
         // The line break the removed bytes end with, if any: `\r\n` or `\n`.
         let removed_line_break: &'static [u8] = match &self.original_bytes[removed.clone()] {
             [.., b'\r', b'\n'] => b"\r\n",
@@ -1302,7 +1327,7 @@ impl Document {
         if parent_loses_last_child
             && let Some(parent) = layout
                 .as_ref()
-                .and_then(|layout| layout.get(&parent_ptr.as_canonical()))
+                .and_then(|layout| layout.containers.get(&parent_ptr.as_canonical()))
         {
             self.mark_emptied_yaml_collection(&parent_ptr, parent, &removed, removed_line_break);
         }

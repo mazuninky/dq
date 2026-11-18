@@ -185,3 +185,34 @@ fn del_of_a_collection_under_a_compact_sequence_entry_is_refused() {
     assert!(doc.del_at(&ptr("/l/0/name")).is_err());
     assert_eq!(doc.original_bytes(), b"l:\n  - name: {n: 1}\n    age: 2\n");
 }
+
+// --- anchors and aliases -----------------------------------------------------
+
+/// `del_at` refuses and leaves the bytes alone.
+fn del_refused(src: &str, pointer: &str) {
+    let mut doc = doc(src);
+    let err = doc.del_at(&ptr(pointer)).expect_err("del_at refuses");
+    assert_eq!(err.kind_name(), "edit_rejected", "{src:?}: {err}");
+    assert_eq!(doc.original_bytes(), src.as_bytes(), "{src:?}");
+}
+
+#[test]
+fn del_of_an_anchor_an_alias_outside_refers_to_is_refused() {
+    del_refused("a: &m\n  x: 1\nb: *m\n", "/a");
+    del_refused("a:\n  inner: &m 1\nb: *m\n", "/a");
+    del_refused("l:\n  - &m 1\n  - *m\n", "/l/0");
+    del_refused("base: &b {x: 1}\nsvc:\n  <<: *b\n", "/base");
+    del_refused("&k foo: 1\nb: *k\n", "/foo");
+    // The alias refers to the later definition; without it, to the first.
+    del_refused("a: &m 1\nb: &m 2\nc: *m\n", "/b");
+}
+
+#[test]
+fn del_of_an_alias_or_inside_an_anchor_is_allowed() {
+    assert_eq!(del("a: &m 1\nb: *m\n", "/b"), "a: &m 1\n");
+    assert_eq!(del("a: &m 1\nb: &m 2\nc: *m\n", "/a"), "b: &m 2\nc: *m\n");
+    assert_eq!(
+        del("base: &b\n  x: 1\n  y: 2\nsvc:\n  <<: *b\n", "/base/x"),
+        "base: &b\n  y: 2\nsvc:\n  <<: *b\n"
+    );
+}
