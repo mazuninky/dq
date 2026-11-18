@@ -6,7 +6,7 @@ description: |
 severity: error
 match:
   format: yaml
-  filter: '.kind == "Deployment" or .kind == "StatefulSet" or .kind == "DaemonSet" or .kind == "Pod"'
+  filter: 'type == "object" and (.kind == "Deployment" or .kind == "StatefulSet" or .kind == "DaemonSet" or .kind == "Pod")'
 check:
   jq: |
     if (.spec.template // null) != null

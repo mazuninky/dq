@@ -11,7 +11,7 @@ match:
   format: hcl
 check:
   jq: |
-    select(.terraform != null)
+    select(.terraform | type == "object")
     | select(.terraform.backend == null)
     | {summary: "no backend configured"}
   message: "terraform block has no backend — state will be local"

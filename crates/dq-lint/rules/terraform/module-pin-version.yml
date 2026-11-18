@@ -12,7 +12,8 @@ match:
   format: hcl
 check:
   jq: |
-    [.module // {} | to_entries[]
+    [.module // {} | objects | to_entries[]
+      | select(.value | type == "object")
       | select(.value.source != null)
       | select(.value.source | type == "string")
       | select(.value.source | startswith("./") or startswith("../") | not)

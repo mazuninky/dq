@@ -7,9 +7,12 @@ description: |
 severity: error
 match:
   format: yaml
-  filter: 'has("jobs")'
+  # Every workflow has `on:` (a reusable one has `on: workflow_call`);
+  # without it a CircleCI `config.yml` (`version` + `jobs:`) would match.
+  filter: 'type == "object" and has("on") and has("jobs") and (.jobs | . == null or type == "object")'
 check:
-  jq: 'select((.on // {}) | (type == "object" and (has("pull_request_target")))) | (.jobs // {}) | to_entries[] as $j | ($j.value.steps // [])[] | select((.uses // "") | tostring | test("^actions/checkout@")) | select((.with.ref // "") | tostring | test("github\\.event\\.pull_request|head\\.sha"))'
+  # `on:` names its events as a string, a list or a mapping keyed by event.
+  jq: 'select(.on | (if type == "string" then [.] elif type == "array" then . elif type == "object" then keys else [] end) | any(. == "pull_request_target")) | (.jobs // {})[] | objects | (.steps // []) | arrays | .[] | objects | select((.uses // "") | tostring | test("^actions/checkout@")) | select((.with.ref? // "") | tostring | test("github\\.event\\.pull_request|head\\.sha"))'
   message: "Workflow uses pull_request_target AND checks out untrusted PR ref — security risk"
 references:
   - https://securitylab.github.com/research/github-actions-preventing-pwn-requests/

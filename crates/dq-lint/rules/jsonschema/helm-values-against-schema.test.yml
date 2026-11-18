@@ -17,3 +17,21 @@ tests:
     expected:
       violations:
         - rule: jsonschema.helm-values-against-schema
+  - name: list root produces no violations
+    input: |
+      - a
+      - b
+    format: yaml
+    expected:
+      violations: []
+  - name: scalar root produces no violations
+    input: |
+      just a string
+    format: yaml
+    expected:
+      violations: []
+  - name: empty document produces no violations
+    input: ""
+    format: yaml
+    expected:
+      violations: []

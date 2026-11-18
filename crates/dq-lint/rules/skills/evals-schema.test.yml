@@ -83,3 +83,18 @@ tests:
     format: json
     expected:
       violations: []
+  - name: list root produces no violations
+    input: |
+      [1, 2]
+    expected:
+      violations: []
+  - name: string root produces no violations
+    input: |
+      "just a string"
+    expected:
+      violations: []
+  - name: null document produces no violations (JSON has no empty document)
+    input: |
+      null
+    expected:
+      violations: []

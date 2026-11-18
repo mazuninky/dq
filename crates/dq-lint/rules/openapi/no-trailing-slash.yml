@@ -8,10 +8,10 @@ description: |
 severity: warn
 match:
   format: [yaml, json]
-  filter: '.openapi != null and (.openapi | type == "string")'
+  filter: 'type == "object" and (.openapi | type == "string")'
 check:
   jq: |
-    [.paths // {} | keys[]
+    [.paths // {} | objects | keys[]
       | select(. != "/" and (endswith("/")))
       | {path: .}][]
   message: "Path '{{ .path }}' ends with a trailing slash"

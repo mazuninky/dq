@@ -25,10 +25,10 @@ check:
   # so the constraint applies to every alias uniformly.
   jq: |
     . as $root |
-    [.provider // {} | to_entries[]
-      | select(.value.version == null)
+    [.provider // {} | objects | to_entries[]
+      | select(.value.version? == null)
       | select(
-          (($root.terraform // {}).required_providers // {}) as $req
+          ($root.terraform.required_providers? // {}) as $req
           | ($req[.key]? | type) != "object"
             or (($req[.key]?.version // null) == null))
       | {name: .key}][]

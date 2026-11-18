@@ -40,3 +40,18 @@ tests:
       violations:
         - rule: terraform.tag-required
           message_contains: "aws_s3_bucket.untagged"
+  - name: top-level attributes in place of blocks are skipped
+    input: |
+      resource = "x"
+      variable = 1
+      module = "m"
+      terraform = "x"
+      output = 1
+      provider = "x"
+    expected:
+      violations: []
+  - name: scalar resource type body is skipped
+    input: |
+      resource = { aws_instance = "x" }
+    expected:
+      violations: []

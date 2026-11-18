@@ -15,7 +15,7 @@ description: |
 severity: error
 match:
   format: json
-  filter: 'has("skill_name") and has("evals")'
+  filter: 'type == "object" and has("skill_name") and has("evals")'
 check:
   schema_file: ./evals.schema.json
 references:

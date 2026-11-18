@@ -10,8 +10,8 @@ match:
   format: hcl
 check:
   jq: |
-    [.variable // {} | to_entries[]
-      | select(.value.description == null
+    [.variable // {} | objects | to_entries[]
+      | select(.value.description? == null
               or (.value.description | type != "string")
               or (.value.description | length == 0))
       | {name: .key}][]

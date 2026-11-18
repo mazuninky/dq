@@ -275,6 +275,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   runtime error` warnings from the `@std/dockerfile` rules. A Dockerfile
   with no instructions (empty, or comments only) no longer gets
   `@std/dockerfile/has-healthcheck`.
+- `dq lint` of a file whose root is not a mapping (a list, a scalar, an
+  empty YAML file) no longer prints `match.filter raised a runtime error`
+  warnings from the github-actions, k8s, openapi, jsonschema, npm and
+  skills rules; a list root used to print 26 of them.
+  `@std/jsonschema/helm-values-against-schema` checks mapping roots
+  only: it used to fail every other YAML file, an empty one included,
+  with exit 4. The rules also stopped raising on a mapping whose fields
+  have an unexpected type, such as `jobs` or `paths` given as a list,
+  `"engines": "node"`, or a Terraform `resource = "x"` attribute.
+- `@std/github-actions` rules need the `on` key that every workflow has,
+  so a CircleCI config, which has `jobs:` too, no longer gets
+  `has-permissions` and `has-timeout`.
+- `@std/github-actions/no-pull-request-target-with-checkout` fires when
+  `on` is written as a string (`on: pull_request_target`) or a list
+  (`on: [push, pull_request_target]`); it used to check only the
+  mapping form.
+- `@std/markdown/frontmatter-required-fields` reports the missing fields
+  on scalar frontmatter, as it does on list frontmatter; it used to
+  print a runtime-error warning and report nothing.
+- JSON Schema rules: a `$ref` inside `const`, `enum`, `default` or
+  `examples` is data and no longer rejected as an external reference. A
+  `$ref` in a schema position, including under a property named `enum`,
+  still is. Every external reference the validator would follow fails
+  with `external $ref is not supported: <uri>`, including one reached
+  through a local `$ref` and an external `$dynamicRef`; some used to fail
+  with a message about the `resolve-http` feature.
 - Dockerfiles that Docker builds no longer fail to parse with exit 3:
   `HEALTHCHECK`, `ONBUILD` and `MAINTAINER`, a one-character argument
   (`WORKDIR /`, `USER 0`, `EXPOSE 8`), lower-case instructions, heredocs

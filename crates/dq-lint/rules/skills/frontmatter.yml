@@ -30,7 +30,7 @@ match:
 check:
   jq: |
     . as $doc
-    | ($doc.frontmatter.value // {}) as $fm
+    | ($doc.frontmatter.value | if type == "object" then . else {} end) as $fm
     | (
         (
           if ($fm | has("name")) and (($fm.name | type) == "string")

@@ -42,3 +42,146 @@ tests:
                 ref: ${{ github.event.pull_request.head.sha }}
     expected:
       violations: []
+  - name: list root produces no violations
+    input: |
+      - a
+      - b
+    expected:
+      violations: []
+  - name: scalar root produces no violations
+    input: |
+      just a string
+    expected:
+      violations: []
+  - name: empty document produces no violations
+    input: ""
+    expected:
+      violations: []
+  - name: jobs as a list is not a workflow
+    input: |
+      on: [push]
+      jobs: [build, test]
+    expected:
+      violations: []
+  - name: jobs as a string is not a workflow
+    input: |
+      on: [push]
+      jobs: build
+    expected:
+      violations: []
+  - name: scalar job, scalar step and scalar with are skipped
+    input: |
+      on: {pull_request_target: {}}
+      jobs:
+        a: x
+        b:
+          steps:
+            - checkout
+            - uses: actions/checkout@v4
+              with: x
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.pull_request.head.sha }}
+    expected:
+      violations:
+        - rule: github-actions.no-pull-request-target-with-checkout
+  - name: CircleCI config (version + jobs, no on) is not a workflow
+    input: |
+      version: 2.1
+      jobs:
+        build:
+          docker:
+            - image: cimg/base:stable
+          steps:
+            - checkout
+            - uses: owner/repo@v1
+            - run: echo hi
+      workflows:
+        main:
+          jobs: [build]
+    expected:
+      violations: []
+  - name: on as a string naming pull_request_target fires
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.pull_request.head.sha }}
+    expected:
+      violations:
+        - rule: github-actions.no-pull-request-target-with-checkout
+  - name: on as a list including pull_request_target fires
+    input: |
+      name: ci
+      on: [push, pull_request_target]
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.pull_request.head.sha }}
+    expected:
+      violations:
+        - rule: github-actions.no-pull-request-target-with-checkout
+  - name: on as a mapping with an empty pull_request_target fires
+    input: |
+      name: ci
+      on:
+        pull_request_target:
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.pull_request.head.sha }}
+    expected:
+      violations:
+        - rule: github-actions.no-pull-request-target-with-checkout
+  - name: pull_request only (string) passes
+    input: |
+      name: ci
+      on: pull_request
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.pull_request.head.sha }}
+    expected:
+      violations: []
+  - name: pull_request only (list) passes
+    input: |
+      name: ci
+      on: [push, pull_request]
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.pull_request.head.sha }}
+    expected:
+      violations: []
+  - name: pull_request only (mapping) passes
+    input: |
+      name: ci
+      on:
+        pull_request:
+          types: [opened]
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.pull_request.head.sha }}
+    expected:
+      violations: []

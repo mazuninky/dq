@@ -40,3 +40,18 @@ tests:
       violations:
         - rule: terraform.variable-has-description
           message_contains: "b"
+  - name: top-level attributes in place of blocks are skipped
+    input: |
+      resource = "x"
+      variable = 1
+      module = "m"
+      terraform = "x"
+      output = 1
+      provider = "x"
+    expected:
+      violations: []
+  - name: scalar variable body is skipped
+    input: |
+      variable = { v = 1 }
+    expected:
+      violations: []

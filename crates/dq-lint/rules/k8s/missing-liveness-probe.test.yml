@@ -29,3 +29,18 @@ tests:
                     port: 8080
     expected:
       violations: []
+  - name: list root produces no violations
+    input: |
+      - a
+      - b
+    expected:
+      violations: []
+  - name: scalar root produces no violations
+    input: |
+      just a string
+    expected:
+      violations: []
+  - name: empty document produces no violations
+    input: ""
+    expected:
+      violations: []

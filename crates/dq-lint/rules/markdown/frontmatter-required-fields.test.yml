@@ -41,3 +41,27 @@ tests:
       Body.
     expected:
       violations: []
+  - name: list frontmatter has none of the required fields
+    input: |
+      ---
+      - a
+      ---
+      # T
+    expected:
+      violations:
+        - rule: markdown.frontmatter-required-fields
+          message_contains: "title"
+        - rule: markdown.frontmatter-required-fields
+          message_contains: "date"
+  - name: scalar frontmatter has none of the required fields
+    input: |
+      ---
+      just text
+      ---
+      # T
+    expected:
+      violations:
+        - rule: markdown.frontmatter-required-fields
+          message_contains: "title"
+        - rule: markdown.frontmatter-required-fields
+          message_contains: "date"

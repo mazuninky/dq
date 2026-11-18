@@ -6,7 +6,7 @@ description: |
 severity: warn
 match:
   format: markdown
-  filter: '.frontmatter != null and (.frontmatter.value.date // null) != null'
+  filter: '.frontmatter != null and (.frontmatter.value | type == "object") and (.frontmatter.value.date // null) != null'
 check:
   jq: |
     (.frontmatter.value.date | tostring) as $d

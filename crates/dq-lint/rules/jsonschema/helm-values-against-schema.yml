@@ -12,6 +12,10 @@ description: |
 severity: error
 match:
   format: yaml
+  # Helm values are a mapping; a list, scalar or empty document is not
+  # a values file, so the schema's top-level `type: object` would only
+  # report noise there.
+  filter: 'type == "object"'
 check:
   schema_file: ./helm-values-template.schema.json
 references:

@@ -7,9 +7,11 @@ description: |
 severity: warn
 match:
   format: yaml
-  filter: 'has("jobs")'
+  # Every workflow has `on:` (a reusable one has `on: workflow_call`);
+  # without it a CircleCI `config.yml` (`version` + `jobs:`) would match.
+  filter: 'type == "object" and has("on") and has("jobs") and (.jobs | . == null or type == "object")'
 check:
-  jq: 'select(.permissions == null and ((.jobs // {}) | to_entries | all(.value.permissions == null)))'
+  jq: 'select(.permissions == null and ((.jobs // {}) | [.[] | objects | .permissions] | all(. == null)))'
   message: "Workflow has no top-level or per-job 'permissions:' (defaults to repo-wide scope)"
 references:
   - https://docs.github.com/en/actions/using-jobs/assigning-permissions-to-jobs
