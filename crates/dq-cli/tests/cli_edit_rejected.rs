@@ -70,7 +70,88 @@ const REFUSALS: &[Refusal] = &[
         args: &["/a"],
         message: "cannot delete '/a': dq cannot remove it as a textual edit; ",
     },
+    // Below an alias the node is the anchored one: the refusal names the
+    // alias's line and the pointer of the anchored node.
+    Refusal {
+        name: "doc.yaml",
+        src: UNDER_ALIAS_YAML,
+        command: "set",
+        args: &["/b/x", "5"],
+        message: "cannot set '/b/x': it lies under the alias on line 3, a copy of /a; \
+                  an edit at the anchored node changes every copy; ",
+    },
+    Refusal {
+        name: "doc.yaml",
+        src: UNDER_ALIAS_YAML,
+        command: "set",
+        args: &["/b/new", "5"],
+        message: "cannot set '/b/new': it lies under the alias on line 3, a copy of /a; ",
+    },
+    Refusal {
+        name: "doc.yaml",
+        src: UNDER_ALIAS_YAML,
+        command: "del",
+        args: &["/b/x"],
+        message: "cannot delete '/b/x': it lies under the alias on line 3, a copy of /a; ",
+    },
+    Refusal {
+        // A merge key is an alias like any other.
+        name: "doc.yaml",
+        src: MERGE_YAML,
+        command: "set",
+        args: &["/svc/<</x", "5"],
+        message: "cannot set '/svc/<</x': it lies under the alias on line 4, a copy of /base; ",
+    },
+    Refusal {
+        name: "doc.yaml",
+        src: MERGE_YAML,
+        command: "del",
+        args: &["/svc/<</x"],
+        message: "cannot delete '/svc/<</x': it lies under the alias on line 4, a copy of /base; ",
+    },
+    Refusal {
+        // The nearest alias on the way down is the one named.
+        name: "doc.yaml",
+        src: NESTED_ALIAS_YAML,
+        command: "set",
+        args: &["/c/k", "5"],
+        message: "cannot set '/c/k': it lies under the alias on line 5, a copy of /a/in; ",
+    },
+    Refusal {
+        name: "doc.yaml",
+        src: NESTED_ALIAS_YAML,
+        command: "set",
+        args: &["/b/in/k", "5"],
+        message: "cannot set '/b/in/k': it lies under the alias on line 4, a copy of /a; ",
+    },
+    Refusal {
+        // A blank CRLF line counts as a line.
+        name: "doc.yaml",
+        src: "a: &m\r\n  x: 1\r\n\r\nb: *m\r\n",
+        command: "set",
+        args: &["/b/x", "5"],
+        message: "cannot set '/b/x': it lies under the alias on line 4, a copy of /a; ",
+    },
+    Refusal {
+        name: "doc.yaml",
+        src: ROOT_SEQUENCE_ALIAS_YAML,
+        command: "del",
+        args: &["/1/x"],
+        message: "cannot delete '/1/x': it lies under the alias on line 2, a copy of /0; ",
+    },
 ];
+
+/// `b` is an alias of the anchored mapping `a`.
+const UNDER_ALIAS_YAML: &str = "a: &m\n  x: 1\nb: *m\n";
+
+/// `svc` merges `base` in through `<<`, which dq keeps as a key.
+const MERGE_YAML: &str = "base: &b\n  x: 1\nsvc:\n  <<: *b\n  y: 2\n";
+
+/// An anchor inside an anchor: `b` copies all of `a`, `c` only `a/in`.
+const NESTED_ALIAS_YAML: &str = "a: &m\n  in: &n\n    k: 1\nb: *m\nc: *n\n";
+
+/// A root sequence whose second item is an alias of the first.
+const ROOT_SEQUENCE_ALIAS_YAML: &str = "- &m {x: 1}\n- *m\n";
 
 /// JSON has no NaN: no writer of dq's can put one there, so the refusal
 /// points to no way around it.
@@ -195,6 +276,118 @@ fn the_same_edits_are_made_where_they_read_back() {
             "{command} {args:?} on {src:?}",
         );
     }
+}
+
+#[test]
+fn edits_at_an_anchored_node_or_of_an_alias_go_through() {
+    // The positive side of the refusals below an alias: the anchored node
+    // itself, a key beside a merge, and the alias replaced as a whole.
+    let cases: &[(&str, &str, &[&str], &str, serde_json::Value)] = &[
+        (
+            NESTED_ALIAS_YAML,
+            "set",
+            &["/a/in/k", "5"],
+            "a: &m\n  in: &n\n    k: 5\nb: *m\nc: *n\n",
+            serde_json::json!({"a": {"in": {"k": 5}}, "b": {"in": {"k": 5}}, "c": {"k": 5}}),
+        ),
+        (
+            MERGE_YAML,
+            "set",
+            &["/base/x", "5"],
+            "base: &b\n  x: 5\nsvc:\n  <<: *b\n  y: 2\n",
+            serde_json::json!({"base": {"x": 5}, "svc": {"<<": {"x": 5}, "y": 2}}),
+        ),
+        (
+            MERGE_YAML,
+            "set",
+            &["/svc/y", "5"],
+            "base: &b\n  x: 1\nsvc:\n  <<: *b\n  y: 5\n",
+            serde_json::json!({"base": {"x": 1}, "svc": {"<<": {"x": 1}, "y": 5}}),
+        ),
+        (
+            ROOT_SEQUENCE_ALIAS_YAML,
+            "set",
+            &["/0/x", "2"],
+            "- &m {x: 2}\n- *m\n",
+            serde_json::json!([{"x": 2}, {"x": 2}]),
+        ),
+        (
+            UNDER_ALIAS_YAML,
+            "set",
+            &["/b", "5"],
+            "a: &m\n  x: 1\nb: 5\n",
+            serde_json::json!({"a": {"x": 1}, "b": 5}),
+        ),
+        (
+            UNDER_ALIAS_YAML,
+            "del",
+            &["/b"],
+            "a: &m\n  x: 1\n",
+            serde_json::json!({"a": {"x": 1}}),
+        ),
+    ];
+    for (src, command, args, want, value) in cases {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("doc.yaml");
+        std::fs::write(&path, src).expect("write fixture");
+        dq().current_dir(dir.path())
+            .args(["-i", "--no-color", command, "doc.yaml"])
+            .args(*args)
+            .assert()
+            .success()
+            .stdout("");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            *want,
+            "{command} {args:?} on {src:?}",
+        );
+        let out = dq()
+            .current_dir(dir.path())
+            .args(["--no-color", "-F", "json", "convert", "doc.yaml"])
+            .output()
+            .expect("convert runs");
+        assert!(out.status.success(), "{command} {args:?}: convert");
+        let got: serde_json::Value = serde_json::from_slice(&out.stdout).expect("JSON");
+        assert_eq!(got, *value, "{command} {args:?}: aliases resolve");
+    }
+}
+
+#[test]
+fn the_refusal_names_the_alias_the_pointer_runs_through() {
+    // `/bc/y` runs through `bc`, not through `b`, whose name is a prefix
+    // of it.
+    let src = "a: &m\n  x: 1\np: &n\n  y: 1\nb: *m\nbc: *n\n";
+    let dir = TempDir::new().expect("tempdir");
+    std::fs::write(dir.path().join("doc.yaml"), src).expect("write fixture");
+    dq().current_dir(dir.path())
+        .args(["-i", "--no-color", "set", "doc.yaml", "/bc/y", "5"])
+        .assert()
+        .code(7)
+        .stdout("")
+        .stderr(
+            predicate::str::contains("cannot set '/bc/y': it lies under the alias on line ")
+                .and(predicate::str::contains(", a copy of /p; ")),
+        );
+    assert_eq!(
+        std::fs::read(dir.path().join("doc.yaml")).expect("read back"),
+        src.as_bytes()
+    );
+}
+
+#[test]
+fn del_of_a_missing_key_below_an_alias_is_not_found() {
+    let dir = TempDir::new().expect("tempdir");
+    std::fs::write(dir.path().join("doc.yaml"), UNDER_ALIAS_YAML).expect("write fixture");
+    dq().current_dir(dir.path())
+        .args(["-i", "--no-color", "del", "doc.yaml", "/b/nope"])
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(predicate::str::contains("path '/b/nope' not found"));
+    assert_eq!(
+        std::fs::read(dir.path().join("doc.yaml")).expect("read back"),
+        UNDER_ALIAS_YAML.as_bytes()
+    );
 }
 
 #[test]
