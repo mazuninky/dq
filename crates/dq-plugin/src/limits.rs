@@ -13,30 +13,21 @@
 //! `memory.grow` is `memory_growing(current, desired, maximum)`, and tables
 //! follow the same shape through `table_growing`. An approved request adds
 //! `desired - current` to the running total before wasmtime performs the
-//! growth. If wasmtime then fails the growth, it calls
-//! `memory_grow_failed` / `table_grow_failed`, and the reservation of that
-//! request is returned to the budget.
+//! growth.
 //!
-//! Two runtime settings keep that rollback exact; `PluginRuntime::new`
-//! pins both:
+//! The accounting is fail-closed: nothing is ever returned to the budget.
+//! When wasmtime fails a growth it had approved (for example because the
+//! host could not allocate), `memory_grow_failed` / `table_grow_failed`
+//! leave the reservation counted. The total can then only be higher than
+//! what the plugin really holds, never lower, whatever order wasmtime
+//! reports events in and whichever wasm features are enabled. WebAssembly
+//! memories and tables do not shrink, and each invocation gets a fresh
+//! store, so there is nothing else to return either.
 //!
-//! - custom page sizes are disabled, so wasmtime never reports a failed
-//!   memory growth without first asking `memory_growing`;
-//! - 64-bit memories and tables are disabled, so a table growth size never
-//!   overflows before `table_growing` is asked.
-//!
-//! The limiter also refuses any request above the memory's or table's own
+//! The limiter refuses any request above the memory's or table's own
 //! declared maximum without reserving anything, the same check
 //! [`wasmtime::StoreLimits`] makes. Wasmtime would fail such a growth
 //! anyway; refusing it up front keeps the budget untouched.
-//!
-//! A creation that the limiter approved but wasmtime then failed is not
-//! reported back, so its reservation stays counted. Instantiation fails in
-//! that case and the store is dropped, so the over-count never limits a
-//! running plugin.
-//!
-//! Memory is never returned to the budget otherwise: WebAssembly memories
-//! and tables do not shrink, and each invocation gets a fresh store.
 
 // Reference point for the budgets below: the plugins built from
 // `examples/plugin-rust/` with wit-bindgen 0.57 and 0.63 instantiate one
@@ -82,12 +73,6 @@ pub(crate) struct PluginLimiter {
     memory_used: usize,
     /// Table elements reserved across every table of the store.
     table_elements_used: usize,
-    /// Bytes reserved by the most recent approved `memory_growing`, until
-    /// a `memory_grow_failed` hands them back or the next request replaces
-    /// the record.
-    pending_memory: usize,
-    /// Elements reserved by the most recent approved `table_growing`.
-    pending_table_elements: usize,
     /// Set once a memory request is refused because of the store budget.
     memory_limit_hit: bool,
 }
@@ -104,8 +89,6 @@ impl PluginLimiter {
             table_elements_limit,
             memory_used: 0,
             table_elements_used: 0,
-            pending_memory: 0,
-            pending_table_elements: 0,
             memory_limit_hit: false,
         }
     }
@@ -154,7 +137,6 @@ impl wasmtime::ResourceLimiter for PluginLimiter {
         desired: usize,
         maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
-        self.pending_memory = 0;
         match reserve(
             self.memory_used,
             self.memory_limit,
@@ -164,7 +146,6 @@ impl wasmtime::ResourceLimiter for PluginLimiter {
         ) {
             Grant::Reserved(delta) => {
                 self.memory_used += delta;
-                self.pending_memory = delta;
                 Ok(true)
             }
             Grant::OverItemMaximum => Ok(false),
@@ -176,10 +157,7 @@ impl wasmtime::ResourceLimiter for PluginLimiter {
     }
 
     fn memory_grow_failed(&mut self, _error: wasmtime::Error) -> wasmtime::Result<()> {
-        // The approved growth did not happen: hand its reservation back.
-        // `take`-style reset makes a repeated call a no-op.
-        self.memory_used = self.memory_used.saturating_sub(self.pending_memory);
-        self.pending_memory = 0;
+        // Fail-closed: the reservation stays counted (see the module doc).
         Ok(())
     }
 
@@ -189,7 +167,6 @@ impl wasmtime::ResourceLimiter for PluginLimiter {
         desired: usize,
         maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
-        self.pending_table_elements = 0;
         match reserve(
             self.table_elements_used,
             self.table_elements_limit,
@@ -199,7 +176,6 @@ impl wasmtime::ResourceLimiter for PluginLimiter {
         ) {
             Grant::Reserved(delta) => {
                 self.table_elements_used += delta;
-                self.pending_table_elements = delta;
                 Ok(true)
             }
             Grant::OverItemMaximum | Grant::OverBudget => Ok(false),
@@ -207,10 +183,7 @@ impl wasmtime::ResourceLimiter for PluginLimiter {
     }
 
     fn table_grow_failed(&mut self, _error: wasmtime::Error) -> wasmtime::Result<()> {
-        self.table_elements_used = self
-            .table_elements_used
-            .saturating_sub(self.pending_table_elements);
-        self.pending_table_elements = 0;
+        // Fail-closed: the reservation stays counted (see the module doc).
         Ok(())
     }
 
@@ -259,28 +232,40 @@ mod tests {
     }
 
     #[test]
-    fn memory_grow_failed_returns_the_reservation() {
+    fn memory_grow_failed_keeps_the_reservation() {
         let mut limiter = PluginLimiter::new(64 * MIB, 10);
         assert!(limiter.memory_growing(0, 32 * MIB, None).unwrap());
         assert!(limiter.memory_growing(32 * MIB, 48 * MIB, None).unwrap());
+        // Wasmtime reports that the approved growth failed: the bytes stay
+        // counted, however many times the failure is reported.
         limiter.memory_grow_failed(failure()).unwrap();
-        assert_eq!(limiter.memory_used, 32 * MIB);
-        // A second report for the same request changes nothing.
         limiter.memory_grow_failed(failure()).unwrap();
-        assert_eq!(limiter.memory_used, 32 * MIB);
-        // The returned bytes are available again.
-        assert!(limiter.memory_growing(0, 32 * MIB, None).unwrap());
-        assert_eq!(limiter.memory_used, 64 * MIB);
-        assert!(!limiter.memory_limit_hit());
+        assert_eq!(limiter.memory_used, 48 * MIB);
+        assert!(!limiter.memory_growing(0, 32 * MIB, None).unwrap());
+        assert!(limiter.memory_limit_hit());
     }
 
     #[test]
-    fn memory_grow_failed_after_a_refusal_returns_nothing() {
+    fn interleaved_failures_never_lower_the_memory_total() {
         let mut limiter = PluginLimiter::new(64 * MIB, 10);
-        assert!(limiter.memory_growing(0, 60 * MIB, None).unwrap());
-        assert!(!limiter.memory_growing(60 * MIB, 80 * MIB, None).unwrap());
-        limiter.memory_grow_failed(failure()).unwrap();
-        assert_eq!(limiter.memory_used, 60 * MIB);
+        let mut current = 0;
+        for _ in 0..64 {
+            // A successful one-MiB growth, then a failure report that is
+            // not preceded by a request of its own.
+            if limiter
+                .memory_growing(current, current + MIB, None)
+                .unwrap()
+            {
+                current += MIB;
+            }
+            limiter.memory_grow_failed(failure()).unwrap();
+        }
+        assert_eq!(limiter.memory_used, 64 * MIB);
+        assert!(
+            !limiter
+                .memory_growing(current, current + MIB, None)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -313,23 +298,20 @@ mod tests {
     }
 
     #[test]
-    fn table_grow_failed_returns_the_reservation() {
+    fn interleaved_table_failures_never_lower_the_element_total() {
         let mut limiter = PluginLimiter::new(64 * MIB, 100);
-        assert!(limiter.table_growing(0, 10, None).unwrap());
-        assert!(limiter.table_growing(10, 30, None).unwrap());
-        limiter.table_grow_failed(failure()).unwrap();
-        assert_eq!(limiter.table_elements_used, 10);
-        limiter.table_grow_failed(failure()).unwrap();
-        assert_eq!(limiter.table_elements_used, 10);
-        assert!(!limiter.table_growing(10, 20, Some(15)).unwrap());
-        assert_eq!(limiter.table_elements_used, 10);
-    }
-
-    #[test]
-    fn count_limits_are_the_store_constants() {
-        let limiter = PluginLimiter::new(MEMORY_LIMIT, TABLE_ELEMENTS_LIMIT);
-        assert_eq!(limiter.instances(), INSTANCE_LIMIT);
-        assert_eq!(limiter.memories(), MEMORIES_LIMIT);
-        assert_eq!(limiter.tables(), TABLES_LIMIT);
+        let mut current = 0;
+        for _ in 0..200 {
+            if limiter.table_growing(current, current + 1, None).unwrap() {
+                current += 1;
+            }
+            limiter.table_grow_failed(failure()).unwrap();
+        }
+        assert_eq!(limiter.table_elements_used, 100);
+        assert!(!limiter.table_growing(current, current + 1, None).unwrap());
+        // A request past the table's own maximum reserves nothing.
+        let mut limiter = PluginLimiter::new(64 * MIB, 100);
+        assert!(!limiter.table_growing(0, 20, Some(15)).unwrap());
+        assert_eq!(limiter.table_elements_used, 0);
     }
 }

@@ -5,8 +5,6 @@
 //! machine-readable. ANSI escapes in the log follow the same precedence as
 //! the report (`--no-color` > `NO_COLOR` > `CLICOLOR_FORCE` > terminal),
 //! applied to stderr.
-//!
-//! Sanity coverage only; the full matrix is left to `rust-cli-test-writer`.
 
 use assert_cmd::Command;
 use tempfile::TempDir;

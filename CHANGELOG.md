@@ -235,6 +235,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `RuleFix` schema now accepts both `jq` (legacy) and `ops` (new) fields,
   each `Option<String>`. At least one must be set; both is allowed and
   `ops` wins at runtime (with a `tracing::warn!` shadowing log).
+- Plugins are limited in the number of core instances, memories and
+  tables they create, and plugins with 64-bit memories or tables are no
+  longer accepted.
 
 ### Deprecated
 
