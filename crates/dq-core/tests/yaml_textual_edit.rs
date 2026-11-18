@@ -70,6 +70,23 @@ fn new_key_after_an_unterminated_block_scalar_switches_it_to_strip() {
         ptr("/a").resolve(reread.value()).expect("/a"),
         &Value::String("x".to_owned())
     );
+    // Keep chomping turns to strip; an indentation indicator stays.
+    assert_eq!(
+        set("a: |+\n  x", "/zz", Value::Int(1)),
+        "a: |-\n  x\nzz: 1\n"
+    );
+    assert_eq!(
+        set("a: |2\n   x", "/zz", Value::Int(1)),
+        "a: |-2\n   x\nzz: 1\n"
+    );
+    assert_eq!(
+        set("a: >2+\n   x", "/zz", Value::Int(1)),
+        "a: >2-\n   x\nzz: 1\n"
+    );
+    assert_eq!(
+        set("a: |-\n  x", "/zz", Value::Int(1)),
+        "a: |-\n  x\nzz: 1\n"
+    );
 }
 
 #[test]
@@ -172,6 +189,10 @@ fn del_of_the_last_child_leaves_an_empty_collection() {
     assert_eq!(del("a:\n  x: 1\nb: 2\n", "/a/x"), "a: {}\nb: 2\n");
     assert_eq!(del("a:\n  - 1\nb: 2\n", "/a/0"), "a: []\nb: 2\n");
     assert_eq!(del("x: 1\n", "/x"), "{}\n");
+    // The marker goes after node properties and before a comment.
+    assert_eq!(del("a: &m\n  x: 1\nb: 2\n", "/a/x"), "a: &m {}\nb: 2\n");
+    assert_eq!(del("a: # c\n  x: 1\nb: 2\n", "/a/x"), "a: {} # c\nb: 2\n");
+    assert_eq!(del("a: &m # c\n  - 1\n", "/a/0"), "a: &m [] # c\n");
 }
 
 #[test]
@@ -191,6 +212,17 @@ fn del_of_a_collection_value_removes_the_whole_entry() {
     assert_eq!(del("k: v\na:\n  x: 1\nb: 2\n", "/a"), "k: v\nb: 2\n");
     assert_eq!(del("a:\n  - 1\nb: 2\n", "/a"), "b: 2\n");
     assert_eq!(del("a: {}\nb: 2\n", "/a"), "b: 2\n");
+    assert_eq!(del("a:\r\n  x: 1\r\nb: 2\r\n", "/a"), "b: 2\r\n");
+    assert_eq!(
+        del("k: 0\r\na:\r\n  - 1\r\n  - 2\r\nb: 2\r\n", "/a"),
+        "k: 0\r\nb: 2\r\n"
+    );
+    // A flow collection over several lines.
+    assert_eq!(
+        del("a: {\n  x: 1,\n  y: [1,\n    2]\n}\nb: 2\n", "/a"),
+        "b: 2\n"
+    );
+    assert_eq!(del("a: [\n  1,\n  2\n]\nb: 2\n", "/a"), "b: 2\n");
     // A comment after the collection belongs to what follows it.
     assert_eq!(
         del("a:\n  x: 1\n# about b\nb: 2\n", "/a"),

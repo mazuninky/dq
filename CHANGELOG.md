@@ -265,7 +265,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `f: {? &a}` in YAML.
 - YAML `set` of a new key after a block scalar (`|`, `>`) or a value on the
   next line puts the key at the mapping's indent instead of inside the
-  value. `del` of such a value removes the whole entry.
+  value. `del` of such a value removes the whole entry. When the file ends
+  inside that block scalar without a final line break, the new key's line
+  break would join its value, so its header turns to strip chomping
+  (`|` → `|-`, `|+` → `|-`), which keeps the value as it was.
 - YAML `set` / `del` after an alias (`*name`) edit the node you point at;
   they used to edit the node after it, or fail with "not found". Lint
   diagnostics on such files point at the right line instead of line 1.
