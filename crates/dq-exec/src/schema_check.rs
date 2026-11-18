@@ -19,7 +19,10 @@
 //! up front with [`crate::ExecError::SchemaFileAbsolutePath`] /
 //! [`crate::ExecError::SchemaFileEscapesRuleDir`].
 
+use std::collections::{HashSet, VecDeque};
+
 use camino::{Utf8Path, Utf8PathBuf};
+use jsonschema::Uri;
 
 use crate::error::{ExecError, Result};
 use crate::ruleset::RuleSource;
@@ -168,154 +171,209 @@ fn find_external_ref(schema: &serde_json::Value) -> Option<&str> {
     }
 }
 
-/// Find a `$schema` URI that jsonschema 0.34 could not resolve offline and
-/// return the compile error it reported for it.
+/// Base URI jsonschema gives a schema without `$id`.
+const DEFAULT_BASE_URI: &str = "json-schema:///";
+
+/// Find a `$schema` jsonschema 0.34 could not resolve offline and return
+/// the compile error it reported for it.
 ///
-/// 0.34 resolved every `$schema` in the document against its registry:
-/// URIs under `https://json-schema.org/draft/` / `http://json-schema.org/draft-`
-/// (the bundled meta-schemas) and the document's own `$id`s resolve; any
-/// other URI went to the retriever, which had no HTTP or file support.
+/// Mirrors the registry crawl of `referencing` 0.34 (`process_queue` +
+/// `collect_external_resources`), which built the 0.34 validator:
+///
+/// - every schema object is visited breadth-first, rebased on its own `$id`
+///   (resolved against the enclosing base per RFC 3986 § 5.2, normalized);
+///   a schema without `$id` at the root has the base `json-schema:///`;
+/// - each object's `$ref` / `$schema` is skipped when it names a bundled
+///   meta-schema (`https://json-schema.org/draft/…`,
+///   `http://json-schema.org/draft-…`), is `#`, or the base is itself under
+///   `https://json-schema.org/draft/`; nothing is checked under a `urn:`
+///   base; a fragment-only reference is followed into the object it points
+///   at; any other reference is resolved against the base;
+/// - a reference that fails to resolve fails the crawl at once — so it wins
+///   over unretrievable ones found anywhere in the document;
+/// - after the crawl, the first resolved reference no `$id` in the
+///   document names is reported as unretrievable. 0.34 kept those in a
+///   hash set, so with several the one it reported varied between runs;
+///   here it is the first in crawl order.
+///
+/// `$ref`s are crawled the same way as 0.34 did, but by the time this runs
+/// [`find_external_ref`] has already rejected every one that is not local.
 fn find_unresolvable_meta_schema(schema: &serde_json::Value) -> Option<String> {
-    let mut ids = Vec::new();
-    collect_ids(schema, None, &mut ids);
-    let uri = find_meta_schema_uri(schema, None, &|raw, resolved| {
-        !(raw.starts_with("https://json-schema.org/draft/")
-            || raw.starts_with("http://json-schema.org/draft-")
-            || resolved.is_empty()
-            || ids.iter().any(|id| id == resolved))
-    })?;
-    let (normalized, scheme) = normalize_uri(&uri);
-    let reason = match scheme.as_deref() {
-        Some("http" | "https") => {
+    MetaSchemaCrawl::run(schema).err()
+}
+
+/// State of [`find_unresolvable_meta_schema`]'s crawl.
+#[derive(Default)]
+struct MetaSchemaCrawl {
+    /// Normalized URI of every resource the document registers: the root
+    /// and each `$id`.
+    resources: HashSet<String>,
+    /// `(base, reference)` pairs already handled.
+    seen: HashSet<(String, String)>,
+    /// `(reference as written, resolved URI)` of each reference that has to
+    /// be in `resources`, in crawl order.
+    external: Vec<(String, Uri<String>)>,
+}
+
+impl MetaSchemaCrawl {
+    fn run(schema: &serde_json::Value) -> std::result::Result<(), String> {
+        let root = jsonschema::uri::from_str(schema_id(schema).unwrap_or(DEFAULT_BASE_URI))
+            .map_err(|err| err.to_string())?;
+        let root = jsonschema::uri::from_str(root.as_str().trim_end_matches('#'))
+            .map_err(|err| err.to_string())?;
+        let mut crawl = Self::default();
+        crawl.resources.insert(root.as_str().to_owned());
+        let mut queue = VecDeque::from([(root, schema)]);
+        while let Some((mut base, contents)) = queue.pop_front() {
+            if let Some(id) = schema_id(contents) {
+                base = resolve_reference(&base.borrow(), id)?;
+                crawl.resources.insert(base.as_str().to_owned());
+            }
+            crawl.collect(&base, contents)?;
+            if let serde_json::Value::Object(map) = contents {
+                queue.extend(subschemas(map).map(|child| (base.clone(), child)));
+            }
+        }
+        for (reference, resolved) in &crawl.external {
+            let fragmentless = resolved.strip_fragment();
+            if !crawl.resources.contains(fragmentless.as_str()) {
+                return Err(unretrievable_meta_schema(
+                    reference,
+                    resolved.scheme().as_str(),
+                    fragmentless.as_str(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Record the references of one schema object (`contents`) whose base is
+    /// `base`.
+    fn collect(
+        &mut self,
+        base: &Uri<String>,
+        contents: &serde_json::Value,
+    ) -> std::result::Result<(), String> {
+        if base.scheme().as_str() == "urn" {
+            return Ok(());
+        }
+        let Some(object) = contents.as_object() else {
+            return Ok(());
+        };
+        // 0.34 read small objects in key order and larger ones `$ref` first.
+        let references: Vec<&str> = if object.len() < 3 {
+            object
+                .iter()
+                .filter(|(keyword, _)| matches!(keyword.as_str(), "$ref" | "$schema"))
+                .filter_map(|(_, value)| value.as_str())
+                .collect()
+        } else {
+            [object.get("$ref"), object.get("$schema")]
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .collect()
+        };
+        for reference in references {
+            self.reference(base, contents, reference)?;
+        }
+        Ok(())
+    }
+
+    fn reference(
+        &mut self,
+        base: &Uri<String>,
+        contents: &serde_json::Value,
+        reference: &str,
+    ) -> std::result::Result<(), String> {
+        if reference.starts_with("https://json-schema.org/draft/")
+            || reference.starts_with("http://json-schema.org/draft-")
+            || base.as_str().starts_with("https://json-schema.org/draft/")
+            || reference == "#"
+        {
+            return Ok(());
+        }
+        if !self
+            .seen
+            .insert((base.as_str().to_owned(), reference.to_owned()))
+        {
+            return Ok(());
+        }
+        if reference.starts_with('#') {
+            if let Some(target) = contents.pointer(reference.trim_start_matches('#')) {
+                self.collect(base, target)?;
+            }
+            return Ok(());
+        }
+        let resolved = if base.has_fragment() {
+            let path = reference
+                .split_once('#')
+                .map_or(reference, |(path, _)| path);
+            resolve_reference(&base.strip_fragment(), path)?
+        } else {
+            resolve_reference(&base.borrow(), reference)?
+        };
+        self.external.push((reference.to_owned(), resolved));
+        Ok(())
+    }
+}
+
+/// The `$id` of a schema object, without trailing `#`s.
+fn schema_id(schema: &serde_json::Value) -> Option<&str> {
+    schema
+        .get("$id")
+        .and_then(serde_json::Value::as_str)
+        .map(|id| id.trim_end_matches('#'))
+}
+
+/// Resolve `reference` against `base` (RFC 3986 § 5.2, dot segments
+/// removed) and normalize the result, the way `referencing` 0.34 did;
+/// `Err` carries its error message.
+///
+/// `referencing` 0.61 drops a fragment of the base first; 0.34 refused such
+/// a base once the reference had parsed.
+fn resolve_reference(
+    base: &Uri<&str>,
+    reference: &str,
+) -> std::result::Result<Uri<String>, String> {
+    if reference.starts_with('#') && base.as_str().ends_with(reference) {
+        return Ok(base.to_owned());
+    }
+    if base.has_fragment() {
+        let parse_only =
+            jsonschema::uri::from_str(DEFAULT_BASE_URI).map_err(|err| err.to_string())?;
+        jsonschema::uri::resolve_against(&parse_only.borrow(), reference)
+            .map_err(|err| err.to_string())?;
+        return Err(format!(
+            "Failed to resolve '{reference}' against '{}': base should not have fragment",
+            base.as_str()
+        ));
+    }
+    jsonschema::uri::resolve_against(base, reference).map_err(|err| err.to_string())
+}
+
+/// The 0.34 compile error for a meta-schema it could not retrieve: the
+/// default retriever had neither HTTP nor file support, and a reference
+/// that only resolved against the `json-schema:///` placeholder base is
+/// reported as written.
+fn unretrievable_meta_schema(reference: &str, scheme: &str, fragmentless: &str) -> String {
+    let (resource, reason) = match scheme {
+        "json-schema" => (reference, "No base URI is available".to_owned()),
+        "http" | "https" => (
+            fragmentless,
             "`resolve-http` feature or a custom resolver is required to resolve external \
              schemas via HTTP"
-                .to_owned()
-        }
-        Some("file") => "`resolve-file` feature or a custom resolver is required to resolve \
-                         external schemas via files"
-            .to_owned(),
-        Some(other) => format!("Unknown scheme {other}"),
-        None => "No base URI is available".to_owned(),
+                .to_owned(),
+        ),
+        "file" => (
+            fragmentless,
+            "`resolve-file` feature or a custom resolver is required to resolve external \
+             schemas via files"
+                .to_owned(),
+        ),
+        other => (fragmentless, format!("Unknown scheme {other}")),
     };
-    Some(format!(
-        "Resource '{normalized}' is not present in a registry and retrieving it failed: {reason}"
-    ))
-}
-
-/// Every `$id` of `schema` and its subschemas, resolved against the
-/// enclosing `$id` and fragment stripped.
-fn collect_ids(schema: &serde_json::Value, base: Option<&str>, out: &mut Vec<String>) {
-    let serde_json::Value::Object(map) = schema else {
-        return;
-    };
-    let own = map
-        .get("$id")
-        .and_then(serde_json::Value::as_str)
-        .map(|id| resolve_reference(base, strip_fragment(id)));
-    if let Some(id) = &own {
-        out.push(id.clone());
-    }
-    let base = own.as_deref().or(base);
-    subschemas(map).for_each(|child| collect_ids(child, base, out));
-}
-
-/// The first `$schema` of `schema` and its subschemas, resolved against the
-/// enclosing `$id`, for which `unresolvable(raw, resolved)` holds.
-fn find_meta_schema_uri(
-    schema: &serde_json::Value,
-    base: Option<&str>,
-    unresolvable: &dyn Fn(&str, &str) -> bool,
-) -> Option<String> {
-    let serde_json::Value::Object(map) = schema else {
-        return None;
-    };
-    let own = map
-        .get("$id")
-        .and_then(serde_json::Value::as_str)
-        .map(|id| resolve_reference(base, strip_fragment(id)));
-    let base = own.as_deref().or(base);
-    if let Some(raw) = map.get("$schema").and_then(serde_json::Value::as_str) {
-        let resolved = resolve_reference(base, strip_fragment(raw));
-        if unresolvable(raw, &resolved) {
-            return Some(resolved);
-        }
-    }
-    subschemas(map).find_map(|child| find_meta_schema_uri(child, base, unresolvable))
-}
-
-/// Resolve `reference` against `base` (RFC 3986 § 5.2, without
-/// dot-segment removal); a reference with a scheme, or no base, is
-/// returned as is.
-fn resolve_reference(base: Option<&str>, reference: &str) -> String {
-    let Some(base) = base else {
-        return reference.to_owned();
-    };
-    if reference.is_empty() {
-        return base.to_owned();
-    }
-    if uri_scheme(reference).is_some() {
-        return reference.to_owned();
-    }
-    let Some(scheme) = uri_scheme(base) else {
-        return reference.to_owned();
-    };
-    let after_scheme = &base[scheme.len() + 1..];
-    if let Some(network_path) = reference.strip_prefix("//") {
-        return format!("{scheme}://{network_path}");
-    }
-    let (authority, path) = match after_scheme.strip_prefix("//") {
-        Some(rest) => {
-            let end = rest.find('/').unwrap_or(rest.len());
-            (format!("//{}", &rest[..end]), &rest[end..])
-        }
-        None => (String::new(), after_scheme),
-    };
-    let path = path.split(['?', '#']).next().unwrap_or("");
-    if reference.starts_with('/') {
-        return format!("{scheme}:{authority}{reference}");
-    }
-    let directory = path.rfind('/').map_or("", |idx| &path[..=idx]);
-    let directory = if directory.is_empty() && !authority.is_empty() {
-        "/"
-    } else {
-        directory
-    };
-    format!("{scheme}:{authority}{directory}{reference}")
-}
-
-/// The scheme of `uri` when it starts with a valid RFC 3986 scheme.
-fn uri_scheme(uri: &str) -> Option<&str> {
-    let (scheme, _) = uri.split_once(':')?;
-    let valid = scheme
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic())
-        && scheme
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
-    valid.then_some(scheme)
-}
-
-fn strip_fragment(uri: &str) -> &str {
-    uri.split_once('#').map_or(uri, |(base, _)| base)
-}
-
-/// `uri` with the scheme and authority lowercased (RFC 3986 § 6.2.2.1),
-/// plus the lowercased scheme when there is one.
-fn normalize_uri(uri: &str) -> (String, Option<String>) {
-    let Some(scheme) = uri_scheme(uri) else {
-        return (uri.to_owned(), None);
-    };
-    let rest = &uri[scheme.len() + 1..];
-    let scheme = scheme.to_ascii_lowercase();
-    let rest = match rest.strip_prefix("//") {
-        Some(after) => {
-            let end = after.find('/').unwrap_or(after.len());
-            format!("//{}{}", after[..end].to_ascii_lowercase(), &after[end..])
-        }
-        None => rest.to_owned(),
-    };
-    (format!("{scheme}:{rest}"), Some(scheme))
+    format!("Resource '{resource}' is not present in a registry and retrieving it failed: {reason}")
 }
 
 /// The direct subschemas of a schema object — the keyword table the 0.34
@@ -799,131 +857,150 @@ $defs:
         }
     }
 
+    /// [`resolve_reference`] against `base` (parsed and normalized like a
+    /// root `$id`), as a string.
+    fn resolve(base: &str, reference: &str) -> std::result::Result<String, String> {
+        let base = jsonschema::uri::from_str(base).expect("valid base");
+        resolve_reference(&base.borrow(), reference).map(|uri| uri.as_str().to_owned())
+    }
+
     #[test]
     fn resolve_reference_network_path_takes_only_the_base_scheme() {
         assert_eq!(
-            resolve_reference(Some("https://e.com/root"), "//other.org/m"),
-            "https://other.org/m"
+            resolve("https://e.com/root", "//other.org/m").as_deref(),
+            Ok("https://other.org/m")
         );
     }
 
     #[test]
     fn resolve_reference_absolute_path_keeps_the_base_authority() {
         assert_eq!(
-            resolve_reference(Some("https://e.com/dir/root.json"), "/x"),
-            "https://e.com/x"
+            resolve("https://e.com/dir/root.json", "/x").as_deref(),
+            Ok("https://e.com/x")
         );
     }
 
     #[test]
     fn resolve_reference_against_a_base_without_path_starts_at_root() {
         assert_eq!(
-            resolve_reference(Some("https://e.com"), "m.json"),
-            "https://e.com/m.json"
+            resolve("https://e.com", "m.json").as_deref(),
+            Ok("https://e.com/m.json")
         );
     }
 
     #[test]
     fn resolve_reference_empty_reference_is_the_base() {
         assert_eq!(
-            resolve_reference(Some("https://e.com/root"), ""),
-            "https://e.com/root"
+            resolve("https://e.com/root", "").as_deref(),
+            Ok("https://e.com/root")
         );
     }
 
     #[test]
     fn resolve_reference_relative_path_replaces_the_last_base_segment() {
         assert_eq!(
-            resolve_reference(Some("https://e.com/a/root.json"), "m.json"),
-            "https://e.com/a/m.json"
+            resolve("https://e.com/a/root.json", "m.json").as_deref(),
+            Ok("https://e.com/a/m.json")
         );
-        // The base's own query and fragment never leak into the result;
-        // the reference's query is kept.
+        // The base's own query never leaks into the result; the
+        // reference's query is kept.
         assert_eq!(
-            resolve_reference(Some("https://e.com/a/root.json?v=1#top"), "m.json"),
-            "https://e.com/a/m.json"
+            resolve("https://e.com/a/root.json?v=1", "m.json").as_deref(),
+            Ok("https://e.com/a/m.json")
         );
         assert_eq!(
-            resolve_reference(Some("https://e.com/a/root.json"), "m.json?q=1"),
-            "https://e.com/a/m.json?q=1"
+            resolve("https://e.com/a/root.json", "m.json?q=1").as_deref(),
+            Ok("https://e.com/a/m.json?q=1")
         );
     }
 
     #[test]
-    fn resolve_reference_keeps_the_reference_fragment_for_the_caller_to_strip() {
-        let resolved = resolve_reference(Some("https://e.com/a/root.json"), "m.json#frag");
-        assert_eq!(resolved, "https://e.com/a/m.json#frag");
-        assert_eq!(strip_fragment(&resolved), "https://e.com/a/m.json");
-        assert_eq!(strip_fragment("#"), "");
-        assert_eq!(strip_fragment("m.json"), "m.json");
-    }
-
-    #[test]
-    fn resolve_reference_returns_the_reference_when_it_cannot_be_resolved() {
-        // No base at all.
-        assert_eq!(resolve_reference(None, "m.json"), "m.json");
-        // A reference with its own scheme ignores the base.
+    fn resolve_reference_query_only_reference_keeps_the_base_path() {
+        // RFC 3986 § 5.2.2: an empty reference path takes the base path.
         assert_eq!(
-            resolve_reference(Some("https://e.com/a/root.json"), "urn:x:y"),
-            "urn:x:y"
+            resolve("https://e.com/a/root.json", "?q=1").as_deref(),
+            Ok("https://e.com/a/root.json?q=1")
         );
-        // A base without a scheme is not a base URI.
-        assert_eq!(resolve_reference(Some("dir/root.json"), "m.json"), "m.json");
-        // A base without an authority merges into its (slash-less) path.
-        assert_eq!(resolve_reference(Some("urn:x:y"), "m.json"), "urn:m.json");
     }
 
     #[test]
-    #[ignore = "bug: resolve_reference keeps `.`/`..` segments (RFC 3986 § 5.2.4 not applied); \
-                jsonschema 0.34 removed them"]
+    fn resolve_reference_keeps_the_reference_fragment() {
+        assert_eq!(
+            resolve("https://e.com/a/root.json", "m.json#frag").as_deref(),
+            Ok("https://e.com/a/m.json#frag")
+        );
+    }
+
+    #[test]
+    fn resolve_reference_ignores_the_base_for_a_reference_with_a_scheme() {
+        assert_eq!(
+            resolve("https://e.com/a/root.json", "urn:x:y").as_deref(),
+            Ok("urn:x:y")
+        );
+    }
+
+    #[test]
+    fn resolve_reference_rejects_a_relative_reference_against_an_opaque_base() {
+        assert_eq!(
+            resolve("tag:x", "m.json"),
+            Err(
+                "Failed to resolve 'm.json' against 'tag:x': when base has a rootless path \
+                 and no authority, reference should either have scheme, be empty or start \
+                 with '#'"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_reference_rejects_a_base_with_a_fragment() {
+        // `referencing` 0.61 would drop the fragment; 0.34 refused the base.
+        let base = jsonschema::uri::from_str("https://e.com/r#frag").expect("valid base");
+        assert_eq!(
+            resolve_reference(&base.borrow(), "x").map(|uri| uri.as_str().to_owned()),
+            Err(
+                "Failed to resolve 'x' against 'https://e.com/r#frag': base should not have \
+                 fragment"
+                    .to_owned()
+            )
+        );
+        // A reference that does not parse reports that first.
+        assert_eq!(
+            resolve_reference(&base.borrow(), "%zz").map(|uri| uri.as_str().to_owned()),
+            Err("Invalid URI reference '%zz': invalid percent-encoded octet at index 0".to_owned())
+        );
+    }
+
+    #[test]
     fn resolve_reference_removes_dot_segments() {
         assert_eq!(
-            resolve_reference(Some("https://e.com/a/b/root.json"), "../m.json"),
-            "https://e.com/a/m.json"
+            resolve("https://e.com/a/b/root.json", "../m.json").as_deref(),
+            Ok("https://e.com/a/m.json")
         );
         assert_eq!(
-            resolve_reference(Some("https://e.com/a/b/root.json"), "./m.json"),
-            "https://e.com/a/b/m.json"
+            resolve("https://e.com/a/b/root.json", "./m.json").as_deref(),
+            Ok("https://e.com/a/b/m.json")
+        );
+        assert_eq!(
+            resolve("https://e.com/a/root.json", "x/../m.json").as_deref(),
+            Ok("https://e.com/a/m.json")
         );
     }
 
     #[test]
-    fn uri_scheme_accepts_only_rfc_3986_schemes() {
-        for (uri, expected) in [
-            ("https://e.com", Some("https")),
-            ("HTTPS://e.com", Some("HTTPS")),
-            ("urn:x:y", Some("urn")),
-            ("a1+b-c.d:rest", Some("a1+b-c.d")),
-            ("meta.json", None),
-            ("//host:80/p", None),
-            ("1abc:x", None),
-            (":x", None),
-            ("ht tp:x", None),
-            ("#frag:x", None),
-            ("", None),
-        ] {
-            assert_eq!(uri_scheme(uri), expected, "for {uri:?}");
-        }
-    }
-
-    #[test]
-    fn normalize_uri_lowercases_scheme_and_authority_only() {
-        for (uri, expected, scheme) in [
-            (
-                "HTTPS://Example.COM/A/B",
-                "https://example.com/A/B",
-                Some("https"),
-            ),
-            ("HTTP://Example.COM", "http://example.com", Some("http")),
-            ("FILE:///Tmp/M.json", "file:///Tmp/M.json", Some("file")),
-            ("URN:X:Y", "urn:X:Y", Some("urn")),
-            ("meta.json", "meta.json", None),
-            ("//Host/Path", "//Host/Path", None),
+    fn resolve_reference_normalizes_the_result() {
+        for (reference, expected) in [
+            ("HTTPS://Example.COM/A/B", "https://example.com/A/B"),
+            ("HTTP://Example.COM", "http://example.com"),
+            ("FILE:///Tmp/M.json", "file:///Tmp/M.json"),
+            ("URN:X:Y", "urn:X:Y"),
+            ("https://e.com/%7Er", "https://e.com/~r"),
+            ("https://e.com:443/r", "https://e.com/r"),
         ] {
             assert_eq!(
-                normalize_uri(uri),
-                (expected.to_owned(), scheme.map(str::to_owned)),
-                "for {uri:?}"
+                resolve("https://base.org/root", reference).as_deref(),
+                Ok(expected),
+                "for {reference:?}"
             );
         }
     }
@@ -1041,8 +1118,6 @@ $defs:
     }
 
     #[test]
-    #[ignore = "bug: dot segments in a `$schema` are not removed before the `$id` lookup and \
-                the error message (jsonschema 0.34 removed them)"]
     fn compile_inline_meta_schema_resolution_removes_dot_segments() {
         assert_compiles(&serde_json::json!({
             "$id": "https://e.com/a/root.json",
@@ -1059,6 +1134,130 @@ $defs:
             "properties": {"a": {"$schema": "../m.json"}},
         }));
         assert_eq!(message, http_meta_schema_error("https://e.com/a/m.json"));
+    }
+
+    #[test]
+    fn compile_inline_meta_schema_lookup_matches_normalized_ids() {
+        for schema in [
+            serde_json::json!({
+                "$id": "https://ex.com/a/root.json",
+                "$defs": {"m": {"$id": "https://ex.com/b/m.json"}},
+                "properties": {"a": {"$schema": "../b/m.json"}},
+            }),
+            serde_json::json!({
+                "$id": "https://ex.com/a/root.json",
+                "$defs": {"m": {"$id": "https://ex.com/a/m.json"}},
+                "properties": {"a": {"$schema": "x/../m.json"}},
+            }),
+            // The `$id` is normalized before the lookup, too.
+            serde_json::json!({"$id": "https://EX.com/a", "$schema": "https://ex.com/a"}),
+        ] {
+            assert_compiles(&schema);
+        }
+    }
+
+    #[test]
+    fn compile_inline_reports_meta_schema_resolved_per_rfc_3986() {
+        for (schema, resolved) in [
+            (
+                serde_json::json!({"$id": "https://ex.com/a/root.json", "$schema": "?q=1"}),
+                "https://ex.com/a/root.json?q=1",
+            ),
+            (
+                serde_json::json!({
+                    "$id": "https://ex.com/a/root.json",
+                    "properties": {"a": {"$schema": "../b/m.json"}},
+                }),
+                "https://ex.com/b/m.json",
+            ),
+        ] {
+            assert_eq!(
+                compile_error_message(schema.clone()),
+                http_meta_schema_error(resolved),
+                "for {schema}"
+            );
+        }
+    }
+
+    #[test]
+    fn compile_inline_does_not_check_meta_schema_under_a_urn_base() {
+        for schema in [
+            serde_json::json!({"$id": "urn:a:b", "$schema": "m"}),
+            serde_json::json!({"$id": "urn:x:y", "$schema": "https://example.com/m"}),
+            serde_json::json!({
+                "$id": "urn:x:y",
+                "properties": {"a": {"$schema": "https://example.com/m"}},
+            }),
+        ] {
+            assert_compiles(&schema);
+        }
+        // A nested `$id` with another scheme is checked again.
+        assert_eq!(
+            compile_error_message(serde_json::json!({
+                "$id": "urn:x:y",
+                "properties": {"a": {"$id": "https://e.com/r", "$schema": "m.json"}},
+            })),
+            http_meta_schema_error("https://e.com/m.json")
+        );
+    }
+
+    #[test]
+    fn compile_inline_rejects_relative_meta_schema_under_a_tag_base() {
+        let opaque = |reference: &str| {
+            format!(
+                "Failed to resolve '{reference}' against 'tag:x': when base has a rootless path \
+                 and no authority, reference should either have scheme, be empty or start with \
+                 '#'"
+            )
+        };
+        assert_eq!(
+            compile_error_message(serde_json::json!({"$id": "tag:x", "$schema": "m.json"})),
+            opaque("m.json")
+        );
+        // A resolution failure anywhere wins over an unretrievable
+        // meta-schema found earlier.
+        assert_eq!(
+            compile_error_message(serde_json::json!({
+                "$schema": "https://example.com/m",
+                "properties": {"a": {"$id": "tag:x", "properties": {"b": {"$schema": "m"}}}},
+            })),
+            opaque("m")
+        );
+        // An absolute `$schema` under it is looked up as usual.
+        assert_eq!(
+            compile_error_message(serde_json::json!({
+                "$id": "tag:x",
+                "$schema": "https://example.com/m",
+            })),
+            http_meta_schema_error("https://example.com/m")
+        );
+    }
+
+    #[test]
+    fn compile_inline_follows_fragment_only_references_to_their_target() {
+        for schema in [
+            serde_json::json!({
+                "$ref": "#/default",
+                "default": {"$schema": "https://example.com/m"},
+            }),
+            serde_json::json!({
+                "$id": "https://e.com/r",
+                "$schema": "#/default",
+                "default": {"$schema": "https://example.com/m"},
+            }),
+        ] {
+            assert_eq!(
+                compile_error_message(schema.clone()),
+                http_meta_schema_error("https://example.com/m"),
+                "for {schema}"
+            );
+        }
+        // A pointer that leads back to itself, or nowhere, is fine.
+        assert_compiles(&serde_json::json!({
+            "$schema": "#/default",
+            "default": {"$schema": "#/default"},
+        }));
+        assert_compiles(&serde_json::json!({"$schema": "#/nope"}));
     }
 
     #[test]

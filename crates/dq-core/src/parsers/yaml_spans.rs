@@ -37,7 +37,7 @@
 //!   value_range; replacement renders the value only. M3 will revisit if a
 //!   user reports a real-world case where this matters.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use saphyr_parser::{Event, Parser as YamlParser, ScalarStyle, Span};
@@ -197,23 +197,53 @@ fn build_provenance_with_inline_offsets(
 /// or [`ScalarStyle::Folded`]).
 ///
 /// Implementation mirrors the spike's state machine (see file-level docs).
-/// Step 1 counts documents (so we know whether to namespace pointers under
-/// `/{doc_idx}`); step 2 walks events recording one [`ValueSpan`] per scalar
-/// value (not per scalar key) and, alongside, recording the canonical pointer
-/// of every block-style leaf for the inline-offset enrichment in
-/// [`parse_yaml_with_spans`].
+/// Step 1 ([`prescan`]) counts documents (so we know whether to namespace
+/// pointers under `/{doc_idx}`) and collects the block scalars with node
+/// properties; step 2 ([`replay_block_scalar_body_starts`]) finds their
+/// 0.0.6 span starts in one extra pass, skipped when there are none; step 3
+/// walks events recording one [`ValueSpan`] per scalar value (not per scalar
+/// key) and, alongside, recording the canonical pointer of every block-style
+/// leaf for the inline-offset enrichment in [`parse_yaml_with_spans`]. The
+/// pass count does not grow with the number of scalars.
 ///
 /// # saphyr-parser char-vs-byte caveat
 ///
 /// `saphyr_parser::Marker::index()` reports a **character** index (count of
 /// Unicode scalars seen so far) despite the rustdoc claiming bytes — see the
-/// `index` field comment in `saphyr-parser` 0.0.6 `src/scanner.rs`. The splice
+/// `index` field comment on `Marker` in `saphyr-parser`'s `src/scanner.rs`
+/// (0.0.6 and 0.3 alike). The splice
 /// path needs byte offsets, so we precompute a char-index → byte-offset map
 /// up front and translate every marker through [`char_index_to_byte`] before
 /// constructing a [`Range<usize>`]. Without this, any non-ASCII byte before a
 /// span (em-dash in a comment, accented identifier, …) shifts every later
 /// span's `value_range` by `(utf8_len - 1)` bytes per multi-byte codepoint.
 fn build_span_map_and_block_scalars(bytes: &[u8]) -> Result<(SpanMap, HashSet<String>)> {
+    let built = build_span_map_with_stats(bytes)?;
+    tracing::trace!(
+        parser_passes = built.parser_passes,
+        spans = built.spans.len(),
+        "built YAML span map",
+    );
+    Ok((built.spans, built.block_scalars))
+}
+
+/// Output of [`build_span_map_with_stats`].
+struct BuiltSpans {
+    spans: SpanMap,
+    block_scalars: HashSet<String>,
+    /// Number of `saphyr-parser` passes over the source (or a blanked copy
+    /// of it). Two without block scalars carrying node properties, three
+    /// with them — independent of how many there are.
+    parser_passes: usize,
+}
+
+/// [`build_span_map_and_block_scalars`], also reporting how many parser
+/// passes the build took.
+///
+/// The passes are: [`prescan`] (document count, block scalars with node
+/// properties, aliases), at most one [`replay_block_scalar_body_starts`]
+/// over a blanked copy, and the main [`State`] walk.
+fn build_span_map_with_stats(bytes: &[u8]) -> Result<BuiltSpans> {
     let text = std::str::from_utf8(bytes).map_err(|err| Error::Parse {
         file: None,
         line: 0,
@@ -223,16 +253,20 @@ fn build_span_map_and_block_scalars(bytes: &[u8]) -> Result<(SpanMap, HashSet<St
         message: format!("source is not valid UTF-8: {err}"),
     })?;
 
-    let n_docs = count_documents(text, bytes)?;
-    let multi_doc = n_docs > 1;
-
     // One-time O(N) precompute. Lookup by char-index then becomes O(1).
     let char_to_byte = build_char_to_byte_map(text);
 
+    let mut parser_passes = 1;
+    let prescan = prescan(text, bytes, &char_to_byte)?;
+    let multi_doc = prescan.n_docs > 1;
+    let body_starts =
+        replay_block_scalar_body_starts(text, &char_to_byte, &prescan, &mut parser_passes);
+
     let mut spans = SpanMap::new();
     let mut block_scalars: HashSet<String> = HashSet::new();
-    let mut state = State::new(text, multi_doc, &char_to_byte);
+    let mut state = State::new(text, multi_doc, &char_to_byte, &body_starts);
 
+    parser_passes += 1;
     let mut parser = YamlParser::new_from_str(text);
     while let Some(item) = parser.next_event() {
         let (event, span) =
@@ -240,7 +274,11 @@ fn build_span_map_and_block_scalars(bytes: &[u8]) -> Result<(SpanMap, HashSet<St
         state.observe(event, span, &mut spans, &mut block_scalars)?;
     }
 
-    Ok((spans, block_scalars))
+    Ok(BuiltSpans {
+        spans,
+        block_scalars,
+        parser_passes,
+    })
 }
 
 /// Build a `Vec<usize>` whose entry `i` is the byte offset of the `i`-th
@@ -269,25 +307,202 @@ fn char_index_to_byte(char_to_byte: &[usize], char_idx: usize) -> usize {
         .unwrap_or_else(|| char_to_byte.last().copied().unwrap_or(0))
 }
 
-/// First pass: count `Event::DocumentStart` occurrences. Required to decide
-/// whether the second pass should prefix pointers with `/{doc_idx}`.
-fn count_documents(text: &str, bytes: &[u8]) -> Result<usize> {
-    // The first pass walks events purely to count documents. If a scan
-    // error fires here, the marker is converted via a fresh char-to-byte
-    // map: the cost is paid only on the (rare) error path, so we don't
-    // bother threading the precomputed map through.
+/// What the first pass learns before the main walk.
+struct Prescan {
+    /// Number of `Event::DocumentStart` events. Decides whether the main
+    /// walk prefixes pointers with `/{doc_idx}`.
+    n_docs: usize,
+    /// Every block scalar (`|` / `>`) carrying node properties, in stream
+    /// order — the scalars whose 0.0.6 span start needs the replay.
+    propertied_block_scalars: Vec<PropertiedBlockScalar>,
+    /// Byte range of every alias (`*name`), in stream order.
+    aliases: Vec<Range<usize>>,
+}
+
+/// A block scalar with node properties, as seen by [`prescan`].
+struct PropertiedBlockScalar {
+    /// Position of the scalar's event in the stream (`StreamStart` is 0).
+    ordinal: usize,
+    /// Byte range of the node properties (`&a`, `!t`, `&a !t`, …).
+    props: Range<usize>,
+    /// Character index where the scalar's span ends. Blanking the properties
+    /// leaves it unchanged, so the replay uses it to confirm it is looking
+    /// at the same scalar.
+    end_char: usize,
+}
+
+/// First pass: count documents and collect what
+/// [`replay_block_scalar_body_starts`] needs.
+fn prescan(text: &str, bytes: &[u8], char_to_byte: &[usize]) -> Result<Prescan> {
+    let mut prescan = Prescan {
+        n_docs: 0,
+        propertied_block_scalars: Vec::new(),
+        aliases: Vec::new(),
+    };
     let mut parser = YamlParser::new_from_str(text);
-    let mut n = 0_usize;
+    let mut ordinal = 0_usize;
     while let Some(item) = parser.next_event() {
-        let (event, _) = item.map_err(|scan_err| {
-            let char_to_byte = build_char_to_byte_map(text);
-            scan_to_parse_error(&scan_err, bytes, &char_to_byte)
-        })?;
-        if matches!(event, Event::DocumentStart(_)) {
-            n += 1;
+        let (event, span) =
+            item.map_err(|scan_err| scan_to_parse_error(&scan_err, bytes, char_to_byte))?;
+        match event {
+            Event::DocumentStart(_) => prescan.n_docs += 1,
+            Event::Scalar(_, ScalarStyle::Literal | ScalarStyle::Folded, anchor, tag)
+                if anchor != 0 || tag.is_some() =>
+            {
+                let n_properties = usize::from(anchor != 0) + usize::from(tag.is_some());
+                let props_start = char_index_to_byte(char_to_byte, span.start.index());
+                let props_end = skip_node_properties(bytes, props_start, n_properties).0;
+                prescan
+                    .propertied_block_scalars
+                    .push(PropertiedBlockScalar {
+                        ordinal,
+                        props: props_start..props_end,
+                        end_char: span.end.index(),
+                    });
+            }
+            Event::Alias(_) => prescan.aliases.push(span_to_range(span, char_to_byte)),
+            _ => {}
+        }
+        ordinal += 1;
+    }
+    Ok(prescan)
+}
+
+/// Byte offset where saphyr-parser 0.0.6 started the span of each block
+/// scalar with node properties — the first content line, not the `|` / `>`
+/// indicator — keyed by the scalar's event ordinal.
+///
+/// The scanner's block-scalar rules (indentation auto-detection, explicit
+/// indentation indicators, leading blank lines) are not re-implemented
+/// here. Instead the stream is replayed once over a copy of the source in
+/// which every such scalar's properties are blanked out (line breaks kept,
+/// so character indices and lines stay put): without properties
+/// saphyr-parser reports the 0.0.6 start as it is. Blanking an anchor would
+/// make its aliases dangling, so every alias is overwritten with a plain
+/// scalar of the same length — one event for one event, so ordinals line
+/// up.
+///
+/// A scalar the combined replay cannot confirm (wrong event at its ordinal,
+/// a different span end, or a replay error) falls back to
+/// [`replay_one_block_scalar`], which blanks only that scalar and stops at
+/// it. A scalar missing from the map means even that diverged, which would
+/// be a parser bug; the caller then uses the indicator position.
+///
+/// Costs one parser pass (none when there are no such scalars), plus one per
+/// fallback.
+fn replay_block_scalar_body_starts(
+    text: &str,
+    char_to_byte: &[usize],
+    prescan: &Prescan,
+    parser_passes: &mut usize,
+) -> HashMap<usize, usize> {
+    let targets = &prescan.propertied_block_scalars;
+    let mut starts = HashMap::with_capacity(targets.len());
+    if targets.is_empty() {
+        return starts;
+    }
+    let mut unconfirmed: Vec<&PropertiedBlockScalar> = Vec::new();
+    if let Some(blanked) = blank_for_replay(text, targets, &prescan.aliases) {
+        *parser_passes += 1;
+        let mut parser = YamlParser::new_from_str(&blanked);
+        let mut pending = targets.iter().peekable();
+        let mut ordinal = 0_usize;
+        while let Some(target) = pending.peek().copied() {
+            let Some(Ok((event, span))) = parser.next_event() else {
+                break;
+            };
+            if ordinal == target.ordinal {
+                match event {
+                    Event::Scalar(_, ScalarStyle::Literal | ScalarStyle::Folded, _, _)
+                        if span.end.index() == target.end_char =>
+                    {
+                        starts.insert(
+                            target.ordinal,
+                            char_index_to_byte(char_to_byte, span.start.index()),
+                        );
+                    }
+                    other => {
+                        tracing::debug!(
+                            ?other,
+                            ordinal,
+                            "combined block-scalar span replay diverged; replaying the scalar alone",
+                        );
+                        unconfirmed.push(target);
+                    }
+                }
+                pending.next();
+            }
+            ordinal += 1;
+        }
+        unconfirmed.extend(pending);
+    } else {
+        unconfirmed.extend(targets);
+    }
+    for target in unconfirmed {
+        *parser_passes += 1;
+        if let Some(start) = replay_one_block_scalar(text, char_to_byte, target) {
+            starts.insert(target.ordinal, start);
         }
     }
-    Ok(n)
+    starts
+}
+
+/// Copy of `text` with the properties of every scalar in `targets` turned
+/// into spaces and every alias in `aliases` turned into a run of `x` — each
+/// character replaced by one ASCII character, line breaks kept, so character
+/// indices and line numbers match the source. `None` if two ranges overlap
+/// or one is not on a character boundary, which would be a prescan bug.
+fn blank_for_replay(
+    text: &str,
+    targets: &[PropertiedBlockScalar],
+    aliases: &[Range<usize>],
+) -> Option<String> {
+    let mut edits: Vec<(&Range<usize>, char)> = targets
+        .iter()
+        .map(|target| (&target.props, ' '))
+        .chain(aliases.iter().map(|alias| (alias, 'x')))
+        .collect();
+    edits.sort_by_key(|(range, _)| range.start);
+    let mut out = String::with_capacity(text.len());
+    let mut pos = 0;
+    for (range, fill) in edits {
+        out.push_str(text.get(pos..range.start)?);
+        for ch in text.get(range.clone())?.chars() {
+            out.push(if matches!(ch, '\n' | '\r') { ch } else { fill });
+        }
+        pos = range.end;
+    }
+    out.push_str(text.get(pos..)?);
+    Some(out)
+}
+
+/// The 0.0.6 span start of one block scalar with properties: replay the
+/// stream with only its properties blanked, up to its ordinal. Events before
+/// the ordinal are unaffected by the blanking — an alias of the blanked
+/// anchor can only come later. Fallback of
+/// [`replay_block_scalar_body_starts`]; `None` if this replay diverges too.
+fn replay_one_block_scalar(
+    text: &str,
+    char_to_byte: &[usize],
+    target: &PropertiedBlockScalar,
+) -> Option<usize> {
+    let blanked = blank_for_replay(text, std::slice::from_ref(target), &[])?;
+    let mut parser = YamlParser::new_from_str(&blanked);
+    for _ in 0..target.ordinal {
+        parser.next_event()?.ok()?;
+    }
+    match parser.next_event()?.ok()? {
+        (Event::Scalar(_, ScalarStyle::Literal | ScalarStyle::Folded, _, _), span) => {
+            Some(char_index_to_byte(char_to_byte, span.start.index()))
+        }
+        (other, _) => {
+            tracing::debug!(
+                ?other,
+                "block-scalar span replay diverged; using the indicator position",
+            );
+            None
+        }
+    }
 }
 
 /// Convert a `saphyr_parser::ScanError` into our domain [`Error::Parse`],
@@ -382,13 +597,20 @@ struct State<'src> {
     stack: Vec<Frame>,
     path: Vec<String>,
     /// Position of the next event in the parser's stream (`StreamStart` is
-    /// 0). [`State::block_scalar_body_start`] replays the stream up to this
-    /// position.
+    /// 0). Keys [`State::block_body_starts`].
     next_ordinal: usize,
+    /// 0.0.6 span start of each block scalar with node properties, keyed by
+    /// event ordinal — see [`replay_block_scalar_body_starts`].
+    block_body_starts: &'src HashMap<usize, usize>,
 }
 
 impl<'src> State<'src> {
-    fn new(text: &'src str, multi_doc: bool, char_to_byte: &'src [usize]) -> Self {
+    fn new(
+        text: &'src str,
+        multi_doc: bool,
+        char_to_byte: &'src [usize],
+        block_body_starts: &'src HashMap<usize, usize>,
+    ) -> Self {
         Self {
             text,
             bytes: text.as_bytes(),
@@ -399,6 +621,7 @@ impl<'src> State<'src> {
             stack: Vec::new(),
             path: Vec::new(),
             next_ordinal: 0,
+            block_body_starts,
         }
     }
 
@@ -554,14 +777,15 @@ impl<'src> State<'src> {
     ) -> (Range<usize>, usize) {
         let props_start = char_index_to_byte(self.char_to_byte, span.start.index());
         let end = char_index_to_byte(self.char_to_byte, span.end.index());
-        let (props_end, content_start) =
-            skip_node_properties(self.bytes, props_start, n_properties);
+        let content_start = skip_node_properties(self.bytes, props_start, n_properties).1;
         let range = if is_empty_node {
             // 0.0.6 reported the span of the token that follows the
             // properties.
             return self.legacy_empty_node_span(content_start);
         } else if matches!(style, ScalarStyle::Literal | ScalarStyle::Folded) {
-            self.block_scalar_body_start(props_start..props_end, ordinal)
+            self.block_body_starts
+                .get(&ordinal)
+                .copied()
                 .unwrap_or(content_start)..end
         } else {
             content_start..end
@@ -695,47 +919,6 @@ impl<'src> State<'src> {
             }
         }
         0
-    }
-
-    /// Byte offset where saphyr-parser 0.0.6 started the span of the block
-    /// scalar whose node properties occupy `props` — the first content line,
-    /// not the `|` / `>` indicator.
-    ///
-    /// The scanner's block-scalar rules (indentation auto-detection, explicit
-    /// indentation indicators, leading blank lines) are not re-implemented
-    /// here. Instead the stream is replayed with the properties blanked out
-    /// (line breaks kept, so character indices and lines stay put): without
-    /// properties saphyr-parser reports the 0.0.6 start as it is. Events
-    /// before `ordinal` are unaffected by the blanking, so the replay can stop
-    /// there — an alias of the blanked anchor can only come later.
-    ///
-    /// Costs one extra parse per block scalar with properties. `None` only if
-    /// the replay diverges, which would be a parser bug.
-    fn block_scalar_body_start(&self, props: Range<usize>, ordinal: usize) -> Option<usize> {
-        let text = self.text;
-        let mut blanked = String::with_capacity(text.len());
-        blanked.push_str(text.get(..props.start)?);
-        for ch in text.get(props.clone())?.chars() {
-            blanked.push(if matches!(ch, '\n' | '\r') { ch } else { ' ' });
-        }
-        blanked.push_str(text.get(props.end..)?);
-
-        let mut parser = YamlParser::new_from_str(&blanked);
-        for _ in 0..ordinal {
-            parser.next_event()?.ok()?;
-        }
-        match parser.next_event()?.ok()? {
-            (Event::Scalar(_, ScalarStyle::Literal | ScalarStyle::Folded, _, _), span) => {
-                Some(char_index_to_byte(self.char_to_byte, span.start.index()))
-            }
-            (other, _) => {
-                tracing::debug!(
-                    ?other,
-                    "block-scalar span replay diverged; using the indicator position",
-                );
-                None
-            }
-        }
     }
 
     fn value_pointer(&mut self) -> String {
@@ -2173,5 +2356,80 @@ mod tests {
             }),
             "block scalar inside nested mapping MUST still carry inline_offset",
         );
+    }
+
+    // -- block scalars with node properties: one replay pass ------------
+
+    #[test]
+    fn propertied_block_scalars_span_from_first_content_line() {
+        // The alias sits last: an alias value leaves the pending key in
+        // place, so anything after it in the mapping would shift.
+        let bytes = b"a: &x |\n  body\n  two\nb: !t >-\n  fold\nc: !!str &y |2\n   ind\nd: *x\n";
+        let (_, spans) = parse_with_spans(bytes).expect("parse");
+        assert_span(&spans, "/a", bytes, b"body\n  two\n");
+        assert_span(&spans, "/b", bytes, b"fold\n");
+        assert_span(&spans, "/c", bytes, b" ind\n");
+    }
+
+    #[test]
+    fn propertied_block_scalar_replay_is_a_single_pass() {
+        // Regression guard for the per-scalar replay, which re-parsed the
+        // stream once per block scalar with properties (O(N * file size)).
+        let mut src = String::new();
+        for i in 0..500 {
+            src.push_str(&format!(
+                "k{i}: &a{i} |\n  body {i}\nt{i}: !Sub >-\n  fold {i}\n"
+            ));
+        }
+        src.push_str("last: *a0\n");
+        let built = build_span_map_with_stats(src.as_bytes()).expect("parse");
+        assert_eq!(
+            built.parser_passes, 3,
+            "prescan + one combined replay + main walk"
+        );
+        assert_span(&built.spans, "/k0", src.as_bytes(), b"body 0\n");
+        assert_span(&built.spans, "/t499", src.as_bytes(), b"fold 499\n");
+    }
+
+    #[test]
+    fn span_build_without_propertied_block_scalars_skips_the_replay() {
+        let bytes = b"a: &x 1\nb: |\n  body\nc: *x\n";
+        let built = build_span_map_with_stats(bytes).expect("parse");
+        assert_eq!(built.parser_passes, 2, "prescan + main walk only");
+    }
+
+    #[test]
+    fn unconfirmed_block_scalar_falls_back_to_a_solo_replay() {
+        let text = "a: &x |\n  body\nb: !t |\n  two\nc: *x\n";
+        let char_to_byte = build_char_to_byte_map(text);
+        let mut prescan = prescan(text, text.as_bytes(), &char_to_byte).expect("prescan");
+        assert_eq!(prescan.propertied_block_scalars.len(), 2);
+        let mut passes = 0;
+        let confirmed = replay_block_scalar_body_starts(text, &char_to_byte, &prescan, &mut passes);
+        assert_eq!(passes, 1);
+        // A wrong span end makes the combined replay reject the first
+        // scalar; the solo replay must still find the same start.
+        prescan.propertied_block_scalars[0].end_char += 1;
+        let mut passes = 0;
+        let with_fallback =
+            replay_block_scalar_body_starts(text, &char_to_byte, &prescan, &mut passes);
+        assert_eq!(passes, 2, "combined replay + one solo replay");
+        assert_eq!(with_fallback, confirmed);
+        let first = prescan.propertied_block_scalars[0].ordinal;
+        assert_eq!(
+            with_fallback.get(&first),
+            Some(&text.find("body").expect("body"))
+        );
+    }
+
+    #[test]
+    fn blank_for_replay_keeps_character_positions() {
+        let text = "k: &аб |\n  é\nr: *аб\n";
+        let char_to_byte = build_char_to_byte_map(text);
+        let prescan = prescan(text, text.as_bytes(), &char_to_byte).expect("prescan");
+        let blanked = blank_for_replay(text, &prescan.propertied_block_scalars, &prescan.aliases)
+            .expect("ranges are disjoint");
+        assert_eq!(blanked, "k:     |\n  é\nr: xxx\n");
+        assert_eq!(blanked.chars().count(), text.chars().count());
     }
 }

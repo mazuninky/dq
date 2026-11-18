@@ -605,12 +605,15 @@ mod tests {
     // specific status code. The live-API test is retained as a pre-release
     // smoke check that confirms the GitHub API contract hasn't drifted.
     //
-    // Test gap: `run_update` still wraps `self_update::backends::github`
-    // with no seam. The `ensure_writable_install_dir` helper IS unit-testable
-    // (covered indirectly by the integration test below) but the
-    // `Update::configure` invocation cannot be observed without launching a
-    // real download. The trait-based seam asked for in spec §4.5 was not
-    // implemented in the production-code pass — flagged as a follow-up.
+    // `run_update` builds its updater through [`update_builder`], so the
+    // request shape is observable: the `update_builder_*` tests below point
+    // `api_base_url` at the local mock and check the User-Agent on both the
+    // release listing and the asset download, failing with 404 before
+    // anything is extracted or the binary is replaced. The
+    // `ensure_writable_install_dir` helper is covered indirectly by the
+    // integration test below. Still untested: `run_update` itself
+    // (`current_exe`, the replacement step) — it needs a real release, so the
+    // trait-based seam from spec §4.5 remains a follow-up.
     // ---------------------------------------------------------------------
 
     /// Minimal one-shot HTTP server backed by a `TcpListener`. Reads the

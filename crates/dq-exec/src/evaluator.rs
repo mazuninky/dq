@@ -1600,6 +1600,64 @@ check:
         );
     }
 
+    #[test]
+    fn schema_check_validates_a_root_draft_07_schema_as_2020_12() {
+        // jsonschema 0.34 compiled a root `$schema` of draft-04/06/07 but
+        // validated nothing. 0.61 validates it — with 2020-12 semantics,
+        // since the validator is built with an explicit 2020-12 draft. The
+        // owner kept the new behaviour; this pins it.
+        let compile = |schema: &str| {
+            Evaluator::new(vec![ruleset_from_yaml(&format!(
+                "id: test.schema-draft7\ndescription: x\nseverity: error\nmatch:\n  format: \
+                 json\ncheck:\n  schema: {schema}\n"
+            ))])
+        };
+        let messages = |schema: &str, value: serde_json::Value| -> Vec<String> {
+            let owned = ir_for_test(&value, "json");
+            compile(schema)
+                .expect("build evaluator")
+                .evaluate_file(&Utf8PathBuf::from("d.json"), &owned.to_borrowed(), "json")
+                .into_iter()
+                .map(|diag| diag.message)
+                .collect()
+        };
+        let draft7 = r##""http://json-schema.org/draft-07/schema#""##;
+
+        assert_eq!(
+            messages(
+                &format!(r#"{{"$schema": {draft7}, "required": ["zz"]}}"#),
+                json!({}),
+            ),
+            vec![r#"/required: "zz" is a required property"#.to_owned()],
+        );
+        assert_eq!(
+            messages(
+                &format!(r#"{{"$schema": {draft7}, "type": "object"}}"#),
+                json!([1]),
+            ),
+            vec![r#"/type: [1] is not of type "object""#.to_owned()],
+        );
+        // 2020-12, not draft-07: a keyword next to `$ref` still applies...
+        assert_eq!(
+            messages(
+                &format!(
+                    r##"{{"$schema": {draft7}, "$ref": "#/definitions/x",
+                        "definitions": {{"x": {{}}}}, "required": ["zz"]}}"##
+                ),
+                json!({}),
+            ),
+            vec![r#"/required: "zz" is a required property"#.to_owned()],
+        );
+        // ...and the draft-07 array form of `items` fails the compile.
+        assert!(
+            compile(&format!(
+                r#"{{"$schema": {draft7}, "items": [{{"type": "string"}}]}}"#
+            ))
+            .is_err(),
+            "array-form `items` must be rejected as under 2020-12",
+        );
+    }
+
     // --- perf-jq-compile-cache regression tests ----------------------------
     //
     // The cache is invisible from `Evaluator`'s public API; we reach into

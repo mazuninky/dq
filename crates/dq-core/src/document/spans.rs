@@ -59,8 +59,8 @@ pub struct ValueSpan {
 
 /// Syntactic context of a span — block-vs-flow and mapping-vs-sequence.
 ///
-/// The saphyr-parser 0.0.6 events do not carry an explicit block-vs-flow
-/// flag, but the spike confirmed it can be derived from event sequences and
+/// The saphyr-parser events do not carry an explicit block-vs-flow flag,
+/// but the spike confirmed it can be derived from event sequences and
 /// preceding source bytes. We materialize the result here so the renderer
 /// does not re-derive it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
