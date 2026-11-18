@@ -262,7 +262,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   when stderr is a terminal and colour is not turned off.
 - `dq lint` of a YAML file no longer prints four `check.jq raised a
   runtime error` warnings from the `@std/dockerfile` rules: they skip any
-  YAML that is not a list of Dockerfile instructions.
+  YAML that is not a list of Dockerfile instructions. They skip a
+  Dockerfile with no instructions too (empty, or comments only), which
+  no longer gets `@std/dockerfile/has-healthcheck`.
 - `dq set` / `del` / `lint` no longer panic on a file with an empty or
   null key: `"": 1` in YAML, `{"": 1}` in JSON, `"" = 1` in TOML,
   `f: {? &a}` in YAML. `set` of a new key next to an empty key that is
