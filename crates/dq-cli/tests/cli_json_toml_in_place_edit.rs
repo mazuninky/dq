@@ -283,3 +283,91 @@ fn toml_del_of_an_array_of_tables_item_with_a_subtable() {
         ],
     );
 }
+
+#[test]
+fn toml_set_over_a_table_whose_parent_only_it_makes() {
+    // The parent has no header of its own: the new value goes in as an
+    // inline table for the parent, where the header was.
+    check(
+        "toml",
+        &[
+            (
+                "x = 1\n[a.b]\nc = 1\n",
+                "set",
+                &["/a/b", "5"],
+                "x = 1\na = { b = 5 }\n",
+            ),
+            (
+                "x = 1\n[a.b]\nc = 1\n",
+                "set",
+                &["/a/b", "{\"z\":1}"],
+                "x = 1\na = { b = { z = 1 } }\n",
+            ),
+            (
+                "x = 1\r\n[a.b]\r\nc = 1\r\n",
+                "set",
+                &["/a/b", "5"],
+                "x = 1\r\na = { b = 5 }\r\n",
+            ),
+            (
+                "a.b.c = 1\ne = 1\n",
+                "set",
+                &["/a/b", "5"],
+                "e = 1\na = { b = 5 }\n",
+            ),
+            (
+                "[q]\n[q.a.b]\nc = 1\n",
+                "set",
+                &["/q/a/b", "5"],
+                "[q]\na = { b = 5 }\n",
+            ),
+            // An `[[arr]]` item whose only section is a subtable.
+            (
+                "[[arr]]\n[arr.s]\nk = 1\n",
+                "set",
+                &["/arr/0/s", "5"],
+                "[[arr]]\ns = 5\n",
+            ),
+        ],
+    );
+}
+
+#[test]
+fn a_new_key_next_to_an_only_empty_key() {
+    check(
+        "json",
+        &[
+            (
+                r#"{"a": {"": 2}}"#,
+                "set",
+                &["/a/zzq", "1"],
+                r#"{"a": {"": 2, "zzq": 1}}"#,
+            ),
+            (r#"{"": 2}"#, "set", &["/zzq", "1"], r#"{"": 2, "zzq": 1}"#),
+        ],
+    );
+    check(
+        "toml",
+        &[
+            (
+                "[a]\n\"\" = 2\n",
+                "set",
+                &["/a/zzq", "1"],
+                "[a]\n\"\" = 2\nzzq = 1\n",
+            ),
+            ("\"\" = 2\n", "set", &["/zzq", "1"], "\"\" = 2\nzzq = 1\n"),
+        ],
+    );
+    check(
+        "yaml",
+        &[
+            (
+                "a:\n  \"\": 2\n",
+                "set",
+                &["/a/zzq", "1"],
+                "a:\n  \"\": 2\n  zzq: 1\n",
+            ),
+            ("\"\": 2\n", "set", &["/zzq", "1"], "\"\": 2\nzzq: 1\n"),
+        ],
+    );
+}

@@ -500,6 +500,26 @@ fn set_over_a_block_collection_replaces_it_after_its_key() {
 }
 
 #[test]
+fn set_over_a_collection_takes_an_alias_inside_it_along() {
+    // The alias goes away with its anchor: nothing is left to dangle.
+    check(&[
+        (
+            "a:\n  x: &q 1\n  y: *q\nb: 2\n",
+            "set",
+            &["/a", "5"],
+            "a: 5\nb: 2\n",
+        ),
+        ("a: {x: &q 1, y: *q}\n", "set", &["/a", "5"], "a: 5\n"),
+        (
+            "l:\n  - x: &q 1\n    y: *q\n  - 2\n",
+            "set",
+            &["/l/0", "5"],
+            "l:\n  - 5\n  - 2\n",
+        ),
+    ]);
+}
+
+#[test]
 fn del_of_a_compact_first_key_hands_its_comments_to_the_dash() {
     check(&[
         (

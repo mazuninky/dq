@@ -164,6 +164,39 @@ const REFUSALS: &[Refusal] = &[
         args: &["/bc/y", "5"],
         message: "cannot set '/bc/y': it lies under the alias on line 6, a copy of /p; ",
     },
+    // A set over a collection drops the anchors inside it: an alias
+    // outside would dangle.
+    Refusal {
+        name: "doc.yaml",
+        src: "a:\n  x: &q 1\n  y: 2\nb: *q\n",
+        command: "set",
+        args: &["/a", "5"],
+        message: "cannot set '/a': it holds an anchor that the alias on line 4 refers to; ",
+    },
+    Refusal {
+        name: "doc.yaml",
+        src: "a: {x: &q 1}\nb: *q\n",
+        command: "set",
+        args: &["/a", "5"],
+        message: "cannot set '/a': it holds an anchor that the alias on line 2 refers to; ",
+    },
+    Refusal {
+        name: "doc.yaml",
+        src: "l:\n  - x: &q 1\n    y: 2\nb: *q\n",
+        command: "set",
+        args: &["/l/0", "5"],
+        message: "cannot set '/l/0': it holds an anchor that the alias on line 4 refers to; ",
+    },
+    Refusal {
+        // `a.b` and `a.d` share `a`, which has no header to write
+        // `b = …` under.
+        name: "doc.toml",
+        src: "[a.b]\nc = 1\n[a.d]\ne = 1\n",
+        command: "set",
+        args: &["/a/b", "5"],
+        message: "cannot set '/a/b': dq cannot write the key anew in a table with no header \
+                  of its own; ",
+    },
 ];
 
 /// `b` is an alias of the anchored mapping `a`.
