@@ -265,7 +265,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   YAML that is not a list of Dockerfile instructions.
 - `dq set` / `del` / `lint` no longer panic on a file with an empty or
   null key: `"": 1` in YAML, `{"": 1}` in JSON, `"" = 1` in TOML,
-  `f: {? &a}` in YAML.
+  `f: {? &a}` in YAML. `set` of a new key next to an empty key that is
+  its map's only key writes it after that key; it used to fail with
+  "not found".
 - YAML `.nan` / `.inf` / `-.inf`: `convert -F json` fails, as it already
   did for TOML `nan`, since JSON has no such number; it used to print
   `.nan` into the JSON. `convert -F yaml` writes them as floats again (it

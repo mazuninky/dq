@@ -41,6 +41,31 @@ fn unaddressable_empty_keys_do_not_panic() {
     assert_eq!(json.original_bytes(), b"{\"\": 1, \"a\": 3}");
 }
 
+#[test]
+fn set_of_a_new_key_goes_after_an_only_empty_key() {
+    assert_eq!(
+        set("a:\n  \"\": 2\n", "/a/zzq", Value::Int(1)),
+        "a:\n  \"\": 2\n  zzq: 1\n"
+    );
+    assert_eq!(
+        set("\"\": 1\na:\n  \"\": 2\n", "/a/zzq", Value::Int(1)),
+        "\"\": 1\na:\n  \"\": 2\n  zzq: 1\n"
+    );
+    assert_eq!(set("\"\": 1\n", "/zzq", Value::Int(1)), "\"\": 1\nzzq: 1\n");
+    for (src, pointer, want) in [
+        (
+            "{\"a\": {\"\": 2}}",
+            "/a/zzq",
+            "{\"a\": {\"\": 2, \"zzq\": 1}}",
+        ),
+        ("{\"\": 1}", "/zzq", "{\"\": 1, \"zzq\": 1}"),
+    ] {
+        let mut json = parse_json_with_spans(src.as_bytes()).expect("JSON parses");
+        json.set_at(&ptr(pointer), Value::Int(1)).expect("set_at");
+        assert_eq!(String::from_utf8_lossy(json.original_bytes()), want);
+    }
+}
+
 // --- block scalars and values on the next line -----------------------------
 
 #[test]

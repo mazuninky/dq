@@ -1684,7 +1684,7 @@ impl Document {
         let direct = |pointer: &str| {
             pointer
                 .strip_prefix(sibling_prefix)
-                .is_some_and(|tail| !tail.is_empty() && !tail.contains('/'))
+                .is_some_and(|tail| !tail.contains('/'))
         };
         let scalar = || {
             self.rightmost_direct_sibling(sibling_prefix)
@@ -1766,8 +1766,9 @@ impl Document {
             .filter(|(k, _)| {
                 // Exclude grand-children: a direct sibling's pointer string
                 // has no further `/` after stripping the parent prefix.
+                // An empty tail is the empty key `""`.
                 let tail = &k.as_str()[sibling_prefix.len()..];
-                !tail.is_empty() && !tail.contains('/')
+                !tail.contains('/')
             })
             .max_by_key(|(_, span)| span.value_range.end)
             .map(|(k, span)| (k.as_str(), span))
