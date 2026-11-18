@@ -161,8 +161,13 @@ fn build_provenance_with_inline_offsets(
 ) -> ProvenanceMap {
     let mut map = ProvenanceMap::with_capacity(spans.len());
     for (canonical, span) in spans {
-        let pointer = Pointer::parse(canonical)
-            .expect("canonical span keys are produced by Pointer::as_canonical");
+        // An empty key (`"": v`, a null key `? &a`) gives a pointer with an
+        // empty segment, which `Pointer::parse` rejects: no pointer can
+        // address that node, so it gets no provenance.
+        let Ok(pointer) = Pointer::parse(canonical) else {
+            tracing::debug!(pointer = %canonical, "no provenance for an unaddressable span");
+            continue;
+        };
         let inline_offset = if block_scalar_pointers.contains(canonical) {
             // YAML block-scalar contract: body starts at byte 0, line 1, col 1
             // of the inner content (after the indicator + newline). The

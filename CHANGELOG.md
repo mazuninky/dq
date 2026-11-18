@@ -257,6 +257,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Log messages (`WARN` and the `-v` levels) go to stderr instead of
   stdout, so `dq -F json … | jq` gets clean JSON. They are coloured only
   when stderr is a terminal and colour is not turned off.
+- `dq set` / `del` / `lint` no longer panic on a file with an empty or
+  null key: `"": 1` in YAML, `{"": 1}` in JSON, `"" = 1` in TOML,
+  `f: {? &a}` in YAML.
 
 ### Security
 

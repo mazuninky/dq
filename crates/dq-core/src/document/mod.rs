@@ -1235,13 +1235,14 @@ fn provenance_from_spans(spans: &SpanMap) -> ProvenanceMap {
     let mut map = ProvenanceMap::with_capacity(spans.len());
     for (canonical, span) in spans {
         // Re-parse the canonical pointer string so the structured
-        // [`Pointer`] inside `Original` matches the canonical key. The
-        // canonical form was produced by [`Pointer::as_canonical`], so
-        // [`Pointer::parse`] is the exact inverse and cannot fail on
-        // well-formed input. Defensive `expect` documents the invariant
-        // for future readers.
-        let pointer = Pointer::parse(canonical)
-            .expect("canonical span keys are produced by Pointer::as_canonical");
+        // [`Pointer`] inside `Original` matches the canonical key. A span
+        // under an empty key (`{"": 1}`, YAML `? &a`) has a pointer with an
+        // empty segment, which `Pointer::parse` rejects: no pointer can
+        // address that node, so it gets no provenance.
+        let Ok(pointer) = Pointer::parse(canonical) else {
+            tracing::debug!(pointer = %canonical, "no provenance for an unaddressable span");
+            continue;
+        };
         map.insert(
             canonical.clone(),
             Provenance::original(pointer, Some(span.clone())),
