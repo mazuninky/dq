@@ -1206,10 +1206,18 @@ impl Document {
                     }
                 })
             }
-            FormatTag::Yaml | FormatTag::Toml => matches!(
+            // An empty `{}` / `[]` carries a flow context of its own even
+            // as a block entry: the token after the sibling tells.
+            FormatTag::Yaml | FormatTag::Toml => (matches!(
                 sibling.context,
                 SpanContext::FlowMapValue | SpanContext::FlowSeqItem
-            )
+            ) && matches!(
+                self.original_bytes.get(skip_blanks_and_comments(
+                    &self.original_bytes,
+                    sibling.value_range.end
+                )),
+                Some(b',' | b'}')
+            ))
             .then_some(FlowLayout::SameLine),
             _ => None,
         }
@@ -1799,6 +1807,19 @@ fn yaml_properties_start(bytes: &[u8], start: usize) -> usize {
     }
 }
 
+/// First byte at or after `pos` that is neither blank, a line break nor
+/// part of a `#` comment.
+fn skip_blanks_and_comments(bytes: &[u8], pos: usize) -> usize {
+    let mut pos = skip_blanks(bytes, pos);
+    while bytes.get(pos) == Some(&b'#') {
+        while bytes.get(pos).is_some_and(|&b| b != b'\n') {
+            pos += 1;
+        }
+        pos = skip_blanks(bytes, pos);
+    }
+    pos
+}
+
 /// First byte at or after `pos` that is not a space, tab or line break.
 fn skip_blanks(bytes: &[u8], pos: usize) -> usize {
     let mut pos = pos;
@@ -1990,7 +2011,7 @@ fn format_specific_splice(
             // Strip a leading `\n` from the renderer output if present —
             // the splice point is already past the sibling's `\n`.
             let trimmed: &[u8] = fragment.strip_prefix(b"\n").unwrap_or(fragment);
-            let mut splice_at = sibling_span.line_range.end;
+            let mut splice_at = past_line_break(original_bytes, sibling_span.line_range.end);
             let mut out = Vec::with_capacity(trimmed.len() + 1);
             // Guard: the sibling's `line_range.end` should point past a
             // `\n`. If the source ends without one (e.g. final value with
@@ -2008,7 +2029,7 @@ fn format_specific_splice(
             (splice_at, out)
         }
         FormatTag::Toml => {
-            let mut splice_at = sibling_span.line_range.end;
+            let mut splice_at = past_line_break(original_bytes, sibling_span.line_range.end);
             let mut out = Vec::with_capacity(fragment.len() + 1);
             if splice_at == 0 || original_bytes.get(splice_at - 1) != Some(&b'\n') {
                 out.push(b'\n');
@@ -2077,6 +2098,19 @@ fn flow_sibling_splice(
     }
     out.extend_from_slice(entry);
     (sibling.value_range.end, out)
+}
+
+/// `pos`, or — when it is not at the start of a line — just past the line
+/// break that ends its line: the `line_range` of an empty `{}` / `[]`
+/// ends at its bracket. Stays at `pos` when no line break follows.
+fn past_line_break(bytes: &[u8], pos: usize) -> usize {
+    if pos == 0 || pos > bytes.len() || bytes[pos - 1] == b'\n' {
+        return pos;
+    }
+    bytes[pos..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(pos, |at| pos + at + 1)
 }
 
 /// Translate the per-format [`InsertionRenderer`] fragment into a final

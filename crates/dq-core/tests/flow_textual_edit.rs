@@ -151,3 +151,39 @@ fn set_of_a_new_key_in_a_flow_mapping_stays_inside_it() {
         "a = {x = 1, z = 3}\n"
     );
 }
+
+#[test]
+fn set_of_a_new_key_after_an_empty_collection_in_a_block_takes_its_own_line() {
+    // `[]` / `{}` is a flow node, but the entry holding it is a block one.
+    assert_eq!(
+        set("yaml", "e:\n  v: []\n", "/e/z", Value::Int(1)),
+        "e:\n  v: []\n  z: 1\n"
+    );
+    assert_eq!(
+        set("yaml", "e:\n  v: {} # c\n", "/e/z", Value::Int(1)),
+        "e:\n  v: {} # c\n  z: 1\n"
+    );
+    assert_eq!(
+        set("toml", "[t]\nv = []\n", "/t/z", Value::Int(1)),
+        "[t]\nv = []\nz = 1\n"
+    );
+    assert_eq!(
+        set("toml", "v = {}\n", "/z", Value::Int(1)),
+        "v = {}\nz = 1\n"
+    );
+    // Inside a flow mapping it stays on the line.
+    assert_eq!(
+        set("yaml", "a: {x: [], y: {}}\n", "/a/z", Value::Int(3)),
+        "a: {x: [], y: {}, z: 3}\n"
+    );
+}
+
+#[test]
+fn del_of_an_empty_toml_inline_value_removes_its_line() {
+    assert_eq!(del("toml", "r0 = {}\nr1 = 1\n", "/r0"), "r1 = 1\n");
+    assert_eq!(del("toml", "r1 = 1\nr0 = []", "/r0"), "r1 = 1\n");
+    assert_eq!(
+        del("toml", "r0 = {a = 1, b = {}}\n", "/r0/b"),
+        "r0 = {a = 1}\n"
+    );
+}

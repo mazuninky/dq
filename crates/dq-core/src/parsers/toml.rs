@@ -284,8 +284,12 @@ fn walk_value(
             record_scalar(value.span(), bytes, path, SpanContext::BlockMapValue, spans);
             Value::String(dt.value().to_string())
         }
-        TomlValue::Array(arr) => walk_inline_array(arr, bytes, path, spans),
-        TomlValue::InlineTable(it) => walk_inline_table(it, bytes, path, spans),
+        TomlValue::Array(arr) => {
+            walk_inline_array(arr, bytes, path, spans, SpanContext::BlockMapValue)
+        }
+        TomlValue::InlineTable(it) => {
+            walk_inline_table(it, bytes, path, spans, SpanContext::BlockMapValue)
+        }
     }
 }
 
@@ -315,17 +319,27 @@ fn record_scalar(
     );
 }
 
+/// `entry` is the context of the entry holding the array — block for
+/// `key = [...]`, flow inside another inline value.
 fn walk_inline_array(
     arr: &TomlArray,
     bytes: &[u8],
     path: &mut Vec<String>,
     spans: &mut SpanMap,
+    entry: SpanContext,
 ) -> Value {
     if arr.is_empty() {
         // Record an empty-container span for the empty inline array `[]`
         // so the empty-parent mkdir-p path in
         // [`crate::document::Document::set_at`] can locate the `[]` body.
-        record_empty_container(arr.span(), bytes, path, SpanContext::FlowSeqItem, spans);
+        record_empty_container(
+            arr.span(),
+            bytes,
+            path,
+            SpanContext::FlowSeqItem,
+            entry,
+            spans,
+        );
         return Value::Array(Vec::new());
     }
     let mut out: Vec<Value> = Vec::with_capacity(arr.len());
@@ -339,16 +353,25 @@ fn walk_inline_array(
     Value::Array(out)
 }
 
+/// `entry`: see [`walk_inline_array`].
 fn walk_inline_table(
     it: &InlineTable,
     bytes: &[u8],
     path: &mut Vec<String>,
     spans: &mut SpanMap,
+    entry: SpanContext,
 ) -> Value {
     if it.is_empty() {
         // Empty inline table `{}` — see [`walk_inline_array`] for the
         // rationale. The splicer uses the recorded span as its anchor.
-        record_empty_container(it.span(), bytes, path, SpanContext::FlowMapValue, spans);
+        record_empty_container(
+            it.span(),
+            bytes,
+            path,
+            SpanContext::FlowMapValue,
+            entry,
+            spans,
+        );
         return Value::Map(IndexMap::new());
     }
     let mut out: IndexMap<String, Value> = IndexMap::new();
@@ -372,11 +395,14 @@ fn record_empty_container(
     bytes: &[u8],
     path: &[String],
     context: SpanContext,
+    entry: SpanContext,
     spans: &mut SpanMap,
 ) {
     let Some(value_range) = span else { return };
     let pointer = pointer_for(path);
-    let line_range = compute_line_range(bytes, &value_range, context);
+    // The container's own context is flow; its `line_range` follows the
+    // entry holding it, so `del` of `key = {}` removes the line.
+    let line_range = compute_line_range(bytes, &value_range, entry);
     let indent = compute_indent(bytes, value_range.start);
     spans.insert(
         pointer,
@@ -417,8 +443,8 @@ fn walk_value_with_context(
             record_scalar(value.span(), bytes, path, context, spans);
             Value::String(dt.value().to_string())
         }
-        TomlValue::Array(arr) => walk_inline_array(arr, bytes, path, spans),
-        TomlValue::InlineTable(it) => walk_inline_table(it, bytes, path, spans),
+        TomlValue::Array(arr) => walk_inline_array(arr, bytes, path, spans, context),
+        TomlValue::InlineTable(it) => walk_inline_table(it, bytes, path, spans, context),
     }
 }
 

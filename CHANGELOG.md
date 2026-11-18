@@ -314,7 +314,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   "c": 3}`, `a: {x: 1, z: 3}`, `a = {x = 1, z = 3}`), or on a line of its
   own at the sibling's column in multi-line JSON. YAML and TOML used to
   write it as a block line inside the braces, which did not parse; JSON
-  started a new line indented two columns too far.
+  started a new line indented two columns too far. After an empty `[]` /
+  `{}` value of a block entry the new key no longer gets a blank line
+  after it, and TOML `del` of `key = {}` removes the line instead of
+  leaving `key = `.
 
 ### Security
 
