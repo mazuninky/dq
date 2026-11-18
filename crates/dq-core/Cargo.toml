@@ -49,12 +49,11 @@ regex = { workspace = true }
 
 # M5 format extensions — see `parsers/{hcl,ini,dotenv,csv,dockerfile,...}.rs`
 # for usage. License audit: hcl-rs (MIT OR Apache-2.0), rust-ini (MIT), dotenvy (MIT),
-# csv (Unlicense/MIT), dockerfile-parser-rs (MIT). All cleared by
+# csv (Unlicense/MIT). All cleared by
 # `cargo deny check licenses`.
 hcl-rs = { workspace = true }
 rust-ini = { workspace = true }
 csv = { workspace = true }
-dockerfile-parser-rs = { workspace = true }
 
 # M9 markdown — `comrak` is the CommonMark + GFM parser consumed by
 # `parsers/markdown.rs`. License: BSD-2-Clause (cleared by the workspace

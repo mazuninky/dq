@@ -6,12 +6,12 @@ description: |
   worth confirming intent.
 severity: info
 match:
-  format: [dockerfile, yaml]
-  # `yaml` lets the fixtures spell the instruction list; the filter
-  # keeps the rule off any YAML that is not one.
-  filter: 'type == "array" and length > 0 and all(.[]; type == "object" and (.instruction | type) == "string")'
+  format: [dockerfile]
+  # An empty (or comments-only) Dockerfile has no instructions to judge.
+  filter: 'length > 0'
 check:
-  jq: 'select(map(.instruction) | (contains(["HEALTHCHECK"]) | not)) | {summary: "no HEALTHCHECK"}'
+  # `any` compares whole names; `contains` on strings is a substring test.
+  jq: 'select(any(.[]; .instruction == "HEALTHCHECK") | not) | {summary: "no HEALTHCHECK"}'
   message: "Dockerfile has no HEALTHCHECK directive"
 references:
   - https://docs.docker.com/engine/reference/builder/#healthcheck

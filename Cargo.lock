@@ -994,18 +994,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dockerfile-parser-rs"
-version = "3.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73f5da5f8515ec5d0504b50a9a3498c7189052a620ab782e96d81106eaad136b"
-dependencies = [
- "clap",
- "regex",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "document-features"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1059,7 +1047,6 @@ dependencies = [
  "comrak",
  "criterion",
  "csv",
- "dockerfile-parser-rs",
  "hcl-rs",
  "indexmap",
  "insta",

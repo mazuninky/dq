@@ -238,6 +238,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Plugins are limited in the number of core instances, memories and
   tables they create, and plugins with 64-bit memories or tables are no
   longer accepted.
+- Dockerfile IR: `arguments` of a shell-form instruction is the text as
+  written, so `RUN curl -fsSL https://x | bash` reads as
+  `"curl -fsSL https://x | bash"`; it used to be split on spaces into an
+  array, with COPY/ADD flags dropped. The JSON form
+  (`RUN ["sh", "-c", "echo hi"]`) is an array of its elements; it used to
+  be one comma-joined string. `line` is the line the instruction starts
+  on; it used to be the instruction's position in the file. dq parses
+  Dockerfiles itself now, and the `dockerfile-parser-rs` dependency is
+  gone.
+- `@std/dockerfile` rules run on Dockerfiles only. They used to run on any
+  YAML file shaped like a list of instructions.
 
 ### Deprecated
 
@@ -261,10 +272,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stdout, so `dq -F json … | jq` gets clean JSON. They are coloured only
   when stderr is a terminal and colour is not turned off.
 - `dq lint` of a YAML file no longer prints four `check.jq raised a
-  runtime error` warnings from the `@std/dockerfile` rules: they skip any
-  YAML that is not a list of Dockerfile instructions. They skip a
-  Dockerfile with no instructions too (empty, or comments only), which
-  no longer gets `@std/dockerfile/has-healthcheck`.
+  runtime error` warnings from the `@std/dockerfile` rules. A Dockerfile
+  with no instructions (empty, or comments only) no longer gets
+  `@std/dockerfile/has-healthcheck`.
+- Dockerfiles that Docker builds no longer fail to parse with exit 3:
+  `HEALTHCHECK`, `ONBUILD` and `MAINTAINER`, a one-character argument
+  (`WORKDIR /`, `USER 0`, `EXPOSE 8`), lower-case instructions, heredocs
+  (`RUN <<EOF`), a UTF-8 BOM, and the `# escape=` directive. `ENV A 1`
+  keeps its value; it used to read as `{}`. A Dockerfile that Docker
+  rejects fails with the line of the bad instruction.
+- `@std/dockerfile` on real Dockerfiles:
+  - `has-healthcheck` passes on a Dockerfile with a `HEALTHCHECK`. It
+    used to fire on every Dockerfile that parsed.
+  - `no-curl-pipe-bash` catches `RUN curl … | bash`, including
+    `| /bin/sh`, `| sudo bash` and a command split over lines. It used to
+    catch only the exec form (`RUN ["sh", "-c", "curl … | bash"]`).
+  - `no-add-use-copy` no longer flags a remote source (`ADD https://…`,
+    `git@…`, `ssh://…`), a local tar archive, which ADD unpacks, or a
+    heredoc.
+  - `no-latest-base-image` no longer flags `FROM scratch` or an earlier
+    build stage (`FROM build`), and catches an untagged image on a
+    registry with a port (`localhost:5000/img`).
 - `dq set` / `del` / `lint` no longer panic on a file with an empty or
   null key: `"": 1` in YAML, `{"": 1}` in JSON, `"" = 1` in TOML,
   `f: {? &a}` in YAML. `set` of a new key next to an empty key that is

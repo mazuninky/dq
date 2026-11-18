@@ -16,7 +16,7 @@ Per-format details, write-mode semantics, and the contract behind every output f
 | dotenv            | `.env`, `.env.*`                 | ✓    | ✓     | `/DATABASE_URL`, `/PORT`                                             | Flat `KEY=VALUE`. Source order + quoting preserved on textual edit. |
 | CSV / TSV         | `.csv`, `.tsv`                   | ✓    | ✓     | `/0/name`, `/0/age` (array of records, header = keys)                | Tabular; no nested structure.                                 |
 | Markdown          | `.md`, `.markdown`               | ✓    | ✓ (frontmatter only) | `/frontmatter/value/title`, `/frontmatter/kind`, `/children/0/level` (CommonMark AST) | Frontmatter (`---` YAML / `+++` TOML / `{}` JSON) is parsed; body becomes a queryable AST. Writes touch frontmatter only — body stays verbatim. |
-| Dockerfile        | `Dockerfile`, `*.Dockerfile`     | ✓    | —     | `/instructions/0/cmd`                                                | Read-only.                                                    |
+| Dockerfile        | `Dockerfile`, `*.Dockerfile`     | ✓    | —     | `/0/arguments`                                                       | Read-only.                                                    |
 | ignore-lists      | `.gitignore`, `.dockerignore`    | ✓    | —     | `/0`, `/1`, …                                                        | Flat array. Read-only.                                        |
 | TOON              | n/a                              | —    | ✓     | n/a                                                                  | Output-only; agent-friendly compact token format.             |
 

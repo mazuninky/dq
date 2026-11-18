@@ -6,12 +6,41 @@ description: |
   checksum, then execute.
 severity: warn
 match:
-  format: [dockerfile, yaml]
-  # `yaml` lets the fixtures spell the instruction list; the filter
-  # keeps the rule off any YAML that is not one.
-  filter: 'type == "array" and length > 0 and all(.[]; type == "object" and (.instruction | type) == "string")'
+  format: [dockerfile]
 check:
-  jq: '.[] | select(.instruction == "RUN") | select(.arguments | tostring | test("(curl|wget)[^|]*\\|\\s*(ba)?sh"))'
+  # The shell text (a backslash-newline inside a heredoc body joined first)
+  # is split into commands on `;`, `&&`, `||` and newlines, each command
+  # into pipeline stages on `|`. A command fires when a stage runs curl/wget
+  # and a later stage is a shell (`sh`, `bash`, `ash`, `dash`, `zsh`, `ksh`;
+  # by path; after `sudo`, `env` and `NAME=value` assignments; a `)` may
+  # close a subshell or `$(…)` right after it).
+  # Exec form has no pipe unless it runs a shell (`["sh", "-c", "…"]`).
+  jq: |-
+    # The exec form: a JSON array, or JSON after leading `--flag` words
+    # (the parser keeps `RUN --network=host ["…"]` as a string).
+    def exec_args:
+      if type == "array" then .
+      elif type == "string" then
+        sub("^(--\\S+\\s+)*"; "") | select(startswith("[")) | (try fromjson catch null)
+        | select(type == "array" and all(.[]; type == "string"))
+      else empty end;
+    def pipes_into_shell:
+      gsub("\\\\\n"; " ")
+      | [splits("\\|\\||&&|;|\\n")]
+      | any(.[];
+          [splits("\\|")] as $stages
+          | [range(0; $stages | length) as $i
+             | ($stages[$i] | test("\\b(curl|wget)\\b"))
+               and any($stages[$i + 1:][];
+                   test("^\\s*(sudo(\\s+-\\S+)*\\s+)?([A-Za-z_][A-Za-z0-9_]*=(\"[^\"]*\"|'[^']*'|\\S*)\\s+)*((\\S*/)?env(\\s+-\\S+)*\\s+([A-Za-z_][A-Za-z0-9_]*=(\"[^\"]*\"|'[^']*'|\\S*)\\s+)*)?(\\S*/)?(ba|da|z|k|a)?sh(\\s|\\)|$)"))]
+          | any);
+    .[] | select(.instruction == "RUN")
+    | select(
+        ([.arguments | exec_args] | .[0]) as $exec
+        | (if $exec == null then .arguments | tostring
+           elif ($exec[0] // "" | test("(^|/)(ba|da|z|k|a)?sh$")) then $exec[1:] | join(" ")
+           else "" end)
+        | pipes_into_shell)
   message: "RUN line {{ .line }} pipes curl/wget into a shell"
 references:
   - https://www.idontplaydarts.com/2016/04/detecting-curl-pipe-bash-server-side/

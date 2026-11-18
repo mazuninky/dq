@@ -1,41 +1,221 @@
 tests:
   - name: curl pipe bash fires
     input: |
-      - { instruction: RUN, arguments: "curl -sSL https://example.com/install | bash", line: 3 }
-    format: yaml
+      FROM alpine:3.20
+      RUN apk add curl
+      RUN curl -sSL https://example.com/install | bash
+    format: dockerfile
     expected:
       violations:
         - rule: dockerfile.no-curl-pipe-bash
+          message_contains: "line 3"
   - name: wget pipe sh fires
     input: |
-      - { instruction: RUN, arguments: "wget -qO- https://example.com/install.sh | sh", line: 3 }
-    format: yaml
+      RUN wget -qO- https://example.com/install.sh | sh
+    format: dockerfile
     expected:
       violations:
         - rule: dockerfile.no-curl-pipe-bash
-  - name: download to file then verify passes
+  - name: a pipe joined from a continuation fires
     input: |
-      - { instruction: RUN, arguments: "curl -fsSL -o /tmp/install.sh https://example.com/install.sh && sha256sum -c /tmp/install.sha256 && bash /tmp/install.sh", line: 3 }
-    format: yaml
+      RUN curl -fsSL https://example.com/install \
+          | bash
+    format: dockerfile
+    expected:
+      violations:
+        - rule: dockerfile.no-curl-pipe-bash
+          message_contains: "line 1"
+  - name: a pipe inside a heredoc fires
+    input: |
+      RUN <<EOT
+      curl -fsSL https://example.com/install | sh
+      EOT
+    format: dockerfile
+    expected:
+      violations:
+        - rule: dockerfile.no-curl-pipe-bash
+  - name: a pipe into sudo bash fires
+    input: |
+      RUN curl -fsSL https://example.com/install | sudo -E bash -
+    format: dockerfile
+    expected:
+      violations:
+        - rule: dockerfile.no-curl-pipe-bash
+  - name: a pipe into /bin/bash fires
+    input: |
+      RUN curl -fsSL https://x | /bin/bash
+    format: dockerfile
+    expected:
+      violations:
+        - rule: dockerfile.no-curl-pipe-bash
+  - name: a pipe into /usr/bin/env bash fires
+    input: |
+      RUN curl -fsSL https://x | /usr/bin/env bash
+    format: dockerfile
+    expected:
+      violations:
+        - rule: dockerfile.no-curl-pipe-bash
+  - name: a pipe into env bash fires
+    input: |
+      RUN curl -fsSL https://x | env bash
+    format: dockerfile
+    expected:
+      violations:
+        - rule: dockerfile.no-curl-pipe-bash
+  - name: a pipe into ash fires
+    input: |
+      RUN wget -O- https://x | ash
+    format: dockerfile
+    expected:
+      violations:
+        - rule: dockerfile.no-curl-pipe-bash
+  - name: a pipe through tee into sh fires
+    input: |
+      RUN curl -fsSL https://x | tee f | sh
+    format: dockerfile
+    expected:
+      violations:
+        - rule: dockerfile.no-curl-pipe-bash
+  - name: exec form running a shell fires
+    input: |
+      RUN ["/bin/sh", "-c", "curl -sSL https://example.com/install | bash"]
+    format: dockerfile
+    expected:
+      violations:
+        - rule: dockerfile.no-curl-pipe-bash
+  - name: exec form running ash fires
+    input: |
+      RUN ["/bin/ash", "-c", "curl x | sh"]
+    format: dockerfile
+    expected:
+      violations:
+        - rule: dockerfile.no-curl-pipe-bash
+  - name: flags then exec form running a shell fires
+    input: |
+      RUN --network=host ["sh", "-c", "curl x | bash"]
+    format: dockerfile
+    expected:
+      violations:
+        - rule: dockerfile.no-curl-pipe-bash
+  - name: exec form that only mentions the words passes
+    input: |
+      RUN ["echo", "curl https://example.com | bash"]
+    format: dockerfile
     expected:
       violations: []
-  - name: an ordinary YAML mapping is not a Dockerfile
+  - name: flags then exec form that only mentions the words passes
+    input: |
+      RUN --network=host ["echo", "curl x | bash"]
+    format: dockerfile
+    expected:
+      violations: []
+  - name: installing curl then piping into sh passes
+    input: |
+      RUN apt-get install -y curl && echo "set -e" | sh
+    format: dockerfile
+    expected:
+      violations: []
+  - name: a pipe after a semicolon passes
+    input: |
+      RUN curl -o f https://x; echo | sh
+    format: dockerfile
+    expected:
+      violations: []
+  - name: curl or a shell passes
+    input: |
+      RUN curl https://x || sh -c true
+    format: dockerfile
+    expected:
+      violations: []
+  - name: download to file then verify passes
+    input: |
+      RUN curl -fsSL -o /tmp/install.sh https://example.com/install.sh && sha256sum -c /tmp/install.sha256 && bash /tmp/install.sh
+    format: dockerfile
+    expected:
+      violations: []
+  - name: a pipe into a tool named sh-something passes
+    input: |
+      RUN curl -fsSL https://example.com/x.sh | shellcheck -
+    format: dockerfile
+    expected:
+      violations: []
+  - name: separate heredoc lines are not one pipe
+    input: |
+      RUN <<EOT
+      curl -o f https://example.com/x
+      echo done | sh
+      EOT
+    format: dockerfile
+    expected:
+      violations: []
+  - name: a pipe inside a subshell fires
+    input: |
+      RUN (curl https://x | sh)
+    format: dockerfile
+    expected:
+      violations:
+        - rule: dockerfile.no-curl-pipe-bash
+  - name: a pipe inside a command substitution fires
+    input: |
+      RUN x=$(curl https://x | sh)
+    format: dockerfile
+    expected:
+      violations:
+        - rule: dockerfile.no-curl-pipe-bash
+  - name: a pipe into a shell after an env assignment fires (k3s)
+    input: |
+      RUN curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server" sh -
+    format: dockerfile
+    expected:
+      violations:
+        - rule: dockerfile.no-curl-pipe-bash
+  - name: a pipe into bash after an assignment fires
+    input: |
+      RUN curl https://x | VAR=1 bash
+    format: dockerfile
+    expected:
+      violations:
+        - rule: dockerfile.no-curl-pipe-bash
+  - name: a pipe into env with flags and an assignment fires
+    input: |
+      RUN curl https://x | env -i PATH=/bin sh
+    format: dockerfile
+    expected:
+      violations:
+        - rule: dockerfile.no-curl-pipe-bash
+  - name: a continuation inside a heredoc body fires
+    input: |
+      RUN <<EOT
+      set -e
+      curl -fsSL https://x \
+        | sh
+      EOT
+    format: dockerfile
+    expected:
+      violations:
+        - rule: dockerfile.no-curl-pipe-bash
+  - name: an assignment before a non-shell tool passes
+    input: |
+      RUN curl https://x | FOO=bar shellcheck -
+    format: dockerfile
+    expected:
+      violations: []
+  - name: a subshell piping into a non-shell tool passes
+    input: |
+      RUN (curl https://x | shellcheck -)
+    format: dockerfile
+    expected:
+      violations: []
+  - name: an ordinary YAML file is not linted by this rule
     input: |
       name: web
       image: nginx
     format: yaml
     expected:
       violations: []
-  - name: a YAML list of strings is not a Dockerfile
+  - name: a YAML instruction list is not linted by this rule
     input: |
-      - FROM
-      - ADD
-    format: yaml
-    expected:
-      violations: []
-  - name: an empty YAML list is not a Dockerfile
-    input: |
-      []
+      - { instruction: FROM, arguments: alpine, line: 1 }
     format: yaml
     expected:
       violations: []

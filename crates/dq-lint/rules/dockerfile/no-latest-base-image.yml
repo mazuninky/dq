@@ -6,12 +6,26 @@ description: |
   produce different images day to day.
 severity: error
 match:
-  format: [dockerfile, yaml]
-  # `yaml` lets the fixtures spell the instruction list; the filter
-  # keeps the rule off any YAML that is not one.
-  filter: 'type == "array" and length > 0 and all(.[]; type == "object" and (.instruction | type) == "string")'
+  format: [dockerfile]
 check:
-  jq: '.[] | select(.instruction == "FROM") | select(.arguments | tostring | test(":latest($|\\s)") or (test(":") | not))'
+  # The image is the first word after the flags (`--platform=…`). Skipped:
+  # `scratch`, a name a previous `FROM … AS <name>` defined (stage names are
+  # case-insensitive), a digest (`@sha256:…`) and anything built from a
+  # variable (`${BASE}`). A tag is a `:` after the last `/`, so a registry
+  # port (`localhost:5000/img`) is not one.
+  jq: |-
+    [.[] | select(.instruction == "FROM" and (.arguments | type) == "string")]
+    | . as $froms
+    | range(0; length) as $i
+    | $froms[$i]
+    | ([.arguments | match("\\S+"; "g").string] | map(select(startswith("--") | not))) as $words
+    | ($words[0] // "") as $image
+    | select($image != "" and ($image | ascii_downcase) != "scratch" and ($image | contains("$") | not))
+    | select([$froms[0:$i][] | [.arguments | match("\\S+"; "g").string] | map(select(startswith("--") | not))
+              | select(length >= 3 and (.[1] | ascii_downcase) == "as") | .[2] | ascii_downcase]
+             | any(.[]; . == ($image | ascii_downcase)) | not)
+    | select($image | contains("@") | not)
+    | select(($image | split("/") | last) as $name | ($name | contains(":") | not) or ($name | endswith(":latest")))
   message: "FROM line uses :latest (or no tag): {{ .arguments }}"
 references:
   - https://docs.docker.com/develop/develop-images/dockerfile_best-practices/

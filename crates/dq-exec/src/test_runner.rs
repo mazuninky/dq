@@ -16,7 +16,8 @@
 //! The runner parses a fixture's `input:` text by name. M8 supported
 //! `yaml` / `json`; M9 added `markdown` (CommonMark + GFM AST); M11
 //! Phase 5 added `hcl` so the `@std/terraform` ruleset can ship with
-//! co-located fixtures. Any other format produces an [`TestOutcome::Error`]
+//! co-located fixtures; `dockerfile` lets the `@std/dockerfile` fixtures
+//! feed real Dockerfile text through the parser. Any other format produces an [`TestOutcome::Error`]
 //! with a "format not yet supported in test runner" message — that
 //! message intentionally points future authors at the
 //! `dq_core::by_name` registry, since adding a format here is a
@@ -318,7 +319,8 @@ fn run_case(
 /// wired through `serde_norway` / `serde_json` directly; `markdown` (M9 — the
 /// CommonMark + GFM AST format) routes through `dq_core::by_name("markdown")`
 /// so the fixture sees the same typed-discriminator-Map shape that the
-/// `@std/markdown` rules check.dispatch against. Other formats yield an
+/// `@std/markdown` rules check.dispatch against; `hcl` and `dockerfile` go
+/// through their parsers the same way. Other formats yield an
 /// `Err(message)` for the caller to surface as a [`TestOutcome::Error`].
 fn parse_input(input: &str, format: &str) -> std::result::Result<serde_json::Value, String> {
     match format {
@@ -360,8 +362,21 @@ fn parse_input(input: &str, format: &str) -> std::result::Result<serde_json::Val
             serde_json::to_value(doc.value())
                 .map_err(|err| format!("hcl value serialize error: {err}"))
         }
+        "dockerfile" => {
+            // The `@std/dockerfile` fixtures are Dockerfile text, so the rules
+            // see the parser's IR (`[{instruction, arguments, line}]`) rather
+            // than a hand-spelled copy of it. No spans: diagnostics resolve
+            // to the default `(line=1, col=1)`, as for HCL.
+            let parser = dq_core::by_name("dockerfile")
+                .ok_or_else(|| "dockerfile format not registered".to_owned())?;
+            let doc = parser
+                .parse(input.as_bytes())
+                .map_err(|err| format!("dockerfile parse error: {err}"))?;
+            serde_json::to_value(doc.value())
+                .map_err(|err| format!("dockerfile value serialize error: {err}"))
+        }
         other => Err(format!(
-            "format not yet supported in test runner: {other} (supported: yaml, json, markdown, hcl; add a new arm in test_runner::parse_input that calls dq_core::by_name)",
+            "format not yet supported in test runner: {other} (supported: yaml, json, markdown, hcl, dockerfile; add a new arm in test_runner::parse_input that calls dq_core::by_name)",
         )),
     }
 }
@@ -641,6 +656,20 @@ tests:
     }
 
     #[test]
+    fn dockerfile_input_goes_through_the_dockerfile_parser() {
+        let value = parse_input("FROM alpine\nRUN [\"sh\"]\n", "dockerfile").expect("parse");
+        assert_eq!(
+            value,
+            serde_json::json!([
+                {"instruction": "FROM", "arguments": "alpine", "line": 1},
+                {"instruction": "RUN", "arguments": ["sh"], "line": 2},
+            ])
+        );
+        let err = parse_input("FOO x\n", "dockerfile").expect_err("unknown instruction");
+        assert!(err.contains("dockerfile parse error"), "got: {err}");
+    }
+
+    #[test]
     fn unsupported_format_in_test_case_yields_error_outcome() {
         let (_t, dir) = tempdir_utf8();
         // Use a format that the test runner does NOT have a parse arm for.
@@ -649,7 +678,7 @@ tests:
         let fixture = r#"
 tests:
   - name: unsupported format
-    format: dockerfile
+    format: ini
     input: ""
     expected:
       violations: []

@@ -1,41 +1,169 @@
 tests:
   - name: ADD with local path fires
     input: |
-      - { instruction: ADD, arguments: "./app /app", line: 5 }
-    format: yaml
+      FROM alpine:3.20
+      RUN echo hi
+      ADD ./app /app
+    format: dockerfile
     expected:
       violations:
         - rule: dockerfile.no-add-use-copy
-          message_contains: "line 5"
+          message_contains: "line 3"
+  - name: ADD with flags and a local path fires
+    input: |
+      ADD --chown=1:1 ./app /app
+    format: dockerfile
+    expected:
+      violations:
+        - rule: dockerfile.no-add-use-copy
+  - name: ADD in JSON form with a local path fires
+    input: |
+      ADD ["./a b", "/app"]
+    format: dockerfile
+    expected:
+      violations:
+        - rule: dockerfile.no-add-use-copy
+  - name: ADD with flags and JSON form with a local path fires
+    input: |
+      ADD --chmod=644 ["./a", "/app"]
+    format: dockerfile
+    expected:
+      violations:
+        - rule: dockerfile.no-add-use-copy
+  - name: ADD with a quoted local path fires
+    input: |
+      ADD "./app" /app
+    format: dockerfile
+    expected:
+      violations:
+        - rule: dockerfile.no-add-use-copy
   - name: ADD with URL passes
     input: |
-      - { instruction: ADD, arguments: "https://example.com/foo.tar.gz /tmp/", line: 5 }
-    format: yaml
+      ADD https://example.com/foo.tar.gz /tmp/
+    format: dockerfile
+    expected:
+      violations: []
+  - name: ADD with a checksum flag and URL passes
+    input: |
+      ADD --checksum=sha256:24454f830cdb571e2c4ad15481119c43b3cafd48dd869a9b2945d1036d1dc68d https://example.com/foo.tar.gz /tmp/
+    format: dockerfile
+    expected:
+      violations: []
+  - name: ADD in JSON form with URL passes
+    input: |
+      ADD ["https://example.com/foo.tar.gz", "/tmp/"]
+    format: dockerfile
+    expected:
+      violations: []
+  - name: ADD with flags and JSON form with URL passes
+    input: |
+      ADD --chmod=644 ["https://x/y", "/y"]
+    format: dockerfile
+    expected:
+      violations: []
+  - name: ADD with a quoted URL passes
+    input: |
+      ADD "https://x" /y
+    format: dockerfile
+    expected:
+      violations: []
+  - name: ADD with an upper-case scheme passes
+    input: |
+      ADD HTTPS://x /y
+    format: dockerfile
+    expected:
+      violations: []
+  - name: ADD of an ssh git remote passes
+    input: |
+      ADD ssh://git@github.com/o/r.git /src
+    format: dockerfile
+    expected:
+      violations: []
+  - name: ADD of an scp-style git remote passes
+    input: |
+      ADD git@github.com:org/repo.git /src
+    format: dockerfile
+    expected:
+      violations: []
+  - name: ADD of a heredoc passes
+    input: |
+      ADD <<EOF /x
+      hello
+      EOF
+    format: dockerfile
     expected:
       violations: []
   - name: COPY passes
     input: |
-      - { instruction: COPY, arguments: "./app /app", line: 5 }
-    format: yaml
+      COPY ./app /app
+    format: dockerfile
     expected:
       violations: []
-  - name: an ordinary YAML mapping is not a Dockerfile
+  - name: ADD of a local .tar.gz archive passes
+    input: |
+      ADD app.tar.gz /app
+    format: dockerfile
+    expected:
+      violations: []
+  - name: ADD of a local .tgz archive passes
+    input: |
+      ADD app.tgz /app
+    format: dockerfile
+    expected:
+      violations: []
+  - name: ADD of a local .tar.xz archive passes
+    input: |
+      ADD app.tar.xz /app
+    format: dockerfile
+    expected:
+      violations: []
+  - name: ADD of a local .tar.bz2 archive passes
+    input: |
+      ADD app.tar.bz2 /app
+    format: dockerfile
+    expected:
+      violations: []
+  - name: ADD of a local .tar.zst archive passes
+    input: |
+      ADD app.tar.zst /app
+    format: dockerfile
+    expected:
+      violations: []
+  - name: ADD of a local .tbz2 archive passes
+    input: |
+      ADD app.tbz2 /app
+    format: dockerfile
+    expected:
+      violations: []
+  - name: ADD of a local .txz archive passes
+    input: |
+      ADD app.txz /app
+    format: dockerfile
+    expected:
+      violations: []
+  - name: ADD of a local .tar archive passes
+    input: |
+      ADD app.tar /app
+    format: dockerfile
+    expected:
+      violations: []
+  - name: ADD of a local file named like an archive directory fires
+    input: |
+      ADD ./app.tar.gz.d /app
+    format: dockerfile
+    expected:
+      violations:
+        - rule: dockerfile.no-add-use-copy
+  - name: an ordinary YAML file is not linted by this rule
     input: |
       name: web
       image: nginx
     format: yaml
     expected:
       violations: []
-  - name: a YAML list of strings is not a Dockerfile
+  - name: a YAML instruction list is not linted by this rule
     input: |
-      - FROM
-      - ADD
-    format: yaml
-    expected:
-      violations: []
-  - name: an empty YAML list is not a Dockerfile
-    input: |
-      []
+      - { instruction: FROM, arguments: alpine, line: 1 }
     format: yaml
     expected:
       violations: []

@@ -93,7 +93,6 @@ walkdir = "2"
 hcl-rs = "0.20"
 rust-ini = "0.21"
 csv = "1.4"
-dockerfile-parser-rs = "3.4"
 
 # M6 distribution — `dq self check` / `dq self update`. `self_update` handles
 # the download → extract → atomic replace dance against GitHub Releases over

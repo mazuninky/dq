@@ -208,13 +208,17 @@ RUN apk add curl
 CMD ["sh"]
 ```
 ```
-/instructions/0/cmd  → "FROM"
-/instructions/0/args → ["alpine:3.18"]
-/instructions/1/cmd  → "RUN"
-/instructions/2/cmd  → "CMD"
+/0/instruction → "FROM"
+/0/arguments   → "alpine:3.18"
+/0/line        → 1
+/1/arguments   → "apk add curl"
+/2/arguments   → ["sh"]
 ```
 
-Read-only; no `set`/`del`.
+`arguments` is the text as written for the shell form (flags, joined continuations and heredoc
+bodies included), an array for the JSON form (`CMD ["sh"]`, `COPY ["a", "b"]`), and a map for
+`ENV` / `LABEL` / `ARG` (`ARG` without a default → `null`). `line` is the source line where the
+instruction starts. Read-only; no `set`/`del`.
 
 ### ignore-lists — flat array
 
