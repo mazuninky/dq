@@ -302,6 +302,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   multi-line JSON object left a trailing comma. A collection inside a
   YAML flow collection can be deleted too; it used to fail with "not
   found".
+- YAML `set` on a `|` / `>` block scalar replaces it, header included,
+  with an inline value: `k: |` + `  x` set to `42` gives `k: 42`. It used
+  to keep the header and glue the value to the next line (`k: |` +
+  `  42r: 1`). A comment on the header line and node properties stay; a
+  string that needs several lines is written double-quoted.
 - `set` of a new key next to such an entry keeps it on the line (`{"a": 1,
   "c": 3}`, `a: {x: 1, z: 3}`, `a = {x = 1, z = 3}`), or on a line of its
   own at the sibling's column in multi-line JSON. YAML and TOML used to

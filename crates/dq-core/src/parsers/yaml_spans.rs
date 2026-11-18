@@ -277,8 +277,29 @@ pub(crate) fn strip_chomping_before_eof_append(
     {
         return None;
     }
-    // The header sits on the last non-blank line above the content (only
-    // blank lines may separate them), and within the entry.
+    let (indicator, _) = block_scalar_header(bytes, span)?;
+    let modifiers = indicator + 1;
+    let mut end = modifiers;
+    while matches!(bytes.get(end), Some(b'1'..=b'9' | b'+' | b'-')) {
+        end += 1;
+    }
+    match bytes[modifiers..end]
+        .iter()
+        .position(|&b| b == b'+' || b == b'-')
+    {
+        Some(at) if bytes[modifiers + at] == b'-' => None,
+        Some(at) => Some((modifiers + at, 1, b"-")),
+        None => Some((modifiers, 0, b"-")),
+    }
+}
+
+/// The `|` / `>` header of the block scalar whose content `span` covers:
+/// the indicator's byte offset and the header's line (without its line
+/// break). The header sits on the last non-blank line above the content —
+/// only blank lines may separate them — and within the entry. `None` when
+/// that line holds no indicator: the value is not a block scalar.
+fn block_scalar_header(bytes: &[u8], span: &ValueSpan) -> Option<(usize, Range<usize>)> {
+    let content = &span.value_range;
     let mut line_end = line_start_at(bytes, content.start);
     let header_line = loop {
         if line_end == 0 || line_end <= span.line_range.start {
@@ -294,20 +315,46 @@ pub(crate) fn strip_chomping_before_eof_append(
         }
         line_end = start;
     };
-    let indicator = block_scalar_indicator(bytes, header_line)?;
-    let modifiers = indicator + 1;
-    let mut end = modifiers;
-    while matches!(bytes.get(end), Some(b'1'..=b'9' | b'+' | b'-')) {
-        end += 1;
+    let indicator = block_scalar_indicator(bytes, header_line.clone())?;
+    Some((indicator, header_line))
+}
+
+/// What replacing the `|` / `>` block scalar whose content `span` covers
+/// with an inline scalar takes: the bytes from its header's indicator
+/// through its last non-blank content line, and the part of the header
+/// line to put back after the new value — the blanks and comment that
+/// follow the indicators, empty without a comment. Blank lines after the
+/// content stay, as blank lines. `None` when the value is not a block
+/// scalar (see [`block_scalar_header`]).
+pub(crate) fn block_scalar_extent(
+    bytes: &[u8],
+    span: &ValueSpan,
+) -> Option<(Range<usize>, Range<usize>)> {
+    if !starts_line(bytes, span.value_range.start) {
+        return None;
     }
-    match bytes[modifiers..end]
-        .iter()
-        .position(|&b| b == b'+' || b == b'-')
+    let (indicator, header_line) = block_scalar_header(bytes, span)?;
+    let mut header_end = header_line.end;
+    while header_end > header_line.start && bytes[header_end - 1] == b'\r' {
+        header_end -= 1;
+    }
+    let mut indicators_end = indicator + 1;
+    while indicators_end < header_end && matches!(bytes[indicators_end], b'1'..=b'9' | b'+' | b'-')
     {
-        Some(at) if bytes[modifiers + at] == b'-' => None,
-        Some(at) => Some((modifiers + at, 1, b"-")),
-        None => Some((modifiers, 0, b"-")),
+        indicators_end += 1;
     }
+    let comment = bytes[indicators_end..header_end].contains(&b'#');
+    let keep = if comment {
+        indicators_end..header_end
+    } else {
+        header_end..header_end
+    };
+    let content = &span.value_range;
+    let content_end = bytes[content.start.min(bytes.len())..content.end.min(bytes.len())]
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(header_end, |last| content.start + last + 1);
+    Some((indicator..content_end.max(header_end), keep))
 }
 
 /// Byte offset of the last block-scalar indicator (`|` / `>` starting a

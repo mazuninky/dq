@@ -73,6 +73,40 @@ fn new_key_after_an_unterminated_block_scalar_switches_it_to_strip() {
 }
 
 #[test]
+fn set_on_a_block_scalar_rewrites_it_inline() {
+    assert_eq!(
+        set("k: |\n  x\nr: 1\n", "/k", Value::Int(42)),
+        "k: 42\nr: 1\n"
+    );
+    assert_eq!(
+        set(
+            "k: >-\n  x\n  y\n\nr: 1\n",
+            "/k",
+            Value::String("hi".to_owned())
+        ),
+        "k: hi\n\nr: 1\n"
+    );
+    // Node properties and a comment on the header line stay.
+    assert_eq!(
+        set("k: &a | # c\n  x\nr: *a\n", "/k", Value::Int(42)),
+        "k: &a 42 # c\nr: *a\n"
+    );
+    assert_eq!(
+        set("l:\n  - |2+\n     x\n  - 2\n", "/l/0", Value::Int(42)),
+        "l:\n  - 42\n  - 2\n"
+    );
+    assert_eq!(set("k: |\n  x", "/k", Value::Int(42)), "k: 42");
+    assert_eq!(
+        set("k: |\n\nr: 1\n", "/k", Value::Int(42)),
+        "k: 42\n\nr: 1\n"
+    );
+    assert_eq!(
+        set("k: |\r\n  x\r\nr: 1\r\n", "/k", Value::Int(42)),
+        "k: 42\r\nr: 1\r\n"
+    );
+}
+
+#[test]
 fn del_of_a_block_scalar_removes_its_whole_entry() {
     assert_eq!(del("a: |\n  x\nb: 1\n", "/a"), "b: 1\n");
     assert_eq!(del("a:\n  x y\nb: 1\n", "/a"), "b: 1\n");

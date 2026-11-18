@@ -730,18 +730,39 @@ impl Document {
             // Replace-in-span path: render the new value using the same
             // syntactic context as the original, splice into the source
             // buffer, then shift every span to the right of the edit.
-            let original_slice = &self.original_bytes[span.value_range.clone()];
-            let rendered = renderer.render_replacement(&value, span.context, original_slice);
+            //
+            // A `|` / `>` block scalar is rewritten whole as an inline
+            // scalar, header included: a block scalar can only hold a
+            // string, and its value depends on its header's chomping.
+            let block_scalar = (self.format == FormatTag::Yaml
+                && matches!(pointer.resolve(&self.value), Ok(Value::String(_))))
+            .then(|| crate::parsers::yaml_spans::block_scalar_extent(&self.original_bytes, &span))
+            .flatten();
+            let (replaced, rendered, value_len) = match block_scalar {
+                Some((extent, keep)) => {
+                    let mut rendered = renderer.render_replacement(&value, span.context, &[]);
+                    let value_len = rendered.len();
+                    rendered.extend_from_slice(&self.original_bytes[keep]);
+                    (extent, rendered, value_len)
+                }
+                None => {
+                    let original_slice = &self.original_bytes[span.value_range.clone()];
+                    let rendered =
+                        renderer.render_replacement(&value, span.context, original_slice);
+                    let value_len = rendered.len();
+                    (span.value_range.clone(), rendered, value_len)
+                }
+            };
             let delta = SpanRecomputeDelta {
-                at: span.value_range.start,
-                old_len: span.value_range.end - span.value_range.start,
+                at: replaced.start,
+                old_len: replaced.end - replaced.start,
                 new_len: rendered.len(),
             };
             // `splice` requires an owned iterator; cloning into a Vec keeps
             // the operation straightforward and the cost is negligible for
             // human-scale documents.
             self.original_bytes
-                .splice(span.value_range.clone(), rendered.iter().copied());
+                .splice(replaced.clone(), rendered.iter().copied());
             apply_delta(&mut self.spans, delta);
             // Update the also-stored `Value` tree so subsequent reads via
             // `value()` reflect the write. Failures here are propagated as
@@ -752,9 +773,9 @@ impl Document {
             // Patch span metadata in place: keep `at` and `line_range.start`
             // anchored to the original byte position, but extend the end to
             // the new length.
-            let new_end = span.value_range.start + rendered.len();
+            let new_end = replaced.start + value_len;
             if let Some(updated) = self.spans.get_mut(&canonical) {
-                updated.value_range = span.value_range.start..new_end;
+                updated.value_range = replaced.start..new_end;
                 // For single-line scalars `line_range` typically equals
                 // `value_range` plus the trailing newline. Conservatively
                 // extend by the same delta so the line range stays anchored.
