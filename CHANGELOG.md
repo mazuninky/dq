@@ -393,6 +393,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - YAML `set` / `del` below an alias (`b: *m`, `set /b/x 1`) fails with
   exit 7 and names the anchored node to edit instead; it used to fail
   with "not found" though `get` found the path.
+- `dq lint` of a YAML file no longer prints four `check.jq raised a
+  runtime error` warnings from the `@std/dockerfile` rules: they skip any
+  YAML that is not a list of Dockerfile instructions.
 
 ### Security
 
