@@ -604,6 +604,57 @@ fn edit_below_an_alias_is_refused_naming_the_anchored_node() {
     assert_eq!(err.kind_name(), "path", "{err}");
 }
 
+#[test]
+fn del_of_an_anchor_names_the_line_of_the_alias() {
+    for (src, line) in [
+        ("a: &m 1\nb: *m\n", 2),
+        ("x: 0\na: &m 1\n\nb: [*m]\n", 4),
+        ("a: &m 1\r\nx: 0\r\nb: *m\r\n", 3),
+    ] {
+        let mut yaml = doc(src);
+        let err = yaml.del_at(&ptr("/a")).expect_err("del_at refuses");
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!(
+                "it holds an anchor that the alias on line {line} refers to"
+            )),
+            "{src:?}: {message}"
+        );
+        assert_eq!(yaml.original_bytes(), src.as_bytes(), "{src:?}");
+    }
+}
+
+#[test]
+fn a_star_that_is_not_an_alias_does_not_hold_back_del_of_an_anchor() {
+    assert_eq!(del("a: &m 1\nb: \"*m\"\n", "/a"), "b: \"*m\"\n");
+    assert_eq!(
+        del("a: &m 1\nc: '*m'\nglob: \"src/**/*.rs\"\n", "/a"),
+        "c: '*m'\nglob: \"src/**/*.rs\"\n"
+    );
+    assert_eq!(del("a: &m 1 # see *m\nb: 2\n", "/a"), "b: 2\n");
+}
+
+// --- an entry sharing its line with an indicator ---------------------------
+
+#[test]
+fn del_of_an_entry_after_an_explicit_key_indicator() {
+    assert_eq!(del("? k\n: v\nb: 2\n", "/k"), "b: 2\n");
+    assert_eq!(del("k:\n  ? a\n  : 1\n  b: 2\n", "/k/a"), "k:\n  b: 2\n");
+    // The value's first entry shares its line with the `:`.
+    assert_eq!(
+        del("? k\n: - 1\n  - 2\nb: 2\n", "/k/0"),
+        "? k\n: - 2\nb: 2\n"
+    );
+    assert_eq!(del("? a\n: x: 1\n  y: 2\n", "/a/x"), "? a\n: y: 2\n");
+}
+
+#[test]
+fn del_of_an_entry_on_a_document_start_line() {
+    assert_eq!(del("--- [1, 2, 3]\n", "/1"), "--- [1, 3]\n");
+    assert_eq!(del("--- {a: 1, b: 2}\n", "/a"), "--- {b: 2}\n");
+    assert_eq!(del("---\na: 1\nb: 2\n", "/a"), "---\nb: 2\n");
+}
+
 // --- read-back check ---------------------------------------------------------
 
 #[test]
