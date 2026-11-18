@@ -144,7 +144,7 @@ proptest = "1"
 # `[dev-dependencies]` plus `[[bench]] harness = false` entries. The
 # `html_reports` feature emits `target/criterion/<bench>/report/index.html`
 # for offline inspection (cargo already ignores `target/`).
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 # Deterministic workload generation inside bench files. Each `synth_*`
 # helper seeds an `StdRng::seed_from_u64(42)` so numbers are reproducible
 # across runs and machines.
