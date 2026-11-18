@@ -210,7 +210,76 @@ fn build_value_and_spans<S: AsRef<str>>(
     let mut path: Vec<String> = Vec::new();
     let mut map: IndexMap<String, Value> = IndexMap::new();
     walk_table(doc.as_table(), bytes, &mut path, spans, &mut map);
+    if map.is_empty() {
+        // An empty root is an empty container like any other; its span
+        // also tells an empty file apart from a read-only document.
+        spans.insert(
+            String::new(),
+            ValueSpan {
+                value_range: 0..0,
+                line_range: 0..0,
+                indent: 1,
+                context: SpanContext::BlockMapValue,
+            },
+        );
+    }
     Value::Map(map)
+}
+
+/// Byte offset where a new key of the root table goes when the root has
+/// no key of its own to follow: the start of the first table header
+/// (`[t]`, `[[t]]`), before the comment lines right above it, or the end
+/// of the file. `None` when the bytes do not parse.
+pub(crate) fn toml_root_insertion_point(bytes: &[u8]) -> Option<usize> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let doc = TomlDocument::parse(text).ok()?;
+    let Some(header) = first_header(doc.as_table()) else {
+        return Some(bytes.len());
+    };
+    let mut at = bytes[..header]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |i| i + 1);
+    // Comment lines directly above the header belong to it.
+    while at > 0 {
+        let prev = bytes[..at - 1]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |i| i + 1);
+        if bytes[prev..at].trim_ascii_start().starts_with(b"#") {
+            at = prev;
+        } else {
+            break;
+        }
+    }
+    Some(at)
+}
+
+/// Start of the earliest `[table]` / `[[table]]` header under `table`.
+fn first_header(table: &Table) -> Option<usize> {
+    table
+        .iter()
+        .filter_map(|(_, item)| match item {
+            Item::Table(child) => {
+                let own = (!child.is_dotted() && !child.is_implicit())
+                    .then(|| child.span().map(|span| span.start))
+                    .flatten();
+                own.into_iter().chain(first_header(child)).min()
+            }
+            Item::ArrayOfTables(tables) => tables
+                .iter()
+                .filter_map(|child| {
+                    child
+                        .span()
+                        .map(|span| span.start)
+                        .into_iter()
+                        .chain(first_header(child))
+                        .min()
+                })
+                .min(),
+            Item::None | Item::Value(_) => None,
+        })
+        .min()
 }
 
 /// Walk a `[table]` (or the top-level document table). Children are pushed
@@ -652,10 +721,9 @@ impl ScalarRenderer for TomlScalarRenderer {
             Value::Float(f) => render_float(*f),
             Value::BigFloat(s) => s.clone().into_bytes(),
             Value::String(s) => render_string(s, original_style, context),
-            // Replacing a scalar span with a structural value at this layer
-            // is out of scope (D14 / mkdir-p path). Fall through to a
-            // well-formed empty string to keep the splice valid.
-            Value::Array(_) | Value::Map(_) => b"\"\"".to_vec(),
+            // A collection where a scalar was: an inline table or array,
+            // valid wherever a value is.
+            Value::Array(_) | Value::Map(_) => render_inline_scalar(value),
         }
     }
 }
@@ -709,9 +777,9 @@ fn toml_key_token(key: &str) -> String {
     }
 }
 
-/// Render a leaf value as its inline TOML form. Containers fall back to an
-/// empty inline literal so the result is well-formed; full nested rendering
-/// is the caller's responsibility.
+/// Render a value as its inline TOML form: a collection as an inline
+/// array (`[1, "x"]`) or table (`{ a = 1, b = [2] }`). A `null`, which
+/// TOML cannot spell, is written as `""`; the read-back check refuses it.
 fn render_inline_scalar(value: &Value) -> Vec<u8> {
     match value {
         Value::Null => b"\"\"".to_vec(),
@@ -727,8 +795,31 @@ fn render_inline_scalar(value: &Value) -> Vec<u8> {
         Value::Float(f) => render_float(*f),
         Value::BigFloat(s) => s.clone().into_bytes(),
         Value::String(s) => render_basic_string(s),
-        Value::Array(_) => b"[]".to_vec(),
-        Value::Map(_) => b"{}".to_vec(),
+        Value::Array(items) => {
+            let mut out = b"[".to_vec();
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.extend_from_slice(b", ");
+                }
+                out.extend_from_slice(&render_inline_scalar(item));
+            }
+            out.push(b']');
+            out
+        }
+        Value::Map(map) if map.is_empty() => b"{}".to_vec(),
+        Value::Map(map) => {
+            let mut out = b"{ ".to_vec();
+            for (i, (key, item)) in map.iter().enumerate() {
+                if i > 0 {
+                    out.extend_from_slice(b", ");
+                }
+                out.extend_from_slice(toml_key_token(key).as_bytes());
+                out.extend_from_slice(b" = ");
+                out.extend_from_slice(&render_inline_scalar(item));
+            }
+            out.extend_from_slice(b" }");
+            out
+        }
     }
 }
 

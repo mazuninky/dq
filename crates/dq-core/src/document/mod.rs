@@ -709,8 +709,9 @@ impl Document {
         // SpanMap (e.g. `{"a":{}}` whose only key is itself an empty
         // container) is still write-aware; its mkdir-p path will fail
         // through to `Error::Path { MissingKey }` further down, but the
-        // top-level capability check should not falsely block it.
-        if self.original_bytes.is_empty() {
+        // top-level capability check should not falsely block it. An empty
+        // file parsed write-aware has no bytes but a span for its root.
+        if self.original_bytes.is_empty() && self.spans.is_empty() {
             return Err(Error::WriteUnavailable {
                 reason: format!(
                     "{} document was loaded read-only; reload via a write-aware parser to enable set",
@@ -991,6 +992,9 @@ impl Document {
             // `missing_key` captures `self.value` via
             // `longest_existing_value_prefix` and so cannot coexist with
             // the `&mut self` we need for the splice).
+            if self.format == FormatTag::Toml && parent_canonical.is_empty() {
+                return self.toml_root_insertion(pointer, &new_key, value, insertion_renderer);
+            }
             let parent_is_empty_map = parent_map.is_empty();
             let fallback_err = missing_key();
             return self.try_empty_parent_mkdir_p(
@@ -1117,6 +1121,45 @@ impl Document {
         // Re-sync the provenance side-channel.
         self.provenance = provenance_from_spans(&self.spans);
         Ok(())
+    }
+
+    /// Insert `key = value` into the TOML root table when it has no key of
+    /// its own to follow: before the first table header, or at the end of
+    /// a file without one. The read-back check settles the spans.
+    fn toml_root_insertion(
+        &mut self,
+        pointer: &Pointer,
+        new_key: &str,
+        value: Value,
+        insertion_renderer: &dyn crate::textual_edit::InsertionRenderer,
+    ) -> Result<()> {
+        let at = crate::parsers::toml::toml_root_insertion_point(&self.original_bytes).ok_or_else(
+            || Error::EditRejected {
+                action: "set",
+                pointer: pointer.as_canonical(),
+                reason: "the document does not parse".to_owned(),
+            },
+        )?;
+        let mut inserted = Vec::new();
+        if at > 0 && self.original_bytes[at - 1] != b'\n' {
+            inserted.push(b'\n');
+        }
+        inserted.extend(insertion_renderer.render_insertion(
+            new_key,
+            &value,
+            1,
+            SpanContext::BlockMapValue,
+        ));
+        let inserted = with_line_ending_at(&self.original_bytes, at, inserted);
+        let delta = SpanRecomputeDelta {
+            at,
+            old_len: 0,
+            new_len: inserted.len(),
+        };
+        self.original_bytes.splice(at..at, inserted);
+        apply_delta(&mut self.spans, delta);
+        self.spans.shift_remove("");
+        set_value_at(&mut self.value, pointer, value)
     }
 
     /// Empty-parent splice: insert `value` at `pointer` when the parent
@@ -1594,8 +1637,9 @@ impl Document {
         // "Read-only" is signalled by empty `original_bytes` (`value_only`
         // constructor); an all-container document with zero leaf scalars
         // has an empty SpanMap but populated bytes — its del would
-        // legitimately fall through to MissingKey, not WriteUnavailable.
-        if self.original_bytes.is_empty() {
+        // legitimately fall through to MissingKey, not WriteUnavailable. An
+        // empty file parsed write-aware has a span for its root.
+        if self.original_bytes.is_empty() && self.spans.is_empty() {
             return Err(Error::WriteUnavailable {
                 reason: format!(
                     "{} document was loaded read-only; reload via a write-aware parser to enable del",
@@ -1635,7 +1679,7 @@ impl Document {
         let in_map = matches!(parent_ptr.resolve(&self.value), Ok(Value::Map(_)));
         // What takes the place of the removed bytes: `{}` / `[]` for the
         // only entry of a compact collection.
-        let mut inserted: &'static [u8] = b"";
+        let mut inserted: Vec<u8> = Vec::new();
         let compact_entry = match layout.as_ref() {
             Some(layout) => self.compact_entry_removal(
                 layout,
@@ -1647,7 +1691,7 @@ impl Document {
             None => None,
         };
         if compact_entry.is_some() && parent_loses_last_child {
-            inserted = if in_map { b"{}" } else { b"[]" };
+            inserted = if in_map { b"{}" } else { b"[]" }.to_vec();
         }
         let collection = layout
             .as_ref()
@@ -1711,6 +1755,21 @@ impl Document {
                     .unwrap_or_else(|| span.line_range.clone())
             }
         };
+        // `a.b = 1`, the only key under `a`: removing its line would remove
+        // `a` too, so it becomes `a = {}`.
+        if self.format == FormatTag::Toml
+            && parent_loses_last_child
+            && in_map
+            && let Some(prefix) = toml_dotted_key_parent(&self.original_bytes[line_range.clone()])
+        {
+            inserted = prefix;
+            inserted.extend_from_slice(b" = {}");
+            inserted.extend_from_slice(match &self.original_bytes[line_range.clone()] {
+                [.., b'\r', b'\n'] => b"\r\n",
+                [.., b'\n'] => b"\n",
+                _ => b"",
+            });
+        }
         let removed = line_range.clone();
         // An alias elsewhere would dangle — or resolve to an earlier
         // definition of its anchor name — once the bytes defining its anchor
@@ -2362,6 +2421,33 @@ fn with_line_ending_at(bytes: &[u8], at: usize, inserted: Vec<u8>) -> Vec<u8> {
         out.push(b);
     }
     out
+}
+
+/// For the TOML line `line` holding a dotted key (`  a."b.c".d = 1`), the
+/// key without its last part (`  a."b.c"`); `None` for a key of one part
+/// or a line that is not `key = value`.
+fn toml_dotted_key_parent(line: &[u8]) -> Option<Vec<u8>> {
+    let mut quote = None;
+    let mut last_dot = None;
+    for (i, &b) in line.iter().enumerate() {
+        match (quote, b) {
+            (Some(q), _) if b == q => quote = None,
+            (Some(b'"'), b'\\') => return None,
+            (Some(_), _) => {}
+            (None, b'"' | b'\'') => quote = Some(b),
+            (None, b'.') => last_dot = Some(i),
+            (None, b'=') => {
+                let mut end = last_dot?;
+                while end > 0 && matches!(line[end - 1], b' ' | b'\t') {
+                    end -= 1;
+                }
+                return Some(line[..end].to_vec());
+            }
+            (None, b'#' | b'\n' | b'[' | b'{') => return None,
+            (None, _) => {}
+        }
+    }
+    None
 }
 
 /// The anchor and local tags of the node properties `props`, each followed

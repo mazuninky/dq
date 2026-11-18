@@ -301,6 +301,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `set` of a new key in a YAML or TOML file with CRLF line breaks ends
   the lines it adds with CRLF, as JSON already did; it used to add LF
   lines to the file.
+- TOML `set` of a table or array writes it inline (`a = { x = 1 }`,
+  `b = [{ c = 1 }]`), over a scalar or as a new key; it used to write
+  `""` or `{}` / `[]`.
+- TOML `del` of the only key under a dotted key (`a.b = 1`) writes
+  `a = {}`; it used to remove `a` with it.
+- TOML `set` of a new root key in a file whose root holds no key of its
+  own — only tables, or nothing — puts it before the first table header
+  (and the comments right above it), or at the end. It used to fail
+  with "not found", and an empty file was reported as read-only.
 - `set` / `del` on YAML, JSON and TOML check that the edited file reads
   back as the requested change. When it does not, they fail with exit 7,
   print nothing and leave the file alone; they used to write the damaged

@@ -272,3 +272,73 @@ fn set_of_a_new_key_in_a_crlf_file_ends_its_lines_with_crlf() {
     // A file with LF line breaks keeps them.
     assert_eq!(set("toml", "a = 1", "/c", Value::Int(3)), "a = 1\nc = 3\n");
 }
+
+#[test]
+fn set_of_a_toml_collection_writes_it_inline() {
+    let json = |v| Value::from_serde_json(&v);
+    assert_eq!(
+        set(
+            "toml",
+            "a = 1 # c\nb = 2\n",
+            "/a",
+            json(serde_json::json!({"x": 1}))
+        ),
+        "a = { x = 1 } # c\nb = 2\n"
+    );
+    assert_eq!(
+        set("toml", "a = 1\n", "/a", json(serde_json::json!([1, "x"]))),
+        "a = [1, \"x\"]\n"
+    );
+    assert_eq!(
+        set("toml", "a = 1\n", "/b", json(serde_json::json!([{"c": 1}]))),
+        "a = 1\nb = [{ c = 1 }]\n"
+    );
+    assert_eq!(
+        set(
+            "toml",
+            "a = { p = 1 }\n",
+            "/a/q",
+            json(serde_json::json!({"c": {}}))
+        ),
+        "a = { p = 1, q = { c = {} } }\n"
+    );
+}
+
+#[test]
+fn del_of_the_only_dotted_toml_key_leaves_an_empty_table() {
+    assert_eq!(del("toml", "a.b = 1\n", "/a/b"), "a = {}\n");
+    assert_eq!(
+        del("toml", "a.b.c = 1\na.d = 2\n", "/a/b/c"),
+        "a.b = {}\na.d = 2\n"
+    );
+    assert_eq!(
+        del("toml", "[t]\n  a . \"b.c\" . d = 1\n", "/t/a/b.c/d"),
+        "[t]\n  a . \"b.c\" = {}\n"
+    );
+    // A key under a header leaves the header, which reads as `{}`.
+    assert_eq!(del("toml", "[a]\nb = 1\n", "/a/b"), "[a]\n");
+}
+
+#[test]
+fn set_of_a_new_toml_root_key_goes_before_the_first_table() {
+    assert_eq!(
+        set("toml", "[a]\nx = 1\n", "/c", Value::Int(3)),
+        "c = 3\n[a]\nx = 1\n"
+    );
+    // The comment right above a header stays with it.
+    assert_eq!(
+        set(
+            "toml",
+            "# top\n\n# about t\n[t]\nx = 1\n",
+            "/c",
+            Value::Int(3)
+        ),
+        "# top\n\nc = 3\n# about t\n[t]\nx = 1\n"
+    );
+    assert_eq!(
+        set("toml", "a.b = 1\n[[p]]\nx = 1\n", "/c", Value::Int(3)),
+        "a.b = 1\nc = 3\n[[p]]\nx = 1\n"
+    );
+    assert_eq!(set("toml", "# c", "/a", Value::Int(1)), "# c\na = 1\n");
+    assert_eq!(set("toml", "", "/a", Value::Int(1)), "a = 1\n");
+}
