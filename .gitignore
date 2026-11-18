@@ -43,3 +43,6 @@ openspec/changes/.openspec.cache/
 # Skill eval runner — workspace + staging dirs are per-run artefacts, not source.
 **/*-workspace/
 /plugins/
+
+# Locally built dq-plugin integration-test fixtures (see crates/dq-plugin/tests/fixtures/README.md)
+crates/dq-plugin/tests/fixtures/*.wasm

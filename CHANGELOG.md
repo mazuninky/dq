@@ -171,6 +171,46 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `dq select` now follows RFC 9535 strictly (jsonpath-rust 0.7 → 1.0).
+  - Filters without parentheses (`$.items[?@.n > 1].name`), function
+    extensions such as `length(@.tags)`, and negative indices
+    (`$.items[-1]`) now work. They used to exit with code 1.
+  - The 0.7 extensions `.length()`, `.['x']` and `=~` are rejected with
+    exit code 1 and `invalid JSONPath expression:`. Use `length(@.x)`,
+    `['x']`, and `match()` or `search()` instead.
+  - `in` is not an RFC 9535 operator: `[?(@.name in ["x"])]` returns `[]`
+    with exit code 0 instead of matching. A space inside a dot-name is
+    part of the name, so `$.s y` looks up the key `"s y"`.
+  - `$..*` lists a node's children before descending into them. The
+    values are the same; the order differs.
+- `-F toon` writes TOON spec v4 (toon-format 0.4 → 0.7). An empty array
+  is written as `roles: []` instead of `roles[0]:`. Strings such as
+  `#bob` and `+1`, and non-ASCII keys such as `ключ`, are quoted. Tools
+  that read dq's TOON output need a v4 reader.
+- Markdown IR `position.end` moved for some nodes (comrak 0.52 → 1.0).
+  Lists and list items end at their last child: in `> - a\n>\n> b\n` the
+  list ends at `1:5`, not `2:1`. Indented code blocks end at their last
+  character instead of the start of the next line: a block on lines 8–9
+  ends at `9:8`, not `10:0`. Rules and scripts that compare these
+  positions need new expectations.
+- JSON Schema rules whose root `$schema` names draft-04, draft-06 or
+  draft-07 now validate (jsonschema 0.34 → 0.61). jsonschema 0.34 skipped
+  the root keywords of such schemas, so these rules reported nothing.
+  dq applies 2020-12 semantics to them, so draft-07-only syntax such as
+  array-form `items` fails to compile. Schemas copied from SchemaStore
+  often declare draft-07 and may start reporting violations.
+- Some JSON Schema messages read differently. `pattern` messages quote
+  the regex as written in the schema (`\w+@\w+`) instead of a rewritten
+  form, a `type` list is printed in a different order (`"null",
+  "integer"`), and `$dynamicRef` paths include every evaluation step.
+  Exit codes and positions are unchanged.
+- TOML parse errors use the toml_edit 0.25 wording. For `bad = ` the
+  message is now `string values must be quoted, expected literal string`.
+- Building from source needs Rust 1.100 (was 1.94). The Docker images
+  build on `rust:1.100-alpine` and run on `alpine:3.24`.
+- The plugin host runs on wasmtime 50. The WIT contract
+  `dq:plugin@0.1.0` is unchanged, and plugins built with wit-bindgen 0.57
+  still load.
 - `dq_exec::Evaluator::evaluate_file` now takes `&dq_core::Ir<'_>` instead
   of `&serde_json::Value`. Internally the evaluator still feeds `serde`
   values into jaq; the `Ir` is required so the new `loc.pointer` chain has
@@ -203,3 +243,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `fix.jq` whole-document jq fixes. Backwards-compatible; new rules
   should prefer `fix.ops` for comment preservation. Removal is deferred
   to a future change once the `@std/*` rule library has fully migrated.
+
+### Fixed
+
+- A YAML file with a UTF-8 BOM and a single key can be edited: `set /key`
+  used to fail with `path '/key' not found` (saphyr-parser 0.0.6 → 0.3).
+  The BOM is kept on write.
+- Some YAML documents that saphyr-parser 0.0.6 rejected with a parse
+  error now parse.
+
+### Security
+
+- `cargo audit` reports no advisories; it reported 37 vulnerabilities
+  and 3 unsound warnings before these updates.
+  - wasmtime 44 → 50 in the plugin runtime: RUSTSEC-2026-0222, -0269,
+    -0316, -0327, -0359, -0362, -0363, -0379, -0424.
+  - self_update 0.44 → 1.3 for `dq self update` drops zip 6
+    (RUSTSEC-2026-0367, -0368, -0369, -0429, -0545, -0547, -0548) and
+    quick-xml 0.38.
+  - quick-xml 0.40 → 0.42 in the XML parser: RUSTSEC-2026-0194, -0195.
+  - rustls, rustls-webpki, webpki-roots and webpki-root-certs, used by
+    `dq self check` and `dq self update`: RUSTSEC-2026-0285, -0346,
+    -0348, -0349, -0381, -0382, -0383.
+  - The remaining advisories (crossbeam-epoch, h2, quinn-proto,
+    quinn-udp, and the unsound warnings for anyhow, rustix and tokio)
+    were closed by updating `Cargo.lock`.
