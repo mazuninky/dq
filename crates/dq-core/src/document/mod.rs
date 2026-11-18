@@ -2018,7 +2018,7 @@ impl Document {
     }
 
     /// [`Document::del_at`] without the read-back check.
-    fn del_at_unchecked(&mut self, pointer: &Pointer, layout: &LayoutCache) -> Result<()> {
+    fn del_at_unchecked(&mut self, pointer: &Pointer, cache: &LayoutCache) -> Result<()> {
         // "Read-only" is signalled by empty `original_bytes` (`value_only`
         // constructor); an all-container document with zero leaf scalars
         // has an empty SpanMap but populated bytes — its del would
@@ -2054,7 +2054,24 @@ impl Document {
             Ok(Value::Array(items)) => items.len() == 1,
             _ => false,
         };
-        let layout = self.edit_layout(layout);
+        // The YAML layout is a parse of its own: work it out only for a
+        // collection, an entry that may share its line with a `-` (or a
+        // `?` / `:` indicator), and an emptied parent. A line opening with
+        // a key cannot hold a compact entry.
+        let layout_needed = self.format == FormatTag::Yaml
+            && (target_is_collection
+                || parent_loses_last_child
+                || self.spans.get(&canonical).is_none_or(|span| {
+                    self.original_bytes[span.line_range.start..]
+                        .iter()
+                        .find(|&&b| b != b' ' && b != b'\t')
+                        .is_none_or(|b| matches!(b, b'-' | b'?' | b':'))
+                }));
+        let layout = if layout_needed {
+            self.edit_layout(cache)
+        } else {
+            None
+        };
         let in_map = matches!(parent_ptr.resolve(&self.value), Ok(Value::Map(_)));
         // What takes the place of the removed bytes: `{}` / `[]` for the
         // only entry of a compact collection.
@@ -2273,7 +2290,12 @@ impl Document {
         // An alias elsewhere would dangle — or resolve to an earlier
         // definition of its anchor name — once the bytes defining its anchor
         // are gone.
-        if let Some(alias) = layout.as_ref().and_then(|layout| {
+        let aliases = if self.original_bytes.contains(&b'*') {
+            self.edit_layout(cache)
+        } else {
+            None
+        };
+        if let Some(alias) = aliases.and_then(|layout| {
             layout.aliases.iter().find(|alias| {
                 removed.contains(&alias.anchor_at) && !removed.contains(&alias.alias_at)
             })
