@@ -250,152 +250,154 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- A YAML file with a UTF-8 BOM and a single key can be edited: `set /key`
-  used to fail with `path '/key' not found` (saphyr-parser 0.0.6 → 0.3).
-  The BOM is kept on write.
-- Some YAML documents that saphyr-parser 0.0.6 rejected with a parse
-  error now parse.
+- A YAML file with a UTF-8 BOM parses and can be edited, the BOM kept on
+  write. With one key, `set /key` used to fail with `path '/key' not
+  found`; with more, parsing failed with "did not find expected
+  <document start>". Some other documents that saphyr-parser 0.0.6
+  rejected parse too (saphyr-parser 0.0.6 → 0.3).
 - Plugins: the 64 MiB memory limit applies to all of a plugin's memories
   together, and a plugin stopped by it reports `exceeded memory limit`.
 - Log messages (`WARN` and the `-v` levels) go to stderr instead of
   stdout, so `dq -F json … | jq` gets clean JSON. They are coloured only
   when stderr is a terminal and colour is not turned off.
+- `dq lint` of a YAML file no longer prints four `check.jq raised a
+  runtime error` warnings from the `@std/dockerfile` rules: they skip any
+  YAML that is not a list of Dockerfile instructions.
 - `dq set` / `del` / `lint` no longer panic on a file with an empty or
   null key: `"": 1` in YAML, `{"": 1}` in JSON, `"" = 1` in TOML,
   `f: {? &a}` in YAML.
-- YAML `set` of a new key after a block scalar (`|`, `>`) or a value on the
-  next line puts the key at the mapping's indent instead of inside the
-  value. `del` of such a value removes the whole entry. When the file ends
-  inside that block scalar without a final line break, the new key's line
-  break would join its value, so its header turns to strip chomping
-  (`|` → `|-`, `|+` → `|-`), which keeps the value as it was.
-- YAML `set` / `del` after an alias (`*name`) edit the node you point at;
-  they used to edit the node after it, or fail with "not found". Lint
-  diagnostics on such files point at the right line instead of line 1.
-- YAML `del` of the last key or item writes `a: {}` / `a: []` instead of
-  leaving `a:`, which reads as `null`; an emptied document becomes `{}`.
-- YAML `del` of a key whose value is a collection removes the whole entry
-  instead of failing with "not found" (block collections) or leaving the
-  key with a `null` value (`{}` / `[]`).
-- YAML `del` of an empty value — `key: |` with no lines, `key: !!str`,
-  `key: &a`, `- &a` — removes its own entry; it used to remove the entry
-  after it and keep its own.
-- YAML `del` of a node that holds an anchor (`&name`) an alias elsewhere
-  refers to fails with exit 7 and leaves the file alone; it used to leave
-  the alias dangling, so the file no longer parsed. `lint --fix` skips
-  such a fix with a warning.
-- YAML `set` of an object or array where a scalar was writes it in flow
-  style (`a: {"x": 1}`); it used to write `null`.
-- YAML `set` of an explicit key with no value (`? v` alone) writes the
-  value on a `: 42` line of its own; it used to append it to the key.
-- YAML `set` of a new key writes a collection nested in its value in flow
-  style (`b:` + `  - {"x": 1}`); it used to write `{}` / `[]` in its
-  place. Inside a flow mapping the new entry stays on its line
-  (`a: {x: 1, z: [1]}`); one holding a collection used to break the file.
-- YAML `set` of a string a YAML reader would take as something else
-  writes it quoted. That covers what dq itself types — `.nan`, `.inf`,
-  `0x10`, `0o17`, `~`, `Null`, `+1` — and what YAML 1.1 readers such as
-  go-yaml (Kubernetes, GitHub Actions) and PyYAML type: `1_000`, `017`,
-  `1:20`, `2001-12-14`, `y`, `n`, `<<`, `=`. It used to write them plain,
-  so they read back as a number, a date, a bool or `null`. The same goes
-  for a new key such as `null` or `<<`.
-- YAML `set` of a scalar with a `!!` tag (`!!binary |`, `!!int 5`) drops
-  the tag, so the new value is typed by what it is; it used to keep it,
-  and `!!binary hi` no longer parses. Anchors and local tags (`!Ref`)
-  stay.
-- `set` of a new key in a YAML or TOML file with CRLF line breaks ends
-  the lines it adds with CRLF, as JSON already did; it used to add LF
-  lines to the file.
-- TOML `set` of a table or array writes it inline (`a = { x = 1 }`,
-  `b = [{ c = 1 }]`), over a scalar or as a new key; it used to write
-  `""` or `{}` / `[]`.
-- `set` where a non-empty collection is replaces it, in YAML, JSON and
-  TOML; it used to fail with "not found" though `get` found the path. A
-  JSON value, a TOML inline table or array and a YAML flow collection
-  are replaced between their brackets; a YAML block collection loses its
-  lines, the key keeping its comment and anchor (`a: &x 5 # c`); a TOML
-  `[table]` or dotted table is removed and the key written anew among
-  the keys of its table.
-- TOML `del` of a `[table]`, an `[[array]]` item or a dotted table
-  (`a.b = 1`) removes its sections and lines, subtables included; it
-  used to fail with "not found". The last item of an array of tables
-  leaves `arr = []`. So does `del` of a dotted key inside an inline
-  table (`{x."y z".w = 1}`); the last key under one, first in the table,
-  leaves `{x = {}, b = 2}` where it used to lose the comma.
-- TOML `set` of a new key in a `[table]` holding only tables, or nothing,
-  writes it right under the header; it used to fail with "not found".
-- TOML `del` of a non-empty inline table or array removes it — its
-  `key = …` lines, or the entry and one comma inside another inline
-  collection; it used to fail with "not found".
-- TOML `del` of the only key under a dotted key (`a.b = 1`) writes
-  `a = {}`; it used to remove `a` with it.
-- TOML `set` of a new key next to a dotted one (`r0.k0 = 1`) writes it
-  under the same dotted key (`r0.zq = 7`), and after an inline table or
-  array when that is the last child. It was refused, or failed with
-  "not found" when the only sibling was an inline collection.
-- TOML `set` of a new root key in a file whose root holds no key of its
-  own — only tables, or nothing — puts it before the first table header
-  (and the comments right above it), or at the end. It used to fail
-  with "not found", and an empty file was reported as read-only.
-- `set` / `del` on YAML, JSON and TOML check that the edited file reads
-  back as the requested change. When it does not, they fail with exit 7,
-  print nothing and leave the file alone; they used to write the damaged
-  output. The message says why: dq cannot write the value there as a
-  textual edit, the edit would change other parts of the document, or
-  the edited document would not parse; it points to `dq set --jq`, which
-  rewrites the whole file through its writer and drops comments. An edit under a YAML anchor also changes its aliases (`<<:
-  *base`), as YAML defines.
-- A YAML file with a UTF-8 BOM and more than one top-level key parses; it
-  used to fail with "did not find expected <document start>".
-- `del` of an entry that shares its line with others — any JSON member or
-  item, a YAML flow collection, a TOML inline table or array — removes the
-  entry and one comma: `{"a": 1, "b": 2}` `del /a` gives `{"b": 2}`. It
-  used to remove the whole line (an empty file for single-line JSON), or
-  leave `{x: , y: 2}` / `[, 2]` behind; `del` of the last member of a
-  multi-line JSON object left a trailing comma. A collection inside a
-  YAML flow collection or a JSON value can be deleted too; it used to
-  fail with "not found".
-- YAML `set` on a `|` / `>` block scalar replaces it, header included,
-  with an inline value: `k: |` + `  x` set to `42` gives `k: 42`. It used
-  to keep the header and glue the value to the next line (`k: |` +
-  `  42r: 1`). A comment on the header line and node properties stay; a
-  string that needs several lines is written double-quoted.
-- `set` of a new key next to such an entry keeps it on the line (`{"a": 1,
-  "c": 3}`, `a: {x: 1, z: 3}`, `a = {x = 1, z = 3}`), or on a line of its
-  own at the sibling's column in multi-line JSON. YAML and TOML used to
-  write it as a block line inside the braces, which did not parse; JSON
-  started a new line indented two columns too far. After an empty `[]` /
-  `{}` value of a block entry the new key no longer gets a blank line
-  after it, and TOML `del` of `key = {}` removes the line instead of
-  leaving `key = `.
-- YAML `set` on an empty value — `key:`, `key: # c`, `key: &a`,
-  `key: !!str`, an empty `-` item — writes the value after the `:` / `-`
-  (`key: 5`). It used to write it before the `:` (`key5:`). An anchor
-  stays; a `!!` tag goes, as it would retype the new value.
-- YAML `del` of the first key of a compact sequence item (`- name: web`
-  over `  image: x`) hands the `-` on to the next key: `- image: x`. It
-  used to remove the line with the `-`, merging the item's other keys
-  into the item before it. A comment line between the two keys stays,
-  with the `-` before it (`- # note`). The only key leaves `- {}`, the only item of
-  `- - 1` leaves `- []`. A new key of such an item lines up with its keys
-  instead of with the `-`.
-- `set` of a new key in YAML or JSON goes after the map's last child,
-  also when that child is a collection: `set /spec/replicas 3` next to
-  `template:` works, and in `a: 1` + `b:` + `  x: 1`, `set /c 3` adds
-  `c` after `b`. It used to fail with "not found" when every child was a
-  collection, and otherwise put the key after the last scalar child.
 - YAML `.nan` / `.inf` / `-.inf`: `convert -F json` fails, as it already
   did for TOML `nan`, since JSON has no such number; it used to print
   `.nan` into the JSON. `convert -F yaml` writes them as floats again (it
   wrote the strings `'.nan'`), `convert -F toml` and TOML `set` write
   `nan` / `inf` (they failed). JSON `set` of NaN or infinity fails with
   exit 7 and leaves the file alone; it used to crash.
-- YAML `set` / `del` below an alias (`b: *m`, `set /b/x 1`) fails with
-  exit 7 and names the anchored node to edit instead; it used to fail
-  with "not found" though `get` found the path.
-- `dq lint` of a YAML file no longer prints four `check.jq raised a
-  runtime error` warnings from the `@std/dockerfile` rules: they skip any
-  YAML that is not a list of Dockerfile instructions.
+
+Textual edits — `set` and `del` on YAML, JSON and TOML:
+
+- They check that the edited file reads back as the requested change.
+  When it does not, they fail with exit 7, print nothing and leave the
+  file alone; they used to write the damaged output. The message says
+  why — dq cannot write the value there as a textual edit, the edit
+  would change other parts of the document, or the edited document would
+  not parse — and points to `dq set --jq`, which rewrites the whole file
+  through its writer and drops comments.
+- `set` where a non-empty collection is replaces it; it used to fail
+  with "not found" though `get` found the path. A JSON value, a TOML
+  inline table or array and a YAML flow collection are replaced between
+  their brackets; a YAML block collection loses its lines, the key
+  keeping its comment and anchor (`a: &x 5 # c`); a TOML `[table]` or
+  dotted table is removed and the key written anew among the keys of
+  its table.
+- `del` of an entry that shares its line with others — any JSON member
+  or item, a YAML flow collection, a TOML inline table or array —
+  removes the entry and one comma: `{"a": 1, "b": 2}` `del /a` gives
+  `{"b": 2}`. It used to remove the whole line (an empty file for
+  single-line JSON), or leave `{x: , y: 2}` / `[, 2]` behind; `del` of
+  the last member of a multi-line JSON object left a trailing comma. A
+  collection inside a YAML flow collection or a JSON value can be
+  deleted too; it used to fail with "not found".
+- `set` of a new key next to such an entry keeps it on the line
+  (`{"a": 1, "c": 3}`, `a: {x: 1, z: 3}`, `a = {x = 1, z = 3}`), or on a
+  line of its own at the sibling's column in multi-line JSON. YAML and
+  TOML used to write it as a block line inside the braces, which did not
+  parse; JSON started a new line indented two columns too far. After an
+  empty `[]` / `{}` value of a block entry the new key no longer gets a
+  blank line after it.
+- `set` of a new key in YAML or JSON goes after the map's last child,
+  also when that child is a collection: `set /spec/replicas 3` next to
+  `template:` works, and in `a: 1` + `b:` + `  x: 1`, `set /c 3` adds
+  `c` after `b`. It used to fail with "not found" when every child was a
+  collection, and otherwise put the key after the last scalar child.
+- `set` of a new key in a YAML or TOML file with CRLF line breaks ends
+  the lines it adds with CRLF, as JSON already did; it used to add LF
+  lines to the file.
+
+YAML:
+
+- `set` of a string a YAML reader would take as something else writes
+  it quoted. That covers what dq itself types — `.nan`, `.inf`, `0x10`,
+  `0o17`, `~`, `Null`, `+1` — and what YAML 1.1 readers such as go-yaml
+  (Kubernetes, GitHub Actions) and PyYAML type: `1_000`, `017`, `1:20`,
+  `2001-12-14`, `y`, `n`, `<<`, `=`. It used to write them plain, so
+  they read back as a number, a date, a bool or `null`. The same goes
+  for a new key such as `null` or `<<`.
+- `set` of an object or array where a scalar was writes it in flow style
+  (`a: {"x": 1}`); it used to write `null`. A new key's value holding a
+  collection gets one in flow style too (`b:` + `  - {"x": 1}`), not
+  `{}` / `[]`. Inside a flow mapping the new entry stays on its line
+  (`a: {x: 1, z: [1]}`); one holding a collection used to break the
+  file.
+- `set` on an empty value — `key:`, `key: # c`, `key: &a`,
+  `key: !!str`, an empty `-` item — writes the value after the `:` / `-`
+  (`key: 5`); it used to write it before the `:` (`key5:`). On a `|` /
+  `>` block scalar it replaces the scalar, header included, with an
+  inline value: `k: |` + `  x` set to `42` gives `k: 42`; it used to
+  glue the value to the next line (`k: |` + `  42r: 1`). A string that
+  needs several lines is written double-quoted. On an explicit key with
+  no value (`? v` alone) it writes `: 42` on a line of its own; it used
+  to append it to the key. Anchors and comments on the line stay; a `!!`
+  tag (`!!binary |`, `!!int 5`) goes, so the new value is typed by what
+  it is — it used to stay, and `!!binary hi` no longer parses. Local
+  tags (`!Ref`) stay.
+- `set` of a new key after a block scalar (`|`, `>`) or a value on the
+  next line puts the key at the mapping's indent instead of inside the
+  value. When the file ends inside that block scalar without a final
+  line break, its header turns to strip chomping (`|` → `|-`, `|+` →
+  `|-`), so the value stays as it was.
+- `set` / `del` after an alias (`*name`) edit the node you point at; they
+  used to edit the node after it, or fail with "not found". Lint
+  diagnostics on such files point at the right line instead of line 1.
+  An edit under an anchor also changes its aliases (`<<: *base`), as
+  YAML defines. An edit below an alias (`b: *m`, `set /b/x 1`) fails
+  with exit 7 and names the anchored node to edit instead; it used to
+  fail with "not found" though `get` found the path.
+- `del` of a key whose value is a collection, a block scalar or a value
+  on the next line removes the whole entry; for a block collection it
+  used to fail with "not found", for `{}` / `[]` it left the key with a
+  `null` value. `del` of an empty value — `key: |` with no lines,
+  `key: !!str`, `key: &a`, `- &a` — removes its own entry; it used to
+  remove the entry after it and keep its own.
+- `del` of the last key or item writes `a: {}` / `a: []` instead of
+  leaving `a:`, which reads as `null`; an emptied document becomes `{}`.
+- `del` of the first key of a compact sequence item (`- name: web` over
+  `  image: x`) hands the `-` on to the next key: `- image: x`. It used
+  to remove the line with the `-`, merging the item's other keys into
+  the item before it. A comment line between the two keys stays, with
+  the `-` before it (`- # note`). The only key leaves `- {}`, the only
+  item of `- - 1` leaves `- []`. A new key of such an item lines up with
+  its keys instead of with the `-`.
+- `del` of a node that holds an anchor (`&name`) an alias elsewhere
+  refers to fails with exit 7 and leaves the file alone; it used to
+  leave the alias dangling, so the file no longer parsed. `lint --fix`
+  skips such a fix with a warning.
+
+TOML:
+
+- `set` of a table or array writes it inline (`a = { x = 1 }`,
+  `b = [{ c = 1 }]`), over a scalar or as a new key; it used to write
+  `""` or `{}` / `[]`.
+- `set` of a new key next to a dotted one (`r0.k0 = 1`) writes it under
+  the same dotted key (`r0.zq = 7`), and after an inline table or array
+  when that is the last child. It was refused, or failed with "not
+  found" when the only sibling was an inline collection.
+- `set` of a new key in a table with no key of its own — the root or a
+  `[table]` holding only tables, or nothing — writes it right under the
+  header, or for the root before the first table header (and the
+  comments right above it) or at the end. It used to fail with "not
+  found", and an empty file was reported as read-only.
+- `del` of a `[table]`, an `[[array]]` item or a dotted table
+  (`a.b = 1`) removes its sections and lines, subtables included; `del`
+  of a non-empty inline table or array removes its `key = …` lines, or
+  the entry and one comma inside another inline collection. They used
+  to fail with "not found". So did `del` of a dotted key inside an
+  inline table (`{x."y z".w = 1}`), which now removes its entry. The last
+  item of an array of tables leaves `arr = []`, and `del` of `key = {}`
+  removes the line instead of leaving `key = `.
+- `del` of the only key under a dotted key (`a.b = 1`) writes `a = {}`;
+  it used to remove `a` with it. Inside an inline table, the last key
+  under a dotted key that comes first leaves `{x = {}, b = 2}`; it used
+  to lose the comma.
 
 ### Security
 
