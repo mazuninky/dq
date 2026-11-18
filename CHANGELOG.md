@@ -283,6 +283,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   such a fix with a warning.
 - YAML `set` of an object or array where a scalar was writes it in flow
   style (`a: {"x":1}`); it used to write `null`.
+- `set` / `del` on YAML, JSON and TOML check that the edited file reads
+  back as the requested change. When the textual edit would change other
+  parts of the file or break its syntax, they fail with exit 7 ("cannot
+  set '/a': the edit would change other parts of the document"), print
+  nothing and leave the file alone; they used to write the damaged
+  output. An edit under a YAML anchor also changes its aliases (`<<:
+  *base`), as YAML defines.
 
 ### Security
 

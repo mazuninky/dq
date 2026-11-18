@@ -140,3 +140,24 @@ fn del_of_an_anchor_an_alias_refers_to_is_refused_with_exit_7() {
         ));
     assert_eq!(std::fs::read_to_string(path).expect("read back"), src);
 }
+
+#[test]
+fn an_edit_that_does_not_read_back_is_refused_with_exit_7() {
+    // The TOML scalar renderer has no inline-table form and writes `""`
+    // for a table: the read-back check refuses it, prints nothing and
+    // leaves the file alone.
+    let src = "a = 1\nb = 2\n";
+    let file = write_with_suffix(src, ".toml");
+    let path = file.to_str().expect("UTF-8 path");
+    for extra in [&[][..], &["-i"][..]] {
+        dq().args(["set", path, "/a", r#"{"x": 1}"#, "--no-color"])
+            .args(extra)
+            .assert()
+            .code(7)
+            .stdout("")
+            .stderr(predicates::str::contains(
+                "cannot set '/a': the edit would change other parts of the document",
+            ));
+        assert_eq!(std::fs::read_to_string(path).expect("read back"), src);
+    }
+}

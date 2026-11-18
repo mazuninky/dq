@@ -676,13 +676,33 @@ impl Document {
     /// strictly read-only for mkdir-p and continue to return
     /// [`Error::Path`].
     ///
+    /// # Read-back check
+    ///
+    /// The edited bytes are parsed again and must read back as the tree
+    /// before the edit with `value` at `pointer` — and, in YAML, at every
+    /// alias of an anchored node at or above `pointer`, which shares the
+    /// edit. Otherwise the document is left as it was and the edit fails.
+    /// On success the value tree, spans and provenance are the fresh
+    /// parse's.
+    ///
     /// # Errors
     ///
     /// - [`Error::WriteUnavailable`] when the document was loaded
     ///   read-only (no spans or no renderer registered).
     /// - [`Error::Path`] when the pointer addresses a non-existent path
     ///   that cannot be created via the single-level mkdir-p path.
+    /// - [`Error::EditRejected`] when the edited bytes fail the read-back
+    ///   check.
     pub fn set_at(&mut self, pointer: &Pointer, value: Value) -> Result<()> {
+        let before = self.clone();
+        let result = self.set_at_unchecked(pointer, value.clone());
+        self.check_edit(before, result, "set", pointer, |tree, at| {
+            set_value_at(tree, at, value.clone())
+        })
+    }
+
+    /// [`Document::set_at`] without the read-back check.
+    fn set_at_unchecked(&mut self, pointer: &Pointer, value: Value) -> Result<()> {
         // "Read-only" really means "no source bytes captured" — read-only
         // parsers go through `value_only` / `multi_value_only` and leave
         // `original_bytes` empty. A document with bytes but an empty
@@ -1208,8 +1228,130 @@ impl Document {
     /// - [`Error::Path`] with `kind = MissingKey` when no span exists for
     ///   the pointer (and, for YAML, it is no removable collection).
     /// - [`Error::EditRejected`] when the YAML bytes to remove define an
-    ///   anchor that an alias outside them refers to.
+    ///   anchor that an alias outside them refers to, or when the edited
+    ///   bytes fail the read-back check [`Document::set_at`] describes.
     pub fn del_at(&mut self, pointer: &Pointer) -> Result<()> {
+        let before = self.clone();
+        let result = self.del_at_unchecked(pointer);
+        self.check_edit(before, result, "delete", pointer, delete_value_at)
+    }
+
+    /// Finish an edit of `pointer` whose unchecked step returned `result`:
+    /// on success, parse the edited bytes again and compare them with
+    /// `before`'s tree after `apply` at `pointer` and, in YAML, at every
+    /// alias sharing the edited node. Any failure restores `before`.
+    fn check_edit(
+        &mut self,
+        before: Self,
+        result: Result<()>,
+        action: &'static str,
+        pointer: &Pointer,
+        apply: impl Fn(&mut Value, &Pointer) -> Result<()>,
+    ) -> Result<()> {
+        if let Err(err) = result {
+            *self = before;
+            return Err(err);
+        }
+        let canonical = pointer.as_canonical();
+        let reparsed = match self.format {
+            FormatTag::Yaml => crate::parsers::parse_yaml_with_spans(&self.original_bytes),
+            FormatTag::Json => crate::parsers::parse_json_with_spans(&self.original_bytes),
+            FormatTag::Toml => {
+                crate::format::Format::parse(&crate::parsers::Toml, &self.original_bytes)
+            }
+            // No textual-edit renderer: the unchecked step refused already.
+            _ => return Ok(()),
+        };
+        let reason = match reparsed {
+            Ok(fresh) => {
+                let expected = before.expected_after_edit(pointer, &apply);
+                match expected
+                    .as_ref()
+                    .map(|tree| first_difference(tree, &fresh.value, ""))
+                {
+                    Some(None) => {
+                        self.value = fresh.value;
+                        self.spans = fresh.spans;
+                        self.provenance = fresh.provenance;
+                        return Ok(());
+                    }
+                    Some(Some(at)) => {
+                        tracing::debug!(
+                            pointer = %canonical,
+                            action,
+                            difference = %at,
+                            "edited bytes read back as a different tree",
+                        );
+                    }
+                    None => {
+                        tracing::debug!(
+                            pointer = %canonical,
+                            action,
+                            "no expected tree: the edit does not apply to every alias",
+                        );
+                    }
+                }
+                "the edit would change other parts of the document"
+            }
+            Err(err) => {
+                tracing::debug!(pointer = %canonical, action, %err, "edited bytes do not parse");
+                "the edited document would not parse"
+            }
+        };
+        *self = before;
+        Err(Error::EditRejected {
+            action,
+            pointer: canonical,
+            reason: reason.to_owned(),
+        })
+    }
+
+    /// The value tree after applying an edit (`apply`) at `pointer` and,
+    /// in YAML, at the copy of it under every alias of an anchored node at
+    /// or above it — nested aliases included. `None` if `apply` fails at
+    /// one of them.
+    fn expected_after_edit(
+        &self,
+        pointer: &Pointer,
+        apply: &impl Fn(&mut Value, &Pointer) -> Result<()>,
+    ) -> Option<Value> {
+        let mut targets = vec![pointer.as_canonical()];
+        if self.format == FormatTag::Yaml && self.original_bytes.contains(&b'*') {
+            let aliases = crate::parsers::yaml_spans::edit_layout(&self.original_bytes)
+                .map(|layout| layout.aliases)
+                .unwrap_or_default();
+            let mut i = 0;
+            while i < targets.len() {
+                for alias in &aliases {
+                    let (Some(alias_at), Some(anchor_at)) =
+                        (&alias.alias_pointer, &alias.anchor_pointer)
+                    else {
+                        continue;
+                    };
+                    let Some(rest) = targets[i].strip_prefix(anchor_at.as_str()) else {
+                        continue;
+                    };
+                    if !(rest.is_empty() || rest.starts_with('/')) {
+                        continue;
+                    }
+                    let copy = format!("{alias_at}{rest}");
+                    if !targets.contains(&copy) {
+                        targets.push(copy);
+                    }
+                }
+                i += 1;
+            }
+        }
+        let mut tree = self.value.clone();
+        for target in &targets {
+            let target = Pointer::parse(target).ok()?;
+            apply(&mut tree, &target).ok()?;
+        }
+        Some(tree)
+    }
+
+    /// [`Document::del_at`] without the read-back check.
+    fn del_at_unchecked(&mut self, pointer: &Pointer) -> Result<()> {
         // "Read-only" is signalled by empty `original_bytes` (`value_only`
         // constructor); an all-container document with zero leaf scalars
         // has an empty SpanMap but populated bytes — its del would
@@ -1412,6 +1554,38 @@ impl Document {
                     SpanContext::FlowSeqItem
                 },
             });
+    }
+}
+
+/// Pointer (below `at`) of the first place `expected` and `actual`
+/// differ, `None` when they are the same tree. Map order does not count,
+/// and NaN equals NaN.
+fn first_difference(expected: &Value, actual: &Value, at: &str) -> Option<String> {
+    match (expected, actual) {
+        (Value::Map(want), Value::Map(got)) => {
+            if want.len() != got.len() {
+                return Some(at.to_owned());
+            }
+            want.iter().find_map(|(key, want)| {
+                let below = format!("{at}/{}", key.replace('~', "~0").replace('/', "~1"));
+                match got.get(key) {
+                    Some(got) => first_difference(want, got, &below),
+                    None => Some(below),
+                }
+            })
+        }
+        (Value::Array(want), Value::Array(got)) => {
+            if want.len() != got.len() {
+                return Some(at.to_owned());
+            }
+            want.iter()
+                .zip(got)
+                .enumerate()
+                .find_map(|(i, (want, got))| first_difference(want, got, &format!("{at}/{i}")))
+        }
+        (Value::Float(want), Value::Float(got)) if want.is_nan() && got.is_nan() => None,
+        (want, got) if want == got => None,
+        _ => Some(at.to_owned()),
     }
 }
 
@@ -2955,6 +3129,24 @@ mod tests {
     }
 
     #[test]
+    fn first_difference_ignores_map_order_and_matches_nan() {
+        let tree = |json: serde_json::Value| Value::from_serde_json(&json);
+        let a = tree(serde_json::json!({"a": 1, "b": [1, {"c/d": 2}]}));
+        let b = tree(serde_json::json!({"b": [1, {"c/d": 2}], "a": 1}));
+        assert_eq!(first_difference(&a, &b, ""), None);
+        let c = tree(serde_json::json!({"a": 1, "b": [1, {"c/d": 3}]}));
+        assert_eq!(first_difference(&a, &c, ""), Some("/b/1/c~1d".to_owned()));
+        assert_eq!(
+            first_difference(&Value::Float(f64::NAN), &Value::Float(f64::NAN), ""),
+            None
+        );
+        assert_eq!(
+            first_difference(&Value::Int(1), &Value::Float(1.0), "/x"),
+            Some("/x".to_owned())
+        );
+    }
+
+    #[test]
     fn del_at_recompute_only_shifts_spans_after_edit_end() {
         // Three sibling spans on synthesized bytes — `/a` left of edit,
         // `/b` is the edit target, `/c` to the right. After del_at(/b)
@@ -2984,7 +3176,10 @@ mod tests {
             FormatTag::Yaml,
         );
         let pointer = Pointer::parse("/b").unwrap();
-        doc.del_at(&pointer).expect("del_at /b must succeed");
+        // The bytes are a synthetic layout that does not read back as the
+        // tree: exercise the splice without the read-back check.
+        doc.del_at_unchecked(&pointer)
+            .expect("del_at /b must succeed");
 
         let span_a = doc
             .span_at(&Pointer::parse("/a").unwrap())

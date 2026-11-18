@@ -230,3 +230,35 @@ fn del_of_an_alias_or_inside_an_anchor_is_allowed() {
         "base: &b\n  y: 2\nsvc:\n  <<: *b\n"
     );
 }
+
+// --- read-back check ---------------------------------------------------------
+
+#[test]
+fn edit_under_an_anchor_also_changes_its_aliases() {
+    // compose / k8s: `<<: *base` shares the anchored node, so the edit
+    // reaches the copy the value tree keeps under `<<`.
+    let src = "base: &b\n  x: 1\nsvc:\n  <<: *b\n  y: 3\n";
+    let mut yaml = doc(src);
+    yaml.set_at(&ptr("/base/x"), Value::Int(5)).expect("set_at");
+    assert_eq!(
+        yaml.original_bytes(),
+        b"base: &b\n  x: 5\nsvc:\n  <<: *b\n  y: 3\n"
+    );
+    assert_eq!(
+        ptr("/svc/<</x").resolve(yaml.value()).ok(),
+        Some(&Value::Int(5))
+    );
+
+    let mut yaml = doc("a: &x 1\nl: [*x, 2]\n");
+    yaml.set_at(&ptr("/a"), Value::Int(7)).expect("set_at");
+    assert_eq!(yaml.original_bytes(), b"a: &x 7\nl: [*x, 2]\n");
+    assert_eq!(ptr("/l/0").resolve(yaml.value()).ok(), Some(&Value::Int(7)));
+
+    let mut yaml = doc(src);
+    yaml.del_at(&ptr("/base/x")).expect("del_at");
+    assert_eq!(
+        yaml.original_bytes(),
+        b"base: &b {}\nsvc:\n  <<: *b\n  y: 3\n"
+    );
+    assert!(ptr("/svc/<</x").resolve(yaml.value()).is_err());
+}
