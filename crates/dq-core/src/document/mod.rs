@@ -1105,8 +1105,21 @@ impl Document {
             (FormatTag::Yaml, None) => SpanContext::BlockMapValue,
             _ => sibling_span.context,
         };
-        let fragment =
+        let mut fragment =
             insertion_renderer.render_insertion(&new_key, &value, parent_children_indent, context);
+        if self.format == FormatTag::Toml && flow_layout.is_none() {
+            // A sibling written under a dotted key (`r0.k0 = 1`) has its
+            // parent in the key, not in a header: the new key needs it too.
+            let line_start = self.original_bytes[..sibling_span.value_range.start]
+                .iter()
+                .rposition(|&b| b == b'\n')
+                .map_or(0, |i| i + 1);
+            if let Some(prefix) = toml_dotted_key_parent(&self.original_bytes[line_start..]) {
+                let prefix = prefix.trim_ascii_start();
+                let at = fragment.len() - fragment.trim_ascii_start().len();
+                fragment.splice(at..at, prefix.iter().copied().chain(*b"."));
+            }
+        }
 
         // Compute the actual splice point + final bytes, format-aware so
         // we don't smear `\n`s or forget a `,` separator.
@@ -1472,6 +1485,21 @@ impl Document {
                     .filter(|(pointer, _)| direct(pointer))
                     .max_by_key(|(_, value)| value.start);
                 last_by_start(scalar(), collection, SpanContext::BlockMapValue)
+            }
+            FormatTag::Toml => {
+                let collection =
+                    crate::parsers::toml::toml_inline_collections(&self.original_bytes)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|(pointer, _)| direct(pointer))
+                        .max_by_key(|(_, (value, _))| value.start);
+                // One inside an inline table is a flow entry.
+                let context = match collection {
+                    Some((_, (_, true))) => SpanContext::FlowMapValue,
+                    _ => SpanContext::BlockMapValue,
+                };
+                let collection = collection.map(|(pointer, (value, _))| (pointer, value));
+                last_by_start(scalar(), collection, context)
             }
             _ => scalar(),
         }

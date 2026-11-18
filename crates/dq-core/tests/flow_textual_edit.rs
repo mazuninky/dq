@@ -320,6 +320,49 @@ fn del_of_the_only_dotted_toml_key_leaves_an_empty_table() {
 }
 
 #[test]
+fn set_of_a_new_toml_key_under_a_dotted_key_keeps_its_prefix() {
+    assert_eq!(
+        set("toml", "r0.k0 = \"s\"\nb = 1\n", "/r0/zq", Value::Int(7)),
+        "r0.k0 = \"s\"\nr0.zq = 7\nb = 1\n"
+    );
+    assert_eq!(
+        set(
+            "toml",
+            "[t]\na.\"b c\".k = 1\n",
+            "/t/a/b c/zq",
+            Value::Int(7)
+        ),
+        "[t]\na.\"b c\".k = 1\na.\"b c\".zq = 7\n"
+    );
+}
+
+#[test]
+fn set_of_a_new_toml_key_goes_after_an_inline_collection() {
+    assert_eq!(
+        set("toml", "r0.k1 = [{k0 = 1}]\n", "/r0/zq", Value::Int(7)),
+        "r0.k1 = [{k0 = 1}]\nr0.zq = 7\n"
+    );
+    assert_eq!(
+        set(
+            "toml",
+            "[t]\nl = [\n  1,\n]\n\n[u]\n",
+            "/t/zq",
+            Value::Int(7)
+        ),
+        "[t]\nl = [\n  1,\n]\nzq = 7\n\n[u]\n"
+    );
+    assert_eq!(
+        set(
+            "toml",
+            "a = { b = 1, c = { d = 1 } }\n",
+            "/a/zq",
+            Value::Int(7)
+        ),
+        "a = { b = 1, c = { d = 1 }, zq = 7 }\n"
+    );
+}
+
+#[test]
 fn set_of_a_new_toml_root_key_goes_before_the_first_table() {
     assert_eq!(
         set("toml", "[a]\nx = 1\n", "/c", Value::Int(3)),

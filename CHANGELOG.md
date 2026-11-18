@@ -311,6 +311,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   collection; it used to fail with "not found".
 - TOML `del` of the only key under a dotted key (`a.b = 1`) writes
   `a = {}`; it used to remove `a` with it.
+- TOML `set` of a new key next to a dotted one (`r0.k0 = 1`) writes it
+  under the same dotted key (`r0.zq = 7`), and after an inline table or
+  array when that is the last child. It was refused, or failed with
+  "not found" when the only sibling was an inline collection.
 - TOML `set` of a new root key in a file whose root holds no key of its
   own — only tables, or nothing — puts it before the first table header
   (and the comments right above it), or at the end. It used to fail
