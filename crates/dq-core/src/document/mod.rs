@@ -1761,7 +1761,27 @@ impl Document {
             .and_then(|value| {
                 flow_entry_removal(&self.original_bytes, &value, in_map, self.format)
             });
-        let collection_entry = compact_entry.or(collection_entry).or(json_collection_entry);
+        // Nor does TOML for a non-empty inline table or array: inside
+        // another one it is a flow entry, otherwise its `key = …` lines.
+        let toml_collection_entry = (self.format == FormatTag::Toml && target_is_collection)
+            .then(|| crate::parsers::toml::toml_inline_collections(&self.original_bytes))
+            .flatten()
+            .and_then(|mut ranges| ranges.remove(&canonical))
+            .and_then(|(value, in_flow)| {
+                if in_flow {
+                    flow_entry_removal(&self.original_bytes, &value, in_map, self.format)
+                } else {
+                    let line_start = self.original_bytes[..value.start]
+                        .iter()
+                        .rposition(|&b| b == b'\n')
+                        .map_or(0, |i| i + 1);
+                    Some(line_start..past_line_break(&self.original_bytes, value.end))
+                }
+            });
+        let collection_entry = compact_entry
+            .or(collection_entry)
+            .or(json_collection_entry)
+            .or(toml_collection_entry);
         if collection.is_some_and(|collection| !collection.top_level) && collection_entry.is_none()
         {
             // `- key: {…}`, or a flow entry with a comment in between: the

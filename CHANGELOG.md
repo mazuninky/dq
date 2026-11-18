@@ -304,6 +304,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - TOML `set` of a table or array writes it inline (`a = { x = 1 }`,
   `b = [{ c = 1 }]`), over a scalar or as a new key; it used to write
   `""` or `{}` / `[]`.
+- TOML `del` of a non-empty inline table or array removes it — its
+  `key = …` lines, or the entry and one comma inside another inline
+  collection; it used to fail with "not found".
 - TOML `del` of the only key under a dotted key (`a.b = 1`) writes
   `a = {}`; it used to remove `a` with it.
 - TOML `set` of a new root key in a file whose root holds no key of its

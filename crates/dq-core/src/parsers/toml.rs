@@ -255,6 +255,75 @@ pub(crate) fn toml_root_insertion_point(bytes: &[u8]) -> Option<usize> {
     Some(at)
 }
 
+/// The non-empty inline tables and arrays (`k = { … }`, `k = [ … ]`), by
+/// canonical pointer: the bytes of their brackets, and whether they sit
+/// inside another inline collection rather than on a `key = value` line.
+/// The span map records none of them. `None` when the bytes do not parse.
+pub(crate) fn toml_inline_collections(
+    bytes: &[u8],
+) -> Option<std::collections::HashMap<String, (Range<usize>, bool)>> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let doc = TomlDocument::parse(text).ok()?;
+    let mut out = std::collections::HashMap::new();
+    collect_inline_in_table(doc.as_table(), &mut Vec::new(), &mut out);
+    Some(out)
+}
+
+fn collect_inline_in_table(
+    table: &Table,
+    path: &mut Vec<String>,
+    out: &mut std::collections::HashMap<String, (Range<usize>, bool)>,
+) {
+    for (key, item) in table.iter() {
+        path.push(pointer_escape(key));
+        match item {
+            Item::Value(value) => collect_inline(value, false, path, out),
+            Item::Table(child) => collect_inline_in_table(child, path, out),
+            Item::ArrayOfTables(tables) => {
+                for (i, child) in tables.iter().enumerate() {
+                    path.push(i.to_string());
+                    collect_inline_in_table(child, path, out);
+                    path.pop();
+                }
+            }
+            Item::None => {}
+        }
+        path.pop();
+    }
+}
+
+fn collect_inline(
+    value: &TomlValue,
+    in_flow: bool,
+    path: &mut Vec<String>,
+    out: &mut std::collections::HashMap<String, (Range<usize>, bool)>,
+) {
+    let mut note = |span: Option<Range<usize>>, path: &[String]| {
+        if let Some(span) = span {
+            out.insert(pointer_for(path), (span, in_flow));
+        }
+    };
+    match value {
+        TomlValue::Array(items) if !items.is_empty() => {
+            note(value.span(), path);
+            for (i, item) in items.iter().enumerate() {
+                path.push(i.to_string());
+                collect_inline(item, true, path, out);
+                path.pop();
+            }
+        }
+        TomlValue::InlineTable(table) if !table.is_empty() => {
+            note(value.span(), path);
+            for (key, item) in table.iter() {
+                path.push(pointer_escape(key));
+                collect_inline(item, true, path, out);
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Start of the earliest `[table]` / `[[table]]` header under `table`.
 fn first_header(table: &Table) -> Option<usize> {
     table

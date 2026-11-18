@@ -342,3 +342,21 @@ fn set_of_a_new_toml_root_key_goes_before_the_first_table() {
     assert_eq!(set("toml", "# c", "/a", Value::Int(1)), "# c\na = 1\n");
     assert_eq!(set("toml", "", "/a", Value::Int(1)), "a = 1\n");
 }
+
+#[test]
+fn del_of_a_toml_inline_collection_removes_its_entry() {
+    let src = "r0 = {k0 = [{a = 1}, 2], k2 = \"q\"}\nr1 = 2.5\n";
+    assert_eq!(del("toml", src, "/r0"), "r1 = 2.5\n");
+    assert_eq!(del("toml", src, "/r0/k0"), "r0 = {k2 = \"q\"}\nr1 = 2.5\n");
+    assert_eq!(
+        del("toml", src, "/r0/k0/0"),
+        "r0 = {k0 = [2], k2 = \"q\"}\nr1 = 2.5\n"
+    );
+    // A multi-line array goes with all its lines.
+    assert_eq!(
+        del("toml", "a = [\n  1,\n  2,\n] # c\nb = 1\n", "/a"),
+        "b = 1\n"
+    );
+    assert_eq!(del("toml", "[t]\nx = [1]\ny = 2\n", "/t/x"), "[t]\ny = 2\n");
+    assert_eq!(del("toml", "p.q = [1]\n", "/p/q"), "p = {}\n");
+}
