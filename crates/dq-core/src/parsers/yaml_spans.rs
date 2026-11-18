@@ -819,6 +819,11 @@ pub(crate) struct EditLayout {
     pub(crate) containers: HashMap<String, ContainerLayout>,
     /// Every alias, in document order.
     pub(crate) aliases: Vec<AliasRef>,
+    /// For every empty node of a block collection (`key:`, `-`, `key: &a`,
+    /// `key: !!str`), keyed by canonical pointer: the bytes a value set
+    /// there replaces — its node properties, or without any the empty range
+    /// just past the key's `:` / the item's `-`.
+    pub(crate) empty_values: HashMap<String, Range<usize>>,
 }
 
 /// An alias and the anchored node it refers to. A redefined anchor name
@@ -1130,6 +1135,19 @@ impl<'src> State<'src> {
                     };
                     let context = self.value_context();
                     let node_end = char_index_to_byte(self.char_to_byte, span.end.index());
+                    if style == ScalarStyle::Plain
+                        && value.is_empty()
+                        && let Some(anchor) = entry
+                        && let Some(layout) = self.layout.as_mut()
+                    {
+                        let end = empty_node_end(self.bytes, anchor.value_from, node_end);
+                        let start = if end == anchor.value_from {
+                            end
+                        } else {
+                            skip_separation(self.bytes, anchor.value_from)
+                        };
+                        layout.empty_values.insert(pointer.clone(), start..end);
+                    }
                     let line_range =
                         self.compute_line_range(&value_range, context, style, entry, node_end);
                     let indent = u32::try_from(col).unwrap_or(u32::MAX);

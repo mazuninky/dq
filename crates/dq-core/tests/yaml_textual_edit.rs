@@ -130,6 +130,36 @@ fn del_of_a_block_scalar_removes_its_whole_entry() {
     assert_eq!(del("l:\n  - |\n    x\n  - 2\n", "/l/0"), "l:\n  - 2\n");
 }
 
+// --- an empty value -----------------------------------------------------------
+
+#[test]
+fn set_on_an_empty_value_writes_it_after_the_indicator() {
+    assert_eq!(set("a:\nb: 1\n", "/a", Value::Int(5)), "a: 5\nb: 1\n");
+    assert_eq!(set("a:", "/a", Value::Int(5)), "a: 5");
+    assert_eq!(
+        set("a:\r\nb: 1\r\n", "/a", Value::Int(5)),
+        "a: 5\r\nb: 1\r\n"
+    );
+    assert_eq!(
+        set("a: # c\nb: 1\n", "/a", Value::Int(5)),
+        "a: 5 # c\nb: 1\n"
+    );
+    assert_eq!(
+        set("l:\n  -\n  - 2\n", "/l/0", Value::Int(5)),
+        "l:\n  - 5\n  - 2\n"
+    );
+    assert_eq!(
+        set("- a:\n  b: 1\n", "/0/a", Value::Int(5)),
+        "- a: 5\n  b: 1\n"
+    );
+    // An anchor stays; a core-schema tag would retype the value and goes.
+    assert_eq!(
+        set("a: &x\nb: *x\n", "/a", Value::Int(5)),
+        "a: &x 5\nb: *x\n"
+    );
+    assert_eq!(set("a: !!str\nb: 1\n", "/a", Value::Int(5)), "a: 5\nb: 1\n");
+}
+
 // --- aliases -----------------------------------------------------------------
 
 #[test]

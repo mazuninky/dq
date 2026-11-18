@@ -726,6 +726,45 @@ impl Document {
         })?;
 
         let canonical = pointer.as_canonical();
+        if self.format == FormatTag::Yaml
+            && match pointer.resolve(&self.value) {
+                // `key: !!str` reads as "".
+                Ok(Value::Null) => true,
+                Ok(Value::String(s)) => s.is_empty(),
+                _ => false,
+            }
+            && let Some(span) = self.spans.get(&canonical).cloned()
+            && let Some(at) = crate::parsers::yaml_spans::edit_layout(&self.original_bytes)
+                .ok()
+                .and_then(|mut layout| layout.empty_values.remove(&canonical))
+        {
+            // An empty node (`key:`, `- &a`) has no text to replace; its
+            // recorded span sits on the token after it.
+            let rendered = renderer.render_replacement(&value, span.context, &[]);
+            let (replacement, value_offset) =
+                empty_node_replacement(&self.original_bytes[at.clone()], &rendered);
+            self.original_bytes
+                .splice(at.clone(), replacement.iter().copied());
+            apply_delta(
+                &mut self.spans,
+                SpanRecomputeDelta {
+                    at: at.start,
+                    old_len: at.len(),
+                    new_len: replacement.len(),
+                },
+            );
+            set_value_at(&mut self.value, pointer, value)?;
+            let start = at.start + value_offset;
+            self.spans.insert(
+                canonical,
+                ValueSpan {
+                    value_range: start..start + rendered.len(),
+                    ..span
+                },
+            );
+            self.provenance = provenance_from_spans(&self.spans);
+            return Ok(());
+        }
         if let Some(span) = self.spans.get(&canonical).cloned() {
             // Replace-in-span path: render the new value using the same
             // syntactic context as the original, splice into the source
@@ -2058,6 +2097,28 @@ fn format_specific_splice(
             (sibling_span.line_range.end, trimmed.to_vec())
         }
     }
+}
+
+/// What replaces the node properties `props` of an empty node (empty
+/// without any) when it gets the value `rendered`, and the offset of the
+/// value in it. Anchors stay; `!!` tags of the core schema go, as they
+/// would retype the new value (`!!str` turns `5` into `"5"`). Without
+/// properties a blank separates the value from the `:` / `-` before it.
+fn empty_node_replacement(props: &[u8], rendered: &[u8]) -> (Vec<u8>, usize) {
+    let mut out = Vec::with_capacity(props.len() + rendered.len() + 1);
+    if props.is_empty() {
+        out.push(b' ');
+    }
+    for token in props
+        .split(|b| b.is_ascii_whitespace())
+        .filter(|token| !token.is_empty() && !token.starts_with(b"!!"))
+    {
+        out.extend_from_slice(token);
+        out.push(b' ');
+    }
+    let offset = out.len();
+    out.extend_from_slice(rendered);
+    (out, offset)
 }
 
 /// Where a new flow entry goes relative to the sibling it follows.

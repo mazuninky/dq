@@ -318,6 +318,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `{}` value of a block entry the new key no longer gets a blank line
   after it, and TOML `del` of `key = {}` removes the line instead of
   leaving `key = `.
+- YAML `set` on an empty value — `key:`, `key: # c`, `key: &a`,
+  `key: !!str`, an empty `-` item — writes the value after the `:` / `-`
+  (`key: 5`). It used to write it before the `:` (`key5:`). An anchor
+  stays; a `!!` tag goes, as it would retype the new value.
 
 ### Security
 
