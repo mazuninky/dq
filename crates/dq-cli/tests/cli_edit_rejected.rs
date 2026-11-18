@@ -139,6 +139,31 @@ const REFUSALS: &[Refusal] = &[
         args: &["/1/x"],
         message: "cannot delete '/1/x': it lies under the alias on line 2, a copy of /0; ",
     },
+    Refusal {
+        // The second alias of an anchor is named at its own line.
+        name: "doc.yaml",
+        src: "a: &m\n  x: 1\nb: *m\nzz: *m\n",
+        command: "set",
+        args: &["/zz/x", "5"],
+        message: "cannot set '/zz/x': it lies under the alias on line 4, a copy of /a; ",
+    },
+    Refusal {
+        // Two aliases on one flow line: the line is theirs, not the
+        // anchor's.
+        name: "doc.yaml",
+        src: "a: &m\n  x: 1\nl: [*m, *m]\n",
+        command: "set",
+        args: &["/l/1/x", "5"],
+        message: "cannot set '/l/1/x': it lies under the alias on line 3, a copy of /a; ",
+    },
+    Refusal {
+        // `bc` after `b`, whose name is a prefix of it.
+        name: "doc.yaml",
+        src: "a: &m\n  x: 1\np: &n\n  y: 1\nb: *m\nbc: *n\n",
+        command: "set",
+        args: &["/bc/y", "5"],
+        message: "cannot set '/bc/y': it lies under the alias on line 6, a copy of /p; ",
+    },
 ];
 
 /// `b` is an alias of the anchored mapping `a`.
