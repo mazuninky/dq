@@ -173,6 +173,23 @@ fn set_of_a_new_key_goes_after_the_last_child_even_a_collection() {
 // --- an empty value -----------------------------------------------------------
 
 #[test]
+fn set_on_an_explicit_key_without_a_value_adds_the_indicator() {
+    assert_eq!(
+        set("? v\na: 1\n", "/v", Value::Int(42)),
+        "? v\n: 42\na: 1\n"
+    );
+    assert_eq!(
+        set("? v\r\na: 1\r\n", "/v", Value::Int(42)),
+        "? v\r\n: 42\r\na: 1\r\n"
+    );
+    assert_eq!(set("? &a v\n", "/v", Value::Int(42)), "? &a v\n: 42\n");
+    assert_eq!(
+        set("l:\n  - ? v\n", "/l/0/v", Value::Int(42)),
+        "l:\n  - ? v\n    : 42\n"
+    );
+}
+
+#[test]
 fn set_on_an_empty_value_writes_it_after_the_indicator() {
     assert_eq!(set("a:\nb: 1\n", "/a", Value::Int(5)), "a: 5\nb: 1\n");
     assert_eq!(set("a:", "/a", Value::Int(5)), "a: 5");

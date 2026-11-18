@@ -286,6 +286,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   such a fix with a warning.
 - YAML `set` of an object or array where a scalar was writes it in flow
   style (`a: {"x": 1}`); it used to write `null`.
+- YAML `set` of an explicit key with no value (`? v` alone) writes the
+  value on a `: 42` line of its own; it used to append it to the key.
 - YAML `set` of a new key writes a collection nested in its value in flow
   style (`b:` + `  - {"x": 1}`); it used to write `{}` / `[]` in its
   place. Inside a flow mapping the new entry stays on its line

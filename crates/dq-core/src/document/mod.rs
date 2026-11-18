@@ -769,8 +769,33 @@ impl Document {
             // An empty node (`key:`, `- &a`) has no text to replace; its
             // recorded span sits on the token after it.
             let rendered = renderer.render_replacement(&value, span.context, &[]);
-            let (replacement, value_offset) =
+            let (mut replacement, mut value_offset) =
                 empty_node_replacement(&self.original_bytes[at.clone()], &rendered);
+            // `? key` with no `:` line: the value needs its indicator, on
+            // a line of its own at the `?` column.
+            let explicit_key = self
+                .edit_layout(layout)
+                .and_then(|layout| layout.entries.get(&canonical))
+                .map(|entry| entry.at)
+                .filter(|&entry| self.original_bytes[entry] == b'?');
+            let indicator = skip_blanks_back(&self.original_bytes, at.start);
+            if let Some(question) = explicit_key
+                && span.context == SpanContext::BlockMapValue
+                && at.is_empty()
+                && self.original_bytes[..indicator].last() != Some(&b':')
+            {
+                let mut line = b"\n".to_vec();
+                line.extend(std::iter::repeat_n(
+                    b' ',
+                    line_column(&self.original_bytes, question),
+                ));
+                line.extend_from_slice(b":");
+                let line = with_line_ending_at(&self.original_bytes, at.start, line);
+                value_offset += line.len();
+                line.into_iter()
+                    .rev()
+                    .for_each(|b| replacement.insert(0, b));
+            }
             self.original_bytes
                 .splice(at.clone(), replacement.iter().copied());
             apply_delta(
@@ -2467,6 +2492,14 @@ fn empty_node_replacement(props: &[u8], rendered: &[u8]) -> (Vec<u8>, usize) {
     let offset = out.len();
     out.extend_from_slice(rendered);
     (out, offset)
+}
+
+/// Byte offset of `pos` from the start of its line.
+fn line_column(bytes: &[u8], pos: usize) -> usize {
+    pos - bytes[..pos]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |i| i + 1)
 }
 
 /// `inserted`, to go in `bytes` at `at`, with each bare `\n` turned into
