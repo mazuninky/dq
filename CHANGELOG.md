@@ -287,11 +287,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - YAML `set` of an object or array where a scalar was writes it in flow
   style (`a: {"x":1}`); it used to write `null`.
 - `set` / `del` on YAML, JSON and TOML check that the edited file reads
-  back as the requested change. When the textual edit would change other
-  parts of the file or break its syntax, they fail with exit 7 ("cannot
-  set '/a': the edit would change other parts of the document"), print
-  nothing and leave the file alone; they used to write the damaged
-  output. An edit under a YAML anchor also changes its aliases (`<<:
+  back as the requested change. When it does not, they fail with exit 7,
+  print nothing and leave the file alone; they used to write the damaged
+  output. The message says why: dq cannot write the value there as a
+  textual edit, the edit would change other parts of the document, or
+  the edited document would not parse; it points to `dq set --jq`, which
+  rewrites the whole file through its writer and drops comments. An edit under a YAML anchor also changes its aliases (`<<:
   *base`), as YAML defines.
 - A YAML file with a UTF-8 BOM and more than one top-level key parses; it
   used to fail with "did not find expected <document start>".

@@ -255,7 +255,7 @@ Bulk multi-file mode prints `Modified: N, Skipped: M, Failed: K`. Single-file in
 | 4 | validate fail |
 | 5 | I/O error (read; `self check` / `update` network errors) |
 | 6 | invalid input |
-| 7 | write failed (write IO, renderer unavailable, textual edit that would change other parts of the file (`edit_rejected`), bulk partial-failure, self-update atomic-replace failure) |
+| 7 | write failed (write IO, renderer unavailable, textual edit refused because the file would not read back as the change (`edit_rejected`), bulk partial-failure, self-update atomic-replace failure) |
 
 ## Plugins (experimental)
 

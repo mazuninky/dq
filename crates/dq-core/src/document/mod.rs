@@ -1476,6 +1476,19 @@ impl Document {
                             difference = %at,
                             "edited bytes read back as a different tree",
                         );
+                        // An array that lost or gained an item reports
+                        // itself, the edited value's parent.
+                        let parent = canonical.rsplit_once('/').map_or("", |(parent, _)| parent);
+                        let at_the_edit = at == canonical
+                            || at.starts_with(&format!("{canonical}/"))
+                            || at == parent;
+                        if at_the_edit && action == "set" {
+                            "dq cannot write this value here as a textual edit"
+                        } else if at_the_edit {
+                            "dq cannot remove it as a textual edit"
+                        } else {
+                            "the edit would change other parts of the document"
+                        }
                     }
                     None => {
                         tracing::debug!(
@@ -1483,9 +1496,9 @@ impl Document {
                             action,
                             "no expected tree: the edit does not apply to every alias",
                         );
+                        "the edit would change other parts of the document"
                     }
                 }
-                "the edit would change other parts of the document"
             }
             Err(err) => {
                 tracing::debug!(pointer = %canonical, action, %err, "edited bytes do not parse");
@@ -1496,7 +1509,7 @@ impl Document {
         Err(Error::EditRejected {
             action,
             pointer: canonical,
-            reason: reason.to_owned(),
+            reason: format!("{reason}; {JQ_REWRITE_HINT}"),
         })
     }
 
@@ -2055,16 +2068,17 @@ fn skip_blanks_back(bytes: &[u8], pos: usize) -> usize {
 fn first_difference(expected: &Value, actual: &Value, at: &str) -> Option<String> {
     match (expected, actual) {
         (Value::Map(want), Value::Map(got)) => {
-            if want.len() != got.len() {
-                return Some(at.to_owned());
-            }
-            want.iter().find_map(|(key, want)| {
-                let below = format!("{at}/{}", key.replace('~', "~0").replace('/', "~1"));
-                match got.get(key) {
-                    Some(got) => first_difference(want, got, &below),
-                    None => Some(below),
-                }
-            })
+            let below = |key: &str| format!("{at}/{}", key.replace('~', "~0").replace('/', "~1"));
+            want.iter()
+                .find_map(|(key, want)| match got.get(key) {
+                    Some(got) => first_difference(want, got, &below(key)),
+                    None => Some(below(key)),
+                })
+                .or_else(|| {
+                    got.keys()
+                        .find(|key| !want.contains_key(*key))
+                        .map(|key| below(key))
+                })
         }
         (Value::Array(want), Value::Array(got)) => {
             if want.len() != got.len() {
@@ -2325,6 +2339,10 @@ fn last_by_start(
         (scalar, None) => scalar,
     }
 }
+
+/// The way around an edit the read-back check refuses.
+const JQ_REWRITE_HINT: &str =
+    "`dq set --jq` rewrites the whole file through its writer instead, dropping comments";
 
 /// Where a new flow entry goes relative to the sibling it follows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -156,7 +156,7 @@ fn an_edit_that_does_not_read_back_is_refused_with_exit_7() {
             .code(7)
             .stdout("")
             .stderr(predicates::str::contains(
-                "cannot set '/a': the edit would change other parts of the document",
+                "cannot set '/a': dq cannot write this value here as a textual edit; `dq set --jq`",
             ));
         assert_eq!(std::fs::read_to_string(path).expect("read back"), src);
     }
