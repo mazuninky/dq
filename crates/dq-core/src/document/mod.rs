@@ -1059,6 +1059,7 @@ impl Document {
                 format_specific_splice(self.format, &fragment, &sibling_span, &self.original_bytes)
             }
         };
+        let splice_bytes = with_line_ending_at(&self.original_bytes, splice_at, splice_bytes);
 
         // Render the value through the scalar renderer so we can locate
         // its exact byte range inside the spliced bytes. Splicing the
@@ -1198,6 +1199,7 @@ impl Document {
             &parent_span,
             &self.original_bytes,
         );
+        let splice_bytes = with_line_ending_at(&self.original_bytes, splice_at, splice_bytes);
 
         // Resolve the scalar renderer so we can locate the value bytes
         // inside the spliced fragment — mirrors the sibling-anchored path
@@ -2337,6 +2339,29 @@ fn empty_node_replacement(props: &[u8], rendered: &[u8]) -> (Vec<u8>, usize) {
     let offset = out.len();
     out.extend_from_slice(rendered);
     (out, offset)
+}
+
+/// `inserted`, to go in `bytes` at `at`, with each bare `\n` turned into
+/// `\r\n` when the line break nearest `at` — the last one before it, or
+/// else the first after — is one.
+fn with_line_ending_at(bytes: &[u8], at: usize, inserted: Vec<u8>) -> Vec<u8> {
+    let at = at.min(bytes.len());
+    let nearest = bytes[..at]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .or_else(|| bytes[at..].iter().position(|&b| b == b'\n').map(|i| at + i));
+    let crlf = nearest.is_some_and(|i| i > 0 && bytes[i - 1] == b'\r');
+    if !crlf || !inserted.contains(&b'\n') {
+        return inserted;
+    }
+    let mut out = Vec::with_capacity(inserted.len() + 4);
+    for (i, &b) in inserted.iter().enumerate() {
+        if b == b'\n' && (i == 0 || inserted[i - 1] != b'\r') {
+            out.push(b'\r');
+        }
+        out.push(b);
+    }
+    out
 }
 
 /// The anchor and local tags of the node properties `props`, each followed

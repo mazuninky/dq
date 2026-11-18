@@ -241,3 +241,34 @@ fn set_of_a_new_json_key_goes_after_a_collection_member() {
         "{\n  \"a\": {\n    \"x\": 1\n  },\n  \"c\": 3\n}\n"
     );
 }
+
+#[test]
+fn set_of_a_new_key_in_a_crlf_file_ends_its_lines_with_crlf() {
+    assert_eq!(
+        set("yaml", "a: 1\r\nb: 2\r\n", "/c", Value::Int(3)),
+        "a: 1\r\nb: 2\r\nc: 3\r\n"
+    );
+    assert_eq!(
+        set(
+            "yaml",
+            "a:\r\n  x: 1\r\n",
+            "/a/y",
+            Value::Array(vec![Value::Int(1)])
+        ),
+        "a:\r\n  x: 1\r\n  y:\r\n    - 1\r\n"
+    );
+    assert_eq!(
+        set("yaml", "a:\r\n  b: |\r\n    x", "/c", Value::Int(1)),
+        "a:\r\n  b: |-\r\n    x\r\nc: 1\r\n"
+    );
+    assert_eq!(
+        set("toml", "a = 1\r\n", "/c", Value::Int(3)),
+        "a = 1\r\nc = 3\r\n"
+    );
+    assert_eq!(
+        set("toml", "[t]\r\nx = 1\r\n", "/t/y", Value::Int(3)),
+        "[t]\r\nx = 1\r\ny = 3\r\n"
+    );
+    // A file with LF line breaks keeps them.
+    assert_eq!(set("toml", "a = 1", "/c", Value::Int(3)), "a = 1\nc = 3\n");
+}

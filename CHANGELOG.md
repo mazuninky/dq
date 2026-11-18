@@ -298,6 +298,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the tag, so the new value is typed by what it is; it used to keep it,
   and `!!binary hi` no longer parses. Anchors and local tags (`!Ref`)
   stay.
+- `set` of a new key in a YAML or TOML file with CRLF line breaks ends
+  the lines it adds with CRLF, as JSON already did; it used to add LF
+  lines to the file.
 - `set` / `del` on YAML, JSON and TOML check that the edited file reads
   back as the requested change. When it does not, they fail with exit 7,
   print nothing and leave the file alone; they used to write the damaged
