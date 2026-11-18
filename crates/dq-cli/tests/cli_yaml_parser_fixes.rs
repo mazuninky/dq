@@ -90,11 +90,11 @@ fn set_replaces_multiline_plain_scalar_without_final_newline() {
     );
 }
 
-/// `bytes` read back through `dq -F json convert`, as JSON. `-q` silences
-/// the lossy-conversion warning, which the binary logs to stdout.
+/// `bytes` read back through `dq -F json convert`, as JSON. The
+/// lossy-conversion warning goes to stderr and leaves stdout alone.
 fn read_back(bytes: &[u8]) -> serde_json::Value {
     let file = write_yaml(bytes);
-    let out = stdout_of(&["-q", "-F", "json", "convert"], &file, &[]);
+    let out = stdout_of(&["-F", "json", "convert"], &file, &[]);
     serde_json::from_slice(&out).expect("stdout is JSON")
 }
 
