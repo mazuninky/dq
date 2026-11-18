@@ -901,6 +901,14 @@ impl Document {
             // splice and span-recompute that already ran above.
             self.provenance = provenance_from_spans(&self.spans);
             Ok(())
+        } else if !pointer.is_root()
+            && matches!(
+                pointer.resolve(&self.value),
+                Ok(Value::Map(_) | Value::Array(_))
+            )
+        {
+            // A non-empty collection records no span of its own.
+            self.replace_collection(pointer, &canonical, value, layout, renderer)
         } else {
             // mkdir-p path: try the single-level insertion fallback before
             // surfacing `Error::Path { MissingKey }`. Multi-level chains
@@ -1045,8 +1053,31 @@ impl Document {
             // `missing_key` captures `self.value` via
             // `longest_existing_value_prefix` and so cannot coexist with
             // the `&mut self` we need for the splice).
-            if self.format == FormatTag::Toml && parent_canonical.is_empty() {
-                return self.toml_root_insertion(pointer, &new_key, value, insertion_renderer);
+            if self.format == FormatTag::Toml {
+                // The root, or a `[table]` holding only tables: the new key
+                // goes before the first header, or right under its own.
+                let at = if parent_canonical.is_empty() {
+                    crate::parsers::toml::toml_root_insertion_point(&self.original_bytes)
+                } else {
+                    crate::parsers::toml::toml_tables(&self.original_bytes)
+                        .and_then(|tables| tables.header_line_ends.get(&parent_canonical).copied())
+                };
+                if let Some(at) = at {
+                    return self.toml_table_insertion(
+                        pointer,
+                        &new_key,
+                        value,
+                        insertion_renderer,
+                        at,
+                    );
+                }
+                if parent_canonical.is_empty() {
+                    return Err(Error::EditRejected {
+                        action: "set",
+                        pointer: pointer.as_canonical(),
+                        reason: "the document does not parse".to_owned(),
+                    });
+                }
             }
             let parent_is_empty_map = parent_map.is_empty();
             let fallback_err = missing_key();
@@ -1189,23 +1220,163 @@ impl Document {
         Ok(())
     }
 
-    /// Insert `key = value` into the TOML root table when it has no key of
-    /// its own to follow: before the first table header, or at the end of
-    /// a file without one. The read-back check settles the spans.
-    fn toml_root_insertion(
+    /// Read the bytes as they are now — after a first step of a two-step
+    /// edit — so the next step sees their spans and layout.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::EditRejected`] when they do not parse.
+    fn adopt_reparse(&mut self, action: &'static str, canonical: &str) -> Result<()> {
+        match parse_again(self.format, &self.original_bytes) {
+            Some(Ok(fresh)) => {
+                self.value = fresh.value;
+                self.spans = fresh.spans;
+                self.provenance = fresh.provenance;
+                Ok(())
+            }
+            Some(Err(err)) => {
+                tracing::debug!(pointer = %canonical, action, %err, "edited bytes do not parse");
+                Err(Error::EditRejected {
+                    action,
+                    pointer: canonical.to_owned(),
+                    reason: "the edited document would not parse".to_owned(),
+                })
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// `set` of `value` where a non-empty collection is, which the span
+    /// map records no span for: a flow collection — a JSON value, a TOML
+    /// inline table or array, a YAML `{…}` / `[…]` — is replaced between
+    /// its brackets; a YAML block collection loses its children, leaving
+    /// an empty node that the value then goes into; a TOML `[table]` or
+    /// dotted table is deleted and the key written anew.
+    ///
+    /// The spans are left as they were: the read-back check that follows
+    /// parses the bytes again.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::EditRejected`] when the collection's bytes are not found.
+    fn replace_collection(
+        &mut self,
+        pointer: &Pointer,
+        canonical: &str,
+        value: Value,
+        layout: &LayoutCache,
+        renderer: &dyn crate::textual_edit::ScalarRenderer,
+    ) -> Result<()> {
+        let rejected = || Error::EditRejected {
+            action: "set",
+            pointer: canonical.to_owned(),
+            reason: "dq cannot find the bytes of the collection there".to_owned(),
+        };
+        let segments = pointer.segments();
+        let parent = Pointer::new(segments[..segments.len().saturating_sub(1)].to_vec());
+        let in_map = matches!(parent.resolve(&self.value), Ok(Value::Map(_)));
+        let brackets = match self.format {
+            FormatTag::Json => crate::parsers::json::json_container_ranges(&self.original_bytes)
+                .ok()
+                .and_then(|mut ranges| ranges.remove(canonical))
+                .map(|range| (range, SpanContext::BlockMapValue)),
+            FormatTag::Toml => crate::parsers::toml::toml_inline_collections(&self.original_bytes)
+                .and_then(|mut ranges| ranges.remove(canonical))
+                .map(|(range, in_flow)| {
+                    let context = match (in_flow, in_map) {
+                        (true, true) => SpanContext::FlowMapValue,
+                        (true, false) => SpanContext::FlowSeqItem,
+                        (false, _) => SpanContext::BlockMapValue,
+                    };
+                    (range, context)
+                }),
+            FormatTag::Yaml => {
+                let collection = self
+                    .edit_layout(layout)
+                    .and_then(|layout| layout.containers.get(canonical))
+                    .ok_or_else(rejected)?;
+                if collection.top_level {
+                    return Err(rejected());
+                }
+                if let Some(brackets) = collection.brackets.clone() {
+                    // In a block parent the range runs on to the next
+                    // token, past a comment.
+                    let brackets = if collection.flow_value.is_some() {
+                        brackets
+                    } else {
+                        brackets.start
+                            ..yaml_flow_end(&self.original_bytes, brackets.clone())
+                                .ok_or_else(rejected)?
+                    };
+                    let context = match (collection.flow_value.is_some(), in_map) {
+                        (true, true) => SpanContext::FlowMapValue,
+                        (true, false) => SpanContext::FlowSeqItem,
+                        (false, true) => SpanContext::BlockMapValue,
+                        (false, false) => SpanContext::BlockSeqItem,
+                    };
+                    Some((brackets, context))
+                } else {
+                    // Its children go; the key or `-`, its properties and
+                    // any comment on that line stay as an empty node.
+                    let marker = collection.empty_marker_at.ok_or_else(rejected)?;
+                    let first = collection.first_child_line.ok_or_else(rejected)?;
+                    let children = if first >= marker {
+                        first..collection.end
+                    } else {
+                        // `- key: …` / `- - …`: the first child shares the
+                        // line with the `-`.
+                        let mut end = collection.end;
+                        while end > marker && self.original_bytes[end - 1].is_ascii_whitespace() {
+                            end -= 1;
+                        }
+                        marker..end
+                    };
+                    self.original_bytes.drain(children);
+                    self.adopt_reparse("set", canonical)?;
+                    if !matches!(pointer.resolve(&self.value), Ok(Value::Null)) {
+                        return Err(rejected());
+                    }
+                    return self.set_at_unchecked(pointer, value, &LayoutCache::new());
+                }
+            }
+            _ => None,
+        };
+        if let Some((range, context)) = brackets {
+            let rendered = renderer.render_replacement(&value, context, &[]);
+            self.original_bytes.splice(range, rendered);
+            return set_value_at(&mut self.value, pointer, value);
+        }
+        if self.format == FormatTag::Toml {
+            let ranges = crate::parsers::toml::toml_tables(&self.original_bytes)
+                .map(|tables| tables.ranges_of(canonical))
+                .unwrap_or_default();
+            if ranges.is_empty() {
+                return Err(rejected());
+            }
+            for range in ranges.into_iter().rev() {
+                self.original_bytes.drain(range);
+            }
+            self.adopt_reparse("set", canonical)?;
+            if pointer.resolve(&self.value).is_ok() {
+                return Err(rejected());
+            }
+            return self.set_at_unchecked(pointer, value, &LayoutCache::new());
+        }
+        Err(rejected())
+    }
+
+    /// Insert `key = value` at `at` into a TOML table that has no key of
+    /// its own to follow — the root, before its first table header or at
+    /// the end of a file without one; a `[table]` right under its header.
+    /// The read-back check settles the spans.
+    fn toml_table_insertion(
         &mut self,
         pointer: &Pointer,
         new_key: &str,
         value: Value,
         insertion_renderer: &dyn crate::textual_edit::InsertionRenderer,
+        at: usize,
     ) -> Result<()> {
-        let at = crate::parsers::toml::toml_root_insertion_point(&self.original_bytes).ok_or_else(
-            || Error::EditRejected {
-                action: "set",
-                pointer: pointer.as_canonical(),
-                reason: "the document does not parse".to_owned(),
-            },
-        )?;
         let mut inserted = Vec::new();
         if at > 0 && self.original_bytes[at - 1] != b'\n' {
             inserted.push(b'\n');
@@ -1605,17 +1776,24 @@ impl Document {
     ) -> Result<()> {
         if let Err(err) = result {
             *self = before;
-            return Err(err);
+            return Err(match err {
+                // Every refusal names the way around it.
+                Error::EditRejected {
+                    action,
+                    pointer,
+                    reason,
+                } if !reason.contains(JQ_REWRITE_HINT) => Error::EditRejected {
+                    action,
+                    pointer,
+                    reason: format!("{reason}; {JQ_REWRITE_HINT}"),
+                },
+                err => err,
+            });
         }
         let canonical = pointer.as_canonical();
-        let reparsed = match self.format {
-            FormatTag::Yaml => crate::parsers::parse_yaml_with_spans(&self.original_bytes),
-            FormatTag::Json => crate::parsers::parse_json_with_spans(&self.original_bytes),
-            FormatTag::Toml => {
-                crate::format::Format::parse(&crate::parsers::Toml, &self.original_bytes)
-            }
-            // No textual-edit renderer: the unchecked step refused already.
-            _ => return Ok(()),
+        // No textual-edit renderer: the unchecked step refused already.
+        let Some(reparsed) = parse_again(self.format, &self.original_bytes) else {
+            return Ok(());
         };
         let reason = match reparsed {
             Ok(fresh) => {
@@ -1831,10 +2009,86 @@ impl Document {
                     Some(line_start..past_line_break(&self.original_bytes, value.end))
                 }
             });
+        // A TOML `[table]`, `[[array]]` item or dotted table: its sections
+        // and lines, wherever they are.
+        if self.format == FormatTag::Toml
+            && target_is_collection
+            && toml_collection_entry.is_none()
+            && let Some(ranges) = crate::parsers::toml::toml_tables(&self.original_bytes)
+                .map(|tables| tables.ranges_of(&canonical))
+                .filter(|ranges| !ranges.is_empty())
+        {
+            for range in ranges.into_iter().rev() {
+                self.original_bytes.drain(range);
+            }
+            self.adopt_reparse("delete", &canonical)?;
+            // The last `[[array]]` item, or the last table under a table
+            // with no header of its own: the parent goes with it unless
+            // written as `key = []` / `key = {}`.
+            if parent_loses_last_child && parent_ptr.resolve(&self.value).is_err() {
+                let empty = if in_map {
+                    Value::Map(IndexMap::new())
+                } else {
+                    Value::Array(Vec::new())
+                };
+                return self
+                    .set_at_unchecked(&parent_ptr, empty, &LayoutCache::new())
+                    .map_err(|_| Error::EditRejected {
+                        action: "delete",
+                        pointer: canonical.clone(),
+                        reason: "dq cannot keep the table it empties".to_owned(),
+                    });
+            }
+            return Ok(());
+        }
+        // A dotted key inside an inline table (`{x."y z".w = 1}`, `/x`):
+        // the entry of its one value.
+        let toml_dotted_entry = (self.format == FormatTag::Toml
+            && target_is_collection
+            && toml_collection_entry.is_none())
+        .then(|| {
+            let prefix = format!("{canonical}/");
+            let mut leaves = self.spans.iter().filter(|(key, span)| {
+                key.starts_with(&prefix) && span.context == SpanContext::FlowMapValue
+            });
+            match (leaves.next(), leaves.next()) {
+                (Some((_, leaf)), None) => {
+                    flow_entry_removal(&self.original_bytes, &leaf.value_range, true, self.format)
+                }
+                _ => None,
+            }
+        })
+        .flatten();
+        let dotted_target = toml_dotted_entry.is_some();
+        // The value of a TOML entry inside an inline table.
+        let toml_flow_value = (self.format == FormatTag::Toml && !dotted_target)
+            .then(|| match self.spans.get(&canonical) {
+                Some(span) => {
+                    (span.context == SpanContext::FlowMapValue).then(|| span.value_range.clone())
+                }
+                None => crate::parsers::toml::toml_inline_collections(&self.original_bytes)
+                    .and_then(|mut ranges| ranges.remove(&canonical))
+                    .and_then(|(value, in_flow)| in_flow.then_some(value)),
+            })
+            .flatten();
         let collection_entry = compact_entry
             .or(collection_entry)
             .or(json_collection_entry)
-            .or(toml_collection_entry);
+            .or(toml_collection_entry)
+            .or(toml_dotted_entry);
+        if collection_entry.is_none()
+            && target_is_collection
+            && !self.spans.contains_key(&canonical)
+            && self.format != FormatTag::Yaml
+        {
+            // A JSON or TOML collection whose bytes were not found, such as
+            // a dotted key spread over several entries of an inline table.
+            return Err(Error::EditRejected {
+                action: "delete",
+                pointer: canonical,
+                reason: "dq cannot find the bytes of the collection there".to_owned(),
+            });
+        }
         if collection.is_some_and(|collection| !collection.top_level) && collection_entry.is_none()
         {
             // `- key: {…}`, or a flow entry with a comment in between: the
@@ -1845,7 +2099,7 @@ impl Document {
                 reason: "it shares its line with the entry around it".to_owned(),
             });
         }
-        let line_range = match collection_entry {
+        let mut line_range = match collection_entry {
             Some(entry) => entry,
             None => {
                 let span = self.spans.get(&canonical).ok_or_else(|| Error::Path {
@@ -1882,6 +2136,30 @@ impl Document {
         if self.format == FormatTag::Toml
             && parent_loses_last_child
             && in_map
+            && let Some(value) = &toml_flow_value
+        {
+            // Inside an inline table (`{x.y = 1, b = 2}`): the entry turns
+            // into `x = {}`, its separators kept.
+            let sep = skip_blanks_back(&self.original_bytes, value.start);
+            if let Some(key) = (sep > 0 && self.original_bytes[sep - 1] == b'=')
+                .then(|| {
+                    flow_key_start(
+                        &self.original_bytes,
+                        skip_blanks_back(&self.original_bytes, sep - 1),
+                        self.format,
+                    )
+                })
+                .flatten()
+                && let Some(prefix) = toml_dotted_key_parent(&self.original_bytes[key..])
+            {
+                line_range = key..value.end;
+                inserted = prefix;
+                inserted.extend_from_slice(b" = {}");
+            }
+        } else if self.format == FormatTag::Toml
+            && parent_loses_last_child
+            && in_map
+            && !dotted_target
             && let Some(prefix) = toml_dotted_key_parent(&self.original_bytes[line_range.clone()])
         {
             inserted = prefix;
@@ -2648,6 +2926,70 @@ fn last_by_start(
             },
         )),
         (scalar, None) => scalar,
+    }
+}
+
+/// Past the bracket closing the YAML flow collection that opens at
+/// `within.start`, found before `within.end`; quoted scalars and comments
+/// skipped.
+fn yaml_flow_end(bytes: &[u8], within: std::ops::Range<usize>) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = within.start;
+    while i < within.end {
+        let prev = i.checked_sub(1).map(|p| bytes[p]);
+        // A quote opens a scalar only where a scalar can begin.
+        let scalar_start = prev.is_none_or(|p| {
+            matches!(
+                p,
+                b'[' | b'{' | b',' | b':' | b'?' | b' ' | b'\t' | b'\n' | b'\r'
+            )
+        });
+        match bytes[i] {
+            b'[' | b'{' => depth += 1,
+            b']' | b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            b'"' if scalar_start => loop {
+                i += 1;
+                match bytes.get(i)? {
+                    b'\\' => i += 1,
+                    b'"' => break,
+                    _ => {}
+                }
+            },
+            b'\'' if scalar_start => loop {
+                i += 1;
+                if *bytes.get(i)? == b'\'' {
+                    if bytes.get(i + 1) == Some(&b'\'') {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+            },
+            b'#' if prev.is_some_and(|p| p.is_ascii_whitespace()) => {
+                while i < within.end && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `bytes` parsed again write-aware as `format`; `None` for a format
+/// without textual edits.
+fn parse_again(format: FormatTag, bytes: &[u8]) -> Option<Result<Document>> {
+    match format {
+        FormatTag::Yaml => Some(crate::parsers::parse_yaml_with_spans(bytes)),
+        FormatTag::Json => Some(crate::parsers::parse_json_with_spans(bytes)),
+        FormatTag::Toml => Some(crate::format::Format::parse(&crate::parsers::Toml, bytes)),
+        _ => None,
     }
 }
 

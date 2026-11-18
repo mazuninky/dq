@@ -891,6 +891,9 @@ pub(crate) struct ContainerLayout {
     /// Bytes of a flow collection inside another flow collection, from its
     /// opening bracket through its closing one. `None` otherwise.
     pub(crate) flow_value: Option<Range<usize>>,
+    /// Bytes of any flow collection, from its opening bracket through its
+    /// closing one. `None` for a block collection.
+    pub(crate) brackets: Option<Range<usize>>,
     /// Where the collection's entry ends: past its last line for a block
     /// collection or one in a block parent, past its closing bracket in a
     /// flow parent.
@@ -1616,6 +1619,7 @@ impl<'src> State<'src> {
                     end,
                     flow_value: (style == ContextStyle::Flow && in_flow_parent)
                         .then_some(start_byte..end_byte),
+                    brackets: (style == ContextStyle::Flow).then_some(start_byte..end_byte),
                 },
             );
         }

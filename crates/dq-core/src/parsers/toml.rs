@@ -236,23 +236,8 @@ pub(crate) fn toml_root_insertion_point(bytes: &[u8]) -> Option<usize> {
     let Some(header) = first_header(doc.as_table()) else {
         return Some(bytes.len());
     };
-    let mut at = bytes[..header]
-        .iter()
-        .rposition(|&b| b == b'\n')
-        .map_or(0, |i| i + 1);
     // Comment lines directly above the header belong to it.
-    while at > 0 {
-        let prev = bytes[..at - 1]
-            .iter()
-            .rposition(|&b| b == b'\n')
-            .map_or(0, |i| i + 1);
-        if bytes[prev..at].trim_ascii_start().starts_with(b"#") {
-            at = prev;
-        } else {
-            break;
-        }
-    }
-    Some(at)
+    Some(section_start(bytes, header))
 }
 
 /// The non-empty inline tables and arrays (`k = { … }`, `k = [ … ]`), by
@@ -322,6 +307,174 @@ fn collect_inline(
         }
         _ => {}
     }
+}
+
+/// Where the tables the span map records nothing for lie in a TOML
+/// document: `[table]` / `[[array]]` sections and the lines of keys
+/// written under a dotted key (`a.b = 1`).
+#[derive(Debug, Default)]
+pub(crate) struct TomlTables {
+    /// Every `[table]` and `[[array]]` item, by canonical pointer: from its
+    /// header line — and the comment lines right above it — to where the
+    /// next section begins, or the end of the file.
+    pub(crate) sections: Vec<(String, Range<usize>)>,
+    /// Past the line break of every header's line, by canonical pointer:
+    /// where the table's first key goes.
+    pub(crate) header_line_ends: std::collections::HashMap<String, usize>,
+    /// The line(s) of every value written under a dotted key outside an
+    /// inline table, by the canonical pointer of the value.
+    pub(crate) dotted_lines: Vec<(String, Range<usize>)>,
+}
+
+impl TomlTables {
+    /// The bytes that hold the table at `canonical` and everything under
+    /// it, merged and in order; empty when it has none of its own (an
+    /// inline table, or a table the walk does not know).
+    pub(crate) fn ranges_of(&self, canonical: &str) -> Vec<Range<usize>> {
+        let prefix = format!("{canonical}/");
+        let under = |pointer: &str| pointer == canonical || pointer.starts_with(&prefix);
+        let mut ranges: Vec<Range<usize>> = self
+            .sections
+            .iter()
+            .chain(&self.dotted_lines)
+            .filter(|(pointer, _)| under(pointer))
+            .map(|(_, range)| range.clone())
+            .collect();
+        ranges.sort_by_key(|range| range.start);
+        let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            match merged.last_mut() {
+                Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+                _ => merged.push(range),
+            }
+        }
+        merged
+    }
+}
+
+/// The [`TomlTables`] of `bytes`; `None` when they do not parse.
+pub(crate) fn toml_tables(bytes: &[u8]) -> Option<TomlTables> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let doc = TomlDocument::parse(text).ok()?;
+    let mut headers: Vec<(String, Range<usize>)> = Vec::new();
+    let mut tables = TomlTables::default();
+    collect_tables(
+        doc.as_table(),
+        bytes,
+        &mut Vec::new(),
+        &mut headers,
+        &mut tables.dotted_lines,
+    );
+    headers.sort_by_key(|(_, header)| header.start);
+    let starts: Vec<usize> = headers
+        .iter()
+        .map(|(_, header)| section_start(bytes, header.start))
+        .collect();
+    for (i, (pointer, header)) in headers.into_iter().enumerate() {
+        let end = starts.get(i + 1).copied().unwrap_or(bytes.len());
+        tables
+            .header_line_ends
+            .insert(pointer.clone(), past_line_break(bytes, header.end));
+        tables.sections.push((pointer, starts[i]..end));
+    }
+    Some(tables)
+}
+
+fn collect_tables(
+    table: &Table,
+    bytes: &[u8],
+    path: &mut Vec<String>,
+    headers: &mut Vec<(String, Range<usize>)>,
+    dotted_lines: &mut Vec<(String, Range<usize>)>,
+) {
+    for (key, item) in table.iter() {
+        path.push(pointer_escape(key));
+        match item {
+            Item::Table(child) => {
+                if !child.is_dotted()
+                    && !child.is_implicit()
+                    && let Some(span) = child.span()
+                {
+                    headers.push((pointer_for(path), span));
+                }
+                if child.is_dotted() {
+                    collect_dotted_lines(child, bytes, path, dotted_lines);
+                }
+                collect_tables(child, bytes, path, headers, dotted_lines);
+            }
+            Item::ArrayOfTables(items) => {
+                for (i, child) in items.iter().enumerate() {
+                    path.push(i.to_string());
+                    if let Some(span) = child.span() {
+                        headers.push((pointer_for(path), span));
+                    }
+                    collect_tables(child, bytes, path, headers, dotted_lines);
+                    path.pop();
+                }
+            }
+            Item::Value(_) | Item::None => {}
+        }
+        path.pop();
+    }
+}
+
+/// The lines of the values of the dotted table `table`, nested dotted
+/// tables included.
+fn collect_dotted_lines(
+    table: &Table,
+    bytes: &[u8],
+    path: &mut Vec<String>,
+    out: &mut Vec<(String, Range<usize>)>,
+) {
+    for (key, item) in table.iter() {
+        path.push(pointer_escape(key));
+        match item {
+            Item::Value(value) => {
+                if let Some(span) = value.span() {
+                    let start = bytes[..span.start]
+                        .iter()
+                        .rposition(|&b| b == b'\n')
+                        .map_or(0, |i| i + 1);
+                    out.push((pointer_for(path), start..past_line_break(bytes, span.end)));
+                }
+            }
+            Item::Table(child) if child.is_dotted() => {
+                collect_dotted_lines(child, bytes, path, out);
+            }
+            _ => {}
+        }
+        path.pop();
+    }
+}
+
+/// Start of the line holding `header`, or of the comment lines right
+/// above it.
+fn section_start(bytes: &[u8], header: usize) -> usize {
+    let mut at = bytes[..header]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |i| i + 1);
+    while at > 0 {
+        let prev = bytes[..at - 1]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |i| i + 1);
+        if bytes[prev..at].trim_ascii_start().starts_with(b"#") {
+            at = prev;
+        } else {
+            break;
+        }
+    }
+    at
+}
+
+/// Past the line break that ends the line holding `at`, or the end of
+/// `bytes`.
+fn past_line_break(bytes: &[u8], at: usize) -> usize {
+    bytes[at..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(bytes.len(), |i| at + i + 1)
 }
 
 /// Start of the earliest `[table]` / `[[table]]` header under `table`.

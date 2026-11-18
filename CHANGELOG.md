@@ -309,6 +309,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - TOML `set` of a table or array writes it inline (`a = { x = 1 }`,
   `b = [{ c = 1 }]`), over a scalar or as a new key; it used to write
   `""` or `{}` / `[]`.
+- `set` where a non-empty collection is replaces it, in YAML, JSON and
+  TOML; it used to fail with "not found" though `get` found the path. A
+  JSON value, a TOML inline table or array and a YAML flow collection
+  are replaced between their brackets; a YAML block collection loses its
+  lines, the key keeping its comment and anchor (`a: &x 5 # c`); a TOML
+  `[table]` or dotted table is removed and the key written anew among
+  the keys of its table.
+- TOML `del` of a `[table]`, an `[[array]]` item or a dotted table
+  (`a.b = 1`) removes its sections and lines, subtables included; it
+  used to fail with "not found". The last item of an array of tables
+  leaves `arr = []`. So does `del` of a dotted key inside an inline
+  table (`{x."y z".w = 1}`); the last key under one, first in the table,
+  leaves `{x = {}, b = 2}` where it used to lose the comma.
+- TOML `set` of a new key in a `[table]` holding only tables, or nothing,
+  writes it right under the header; it used to fail with "not found".
 - TOML `del` of a non-empty inline table or array removes it — its
   `key = …` lines, or the entry and one comma inside another inline
   collection; it used to fail with "not found".
