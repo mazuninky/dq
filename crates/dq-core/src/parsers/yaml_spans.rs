@@ -2626,6 +2626,60 @@ mod tests {
         assert_eq!(slice, expected_value, "value bytes mismatch at {pointer}");
     }
 
+    #[test]
+    fn block_scalar_extent_runs_from_the_indicator_to_the_last_content() {
+        // (source, pointer, bytes a new value replaces, the part of the
+        // header line put back after it)
+        type Case = (&'static [u8], &'static str, &'static [u8], &'static [u8]);
+        let cases: [Case; 9] = [
+            (b"k: |\n  x\nr: 1\n", "/k", b"|\n  x", b""),
+            (b"k: |\r\n  x\r\nr: 1\r\n", "/k", b"|\r\n  x", b""),
+            (b"r: 1\nk: |\r\n  x", "/k", b"|\r\n  x", b""),
+            (b"k: |2-\n   x\nr: 1\n", "/k", b"|2-\n   x", b""),
+            // Trailing blank lines of keep chomping stay outside.
+            (b"k: |+\n  x\n\n\nr: 1\n", "/k", b"|+\n  x", b""),
+            (b"k: | # a | b\n  x\n", "/k", b"| # a | b\n  x", b" # a | b"),
+            (b"k: | # c\r\n  x\r\n", "/k", b"| # c\r\n  x", b" # c"),
+            (b"k: &a !t |\r\n  x\r\n", "/k", b"|\r\n  x", b""),
+            // The header on a line of its own.
+            (b"k:\n  |\n  x\nr: 1\n", "/k", b"|\n  x", b""),
+        ];
+        for (src, pointer, replaced, keep) in cases {
+            let (_, spans) = parse_with_spans(src).expect("parse");
+            let span = spans.get(pointer).expect("span");
+            let (range, kept) = block_scalar_extent(src, span).unwrap_or_else(|| {
+                panic!("{:?}: not a block scalar", String::from_utf8_lossy(src))
+            });
+            assert_eq!(
+                (&src[range], &src[kept]),
+                (replaced, keep),
+                "{:?}",
+                String::from_utf8_lossy(src)
+            );
+        }
+    }
+
+    #[test]
+    fn block_scalar_extent_is_none_for_other_scalars() {
+        for src in [
+            &b"k: x\n"[..],
+            b"k: \"|\"\n",
+            b"k: 'a |'\n",
+            b"k: a |\n",
+            b"k: x # |\n",
+            b"k:\n  x\n  y\n",
+        ] {
+            let (_, spans) = parse_with_spans(src).expect("parse");
+            let span = spans.get("/k").expect("span");
+            assert_eq!(
+                block_scalar_extent(src, span),
+                None,
+                "{:?}",
+                String::from_utf8_lossy(src)
+            );
+        }
+    }
+
     // -- span builder ---------------------------------------------------
 
     #[test]

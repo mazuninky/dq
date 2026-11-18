@@ -4048,6 +4048,152 @@ mod tests {
         );
     }
 
+    /// Byte offset of the first occurrence of `needle` in `src`.
+    fn at(src: &str, needle: &str) -> usize {
+        src.find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} in {src:?}"))
+    }
+
+    #[test]
+    fn flow_key_start_finds_quoted_and_dotted_keys() {
+        // (format, source, key text as written, the key ends where it ends)
+        let cases = [
+            (FormatTag::Json, r#"{"b": 2, "q\"x": 1}"#, r#""q\"x""#),
+            (FormatTag::Json, r#"{"b": 2, "a\\\"": 1}"#, r#""a\\\"""#),
+            (FormatTag::Json, r#"{"b": 2, "q\\": 1}"#, r#""q\\""#),
+            (FormatTag::Yaml, "{b: 2, 'it''s': 1}", "'it''s'"),
+            (FormatTag::Yaml, "{b: 2,'''': 1}", "''''"),
+            (FormatTag::Yaml, "{b: 2, '': 1}", "''"),
+            (FormatTag::Yaml, "{b: 2,  plain key: 1}", "plain key"),
+            (FormatTag::Yaml, "{b: 2,\n  k: 1}", "k"),
+            (
+                FormatTag::Toml,
+                "{b = 2, x . \"y z\" . w = 1}",
+                "x . \"y z\" . w",
+            ),
+            (FormatTag::Toml, "{b = 2, x.'y.z'.w = 1}", "x.'y.z'.w"),
+            (FormatTag::Toml, "{b = 2, \"x\" = 1}", "\"x\""),
+        ];
+        for (format, src, key) in cases {
+            let start = at(src, key);
+            assert_eq!(
+                flow_key_start(src.as_bytes(), start + key.len(), format),
+                Some(start),
+                "{format:?} {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn flow_entry_removal_takes_the_entry_and_one_comma() {
+        // (format, source, value of the entry to remove, map entry, what
+        // is left)
+        let cases = [
+            (FormatTag::Yaml, "{a: 1, b: 2}", "1", true, "{b: 2}"),
+            (FormatTag::Yaml, "{a: 1, b: 2}", "2", true, "{a: 1}"),
+            (FormatTag::Yaml, "{a: 1}", "1", true, "{}"),
+            (FormatTag::Yaml, "[1, 2]", "2", false, "[1]"),
+            // A trailing comma: the last entry takes the comma before it.
+            (FormatTag::Yaml, "{a: 1, b: 2,}", "2", true, "{a: 1}"),
+            (FormatTag::Yaml, "{a: 1,}", "1", true, "{}"),
+            // The blank before a comment stays, so it is still a comment.
+            (
+                FormatTag::Yaml,
+                "{a: 1, # c\n b: 2}",
+                "1",
+                true,
+                "{ # c\n b: 2}",
+            ),
+            // Node properties and an explicit key go with the entry.
+            (
+                FormatTag::Yaml,
+                "{? &k a : !!str 1, b: 2}",
+                "1",
+                true,
+                "{b: 2}",
+            ),
+            (
+                FormatTag::Json,
+                r#"{"q\"x": 1, "b": 2}"#,
+                "1",
+                true,
+                r#"{"b": 2}"#,
+            ),
+            (
+                FormatTag::Toml,
+                "{x . \"y z\" . w = 1, b = 2}",
+                "1",
+                true,
+                "{b = 2}",
+            ),
+            (FormatTag::Toml, "{b = 2, x.y = 1}", "1", true, "{b = 2}"),
+        ];
+        for (format, src, value, map_entry, want) in cases {
+            let start = src.rfind(value).expect("value in source");
+            let range = flow_entry_removal(
+                src.as_bytes(),
+                &(start..start + value.len()),
+                map_entry,
+                format,
+            )
+            .unwrap_or_else(|| panic!("{format:?} {src:?}: no removal"));
+            let mut left = src.to_owned();
+            left.replace_range(range, "");
+            assert_eq!(left, want, "{format:?} {src:?}");
+        }
+    }
+
+    #[test]
+    fn flow_entry_removal_refuses_what_it_does_not_recognise() {
+        // A comment before the closing bracket, a comment before the comma,
+        // a value that is not a flow entry at all.
+        let cases = [
+            ("{a: 1 # c\n}", "1"),
+            ("{a: 1 # c\n, b: 2}", "1"),
+            ("a: 1\n", "1"),
+        ];
+        for (src, value) in cases {
+            let start = src.find(value).expect("value in source");
+            assert_eq!(
+                flow_entry_removal(
+                    src.as_bytes(),
+                    &(start..start + value.len()),
+                    true,
+                    FormatTag::Yaml
+                ),
+                None,
+                "{src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn past_line_break_moves_to_the_next_line_start() {
+        let src = b"a: {}\r\nb: 1";
+        // Mid-line: past the `\n` of a CRLF.
+        assert_eq!(past_line_break(src, 5), 7);
+        // At a line start, at 0, past the end: stays.
+        assert_eq!(past_line_break(src, 7), 7);
+        assert_eq!(past_line_break(src, 0), 0);
+        assert_eq!(past_line_break(src, src.len() + 1), src.len() + 1);
+        // No line break after: stays.
+        assert_eq!(past_line_break(src, 9), 9);
+    }
+
+    #[test]
+    fn skip_blanks_and_comments_stops_at_content() {
+        let src = b"  # one\r\n\t# two\n\n  x # three";
+        assert_eq!(
+            skip_blanks_and_comments(src, 0),
+            at("  # one\r\n\t# two\n\n  x", "x")
+        );
+        // A `#` inside content is not skipped from: content is content.
+        assert_eq!(skip_blanks_and_comments(b"x # c", 0), 0);
+        // A comment to the end of the input ends there.
+        assert_eq!(skip_blanks_and_comments(b" # c", 0), 4);
+        assert_eq!(skip_blanks_and_comments(b"", 0), 0);
+    }
+
     #[test]
     fn del_at_recompute_only_shifts_spans_after_edit_end() {
         // Three sibling spans on synthesized bytes — `/a` left of edit,
