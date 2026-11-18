@@ -818,6 +818,9 @@ pub(crate) struct ContainerLayout {
     /// Start of the line the first child's entry (its key or `-`) begins
     /// on. `None` without children and when not located.
     pub(crate) first_child_line: Option<usize>,
+    /// Bytes of a flow collection inside another flow collection, from its
+    /// opening bracket through its closing one. `None` otherwise.
+    pub(crate) flow_value: Option<Range<usize>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1434,12 +1437,22 @@ impl<'src> State<'src> {
         };
         let style = frame.style();
         let in_flow_parent = self.flow_depth > usize::from(style == ContextStyle::Flow);
-        let (entry, props_end, content_end, first_entry) = match frame {
-            Frame::Mapping { container, .. } | Frame::Sequence { container, .. } => (
+        let (entry, props_end, content_end, first_entry, start_byte) = match frame {
+            Frame::Mapping {
+                container,
+                start_byte,
+                ..
+            }
+            | Frame::Sequence {
+                container,
+                start_byte,
+                ..
+            } => (
                 container.entry,
                 container.props_end,
                 container.content_end,
                 container.first_entry,
+                *start_byte,
             ),
         };
         let end = match style {
@@ -1478,6 +1491,8 @@ impl<'src> State<'src> {
                         None
                     },
                     first_child_line: first_entry.flatten(),
+                    flow_value: (style == ContextStyle::Flow && in_flow_parent)
+                        .then_some(start_byte..end_byte),
                 },
             );
         }

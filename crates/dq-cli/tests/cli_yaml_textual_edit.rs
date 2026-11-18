@@ -161,3 +161,16 @@ fn an_edit_that_does_not_read_back_is_refused_with_exit_7() {
         assert_eq!(std::fs::read_to_string(path).expect("read back"), src);
     }
 }
+
+#[test]
+fn del_in_place_on_single_line_json_keeps_the_other_members() {
+    let file = write_with_suffix(r#"{"a": 1, "b": 2}"#, ".json");
+    let path = file.to_str().expect("UTF-8 path");
+    dq().args(["del", "-i", path, "/a", "--no-color"])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(path).expect("read back"),
+        r#"{"b": 2}"#
+    );
+}

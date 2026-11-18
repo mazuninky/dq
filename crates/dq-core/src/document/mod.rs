@@ -955,8 +955,12 @@ impl Document {
 
         // Compute the actual splice point + final bytes, format-aware so
         // we don't smear `\n`s or forget a `,` separator.
-        let (splice_at, splice_bytes) =
-            format_specific_splice(self.format, &fragment, &sibling_span, &self.original_bytes);
+        let (splice_at, splice_bytes) = match self.flow_layout(&sibling_span) {
+            Some(layout) => flow_sibling_splice(&fragment, &sibling_span, layout),
+            None => {
+                format_specific_splice(self.format, &fragment, &sibling_span, &self.original_bytes)
+            }
+        };
 
         // Render the value through the scalar renderer so we can locate
         // its exact byte range inside the spliced bytes. Splicing the
@@ -1152,6 +1156,44 @@ impl Document {
     /// the splice anchors against an actual sibling at the parent's depth
     /// rather than a deeply nested grand-child whose `value_range` could
     /// be inside an entirely different container.
+    /// How a new entry goes next to `sibling` when they share a flow
+    /// collection — or a JSON value, which is all flow — rather than a
+    /// block, where it takes a line of its own. `None` for a block sibling.
+    fn flow_layout(&self, sibling: &ValueSpan) -> Option<FlowLayout> {
+        match self.format {
+            FormatTag::Json => {
+                let bytes = &self.original_bytes;
+                let start = &sibling.value_range.start;
+                // The entry's start: its key when it has one.
+                let sep = skip_blanks_back(bytes, *start);
+                let entry = if sep > 0 && bytes[sep - 1] == b':' {
+                    flow_key_start(bytes, skip_blanks_back(bytes, sep - 1), self.format)?
+                } else {
+                    *start
+                };
+                let mut before = entry;
+                while before > 0 && matches!(bytes[before - 1], b' ' | b'\t') {
+                    before -= 1;
+                }
+                let shares_line = before > 0 && matches!(bytes[before - 1], b',' | b'{' | b'[');
+                Some(if shares_line {
+                    FlowLayout::SameLine
+                } else {
+                    FlowLayout::OwnLine {
+                        column: entry - before,
+                        crlf: before >= 2 && bytes[before - 2] == b'\r',
+                    }
+                })
+            }
+            FormatTag::Yaml | FormatTag::Toml => matches!(
+                sibling.context,
+                SpanContext::FlowMapValue | SpanContext::FlowSeqItem
+            )
+            .then_some(FlowLayout::SameLine),
+            _ => None,
+        }
+    }
+
     fn rightmost_direct_sibling(&self, sibling_prefix: &str) -> Option<(&str, &ValueSpan)> {
         self.spans
             .iter()
@@ -1397,18 +1439,32 @@ impl Document {
         } else {
             None
         };
-        let collection_entry = layout
+        let in_map = matches!(parent_ptr.resolve(&self.value), Ok(Value::Map(_)));
+        let collection = layout
             .as_ref()
             .filter(|_| target_is_collection)
-            .and_then(|layout| layout.containers.get(&canonical))
-            .and_then(|collection| collection.entry.clone());
+            .and_then(|layout| layout.containers.get(&canonical));
+        let collection_entry = collection.and_then(|collection| {
+            collection.entry.clone().or_else(|| {
+                collection.flow_value.as_ref().and_then(|value| {
+                    flow_entry_removal(&self.original_bytes, value, in_map, self.format)
+                })
+            })
+        });
+        if collection.is_some_and(|collection| !collection.top_level) && collection_entry.is_none()
+        {
+            // `- key: {…}`, or a flow entry with a comment in between: the
+            // entry's bytes cannot be told from those around it.
+            return Err(Error::EditRejected {
+                action: "delete",
+                pointer: canonical,
+                reason: "it shares its line with the entry around it".to_owned(),
+            });
+        }
         let line_range = match collection_entry {
             Some(entry) => entry,
-            None => self
-                .spans
-                .get(&canonical)
-                .map(|span| span.line_range.clone())
-                .ok_or_else(|| Error::Path {
+            None => {
+                let span = self.spans.get(&canonical).ok_or_else(|| Error::Path {
                     pointer: canonical.clone(),
                     // SpanMap only records scalar leaves; walk the in-memory
                     // Value tree so the diagnostic surfaces the longest
@@ -1416,7 +1472,26 @@ impl Document {
                     matched_prefix: longest_existing_value_prefix(&self.value, pointer),
                     kind: PathErrorKind::MissingKey,
                     did_you_mean: Vec::new(),
-                })?,
+                })?;
+                // An entry of a JSON value or of a flow collection shares its
+                // line with others: remove it with one separating comma.
+                let in_flow = self.format == FormatTag::Json
+                    || matches!(
+                        span.context,
+                        SpanContext::FlowMapValue | SpanContext::FlowSeqItem
+                    );
+                in_flow
+                    .then(|| {
+                        flow_entry_removal(
+                            &self.original_bytes,
+                            &span.value_range,
+                            in_map,
+                            self.format,
+                        )
+                    })
+                    .flatten()
+                    .unwrap_or_else(|| span.line_range.clone())
+            }
         };
         let removed = line_range.clone();
         // An alias elsewhere would dangle — or resolve to an earlier
@@ -1555,6 +1630,171 @@ impl Document {
                 },
             });
     }
+}
+
+/// Bytes to remove to delete one entry of a flow collection — any JSON
+/// object or array, a YAML flow collection, a TOML inline table or array —
+/// whose value is at `value`: the entry (its key and YAML node properties
+/// included) and one separating comma, or everything between the brackets
+/// for the only entry. `None` when the surroundings are not the expected
+/// separators — a comment in between, say.
+fn flow_entry_removal(
+    bytes: &[u8],
+    value: &std::ops::Range<usize>,
+    map_entry: bool,
+    format: FormatTag,
+) -> Option<std::ops::Range<usize>> {
+    let yaml = format == FormatTag::Yaml;
+    let mut start = value.start;
+    if yaml {
+        start = yaml_properties_start(bytes, start);
+    }
+    if map_entry {
+        let indicator = if format == FormatTag::Toml {
+            b'='
+        } else {
+            b':'
+        };
+        let sep = skip_blanks_back(bytes, start);
+        if sep == 0 || bytes[sep - 1] != indicator {
+            return None;
+        }
+        start = flow_key_start(bytes, skip_blanks_back(bytes, sep - 1), format)?;
+        if yaml {
+            start = yaml_properties_start(bytes, start);
+            let explicit = skip_blanks_back(bytes, start);
+            if explicit > 0 && bytes[explicit - 1] == b'?' {
+                start = explicit - 1;
+            }
+        }
+    }
+    let after = skip_blanks(bytes, value.end);
+    let before = skip_blanks_back(bytes, start);
+    let preceding = before.checked_sub(1).map(|i| bytes[i]);
+    match bytes.get(after) {
+        Some(b',') => {
+            let next = skip_blanks(bytes, after + 1);
+            match bytes.get(next) {
+                // Keep the blank that makes a comment a comment.
+                Some(b'#') => return Some(start..after + 1),
+                Some(b'}' | b']') => {}
+                _ => return Some(start..next),
+            }
+            // A trailing comma: the entry is the last one.
+            match preceding {
+                Some(b',') => Some(before - 1..after + 1),
+                Some(b'{' | b'[') => Some(before..next),
+                _ => None,
+            }
+        }
+        Some(b'}' | b']') => match preceding {
+            Some(b',') => Some(before - 1..value.end),
+            Some(b'{' | b'[') => Some(before..after),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Start of the key that ends at `end` in a flow mapping: a quoted key, a
+/// TOML dotted key (`a."b".c`), or a plain key back to the flow indicator
+/// before it.
+fn flow_key_start(bytes: &[u8], end: usize, format: FormatTag) -> Option<usize> {
+    let mut end = end;
+    loop {
+        let last = *bytes.get(end.checked_sub(1)?)?;
+        let start = match last {
+            b'"' => {
+                // The opening quote: the nearest `"` before the closing one
+                // that no odd run of backslashes escapes.
+                let mut i = end - 1;
+                loop {
+                    i = bytes[..i].iter().rposition(|&b| b == b'"')?;
+                    let backslashes = bytes[..i].iter().rev().take_while(|&&b| b == b'\\').count();
+                    if backslashes % 2 == 0 {
+                        break i;
+                    }
+                }
+            }
+            b'\'' if format != FormatTag::Json => {
+                // `''` inside a single-quoted scalar is an escaped quote.
+                let mut i = end - 1;
+                loop {
+                    let quote = bytes[..i].iter().rposition(|&b| b == b'\'')?;
+                    if quote > 0 && bytes[quote - 1] == b'\'' {
+                        i = quote - 1;
+                        continue;
+                    }
+                    break quote;
+                }
+            }
+            _ => {
+                let toml = format == FormatTag::Toml;
+                let stops = |b: u8| {
+                    matches!(b, b'{' | b'[' | b',' | b'\n' | b'\r')
+                        || (toml && matches!(b, b'.' | b' ' | b'\t'))
+                };
+                let mut i = end;
+                while i > 0 && !stops(bytes[i - 1]) {
+                    i -= 1;
+                }
+                while i < end && matches!(bytes[i], b' ' | b'\t') {
+                    i += 1;
+                }
+                i
+            }
+        };
+        if format == FormatTag::Toml {
+            let dot = skip_blanks_back(bytes, start);
+            if dot > 0 && bytes[dot - 1] == b'.' {
+                end = skip_blanks_back(bytes, dot - 1);
+                continue;
+            }
+        }
+        return Some(start);
+    }
+}
+
+/// Start of the YAML node properties (`&anchor`, `!tag`) right before
+/// `start`, or `start` without any.
+fn yaml_properties_start(bytes: &[u8], start: usize) -> usize {
+    let mut start = start;
+    loop {
+        let end = skip_blanks_back(bytes, start);
+        let mut token = end;
+        while token > 0
+            && !matches!(
+                bytes[token - 1],
+                b' ' | b'\t' | b'\n' | b'\r' | b'{' | b'[' | b','
+            )
+        {
+            token -= 1;
+        }
+        if token < end && matches!(bytes[token], b'&' | b'!') {
+            start = token;
+        } else {
+            return start;
+        }
+    }
+}
+
+/// First byte at or after `pos` that is not a space, tab or line break.
+fn skip_blanks(bytes: &[u8], pos: usize) -> usize {
+    let mut pos = pos;
+    while matches!(bytes.get(pos), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+        pos += 1;
+    }
+    pos
+}
+
+/// `pos` moved back over spaces, tabs and line breaks: `bytes[result - 1]`
+/// is the last other byte before `pos`.
+fn skip_blanks_back(bytes: &[u8], pos: usize) -> usize {
+    let mut pos = pos.min(bytes.len());
+    while pos > 0 && matches!(bytes[pos - 1], b' ' | b'\t' | b'\n' | b'\r') {
+        pos -= 1;
+    }
+    pos
 }
 
 /// Pointer (below `at`) of the first place `expected` and `actual`
@@ -1776,6 +2016,46 @@ fn format_specific_splice(
             (sibling_span.line_range.end, trimmed.to_vec())
         }
     }
+}
+
+/// Where a new flow entry goes relative to the sibling it follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlowLayout {
+    /// On the sibling's line: `, k: v`.
+    SameLine,
+    /// On a line of its own, its key at `column` (0-based) like the
+    /// sibling's, after the line break the sibling's line ends in.
+    OwnLine { column: usize, crlf: bool },
+}
+
+/// `(splice_at, splice_bytes)` putting the entry the insertion renderer
+/// wrote as `fragment` right after the flow `sibling`, behind a comma. The
+/// renderers write a block entry (a line break, indentation, a trailing
+/// line break): only its `key: value` / `key = value` text is kept.
+fn flow_sibling_splice(
+    fragment: &[u8],
+    sibling: &ValueSpan,
+    layout: FlowLayout,
+) -> (usize, Vec<u8>) {
+    let start = fragment
+        .iter()
+        .position(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+        .unwrap_or(fragment.len());
+    let end = fragment
+        .iter()
+        .rposition(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+        .map_or(start, |last| last + 1);
+    let entry = &fragment[start..end.max(start)];
+    let mut out = Vec::with_capacity(entry.len() + 2);
+    match layout {
+        FlowLayout::SameLine => out.extend_from_slice(b", "),
+        FlowLayout::OwnLine { column, crlf } => {
+            out.extend_from_slice(if crlf { b",\r\n" } else { b",\n" });
+            out.extend(std::iter::repeat_n(b' ', column));
+        }
+    }
+    out.extend_from_slice(entry);
+    (sibling.value_range.end, out)
 }
 
 /// Translate the per-format [`InsertionRenderer`] fragment into a final

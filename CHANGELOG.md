@@ -273,7 +273,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   leaving `a:`, which reads as `null`; an emptied document becomes `{}`.
 - YAML `del` of a key whose value is a collection removes the whole entry
   instead of failing with "not found" (block collections) or leaving the
-  key with a `null` value (`{}` / `[]`).
+  key with a `null` value (`{}` / `[]`). Where the key shares its line
+  with a sequence item's `-` (`- key: {…}`), `del` fails with exit 7 and
+  leaves the file alone.
 - YAML `del` of an empty value — `key: |` with no lines, `key: !!str`,
   `key: &a`, `- &a` — removes its own entry; it used to remove the entry
   after it and keep its own.
@@ -292,6 +294,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   *base`), as YAML defines.
 - A YAML file with a UTF-8 BOM and more than one top-level key parses; it
   used to fail with "did not find expected <document start>".
+- `del` of an entry that shares its line with others — any JSON member or
+  item, a YAML flow collection, a TOML inline table or array — removes the
+  entry and one comma: `{"a": 1, "b": 2}` `del /a` gives `{"b": 2}`. It
+  used to remove the whole line (an empty file for single-line JSON), or
+  leave `{x: , y: 2}` / `[, 2]` behind; `del` of the last member of a
+  multi-line JSON object left a trailing comma. A collection inside a
+  YAML flow collection can be deleted too; it used to fail with "not
+  found".
+- `set` of a new key next to such an entry keeps it on the line (`{"a": 1,
+  "c": 3}`, `a: {x: 1, z: 3}`, `a = {x = 1, z = 3}`), or on a line of its
+  own at the sibling's column in multi-line JSON. YAML and TOML used to
+  write it as a block line inside the braces, which did not parse; JSON
+  started a new line indented two columns too far.
 
 ### Security
 

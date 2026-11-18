@@ -1,0 +1,153 @@
+//! `Document::set_at` / `Document::del_at` on entries that share a line
+//! with others: any JSON object or array, a YAML flow collection, a TOML
+//! inline table or array.
+
+use dq_core::{Document, Pointer, Value, by_name, parse_yaml_with_spans};
+use pretty_assertions::assert_eq;
+
+fn doc(format: &str, src: &str) -> Document {
+    if format == "yaml" {
+        return parse_yaml_with_spans(src.as_bytes()).expect("YAML source parses");
+    }
+    by_name(format)
+        .expect("format registered")
+        .parse(src.as_bytes())
+        .unwrap_or_else(|err| panic!("{format} source parses: {err}"))
+}
+
+fn ptr(pointer: &str) -> Pointer {
+    Pointer::parse(pointer).expect("pointer parses")
+}
+
+fn del(format: &str, src: &str, pointer: &str) -> String {
+    let mut doc = doc(format, src);
+    doc.del_at(&ptr(pointer))
+        .unwrap_or_else(|err| panic!("del {pointer} on {src:?}: {err}"));
+    String::from_utf8(doc.original_bytes().to_vec()).expect("UTF-8")
+}
+
+fn set(format: &str, src: &str, pointer: &str, value: Value) -> String {
+    let mut doc = doc(format, src);
+    doc.set_at(&ptr(pointer), value)
+        .unwrap_or_else(|err| panic!("set {pointer} on {src:?}: {err}"));
+    String::from_utf8(doc.original_bytes().to_vec()).expect("UTF-8")
+}
+
+#[test]
+fn del_in_single_line_json_removes_only_the_entry() {
+    let src = r#"{"a": 1, "b": 2}"#;
+    assert_eq!(del("json", src, "/a"), r#"{"b": 2}"#);
+    assert_eq!(del("json", src, "/b"), r#"{"a": 1}"#);
+    assert_eq!(del("json", r#"{"a": 1}"#, "/a"), "{}");
+    assert_eq!(del("json", "[1, 2, 3]", "/1"), "[1, 3]");
+    assert_eq!(del("json", "[1, 2, 3]", "/2"), "[1, 2]");
+}
+
+#[test]
+fn del_of_the_last_json_member_takes_the_comma_before_it() {
+    let src = "{\n  \"a\": 1,\n  \"b\": 2\n}\n";
+    assert_eq!(del("json", src, "/b"), "{\n  \"a\": 1\n}\n");
+    assert_eq!(del("json", src, "/a"), "{\n  \"b\": 2\n}\n");
+}
+
+#[test]
+fn del_in_a_yaml_flow_collection_removes_the_entry_and_a_comma() {
+    assert_eq!(del("yaml", "a: {x: 1, y: 2}\n", "/a/x"), "a: {y: 2}\n");
+    assert_eq!(del("yaml", "a: {x: 1, y: 2}\n", "/a/y"), "a: {x: 1}\n");
+    assert_eq!(del("yaml", "a: [1, 2]\n", "/a/0"), "a: [2]\n");
+    assert_eq!(del("yaml", "a: [1, 2]\n", "/a/1"), "a: [1]\n");
+    assert_eq!(del("yaml", "a: [1]\nb: 2\n", "/a/0"), "a: []\nb: 2\n");
+    // Node properties and an explicit key go along with the entry.
+    assert_eq!(
+        del("yaml", "a: {\"x y\": &q 1, ? z : 2}\n", "/a/x y"),
+        "a: {? z : 2}\n"
+    );
+    assert_eq!(
+        del("yaml", "a: {x: !!str 1, y: 2}\n", "/a/x"),
+        "a: {y: 2}\n"
+    );
+}
+
+#[test]
+fn del_of_a_collection_inside_a_flow_collection() {
+    assert_eq!(del("yaml", "a: {x: {p: 1}, y: 2}\n", "/a/x"), "a: {y: 2}\n");
+    assert_eq!(
+        del("yaml", "a: {y: 2, x: &q {p: 1}}\n", "/a/x"),
+        "a: {y: 2}\n"
+    );
+    assert_eq!(del("yaml", "a: [[1], 2]\n", "/a/0"), "a: [2]\n");
+    assert_eq!(del("yaml", "[[1], 2]\n", "/0"), "[2]\n");
+}
+
+#[test]
+fn del_in_a_multi_line_flow_collection() {
+    assert_eq!(
+        del("yaml", "a: [\n  1,\n  2,\n]\n", "/a/1"),
+        "a: [\n  1\n]\n"
+    );
+    // The blank before `#` stays, so the comment still is one.
+    assert_eq!(
+        del("yaml", "a: [1, # c\n  2]\n", "/a/0"),
+        "a: [ # c\n  2]\n"
+    );
+    assert_eq!(
+        del("toml", "a = [\n  1,\n  2,\n]\n", "/a/1"),
+        "a = [\n  1\n]\n"
+    );
+}
+
+#[test]
+fn del_in_a_toml_inline_table_or_array() {
+    assert_eq!(del("toml", "a = [1, 2]\n", "/a/0"), "a = [2]\n");
+    assert_eq!(del("toml", "a = {x = 1, y = 2}\n", "/a/x"), "a = {y = 2}\n");
+    assert_eq!(
+        del("toml", "a = {x.p = 1, \"y\" = 2}\n", "/a/y"),
+        "a = {x.p = 1}\n"
+    );
+}
+
+#[test]
+fn set_of_a_new_key_in_single_line_json_stays_on_the_line() {
+    assert_eq!(
+        set("json", r#"{"a": 1, "b": 2}"#, "/c", Value::Int(3)),
+        r#"{"a": 1, "b": 2, "c": 3}"#
+    );
+}
+
+#[test]
+fn set_of_a_new_key_in_multi_line_json_takes_the_sibling_column() {
+    assert_eq!(
+        set(
+            "json",
+            "{\n  \"a\": 1,\n  \"b\": 2\n}\n",
+            "/c",
+            Value::Int(3)
+        ),
+        "{\n  \"a\": 1,\n  \"b\": 2,\n  \"c\": 3\n}\n"
+    );
+    assert_eq!(
+        set(
+            "json",
+            "{\n    \"o\": {\n        \"a\": 1\n    }\n}\n",
+            "/o/c",
+            Value::Int(3)
+        ),
+        "{\n    \"o\": {\n        \"a\": 1,\n        \"c\": 3\n    }\n}\n"
+    );
+    assert_eq!(
+        set("json", "{\r\n  \"a\": 1\r\n}\r\n", "/c", Value::Int(3)),
+        "{\r\n  \"a\": 1,\r\n  \"c\": 3\r\n}\r\n"
+    );
+}
+
+#[test]
+fn set_of_a_new_key_in_a_flow_mapping_stays_inside_it() {
+    assert_eq!(
+        set("yaml", "a: {x: 1}\n", "/a/z", Value::Int(3)),
+        "a: {x: 1, z: 3}\n"
+    );
+    assert_eq!(
+        set("toml", "a = {x = 1}\n", "/a/z", Value::Int(3)),
+        "a = {x = 1, z = 3}\n"
+    );
+}
