@@ -579,6 +579,31 @@ fn del_of_an_alias_or_inside_an_anchor_is_allowed() {
     );
 }
 
+#[test]
+fn edit_below_an_alias_is_refused_naming_the_anchored_node() {
+    let src = "a: &m\n  x: 1\nb: *m\n";
+    for (action, pointer) in [("set", "/b/x"), ("set", "/b/new"), ("delete", "/b/x")] {
+        let mut yaml = doc(src);
+        let result = if action == "set" {
+            yaml.set_at(&ptr(pointer), Value::Int(5))
+        } else {
+            yaml.del_at(&ptr(pointer))
+        };
+        let err = result.expect_err("an edit below an alias is refused");
+        assert_eq!(err.kind_name(), "edit_rejected", "{pointer}: {err}");
+        let message = err.to_string();
+        assert!(
+            message.contains("under the alias on line 3, a copy of /a")
+                && message.contains("`dq set --jq`"),
+            "{message}"
+        );
+        assert_eq!(yaml.original_bytes(), src.as_bytes(), "{pointer}");
+    }
+    // A key that is not there is still not found.
+    let err = doc(src).del_at(&ptr("/b/nope")).expect_err("no such key");
+    assert_eq!(err.kind_name(), "path", "{err}");
+}
+
 // --- read-back check ---------------------------------------------------------
 
 #[test]

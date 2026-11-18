@@ -384,6 +384,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `template:` works, and in `a: 1` + `b:` + `  x: 1`, `set /c 3` adds
   `c` after `b`. It used to fail with "not found" when every child was a
   collection, and otherwise put the key after the last scalar child.
+- YAML `.nan` / `.inf` / `-.inf`: `convert -F json` fails, as it already
+  did for TOML `nan`, since JSON has no such number; it used to print
+  `.nan` into the JSON. `convert -F yaml` writes them as floats again (it
+  wrote the strings `'.nan'`), `convert -F toml` and TOML `set` write
+  `nan` / `inf` (they failed). JSON `set` of NaN or infinity fails with
+  exit 7 and leaves the file alone; it used to crash.
+- YAML `set` / `del` below an alias (`b: *m`, `set /b/x 1`) fails with
+  exit 7 and names the anchored node to edit instead; it used to fail
+  with "not found" though `get` found the path.
 
 ### Security
 

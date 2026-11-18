@@ -874,6 +874,9 @@ fn value_to_toml(v: &Value) -> Result<toml::Value> {
         }
         Value::Bool(b) => toml::Value::Boolean(*b),
         Value::Int(i) => toml::Value::Integer(*i),
+        Value::BigFloat(s) if let Some(f) = crate::document::non_finite_literal(s) => {
+            toml::Value::Float(f)
+        }
         Value::BigInt(s) | Value::BigFloat(s) => {
             return Err(Error::Format {
                 format: "toml",
@@ -941,7 +944,7 @@ impl ScalarRenderer for TomlScalarRenderer {
             Value::Int(i) => i.to_string().into_bytes(),
             Value::BigInt(s) => s.clone().into_bytes(),
             Value::Float(f) => render_float(*f),
-            Value::BigFloat(s) => s.clone().into_bytes(),
+            Value::BigFloat(s) => render_big_float(s),
             Value::String(s) => render_string(s, original_style, context),
             // A collection where a scalar was: an inline table or array,
             // valid wherever a value is.
@@ -1015,7 +1018,7 @@ fn render_inline_scalar(value: &Value) -> Vec<u8> {
         Value::Int(i) => i.to_string().into_bytes(),
         Value::BigInt(s) => s.clone().into_bytes(),
         Value::Float(f) => render_float(*f),
-        Value::BigFloat(s) => s.clone().into_bytes(),
+        Value::BigFloat(s) => render_big_float(s),
         Value::String(s) => render_basic_string(s),
         Value::Array(items) => {
             let mut out = b"[".to_vec();
@@ -1071,6 +1074,15 @@ fn detect_string_style(bytes: &[u8]) -> StringStyle {
 /// Render an `f64` as a TOML float literal. NaN / infinity use TOML's
 /// canonical forms; finite values use `Display` and add `.0` when the
 /// printed form would otherwise look like an integer.
+/// A big-float literal as TOML: a YAML `.nan` / `.inf` as `nan` / `inf`,
+/// any other as written.
+fn render_big_float(literal: &str) -> Vec<u8> {
+    match crate::document::non_finite_literal(literal) {
+        Some(f) => render_float(f),
+        None => literal.as_bytes().to_vec(),
+    }
+}
+
 fn render_float(f: f64) -> Vec<u8> {
     if f.is_nan() {
         return b"nan".to_vec();

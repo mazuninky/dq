@@ -959,6 +959,14 @@ pub(crate) fn write_value_compact(v: &Value, w: &mut dyn Write) -> Result<()> {
     write_value_with(v, w, 0, false, 2)
 }
 
+/// JSON has no token for NaN or ±Infinity.
+fn non_finite_error() -> Error {
+    Error::Format {
+        format: "json",
+        message: "non-finite float (NaN or Infinity) cannot be serialized as JSON".to_owned(),
+    }
+}
+
 /// Write a `Value` as pretty-printed JSON with an explicit indent step.
 ///
 /// `indent_step` is the number of spaces per indent level — the M4
@@ -989,17 +997,19 @@ fn write_value_with(
             let s = n.to_string();
             write_io(w, s.as_bytes())?;
         }
-        Value::BigInt(s) | Value::BigFloat(s) => write_io(w, s.as_bytes())?,
+        // A YAML `.nan` / `.inf` arrives as a literal no JSON number spells.
+        Value::BigInt(s) | Value::BigFloat(s) => {
+            if serde_json::Number::from_str(s).is_err() {
+                return Err(non_finite_error());
+            }
+            write_io(w, s.as_bytes())?;
+        }
         Value::Float(n) => {
             // NaN and ±Infinity are not valid JSON (RFC 8259 § 6) — fail
             // loudly instead of emitting `NaN`/`inf` literals that downstream
             // consumers would reject.
             if !n.is_finite() {
-                return Err(Error::Format {
-                    format: "json",
-                    message: "non-finite float (NaN or Infinity) cannot be serialized as JSON"
-                        .to_owned(),
-                });
+                return Err(non_finite_error());
             }
             // Use the shortest-round-trip representation. If the value is
             // integral, append `.0` to keep it parseable as float.
@@ -1148,10 +1158,12 @@ impl ScalarRenderer for JsonScalarRenderer {
         _original: &[u8],
     ) -> Vec<u8> {
         let mut buf: Vec<u8> = Vec::new();
-        // The inner write helpers can only fail on I/O; writing into a
-        // `Vec<u8>` is infallible. `expect` keeps the trait signature simple
-        // (no `Result` propagation) without hiding a real bug.
-        write_value_compact(value, &mut buf).expect("writing to Vec<u8> is infallible");
+        // The inner write helpers fail on I/O, infallible into a `Vec<u8>`,
+        // and on NaN / Infinity, which `Document::set_at` refuses before
+        // rendering. `expect` keeps the trait signature simple (no
+        // `Result` propagation) without hiding a real bug.
+        write_value_compact(value, &mut buf)
+            .expect("writing to Vec<u8> is infallible; `set_at` refuses NaN and Infinity");
         buf
     }
 }
@@ -1189,7 +1201,8 @@ impl InsertionRenderer for JsonInsertionRenderer {
         out.extend_from_slice(&key_buf);
         out.extend_from_slice(b": ");
         let mut val_buf: Vec<u8> = Vec::new();
-        write_value_compact(value, &mut val_buf).expect("writing to Vec<u8> is infallible");
+        write_value_compact(value, &mut val_buf)
+            .expect("writing to Vec<u8> is infallible; `set_at` refuses NaN and Infinity");
         out.extend_from_slice(&val_buf);
         out
     }

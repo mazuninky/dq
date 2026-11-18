@@ -224,6 +224,45 @@ pub struct Document {
     provenance: ProvenanceMap,
 }
 
+/// The not-a-number or infinite float a number literal spells in YAML
+/// (`.nan`, `-.inf`, `.Inf`) or TOML (`nan`, `+inf`) — how a
+/// [`Value::BigFloat`] carries one; `None` for any other literal.
+pub(crate) fn non_finite_literal(literal: &str) -> Option<f64> {
+    let (negative, rest) = match literal.as_bytes().first() {
+        Some(b'-') => (true, &literal[1..]),
+        Some(b'+') => (false, &literal[1..]),
+        _ => (false, literal),
+    };
+    let rest = rest.strip_prefix('.').unwrap_or(rest);
+    match rest {
+        "nan" | "NaN" | "NAN" => Some(f64::NAN),
+        "inf" | "Inf" | "INF" => Some(if negative {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        }),
+        _ => None,
+    }
+}
+
+/// The NaN or infinite float `value` is, as a float or a literal.
+fn non_finite(value: &Value) -> Option<f64> {
+    match value {
+        Value::Float(f) if !f.is_finite() => Some(*f),
+        Value::BigFloat(s) => non_finite_literal(s),
+        _ => None,
+    }
+}
+
+/// Whether `value` is or holds a NaN or infinite float.
+fn holds_non_finite(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(holds_non_finite),
+        Value::Map(map) => map.values().any(holds_non_finite),
+        scalar => non_finite(scalar).is_some(),
+    }
+}
+
 impl Value {
     /// Stable type name used by the `type` command and error messages.
     #[must_use]
@@ -754,6 +793,13 @@ impl Document {
         })?;
 
         let canonical = pointer.as_canonical();
+        if self.format == FormatTag::Json && holds_non_finite(&value) {
+            return Err(Error::EditRejected {
+                action: "set",
+                pointer: canonical,
+                reason: JSON_NON_FINITE.to_owned(),
+            });
+        }
         if self.format == FormatTag::Yaml
             && match pointer.resolve(&self.value) {
                 // `key: !!str` reads as "".
@@ -1776,17 +1822,25 @@ impl Document {
     ) -> Result<()> {
         if let Err(err) = result {
             *self = before;
+            let err = match err {
+                // A path `get` finds that runs through an alias: the alias
+                // node has no bytes of its own below it to edit.
+                Error::Path { .. } => self.through_alias(pointer, layout, action).unwrap_or(err),
+                err => err,
+            };
             return Err(match err {
                 // Every refusal names the way around it.
                 Error::EditRejected {
                     action,
                     pointer,
                     reason,
-                } if !reason.contains(JQ_REWRITE_HINT) => Error::EditRejected {
-                    action,
-                    pointer,
-                    reason: format!("{reason}; {JQ_REWRITE_HINT}"),
-                },
+                } if !reason.contains(JQ_REWRITE_HINT) && reason != JSON_NON_FINITE => {
+                    Error::EditRejected {
+                        action,
+                        pointer,
+                        reason: format!("{reason}; {JQ_REWRITE_HINT}"),
+                    }
+                }
                 err => err,
             });
         }
@@ -1860,6 +1914,51 @@ impl Document {
             action,
             pointer: canonical,
             reason: format!("{reason}; {JQ_REWRITE_HINT}"),
+        })
+    }
+
+    /// The refusal of an edit at `pointer`, below a YAML alias, whose
+    /// target (or, for `set`, its parent) the value tree resolves — the
+    /// bytes there are the anchored node's.
+    fn through_alias(
+        &self,
+        pointer: &Pointer,
+        layout: &LayoutCache,
+        action: &'static str,
+    ) -> Option<Error> {
+        if self.format != FormatTag::Yaml || !self.original_bytes.contains(&b'*') {
+            return None;
+        }
+        let canonical = pointer.as_canonical();
+        // `set` may add a key; `del` needs one there.
+        let mut found = pointer.clone();
+        if action != "delete" {
+            found.pop_segment()?;
+        }
+        found.resolve(&self.value).ok()?;
+        let alias = self.edit_layout(layout)?.aliases.iter().find(|alias| {
+            alias.alias_pointer.as_deref().is_some_and(|at| {
+                canonical
+                    .strip_prefix(at)
+                    .is_some_and(|rest| rest.starts_with('/'))
+            })
+        })?;
+        let line = 1 + self.original_bytes[..alias.alias_at]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count();
+        let copied = match &alias.anchor_pointer {
+            Some(at) if at.is_empty() => " of the root".to_owned(),
+            Some(at) => format!(" of {at}"),
+            None => String::new(),
+        };
+        Some(Error::EditRejected {
+            action,
+            pointer: canonical,
+            reason: format!(
+                "it lies under the alias on line {line}, a copy{copied}; \
+                 an edit at the anchored node changes every copy"
+            ),
         })
     }
 
@@ -2583,7 +2682,14 @@ fn first_difference(expected: &Value, actual: &Value, at: &str) -> Option<String
                 .enumerate()
                 .find_map(|(i, (want, got))| first_difference(want, got, &format!("{at}/{i}")))
         }
-        (Value::Float(want), Value::Float(got)) if want.is_nan() && got.is_nan() => None,
+        // NaN equals no float, and YAML holds `.nan` / `.inf` as literals
+        // a TOML `nan` / `inf` reads back as floats.
+        (want, got)
+            if let (Some(want), Some(got)) = (non_finite(want), non_finite(got))
+                && (want == got || (want.is_nan() && got.is_nan())) =>
+        {
+            None
+        }
         (want, got) if want == got => None,
         _ => Some(at.to_owned()),
     }
@@ -2996,6 +3102,10 @@ fn parse_again(format: FormatTag, bytes: &[u8]) -> Option<Result<Document>> {
 /// The YAML edit layout of a document before an edit, worked out at most
 /// once per edit — see [`Document::edit_layout`].
 type LayoutCache = std::cell::OnceCell<Option<crate::parsers::yaml_spans::EditLayout>>;
+
+/// Why a JSON `set` of NaN or Infinity is refused — by the JSON writer
+/// too, so with no way around it.
+const JSON_NON_FINITE: &str = "JSON has no NaN or Infinity";
 
 /// The way around an edit the read-back check refuses.
 const JQ_REWRITE_HINT: &str =
@@ -3638,6 +3748,8 @@ impl serde::Serialize for Value {
             // handled by the dedicated JSON writer, not the generic
             // `Serialize` impl, because not every serializer can represent
             // them as numeric tokens without precision loss.
+            // `.nan` / `.inf` are floats every serializer has a token for.
+            Self::BigFloat(s) if let Some(f) = non_finite_literal(s) => serializer.serialize_f64(f),
             Self::BigInt(s) | Self::BigFloat(s) => serializer.serialize_str(s),
             Self::Array(items) => {
                 let mut seq = serializer.serialize_seq(Some(items.len()))?;

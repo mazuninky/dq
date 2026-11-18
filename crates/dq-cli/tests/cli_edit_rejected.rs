@@ -70,21 +70,50 @@ const REFUSALS: &[Refusal] = &[
         args: &["/a"],
         message: "cannot delete '/a': dq cannot remove it as a textual edit; ",
     },
-    Refusal {
-        // JSON has no NaN.
-        name: "doc.json",
-        src: "{\"j\": 1}\n",
-        command: "set",
-        args: &["/j", "--value-from", "nan.yaml"],
-        message: "cannot set '/j': the edited document would not parse; ",
-    },
 ];
+
+/// JSON has no NaN: no writer of dq's can put one there, so the refusal
+/// points to no way around it.
+#[test]
+fn a_json_set_of_nan_exits_7_with_no_way_around() {
+    let dir = TempDir::new().expect("tempdir");
+    std::fs::write(dir.path().join("nan.yaml"), "x: .nan\n").expect("write value file");
+    let src = "{\"j\": 1}\n";
+    std::fs::write(dir.path().join("doc.json"), src).expect("write fixture");
+    for in_place in [false, true] {
+        let mut cmd = dq();
+        cmd.current_dir(dir.path());
+        if in_place {
+            cmd.arg("-i");
+        }
+        cmd.args([
+            "--no-color",
+            "set",
+            "doc.json",
+            "/j",
+            "--value-from",
+            "nan.yaml",
+        ])
+        .assert()
+        .code(7)
+        .stdout("")
+        .stderr(
+            predicate::str::contains("cannot set '/j': JSON has no NaN or Infinity")
+                .and(predicate::str::contains(JQ_HINT).not())
+                .and(predicate::str::contains("panicked").not()),
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("doc.json")).expect("read back"),
+            src.as_bytes(),
+            "-i={in_place}: the file is untouched"
+        );
+    }
+}
 
 #[test]
 fn a_refused_edit_exits_7_and_leaves_the_file_alone() {
     for case in REFUSALS {
         let dir = TempDir::new().expect("tempdir");
-        std::fs::write(dir.path().join("nan.yaml"), "x: .nan\n").expect("write value file");
         let path = dir.path().join(case.name);
         std::fs::write(&path, case.src).expect("write fixture");
         for in_place in [false, true] {
