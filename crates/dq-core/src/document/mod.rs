@@ -1406,7 +1406,34 @@ impl Document {
             if pointer.resolve(&self.value).is_ok() {
                 return Err(rejected());
             }
-            return self.set_at_unchecked(pointer, value, &LayoutCache::new());
+            // A parent only the removed sections made (`[a.b]` alone makes
+            // `a`) is gone with them: write the value at the first missing
+            // ancestor, wrapped in the tables down to the key.
+            let mut at = parent;
+            let mut value = value;
+            let mut key = segments.last().cloned();
+            while !at.is_root() && at.resolve(&self.value).is_err() {
+                let Some(Segment::Key(name)) = key.take() else {
+                    return Err(rejected());
+                };
+                value = Value::Map(IndexMap::from([(name, value)]));
+                key = at.pop_segment();
+            }
+            let mut target = at;
+            target.push_segment(key.ok_or_else(rejected)?);
+            return self
+                .set_at_unchecked(&target, value, &LayoutCache::new())
+                .map_err(|err| match err {
+                    // `a` still stands, made by another `[a.…]` section:
+                    // dq has no header to write the new key under.
+                    Error::Path { .. } => Error::EditRejected {
+                        action: "set",
+                        pointer: canonical.to_owned(),
+                        reason: "dq cannot write the key anew in a table with no header of its own"
+                            .to_owned(),
+                    },
+                    err => err,
+                });
         }
         Err(rejected())
     }

@@ -213,6 +213,50 @@ fn set_over_a_toml_table_writes_the_key_anew() {
 }
 
 #[test]
+fn set_over_a_toml_table_whose_parent_it_alone_makes_writes_the_parent_inline() {
+    assert_eq!(
+        set("toml", "x = 1\n[a.b]\nc = 1\n", "/a/b", Value::Int(5)),
+        "x = 1\na = { b = 5 }\n"
+    );
+    assert_eq!(
+        set(
+            "toml",
+            "a.b.c = 1\ne = 1\n",
+            "/a/b",
+            json(serde_json::json!({"z": 1}))
+        ),
+        "e = 1\na = { b = { z = 1 } }\n"
+    );
+    assert_eq!(
+        set("toml", "[a.b.c]\nk = 1\n", "/a/b/c", Value::Int(5)),
+        "a = { b = { c = 5 } }\n"
+    );
+    assert_eq!(
+        set("toml", "[q]\n[q.a.b]\nc = 1\n", "/q/a/b", Value::Int(5)),
+        "[q]\na = { b = 5 }\n"
+    );
+    assert_eq!(
+        set("toml", "[a.b]\nc = 1\n[z]\nw = 1\n", "/a/b", Value::Int(5)),
+        "a = { b = 5 }\n[z]\nw = 1\n"
+    );
+}
+
+#[test]
+fn set_over_a_toml_table_under_a_parent_with_no_header_is_refused() {
+    // `a` stays, made by `[a.d]`, with no header for `b` to go under.
+    let src = "[a.b]\nc = 1\n[a.d]\ne = 1\n";
+    let mut doc = doc("toml", src);
+    match doc.set_at(&ptr("/a/b"), Value::Int(5)) {
+        Err(Error::EditRejected { reason, .. }) => {
+            assert!(reason.contains("no header of its own"), "{reason}");
+            assert!(reason.contains("`dq set --jq`"), "{reason}");
+        }
+        other => panic!("expected EditRejected, got {other:?}"),
+    }
+    assert_eq!(doc.original_bytes(), src.as_bytes(), "bytes untouched");
+}
+
+#[test]
 fn set_of_a_new_key_in_a_toml_table_of_tables_goes_under_its_header() {
     assert_eq!(
         set("toml", "[t]\n[t.s]\nk = 1\n", "/t/z", Value::Int(3)),

@@ -286,9 +286,15 @@ Textual edits — `set` and `del` on YAML, JSON and TOML:
   with "not found" though `get` found the path. A JSON value, a TOML
   inline table or array and a YAML flow collection are replaced between
   their brackets; a YAML block collection loses its lines, the key
-  keeping its comment and anchor (`a: &x 5 # c`); a TOML `[table]` or
-  dotted table is removed and the key written anew among the keys of
-  its table.
+  keeping its comment and anchor (`a: &x 5 # c`). An anchored node
+  replaced this way stays anchored, so its aliases change with it: with
+  `a: &m {x: 1}` and `b: *m`, `set /a 42` makes `b` read 42 too. A TOML
+  `[table]` or dotted table is removed and the key written anew among
+  the keys of its table; when no other key or section makes its parent
+  table, the parent is written inline (`[a.b]` + `c = 1`, `set /a/b 5`
+  gives `a = { b = 5 }`). When another section still makes the parent
+  (`[a.b]` next to `[a.d]`), there is no header to write the key under
+  and the edit fails with exit 7.
 - `del` of an entry that shares its line with others — any JSON member
   or item, a YAML flow collection, a TOML inline table or array —
   removes the entry and one comma: `{"a": 1, "b": 2}` `del /a` gives
