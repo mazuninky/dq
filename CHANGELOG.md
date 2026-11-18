@@ -326,6 +326,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   into the item before it. The only key leaves `- {}`, the only item of
   `- - 1` leaves `- []`. A new key of such an item lines up with its keys
   instead of with the `-`.
+- `set` of a new key in YAML or JSON goes after the map's last child,
+  also when that child is a collection: `set /spec/replicas 3` next to
+  `template:` works, and in `a: 1` + `b:` + `  x: 1`, `set /c 3` adds
+  `c` after `b`. It used to fail with "not found" when every child was a
+  collection, and otherwise put the key after the last scalar child.
 
 ### Security
 

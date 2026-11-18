@@ -961,9 +961,7 @@ impl Document {
         } else {
             format!("{parent_canonical}/")
         };
-        let sibling = self
-            .rightmost_direct_sibling(&sibling_prefix)
-            .map(|(k, span)| (k.to_owned(), span.clone()));
+        let sibling = self.last_direct_child(&sibling_prefix);
         let Some((sibling_key, mut sibling_span)) = sibling else {
             // No sibling — try the empty-parent path. The parent's `{}` /
             // `[]` body must have a recorded container span for this branch
@@ -1004,7 +1002,23 @@ impl Document {
         };
         let parent_children_indent = sibling_key_column(&self.original_bytes, key_line);
         if self.format == FormatTag::Yaml {
-            self.strip_yaml_chomping_before_eof_append(&sibling_key, &mut sibling_span);
+            if self.spans.contains_key(&sibling_key) {
+                self.strip_yaml_chomping_before_eof_append(&sibling_key, &mut sibling_span);
+            } else if sibling_span.line_range.end == self.original_bytes.len() {
+                // A collection ending the document: its last scalar may be
+                // a block scalar without a final line break.
+                let prefix = format!("{sibling_key}/");
+                if let Some((last_key, mut last_span)) = self
+                    .spans
+                    .iter()
+                    .filter(|(key, _)| key.starts_with(&prefix))
+                    .max_by_key(|(_, span)| span.value_range.end)
+                    .map(|(key, span)| (key.clone(), span.clone()))
+                {
+                    self.strip_yaml_chomping_before_eof_append(&last_key, &mut last_span);
+                    sibling_span.line_range.end = self.original_bytes.len();
+                }
+            }
         }
         let fragment = insertion_renderer.render_insertion(
             &new_key,
@@ -1259,6 +1273,76 @@ impl Document {
             ))
             .then_some(FlowLayout::SameLine),
             _ => None,
+        }
+    }
+
+    /// The last direct child of the map whose children's pointers start
+    /// with `sibling_prefix` — the one a new key goes after — and its span.
+    /// A non-empty collection has no recorded span: its span is made up of
+    /// its entry's bytes (YAML) or its brackets (JSON), with `value_range`
+    /// empty at its end for a YAML block entry.
+    fn last_direct_child(&self, sibling_prefix: &str) -> Option<(String, ValueSpan)> {
+        let direct = |pointer: &str| {
+            pointer
+                .strip_prefix(sibling_prefix)
+                .is_some_and(|tail| !tail.is_empty() && !tail.contains('/'))
+        };
+        let scalar = || {
+            self.rightmost_direct_sibling(sibling_prefix)
+                .map(|(key, span)| (key.to_owned(), span.clone()))
+        };
+        match self.format {
+            FormatTag::Yaml => {
+                let Ok(layout) = crate::parsers::yaml_spans::edit_layout(&self.original_bytes)
+                else {
+                    return scalar();
+                };
+                let last_entry = layout
+                    .entries
+                    .iter()
+                    .filter(|(pointer, _)| direct(pointer))
+                    .max_by_key(|(_, entry)| entry.at);
+                if let Some((pointer, entry)) = last_entry {
+                    if let Some(span) = self.spans.get(pointer) {
+                        return Some((pointer.clone(), span.clone()));
+                    }
+                    let collection = layout.containers.get(pointer)?;
+                    let line_start = self.original_bytes[..entry.at]
+                        .iter()
+                        .rposition(|&b| b == b'\n')
+                        .map_or(0, |i| i + 1);
+                    let end = collection.end;
+                    return Some((
+                        pointer.clone(),
+                        ValueSpan {
+                            value_range: end..end,
+                            line_range: line_start..end,
+                            indent: 1,
+                            context: SpanContext::BlockMapValue,
+                        },
+                    ));
+                }
+                // A flow mapping: the child that starts last.
+                let flow = layout
+                    .containers
+                    .iter()
+                    .filter(|(pointer, _)| direct(pointer))
+                    .filter_map(|(pointer, collection)| {
+                        Some((pointer.clone(), collection.flow_value.clone()?))
+                    })
+                    .max_by_key(|(_, value)| value.start);
+                last_by_start(scalar(), flow, SpanContext::FlowMapValue)
+            }
+            FormatTag::Json => {
+                let ranges = crate::parsers::json::json_container_ranges(&self.original_bytes)
+                    .unwrap_or_default();
+                let collection = ranges
+                    .into_iter()
+                    .filter(|(pointer, _)| direct(pointer))
+                    .max_by_key(|(_, value)| value.start);
+                last_by_start(scalar(), collection, SpanContext::BlockMapValue)
+            }
+            _ => scalar(),
         }
     }
 
@@ -2215,6 +2299,31 @@ fn empty_node_replacement(props: &[u8], rendered: &[u8]) -> (Vec<u8>, usize) {
     let offset = out.len();
     out.extend_from_slice(rendered);
     (out, offset)
+}
+
+/// Of the recorded `scalar` child and the `collection` child spanning its
+/// brackets, the one that starts later, the collection with a span over
+/// its brackets in `context`.
+fn last_by_start(
+    scalar: Option<(String, ValueSpan)>,
+    collection: Option<(String, std::ops::Range<usize>)>,
+    context: SpanContext,
+) -> Option<(String, ValueSpan)> {
+    match (scalar, collection) {
+        (Some(scalar), Some((_, value))) if scalar.1.value_range.start > value.start => {
+            Some(scalar)
+        }
+        (_, Some((pointer, value))) => Some((
+            pointer,
+            ValueSpan {
+                line_range: value.clone(),
+                value_range: value,
+                indent: 1,
+                context,
+            },
+        )),
+        (scalar, None) => scalar,
+    }
 }
 
 /// Where a new flow entry goes relative to the sibling it follows.

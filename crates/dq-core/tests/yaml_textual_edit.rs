@@ -31,8 +31,8 @@ fn del(src: &str, pointer: &str) -> String {
 fn unaddressable_empty_keys_do_not_panic() {
     // A null key with properties and an empty string key both give a
     // pointer with an empty segment, which no pointer can spell.
-    let mut yaml = doc("f: {? &a}\n");
-    assert!(yaml.set_at(&ptr("/g"), Value::Int(1)).is_err());
+    // A new key goes after the collection holding it.
+    assert_eq!(set("f: {? &a}\n", "/g", Value::Int(1)), "f: {? &a}\ng: 1\n");
     let mut yaml = doc("\"\": 1\nb: 2\n");
     yaml.set_at(&ptr("/b"), Value::Int(3)).expect("set_at /b");
     assert_eq!(yaml.original_bytes(), b"\"\": 1\nb: 3\n");
@@ -128,6 +128,46 @@ fn del_of_a_block_scalar_removes_its_whole_entry() {
     assert_eq!(del("a: |\n  x\nb: 1\n", "/a"), "b: 1\n");
     assert_eq!(del("a:\n  x y\nb: 1\n", "/a"), "b: 1\n");
     assert_eq!(del("l:\n  - |\n    x\n  - 2\n", "/l/0"), "l:\n  - 2\n");
+}
+
+// --- a new key goes after the last child ----------------------------------------
+
+#[test]
+fn set_of_a_new_key_goes_after_the_last_child_even_a_collection() {
+    assert_eq!(
+        set("root:\n  inner: x\n", "/zz", Value::Int(1)),
+        "root:\n  inner: x\nzz: 1\n"
+    );
+    assert_eq!(
+        set("a: 1\nb:\n  x: 1\n", "/c", Value::Int(3)),
+        "a: 1\nb:\n  x: 1\nc: 3\n"
+    );
+    assert_eq!(
+        set(
+            "spec:\n  template:\n    metadata: {a: 1}\n",
+            "/spec/replicas",
+            Value::Int(3)
+        ),
+        "spec:\n  template:\n    metadata: {a: 1}\n  replicas: 3\n"
+    );
+    // A comment after the collection belongs to what follows it.
+    assert_eq!(
+        set("a: 1\nb:\n  - 1\n# tail\n", "/c", Value::Int(3)),
+        "a: 1\nb:\n  - 1\nc: 3\n# tail\n"
+    );
+    assert_eq!(
+        set("l:\n  - a:\n      x: 1\n", "/l/0/z", Value::Int(3)),
+        "l:\n  - a:\n      x: 1\n    z: 3\n"
+    );
+    assert_eq!(
+        set("a: {p: {x: 1}}\n", "/a/z", Value::Int(3)),
+        "a: {p: {x: 1}, z: 3}\n"
+    );
+    // The collection's last scalar is an unterminated block scalar.
+    assert_eq!(
+        set("b:\n  s: |\n    x", "/c", Value::Int(3)),
+        "b:\n  s: |-\n    x\nc: 3\n"
+    );
 }
 
 // --- an empty value -----------------------------------------------------------

@@ -220,3 +220,24 @@ fn del_of_a_json_collection_removes_the_member_and_a_comma() {
         "{\n  \"b\": 2\n}\n"
     );
 }
+
+#[test]
+fn set_of_a_new_json_key_goes_after_a_collection_member() {
+    assert_eq!(
+        set("json", r#"{"a": {"x": 1}}"#, "/c", Value::Int(3)),
+        r#"{"a": {"x": 1}, "c": 3}"#
+    );
+    assert_eq!(
+        set("json", r#"{"b": 1, "a": [1]}"#, "/c", Value::Int(3)),
+        r#"{"b": 1, "a": [1], "c": 3}"#
+    );
+    assert_eq!(
+        set(
+            "json",
+            "{\n  \"a\": {\n    \"x\": 1\n  }\n}\n",
+            "/c",
+            Value::Int(3)
+        ),
+        "{\n  \"a\": {\n    \"x\": 1\n  },\n  \"c\": 3\n}\n"
+    );
+}

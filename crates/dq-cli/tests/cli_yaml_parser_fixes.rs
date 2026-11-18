@@ -4,8 +4,7 @@
 //!
 //! The write commands route YAML through `parse_yaml_with_spans`, so these
 //! tests drive `set` / `del` through the real binary and compare the bytes
-//! it writes. The `#[ignore]` test pins a textual-edit bug found on the
-//! way; it predates the bump.
+//! it writes.
 
 use std::io::Write as _;
 
@@ -128,11 +127,9 @@ fn set_new_key_after_next_line_value_lands_at_the_mapping_indent() {
 }
 
 #[test]
-#[ignore = "bug: set of a new key into a mapping whose only children are collections fails with exit 2"]
 fn set_new_root_key_next_to_a_collection_sibling() {
-    // Today, and in the saphyr-parser 0.0.6 build, `/zz` on this file fails
-    // with exit 2 "path '/zz' not found": the root's only child `root` is a
-    // collection, and the insertion anchors on a scalar sibling only.
+    // The root's only child `root` is a collection; the insertion used to
+    // anchor on a scalar sibling only and failed with exit 2.
     let file = write_yaml(MULTILINE_PLAIN);
     let out = stdout_of(&["set"], &file, &["/zz", "1"]);
     assert_eq!(
