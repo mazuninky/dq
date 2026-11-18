@@ -3,7 +3,7 @@
 [![CI](https://github.com/mazuninky/dq/actions/workflows/ci.yml/badge.svg)](https://github.com/mazuninky/dq/actions/workflows/ci.yml)
 [![Release](https://github.com/mazuninky/dq/actions/workflows/release.yml/badge.svg)](https://github.com/mazuninky/dq/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![MSRV](https://img.shields.io/badge/MSRV-1.94-blue)](rust-toolchain.toml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.100-blue)](rust-toolchain.toml)
 
 Agent-friendly Rust CLI for structured data files (YAML, JSON, TOML, HCL, INI, .env, CSV, Dockerfile, Markdown frontmatter, XML) and a platform for writing linters over them. Query, in-place edit with round-trip preservation, format conversion, JSON Patch / Merge Patch, and lint+autofix engine — all in a single static binary.
 
@@ -76,7 +76,7 @@ Pin to a specific release tag (`v2026.20.1`) or to a digest (`@sha256:…`) for 
 
 ### From source
 
-Requires Rust stable **1.94 or newer**.
+Requires Rust stable **1.100 or newer**.
 
 ```sh
 cargo install --locked --git https://github.com/mazuninky/dq dq-cli

@@ -15,7 +15,7 @@ version = "2026.20.2"
 edition = "2024"
 license = "MIT"
 authors = ["Mazunin Konstantin"]
-rust-version = "1.94"
+rust-version = "1.100"
 repository = "https://github.com/mazuninky/dq"
 # Workspace crates are not published to crates.io — dq is distributed via
 # GitHub Releases, Homebrew, GHCR, and `cargo install --git`. Declaring this
@@ -82,7 +82,6 @@ walkdir = "2"
 # `Format` impl in `dq-core/src/parsers/`.
 hcl-rs = "0.19"
 rust-ini = "0.21"
-dotenvy = "0.15"
 csv = "1.3"
 dockerfile-parser-rs = "3.3"
 

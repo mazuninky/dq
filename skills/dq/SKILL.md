@@ -323,7 +323,7 @@ brew install mazuninky/tap/dq
 # Docker (multi-arch, GHCR with provenance)
 docker run --rm -v "$PWD:/work" ghcr.io/mazuninky/dq:latest get config.yaml /name
 
-# Cargo (MSRV 1.94)
+# Cargo (MSRV 1.100)
 cargo install --locked --git https://github.com/mazuninky/dq dq-cli
 
 # Verified GitHub Releases (SLSA attestation)

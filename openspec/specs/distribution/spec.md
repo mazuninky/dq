@@ -50,7 +50,7 @@ The script MUST NOT depend on `jq`, `curl`-only-flags absent from BusyBox (for a
 ### Requirement: Multi-stage alpine Dockerfile
 
 The repo SHALL contain a `Dockerfile` that:
-- Uses `rust:1.94-alpine` for the build stage and `alpine:3.21` for the runtime stage.
+- Uses `rust:1.100-alpine` for the build stage and `alpine:3.24` for the runtime stage.
 - Ships only the `dq` binary in `/usr/local/bin/dq` in the runtime stage.
 - Adds a non-root `dq` user (UID 1000) and runs as that user.
 - Sets `ENTRYPOINT ["/usr/local/bin/dq"]` and `CMD ["--help"]`.
@@ -124,7 +124,7 @@ The third-party action vendors used MUST be limited to `actions/`, `dtolnay/`, `
 
 `.github/workflows/ci.yml` SHALL trigger on `push` and `pull_request`. It SHALL run a matrix over `ubuntu-latest`, `macos-14`, `windows-latest` with steps:
 - Checkout
-- Install the Rust stable toolchain via `dtolnay/rust-toolchain@stable` (the workspace is pinned to `1.94` in `rust-toolchain.toml`, which `rustup` honours; the action installs whatever stable channel is current and lets the toolchain file pin the exact version)
+- Install the Rust stable toolchain via `dtolnay/rust-toolchain@stable` (the workspace is pinned to `1.100` in `rust-toolchain.toml`, which `rustup` honours; the action installs whatever stable channel is current and lets the toolchain file pin the exact version)
 - `cargo build --workspace --all-targets`
 - `cargo test --workspace --all-features`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`

@@ -17,7 +17,7 @@ context: |
     - `dq-lint`     — стандартная библиотека правил (k8s/markdown/npm/github-actions, M8+)
     - `dq-cli`      — бинарь, тонкая обёртка над всеми слоями
 
-  Tech stack (Rust): edition 2024 (lang minimum 1.85), pinned channel 1.94.0 in
+  Tech stack (Rust): edition 2024 (lang minimum 1.85), pinned channel 1.100.0 in
   rust-toolchain.toml (matches the atl reference project; not a true MSRV — we
   don't currently target older toolchains), clap v4 derive, camino::Utf8PathBuf,
   thiserror (per-module domain enums) + anyhow (command handlers), tracing +
