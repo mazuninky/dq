@@ -884,7 +884,7 @@ impl Document {
         let sibling = self
             .rightmost_direct_sibling(&sibling_prefix)
             .map(|(k, span)| (k.to_owned(), span.clone()));
-        let Some((_sibling_key, sibling_span)) = sibling else {
+        let Some((sibling_key, mut sibling_span)) = sibling else {
             // No sibling — try the empty-parent path. The parent's `{}` /
             // `[]` body must have a recorded container span for this branch
             // to succeed; if it doesn't, fall through to MissingKey.
@@ -913,9 +913,19 @@ impl Document {
         // of the parent's children (YAML's convention), or as the leading
         // indent count for JSON. The sibling's `indent` is the column of
         // the sibling's *value*, not its key, so we re-derive the key
-        // column by scanning back through the sibling's line.
-        let parent_children_indent =
-            sibling_key_column(&self.original_bytes, sibling_span.value_range.start);
+        // column by scanning back through the sibling's line. A YAML value
+        // can start lines below its key (a `|` / `>` block scalar's
+        // content, a value on the next line); its `line_range` starts on
+        // the key's line, so that is the line to scan.
+        let key_line = if self.format == FormatTag::Yaml {
+            sibling_span.line_range.start
+        } else {
+            sibling_span.value_range.start
+        };
+        let parent_children_indent = sibling_key_column(&self.original_bytes, key_line);
+        if self.format == FormatTag::Yaml {
+            self.strip_yaml_chomping_before_eof_append(&sibling_key, &mut sibling_span);
+        }
         let fragment = insertion_renderer.render_insertion(
             &new_key,
             &value,
@@ -1134,6 +1144,43 @@ impl Document {
             })
             .max_by_key(|(_, span)| span.value_range.end)
             .map(|(k, span)| (k.as_str(), span))
+    }
+
+    /// Before a YAML insertion after `sibling` at the end of a document that
+    /// lacks a final line break: when the sibling is a `|` / `>` block
+    /// scalar running to the end, switch its header to strip chomping so the
+    /// line break the insertion adds does not become part of its value.
+    /// Updates `sibling` (and its entry in `self.spans`) to the shifted
+    /// bytes.
+    fn strip_yaml_chomping_before_eof_append(
+        &mut self,
+        sibling_key: &str,
+        sibling: &mut ValueSpan,
+    ) {
+        let Some((at, old_len, replacement)) =
+            crate::parsers::yaml_spans::strip_chomping_before_eof_append(
+                &self.original_bytes,
+                sibling,
+            )
+        else {
+            return;
+        };
+        self.original_bytes
+            .splice(at..at + old_len, replacement.iter().copied());
+        apply_delta(
+            &mut self.spans,
+            SpanRecomputeDelta {
+                at,
+                old_len,
+                new_len: replacement.len(),
+            },
+        );
+        // `apply_delta` moved the whole span, but its entry still starts on
+        // the key's line, before the header.
+        if let Some(span) = self.spans.get_mut(sibling_key) {
+            span.line_range.start = sibling.line_range.start;
+            *sibling = span.clone();
+        }
     }
 
     /// Remove the value at `pointer`, splicing out its physical line(s) and

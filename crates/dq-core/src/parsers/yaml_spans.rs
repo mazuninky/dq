@@ -232,6 +232,100 @@ fn build_span_map_and_block_scalars(bytes: &[u8]) -> Result<(SpanMap, HashSet<St
     Ok((built.spans, built.block_scalars))
 }
 
+/// The edit that keeps a block scalar's value when a line is appended after
+/// it: `Some((at, old_len, replacement))` when `span` is a literal / folded
+/// scalar whose last content line ends the input without a line break and
+/// whose header does not already strip (`-`).
+///
+/// Appending `\nkey: value` turns that unterminated last line into a
+/// terminated one, which clip (`|`) and keep (`|+`) chomping then add to
+/// the value. Switching the header to strip (`|-`, `|2-`) keeps the value
+/// as it was. The header is the last `|` / `>` indicator on the last
+/// non-blank line before the content, outside quotes and comments.
+pub(crate) fn strip_chomping_before_eof_append(
+    bytes: &[u8],
+    span: &ValueSpan,
+) -> Option<(usize, usize, &'static [u8])> {
+    let content = &span.value_range;
+    if content.is_empty()
+        || content.end != bytes.len()
+        || span.line_range.end != bytes.len()
+        || bytes.last() == Some(&b'\n')
+        || !starts_line(bytes, content.start)
+    {
+        return None;
+    }
+    // The header sits on the last non-blank line above the content (only
+    // blank lines may separate them), and within the entry.
+    let mut line_end = line_start_at(bytes, content.start);
+    let header_line = loop {
+        if line_end == 0 || line_end <= span.line_range.start {
+            return None;
+        }
+        let start = line_start_at(bytes, line_end - 1);
+        let line = start..line_end - 1;
+        if bytes[line.clone()]
+            .iter()
+            .any(|&b| !matches!(b, b' ' | b'\t' | b'\r'))
+        {
+            break line;
+        }
+        line_end = start;
+    };
+    let indicator = block_scalar_indicator(bytes, header_line)?;
+    let modifiers = indicator + 1;
+    let mut end = modifiers;
+    while matches!(bytes.get(end), Some(b'1'..=b'9' | b'+' | b'-')) {
+        end += 1;
+    }
+    match bytes[modifiers..end]
+        .iter()
+        .position(|&b| b == b'+' || b == b'-')
+    {
+        Some(at) if bytes[modifiers + at] == b'-' => None,
+        Some(at) => Some((modifiers + at, 1, b"-")),
+        None => Some((modifiers, 0, b"-")),
+    }
+}
+
+/// Byte offset of the last block-scalar indicator (`|` / `>` starting a
+/// token, followed by indentation / chomping indicators only) in `line`,
+/// skipping quoted scalars and stopping at a comment.
+fn block_scalar_indicator(bytes: &[u8], line: Range<usize>) -> Option<usize> {
+    let mut found = None;
+    let mut pos = line.start;
+    let token_start = |pos: usize| pos == line.start || matches!(bytes[pos - 1], b' ' | b'\t');
+    while pos < line.end {
+        match bytes[pos] {
+            b'#' if pos == line.start || matches!(bytes[pos - 1], b' ' | b'\t') => break,
+            quote @ (b'"' | b'\'') if token_start(pos) => {
+                pos += 1;
+                while pos < line.end {
+                    match bytes[pos] {
+                        b'\\' if quote == b'"' => pos += 1,
+                        b'\'' if quote == b'\'' && bytes.get(pos + 1) == Some(&b'\'') => pos += 1,
+                        b if b == quote => break,
+                        _ => {}
+                    }
+                    pos += 1;
+                }
+            }
+            b'|' | b'>' if token_start(pos) => {
+                let mut end = pos + 1;
+                while end < line.end && matches!(bytes[end], b'1'..=b'9' | b'+' | b'-') {
+                    end += 1;
+                }
+                if end == line.end || matches!(bytes[end], b' ' | b'\t' | b'\r') {
+                    found = Some(pos);
+                }
+            }
+            _ => {}
+        }
+        pos += 1;
+    }
+    found
+}
+
 /// Output of [`build_span_map_with_stats`].
 struct BuiltSpans {
     spans: SpanMap,
@@ -559,6 +653,11 @@ enum Frame {
     /// for the value event.
     Mapping {
         pending_key: Option<String>,
+        /// Byte range of the pending key's node (properties included), set
+        /// alongside `pending_key` and taken by [`State::entry_anchor`]. The
+        /// entry of a mapping value starts on the key's line, whatever line
+        /// the value itself starts on.
+        pending_key_range: Option<Range<usize>>,
         style: ContextStyle,
         /// Byte offset of the `MappingStart` event — used to record an
         /// empty-container span when `MappingEnd` fires with no children.
@@ -581,6 +680,22 @@ enum Frame {
         /// [`State::block_indent`].
         indentless: bool,
     },
+}
+
+impl Frame {
+    fn style(&self) -> ContextStyle {
+        match self {
+            Self::Mapping { style, .. } | Self::Sequence { style, .. } => *style,
+        }
+    }
+}
+
+/// Where the entry holding a value of a block collection begins: a mapping
+/// entry at its key, a sequence item at its `-`.
+#[derive(Debug, Clone, Copy)]
+struct EntryAnchor {
+    /// Start of the line the entry begins on.
+    line_start: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -607,6 +722,8 @@ struct State<'src> {
     /// 0.0.6 span start of each block scalar with node properties, keyed by
     /// event ordinal — see [`replay_block_scalar_body_starts`].
     block_body_starts: &'src HashMap<usize, usize>,
+    /// Number of flow frames on `self.stack`.
+    flow_depth: usize,
 }
 
 impl<'src> State<'src> {
@@ -627,7 +744,111 @@ impl<'src> State<'src> {
             path: Vec::new(),
             next_ordinal: 0,
             block_body_starts,
+            flow_depth: 0,
         }
+    }
+
+    /// `true` if the next key or value event is a mapping key.
+    fn expects_key(&self) -> bool {
+        matches!(
+            self.stack.last(),
+            Some(Frame::Mapping {
+                pending_key: None,
+                ..
+            })
+        )
+    }
+
+    /// Record `key` (escaped) as the pending key of the innermost mapping;
+    /// `range` is the key node's byte range.
+    fn set_pending_key(&mut self, key: String, range: Range<usize>) {
+        if let Some(Frame::Mapping {
+            pending_key,
+            pending_key_range,
+            saw_child,
+            ..
+        }) = self.stack.last_mut()
+        {
+            *pending_key = Some(key);
+            *pending_key_range = Some(range);
+            // A key event proves the mapping is non-empty, so `MappingEnd`
+            // should NOT record an empty-container span. Setting `saw_child`
+            // here keeps the bookkeeping consistent even if the matching
+            // value event turns out to be another container or scalar.
+            *saw_child = true;
+        }
+    }
+
+    /// Where the entry holding the value about to be recorded begins, for a
+    /// value of a block collection outside any flow collection. `item_start`
+    /// is where the value's node starts (its properties included).
+    ///
+    /// Takes the pending key's range, so it must run once per value.
+    fn entry_anchor(&mut self, item_start: usize) -> Option<EntryAnchor> {
+        let bytes = self.bytes;
+        let in_flow = self.flow_depth > 0;
+        match self.stack.last_mut()? {
+            Frame::Mapping {
+                pending_key_range, ..
+            } => {
+                let key = pending_key_range.take()?;
+                if in_flow {
+                    return None;
+                }
+                Some(EntryAnchor {
+                    line_start: line_start_at(bytes, key.start),
+                })
+            }
+            Frame::Sequence { .. } if in_flow => None,
+            Frame::Sequence { .. } => {
+                let line_start = if starts_line(bytes, item_start) {
+                    dash_line_above(bytes, item_start)?
+                } else {
+                    line_start_at(bytes, item_start)
+                };
+                Some(EntryAnchor { line_start })
+            }
+        }
+    }
+
+    /// Push a container frame for a `MappingStart` / `SequenceStart` whose
+    /// event span is `span` and which carries `n_properties` properties.
+    fn open_container(&mut self, span: Span, n_properties: usize, mapping: bool) {
+        let event_start = char_index_to_byte(self.char_to_byte, span.start.index());
+        let start_byte = self.legacy_container_start(span, n_properties);
+        let style = detect_container_style(self.bytes, start_byte);
+        let indentless = !mapping
+            && style == ContextStyle::Block
+            && matches!(
+                self.stack.last(),
+                Some(Frame::Mapping {
+                    style: ContextStyle::Block,
+                    ..
+                })
+            )
+            && !starts_line(self.bytes, start_byte);
+        // The parent's pending key belongs to this container.
+        let _ = self.entry_anchor(event_start);
+        self.enter_container();
+        if style == ContextStyle::Flow {
+            self.flow_depth += 1;
+        }
+        self.stack.push(if mapping {
+            Frame::Mapping {
+                pending_key: None,
+                pending_key_range: None,
+                style,
+                start_byte,
+                saw_child: false,
+            }
+        } else {
+            Frame::Sequence {
+                index: 0,
+                style,
+                start_byte,
+                indentless,
+            }
+        });
     }
 
     fn observe(
@@ -657,31 +878,13 @@ impl<'src> State<'src> {
             }
             Event::Scalar(value, style, anchor, tag) => {
                 let n_properties = usize::from(anchor != 0) + usize::from(tag.is_some());
-                let is_key = matches!(
-                    self.stack.last(),
-                    Some(Frame::Mapping {
-                        pending_key: None,
-                        ..
-                    })
-                );
-                if is_key {
+                if self.expects_key() {
                     let key_str =
                         pointer_escape(legacy_key_text(value.as_ref(), style, n_properties));
-                    if let Some(Frame::Mapping {
-                        pending_key,
-                        saw_child,
-                        ..
-                    }) = self.stack.last_mut()
-                    {
-                        *pending_key = Some(key_str);
-                        // A key event proves the mapping is non-empty, so
-                        // `MappingEnd` should NOT record an empty-container
-                        // span. Setting `saw_child` here keeps the
-                        // bookkeeping consistent even if the matching value
-                        // event turns out to be another container or scalar.
-                        *saw_child = true;
-                    }
+                    self.set_pending_key(key_str, span_to_range(span, self.char_to_byte));
                 } else {
+                    let entry = self
+                        .entry_anchor(char_index_to_byte(self.char_to_byte, span.start.index()));
                     let pointer = self.value_pointer();
                     let (value_range, col) = if n_properties == 0 {
                         (span_to_range(span, self.char_to_byte), span.start.col())
@@ -690,7 +893,7 @@ impl<'src> State<'src> {
                         self.legacy_scalar_span(span, style, is_empty_node, n_properties, ordinal)
                     };
                     let context = self.value_context();
-                    let line_range = self.compute_line_range(&value_range, context, style);
+                    let line_range = self.compute_line_range(&value_range, context, style, entry);
                     let indent = u32::try_from(col).unwrap_or(u32::MAX);
                     if matches!(style, ScalarStyle::Literal | ScalarStyle::Folded) {
                         // Record the canonical pointer alongside the span
@@ -726,24 +929,7 @@ impl<'src> State<'src> {
             }
             Event::SequenceStart(anchor, tag) => {
                 let n_properties = usize::from(anchor != 0) + usize::from(tag.is_some());
-                let start_byte = self.legacy_container_start(span, n_properties);
-                let style = detect_container_style(self.bytes, start_byte);
-                let indentless = style == ContextStyle::Block
-                    && matches!(
-                        self.stack.last(),
-                        Some(Frame::Mapping {
-                            style: ContextStyle::Block,
-                            ..
-                        })
-                    )
-                    && !starts_line(self.bytes, start_byte);
-                self.enter_container();
-                self.stack.push(Frame::Sequence {
-                    index: 0,
-                    style,
-                    start_byte,
-                    indentless,
-                });
+                self.open_container(span, n_properties, false);
             }
             Event::SequenceEnd => {
                 let end_byte = char_index_to_byte(self.char_to_byte, span.end.index());
@@ -751,15 +937,7 @@ impl<'src> State<'src> {
             }
             Event::MappingStart(anchor, tag) => {
                 let n_properties = usize::from(anchor != 0) + usize::from(tag.is_some());
-                let start_byte = self.legacy_container_start(span, n_properties);
-                let style = detect_container_style(self.bytes, start_byte);
-                self.enter_container();
-                self.stack.push(Frame::Mapping {
-                    pending_key: None,
-                    style,
-                    start_byte,
-                    saw_child: false,
-                });
+                self.open_container(span, n_properties, true);
             }
             Event::MappingEnd => {
                 let end_byte = char_index_to_byte(self.char_to_byte, span.end.index());
@@ -981,7 +1159,13 @@ impl<'src> State<'src> {
     }
 
     fn leave_container(&mut self) {
-        let _ = self.stack.pop();
+        if self
+            .stack
+            .pop()
+            .is_some_and(|frame| frame.style() == ContextStyle::Flow)
+        {
+            self.flow_depth -= 1;
+        }
         let target_len = self.doc_prefix_len();
         if self.path.len() > target_len {
             self.path.pop();
@@ -1039,7 +1223,8 @@ impl<'src> State<'src> {
             // documents the invariant.
             if !spans.contains_key(&pointer) {
                 let value_range = start_byte.min(self.bytes.len())..end_byte.min(self.bytes.len());
-                let line_range = self.compute_line_range(&value_range, context, ScalarStyle::Plain);
+                let line_range =
+                    self.compute_line_range(&value_range, context, ScalarStyle::Plain, None);
                 // `indent` is the column of the container's opening byte,
                 // which mirrors the parser convention for scalar `indent`.
                 let indent =
@@ -1084,14 +1269,23 @@ impl<'src> State<'src> {
         }
     }
 
-    /// Compute the line range for a value span. Block contexts span the full
-    /// physical line(s); flow contexts have no logical line so the line range
-    /// degenerates to the value range.
+    /// Compute the line range for a value span — the bytes `del_at` removes
+    /// and the line insertions go after. Block contexts span the full
+    /// physical line(s) of the entry; flow contexts have no logical line so
+    /// the line range degenerates to the value range.
+    ///
+    /// `entry` is where the entry holding the value begins
+    /// ([`State::entry_anchor`]). A value can start on a later line than its
+    /// key or `-` — always for a block scalar, whose content follows the
+    /// `|` / `>` line, and for any node written on the next line — so the
+    /// range starts on the entry's line, not the value's. An empty node
+    /// keeps the line of its (0.0.6-shaped) span.
     fn compute_line_range(
         &self,
         value_range: &Range<usize>,
         context: SpanContext,
         scalar_style: ScalarStyle,
+        entry: Option<EntryAnchor>,
     ) -> Range<usize> {
         // For flow contexts a single value is part of `{a: 1, b: 2}` on one
         // line — there is no "delete this physical line" semantics. Returning
@@ -1103,25 +1297,19 @@ impl<'src> State<'src> {
         ) {
             return value_range.clone();
         }
-        // Block scalars (`|` / `>`) already include trailing-newline content
-        // in the value range. We still want `del_at` to pull the entire
-        // logical entry; expand to the next newline boundary like a regular
-        // value, since the value range typically ends at end-of-line already.
-        let _ = scalar_style;
 
         let bytes = self.bytes;
-        let mut start = value_range.start.min(bytes.len());
-        while start > 0 && bytes[start - 1] != b'\n' {
-            start -= 1;
+        let value_line_start = line_start_at(bytes, value_range.start);
+        let start = match entry {
+            Some(anchor) if !value_range.is_empty() => anchor.line_start.min(value_line_start),
+            _ => value_line_start,
+        };
+        if matches!(scalar_style, ScalarStyle::Literal | ScalarStyle::Folded)
+            && let Some(end) = block_scalar_line_end(bytes, value_range)
+        {
+            return start..end;
         }
-        let mut end = value_range.end.min(bytes.len());
-        while end < bytes.len() && bytes[end] != b'\n' {
-            end += 1;
-        }
-        if end < bytes.len() {
-            end += 1; // include trailing newline
-        }
-        start..end
+        start..line_end_after(bytes, value_range.end)
     }
 }
 
@@ -1308,6 +1496,78 @@ fn starts_line(bytes: &[u8], pos: usize) -> bool {
         .rev()
         .take_while(|&&b| !matches!(b, b'\n' | b'\r'))
         .all(|&b| matches!(b, b' ' | b'\t'))
+}
+
+/// Start of the line holding byte `pos`: just past the previous `\n`. On the
+/// first line that is past a byte-order mark, so that removing a whole line
+/// never takes the mark with it.
+fn line_start_at(bytes: &[u8], pos: usize) -> usize {
+    const BOM: &[u8] = "\u{feff}".as_bytes();
+    let pos = pos.min(bytes.len());
+    let first_line = if pos >= BOM.len() && bytes.starts_with(BOM) {
+        BOM.len()
+    } else {
+        0
+    };
+    bytes[..pos]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(first_line, |i| i + 1)
+}
+
+/// End of the line holding byte `pos`, past its `\n` (or the end of input).
+fn line_end_after(bytes: &[u8], pos: usize) -> usize {
+    let pos = pos.min(bytes.len());
+    bytes[pos..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(bytes.len(), |i| pos + i + 1)
+}
+
+/// Where the last line of a block scalar ends, given its event span.
+///
+/// The span of a `|` / `>` scalar runs past its final line break, over
+/// trailing blank lines, and on to the indentation of the next line when
+/// that line is indented — so `line_end_after` its end would swallow the
+/// next entry. The scalar's last line ends at the last line break in the
+/// span when only blanks follow it. `None` when the span holds no line
+/// break or content follows the last one: the scalar ends at the end of
+/// input without a final line break.
+fn block_scalar_line_end(bytes: &[u8], value_range: &Range<usize>) -> Option<usize> {
+    let slice = bytes.get(value_range.clone())?;
+    let last_break = slice.iter().rposition(|&b| b == b'\n')?;
+    slice[last_break + 1..]
+        .iter()
+        .all(|&b| matches!(b, b' ' | b'\t'))
+        .then_some(value_range.start + last_break + 1)
+}
+
+/// For a sequence item whose node starts its own line (`pos`), the line of
+/// the item's `-`: the nearest line above holding a `-` indicator, with
+/// only blank, comment, node-property and block-scalar-header lines in
+/// between. Returns the start of that line, or `None` when another line
+/// comes first.
+fn dash_line_above(bytes: &[u8], pos: usize) -> Option<usize> {
+    let mut line_start = line_start_at(bytes, pos);
+    while line_start > 0 && bytes[line_start - 1] == b'\n' {
+        let prev_start = line_start_at(bytes, line_start - 1);
+        let line = &bytes[prev_start..line_start - 1];
+        line_start = prev_start;
+        let Some(first) = line
+            .iter()
+            .position(|&b| !matches!(b, b' ' | b'\t' | b'\r'))
+        else {
+            continue;
+        };
+        match line[first] {
+            b'-' if matches!(line.get(first + 1), None | Some(b' ' | b'\t' | b'\r')) => {
+                return Some(prev_start);
+            }
+            b'#' | b'&' | b'!' | b'|' | b'>' => {}
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// Byte offset of `pos` from the start of its line.

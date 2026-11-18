@@ -260,6 +260,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `dq set` / `del` / `lint` no longer panic on a file with an empty or
   null key: `"": 1` in YAML, `{"": 1}` in JSON, `"" = 1` in TOML,
   `f: {? &a}` in YAML.
+- YAML `set` of a new key after a block scalar (`|`, `>`) or a value on the
+  next line puts the key at the mapping's indent instead of inside the
+  value. `del` of such a value removes the whole entry.
 
 ### Security
 

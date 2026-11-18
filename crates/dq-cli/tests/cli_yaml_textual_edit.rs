@@ -30,6 +30,23 @@ fn write_yaml(src: &str) -> TempPath {
     write_with_suffix(src, ".yaml")
 }
 
+/// Run `dq <args[0]> <file> <args[1..]> --no-color` on `src`, assert exit
+/// 0, return stdout.
+fn edit(src: &str, args: &[&str]) -> String {
+    let file = write_yaml(src);
+    let out = dq()
+        .arg(args[0])
+        .arg(file.to_str().expect("UTF-8 path"))
+        .args(&args[1..])
+        .arg("--no-color")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(out).expect("UTF-8 stdout")
+}
+
 #[test]
 fn null_key_with_an_anchor_does_not_panic() {
     let file = write_yaml("f: {? &a}\n");
@@ -67,4 +84,16 @@ fn set_next_to_an_empty_key_does_not_panic_in_json_or_toml() {
             want.trim_end()
         );
     }
+}
+
+#[test]
+fn set_new_key_after_a_block_scalar_keeps_the_scalar() {
+    assert_eq!(
+        edit("a: |\n  x\n", &["set", "/zz", "1"]),
+        "a: |\n  x\nzz: 1\n"
+    );
+    assert_eq!(
+        edit("o:\n  a: |\n    x\n", &["set", "/o/zz", "1"]),
+        "o:\n  a: |\n    x\n  zz: 1\n"
+    );
 }

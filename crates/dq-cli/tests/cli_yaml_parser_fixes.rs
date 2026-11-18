@@ -4,8 +4,8 @@
 //!
 //! The write commands route YAML through `parse_yaml_with_spans`, so these
 //! tests drive `set` / `del` through the real binary and compare the bytes
-//! it writes. The two `#[ignore]` tests pin textual-edit bugs found on the
-//! way; they predate the bump.
+//! it writes. The `#[ignore]` test pins a textual-edit bug found on the
+//! way; it predates the bump.
 
 use std::io::Write as _;
 
@@ -100,25 +100,21 @@ fn read_back(bytes: &[u8]) -> serde_json::Value {
 }
 
 #[test]
-#[ignore = "bug: del of a key whose value starts on the next line leaves `key:` (null) behind"]
 fn del_removes_key_whose_multiline_plain_value_starts_on_the_next_line() {
-    // Today the output is `root:\n  inner:\n`: the value is gone, the key
-    // stays and reads back as `null`. Same with a final newline, and the same
-    // in the saphyr-parser 0.0.6 build. Deleting the only key leaves
-    // `root:` (null), as it does for `root:\n  inner: x\n`.
+    // The 0.0.6 build, and this one before the fix, left `root:\n  inner:\n`:
+    // the value was gone, the key stayed and read back as `null`. Now the
+    // whole entry goes; the emptied `root` reads back as `null`.
     let file = write_yaml(MULTILINE_PLAIN);
     let out = stdout_of(&["del"], &file, &["/root/inner"]);
     assert_eq!(read_back(&out), serde_json::json!({"root": null}));
 }
 
 #[test]
-#[ignore = "bug: set of a new key after a value that starts on the next line indents the key into that value"]
 fn set_new_key_after_next_line_value_lands_at_the_mapping_indent() {
-    // Today, and in the saphyr-parser 0.0.6 build:
-    // - `/root/other` gives `root:\n  inner:\n    x\n    y\n    other: z`,
+    // The 0.0.6 build, and this one before the fix:
+    // - `/root/other` gave `root:\n  inner:\n    x\n    y\n    other: z`,
     //   which does not parse ("mapping values are not allowed");
-    // - `/zz` on the same file fails with exit 2 "path '/zz' not found";
-    // - `/zz` after a literal block (`a: |\n  x\n`) gives `a: |\n  x\n  zz: 1`,
+    // - `/zz` after a literal block (`a: |\n  x\n`) gave `a: |\n  x\n  zz: 1`,
     //   which parses, with `zz: 1` folded into the string `a`.
     let file = write_yaml(MULTILINE_PLAIN);
     let out = stdout_of(&["set"], &file, &["/root/other", "z"]);
@@ -126,12 +122,21 @@ fn set_new_key_after_next_line_value_lands_at_the_mapping_indent() {
         read_back(&out),
         serde_json::json!({"root": {"inner": "x y", "other": "z"}})
     );
+    let literal = write_yaml(b"a: |\n  x\n");
+    let out = stdout_of(&["set"], &literal, &["/zz", "1"]);
+    assert_eq!(read_back(&out), serde_json::json!({"a": "x\n", "zz": 1}));
+}
+
+#[test]
+#[ignore = "bug: set of a new key into a mapping whose only children are collections fails with exit 2"]
+fn set_new_root_key_next_to_a_collection_sibling() {
+    // Today, and in the saphyr-parser 0.0.6 build, `/zz` on this file fails
+    // with exit 2 "path '/zz' not found": the root's only child `root` is a
+    // collection, and the insertion anchors on a scalar sibling only.
+    let file = write_yaml(MULTILINE_PLAIN);
     let out = stdout_of(&["set"], &file, &["/zz", "1"]);
     assert_eq!(
         read_back(&out),
         serde_json::json!({"root": {"inner": "x y"}, "zz": 1})
     );
-    let literal = write_yaml(b"a: |\n  x\n");
-    let out = stdout_of(&["set"], &literal, &["/zz", "1"]);
-    assert_eq!(read_back(&out), serde_json::json!({"a": "x\n", "zz": 1}));
 }
