@@ -775,4 +775,388 @@ $defs:
             other => panic!("expected SchemaCompile, got {other:?}"),
         }
     }
+
+    // --- `$schema` emulation of jsonschema 0.34 -----------------------------
+    //
+    // Expected values below were checked against a dq binary built on
+    // jsonschema 0.34, which resolved `$schema` through its own registry.
+
+    /// The 0.34 compile error for a `$schema` it could not retrieve over HTTP.
+    fn http_meta_schema_error(uri: &str) -> String {
+        format!(
+            "Resource '{uri}' is not present in a registry and retrieving it failed: \
+             `resolve-http` feature or a custom resolver is required to resolve external \
+             schemas via HTTP"
+        )
+    }
+
+    /// Compile `schema` inline, panicking with the error when it fails.
+    fn assert_compiles(schema: &serde_json::Value) {
+        let yaml: serde_norway::Value =
+            serde_norway::from_str(&schema.to_string()).expect("json is valid yaml");
+        if let Err(err) = compile_inline("test.ok", &yaml, None) {
+            panic!("{schema} should compile, got {err:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_reference_network_path_takes_only_the_base_scheme() {
+        assert_eq!(
+            resolve_reference(Some("https://e.com/root"), "//other.org/m"),
+            "https://other.org/m"
+        );
+    }
+
+    #[test]
+    fn resolve_reference_absolute_path_keeps_the_base_authority() {
+        assert_eq!(
+            resolve_reference(Some("https://e.com/dir/root.json"), "/x"),
+            "https://e.com/x"
+        );
+    }
+
+    #[test]
+    fn resolve_reference_against_a_base_without_path_starts_at_root() {
+        assert_eq!(
+            resolve_reference(Some("https://e.com"), "m.json"),
+            "https://e.com/m.json"
+        );
+    }
+
+    #[test]
+    fn resolve_reference_empty_reference_is_the_base() {
+        assert_eq!(
+            resolve_reference(Some("https://e.com/root"), ""),
+            "https://e.com/root"
+        );
+    }
+
+    #[test]
+    fn resolve_reference_relative_path_replaces_the_last_base_segment() {
+        assert_eq!(
+            resolve_reference(Some("https://e.com/a/root.json"), "m.json"),
+            "https://e.com/a/m.json"
+        );
+        // The base's own query and fragment never leak into the result;
+        // the reference's query is kept.
+        assert_eq!(
+            resolve_reference(Some("https://e.com/a/root.json?v=1#top"), "m.json"),
+            "https://e.com/a/m.json"
+        );
+        assert_eq!(
+            resolve_reference(Some("https://e.com/a/root.json"), "m.json?q=1"),
+            "https://e.com/a/m.json?q=1"
+        );
+    }
+
+    #[test]
+    fn resolve_reference_keeps_the_reference_fragment_for_the_caller_to_strip() {
+        let resolved = resolve_reference(Some("https://e.com/a/root.json"), "m.json#frag");
+        assert_eq!(resolved, "https://e.com/a/m.json#frag");
+        assert_eq!(strip_fragment(&resolved), "https://e.com/a/m.json");
+        assert_eq!(strip_fragment("#"), "");
+        assert_eq!(strip_fragment("m.json"), "m.json");
+    }
+
+    #[test]
+    fn resolve_reference_returns_the_reference_when_it_cannot_be_resolved() {
+        // No base at all.
+        assert_eq!(resolve_reference(None, "m.json"), "m.json");
+        // A reference with its own scheme ignores the base.
+        assert_eq!(
+            resolve_reference(Some("https://e.com/a/root.json"), "urn:x:y"),
+            "urn:x:y"
+        );
+        // A base without a scheme is not a base URI.
+        assert_eq!(resolve_reference(Some("dir/root.json"), "m.json"), "m.json");
+        // A base without an authority merges into its (slash-less) path.
+        assert_eq!(resolve_reference(Some("urn:x:y"), "m.json"), "urn:m.json");
+    }
+
+    #[test]
+    #[ignore = "bug: resolve_reference keeps `.`/`..` segments (RFC 3986 § 5.2.4 not applied); \
+                jsonschema 0.34 removed them"]
+    fn resolve_reference_removes_dot_segments() {
+        assert_eq!(
+            resolve_reference(Some("https://e.com/a/b/root.json"), "../m.json"),
+            "https://e.com/a/m.json"
+        );
+        assert_eq!(
+            resolve_reference(Some("https://e.com/a/b/root.json"), "./m.json"),
+            "https://e.com/a/b/m.json"
+        );
+    }
+
+    #[test]
+    fn uri_scheme_accepts_only_rfc_3986_schemes() {
+        for (uri, expected) in [
+            ("https://e.com", Some("https")),
+            ("HTTPS://e.com", Some("HTTPS")),
+            ("urn:x:y", Some("urn")),
+            ("a1+b-c.d:rest", Some("a1+b-c.d")),
+            ("meta.json", None),
+            ("//host:80/p", None),
+            ("1abc:x", None),
+            (":x", None),
+            ("ht tp:x", None),
+            ("#frag:x", None),
+            ("", None),
+        ] {
+            assert_eq!(uri_scheme(uri), expected, "for {uri:?}");
+        }
+    }
+
+    #[test]
+    fn normalize_uri_lowercases_scheme_and_authority_only() {
+        for (uri, expected, scheme) in [
+            (
+                "HTTPS://Example.COM/A/B",
+                "https://example.com/A/B",
+                Some("https"),
+            ),
+            ("HTTP://Example.COM", "http://example.com", Some("http")),
+            ("FILE:///Tmp/M.json", "file:///Tmp/M.json", Some("file")),
+            ("URN:X:Y", "urn:X:Y", Some("urn")),
+            ("meta.json", "meta.json", None),
+            ("//Host/Path", "//Host/Path", None),
+        ] {
+            assert_eq!(
+                normalize_uri(uri),
+                (expected.to_owned(), scheme.map(str::to_owned)),
+                "for {uri:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compile_inline_reports_the_normalized_meta_schema_uri() {
+        for (uri, expected) in [
+            (
+                "https://Example.COM/A/B#frag",
+                http_meta_schema_error("https://example.com/A/B"),
+            ),
+            // The bundled-draft prefixes are matched case-sensitively.
+            (
+                "HTTPS://JSON-SCHEMA.ORG/draft/2020-12/schema",
+                http_meta_schema_error("https://json-schema.org/draft/2020-12/schema"),
+            ),
+            (
+                "URN:X:Y",
+                "Resource 'urn:X:Y' is not present in a registry and retrieving it failed: \
+                 Unknown scheme urn"
+                    .to_owned(),
+            ),
+            (
+                "//host/path",
+                "Resource '//host/path' is not present in a registry and retrieving it failed: \
+                 No base URI is available"
+                    .to_owned(),
+            ),
+        ] {
+            let message = compile_error_message(serde_json::json!({"$schema": uri}));
+            assert_eq!(message, expected, "for $schema {uri}");
+        }
+    }
+
+    #[test]
+    fn compile_inline_resolves_meta_schema_against_the_enclosing_id() {
+        for (schema, resolved) in [
+            (
+                serde_json::json!({
+                    "$id": "https://e.com/root",
+                    "properties": {"a": {"$schema": "//other.org/m"}},
+                }),
+                "https://other.org/m",
+            ),
+            (
+                serde_json::json!({
+                    "$id": "https://e.com/dir/root.json",
+                    "properties": {"a": {"$schema": "/x"}},
+                }),
+                "https://e.com/x",
+            ),
+            (
+                serde_json::json!({
+                    "$id": "https://e.com",
+                    "properties": {"a": {"$schema": "m.json"}},
+                }),
+                "https://e.com/m.json",
+            ),
+            (
+                serde_json::json!({
+                    "$id": "https://e.com/a/root.json",
+                    "properties": {"a": {"$schema": "m.json#frag"}},
+                }),
+                "https://e.com/a/m.json",
+            ),
+            (
+                serde_json::json!({
+                    "$id": "https://e.com/a/root.json",
+                    "properties": {"a": {"$schema": "m.json?q=1"}},
+                }),
+                "https://e.com/a/m.json?q=1",
+            ),
+            // A sibling `$id` on the same object does not rebase an
+            // absolute `$schema`.
+            (
+                serde_json::json!({
+                    "properties": {"a": {
+                        "$id": "https://e.com/a",
+                        "$schema": "https://example.com/m",
+                    }},
+                }),
+                "https://example.com/m",
+            ),
+        ] {
+            assert_eq!(
+                compile_error_message(schema.clone()),
+                http_meta_schema_error(resolved),
+                "for {schema}"
+            );
+        }
+    }
+
+    #[test]
+    fn compile_inline_accepts_meta_schema_naming_a_nested_relative_id() {
+        // `$defs/m` registers `meta.json` under the root `$id`, i.e.
+        // `https://e.com/meta.json`; a `$schema` naming it relatively or
+        // absolutely resolves in-document.
+        for reference in ["meta.json", "https://e.com/meta.json"] {
+            assert_compiles(&serde_json::json!({
+                "$id": "https://e.com/root",
+                "$defs": {"m": {"$id": "meta.json"}},
+                "properties": {"a": {"$schema": reference}},
+            }));
+        }
+    }
+
+    #[test]
+    fn compile_inline_rejects_meta_schema_missing_from_the_nested_ids() {
+        let message = compile_error_message(serde_json::json!({
+            "$id": "https://e.com/root",
+            "$defs": {"m": {"$id": "meta.json"}},
+            "properties": {"a": {"$schema": "other.json"}},
+        }));
+        assert_eq!(message, http_meta_schema_error("https://e.com/other.json"));
+    }
+
+    #[test]
+    #[ignore = "bug: dot segments in a `$schema` are not removed before the `$id` lookup and \
+                the error message (jsonschema 0.34 removed them)"]
+    fn compile_inline_meta_schema_resolution_removes_dot_segments() {
+        assert_compiles(&serde_json::json!({
+            "$id": "https://e.com/a/root.json",
+            "$defs": {"m": {"$id": "https://e.com/m.json"}},
+            "properties": {"a": {"$schema": "../m.json"}},
+        }));
+        assert_compiles(&serde_json::json!({
+            "$id": "https://e.com/a/root.json",
+            "$defs": {"m": {"$id": "https://e.com/a/m.json"}},
+            "properties": {"a": {"$schema": "./m.json"}},
+        }));
+        let message = compile_error_message(serde_json::json!({
+            "$id": "https://e.com/a/b/root.json",
+            "properties": {"a": {"$schema": "../m.json"}},
+        }));
+        assert_eq!(message, http_meta_schema_error("https://e.com/a/m.json"));
+    }
+
+    #[test]
+    fn compile_inline_accepts_empty_and_fragment_only_meta_schema() {
+        for schema in [
+            serde_json::json!({"$schema": ""}),
+            serde_json::json!({"$schema": "#"}),
+            serde_json::json!({"$id": "https://e.com/root", "properties": {"a": {"$schema": ""}}}),
+            serde_json::json!({"$id": "https://e.com/root", "properties": {"a": {"$schema": "#"}}}),
+        ] {
+            assert_compiles(&schema);
+        }
+        // And the schema still validates as 2020-12.
+        let yaml: serde_norway::Value =
+            serde_norway::from_str(r#"{"$schema": "", "type": "integer"}"#).expect("yaml");
+        let compiled = compile_inline("test.ok", &yaml, None).expect("compiles");
+        assert!(compiled.validator.is_valid(&serde_json::json!(1)));
+        assert!(!compiled.validator.is_valid(&serde_json::json!({"a": 1})));
+    }
+
+    #[test]
+    fn compile_inline_does_not_walk_the_array_form_of_items() {
+        // 0.34 did not crawl `items: [..]` for resources, so a `$schema`
+        // inside it is never looked up; the 2020-12 validator rejects the
+        // array form itself.
+        let message = compile_error_message(serde_json::json!({
+            "items": [{"$schema": "https://example.com/m"}],
+        }));
+        assert!(
+            !message.contains("not present in a registry"),
+            "array-form `items` must not be walked for `$schema`, got: {message}"
+        );
+        assert!(
+            message.contains(r#"is not of types "boolean", "object""#),
+            "expected the validator's own `items` type error, got: {message}"
+        );
+    }
+
+    #[test]
+    fn compile_inline_walks_object_items_and_prefix_items() {
+        for schema in [
+            serde_json::json!({"items": {"$schema": "https://example.com/m"}}),
+            serde_json::json!({"prefixItems": [{"$schema": "https://example.com/m"}]}),
+        ] {
+            assert_eq!(
+                compile_error_message(schema.clone()),
+                http_meta_schema_error("https://example.com/m"),
+                "for {schema}"
+            );
+        }
+    }
+
+    #[test]
+    fn compile_inline_ignores_meta_schema_lookalikes_in_nested_data_positions() {
+        for schema in [
+            serde_json::json!({"examples": [{"$schema": "https://example.com/m"}]}),
+            serde_json::json!({
+                "properties": {"p": {"default": {"$schema": "https://example.com/m"}}},
+            }),
+            serde_json::json!({
+                "properties": {"p": {"examples": [{"$schema": "https://example.com/m"}]}},
+            }),
+            // A property *named* `$schema` is a schema, not a `$schema` keyword.
+            serde_json::json!({"properties": {"$schema": {"type": "string"}}}),
+        ] {
+            assert_compiles(&schema);
+        }
+    }
+
+    #[test]
+    fn compile_inline_walks_subschemas_named_like_data_keywords() {
+        // Under `$defs` / `properties` the keys are names, so `enum` and
+        // `const` there hold schemas and their `$schema` is looked up.
+        for schema in [
+            serde_json::json!({"$defs": {"enum": {"$schema": "https://example.com/m"}}}),
+            serde_json::json!({"properties": {"enum": {"$schema": "https://example.com/m"}}}),
+            serde_json::json!({"properties": {"const": {"$schema": "https://example.com/m"}}}),
+        ] {
+            assert_eq!(
+                compile_error_message(schema.clone()),
+                http_meta_schema_error("https://example.com/m"),
+                "for {schema}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "bug: find_external_ref walks data positions, so a `$ref` key inside \
+                `const`/`enum`/`default`/`examples` is rejected as an external $ref \
+                (pre-existing, same in the jsonschema 0.34 build)"]
+    fn compile_inline_ignores_ref_lookalikes_in_data_positions() {
+        for schema in [
+            serde_json::json!({"enum": [{"$ref": "https://x.com/y"}]}),
+            serde_json::json!({"const": {"$ref": "https://x.com/y"}}),
+            serde_json::json!({"default": {"$ref": "https://x.com/y"}}),
+            serde_json::json!({"examples": [{"$ref": "https://x.com/y"}]}),
+        ] {
+            assert_compiles(&schema);
+        }
+    }
 }

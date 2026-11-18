@@ -851,6 +851,76 @@ mod tests {
     }
 
     #[test]
+    fn update_builder_sends_the_same_user_agent_on_the_asset_download() {
+        // The listing advertises a newer release whose asset `url` points at
+        // a second local server; that server answers the download with 404,
+        // so the run fails before anything is extracted or replaced.
+        let (asset_url, asset_req) =
+            spawn_one_shot_http_at("/asset/1", http_response("404 Not Found", &[], ""));
+        let listing = serde_json::json!([{
+            "tag_name": "v99999.0.0",
+            "created_at": "2026-01-01T00:00:00Z",
+            "assets": [{
+                "name": format!("dq-v99999.0.0-{}.tar.gz", self_update::get_target()),
+                "url": asset_url,
+            }],
+        }])
+        .to_string();
+        let (list_url, list_req) = spawn_one_shot_http_at(
+            "/repos/mazuninky/dq/releases",
+            http_response(
+                "200 OK",
+                &["Content-Type: application/json"],
+                listing.as_str(),
+            ),
+        );
+        let base = list_url
+            .strip_suffix("/repos/mazuninky/dq/releases")
+            .expect("helper URL ends with the requested path");
+        let mut builder = update_builder(None);
+        // `dq self update` prompts before downloading; a test has no
+        // terminal to answer it.
+        builder.api_base_url(base).no_confirm(true);
+        let err = builder
+            .build()
+            .expect("builder is valid")
+            .update()
+            .expect_err("404 asset download must fail");
+        let (code, _, msg) = mapped(err);
+        assert_eq!(code, 5, "a failed download is a network failure: {msg}");
+
+        let header_values = |raw: &str, name: &str| -> Vec<String> {
+            raw.to_ascii_lowercase()
+                .lines()
+                .filter_map(|line| line.strip_prefix(name).map(|v| v.trim().to_owned()))
+                .collect()
+        };
+        let list_raw =
+            String::from_utf8(list_req.join().expect("listing thread")).expect("ascii request");
+        let asset_raw =
+            String::from_utf8(asset_req.join().expect("asset thread")).expect("ascii request");
+        assert!(
+            asset_raw.to_ascii_lowercase().starts_with("get /asset/1 "),
+            "the asset server must receive the download, got: {asset_raw:?}"
+        );
+        assert_eq!(
+            header_values(&asset_raw, "user-agent:"),
+            vec!["rust/self-update"],
+            "download request was: {asset_raw:?}"
+        );
+        assert_eq!(
+            header_values(&list_raw, "user-agent:"),
+            header_values(&asset_raw, "user-agent:"),
+            "listing request was: {list_raw:?}"
+        );
+        assert_eq!(
+            header_values(&asset_raw, "accept:"),
+            vec!["application/octet-stream"],
+            "download request was: {asset_raw:?}"
+        );
+    }
+
+    #[test]
     fn run_check_renders_outcome_from_tag_name() {
         let (url, _req) = spawn_one_shot_http_at(
             "/releases/latest",
