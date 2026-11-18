@@ -26,7 +26,7 @@ crate-type = ["cdylib"]
 # Guest-side WIT codegen. Pinned to the same major as the host's compiled-in
 # `wit-bindgen` (see `crates/dq-plugin/Cargo.toml`) so the generated bindings
 # match the host's expectations for the `dq:plugin@0.1.0` world.
-wit-bindgen = "0.57.1"
+wit-bindgen = "0.63.0"
 
 [profile.release]
 # Component-model plugins typically benefit from LTO + size-oriented codegen
