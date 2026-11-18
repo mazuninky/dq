@@ -46,3 +46,6 @@ openspec/changes/.openspec.cache/
 
 # Locally built dq-plugin integration-test fixtures (see crates/dq-plugin/tests/fixtures/README.md)
 crates/dq-plugin/tests/fixtures/*.wasm
+
+# Written by `cargo component build`; the example generates its bindings with `wit_bindgen::generate!`
+examples/plugin-rust/src/bindings.rs

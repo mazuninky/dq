@@ -61,9 +61,9 @@ cargo test -p dq-plugin --features plugins
 End-to-end smoke for the example plugin:
 
 ```sh
-cd examples/plugin-rust && cargo component build --release
+cd examples/plugin-rust && cargo component build --release --target wasm32-unknown-unknown
 cd ../.. && cargo run --features plugins -- lint \
-    --plugins examples/plugin-rust/target/wasm32-wasip2/release config.yaml
+    --plugins examples/plugin-rust/target/wasm32-unknown-unknown/release config.yaml
 ```
 
 ## Conventions

@@ -42,15 +42,21 @@ Source lives at `examples/plugin-rust/`. See its README for the full
 walk-through. Short form (Path A — `cargo-component`):
 
 ```sh
-rustup target add wasm32-wasip2
+rustup target add wasm32-unknown-unknown
 cargo install --locked cargo-component
 
 cd examples/plugin-rust
-cargo component build --release
+cargo component build --release --target wasm32-unknown-unknown
 
-cp target/wasm32-wasip2/release/dq_plugin_example_noop.wasm \
+cp target/wasm32-unknown-unknown/release/dq_plugin_example_noop.wasm \
    ../../crates/dq-plugin/tests/fixtures/example_noop.wasm
 ```
+
+Keep `--target wasm32-unknown-unknown` in every recipe below except
+`wasi_plugin.wasm`. Without it `cargo component build` targets
+`wasm32-wasip1` and wraps the module with the WASI adapter, so the
+artifact imports `wasi:cli/*` and `wasi:filesystem/*` and the host
+rejects it.
 
 ### `infinite_loop.wasm` — fuel-exhaustion guest (Task 5.17)
 
@@ -64,25 +70,25 @@ cd /tmp/plugin-loop
 # Replace the lint impl in src/lib.rs with `loop {}`.
 sed -i.bak 's|vec!\[Diagnostic .*\]|{ loop {} }|' src/lib.rs
 
-cargo component build --release
-cp target/wasm32-wasip2/release/*.wasm \
+cargo component build --release --target wasm32-unknown-unknown
+cp target/wasm32-unknown-unknown/release/*.wasm \
    /path/to/dq/crates/dq-plugin/tests/fixtures/infinite_loop.wasm
 ```
 
 ### `wasi_plugin.wasm` — disallowed-import guest (Task 5.18)
 
-A guest that pulls a `wasi:io/streams` import (or any `wasi:*` /
-`wasi_snapshot_preview1` symbol). Sketch — add a WASI dependency to the
-guest's WIT world and re-export a function that uses it:
+A guest that imports any `wasi:*` interface. The unmodified example
+built without `--target` is one: `cargo component build` then targets
+`wasm32-wasip1` and wraps the module with the WASI preview1 adapter,
+which imports `wasi:cli/*`, `wasi:filesystem/*` and `wasi:io/*`.
 
 ```sh
-# In a copy of examples/plugin-rust/wit/world.wit, add:
-#   import wasi:io/streams@0.2.0;
-# Then in src/lib.rs reference any wasi:io::streams item so wasm-tools
-# does not optimize the import away.
+rustup target add wasm32-wasip1
+
+cd examples/plugin-rust
 cargo component build --release
-cp target/wasm32-wasip2/release/*.wasm \
-   /path/to/dq/crates/dq-plugin/tests/fixtures/wasi_plugin.wasm
+cp target/wasm32-wasip1/release/dq_plugin_example_noop.wasm \
+   ../../crates/dq-plugin/tests/fixtures/wasi_plugin.wasm
 ```
 
 ### `wrong_version.wasm` — WIT major mismatch (Task 5.20)
@@ -99,8 +105,8 @@ cd /tmp/plugin-v2
 sed -i.bak 's/dq:plugin@0\.1\.0/dq:plugin@2.0.0/g' wit/world.wit
 sed -i.bak 's/@0\.1\.0/@2.0.0/g' wit/world.wit
 
-cargo component build --release
-cp target/wasm32-wasip2/release/*.wasm \
+cargo component build --release --target wasm32-unknown-unknown
+cp target/wasm32-unknown-unknown/release/*.wasm \
    /path/to/dq/crates/dq-plugin/tests/fixtures/wrong_version.wasm
 ```
 
@@ -122,7 +128,7 @@ cd /tmp/plugin-malformed
 # Replace `Ok(b"[]".to_vec())` with `Ok(b"not json".to_vec())` in src/lib.rs.
 sed -i.bak 's|Ok(b"\[\]".to_vec())|Ok(b"not json".to_vec())|' src/lib.rs
 
-cargo component build --release
-cp target/wasm32-wasip2/release/*.wasm \
+cargo component build --release --target wasm32-unknown-unknown
+cp target/wasm32-unknown-unknown/release/*.wasm \
    /path/to/dq/crates/dq-plugin/tests/fixtures/malformed_fix.wasm
 ```

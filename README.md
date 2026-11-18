@@ -266,9 +266,9 @@ WASM lint+fix plugins via a WIT-described ABI and a `wasmtime` runtime (Componen
 cargo install --locked --features plugins dq-cli
 
 # Build the example plugin
-cd examples/plugin-rust && cargo component build --release
+cd examples/plugin-rust && cargo component build --release --target wasm32-unknown-unknown
 mkdir -p ../../plugins
-cp target/wasm32-wasip2/release/dq_plugin_example_noop.wasm ../../plugins/
+cp target/wasm32-unknown-unknown/release/dq_plugin_example_noop.wasm ../../plugins/
 
 # Use it
 cd ../..
