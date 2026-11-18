@@ -252,10 +252,10 @@ fn set_of_a_new_key_in_a_crlf_file_ends_its_lines_with_crlf() {
         set(
             "yaml",
             "a:\r\n  x: 1\r\n",
-            "/a/y",
+            "/a/z",
             Value::Array(vec![Value::Int(1)])
         ),
-        "a:\r\n  x: 1\r\n  y:\r\n    - 1\r\n"
+        "a:\r\n  x: 1\r\n  z:\r\n    - 1\r\n"
     );
     assert_eq!(
         set("yaml", "a:\r\n  b: |\r\n    x", "/c", Value::Int(1)),

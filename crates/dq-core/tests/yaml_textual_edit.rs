@@ -275,8 +275,8 @@ fn set_of_a_scalar_drops_its_core_tag_and_keeps_the_rest() {
         "b: &a 7\nc: *a\n"
     );
     assert_eq!(
-        set("b: !custom x\n", "/b", Value::String("y".into())),
-        "b: !custom y\n"
+        set("b: !custom x\n", "/b", Value::String("z".into())),
+        "b: !custom z\n"
     );
 }
 
@@ -343,8 +343,37 @@ fn a_string_the_reader_would_type_otherwise_is_quoted() {
             "{text}"
         );
     }
-    // What the reader takes as a string stays plain.
-    for text in ["y", "2024-01-01", "12:30", "1_000", "a-b"] {
+    // dq reads these as strings, a YAML 1.1 reader (go-yaml, PyYAML) does
+    // not: ints, sexagesimals, floats, timestamps, bools, merge and value
+    // keys.
+    for text in [
+        "1_000",
+        "0b101",
+        "017",
+        "1:20",
+        "12:30:45",
+        "190:20:30.15",
+        "1.",
+        "1_000.5",
+        "2001-12-14",
+        "2001-12-14t21:59:43.10-05:00",
+        "2001-12-14 21:59:43.10 -5",
+        "2001-12-14T21:59:43Z",
+        "y",
+        "N",
+        "<<",
+        "=",
+    ] {
+        assert_eq!(
+            set("j: 1\n", "/j", Value::String(text.into())),
+            format!("j: \"{text}\"\n"),
+            "{text}"
+        );
+    }
+    // What every schema takes as a string stays plain.
+    for text in [
+        "12:30:4x", "2024-1-1", "1.2.3", "a-b", "yes!", "<<a", "v1.0",
+    ] {
         assert_eq!(
             set("j: 1\n", "/j", Value::String(text.into())),
             format!("j: {text}\n"),

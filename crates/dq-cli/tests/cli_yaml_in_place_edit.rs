@@ -224,9 +224,10 @@ fn a_string_the_reader_would_type_otherwise_is_written_quoted() {
             "{text}: {out:?}"
         );
     }
-    // A date stays plain: dq reads it back as a string.
+    // A date is quoted too: dq reads it back as a string, a YAML 1.1
+    // reader (go-yaml, PyYAML) as a timestamp.
     let out = in_place("j: 1\n", "set", &["/j", "2024-01-01", "--value-string"]);
-    assert_eq!(out, "j: 2024-01-01\n");
+    assert_eq!(out, "j: \"2024-01-01\"\n");
     assert_eq!(read_back(&out), serde_json::json!({"j": "2024-01-01"}));
 }
 

@@ -51,8 +51,8 @@ fn set_on_single_key_file_with_bom_rewrites_the_value_and_keeps_the_bom() {
     // The 0.0.6 build failed with exit 2 "path '/key' not found".
     let file = write_yaml(BOM_ONE_KEY);
     assert_eq!(
-        stdout_of(&["set"], &file, &["/key", "y"]),
-        b"\xEF\xBB\xBFkey: y\n"
+        stdout_of(&["set"], &file, &["/key", "z"]),
+        b"\xEF\xBB\xBFkey: z\n"
     );
     assert_eq!(
         std::fs::read(&file).unwrap(),
@@ -64,8 +64,8 @@ fn set_on_single_key_file_with_bom_rewrites_the_value_and_keeps_the_bom() {
 #[test]
 fn set_in_place_on_single_key_file_with_bom_writes_the_file() {
     let file = write_yaml(BOM_ONE_KEY);
-    stdout_of(&["-i", "set"], &file, &["/key", "y"]);
-    assert_eq!(std::fs::read(&file).unwrap(), b"\xEF\xBB\xBFkey: y\n");
+    stdout_of(&["-i", "set"], &file, &["/key", "z"]);
+    assert_eq!(std::fs::read(&file).unwrap(), b"\xEF\xBB\xBFkey: z\n");
 }
 
 /// A nested plain scalar spread over two lines, with no newline at EOF.

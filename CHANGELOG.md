@@ -292,10 +292,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   style (`b:` + `  - {"x": 1}`); it used to write `{}` / `[]` in its
   place. Inside a flow mapping the new entry stays on its line
   (`a: {x: 1, z: [1]}`); one holding a collection used to break the file.
-- YAML `set` of a string the reader would take as something else —
-  `.nan`, `.inf`, `0x10`, `0o17`, `~`, `Null`, `+1` — writes it quoted;
-  it used to write it plain, so it read back as a number or `null`. The
-  same goes for a new key such as `null`.
+- YAML `set` of a string a YAML reader would take as something else
+  writes it quoted. That covers what dq itself types — `.nan`, `.inf`,
+  `0x10`, `0o17`, `~`, `Null`, `+1` — and what YAML 1.1 readers such as
+  go-yaml (Kubernetes, GitHub Actions) and PyYAML type: `1_000`, `017`,
+  `1:20`, `2001-12-14`, `y`, `n`, `<<`, `=`. It used to write them plain,
+  so they read back as a number, a date, a bool or `null`. The same goes
+  for a new key such as `null` or `<<`.
 - YAML `set` of a scalar with a `!!` tag (`!!binary |`, `!!int 5`) drops
   the tag, so the new value is typed by what it is; it used to keep it,
   and `!!binary hi` no longer parses. Anchors and local tags (`!Ref`)
