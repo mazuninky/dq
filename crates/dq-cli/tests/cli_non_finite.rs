@@ -88,7 +88,7 @@ fn convert_to_yaml_or_toml_keeps_nan_and_infinity_as_floats() {
     ]);
     assert_eq!(
         stdout_of(&dir, &["-F", "yaml", "convert", "n.yaml"]),
-        "x: .nan\ny: -.inf\nl:\n- .inf\nm:\n  k: .nan\n"
+        "x: .nan\n'y': -.inf\nl:\n- .inf\nm:\n  k: .nan\n"
     );
     assert_eq!(
         stdout_of(&dir, &["-F", "toml", "convert", "n.yaml"]),
@@ -277,7 +277,9 @@ fn set_jq_in_place_keeps_untouched_nan_and_infinity_byte_for_byte() {
             .success()
             .stdout("");
     }
-    assert_eq!(read(&dir, "x.yaml"), "x: .nan\ny: -.inf\nz: 2\n");
+    // The jq path re-emits the YAML file: the key `y` is quoted, a bool to a
+    // YAML 1.1 reader.
+    assert_eq!(read(&dir, "x.yaml"), "x: .nan\n'y': -.inf\nz: 2\n");
     assert_eq!(read(&dir, "x.toml"), "x = nan\ny = -inf\nz = 2\n");
 }
 
@@ -410,7 +412,7 @@ fix:
         (read(&dir, "x.yaml"), read(&dir, "x.toml"))
     };
     let fixed = (
-        "x: .nan\ny: -.inf\nz: 2\n".to_owned(),
+        "x: .nan\n'y': -.inf\nz: 2\n".to_owned(),
         "x = nan\ny = -inf\nz = 2\n".to_owned(),
     );
     assert_eq!(fix("Modified: 2, Skipped: 0, Failed: 0\n"), fixed);
@@ -419,9 +421,10 @@ fix:
 
 #[test]
 fn set_jq_leaves_finite_numbers_as_head_wrote_them() {
-    // `b` and `c` are what HEAD 427397b wrote too: the jq path re-emits
-    // through the YAML writer, which spells `1e3` as `1000.0` and quotes an
-    // integer past `i64` (`yaml_writer_keeps_a_big_integer_a_number` below).
+    // `b` is what HEAD 427397b wrote too: the jq path re-emits through the
+    // YAML writer, which spells `1e3` as `1000.0`. `c`, an integer past
+    // `i64`, stays a plain integer (`yaml_writer_keeps_a_big_integer_a_number`
+    // below).
     let dir = dir_with(&[(
         "f.yaml",
         "a: 1.0\nb: 1e3\nc: 18446744073709551615\nd: 0.1\n",
@@ -433,12 +436,11 @@ fn set_jq_leaves_finite_numbers_as_head_wrote_them() {
         .stdout("");
     assert_eq!(
         read(&dir, "f.yaml"),
-        "a: 1.0\nb: 1000.0\nc: '18446744073709551615'\nd: 0.1\ne: 1\n"
+        "a: 1.0\nb: 1000.0\nc: 18446744073709551615\nd: 0.1\ne: 1\n"
     );
 }
 
 #[test]
-#[ignore = "bug: `printf 'c: 18446744073709551615\\n' > f.yaml; dq set --jq '.e = 1' -i f.yaml; dq type f.yaml /c` prints `string` (was `int`); `dq -F yaml convert f.yaml` quotes it too"]
 fn yaml_writer_keeps_a_big_integer_a_number() {
     let dir = dir_with(&[("f.yaml", "c: 18446744073709551615\n")]);
     assert_eq!(stdout_of(&dir, &["type", "f.yaml", "/c"]), "int\n");

@@ -1,0 +1,670 @@
+//! The native YAML writer: serde_norway's emitter, plus the scalar spellings
+//! it cannot choose itself.
+//!
+//! serde_norway decides a string's style with its own YAML 1.2 resolver, so
+//! it writes `1:20`, `y`, `on` or `2001-12-14` plain — and a YAML 1.1 reader
+//! (PyYAML; go-yaml as used by Kubernetes and Helm) takes them for an int, a
+//! bool, a date. It has no style hook, and it writes a [`Value::BigInt`] or
+//! a [`Value::BigFloat`] as a string. This module walks the [`Value`] tree
+//! itself and hands the emitter, in place of each such scalar:
+//!
+//! - a call that already yields the right scalar — `serialize_char` (always
+//!   single-quoted) for a one-character string, `serialize_u64` (plain) for
+//!   a big integer that fits `u64`;
+//! - otherwise a *placeholder* — a plain token, swapped for the right text
+//!   after emission.
+//!
+//! A placeholder is the nonce `Z<lowercase letters>` padded with `x`. The
+//! nonce is chosen so that no string, key or number literal of the tree
+//! contains it; the emitter copies printable ASCII verbatim and never makes
+//! an uppercase `Z` itself (escapes are `\x..` with `0-9A-F`, `\N`, `\L`, …),
+//! so the nonce occurs in the output only where a placeholder was written.
+//! The substitution checks that anyway: it runs only when the nonce occurs
+//! exactly once per placeholder, at a placeholder. As `Z` occurs in a
+//! placeholder only at its start, two occurrences cannot overlap, and the
+//! emitter writes scalars in tree order, so the n-th occurrence is the n-th
+//! placeholder.
+//!
+//! A key placeholder is as long as the quoted key it stands for, so the
+//! value after it lands in the same column, and the emitter's choice between
+//! a simple key and a `? ` complex key (more than 128 bytes of content) is
+//! the one it makes for the quoted key. The emitter is set to an unlimited
+//! width: it never folds a line, so the column matters to nothing else.
+
+use std::cell::RefCell;
+use std::collections::HashSet;
+
+use serde::ser::{Error as _, SerializeMap, SerializeSeq};
+use serde::{Serialize, Serializer};
+
+use crate::document::{Value, non_finite_literal};
+
+/// Writes `v` as one YAML document — what `serde_norway::to_string` writes,
+/// except for the scalars listed in the module docs.
+pub(super) fn to_yaml_string(v: &Value) -> Result<String, serde_norway::Error> {
+    for nonce in free_nonces(v).take(MAX_ATTEMPTS) {
+        let ctx = Ctx {
+            nonce,
+            fixes: RefCell::new(Vec::new()),
+        };
+        let out = serde_norway::to_string(&Node {
+            value: v,
+            ctx: &ctx,
+        })?;
+        let fixes = ctx.fixes.into_inner();
+        if fixes.is_empty() {
+            return Ok(out);
+        }
+        if let Some(done) = substitute(&out, &ctx.nonce, &fixes) {
+            return Ok(done);
+        }
+    }
+    Err(serde_norway::Error::custom(
+        "the YAML writer found its placeholders clash with the output",
+    ))
+}
+
+/// Whether a YAML 1.1 reader (go-yaml, as in Kubernetes and GitHub
+/// Actions; PyYAML) or a YAML 1.2 core / JSON schema one would take the
+/// plain scalar `s` for something other than a string — a bool, null,
+/// int (`1_000`, `0b1`, `017`, `1:20`), float (`1.`, `1e3`), timestamp
+/// (`2001-12-14`), or the `<<` / `=` keys — though dq's own reader may
+/// not.
+pub(super) fn typed_by_another_schema(s: &str) -> bool {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(concat!(
+            r"^(?:",
+            r"~|null|Null|NULL",
+            r"|y|Y|yes|Yes|YES|n|N|no|No|NO|true|True|TRUE|false|False|FALSE",
+            r"|on|On|ON|off|Off|OFF",
+            r"|[-+]?0b[01_]+|[-+]?0o?[0-7_]+|[-+]?0x[0-9a-fA-F_]+",
+            r"|[-+]?(?:0|[1-9][0-9_]*)(?::[0-5]?[0-9])*",
+            r"|[-+]?(?:[0-9][0-9_]*)?\.[0-9_]*(?:[eE][-+]?[0-9]+)?",
+            r"|[-+]?[0-9][0-9_]*[eE][-+]?[0-9]+",
+            r"|[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+\.[0-9_]*",
+            r"|[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN)",
+            r"|[0-9]{4}-[0-9]{2}-[0-9]{2}",
+            r"|[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}(?:[Tt]|[ \t]+)[0-9]{1,2}:[0-9]{2}:[0-9]{2}",
+            r"(?:\.[0-9]*)?(?:[ \t]*(?:Z|[-+][0-9]{1,2}(?::[0-9]{2})?))?",
+            r"|<<|=",
+            r")$",
+        ))
+        .expect("the YAML type regex compiles")
+    })
+    .is_match(s)
+}
+
+/// Emissions tried with a nonce the tree does not contain. The first one
+/// succeeds — the emitter makes no `Z` of its own — so a failure means that
+/// reasoning broke, and the writer errs instead of looping.
+const MAX_ATTEMPTS: usize = 4;
+
+/// The longest key content the emitter writes as a simple key.
+const MAX_SIMPLE_KEY: usize = 128;
+
+/// The nonce letters, rare ones first, so the first nonce is almost always
+/// free.
+const LETTERS: &[u8; 26] = b"qjxzvkwyfbgpmhdcultsnreoai";
+
+/// The longest run of lowercase letters after a `Z` that is kept: 26^13
+/// windows are more than any tree has `Z`s, so a nonce is never longer.
+const MAX_RUN: usize = 13;
+
+/// The nonces `Z` + `len` letters that no key, string or number literal of
+/// `v` contains, in [`LETTERS`] order, for the shortest `len` that leaves
+/// one.
+///
+/// One pass over the tree records, for every `Z`, the lowercase letters
+/// after it. `Z` + `w` occurs in the tree exactly when `w` is the first
+/// `len` of those letters after some `Z`, so the occupied words of a length
+/// are a set no larger than the number of `Z`s, and the first length with a
+/// word outside the set is found without scanning the tree again.
+fn free_nonces(v: &Value) -> impl Iterator<Item = String> {
+    let mut runs = Vec::new();
+    collect_runs(v, &mut runs);
+    let (len, taken) = (1..=MAX_RUN as u32)
+        .map(|len| {
+            let taken: HashSet<u64> = runs
+                .iter()
+                .filter(|&&(run, _)| run >= len)
+                .map(|&(run, packed)| packed / 26u64.pow(run - len))
+                .collect();
+            (len, taken)
+        })
+        .find(|(len, taken)| (taken.len() as u64) < 26u64.pow(*len))
+        .expect("more letters than `Z`s in any tree");
+    (0..26u64.pow(len)).filter_map(move |index| {
+        let mut word = vec![b'Z'];
+        let mut packed = 0u64;
+        let mut rest = index;
+        for _ in 0..len {
+            let letter = LETTERS[(rest % 26) as usize];
+            rest /= 26;
+            word.push(letter);
+            packed = packed * 26 + u64::from(letter - b'a');
+        }
+        (!taken.contains(&packed)).then(|| String::from_utf8(word).expect("ASCII"))
+    })
+}
+
+/// Appends, for every `Z` in a key, string or number literal of `v`, the
+/// number of lowercase letters after it (at most [`MAX_RUN`]) and those
+/// letters packed in base 26, first letter most significant.
+fn collect_runs(v: &Value, runs: &mut Vec<(u32, u64)>) {
+    fn scan(s: &str, runs: &mut Vec<(u32, u64)>) {
+        let bytes = s.as_bytes();
+        for (at, _) in bytes.iter().enumerate().filter(|&(_, &b)| b == b'Z') {
+            let mut packed = 0u64;
+            let mut run = 0u32;
+            for &b in bytes[at + 1..].iter().take(MAX_RUN) {
+                if !b.is_ascii_lowercase() {
+                    break;
+                }
+                packed = packed * 26 + u64::from(b - b'a');
+                run += 1;
+            }
+            runs.push((run, packed));
+        }
+    }
+    match v {
+        Value::String(s) | Value::BigInt(s) | Value::BigFloat(s) => scan(s, runs),
+        Value::Array(items) => items.iter().for_each(|item| collect_runs(item, runs)),
+        Value::Map(map) => {
+            for (k, item) in map {
+                scan(k, runs);
+                collect_runs(item, runs);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) => {}
+    }
+}
+
+/// One placeholder written and the text that replaces it.
+struct Fix {
+    placeholder: String,
+    text: String,
+}
+
+/// The nonce of one emission attempt and the placeholders it wrote, in
+/// emission order.
+struct Ctx {
+    nonce: String,
+    fixes: RefCell<Vec<Fix>>,
+}
+
+impl Ctx {
+    /// Writes a placeholder `len` bytes long (or the bare nonce, if that is
+    /// longer) to stand for `text`.
+    fn placeholder<S: Serializer>(
+        &self,
+        serializer: S,
+        text: String,
+        len: usize,
+    ) -> Result<S::Ok, S::Error> {
+        let mut placeholder = self.nonce.clone();
+        while placeholder.len() < len {
+            placeholder.push('x');
+        }
+        let result = serializer.serialize_str(&placeholder);
+        self.fixes.borrow_mut().push(Fix { placeholder, text });
+        result
+    }
+}
+
+/// A value of the tree, serialized as `Value`'s own `Serialize` impl does
+/// it except for the scalars this module respells.
+struct Node<'a> {
+    value: &'a Value,
+    ctx: &'a Ctx,
+}
+
+/// A mapping key and the value it maps to.
+struct Key<'a> {
+    key: &'a str,
+    value: &'a Value,
+    ctx: &'a Ctx,
+}
+
+impl Serialize for Node<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.value {
+            Value::String(s) => match quoted_for_other_readers(s) {
+                Some(Quoted::Char(c)) => serializer.serialize_char(c),
+                Some(Quoted::Text(text)) => self.ctx.placeholder(serializer, text, 0),
+                None => serializer.serialize_str(s),
+            },
+            Value::BigInt(s) => match plain_u64(s) {
+                Some(u) => serializer.serialize_u64(u),
+                None => serializer.serialize_str(s),
+            },
+            Value::BigFloat(s) => {
+                if let Some(f) = non_finite_literal(s) {
+                    serializer.serialize_f64(f)
+                } else if let Some(text) = yaml11_float(s) {
+                    self.ctx.placeholder(serializer, text, 0)
+                } else {
+                    serializer.serialize_str(s)
+                }
+            }
+            Value::Array(items) => {
+                let mut seq = serializer.serialize_seq(Some(items.len()))?;
+                for item in items {
+                    seq.serialize_element(&Node {
+                        value: item,
+                        ctx: self.ctx,
+                    })?;
+                }
+                seq.end()
+            }
+            Value::Map(map) => {
+                let mut m = serializer.serialize_map(Some(map.len()))?;
+                for (k, item) in map {
+                    m.serialize_entry(
+                        &Key {
+                            key: k,
+                            value: item,
+                            ctx: self.ctx,
+                        },
+                        &Node {
+                            value: item,
+                            ctx: self.ctx,
+                        },
+                    )?;
+                }
+                m.end()
+            }
+            Value::Float(f) => match yaml11_exponent_float(*f) {
+                Some(text) => self.ctx.placeholder(serializer, text, 0),
+                None => serializer.serialize_f64(*f),
+            },
+            Value::Null | Value::Bool(_) | Value::Int(_) => self.value.serialize(serializer),
+        }
+    }
+}
+
+impl Serialize for Key<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if is_merge(self.key, self.value) {
+            return serializer.serialize_str(self.key);
+        }
+        match quoted_for_other_readers(self.key) {
+            Some(Quoted::Char(c)) => serializer.serialize_char(c),
+            Some(Quoted::Text(text)) => {
+                // As long as the quoted key, unless that would cross the
+                // simple-key limit the bare content stays under.
+                let len = if text.len() <= MAX_SIMPLE_KEY {
+                    text.len()
+                } else {
+                    self.key.len()
+                };
+                self.ctx.placeholder(serializer, text, len)
+            }
+            None => serializer.serialize_str(self.key),
+        }
+    }
+}
+
+/// Whether `<<: value` is a merge a YAML 1.1 reader can apply — a mapping
+/// or a sequence of mappings, an empty sequence included. Such a key is
+/// written plain, as before, so a YAML 1.1 reader merges it.
+///
+/// That holds whatever the document came from: a `"<<"` key over a mapping
+/// in JSON or TOML input is a literal key there, and comes out as a merge
+/// to those readers. The writer cannot tell the two apart — dq reads a YAML
+/// merge key as the plain key `<<`, with the aliased mapping copied in —
+/// and the trade-off favours the common case: quoting the key would turn
+/// every merge of a docker-compose or Helm file that `set --jq` or `fix`
+/// re-emits into a literal `<<` key. Any other value is no merge (a YAML
+/// 1.1 reader fails on it), and the key is quoted.
+fn is_merge(key: &str, value: &Value) -> bool {
+    key == "<<"
+        && match value {
+            Value::Map(_) => true,
+            Value::Array(items) => items.iter().all(|item| matches!(item, Value::Map(_))),
+            _ => false,
+        }
+}
+
+/// How a string the emitter would write plain, though another YAML reader
+/// types it, is written instead.
+enum Quoted {
+    /// One character: `serialize_char` single-quotes it.
+    Char(char),
+    /// The single-quoted scalar.
+    Text(String),
+}
+
+fn quoted_for_other_readers(s: &str) -> Option<Quoted> {
+    if !typed_by_another_schema(s) || !emitted_plain(s) {
+        return None;
+    }
+    let mut chars = s.chars();
+    if let (Some(c), None) = (chars.next(), chars.next()) {
+        return Some(Quoted::Char(c));
+    }
+    Some(Quoted::Text(format!("'{}'", s.replace('\'', "''"))))
+}
+
+/// Whether serde_norway writes the string `s` as a plain scalar. Its choice
+/// for a one-line, non-empty string is the same as a document, a value or
+/// a key, so the string is asked alone.
+fn emitted_plain(s: &str) -> bool {
+    serde_norway::to_string(s).is_ok_and(|out| out.strip_suffix('\n').is_some_and(|text| text == s))
+}
+
+/// The respelling of a finite float serde_norway writes in exponent form
+/// that a YAML 1.1 reader takes for a string — no `.` (`1e16`, `-1e-7`) or
+/// an unsigned exponent (`1.5e300`): `1.0e+16`, `-1.0e-7`, `1.5e+300`.
+/// The digits are serde_norway's (ryu's shortest round-trip), so dq reads
+/// the same `f64` back. `None` when serde_norway's spelling stands — any
+/// float it writes without an exponent, `-0.0` included.
+fn yaml11_exponent_float(f: f64) -> Option<String> {
+    // ryu switches to an exponent only at or above 1e16 and below 1e-5;
+    // the cheap bounds keep every other float off the second emission.
+    let magnitude = f.abs();
+    if !f.is_finite() || f == 0.0 || (1e-4..1e15).contains(&magnitude) {
+        return None;
+    }
+    let written = serde_norway::to_string(&f).ok()?;
+    let written = written.strip_suffix('\n')?;
+    if !written.contains(['e', 'E']) {
+        return None;
+    }
+    yaml11_float(written).filter(|text| text != written)
+}
+
+/// The `u64` a big-integer literal spells exactly — a plain integer that
+/// dq's reader reads back as the same [`Value::BigInt`]. A literal past
+/// `u64` (or below `i64::MIN`) stays a string: serde_norway's reader
+/// rejects a plain `u128` / `i128` and rounds anything longer to a float.
+fn plain_u64(literal: &str) -> Option<u64> {
+    literal
+        .parse::<u64>()
+        .ok()
+        .filter(|u| u.to_string() == literal)
+}
+
+/// A float literal spelled as a float to a YAML 1.1 reader too: a `.` in
+/// the mantissa and a signed exponent (`1e400` → `1.0e+400`), which a
+/// YAML 1.2 core reader also matches as a float. `None` for anything not
+/// shaped `[-+]digits[.digits][e[-+]digits]`.
+///
+/// dq's own reader cannot give the [`Value::BigFloat`] back whatever the
+/// spelling: serde_norway rounds a long literal to an `f64` and reads one
+/// past `f64` (`1.0e+400`) as a string, like a quoted one.
+fn yaml11_float(literal: &str) -> Option<String> {
+    let (sign, rest) = match literal.as_bytes().first()? {
+        b'-' | b'+' => literal.split_at(1),
+        _ => ("", literal),
+    };
+    let (mantissa, exponent) = match rest.find(['e', 'E']) {
+        Some(at) => (&rest[..at], Some((&rest[at..=at], &rest[at + 1..]))),
+        None => (rest, None),
+    };
+    let (int, frac) = match mantissa.split_once('.') {
+        Some((int, frac)) => (int, Some(frac)),
+        None => (mantissa, None),
+    };
+    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(int) || !frac.is_none_or(digits) || int.len() + frac.map_or(0, str::len) == 0 {
+        return None;
+    }
+    // `.5` needs no `0` in YAML 1.2, but a YAML 1.1 reader (PyYAML) reads
+    // `-.5e-3` as a string: a sign wants a digit before the dot.
+    let int = if int.is_empty() { "0" } else { int };
+    let mut out = format!("{sign}{int}.");
+    match frac {
+        Some(frac) => out.push_str(frac),
+        None => out.push('0'),
+    }
+    if let Some((e, exp)) = exponent {
+        let (exp_sign, exp_digits) = match exp.as_bytes().first()? {
+            b'-' | b'+' => exp.split_at(1),
+            _ => ("+", exp),
+        };
+        if exp_digits.is_empty() || !digits(exp_digits) {
+            return None;
+        }
+        out.push_str(e);
+        out.push_str(exp_sign);
+        out.push_str(exp_digits);
+    }
+    Some(out)
+}
+
+/// Replaces the placeholders of `out` with their text, or `None` unless
+/// the nonce occurs exactly once per placeholder, each time at one.
+fn substitute(out: &str, nonce: &str, fixes: &[Fix]) -> Option<String> {
+    let hits: Vec<usize> = out.match_indices(nonce).map(|(at, _)| at).collect();
+    if hits.len() != fixes.len() {
+        return None;
+    }
+    let mut done = String::with_capacity(out.len());
+    let mut from = 0;
+    for (&at, fix) in hits.iter().zip(fixes) {
+        let end = at + fix.placeholder.len();
+        let whole_token = out
+            .as_bytes()
+            .get(end)
+            .is_none_or(|b| !b.is_ascii_alphanumeric());
+        if out.get(at..end) != Some(fix.placeholder.as_str()) || !whole_token {
+            return None;
+        }
+        done.push_str(&out[from..at]);
+        done.push_str(&fix.text);
+        from = end;
+    }
+    done.push_str(&out[from..]);
+    Some(done)
+}
+
+#[cfg(test)]
+mod tests {
+    use indexmap::IndexMap;
+
+    use crate::format::Format as _;
+
+    use super::*;
+
+    fn yaml(v: &Value) -> String {
+        to_yaml_string(v).unwrap()
+    }
+
+    fn map(entries: &[(&str, Value)]) -> Value {
+        let mut m = IndexMap::new();
+        for (k, v) in entries {
+            m.insert((*k).to_owned(), v.clone());
+        }
+        Value::Map(m)
+    }
+
+    fn s(text: &str) -> Value {
+        Value::String(text.to_owned())
+    }
+
+    #[test]
+    fn quotes_strings_a_yaml_1_1_reader_types() {
+        let v = map(&[("a", s("1:20")), ("b", s("y")), ("c", s("2001-12-14"))]);
+        assert_eq!(yaml(&v), "a: '1:20'\nb: 'y'\nc: '2001-12-14'\n");
+    }
+
+    #[test]
+    fn quotes_such_keys_and_keeps_the_value_column() {
+        let v = map(&[("on", s("x")), ("y", Value::Int(1)), ("plain", s("on"))]);
+        assert_eq!(yaml(&v), "'on': x\n'y': 1\nplain: 'on'\n");
+    }
+
+    #[test]
+    fn keeps_a_merge_key_plain_and_quotes_any_other() {
+        let inner = map(&[("x", Value::Int(1))]);
+        let merge = map(&[("<<", inner.clone()), ("k", Value::Int(2))]);
+        assert_eq!(yaml(&merge), "<<:\n  x: 1\nk: 2\n");
+        let list = map(&[("<<", Value::Array(vec![inner])), ("k", Value::Int(2))]);
+        assert_eq!(yaml(&list), "<<:\n- x: 1\nk: 2\n");
+        let scalar = map(&[("<<", s("x")), ("k", s("<<"))]);
+        assert_eq!(yaml(&scalar), "'<<': x\nk: '<<'\n");
+    }
+
+    #[test]
+    fn leaves_strings_serde_norway_already_quotes() {
+        let v = map(&[("a", s("0o17")), ("b", s("true")), ("c", s("hello"))]);
+        assert_eq!(yaml(&v), serde_norway::to_string(&v).unwrap());
+    }
+
+    #[test]
+    fn writes_a_big_integer_in_u64_plain() {
+        let v = map(&[("c", Value::BigInt("18446744073709551615".into()))]);
+        assert_eq!(yaml(&v), "c: 18446744073709551615\n");
+    }
+
+    #[test]
+    fn keeps_a_big_integer_past_u64_a_string() {
+        let v = map(&[("c", Value::BigInt("123456789012345678901234567890".into()))]);
+        assert_eq!(yaml(&v), "c: '123456789012345678901234567890'\n");
+    }
+
+    #[test]
+    fn writes_an_exponent_float_with_a_dot_and_a_signed_exponent() {
+        let floats = [
+            1e16,
+            -1e16,
+            1e-7,
+            -1e-7,
+            1.5e300,
+            1.5e-7,
+            2.5e-300,
+            f64::MAX,
+        ];
+        let v = Value::Array(floats.iter().copied().map(Value::Float).collect());
+        let out = yaml(&v);
+        assert_eq!(
+            out,
+            "- 1.0e+16\n- -1.0e+16\n- 1.0e-7\n- -1.0e-7\n- 1.5e+300\n- 1.5e-7\n\
+             - 2.5e-300\n- 1.7976931348623157e+308\n"
+        );
+        let Value::Array(back) = crate::parsers::Yaml
+            .parse(out.as_bytes())
+            .unwrap()
+            .value()
+            .clone()
+        else {
+            panic!("an array");
+        };
+        for (f, read) in floats.iter().zip(back) {
+            let Value::Float(read) = read else {
+                panic!("{f} read back as {read:?}");
+            };
+            assert_eq!(read.to_bits(), f.to_bits(), "{f}");
+        }
+    }
+
+    #[test]
+    fn leaves_floats_written_without_an_exponent_as_head_wrote_them() {
+        let v = Value::Array(
+            [
+                0.0,
+                -0.0,
+                0.1,
+                -2.25,
+                1e15,
+                9999999999999998.0,
+                1e-5,
+                123456.789,
+            ]
+            .into_iter()
+            .map(Value::Float)
+            .collect(),
+        );
+        assert_eq!(yaml(&v), serde_norway::to_string(&v).unwrap());
+    }
+
+    #[test]
+    fn writes_a_big_float_as_a_yaml_1_1_float() {
+        let v = Value::Array(vec![
+            Value::BigFloat("1e400".into()),
+            Value::BigFloat("-1.5E-400".into()),
+            Value::BigFloat("3.14159265358979323846264338327".into()),
+            Value::BigFloat(".nan".into()),
+        ]);
+        assert_eq!(
+            yaml(&v),
+            "- 1.0e+400\n- -1.5E-400\n- 3.14159265358979323846264338327\n- .nan\n"
+        );
+    }
+
+    #[test]
+    fn leaves_a_big_float_of_another_shape_as_head_wrote_it() {
+        let v = Value::BigFloat("Infinity".into());
+        assert_eq!(yaml(&v), serde_norway::to_string(&v).unwrap());
+    }
+
+    #[test]
+    fn avoids_a_nonce_the_tree_contains() {
+        let v = map(&[("Zq", s("Zj Zqx")), ("k", s("on"))]);
+        assert_eq!(yaml(&v), "Zq: Zj Zqx\nk: 'on'\n");
+    }
+
+    #[test]
+    fn substitute_refuses_a_stray_nonce() {
+        let fixes = [Fix {
+            placeholder: "Zq".into(),
+            text: "'y'".into(),
+        }];
+        assert_eq!(substitute("a: Zq\nb: Zq\n", "Zq", &fixes), None);
+        assert_eq!(substitute("a: Zqa\n", "Zq", &fixes), None);
+        assert_eq!(
+            substitute("a: Zq\n", "Zq", &fixes).as_deref(),
+            Some("a: 'y'\n")
+        );
+    }
+
+    #[test]
+    fn free_nonces_take_the_first_free_word_of_the_shortest_free_length() {
+        let none = Value::Null;
+        let first: Vec<String> = free_nonces(&none).take(2).collect();
+        assert_eq!(first, ["Zq", "Zj"]);
+        // Every `Z` + one letter is taken: the nonce gets two letters, and
+        // `Zqq` (inside `Zqqx`) is taken too.
+        let mut words: Vec<Value> = LETTERS
+            .iter()
+            .map(|&b| Value::String(format!("Z{}", char::from(b))))
+            .collect();
+        words.push(s("Zqqx"));
+        let first: Vec<String> = free_nonces(&Value::Array(words)).take(2).collect();
+        assert_eq!(first, ["Zjq", "Zxq"]);
+    }
+
+    #[test]
+    fn yaml11_float_spells_the_dot_and_the_exponent_sign() {
+        assert_eq!(yaml11_float("1e400").as_deref(), Some("1.0e+400"));
+        assert_eq!(yaml11_float(".5e-3").as_deref(), Some("0.5e-3"));
+        assert_eq!(yaml11_float("-.5e-3").as_deref(), Some("-0.5e-3"));
+        assert_eq!(yaml11_float("+.5").as_deref(), Some("+0.5"));
+        assert_eq!(yaml11_float("+7").as_deref(), Some("+7.0"));
+        assert_eq!(yaml11_float("1.e5").as_deref(), Some("1.e+5"));
+        assert_eq!(yaml11_float("e5"), None);
+        assert_eq!(yaml11_float("1e"), None);
+        assert_eq!(yaml11_float("1_0.5"), None);
+    }
+
+    #[test]
+    fn typed_by_another_schema_matches_yaml_1_1_scalars() {
+        for typed in [
+            "y",
+            "on",
+            "1:20",
+            "1_000",
+            "0b1",
+            "017",
+            "2001-12-14",
+            "<<",
+            "=",
+        ] {
+            assert!(typed_by_another_schema(typed), "{typed}");
+        }
+        for plain in ["yes please", "hello", "1:2:3x", ""] {
+            assert!(!typed_by_another_schema(plain), "{plain}");
+        }
+    }
+}

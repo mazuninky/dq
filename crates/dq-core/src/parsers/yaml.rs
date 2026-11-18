@@ -106,7 +106,7 @@ impl Format for Yaml {
 }
 
 fn write_one(v: &Value, w: &mut dyn Write) -> Result<()> {
-    let s = serde_norway::to_string(v).map_err(map_yaml_err)?;
+    let s = super::yaml_emit::to_yaml_string(v).map_err(map_yaml_err)?;
     write_io(w, s.as_bytes())
 }
 

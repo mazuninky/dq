@@ -864,7 +864,8 @@ mod tests {
     fn set_jq_leaves_an_untouched_nan_a_float() {
         let (result, on_disk) = set_jq_in_place(".yaml", "x: .nan\ny: 1\n", ".y = 2");
         result.expect("--jq succeeds");
-        assert_eq!(on_disk, "x: .nan\ny: 2\n");
+        // The writer quotes the key `y`, a bool to a YAML 1.1 reader.
+        assert_eq!(on_disk, "x: .nan\n'y': 2\n");
         let (result, on_disk) = set_jq_in_place(".toml", "x = nan\ny = 1\n", ".y = 2");
         result.expect("--jq succeeds");
         assert_eq!(on_disk, "x = nan\ny = 2\n");

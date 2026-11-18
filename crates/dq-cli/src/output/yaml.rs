@@ -46,7 +46,8 @@ mod tests {
     fn report_value_writes_nan_and_infinity_as_yaml_floats() {
         let mut buf: Vec<u8> = Vec::new();
         YamlReporter.report_value(&non_finite(), &mut buf).unwrap();
-        assert_eq!(String::from_utf8(buf).unwrap(), "x: .nan\ny:\n- -.inf\n");
+        // `'y'`: the key is a bool to a YAML 1.1 reader.
+        assert_eq!(String::from_utf8(buf).unwrap(), "x: .nan\n'y':\n- -.inf\n");
     }
 
     #[test]

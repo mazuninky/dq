@@ -319,6 +319,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   number; it used to write `{"$serde_json::private::Number": "1e+400"}`
   in its place.
 
+The YAML writer, used by `convert -F yaml`, by `set --jq` and `fix` on
+YAML files, and by `get` / `query -F yaml`:
+
+- It quotes strings that a YAML 1.1 reader (PyYAML; go-yaml, as in
+  Kubernetes and Helm) would read as another type, both as values and
+  as keys: `'1:20'`, `'on'`, `'y'`, `'2001-12-14'`, `'1_000'`, `'0b1'`.
+  It used to write them plain, and PyYAML read `1:20` as the number 80
+  and `on` as `true`. In a GitHub Actions workflow that `set --jq`
+  rewrites, the `on:` key is now written `'on':`. A `<<` merge key over
+  a map stays plain.
+- It writes an integer beyond i64, up to 18446744073709551615, as a
+  number; it used to write it as a quoted string. Larger integers stay
+  quoted, because dq cannot read them back as numbers.
+- It writes a float in exponent form with a dot and a signed exponent,
+  `1.0e+16` and `1.5e+300`, which YAML 1.1 reads as a float. It used to
+  write `1e16` and `1.5e300`, which PyYAML reads as strings. A float
+  literal no f64 holds is written the same way (`1.0e+400`); it used to
+  be quoted, or written as `1e+400`. dq's YAML reader still reads such a
+  literal in a YAML file as a string, so `set --jq` on that file now
+  writes it quoted.
+
 Textual edits — `set` and `del` on YAML, JSON and TOML:
 
 - They check that the edited file reads back as the requested change.

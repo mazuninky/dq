@@ -52,6 +52,8 @@ use crate::ir::{InlineBaseline, Provenance, ProvenanceMap};
 use crate::pointer::Pointer;
 use crate::textual_edit::{InsertionRenderer, ScalarRenderer};
 
+use super::yaml_emit::typed_by_another_schema;
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -2591,37 +2593,6 @@ fn needs_quoting_for_plain(s: &str) -> bool {
         serde_norway::from_str::<serde_norway::Value>(s),
         Ok(serde_norway::Value::String(read)) if read == s
     )
-}
-
-/// Whether a YAML 1.1 reader (go-yaml, as in Kubernetes and GitHub
-/// Actions; PyYAML) or a YAML 1.2 core / JSON schema one would take the
-/// plain scalar `s` for something other than a string — a bool, null,
-/// int (`1_000`, `0b1`, `017`, `1:20`), float (`1.`, `1e3`), timestamp
-/// (`2001-12-14`), or the `<<` / `=` keys — though dq's own reader may
-/// not.
-fn typed_by_another_schema(s: &str) -> bool {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| {
-        regex::Regex::new(concat!(
-            r"^(?:",
-            r"~|null|Null|NULL",
-            r"|y|Y|yes|Yes|YES|n|N|no|No|NO|true|True|TRUE|false|False|FALSE",
-            r"|on|On|ON|off|Off|OFF",
-            r"|[-+]?0b[01_]+|[-+]?0o?[0-7_]+|[-+]?0x[0-9a-fA-F_]+",
-            r"|[-+]?(?:0|[1-9][0-9_]*)(?::[0-5]?[0-9])*",
-            r"|[-+]?(?:[0-9][0-9_]*)?\.[0-9_]*(?:[eE][-+]?[0-9]+)?",
-            r"|[-+]?[0-9][0-9_]*[eE][-+]?[0-9]+",
-            r"|[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+\.[0-9_]*",
-            r"|[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN)",
-            r"|[0-9]{4}-[0-9]{2}-[0-9]{2}",
-            r"|[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}(?:[Tt]|[ \t]+)[0-9]{1,2}:[0-9]{2}:[0-9]{2}",
-            r"(?:\.[0-9]*)?(?:[ \t]*(?:Z|[-+][0-9]{1,2}(?::[0-9]{2})?))?",
-            r"|<<|=",
-            r")$",
-        ))
-        .expect("the YAML type regex compiles")
-    })
-    .is_match(s)
 }
 
 /// `: ` and ` #` cause YAML key/comment confusion in plain scalars.

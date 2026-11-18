@@ -13,6 +13,7 @@ pub mod markdown;
 pub mod toml;
 pub mod xml;
 pub mod yaml;
+mod yaml_emit;
 pub mod yaml_spans;
 
 pub use csv::{Csv, Tsv};
