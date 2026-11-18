@@ -232,6 +232,51 @@ fn a_string_the_reader_would_type_otherwise_is_written_quoted() {
 }
 
 #[test]
+fn a_string_a_yaml_1_1_reader_would_type_is_quoted_wherever_it_lands() {
+    // dq reads these back as strings; go-yaml and PyYAML read ints,
+    // sexagesimals, timestamps, bools, merge and value keys, and
+    // infinity. A value, a flow mapping entry, a flow sequence item and a
+    // new key — each typed as a plain argument, no `--value-string`.
+    let src = "j: 1\nm: {x: 1}\nl: [1]\n";
+    for (text, quoted) in [
+        ("1_000", true),
+        ("0b101", true),
+        ("1:20", true),
+        ("12:30:45", true),
+        ("2024-01-01", true),
+        ("2001-12-14T21:59:43Z", true),
+        ("<<", true),
+        ("=", true),
+        (".Inf", true),
+        ("y", true),
+        ("N", true),
+        ("1.2.3", false),
+        ("v1", false),
+        ("hello", false),
+        ("a-b", false),
+    ] {
+        let mut out = in_place(src, "set", &["/j", text]);
+        out = in_place(&out, "set", &["/m/z", text]);
+        out = in_place(&out, "set", &["/l/0", text]);
+        out = in_place(&out, "set", &[&format!("/{text}"), "1"]);
+        let t = if quoted {
+            format!("\"{text}\"")
+        } else {
+            text.to_owned()
+        };
+        assert_eq!(
+            out,
+            format!("j: {t}\nm: {{x: 1, z: {t}}}\nl: [{t}]\n{t}: 1\n")
+        );
+        assert_eq!(
+            read_back(&out),
+            serde_json::json!({"j": text, "m": {"x": 1, "z": text}, "l": [text], text: 1}),
+            "{text}: {out:?}"
+        );
+    }
+}
+
+#[test]
 fn set_drops_a_core_tag_and_keeps_the_anchor_and_a_local_tag() {
     check(&[
         (
@@ -407,6 +452,89 @@ fn del_of_the_last_child_leaves_an_empty_collection() {
         ("a: {x: {y: 1}}\n", "del", &["/a/x/y"], "a: {x: {}}\n"),
         ("a: [{x: 1}]\n", "del", &["/a/0/x"], "a: [{}]\n"),
         ("a: {x: [1]}\n", "del", &["/a/x/0"], "a: {x: []}\n"),
+    ]);
+}
+
+#[test]
+fn set_over_a_block_collection_replaces_it_after_its_key() {
+    let cases: &[(&str, &[&str], &str, serde_json::Value)] = &[
+        // An anchored collection: the aliases follow the new value.
+        (
+            "a: &m\n  x: 1\nb: *m\nc: 3\n",
+            &["/a", "5"],
+            "a: &m 5\nb: *m\nc: 3\n",
+            serde_json::json!({"a": 5, "b": 5, "c": 3}),
+        ),
+        (
+            "a: &m\n  x: 1\nb: *m\n",
+            &["/a", "[1, 2]"],
+            "a: &m [1, 2]\nb: *m\n",
+            serde_json::json!({"a": [1, 2], "b": [1, 2]}),
+        ),
+        // Comments inside the collection go with it, the comment lines
+        // before its first entry stay; the comment after it stays too.
+        (
+            "a:\n  # lead\n  x: 1 # one\n  # mid\n  y: 2\n# after\nb: 2\n",
+            &["/a", "5"],
+            "a: 5\n  # lead\n# after\nb: 2\n",
+            serde_json::json!({"a": 5, "b": 2}),
+        ),
+        (
+            "a:\n  x: 1 # one\n  y: [1, 2]\nb: 2\n",
+            &["/a", "{\"q\": 1}"],
+            "a: {\"q\": 1}\nb: 2\n",
+            serde_json::json!({"a": {"q": 1}, "b": 2}),
+        ),
+        (
+            "l:\n  - a\n  # c\n  - b\nz: 1\n",
+            &["/l", "[]"],
+            "l: []\nz: 1\n",
+            serde_json::json!({"l": [], "z": 1}),
+        ),
+    ];
+    for (src, args, want, value) in cases {
+        let out = in_place(src, "set", args);
+        assert_eq!(out, *want, "set {args:?} on {src:?}");
+        assert_eq!(read_back(&out), *value, "set {args:?} on {src:?}");
+    }
+}
+
+#[test]
+fn del_of_a_compact_first_key_hands_its_comments_to_the_dash() {
+    check(&[
+        (
+            "l:\n  - a: 1 # t\n    # m1\n    # m2\n    b: 2\n",
+            "del",
+            &["/l/0/a"],
+            "l:\n  - # m1\n    # m2\n    b: 2\n",
+        ),
+        // Blank lines between the comments stay; a blank line alone goes
+        // with the entry.
+        (
+            "l:\n  - a: 1\n    # mid\n\n    # m2\n    b: 2\n  - z: 1\n",
+            "del",
+            &["/l/0/a"],
+            "l:\n  - # mid\n\n    # m2\n    b: 2\n  - z: 1\n",
+        ),
+        (
+            "l:\n  - a: 1\n\n    b: 2\n",
+            "del",
+            &["/l/0/a"],
+            "l:\n  - b: 2\n",
+        ),
+        (
+            "l:\r\n  - a: 1\r\n    # m1\r\n\r\n    # m2\r\n    b: 2\r\n",
+            "del",
+            &["/l/0/a"],
+            "l:\r\n  - # m1\r\n\r\n    # m2\r\n    b: 2\r\n",
+        ),
+        // A comment at the dash's column.
+        (
+            "- a: 1\n# top\n  b: 2\n",
+            "del",
+            &["/0/a"],
+            "- # top\n  b: 2\n",
+        ),
     ]);
 }
 

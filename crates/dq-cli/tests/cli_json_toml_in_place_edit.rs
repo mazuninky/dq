@@ -199,3 +199,87 @@ fn an_empty_key_does_not_get_in_the_way() {
         assert_eq!(std::fs::read_to_string(&path).expect("read back"), src);
     }
 }
+
+#[test]
+fn json_set_over_a_nested_object_replaces_it() {
+    check(
+        "json",
+        &[
+            (
+                "{\n  \"a\": {\n    \"b\": {\"c\": [1, 2]},\n    \"d\": 1\n  },\n  \"e\": 2\n}\n",
+                "set",
+                &["/a", "5"],
+                "{\n  \"a\": 5,\n  \"e\": 2\n}\n",
+            ),
+            (
+                r#"{"a": {"b": {"c": 1}}}"#,
+                "set",
+                &["/a/b", "true"],
+                r#"{"a": {"b": true}}"#,
+            ),
+        ],
+    );
+}
+
+#[test]
+fn toml_set_over_a_table_takes_its_subtables_with_it() {
+    check(
+        "toml",
+        &[
+            // The subtable comes after another table; the new key goes
+            // before the first header, where it stays a root key.
+            (
+                "[a]\nb = 1\n[x]\ny = 1\n[a.c]\nd = 1\n",
+                "set",
+                &["/a", "5"],
+                "a = 5\n[x]\ny = 1\n",
+            ),
+            (
+                "[x]\ny = 1\n[a]\nb = 1\n",
+                "set",
+                &["/a", "{\"n\": 1}"],
+                "a = { n = 1 }\n[x]\ny = 1\n",
+            ),
+            (
+                "top = 1\n[x]\ny = 1\n[[arr]]\nx = 1\n[[arr]]\nx = 2\n",
+                "set",
+                &["/arr", "5"],
+                "top = 1\narr = 5\n[x]\ny = 1\n",
+            ),
+        ],
+    );
+}
+
+#[test]
+fn toml_del_of_an_array_of_tables_item_with_a_subtable() {
+    check(
+        "toml",
+        &[
+            (
+                "[[arr]]\nx = 1\n[arr.sub]\ny = 1\n[[arr]]\nx = 2\n",
+                "del",
+                &["/arr/0"],
+                "[[arr]]\nx = 2\n",
+            ),
+            // The last item leaves an empty array, as a root key.
+            (
+                "[[arr]]\nx = 1\n[arr.sub]\ny = 1\n",
+                "del",
+                &["/arr/0"],
+                "arr = []\n",
+            ),
+            (
+                "[t]\nk = 1\n[[arr]]\nx = 1\n[arr.sub]\ny = 1\n",
+                "del",
+                &["/arr/0"],
+                "arr = []\n[t]\nk = 1\n",
+            ),
+            (
+                "[x]\ny = 1\n[a.b]\nk = 1\n",
+                "del",
+                &["/a/b"],
+                "a = {}\n[x]\ny = 1\n",
+            ),
+        ],
+    );
+}
