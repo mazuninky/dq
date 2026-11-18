@@ -285,7 +285,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the alias dangling, so the file no longer parsed. `lint --fix` skips
   such a fix with a warning.
 - YAML `set` of an object or array where a scalar was writes it in flow
-  style (`a: {"x":1}`); it used to write `null`.
+  style (`a: {"x": 1}`); it used to write `null`.
+- YAML `set` of a new key writes a collection nested in its value in flow
+  style (`b:` + `  - {"x": 1}`); it used to write `{}` / `[]` in its
+  place. Inside a flow mapping the new entry stays on its line
+  (`a: {x: 1, z: [1]}`); one holding a collection used to break the file.
+- YAML `set` of a string the reader would take as something else —
+  `.nan`, `.inf`, `0x10`, `0o17`, `~`, `Null`, `+1` — writes it quoted;
+  it used to write it plain, so it read back as a number or `null`. The
+  same goes for a new key such as `null`.
 - `set` / `del` on YAML, JSON and TOML check that the edited file reads
   back as the requested change. When it does not, they fail with exit 7,
   print nothing and leave the file alone; they used to write the damaged

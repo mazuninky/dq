@@ -245,11 +245,71 @@ fn set_of_a_collection_over_a_scalar_writes_it_in_flow_style() {
     let nested = Value::from_serde_json(&serde_json::json!({"nested": 1, "l": ["x"]}));
     assert_eq!(
         set("a: 3\nb: 4\n", "/a", nested.clone()),
-        "a: {\"nested\":1,\"l\":[\"x\"]}\nb: 4\n"
+        "a: {\"nested\": 1, \"l\": [\"x\"]}\nb: 4\n"
     );
     let mut doc = doc("a: 3\nb: 4\n");
     doc.set_at(&ptr("/a"), nested.clone()).expect("set_at /a");
     assert_eq!(ptr("/a").resolve(doc.value()).expect("/a"), &nested);
+}
+
+#[test]
+fn set_of_a_new_key_writes_nested_collections_in_flow_style() {
+    let json = |v| Value::from_serde_json(&v);
+    assert_eq!(
+        set("a: 1\n", "/b", json(serde_json::json!([{"x": 1}]))),
+        "a: 1\nb:\n  - {\"x\": 1}\n"
+    );
+    assert_eq!(
+        set("a: 1\n", "/b", json(serde_json::json!({"c": {"d": 1}}))),
+        "a: 1\nb:\n  c: {\"d\": 1}\n"
+    );
+    assert_eq!(
+        set(
+            "l:\n  - containerPort: 80\n",
+            "/l/0/resources",
+            json(serde_json::json!({"limits": {"cpu": "1"}}))
+        ),
+        "l:\n  - containerPort: 80\n    resources:\n      limits: {\"cpu\": \"1\"}\n"
+    );
+}
+
+#[test]
+fn set_of_a_new_key_in_a_flow_mapping_stays_on_its_line() {
+    let json = |v| Value::from_serde_json(&v);
+    assert_eq!(
+        set("a: {x: 1}\n", "/a/z", json(serde_json::json!([1]))),
+        "a: {x: 1, z: [1]}\n"
+    );
+    assert_eq!(
+        set("a: {}\n", "/a/z", json(serde_json::json!({"q": [1]}))),
+        "a: {z: {\"q\": [1]}}\n"
+    );
+    assert_eq!(
+        set("a: {x: 1}\n", "/a/z", Value::String("a, b".into())),
+        "a: {x: 1, z: \"a, b\"}\n"
+    );
+}
+
+#[test]
+fn a_string_the_reader_would_type_otherwise_is_quoted() {
+    for text in [
+        ".nan", ".inf", "-.inf", "0x10", "0o17", "~", "Null", "yes", "off", "+1", ".5", "1e3",
+    ] {
+        assert_eq!(
+            set("j: 1\n", "/j", Value::String(text.into())),
+            format!("j: \"{text}\"\n"),
+            "{text}"
+        );
+    }
+    // What the reader takes as a string stays plain.
+    for text in ["y", "2024-01-01", "12:30", "1_000", "a-b"] {
+        assert_eq!(
+            set("j: 1\n", "/j", Value::String(text.into())),
+            format!("j: {text}\n"),
+            "{text}"
+        );
+    }
+    assert_eq!(set("a: 1\n", "/null", Value::Int(2)), "a: 1\n\"null\": 2\n");
 }
 
 // --- del leaves an empty collection ------------------------------------------

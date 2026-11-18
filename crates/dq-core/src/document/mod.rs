@@ -1020,16 +1020,21 @@ impl Document {
                 }
             }
         }
-        let fragment = insertion_renderer.render_insertion(
-            &new_key,
-            &value,
-            parent_children_indent,
-            sibling_span.context,
-        );
+        let flow_layout = self.flow_layout(&sibling_span);
+        // A YAML entry in a flow mapping is written on one line, one in a
+        // block mapping as a block entry, whatever the sibling's own
+        // context (an empty `[]` carries a flow one).
+        let context = match (self.format, flow_layout) {
+            (FormatTag::Yaml, Some(_)) => SpanContext::FlowMapValue,
+            (FormatTag::Yaml, None) => SpanContext::BlockMapValue,
+            _ => sibling_span.context,
+        };
+        let fragment =
+            insertion_renderer.render_insertion(&new_key, &value, parent_children_indent, context);
 
         // Compute the actual splice point + final bytes, format-aware so
         // we don't smear `\n`s or forget a `,` separator.
-        let (splice_at, splice_bytes) = match self.flow_layout(&sibling_span) {
+        let (splice_at, splice_bytes) = match flow_layout {
             Some(layout) => flow_sibling_splice(&fragment, &sibling_span, layout),
             None => {
                 format_specific_splice(self.format, &fragment, &sibling_span, &self.original_bytes)
@@ -1155,12 +1160,18 @@ impl Document {
             _ => parent_span.indent,
         };
         let children_indent = parent_span.indent.saturating_add(2);
-        let fragment = insertion_renderer.render_insertion(
-            &new_key,
-            &value,
-            renderer_indent,
-            parent_span.context,
-        );
+        // A YAML entry inside `{}` is written on one line.
+        let context = match self.format {
+            FormatTag::Yaml
+                if self.original_bytes.get(parent_span.value_range.start) == Some(&b'{') =>
+            {
+                SpanContext::FlowMapValue
+            }
+            FormatTag::Yaml => SpanContext::BlockMapValue,
+            _ => parent_span.context,
+        };
+        let fragment =
+            insertion_renderer.render_insertion(&new_key, &value, renderer_indent, context);
 
         let (splice_at, splice_bytes) = format_specific_empty_parent_splice(
             self.format,

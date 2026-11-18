@@ -2166,11 +2166,8 @@ impl ScalarRenderer for YamlScalarRenderer {
             Value::BigFloat(s) => s.clone().into_bytes(),
             Value::String(s) => render_string_in_style(s, original_style, context),
             // A collection at a scalar's position is written in flow style
-            // — as JSON, which YAML 1.2 reads as flow collections, on the
-            // scalar's line. `Document::set_at` reads the edit back, so a
-            // value JSON cannot spell (a NaN) is refused, not written.
-            Value::Array(_) | Value::Map(_) => serde_json::to_vec(&value.to_serde_json())
-                .unwrap_or_else(|_| render_null(original_style)),
+            // on the scalar's line.
+            Value::Array(_) | Value::Map(_) => render_flow(value),
         }
     }
 }
@@ -2194,14 +2191,19 @@ impl InsertionRenderer for YamlInsertionRenderer {
         parent_indent: u32,
         parent_context: SpanContext,
     ) -> Vec<u8> {
-        // Flow contexts use a different splice strategy (insert before `}` or
-        // `]` with `, ` separators) which the M2 baseline does not yet
-        // implement. For now we render a block-style fragment and let the
-        // caller decide whether to splice it into a flow container; in
-        // practice `Document::set_at`'s mkdir-p path only fires for block
-        // contexts because that's what `value_only`-shaped docs lack and
-        // those documents always reflect block-style configs.
-        let _ = parent_context;
+        // Inside a flow mapping the entry stays on one line; the caller
+        // trims the blanks around it and adds the separator.
+        if matches!(
+            parent_context,
+            SpanContext::FlowMapValue | SpanContext::FlowSeqItem
+        ) {
+            let mut out = b"\n".to_vec();
+            out.extend_from_slice(&render_double_quoted_if(key, needs_quoting_in_flow(key)));
+            out.extend_from_slice(b": ");
+            out.extend_from_slice(&render_flow_item(value));
+            out.push(b'\n');
+            return out;
+        }
 
         let outer_spaces = parent_indent.saturating_sub(1) as usize;
         let inner_spaces = outer_spaces + 2;
@@ -2264,9 +2266,71 @@ impl InsertionRenderer for YamlInsertionRenderer {
     }
 }
 
-/// Render a scalar (leaf) value as its inline YAML form. Containers fall back
-/// to a flow-style empty literal to keep the result well-formed; full nested
-/// rendering is the caller's responsibility.
+/// `s` in double quotes when `quote`, as it is otherwise.
+fn render_double_quoted_if(s: &str, quote: bool) -> Vec<u8> {
+    if quote {
+        render_double_quoted(s)
+    } else {
+        s.as_bytes().to_vec()
+    }
+}
+
+/// Whether `s` written plain inside a flow collection would not read
+/// back as the string `s`.
+fn needs_quoting_in_flow(s: &str) -> bool {
+    needs_quoting_for_plain(s) || needs_flow_quoting(s) || s.contains(['[', '{'])
+}
+
+/// `value` as an entry of a flow collection: a scalar plain where it
+/// reads back as itself, a collection in flow style.
+fn render_flow_item(value: &Value) -> Vec<u8> {
+    match value {
+        Value::String(s) => render_double_quoted_if(s, needs_quoting_in_flow(s)),
+        Value::Array(_) | Value::Map(_) => render_flow(value),
+        scalar => render_scalar_inline(scalar),
+    }
+}
+
+/// A collection in flow style, JSON-shaped with spaces after the
+/// separators — `{"x": [1, {"y": null}]}` — which YAML reads as the same
+/// tree. Floats JSON cannot spell (`.nan`, `.inf`) use YAML's form.
+fn render_flow(value: &Value) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_flow(&mut out, value);
+    out
+}
+
+fn push_flow(out: &mut Vec<u8>, value: &Value) {
+    match value {
+        Value::Array(items) => {
+            out.push(b'[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.extend_from_slice(b", ");
+                }
+                push_flow(out, item);
+            }
+            out.push(b']');
+        }
+        Value::Map(map) => {
+            out.push(b'{');
+            for (i, (key, item)) in map.iter().enumerate() {
+                if i > 0 {
+                    out.extend_from_slice(b", ");
+                }
+                out.extend_from_slice(&render_double_quoted(key));
+                out.extend_from_slice(b": ");
+                push_flow(out, item);
+            }
+            out.push(b'}');
+        }
+        Value::String(s) => out.extend_from_slice(&render_double_quoted(s)),
+        scalar => out.extend_from_slice(&render_scalar_inline(scalar)),
+    }
+}
+
+/// Render a value as its inline YAML form: a scalar as itself, a
+/// collection in flow style.
 fn render_scalar_inline(value: &Value) -> Vec<u8> {
     match value {
         Value::Null => b"null".to_vec(),
@@ -2284,8 +2348,7 @@ fn render_scalar_inline(value: &Value) -> Vec<u8> {
         Value::String(s) => {
             render_string_in_style(s, ScalarStyle::Plain, SpanContext::BlockMapValue)
         }
-        Value::Array(_) => b"[]".to_vec(),
-        Value::Map(_) => b"{}".to_vec(),
+        Value::Array(_) | Value::Map(_) => render_flow(value),
     }
 }
 
@@ -2515,7 +2578,12 @@ fn needs_quoting_for_plain(s: &str) -> bool {
         // A numeric literal would round-trip as a number, not a string.
         return true;
     }
-    false
+    // Whatever else the reader types — `.nan`, `.inf`, `0x10`, `0o17`,
+    // `1e3`, `y` — or reads as more than one scalar: ask the reader itself.
+    !matches!(
+        serde_norway::from_str::<serde_norway::Value>(s),
+        Ok(serde_norway::Value::String(read)) if read == s
+    )
 }
 
 /// `: ` and ` #` cause YAML key/comment confusion in plain scalars.
