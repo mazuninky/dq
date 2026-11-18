@@ -164,6 +164,20 @@ pub trait Reporter {
     /// Returns any I/O error from `w`, plus any format-specific encoding
     /// error (e.g. TOML cannot represent a top-level scalar).
     fn report(&self, value: &serde_json::Value, w: &mut dyn Write) -> anyhow::Result<()>;
+
+    /// Write a [`dq_core::Value`] to `w` — the shape `query` results come
+    /// in, which may hold a NaN or an infinity no `serde_json::Value` can.
+    ///
+    /// The default renders [`dq_core::Value::to_serde_json`], which spells
+    /// a non-finite float as a string; a reporter whose format has (YAML,
+    /// TOML) or forbids (JSON) such a number overrides it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Reporter::report`].
+    fn report_value(&self, value: &dq_core::Value, w: &mut dyn Write) -> anyhow::Result<()> {
+        self.report(&value.to_serde_json(), w)
+    }
 }
 
 /// Resolve whether output should be coloured.

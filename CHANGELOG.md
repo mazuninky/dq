@@ -304,6 +304,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   wrote the strings `'.nan'`), `convert -F toml` and TOML `set` write
   `nan` / `inf` (they failed). JSON `set` of NaN or infinity fails with
   exit 7 and leaves the file alone; it used to crash.
+- NaN and infinity reach jq as numbers in `query`, `set --jq`, `fix` and
+  lint rules: `.x | type` is `"number"` and `isnan` works. They used to
+  reach it as the strings `".nan"` or `"NaN"`, so `set --jq '.y = 2'` on
+  a file with `x: .nan` rewrote `x` as the string `'.nan'` (TOML:
+  `x = "NaN"`). `query 'nan'` and `query 'infinite'` print the number
+  instead of failing with a conversion error. `query -F json` and
+  `-F jsonl` of a NaN fail with exit 1, as `convert -F json` does; they
+  used to print the string `".nan"`. `get` and `query` print them as
+  `.nan`, `.inf` and `-.inf` whatever the source format; a TOML `nan`
+  used to print as `NaN`. `set --jq` writes YAML
+  `.NaN` back as `.nan` and TOML `+inf` as `inf`.
+- `set --jq` on a JSON file with a number beyond f64 (`1e400`) keeps the
+  number; it used to write `{"$serde_json::private::Number": "1e+400"}`
+  in its place.
 
 Textual edits — `set` and `del` on YAML, JSON and TOML:
 

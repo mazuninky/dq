@@ -47,8 +47,7 @@ pub fn run(
     let view = select_document(&doc, doc_arg)?;
     let pointer = Pointer::parse(&args.pointer).map_err(anyhow::Error::new)?;
     let value = pointer.resolve(view.as_ref()).map_err(anyhow::Error::new)?;
-    let json = value.to_serde_json();
-    reporter.report(&json, out)?;
+    reporter.report_value(value, out)?;
     Ok(())
 }
 

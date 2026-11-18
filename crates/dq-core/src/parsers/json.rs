@@ -959,6 +959,20 @@ pub(crate) fn write_value_compact(v: &Value, w: &mut dyn Write) -> Result<()> {
     write_value_with(v, w, 0, false, 2)
 }
 
+/// Fail the way the JSON writer does when `value` is or holds a NaN or
+/// infinite float — for an output path that renders JSON without going
+/// through this writer.
+///
+/// # Errors
+///
+/// [`Error::Format`] naming the non-finite float when `value` holds one.
+pub fn ensure_finite(value: &Value) -> Result<()> {
+    if value.holds_non_finite() {
+        return Err(non_finite_error());
+    }
+    Ok(())
+}
+
 /// JSON has no token for NaN or ±Infinity.
 fn non_finite_error() -> Error {
     Error::Format {
@@ -1354,6 +1368,19 @@ mod tests {
                 other => panic!("expected Format error, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn ensure_finite_fails_like_the_writer_on_a_nested_nan_or_infinity() {
+        let nested = Value::Array(vec![Value::Int(1), Value::BigFloat("-.inf".into())]);
+        for bad in [Value::Float(f64::NAN), nested] {
+            let err = ensure_finite(&bad).expect_err("non-finite float must error");
+            let mut buf: Vec<u8> = Vec::new();
+            let written = write_value_compact(&bad, &mut buf).expect_err("writer errors too");
+            assert_eq!(err.to_string(), written.to_string());
+        }
+        assert!(ensure_finite(&Value::BigFloat("1e400".into())).is_ok());
+        assert!(ensure_finite(&Value::Float(1.5)).is_ok());
     }
 
     #[test]

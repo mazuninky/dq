@@ -318,11 +318,11 @@ impl Evaluator {
     /// Phase 2 of `add-ir-foundation` switched the input from
     /// `&serde_json::Value` to a borrowed [`dq_core::Ir<'_>`] so the
     /// evaluator can resolve `loc.pointer` against the input's provenance
-    /// map / source bytes via [`dq_core::Ir::line_col_for`]. Internally
-    /// the evaluator still feeds jq through `serde_json::Value` (jaq's
-    /// native shape), but the borrowed `Ir` carries the metadata needed
-    /// for span-aware diagnostic positions without forcing every caller
-    /// onto a span-preserving jaq fork.
+    /// map / source bytes via [`dq_core::Ir::line_col_for`]. The
+    /// document-level jq engines run over `ir.value()` (a NaN in the file
+    /// is a jq number there); the borrowed `Ir` also carries the metadata
+    /// needed for span-aware diagnostic positions without forcing every
+    /// caller onto a span-preserving jaq fork.
     #[must_use]
     pub fn evaluate_file(
         &self,
@@ -330,11 +330,12 @@ impl Evaluator {
         ir: &dq_core::Ir<'_>,
         format_name: &str,
     ) -> Vec<Diagnostic> {
-        // Convert once at the boundary: jaq still consumes
-        // `serde_json::Value` (the native shape), so we materialise it
-        // here and pass it to every per-rule jq engine. The `Ir` itself
-        // is forwarded into per-rule helpers so they retain access to
-        // [`dq_core::Ir::line_col_for`] for `loc.pointer` resolution.
+        // Convert once at the boundary: the JSON Schema validator
+        // consumes `serde_json::Value`, so we materialise it here. The
+        // jq engines run over `ir.value()` directly (see
+        // [`run_on_document`]); the `Ir` is forwarded into per-rule helpers
+        // so they also retain access to [`dq_core::Ir::line_col_for`] for
+        // `loc.pointer` resolution.
         let value = ir.value().to_serde_json();
         let mut diagnostics = Vec::new();
         for rule in &self.rules {
@@ -545,8 +546,8 @@ fn compile_check(
 /// without crashing.
 ///
 /// `value` is the result of `ir.value().to_serde_json()` — pre-computed
-/// once per file by the caller so each rule's jq engines can reuse it
-/// without paying for the conversion N times.
+/// once per file by the caller for the JSON Schema check. The jq engines
+/// run over `ir.value()` itself (see [`run_on_document`]).
 ///
 /// Crate-internal: [`crate::composite::run_composite`] re-enters this
 /// helper on the `nested` rule with `current_depth + 1`, so the composite
@@ -577,7 +578,7 @@ pub(crate) fn evaluate_one_rule_at_depth(
 
     // 3. Filter match.
     if let Some(filter) = rule.filter_engine.as_ref() {
-        match filter.run(value) {
+        match run_on_document(filter, ir.value()) {
             Ok(out) => {
                 let Some(first) = out.first() else {
                     return;
@@ -603,7 +604,7 @@ pub(crate) fn evaluate_one_rule_at_depth(
     // 4. Check eval — dispatch on the compiled check variant.
     match &rule.check {
         CompiledCheck::Jq { engine, message } => {
-            let violations = match engine.run(value) {
+            let violations = match run_on_document(engine, ir.value()) {
                 Ok(v) => v,
                 Err(err) => {
                     tracing::warn!(
@@ -622,18 +623,29 @@ pub(crate) fn evaluate_one_rule_at_depth(
             run_schema_check(rule, compiled, path, ir, value, out);
         }
         CompiledCheck::Composite(compiled) => {
-            run_composite(
-                rule,
-                compiled,
-                path,
-                ir,
-                value,
-                current_depth,
-                max_depth,
-                out,
-            );
+            run_composite(rule, compiled, path, ir, current_depth, max_depth, out);
         }
     }
+}
+
+/// Run a document-level jq engine (`match.filter`, `check.jq`, a
+/// composite `extract`, a fix) over the document's own value.
+///
+/// The document goes to jq as a [`dq_core::Value`], so a NaN or an
+/// infinity in the file is a jq number there (`type == "number"`,
+/// `isnan`), not the string `serde_json::Value` would make of it. The
+/// outputs come back through [`dq_core::Value::to_serde_json`], which
+/// spells a non-finite float as a string — they only feed messages,
+/// `loc.*` expressions and truthiness checks.
+pub(crate) fn run_on_document(
+    engine: &JqEngine,
+    value: &dq_core::Value,
+) -> std::result::Result<Vec<serde_json::Value>, dq_transform::JqError> {
+    Ok(engine
+        .run_value(value)?
+        .iter()
+        .map(dq_core::Value::to_serde_json)
+        .collect())
 }
 
 /// Render a diagnostic for one jq-driven violation value.
@@ -991,6 +1003,26 @@ check:
         assert_eq!(diags[0].file.as_ref().unwrap(), &path);
         assert_eq!(diags[0].line, 1);
         assert_eq!(diags[0].col, 1);
+    }
+
+    #[test]
+    fn evaluator_runs_jq_over_a_yaml_nan_as_a_number() {
+        let rule = r#"
+id: test.x-is-nan
+description: x must not be NaN
+severity: error
+match:
+  format: yaml
+  filter: '.x | type == "number"'
+check:
+  jq: 'select(.x | isnan) | {t: (.x | type)}'
+  message: 'x is a NaN {{ .t }}'
+"#;
+        let eval = evaluator_from_yaml(rule);
+        let doc = dq_core::parse_yaml_with_spans(b"x: .nan\n").expect("parse yaml");
+        let diags = eval.evaluate_file(&Utf8PathBuf::from("doc.yaml"), &doc.as_ir(), "yaml");
+        let messages: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(messages, ["x is a NaN number"]);
     }
 
     #[test]

@@ -35,6 +35,33 @@ impl Reporter for ConsoleReporter {
         write_top(value, w, self.use_color)?;
         Ok(())
     }
+
+    /// Spells a NaN or an infinity `.nan` / `.inf` / `-.inf`, as YAML
+    /// does, whatever format it was read from or jq made it in.
+    fn report_value(&self, value: &dq_core::Value, w: &mut dyn Write) -> anyhow::Result<()> {
+        self.report(&console_json(value), w)
+    }
+}
+
+/// `value` as the console renders it: [`dq_core::Value::to_serde_json`],
+/// with a non-finite float spelled the YAML way.
+fn console_json(value: &dq_core::Value) -> serde_json::Value {
+    match value {
+        dq_core::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(console_json).collect())
+        }
+        dq_core::Value::Map(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(k, child)| (k.clone(), console_json(child)))
+                .collect(),
+        ),
+        scalar => match scalar.non_finite_float() {
+            Some(f) if f.is_nan() => serde_json::Value::String(".nan".to_owned()),
+            Some(f) if f > 0.0 => serde_json::Value::String(".inf".to_owned()),
+            Some(_) => serde_json::Value::String("-.inf".to_owned()),
+            None => scalar.to_serde_json(),
+        },
+    }
 }
 
 /// Escape every control byte (`< 0x20`, `0x7f`, including `\n`/`\t`/`\r`/`\x1b`)
@@ -140,6 +167,28 @@ fn write_inline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn report_value_spells_non_finite_floats_the_yaml_way() {
+        let mut map = indexmap::IndexMap::new();
+        map.insert("t".to_owned(), dq_core::Value::BigFloat("+inf".to_owned()));
+        map.insert("y".to_owned(), dq_core::Value::BigFloat(".NaN".to_owned()));
+        let value = dq_core::Value::Array(vec![
+            dq_core::Value::Float(f64::NAN),
+            dq_core::Value::Float(f64::INFINITY),
+            dq_core::Value::Array(vec![dq_core::Value::Float(f64::NEG_INFINITY)]),
+            dq_core::Value::Map(map),
+            dq_core::Value::Float(1.5),
+        ]);
+        let mut buf: Vec<u8> = Vec::new();
+        ConsoleReporter::new(false)
+            .report_value(&value, &mut buf)
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            ".nan\n.inf\n[-.inf]\n{t: .inf, y: .nan}\n1.5\n"
+        );
+    }
 
     fn render(value: &serde_json::Value, use_color: bool) -> String {
         let reporter = ConsoleReporter::new(use_color);

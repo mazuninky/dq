@@ -265,40 +265,41 @@ impl<'a> FileOp for JqFileOp<'a> {
         let original_bytes = read_bytes(path)?;
         let document = format.parse(&original_bytes).map_err(anyhow::Error::new)?;
 
-        // Convert the document's top-level value into serde_json so the jq
-        // engine can consume it.
-        let serde_value = document.value().to_serde_json();
-
         // Evaluate the filter. Runtime / Conversion errors stay as plain
         // anyhow (exit 1) — they aren't compile failures and aren't IO
         // failures. The compile error is handled at the engine-construction
         // site in `run_jq_transform`, before we get here.
+        //
+        // The value goes to jq as a `dq_core::Value`, not through
+        // `serde_json::Value`: that one has no NaN or infinity, and an
+        // untouched `.nan` would come back as the string `'.nan'`.
         let outputs = self
             .engine
-            .run(&serde_value)
+            .run_value(document.value())
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         // The single-output rule (design D5): collect outputs, require
         // exactly one. The error message names the count so users know to
         // wrap iterating filters in `[.[]]`.
-        let single = match outputs.as_slice() {
-            [v] => v,
-            [] => {
+        let mut outputs = outputs.into_iter();
+        let single = match (outputs.next(), outputs.len()) {
+            (Some(v), 0) => v,
+            (None, _) => {
                 return Err(anyhow::Error::new(InvalidInput::new(
                     "--jq filter produced 0 outputs (document would become empty); use `[...]` to collect or pick a non-empty filter",
                 )));
             }
-            many => {
+            (Some(_), rest) => {
                 return Err(anyhow::Error::new(InvalidInput::new(format!(
                     "--jq filter produced {} outputs (expected exactly 1); wrap iteration in `[...]` to collect into an array",
-                    many.len(),
+                    rest + 1,
                 ))));
             }
         };
 
-        // Build a value-only document for the re-emit path.
-        let new_value = serde_json_to_dq_value(single);
-        let new_doc = Document::value_only(new_value, document.format());
+        // Build a value-only document for the re-emit path. A NaN or an
+        // infinity is a float here: YAML / TOML write it, JSON fails.
+        let new_doc = Document::value_only(single, document.format());
 
         // Re-emit through `write_with_options` so global `--sort-keys` /
         // `--indent` are honoured (this is one of the differences vs the
@@ -835,6 +836,46 @@ mod tests {
             on_disk.contains("replicas: 4"),
             "expected replicas to be 4 on disk, got:\n{on_disk}",
         );
+    }
+
+    /// `dq -i set <file> --jq <expression>` on a temp file holding `src`.
+    fn set_jq_in_place(suffix: &str, src: &str, expression: &str) -> (anyhow::Result<()>, String) {
+        let mut tmp = NamedTempFile::with_suffix(suffix).unwrap();
+        tmp.write_all(src.as_bytes()).unwrap();
+        let tmp = tmp.into_temp_path();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
+        let cli =
+            Cli::try_parse_from(["dq", "-i", "set", path.as_str(), "--jq", expression]).unwrap();
+        let args = SetArgs {
+            file: path.clone(),
+            pointer: None,
+            value: None,
+            value_from: None,
+            value_string: false,
+            no_create: false,
+            jq: Some(expression.to_owned()),
+        };
+        let mut out: Vec<u8> = Vec::new();
+        let result = run(&cli, &args, None, false, &mut out);
+        (result, std::fs::read_to_string(&path).unwrap())
+    }
+
+    #[test]
+    fn set_jq_leaves_an_untouched_nan_a_float() {
+        let (result, on_disk) = set_jq_in_place(".yaml", "x: .nan\ny: 1\n", ".y = 2");
+        result.expect("--jq succeeds");
+        assert_eq!(on_disk, "x: .nan\ny: 2\n");
+        let (result, on_disk) = set_jq_in_place(".toml", "x = nan\ny = 1\n", ".y = 2");
+        result.expect("--jq succeeds");
+        assert_eq!(on_disk, "x = nan\ny = 2\n");
+    }
+
+    #[test]
+    fn set_jq_writing_a_nan_into_json_fails_and_leaves_the_file() {
+        let (result, on_disk) = set_jq_in_place(".json", "{\"y\": 1}\n", ".x = nan");
+        let err = result.expect_err("JSON has no NaN");
+        assert!(err.to_string().contains("non-finite float"), "{err:?}");
+        assert_eq!(on_disk, "{\"y\": 1}\n");
     }
 
     #[test]

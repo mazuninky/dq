@@ -245,25 +245,59 @@ pub(crate) fn non_finite_literal(literal: &str) -> Option<f64> {
     }
 }
 
-/// The NaN or infinite float `value` is, as a float or a literal.
-fn non_finite(value: &Value) -> Option<f64> {
-    match value {
-        Value::Float(f) if !f.is_finite() => Some(*f),
-        Value::BigFloat(s) => non_finite_literal(s),
-        _ => None,
-    }
-}
-
-/// Whether `value` is or holds a NaN or infinite float.
-fn holds_non_finite(value: &Value) -> bool {
-    match value {
-        Value::Array(items) => items.iter().any(holds_non_finite),
-        Value::Map(map) => map.values().any(holds_non_finite),
-        scalar => non_finite(scalar).is_some(),
-    }
-}
-
 impl Value {
+    /// The NaN or infinite float this scalar is — a [`Value::Float`]
+    /// holding one, or a [`Value::BigFloat`] spelling one (YAML `.nan` /
+    /// `-.inf`, TOML `nan` / `+inf`); `None` for anything else.
+    #[must_use]
+    pub fn non_finite_float(&self) -> Option<f64> {
+        match self {
+            Self::Float(f) if !f.is_finite() => Some(*f),
+            Self::BigFloat(s) => non_finite_literal(s),
+            _ => None,
+        }
+    }
+
+    /// Whether this value is or holds a NaN or infinite float, which no
+    /// JSON number can spell.
+    #[must_use]
+    pub fn holds_non_finite(&self) -> bool {
+        match self {
+            Self::Array(items) => items.iter().any(Self::holds_non_finite),
+            Self::Map(map) => map.values().any(Self::holds_non_finite),
+            scalar => scalar.non_finite_float().is_some(),
+        }
+    }
+
+    /// Whether `self` and `other` hold the same data.
+    ///
+    /// Unlike `==`, a NaN equals a NaN, a non-finite float equals the
+    /// literal spelling it (`Float(NaN)` and `BigFloat(".nan")`), and
+    /// `-0.0` differs from `0.0` (finite floats compare by bits); map key
+    /// order is ignored, as `==` ignores it.
+    #[must_use]
+    pub fn same_data(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Map(a), Self::Map(b)) => {
+                a.len() == b.len()
+                    && a.iter()
+                        .all(|(key, a)| b.get(key).is_some_and(|b| a.same_data(b)))
+            }
+            (Self::Array(a), Self::Array(b)) => {
+                a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.same_data(b))
+            }
+            (a, b) => match (a.non_finite_float(), b.non_finite_float()) {
+                (Some(a), Some(b)) => a == b || (a.is_nan() && b.is_nan()),
+                // By bits: `-0.0 == 0.0`, but a fix from one to the other
+                // is a change.
+                _ => match (a, b) {
+                    (Self::Float(a), Self::Float(b)) => a.to_bits() == b.to_bits(),
+                    _ => a == b,
+                },
+            },
+        }
+    }
+
     /// Stable type name used by the `type` command and error messages.
     #[must_use]
     pub fn type_name(&self) -> &'static str {
@@ -793,7 +827,7 @@ impl Document {
         })?;
 
         let canonical = pointer.as_canonical();
-        if self.format == FormatTag::Json && holds_non_finite(&value) {
+        if self.format == FormatTag::Json && value.holds_non_finite() {
             return Err(Error::EditRejected {
                 action: "set",
                 pointer: canonical,
@@ -2755,7 +2789,7 @@ fn first_difference(expected: &Value, actual: &Value, at: &str) -> Option<String
         // NaN equals no float, and YAML holds `.nan` / `.inf` as literals
         // a TOML `nan` / `inf` reads back as floats.
         (want, got)
-            if let (Some(want), Some(got)) = (non_finite(want), non_finite(got))
+            if let (Some(want), Some(got)) = (want.non_finite_float(), got.non_finite_float())
                 && (want == got || (want.is_nan() && got.is_nan())) =>
         {
             None
@@ -4584,6 +4618,55 @@ mod tests {
             }
             other => panic!("expected Path/MissingKey, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn non_finite_float_reads_floats_and_literals() {
+        assert!(
+            Value::Float(f64::NAN)
+                .non_finite_float()
+                .is_some_and(f64::is_nan)
+        );
+        assert_eq!(
+            Value::BigFloat("-.Inf".into()).non_finite_float(),
+            Some(f64::NEG_INFINITY)
+        );
+        assert_eq!(Value::Float(1.5).non_finite_float(), None);
+        assert_eq!(Value::BigFloat("1e400".into()).non_finite_float(), None);
+        assert_eq!(Value::String(".nan".into()).non_finite_float(), None);
+    }
+
+    #[test]
+    fn holds_non_finite_looks_inside_collections() {
+        let tree = |json: serde_json::Value| Value::from_serde_json(&json);
+        let mut doc = tree(serde_json::json!({"a": [1, {"b": 2}]}));
+        assert!(!doc.holds_non_finite());
+        if let Value::Map(map) = &mut doc {
+            map.insert(
+                "c".into(),
+                Value::Array(vec![Value::BigFloat(".nan".into())]),
+            );
+        }
+        assert!(doc.holds_non_finite());
+    }
+
+    #[test]
+    fn same_data_matches_nan_its_literal_and_reordered_maps() {
+        let tree = |json: serde_json::Value| Value::from_serde_json(&json);
+        assert!(Value::Float(f64::NAN).same_data(&Value::Float(f64::NAN)));
+        assert!(Value::Float(f64::NAN).same_data(&Value::BigFloat(".nan".into())));
+        assert!(Value::BigFloat("-.inf".into()).same_data(&Value::Float(f64::NEG_INFINITY)));
+        assert!(!Value::Float(f64::INFINITY).same_data(&Value::Float(f64::NEG_INFINITY)));
+        assert!(!Value::Float(f64::NAN).same_data(&Value::String(".nan".into())));
+        assert!(!Value::Int(1).same_data(&Value::Float(1.0)));
+        assert!(!Value::Float(-0.0).same_data(&Value::Float(0.0)));
+        assert!(Value::Float(-0.0).same_data(&Value::Float(-0.0)));
+        assert!(Value::Float(1.5).same_data(&Value::Float(1.5)));
+        let a = tree(serde_json::json!({"a": 1, "b": [1, {"c": 2}]}));
+        assert!(a.same_data(&tree(serde_json::json!({"b": [1, {"c": 2}], "a": 1}))));
+        assert!(!a.same_data(&tree(serde_json::json!({"a": 1, "b": [1, {"c": 3}]}))));
+        assert!(!a.same_data(&tree(serde_json::json!({"a": 1}))));
+        assert!(!a.same_data(&tree(serde_json::json!([1]))));
     }
 
     #[test]

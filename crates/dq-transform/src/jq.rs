@@ -12,6 +12,10 @@
 //!    producing a stream of `Val` outputs that we materialise into a
 //!    `Vec<serde_json::Value>` via [`val_to_serde`].
 //!
+//! [`JqEngine::run_value`] skips `serde_json` on both sides and converts a
+//! [`dq_core::Value`] to and from `Val` directly: `serde_json::Value` has
+//! no NaN or infinity, so a non-finite float survives jq only on that path.
+//!
 //! ## Feature gate
 //!
 //! The `embedded-jq` cargo feature (default-on) controls whether the heavy
@@ -121,6 +125,14 @@ mod stub {
         /// Always returns [`JqError::FeatureDisabled`] when the
         /// `embedded-jq` feature is off.
         pub fn run(&self, _input: &serde_json::Value) -> Result<Vec<serde_json::Value>, JqError> {
+            Err(JqError::FeatureDisabled {
+                hint: FEATURE_DISABLED_HINT,
+            })
+        }
+
+        /// Always returns [`JqError::FeatureDisabled`] when the
+        /// `embedded-jq` feature is off.
+        pub fn run_value(&self, _input: &dq_core::Value) -> Result<Vec<dq_core::Value>, JqError> {
             Err(JqError::FeatureDisabled {
                 hint: FEATURE_DISABLED_HINT,
             })
@@ -282,31 +294,246 @@ mod imp {
             }
             Ok(out)
         }
+
+        /// Evaluate the compiled filter against one [`dq_core::Value`].
+        ///
+        /// Unlike [`JqEngine::run`], nothing passes through
+        /// `serde_json::Value`, which cannot hold a NaN or an infinity: a
+        /// non-finite float (a YAML `.nan`, a TOML `inf`, jq's own `nan` or
+        /// `infinite`) is a jq number inside the filter and comes back as a
+        /// [`dq_core::Value::Float`]. A value the filter passes through
+        /// untouched comes back as the same data (see
+        /// [`dq_core::Value::same_data`]).
+        ///
+        /// Numbers come back as: an `Int` when an `i64` holds the result,
+        /// else a `BigInt` literal; a `Float` for any number jq computed in
+        /// floating point. A float literal — one in the input, or one the
+        /// filter spells or makes with `tonumber` — is a `Float` when the
+        /// nearest `f64` has the same decimal value (`1.10`, `1e3`), and
+        /// otherwise keeps its literal as a `BigFloat` (a 30-digit `π`,
+        /// `1e400`) until the filter computes with it.
+        ///
+        /// # Errors
+        ///
+        /// - [`JqError::Conversion`] if an output cannot become a
+        ///   [`dq_core::Value`] (a `Val::BStr`, an object key that formats
+        ///   to an empty string).
+        /// - [`JqError::Runtime`] if the filter raises an exception.
+        pub fn run_value(&self, input: &dq_core::Value) -> Result<Vec<dq_core::Value>, JqError> {
+            let ctx = Ctx::<data::JustLut<Val>>::new(&self.filter.lut, Vars::new([]));
+            let mut out = Vec::new();
+            for result in self
+                .filter
+                .id
+                .run((ctx, value_to_val(input)))
+                .map(unwrap_valr)
+            {
+                match result {
+                    Ok(v) => out.push(val_to_value(&v)?),
+                    Err(e) => {
+                        return Err(JqError::Runtime {
+                            message: e.to_string(),
+                        });
+                    }
+                }
+            }
+            Ok(out)
+        }
     }
 
     /// Convert a [`serde_json::Value`] into a [`jaq_json::Val`].
     ///
-    /// Uses the `Val: Deserialize` impl provided by the `serde` feature on
-    /// `jaq-json`. The conversion is total: any value that round-trips
-    /// through `serde_json::from_value` will produce a valid `Val`.
+    /// Goes through [`dq_core::Value::from_serde_json`], so a number
+    /// literal the `arbitrary_precision` feature keeps (a big integer, a
+    /// float literal no `f64` holds) reaches jq as a number with its
+    /// literal intact.
     ///
     /// # Errors
     ///
-    /// Returns [`JqError::Conversion`] if `serde_json::from_value` fails
-    /// (e.g. a numeric literal under the `arbitrary_precision` feature
-    /// that is neither integer nor finite float — an unusual case in
-    /// practice).
+    /// Never fails today; the `Result` is kept for the feature-disabled
+    /// stub's sake, which returns [`JqError::FeatureDisabled`].
     pub fn serde_to_val(v: &serde_json::Value) -> Result<Val, JqError> {
-        serde_json::from_value::<Val>(v.clone()).map_err(|e| JqError::Conversion {
-            message: format!("serde_json -> jaq_json::Val: {e}"),
-        })
+        Ok(value_to_val(&dq_core::Value::from_serde_json(v)))
+    }
+
+    /// Convert a [`dq_core::Value`] into a [`jaq_json::Val`].
+    ///
+    /// - `Int` and `Float` (NaN and the infinities included) become the
+    ///   matching jq number.
+    /// - `BigInt` becomes a big integer.
+    /// - `BigFloat` spelling a NaN or an infinity (`.nan`, `-.inf`, `nan`)
+    ///   becomes that float; any other `BigFloat` becomes a decimal number
+    ///   that keeps its literal until jq computes with it.
+    /// - A number literal neither reading accepts stays a string, as
+    ///   [`dq_core::Value::to_serde_json`] keeps it.
+    fn value_to_val(v: &dq_core::Value) -> Val {
+        match v {
+            dq_core::Value::Null => Val::Null,
+            dq_core::Value::Bool(b) => Val::Bool(*b),
+            dq_core::Value::Int(i) => Val::Num(Num::from_integral(*i)),
+            dq_core::Value::Float(f) => Val::Num(Num::Float(*f)),
+            dq_core::Value::BigInt(s) | dq_core::Value::BigFloat(s) => literal_to_val(v, s),
+            dq_core::Value::String(s) => Val::from(s.clone()),
+            dq_core::Value::Array(items) => items.iter().map(value_to_val).collect(),
+            dq_core::Value::Map(map) => Val::obj(
+                map.iter()
+                    .map(|(k, child)| (Val::from(k.clone()), value_to_val(child)))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// The jq number a `BigInt` / `BigFloat` literal spells.
+    fn literal_to_val(v: &dq_core::Value, literal: &str) -> Val {
+        if let Some(f) = v.non_finite_float() {
+            return Val::Num(Num::Float(f));
+        }
+        if let Some(n) = Num::from_str_radix(literal, 10) {
+            return Val::Num(n);
+        }
+        // jaq reads a decimal back with `str::parse::<f64>` and unwraps
+        // the result, so only a literal that parses may become one.
+        if literal.parse::<f64>().is_ok() {
+            return Val::Num(Num::Dec(literal.to_owned().into()));
+        }
+        Val::from(literal.to_owned())
+    }
+
+    /// Convert a [`jaq_json::Val`] into a [`dq_core::Value`] — the inverse
+    /// of [`value_to_val`].
+    ///
+    /// A float becomes a [`dq_core::Value::Float`], NaN and the infinities
+    /// included; a decimal keeps its literal the way
+    /// [`dq_core::Value::from_serde_json`] keeps a number's. Strings and
+    /// object keys follow [`val_to_serde`].
+    ///
+    /// # Errors
+    ///
+    /// [`JqError::Conversion`] for a `Val::BStr`, an object key that
+    /// formats to an empty string, or a decimal that is not a number.
+    fn val_to_value(v: &Val) -> Result<dq_core::Value, JqError> {
+        match v {
+            Val::Null => Ok(dq_core::Value::Null),
+            Val::Bool(b) => Ok(dq_core::Value::Bool(*b)),
+            Val::Num(n) => num_to_value(n),
+            Val::TStr(bytes) => Ok(dq_core::Value::String(bytes_to_utf8_string(bytes.as_ref()))),
+            Val::BStr(_) => Err(bstr_error()),
+            Val::Arr(items) => items
+                .iter()
+                .map(val_to_value)
+                .collect::<Result<_, _>>()
+                .map(dq_core::Value::Array),
+            Val::Obj(map) => map
+                .iter()
+                .map(|(k, child)| Ok((key_to_string(k)?, val_to_value(child)?)))
+                .collect::<Result<_, _>>()
+                .map(dq_core::Value::Map),
+        }
+    }
+
+    /// The [`dq_core::Value`] a jq number is.
+    fn num_to_value(n: &Num) -> Result<dq_core::Value, JqError> {
+        match n {
+            Num::Int(i) => Ok(i64::try_from(*i).map_or_else(
+                |_| dq_core::Value::BigInt(i.to_string()),
+                dq_core::Value::Int,
+            )),
+            Num::BigInt(b) => {
+                let literal = b.to_string();
+                Ok(literal
+                    .parse::<i64>()
+                    .map_or(dq_core::Value::BigInt(literal), dq_core::Value::Int))
+            }
+            Num::Float(f) => Ok(dq_core::Value::Float(*f)),
+            Num::Dec(literal) => dec_to_value(literal),
+        }
+    }
+
+    /// The [`dq_core::Value`] a decimal literal is.
+    ///
+    /// - An `i64` literal is an `Int`; any other integer literal a `BigInt`.
+    /// - A float literal is a `Float` when the nearest `f64` has the same
+    ///   decimal value ([`same_decimal`]: `1.10` and `1e3` qualify), else
+    ///   it stays a `BigFloat` carrying the literal — a 30-digit `π`, or
+    ///   `1e400`, which no `f64` holds.
+    /// - A word jq parses as a float (`NaN`, `inf`) becomes that float.
+    fn dec_to_value(literal: &str) -> Result<dq_core::Value, JqError> {
+        if let Ok(i) = literal.parse::<i64>() {
+            return Ok(dq_core::Value::Int(i));
+        }
+        let Ok(f) = literal.parse::<f64>() else {
+            return Err(JqError::Conversion {
+                message: format!("jaq_json::Num::Dec({literal}) is not a number"),
+            });
+        };
+        if !literal.bytes().any(|b| b.is_ascii_digit()) {
+            return Ok(dq_core::Value::Float(f));
+        }
+        if !literal.contains(['.', 'e', 'E']) {
+            return Ok(dq_core::Value::BigInt(literal.to_owned()));
+        }
+        Ok(
+            if f.is_finite() && same_decimal(literal, &format!("{f:e}")) {
+                dq_core::Value::Float(f)
+            } else {
+                dq_core::Value::BigFloat(literal.to_owned())
+            },
+        )
+    }
+
+    /// Whether two decimal literals spell the same number: sign, digits
+    /// and exponent are compared after dropping leading and trailing
+    /// zeros, so `1.10` equals `1.1` and `1e3` equals `1000`. `false` when
+    /// either is not a plain decimal literal.
+    fn same_decimal(a: &str, b: &str) -> bool {
+        match (normalized_decimal(a), normalized_decimal(b)) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    /// `literal` as `(negative, significant digits, exponent of the last
+    /// digit)`: `-0.0120e2` (-1.2) is `(true, "12", -1)`. Zero has no digits.
+    fn normalized_decimal(literal: &str) -> Option<(bool, String, i64)> {
+        let (negative, rest) = match literal.as_bytes().first()? {
+            b'-' => (true, &literal[1..]),
+            b'+' => (false, &literal[1..]),
+            _ => (false, literal),
+        };
+        let (mantissa, exponent) = match rest.find(['e', 'E']) {
+            Some(at) => (&rest[..at], rest[at + 1..].parse::<i64>().ok()?),
+            None => (rest, 0),
+        };
+        let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+        if (int.is_empty() && frac.is_empty())
+            || !int.bytes().chain(frac.bytes()).all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        let frac_len = i64::try_from(frac.len()).ok()?;
+        let digits = format!("{int}{frac}");
+        let significant = digits.trim_start_matches('0');
+        let trimmed = significant.trim_end_matches('0');
+        let trailing = i64::try_from(significant.len() - trimmed.len()).ok()?;
+        let exponent = exponent.checked_sub(frac_len)?.checked_add(trailing)?;
+        if trimmed.is_empty() {
+            return Some((negative, String::new(), 0));
+        }
+        Some((negative, trimmed.to_owned(), exponent))
+    }
+
+    /// JSON has no byte-string type, and neither has [`dq_core::Value`].
+    fn bstr_error() -> JqError {
+        JqError::Conversion {
+            message: "byte-string (BStr) values cannot be represented in JSON; convert via @text or @base64 inside the filter".into(),
+        }
     }
 
     /// Convert an [`Ir<'_>`](dq_core::Ir) into a [`jaq_json::Val`].
     ///
-    /// IR-aware variant of [`serde_to_val`]: routes the underlying
-    /// [`dq_core::Value`] tree through [`dq_core::Value::to_serde_json`]
-    /// and then through [`serde_to_val`].
+    /// IR-aware variant of [`serde_to_val`]: converts the underlying
+    /// [`dq_core::Value`] tree directly, so a NaN or an infinity reaches jq
+    /// as a number (see [`JqEngine::run_value`]).
     ///
     /// # Provenance is discarded
     ///
@@ -320,18 +547,17 @@ mod imp {
     ///
     /// # Errors
     ///
-    /// Returns [`JqError::Conversion`] when the underlying serde-shape
-    /// conversion fails — same shape as [`serde_to_val`].
+    /// Never fails today; the `Result` is kept for the feature-disabled
+    /// stub's sake, which returns [`JqError::FeatureDisabled`].
     pub fn ir_to_val(input: &dq_core::Ir<'_>) -> Result<Val, JqError> {
-        let serde_value = input.value().to_serde_json();
-        serde_to_val(&serde_value)
+        Ok(value_to_val(input.value()))
     }
 
     /// Convert a [`jaq_json::Val`] into a fresh [`dq_core::OwnedIr`].
     ///
-    /// IR-aware variant of [`val_to_serde`]: routes the `Val` through
-    /// [`val_to_serde`] then through [`dq_core::Value::from_serde_json`]
-    /// to produce an [`dq_core::OwnedIr`] whose [`dq_core::ProvenanceMap`]
+    /// IR-aware variant of [`val_to_serde`]: converts the `Val` directly
+    /// into a [`dq_core::Value`] (a NaN or an infinity stays a float) to
+    /// produce an [`dq_core::OwnedIr`] whose [`dq_core::ProvenanceMap`]
     /// marks every value-tree node as
     /// [`dq_core::Provenance::Synthetic`] with reason
     /// [`dq_core::SyntheticReason::Computed`]. The supplied `format` is
@@ -367,8 +593,7 @@ mod imp {
         val: &Val,
         format: dq_core::FormatTag,
     ) -> Result<dq_core::OwnedIr, JqError> {
-        let serde_value = val_to_serde(val)?;
-        let dq_value = dq_core::Value::from_serde_json(&serde_value);
+        let dq_value = val_to_value(val)?;
         let mut provenance = dq_core::ProvenanceMap::new();
         record_synthetic_provenance(&dq_value, &mut Vec::new(), &mut provenance);
         Ok(dq_core::OwnedIr::new(dq_value, provenance, format))
@@ -381,9 +606,8 @@ mod imp {
     /// Mirrors the leaf-and-container traversal used by
     /// [`dq_core::enumerate_pointers`] but operates on a bare
     /// [`dq_core::Value`] (not a [`dq_core::Document`]) so it can run
-    /// against the freshly-built tree from [`val_to_serde`] +
-    /// [`dq_core::Value::from_serde_json`] without needing a document
-    /// envelope.
+    /// against the freshly-built tree from [`val_to_value`] without
+    /// needing a document envelope.
     fn record_synthetic_provenance(
         value: &dq_core::Value,
         path: &mut Vec<dq_core::Segment>,
@@ -462,9 +686,7 @@ mod imp {
             Val::TStr(bytes) => Ok(serde_json::Value::String(bytes_to_utf8_string(
                 bytes.as_ref(),
             ))),
-            Val::BStr(_) => Err(JqError::Conversion {
-                message: "byte-string (BStr) values cannot be represented in JSON; convert via @text or @base64 inside the filter".into(),
-            }),
+            Val::BStr(_) => Err(bstr_error()),
             Val::Arr(items) => {
                 let mut out = Vec::with_capacity(items.len());
                 for item in items.iter() {
@@ -655,6 +877,85 @@ mod imp {
             snippet: snippet_around(expression, position),
             position,
             message: messages.join("; "),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use pretty_assertions::assert_eq;
+
+        #[test]
+        fn dec_to_value_classifies_like_a_json_number() {
+            assert_eq!(dec_to_value("12").ok(), Some(dq_core::Value::Int(12)));
+            assert_eq!(dec_to_value("1.5").ok(), Some(dq_core::Value::Float(1.5)));
+            assert_eq!(
+                dec_to_value("1e400").ok(),
+                Some(dq_core::Value::BigFloat("1e400".into()))
+            );
+            assert_eq!(
+                dec_to_value("123456789012345678901234567890").ok(),
+                Some(dq_core::Value::BigInt(
+                    "123456789012345678901234567890".into()
+                ))
+            );
+            // A literal no f64 holds keeps it; one an f64 holds exactly,
+            // however spelled, is a float.
+            for exact in [
+                "3.14159265358979323846264338327950288",
+                "12345678901234567890123.0",
+                "12345678901234567890.25",
+                "0.1000000000000000000001",
+            ] {
+                assert_eq!(
+                    dec_to_value(exact).ok(),
+                    Some(dq_core::Value::BigFloat(exact.into()))
+                );
+            }
+            for (spelled, f) in [
+                ("1.10", 1.1),
+                ("1e3", 1000.0),
+                ("-0.0", -0.0),
+                ("2.5E-1", 0.25),
+            ] {
+                let Ok(dq_core::Value::Float(got)) = dec_to_value(spelled) else {
+                    panic!("{spelled} is an f64");
+                };
+                assert_eq!(got.to_bits(), f64::to_bits(f), "{spelled}");
+            }
+            assert!(matches!(
+                dec_to_value("NaN"),
+                Ok(dq_core::Value::Float(f)) if f.is_nan()
+            ));
+            assert_eq!(
+                dec_to_value("not-a-number").map_err(|e| e.kind_name()),
+                Err("conversion")
+            );
+        }
+
+        #[test]
+        fn normalized_decimal_drops_zeros_and_folds_the_exponent() {
+            assert_eq!(
+                normalized_decimal("-0.0120e2"),
+                Some((true, "12".into(), -1))
+            );
+            assert_eq!(normalized_decimal("1000"), Some((false, "1".into(), 3)));
+            assert_eq!(normalized_decimal("1e3"), normalized_decimal("1000"));
+            assert_eq!(normalized_decimal("1.10"), normalized_decimal("1.1"));
+            assert_eq!(normalized_decimal("0.0"), Some((false, String::new(), 0)));
+            assert_eq!(normalized_decimal("-0e0"), Some((true, String::new(), 0)));
+            for bad in ["", "-", ".", "1e", "NaN", "1_0", "1.2.3"] {
+                assert_eq!(normalized_decimal(bad), None, "{bad:?}");
+            }
+        }
+
+        #[test]
+        fn literal_to_val_keeps_an_unreadable_literal_as_a_string() {
+            let odd = dq_core::Value::BigFloat("1_0.5x".into());
+            let Val::TStr(bytes) = literal_to_val(&odd, "1_0.5x") else {
+                panic!("an unreadable literal stays a string");
+            };
+            assert_eq!(&bytes[..], b"1_0.5x");
         }
     }
 }
@@ -892,6 +1193,122 @@ mod tests_enabled {
         }
     }
 
+    // -- run_value: no serde_json in between ---------------------------
+
+    /// The value `src` parses to in `format` — the shape a command
+    /// hands to jq (a YAML `.nan` is a `BigFloat(".nan")`, a TOML `nan`
+    /// a `Float(NaN)`).
+    fn parsed(format: &str, src: &str) -> dq_core::Value {
+        let format = dq_core::by_name(format).expect("known format");
+        format
+            .parse(src.as_bytes())
+            .expect("parses")
+            .value()
+            .clone()
+    }
+
+    fn run_value(expression: &str, input: &dq_core::Value) -> Vec<dq_core::Value> {
+        JqEngine::compile(expression)
+            .expect("compile")
+            .run_value(input)
+            .expect("run_value")
+    }
+
+    fn string(s: &str) -> dq_core::Value {
+        dq_core::Value::String(s.to_owned())
+    }
+
+    #[test]
+    fn run_value_sees_yaml_and_toml_non_finite_floats_as_numbers() {
+        for input in [
+            parsed("yaml", "x: .nan\ny: -.inf\n"),
+            parsed("toml", "x = nan\ny = -inf\n"),
+        ] {
+            assert_eq!(
+                run_value("[.x, .y] | map(type)", &input),
+                vec![dq_core::Value::Array(vec![
+                    string("number"),
+                    string("number")
+                ])],
+                "{input:?}"
+            );
+            assert_eq!(
+                run_value(".x | isnan", &input),
+                vec![dq_core::Value::Bool(true)]
+            );
+            assert_eq!(
+                run_value(".y | isinfinite", &input),
+                vec![dq_core::Value::Bool(true)]
+            );
+            let [dq_core::Value::Float(sum)] = run_value(".x + 1", &input)[..] else {
+                panic!("NaN + 1 must be a float");
+            };
+            assert!(sum.is_nan());
+        }
+    }
+
+    #[test]
+    fn run_value_hands_untouched_non_finite_floats_back_as_the_same_data() {
+        let input = parsed("yaml", "x: .nan\ny: -.inf\nz: .Inf\nn: 1\n");
+        let [out] = &run_value(".", &input)[..] else {
+            panic!("identity yields one output");
+        };
+        assert!(out.same_data(&input), "{out:?} vs {input:?}");
+        assert_eq!(
+            run_value(".x", &input)[0]
+                .non_finite_float()
+                .map(f64::is_nan),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn run_value_returns_jq_made_non_finite_floats_as_floats() {
+        let out = run_value("[nan, infinite, -infinite]", &dq_core::Value::Null);
+        let [dq_core::Value::Array(items)] = &out[..] else {
+            panic!("one array, got {out:?}");
+        };
+        let floats: Vec<Option<f64>> = items.iter().map(dq_core::Value::non_finite_float).collect();
+        assert!(matches!(floats[0], Some(f) if f.is_nan()));
+        assert_eq!(floats[1..], [Some(f64::INFINITY), Some(f64::NEG_INFINITY)]);
+    }
+
+    #[test]
+    fn run_value_keeps_big_integer_and_big_float_literals() {
+        let input = parsed(
+            "json",
+            r#"{"i": 12345678901234567890123, "f": 1e400, "s": 1.5}"#,
+        );
+        assert_eq!(run_value(".", &input), vec![input.clone()]);
+        assert_eq!(
+            run_value("[.i, .f] | map(type)", &input),
+            vec![dq_core::Value::Array(vec![
+                string("number"),
+                string("number")
+            ])]
+        );
+        assert_eq!(
+            run_value(".i + 1", &input),
+            vec![dq_core::Value::BigInt("12345678901234567890124".into())]
+        );
+    }
+
+    #[test]
+    fn run_value_rejects_a_byte_string_output() {
+        let err = JqEngine::compile("\"a\" | tobytes")
+            .expect("compile")
+            .run_value(&dq_core::Value::Null)
+            .expect_err("a byte string has no dq value");
+        assert_eq!(err.kind_name(), "conversion", "{err}");
+    }
+
+    #[test]
+    fn serde_run_reads_an_arbitrary_precision_float_as_a_number() {
+        let input: serde_json::Value = serde_json::from_str("1e400").expect("parses");
+        let engine = JqEngine::compile("type").expect("compile");
+        assert_eq!(engine.run(&input).expect("run"), vec![json!("number")]);
+    }
+
     #[test]
     fn val_to_owned_ir_carries_format_tag_through() {
         use dq_core::FormatTag;
@@ -921,6 +1338,14 @@ mod tests_disabled {
         let err = JqError::FeatureDisabled {
             hint: FEATURE_DISABLED_HINT,
         };
+        assert_eq!(err.kind_name(), "feature_disabled");
+    }
+
+    #[test]
+    fn run_value_returns_feature_disabled() {
+        let err = JqEngine
+            .run_value(&dq_core::Value::Null)
+            .expect_err("expected feature_disabled error");
         assert_eq!(err.kind_name(), "feature_disabled");
     }
 

@@ -7,7 +7,8 @@
 //! 2. Load + parse the file (or stdin) through the same shared helpers the
 //!    other read commands use.
 //! 3. Resolve `--doc <idx|all>` against the parsed [`Document`].
-//! 4. Convert the selected view into a [`serde_json::Value`].
+//! 4. Hand the selected view to jq as a [`dq_core::Value`] — not through
+//!    `serde_json::Value`, which has no NaN or infinity.
 //! 5. Compile the jq expression once via [`dq_transform::JqEngine::compile`].
 //!    A compile failure becomes a [`dq_core::Error::Parse`] so the exit-code
 //!    mapper picks `PARSE_ERROR` (3) — same family as file-parse failures.
@@ -15,9 +16,11 @@
 //!    plain `anyhow::anyhow!` so the exit-code mapper picks `GENERIC` (1) —
 //!    the file and the expression were both fine, only the evaluation failed.
 //! 7. Materialise the output stream and hand it to the configured reporter as
-//!    a `serde_json::Value::Array`. The console reporter's "array → one
-//!    element per line" rendering matches the M1 contract for `select`, so we
-//!    reuse it without a special case.
+//!    a `dq_core::Value::Array` through [`Reporter::report_value`]. The
+//!    console reporter's "array → one element per line" rendering matches the
+//!    M1 contract for `select`, so we reuse it without a special case. A NaN
+//!    or an infinity in the results is `.nan` / `nan` in YAML / TOML output
+//!    and an error (exit 1) in JSON / JSONL output.
 
 use std::io::Write;
 
@@ -41,6 +44,8 @@ use crate::output::Reporter;
 ///   [`dq_transform::JqError::Compile`].
 /// - `anyhow::Error` (exit 1) when the compiled filter raises a runtime
 ///   exception during evaluation.
+/// - [`dq_core::Error::Format`] (exit 1) when a JSON-family reporter is
+///   handed a NaN or an infinity.
 pub fn run(
     cli: &Cli,
     args: &QueryArgs,
@@ -73,8 +78,6 @@ pub fn run(
 
     let (_fmt, doc) = load_document_with_path(&args.file, input_format)?;
     let view = select_document(&doc, doc_arg)?;
-    let serde_value = view.to_serde_json();
-
     // Compile errors → dq_core::Error::Parse → exit 3 (PARSE_ERROR).
     let engine = dq_transform::JqEngine::compile(&args.expression)
         .map_err(|e| anyhow::Error::new(jq_compile_to_parse(e, &args.file, &args.expression)))?;
@@ -84,11 +87,10 @@ pub fn run(
     // evaluation against this specific input failed, which doesn't fit any
     // of the structured exit-code categories.
     let outputs = engine
-        .run(&serde_value)
+        .run_value(&view)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let arr = serde_json::Value::Array(outputs);
-    reporter.report(&arr, out)?;
+    reporter.report_value(&dq_core::Value::Array(outputs), out)?;
     Ok(())
 }
 
@@ -195,6 +197,46 @@ mod tests {
         run(&cli, &args, None, None, &reporter, &mut out).expect("field selector");
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed, serde_json::json!([42]));
+    }
+
+    /// Run `expression` over a YAML file holding `src` through `reporter`.
+    fn query_yaml(
+        src: &str,
+        expression: &str,
+        reporter: &dyn Reporter,
+    ) -> (anyhow::Result<()>, String) {
+        let tmp = write_yaml(src);
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
+        let cli = cli_for(&[], path.as_str());
+        let args = QueryArgs {
+            expression: expression.to_owned(),
+            file: path,
+        };
+        let mut out: Vec<u8> = Vec::new();
+        let result = run(&cli, &args, None, None, reporter, &mut out);
+        (result, String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn query_sees_a_yaml_nan_as_a_number_and_writes_it_back_as_yaml_nan() {
+        let reporter = crate::output::YamlReporter;
+        let (result, out) = query_yaml("x: .nan\ny: 1\n", "[(.x | type), .x, .x + 1]", &reporter);
+        result.expect("query succeeds");
+        assert_eq!(out, "- - number\n  - .nan\n  - .nan\n");
+    }
+
+    #[test]
+    fn query_json_output_of_a_nan_fails_with_the_json_format_error() {
+        let (result, out) = query_yaml("x: .nan\n", ".x", &JsonReporter);
+        let err = result.expect_err("JSON has no NaN");
+        assert!(
+            matches!(
+                err.downcast_ref::<dq_core::Error>(),
+                Some(dq_core::Error::Format { format: "json", .. })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(out, "");
     }
 
     #[test]

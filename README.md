@@ -249,7 +249,7 @@ Bulk multi-file mode prints `Modified: N, Skipped: M, Failed: K`. Single-file in
 | Code | Meaning |
 |---|---|
 | 0 | success |
-| 1 | generic (`--check` changes pending, `PatchTestFailed`, a value `convert` cannot write in the target format, such as NaN or Infinity in JSON) |
+| 1 | generic (`--check` changes pending, `PatchTestFailed`, a value `convert`, `query` or `set --jq` cannot write in the output format, such as NaN or Infinity in JSON) |
 | 2 | not found |
 | 3 | parse error (incl. templated file) |
 | 4 | validate fail |

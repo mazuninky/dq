@@ -66,7 +66,7 @@ use camino::Utf8Path;
 use dq_core::{Document, EditScript};
 
 use crate::error::{ExecError, Result};
-use crate::evaluator::{CompiledRule, Evaluator};
+use crate::evaluator::{CompiledRule, Evaluator, run_on_document};
 
 /// Result of applying every rule's fix to one document.
 ///
@@ -149,14 +149,10 @@ impl Fixer {
                 continue;
             }
 
-            // Project the current document to a serde_json value once
-            // per rule — every gate and engine below consumes that
-            // shape. We rebuild it each iteration because earlier
-            // rules in the loop may have mutated `doc`.
-            let value = doc.value().to_serde_json();
-
-            // 2. Match-gate: format / glob / filter.
-            if !rule_applies_to(rule, path, &value, format_name) {
+            // 2. Match-gate: format / glob / filter. Every engine below
+            // runs over the current `doc.value()` — earlier rules in the
+            // loop may have mutated `doc`.
+            if !rule_applies_to(rule, path, doc.value(), format_name) {
                 continue;
             }
 
@@ -177,7 +173,7 @@ impl Fixer {
                     continue;
                 }
             };
-            match check_engine.run(&value) {
+            match run_on_document(check_engine, doc.value()) {
                 Ok(violations) if violations.is_empty() => continue,
                 Ok(_) => {}
                 Err(err) => {
@@ -203,7 +199,6 @@ impl Fixer {
                     rule,
                     path,
                     doc,
-                    &value,
                     &mut applied_rules,
                     &mut skipped_non_idempotent,
                 )?;
@@ -213,7 +208,6 @@ impl Fixer {
                     rule,
                     path,
                     doc,
-                    &value,
                     &mut applied_rules,
                     &mut skipped_non_idempotent,
                 )? {
@@ -239,7 +233,6 @@ fn apply_ops_branch(
     rule: &CompiledRule,
     path: &Utf8Path,
     doc: &mut Document,
-    value: &serde_json::Value,
     applied_rules: &mut Vec<String>,
     skipped_non_idempotent: &mut Vec<String>,
 ) -> Result<()> {
@@ -248,7 +241,7 @@ fn apply_ops_branch(
         .as_ref()
         .expect("fix_ops_engine present in OPS branch");
 
-    let ops_value = run_single_output(engine, value, &rule.rule.id, "fix.ops")?;
+    let ops_value = run_ops_output(engine, doc.value(), &rule.rule.id)?;
     let script: EditScript = match serde_json::from_value::<EditScript>(ops_value) {
         Ok(s) => s,
         Err(err) => {
@@ -305,8 +298,7 @@ fn apply_ops_branch(
     // emits a non-empty patch (e.g. `[replace /x = 1]` on a doc that
     // already has `x: 1`) pass as silently-skipped instead of being
     // recorded on `skipped_non_idempotent`.
-    let value2 = working.value().to_serde_json();
-    let ops_value2 = run_single_output(engine, &value2, &rule.rule.id, "fix.ops")?;
+    let ops_value2 = run_ops_output(engine, working.value(), &rule.rule.id)?;
     let script2: EditScript = match serde_json::from_value::<EditScript>(ops_value2) {
         Ok(s) => s,
         Err(err) => {
@@ -351,7 +343,6 @@ fn apply_jq_branch(
     rule: &CompiledRule,
     path: &Utf8Path,
     doc: &mut Document,
-    value: &serde_json::Value,
     applied_rules: &mut Vec<String>,
     skipped_non_idempotent: &mut Vec<String>,
 ) -> Result<bool> {
@@ -360,13 +351,15 @@ fn apply_jq_branch(
         .as_ref()
         .expect("fix_engine present in JQ branch");
 
-    // Run fix.jq and require single output.
-    let new_value = run_single_output(engine, value, &rule.rule.id, "fix.jq")?;
+    // Run fix.jq and require single output. The document goes to jq as a
+    // `dq_core::Value`, so a NaN or an infinity stays a float.
+    let new_value = run_single_output(engine, doc.value(), &rule.rule.id, "fix.jq")?;
 
     // Idempotency check: the second application must produce the same
     // value as the first. Mirrors the M10 byte-equality semantics.
+    // `same_data`, not `==`: a NaN the fix leaves alone equals itself.
     let new_value_again = run_single_output(engine, &new_value, &rule.rule.id, "fix.jq")?;
-    if new_value_again != new_value {
+    if !new_value_again.same_data(&new_value) {
         tracing::warn!(
             rule_id = %rule.rule.id,
             "fix.jq is non-idempotent; skipping (second application produced a different value)",
@@ -375,8 +368,9 @@ fn apply_jq_branch(
         return Ok(false);
     }
 
-    // No change → already conformant.
-    if new_value == *value {
+    // No change → already conformant. A YAML `.nan` comes back from jq
+    // as `Float(NaN)`, which `same_data` counts as the same.
+    if new_value.same_data(doc.value()) {
         return Ok(false);
     }
 
@@ -391,8 +385,7 @@ fn apply_jq_branch(
     // on the same file will surface `WriteUnavailable` from
     // `EditScript::apply`; that is caught and downgraded to a warn in
     // `apply_ops_branch`.
-    let new_dq_value = dq_core::Value::from_serde_json(&new_value);
-    *doc = Document::value_only(new_dq_value, doc.format());
+    *doc = Document::value_only(new_value, doc.format());
     applied_rules.push(rule.rule.id.clone());
     Ok(true)
 }
@@ -403,7 +396,7 @@ fn apply_jq_branch(
 fn rule_applies_to(
     rule: &CompiledRule,
     path: &Utf8Path,
-    value: &serde_json::Value,
+    value: &dq_core::Value,
     format_name: &str,
 ) -> bool {
     if !rule.rule.match_.format.iter().any(|f| f == format_name) {
@@ -415,7 +408,7 @@ fn rule_applies_to(
         return false;
     }
     if let Some(filter) = rule.filter_engine.as_ref() {
-        match filter.run(value) {
+        match run_on_document(filter, value) {
             Ok(out) => {
                 let Some(first) = out.first() else {
                     return false;
@@ -440,17 +433,39 @@ fn rule_applies_to(
     true
 }
 
+/// Run a `fix.ops` engine against `value`, requiring exactly one output,
+/// as the JSON an [`EditScript`] deserializes from.
+///
+/// An edit script has no way to carry a NaN or an infinity, so an output
+/// holding one is a [`ExecError::FixApply`] rather than the string
+/// [`dq_core::Value::to_serde_json`] would make of it.
+fn run_ops_output(
+    engine: &dq_transform::JqEngine,
+    value: &dq_core::Value,
+    rule_id: &str,
+) -> Result<serde_json::Value> {
+    let output = run_single_output(engine, value, rule_id, "fix.ops")?;
+    if output.holds_non_finite() {
+        return Err(ExecError::FixApply {
+            rule_id: rule_id.to_owned(),
+            message: "fix.ops output holds a NaN or an infinity, which an edit script cannot carry"
+                .to_owned(),
+        });
+    }
+    Ok(output.to_serde_json())
+}
+
 /// Run a fix engine against `value`, requiring exactly one output.
 ///
 /// `which` is `"fix.jq"` or `"fix.ops"` — used to make the error
 /// messages name the correct engine path.
 fn run_single_output(
     engine: &dq_transform::JqEngine,
-    value: &serde_json::Value,
+    value: &dq_core::Value,
     rule_id: &str,
     which: &str,
-) -> Result<serde_json::Value> {
-    let outputs = engine.run(value).map_err(|err| ExecError::FixApply {
+) -> Result<dq_core::Value> {
+    let outputs = engine.run_value(value).map_err(|err| ExecError::FixApply {
         rule_id: rule_id.to_owned(),
         message: format!("{which} runtime error: {err}"),
     })?;
@@ -476,7 +491,7 @@ mod tests {
     use super::*;
     use crate::ruleset::{RuleSet, RuleSource};
     use camino::Utf8PathBuf;
-    use dq_core::FormatTag;
+    use dq_core::{FormatTag, Value};
     use pretty_assertions::assert_eq;
     use serde_json::json;
 
@@ -533,6 +548,82 @@ fix:
         assert_eq!(out.applied_rules, vec!["test.set-fixed".to_owned()]);
         assert_eq!(doc.value().to_serde_json()["fixed"], true);
         assert!(out.skipped_non_idempotent.is_empty());
+    }
+
+    /// A rule that sets `.y = 2` with `fix.jq`.
+    const RULE_Y_IS_TWO: &str = r#"
+id: test.y-is-two
+description: y must be 2
+severity: warn
+match:
+  format: yaml
+check:
+  jq: 'select(.y != 2) | .'
+  message: 'y is not 2'
+fix:
+  jq: '.y = 2'
+"#;
+
+    #[test]
+    fn fixer_jq_keeps_an_untouched_nan_a_float() {
+        let eval = evaluator_from_yaml(RULE_Y_IS_TWO);
+        let fixer = Fixer::new(&eval);
+        let mut doc = parse_yaml(b"x: .nan\ny: 1\n");
+        let out = fixer
+            .apply(&Utf8PathBuf::from("doc.yaml"), &mut doc, "yaml")
+            .expect("fix should run");
+        assert_eq!(out.applied_rules, vec!["test.y-is-two".to_owned()]);
+        assert!(out.skipped_non_idempotent.is_empty(), "{out:?}");
+        let Value::Map(map) = doc.value() else {
+            panic!("a map, got {:?}", doc.value());
+        };
+        assert!(
+            map["x"].non_finite_float().is_some_and(f64::is_nan),
+            "{map:?}"
+        );
+        assert_eq!(map["y"], Value::Int(2));
+    }
+
+    #[test]
+    fn fixer_jq_on_a_conformant_doc_with_a_nan_changes_nothing() {
+        // The fix returns `.nan` as `Float(NaN)`; the doc holds the YAML
+        // literal. Neither "non-idempotent" nor "applied".
+        let eval = evaluator_from_yaml(&RULE_Y_IS_TWO.replace("select(.y != 2)", "select(true)"));
+        let fixer = Fixer::new(&eval);
+        let mut doc = parse_yaml(b"x: .nan\ny: 2\n");
+        let before = doc.clone();
+        let out = fixer
+            .apply(&Utf8PathBuf::from("doc.yaml"), &mut doc, "yaml")
+            .expect("fix should run");
+        assert!(out.applied_rules.is_empty(), "{out:?}");
+        assert!(out.skipped_non_idempotent.is_empty(), "{out:?}");
+        assert_eq!(doc, before);
+    }
+
+    #[test]
+    fn fixer_ops_output_holding_a_nan_is_a_fix_apply_error() {
+        let rule = r#"
+id: test.ops-nan
+description: replace y with NaN
+severity: warn
+match:
+  format: yaml
+check:
+  jq: 'select(.y == 1) | .'
+  message: 'y is 1'
+fix:
+  ops: '[{op: "replace", path: "/y", value: nan}]'
+"#;
+        let eval = evaluator_from_yaml(rule);
+        let fixer = Fixer::new(&eval);
+        let mut doc = parse_yaml(b"y: 1\n");
+        let err = fixer
+            .apply(&Utf8PathBuf::from("doc.yaml"), &mut doc, "yaml")
+            .expect_err("an edit script cannot carry a NaN");
+        assert!(
+            matches!(&err, ExecError::FixApply { message, .. } if message.contains("NaN")),
+            "{err:?}"
+        );
     }
 
     #[test]

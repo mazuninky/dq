@@ -56,7 +56,7 @@ use dq_transform::JqEngine;
 
 use crate::diagnostic::{Diagnostic, Severity};
 use crate::error::{ExecError, Result};
-use crate::evaluator::{CompiledRule, JqCache, compile_rule_to_depth};
+use crate::evaluator::{CompiledRule, JqCache, compile_rule_to_depth, run_on_document};
 use crate::rule::Rule;
 use crate::ruleset::RuleSource;
 
@@ -181,8 +181,8 @@ pub(crate) fn compile_composite(
 /// diagnostic and return immediately — this branch should only fire when
 /// the test override drops `max_depth` below the compile-time bound.
 // Crate-internal entry point with the same plural-context surface as
-// the existing `evaluate_one_rule_at_depth` (rule, path, ir, value,
-// depth budget, output buffer). Bundling the arguments into a struct
+// the existing `evaluate_one_rule_at_depth` (rule, path, ir, depth
+// budget, output buffer). Bundling the arguments into a struct
 // adds indirection without removing any of them; the alternative would
 // force every caller to assemble a tagged context type per evaluation.
 #[allow(clippy::too_many_arguments)]
@@ -191,7 +191,6 @@ pub(crate) fn run_composite(
     composite: &CompiledCompositeCheck,
     path: &Utf8Path,
     ir: &dq_core::Ir<'_>,
-    value: &serde_json::Value,
     current_depth: usize,
     max_depth: usize,
     out: &mut Vec<Diagnostic>,
@@ -209,7 +208,7 @@ pub(crate) fn run_composite(
         return;
     }
 
-    let extract_outputs = match composite.extract.run(value) {
+    let extract_outputs = match run_on_document(&composite.extract, ir.value()) {
         Ok(o) => o,
         Err(err) => {
             tracing::warn!(
