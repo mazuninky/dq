@@ -810,6 +810,9 @@ struct EntryAnchor {
     /// when located, else the end of the key (an explicit `? key` without a
     /// `:`) or the item's start.
     value_from: usize,
+    /// Where the entry itself begins: its key (node properties included)
+    /// or its `-`, else the item's start.
+    start: usize,
 }
 
 /// What [`edit_layout`] reports.
@@ -824,6 +827,21 @@ pub(crate) struct EditLayout {
     /// there replaces — its node properties, or without any the empty range
     /// just past the key's `:` / the item's `-`.
     pub(crate) empty_values: HashMap<String, Range<usize>>,
+    /// Where the entry of every value of a block collection begins, keyed
+    /// by canonical pointer.
+    pub(crate) entries: HashMap<String, EntryStart>,
+}
+
+/// Where an entry of a block collection begins, as [`edit_layout`] reports
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EntryStart {
+    /// Its key (node properties included) or its `-`.
+    pub(crate) at: usize,
+    /// `false` when the entry shares its line with its parent's `-`: the
+    /// first key of a compact mapping (`- key: …`) or the first item of a
+    /// compact sequence (`- - item`).
+    pub(crate) owns_line: bool,
 }
 
 /// An alias and the anchored node it refers to. A redefined anchor name
@@ -873,6 +891,10 @@ pub(crate) struct ContainerLayout {
     /// Bytes of a flow collection inside another flow collection, from its
     /// opening bracket through its closing one. `None` otherwise.
     pub(crate) flow_value: Option<Range<usize>>,
+    /// Where the collection's entry ends: past its last line for a block
+    /// collection or one in a block parent, past its closing bracket in a
+    /// flow parent.
+    pub(crate) end: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -999,11 +1021,22 @@ impl<'src> State<'src> {
                 }
                 let colon = skip_separation(bytes, key.end);
                 let indicator_end = (bytes.get(colon) == Some(&b':')).then_some(colon + 1);
+                // An explicit key (`? key`) begins at its `?`.
+                let mut start = key.start;
+                while start > 0 && matches!(bytes[start - 1], b' ' | b'\t') {
+                    start -= 1;
+                }
+                let start = if start > 0 && bytes[start - 1] == b'?' {
+                    start - 1
+                } else {
+                    key.start
+                };
                 Some(EntryAnchor {
                     line_start: line_start_at(bytes, key.start),
-                    owns_line: starts_line_after_bom(bytes, key.start),
+                    owns_line: starts_line_after_bom(bytes, start),
                     indicator_end,
                     value_from: indicator_end.unwrap_or(key.end),
+                    start,
                 })
             }
             Frame::Sequence { .. } if in_flow => None,
@@ -1015,6 +1048,7 @@ impl<'src> State<'src> {
                         owns_line: starts_line_after_bom(bytes, dash),
                         indicator_end: Some(dash + 1),
                         value_from: dash + 1,
+                        start: dash,
                     })
                 } else {
                     let dash = dash_before(bytes, item_start);
@@ -1023,6 +1057,7 @@ impl<'src> State<'src> {
                         owns_line: dash.is_some_and(|dash| starts_line_after_bom(bytes, dash)),
                         indicator_end: dash.map(|dash| dash + 1),
                         value_from: dash.map_or(item_start, |dash| dash + 1),
+                        start: dash.unwrap_or(item_start),
                     })
                 }
             }
@@ -1058,6 +1093,12 @@ impl<'src> State<'src> {
         let props_end = (n_properties > 0)
             .then(|| skip_node_properties(self.bytes, event_start, n_properties).0);
         self.enter_container();
+        let pointer = if self.path.is_empty() {
+            String::new()
+        } else {
+            format!("/{}", self.path.join("/"))
+        };
+        self.note_entry(&pointer, entry);
         let container = ContainerFrame {
             entry,
             props_end,
@@ -1126,6 +1167,7 @@ impl<'src> State<'src> {
                     let entry = self
                         .entry_anchor(char_index_to_byte(self.char_to_byte, span.start.index()));
                     let pointer = self.value_pointer();
+                    self.note_entry(&pointer, entry);
                     self.note_anchor(anchor, span, Some(pointer.clone()));
                     let (value_range, col) = if n_properties == 0 {
                         (span_to_range(span, self.char_to_byte), span.start.col())
@@ -1194,6 +1236,7 @@ impl<'src> State<'src> {
                 } else {
                     let entry = self.entry_anchor(range.start);
                     let pointer = self.value_pointer();
+                    self.note_entry(&pointer, entry);
                     self.note_alias(anchor, range.start, Some(pointer.clone()));
                     let context = self.value_context();
                     let line_range = self.compute_line_range(
@@ -1236,6 +1279,20 @@ impl<'src> State<'src> {
             }
         }
         Ok(())
+    }
+
+    /// Record where the entry of the value at `pointer` begins, when
+    /// collecting the [`EditLayout`].
+    fn note_entry(&mut self, pointer: &str, entry: Option<EntryAnchor>) {
+        if let (Some(layout), Some(entry)) = (self.layout.as_mut(), entry) {
+            layout.entries.insert(
+                pointer.to_owned(),
+                EntryStart {
+                    at: entry.start,
+                    owns_line: entry.owns_line,
+                },
+            );
+        }
     }
 
     /// Record the node whose event span is `span` as the definition of
@@ -1556,6 +1613,7 @@ impl<'src> State<'src> {
                         None
                     },
                     first_child_line: first_entry.flatten(),
+                    end,
                     flow_value: (style == ContextStyle::Flow && in_flow_parent)
                         .then_some(start_byte..end_byte),
                 },

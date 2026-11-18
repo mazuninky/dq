@@ -276,9 +276,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   leaving `a:`, which reads as `null`; an emptied document becomes `{}`.
 - YAML `del` of a key whose value is a collection removes the whole entry
   instead of failing with "not found" (block collections) or leaving the
-  key with a `null` value (`{}` / `[]`). Where the key shares its line
-  with a sequence item's `-` (`- key: {…}`), `del` fails with exit 7 and
-  leaves the file alone.
+  key with a `null` value (`{}` / `[]`).
 - YAML `del` of an empty value — `key: |` with no lines, `key: !!str`,
   `key: &a`, `- &a` — removes its own entry; it used to remove the entry
   after it and keep its own.
@@ -322,6 +320,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `key: !!str`, an empty `-` item — writes the value after the `:` / `-`
   (`key: 5`). It used to write it before the `:` (`key5:`). An anchor
   stays; a `!!` tag goes, as it would retype the new value.
+- YAML `del` of the first key of a compact sequence item (`- name: web`
+  over `  image: x`) hands the `-` on to the next key: `- image: x`. It
+  used to remove the line with the `-`, merging the item's other keys
+  into the item before it. The only key leaves `- {}`, the only item of
+  `- - 1` leaves `- []`. A new key of such an item lines up with its keys
+  instead of with the `-`.
 
 ### Security
 

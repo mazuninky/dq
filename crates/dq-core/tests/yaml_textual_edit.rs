@@ -287,13 +287,57 @@ fn del_of_an_empty_node_removes_only_its_entry() {
     assert_eq!(del("? v\n  t\n", "/v t"), "{}\n");
 }
 
+// --- compact entries (`- key: v`, `- - v`) ------------------------------------
+
 #[test]
-fn del_of_a_collection_under_a_compact_sequence_entry_is_refused() {
-    // `- name: {…}`: the key shares its line with the item's `-`, and
-    // removing the line would take the item with it.
-    let mut doc = doc("l:\n  - name: {n: 1}\n    age: 2\n");
-    assert!(doc.del_at(&ptr("/l/0/name")).is_err());
-    assert_eq!(doc.original_bytes(), b"l:\n  - name: {n: 1}\n    age: 2\n");
+fn del_of_the_first_entry_of_a_compact_item_hands_the_dash_on() {
+    assert_eq!(del("l:\n  - x: 1\n    y: 2\n", "/l/0/x"), "l:\n  - y: 2\n");
+    assert_eq!(del("l:\n  - x: 1\n    y: 2\n", "/l/0/y"), "l:\n  - x: 1\n");
+    assert_eq!(
+        del("l:\r\n  - x: 1\r\n    y: 2\r\n", "/l/0/x"),
+        "l:\r\n  - y: 2\r\n"
+    );
+    assert_eq!(
+        del("c:\n  - name: web\n    image: x\n", "/c/0/name"),
+        "c:\n  - image: x\n"
+    );
+    assert_eq!(del("- a: {x: 1}\n  b: 2\n", "/0/a"), "- b: 2\n");
+    assert_eq!(
+        del("l:\n  - a:\n      p: 1\n    b: 2\n", "/l/0/a"),
+        "l:\n  - b: 2\n"
+    );
+    assert_eq!(del("l:\n  - a:\n    b: 2\n", "/l/0/a"), "l:\n  - b: 2\n");
+    assert_eq!(
+        del("l:\n  - x: |\n      t\n    y: 2\n", "/l/0/x"),
+        "l:\n  - y: 2\n"
+    );
+    assert_eq!(del("- - 1\n  - 2\n", "/0/0"), "- - 2\n");
+    assert_eq!(del("- - - 1\n    - 2\n", "/0/0/0"), "- - - 2\n");
+}
+
+#[test]
+fn del_of_the_only_entry_of_a_compact_item_leaves_an_empty_collection() {
+    assert_eq!(del("- a: 1\n- b: 2\n", "/0/a"), "- {}\n- b: 2\n");
+    assert_eq!(del("- a: {x: 1}\n", "/0/a"), "- {}\n");
+    assert_eq!(del("- a: {}\n", "/0/a"), "- {}\n");
+    assert_eq!(del("- a: 1 # c\n", "/0/a"), "- {} # c\n");
+    assert_eq!(del("- - 1\n", "/0/0"), "- []\n");
+}
+
+#[test]
+fn set_of_a_new_key_in_a_compact_item_lines_up_with_its_keys() {
+    assert_eq!(
+        set("l:\n  - x: 1\n", "/l/0/z", Value::Int(3)),
+        "l:\n  - x: 1\n    z: 3\n"
+    );
+    assert_eq!(
+        set("- - x: 1\n", "/0/0/z", Value::Int(3)),
+        "- - x: 1\n    z: 3\n"
+    );
+    assert_eq!(
+        set("l:\n- x: 1\n", "/l/0/z", Value::Int(3)),
+        "l:\n- x: 1\n  z: 3\n"
+    );
 }
 
 // --- anchors and aliases -----------------------------------------------------

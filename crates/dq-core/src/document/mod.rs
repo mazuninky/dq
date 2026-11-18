@@ -1496,11 +1496,7 @@ impl Document {
             Ok(Value::Array(items)) => items.len() == 1,
             _ => false,
         };
-        let layout = if self.format == FormatTag::Yaml
-            && (target_is_collection
-                || parent_loses_last_child
-                || self.original_bytes.contains(&b'*'))
-        {
+        let layout = if self.format == FormatTag::Yaml {
             crate::parsers::yaml_spans::edit_layout(&self.original_bytes)
                 .inspect_err(|err| tracing::debug!(%err, "YAML re-parse for del failed"))
                 .ok()
@@ -1508,6 +1504,22 @@ impl Document {
             None
         };
         let in_map = matches!(parent_ptr.resolve(&self.value), Ok(Value::Map(_)));
+        // What takes the place of the removed bytes: `{}` / `[]` for the
+        // only entry of a compact collection.
+        let mut inserted: &'static [u8] = b"";
+        let compact_entry = match layout.as_ref() {
+            Some(layout) => self.compact_entry_removal(
+                layout,
+                &canonical,
+                &parent_ptr,
+                target_is_collection,
+                parent_loses_last_child,
+            )?,
+            None => None,
+        };
+        if compact_entry.is_some() && parent_loses_last_child {
+            inserted = if in_map { b"{}" } else { b"[]" };
+        }
         let collection = layout
             .as_ref()
             .filter(|_| target_is_collection)
@@ -1519,6 +1531,7 @@ impl Document {
                 })
             })
         });
+        let collection_entry = compact_entry.or(collection_entry);
         if collection.is_some_and(|collection| !collection.top_level) && collection_entry.is_none()
         {
             // `- key: {…}`, or a flow entry with a comment in between: the
@@ -1589,10 +1602,10 @@ impl Document {
         let delta = SpanRecomputeDelta {
             at: line_range.start,
             old_len: line_range.end - line_range.start,
-            new_len: 0,
+            new_len: inserted.len(),
         };
         self.original_bytes
-            .splice(line_range, std::iter::empty::<u8>());
+            .splice(line_range, inserted.iter().copied());
         // Drop every span at or below the deleted pointer, then shift the
         // remaining spans by the negative delta. We collect the keys to
         // remove first so we don't borrow `self.spans` mutably and
@@ -1620,6 +1633,72 @@ impl Document {
         // map so the IR view stays consistent across writes.
         self.provenance = provenance_from_spans(&self.spans);
         Ok(())
+    }
+
+    /// The bytes `del` removes for the YAML value at `canonical` when its
+    /// entry shares its line with its parent's `-` (`- key: v`, `- - v`):
+    /// from the entry up to the next entry of the same parent, so that one
+    /// takes the `-`; for the only entry, up to the end of its value — the
+    /// caller writes `{}` / `[]` in its place. `None` for an entry that
+    /// owns its line.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::EditRejected`] when the end of the value is not known.
+    fn compact_entry_removal(
+        &self,
+        layout: &crate::parsers::yaml_spans::EditLayout,
+        canonical: &str,
+        parent_ptr: &Pointer,
+        target_is_collection: bool,
+        only_child: bool,
+    ) -> Result<Option<std::ops::Range<usize>>> {
+        let Some(entry) = layout
+            .entries
+            .get(canonical)
+            .filter(|entry| !entry.owns_line)
+        else {
+            return Ok(None);
+        };
+        let parent = parent_ptr.as_canonical();
+        let siblings = format!("{parent}/");
+        let next = layout
+            .entries
+            .iter()
+            .filter(|(pointer, start)| {
+                pointer
+                    .strip_prefix(&siblings)
+                    .is_some_and(|tail| !tail.is_empty() && !tail.contains('/'))
+                    && start.at > entry.at
+            })
+            .map(|(_, start)| start.at)
+            .min();
+        if let Some(next) = next {
+            return Ok(Some(entry.at..next));
+        }
+        let end = if !only_child {
+            None
+        } else if target_is_collection {
+            layout
+                .containers
+                .get(canonical)
+                .map(|collection| collection.end)
+        } else if let Some(empty) = layout.empty_values.get(canonical) {
+            Some(empty.end)
+        } else {
+            self.spans.get(canonical).map(|span| span.value_range.end)
+        };
+        let Some(mut end) = end.filter(|&end| end > entry.at) else {
+            return Err(Error::EditRejected {
+                action: "delete",
+                pointer: canonical.to_owned(),
+                reason: "it shares its line with the entry around it".to_owned(),
+            });
+        };
+        while end > entry.at && self.original_bytes[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        Ok(Some(entry.at..end))
     }
 
     /// After `del_at` removed the bytes `removed` (ending in the line break
@@ -2002,6 +2081,15 @@ fn sibling_key_column(bytes: &[u8], value_start: usize) -> u32 {
     let mut key_col = line_start;
     while key_col < cap && matches!(bytes[key_col], b' ' | b'\t') {
         key_col += 1;
+    }
+    // A YAML key of a compact mapping sits past its item's `-` (`- key:`,
+    // `- - key:`). No JSON or TOML key starts with `-` and a blank.
+    while key_col + 1 < cap && bytes[key_col] == b'-' && matches!(bytes[key_col + 1], b' ' | b'\t')
+    {
+        key_col += 1;
+        while key_col < cap && matches!(bytes[key_col], b' ' | b'\t') {
+            key_col += 1;
+        }
     }
     // Column = (byte offset on line) + 1 to match the 1-indexed convention
     // saphyr-parser reports for `ValueSpan::indent`.
