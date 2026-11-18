@@ -15,10 +15,11 @@
 //!   at `crates/dq-core/src/transform/merge.rs:38` (the function clones
 //!   the full document for zero useful work).
 
-use criterion::{BatchSize, BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use dq_core::{Document, PatchOp, Pointer, Value, apply_merge, apply_patch, diff};
 use indexmap::IndexMap;
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
+use std::hint::black_box;
 
 /// Build a flat map of `n` `{key_i: i}` entries — the unit workload for
 /// every transform bench below. Flat shape keeps the per-op cost
@@ -53,7 +54,7 @@ fn synth_diff_pair(ratio_per_thousand: u32) -> (Value, Value) {
     let mut rng = StdRng::seed_from_u64(42);
     let count = ratio_per_thousand as usize;
     for _ in 0..count {
-        let idx = rng.gen_range(0..1_000);
+        let idx = rng.random_range(0..1_000);
         let key = format!("key_{idx}");
         b_map.insert(key, Value::String("changed".to_owned()));
     }

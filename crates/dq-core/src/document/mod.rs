@@ -224,6 +224,45 @@ pub struct Document {
     provenance: ProvenanceMap,
 }
 
+/// The not-a-number or infinite float a number literal spells in YAML
+/// (`.nan`, `-.inf`, `.Inf`) or TOML (`nan`, `+inf`) — how a
+/// [`Value::BigFloat`] carries one; `None` for any other literal.
+pub(crate) fn non_finite_literal(literal: &str) -> Option<f64> {
+    let (negative, rest) = match literal.as_bytes().first() {
+        Some(b'-') => (true, &literal[1..]),
+        Some(b'+') => (false, &literal[1..]),
+        _ => (false, literal),
+    };
+    let rest = rest.strip_prefix('.').unwrap_or(rest);
+    match rest {
+        "nan" | "NaN" | "NAN" => Some(f64::NAN),
+        "inf" | "Inf" | "INF" => Some(if negative {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        }),
+        _ => None,
+    }
+}
+
+/// The NaN or infinite float `value` is, as a float or a literal.
+fn non_finite(value: &Value) -> Option<f64> {
+    match value {
+        Value::Float(f) if !f.is_finite() => Some(*f),
+        Value::BigFloat(s) => non_finite_literal(s),
+        _ => None,
+    }
+}
+
+/// Whether `value` is or holds a NaN or infinite float.
+fn holds_non_finite(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(holds_non_finite),
+        Value::Map(map) => map.values().any(holds_non_finite),
+        scalar => non_finite(scalar).is_some(),
+    }
+}
+
 impl Value {
     /// Stable type name used by the `type` command and error messages.
     #[must_use]
@@ -676,21 +715,69 @@ impl Document {
     /// strictly read-only for mkdir-p and continue to return
     /// [`Error::Path`].
     ///
+    /// # Read-back check
+    ///
+    /// The edited bytes are parsed again and must read back as the tree
+    /// before the edit with `value` at `pointer` — and, in YAML, at every
+    /// alias of an anchored node at or above `pointer`, which shares the
+    /// edit. Otherwise the document is left as it was and the edit fails.
+    /// On success the value tree, spans and provenance are the fresh
+    /// parse's.
+    ///
     /// # Errors
     ///
     /// - [`Error::WriteUnavailable`] when the document was loaded
     ///   read-only (no spans or no renderer registered).
     /// - [`Error::Path`] when the pointer addresses a non-existent path
     ///   that cannot be created via the single-level mkdir-p path.
+    /// - [`Error::EditRejected`] when the edited bytes fail the read-back
+    ///   check.
     pub fn set_at(&mut self, pointer: &Pointer, value: Value) -> Result<()> {
+        let before = self.clone();
+        let layout = LayoutCache::new();
+        let result = self.set_at_unchecked(pointer, value.clone(), &layout);
+        self.check_edit(before, result, "set", pointer, &layout, |tree, at| {
+            set_value_at(tree, at, value.clone())
+        })
+    }
+
+    /// The YAML edit layout of the bytes as they were before the edit
+    /// under way, worked out once per edit through `cache`; `None` for
+    /// other formats or bytes saphyr rejects. Call it only before the
+    /// edit splices.
+    fn edit_layout<'a>(
+        &self,
+        cache: &'a LayoutCache,
+    ) -> Option<&'a crate::parsers::yaml_spans::EditLayout> {
+        cache
+            .get_or_init(|| {
+                (self.format == FormatTag::Yaml)
+                    .then(|| {
+                        crate::parsers::yaml_spans::edit_layout(&self.original_bytes)
+                            .inspect_err(|err| tracing::debug!(%err, "YAML edit layout failed"))
+                            .ok()
+                    })
+                    .flatten()
+            })
+            .as_ref()
+    }
+
+    /// [`Document::set_at`] without the read-back check.
+    fn set_at_unchecked(
+        &mut self,
+        pointer: &Pointer,
+        value: Value,
+        layout: &LayoutCache,
+    ) -> Result<()> {
         // "Read-only" really means "no source bytes captured" — read-only
         // parsers go through `value_only` / `multi_value_only` and leave
         // `original_bytes` empty. A document with bytes but an empty
         // SpanMap (e.g. `{"a":{}}` whose only key is itself an empty
         // container) is still write-aware; its mkdir-p path will fail
         // through to `Error::Path { MissingKey }` further down, but the
-        // top-level capability check should not falsely block it.
-        if self.original_bytes.is_empty() {
+        // top-level capability check should not falsely block it. An empty
+        // file parsed write-aware has no bytes but a span for its root.
+        if self.original_bytes.is_empty() && self.spans.is_empty() {
             return Err(Error::WriteUnavailable {
                 reason: format!(
                     "{} document was loaded read-only; reload via a write-aware parser to enable set",
@@ -706,22 +793,133 @@ impl Document {
         })?;
 
         let canonical = pointer.as_canonical();
+        if self.format == FormatTag::Json && holds_non_finite(&value) {
+            return Err(Error::EditRejected {
+                action: "set",
+                pointer: canonical,
+                reason: JSON_NON_FINITE.to_owned(),
+            });
+        }
+        if self.format == FormatTag::Yaml
+            && match pointer.resolve(&self.value) {
+                // `key: !!str` reads as "".
+                Ok(Value::Null) => true,
+                Ok(Value::String(s)) => s.is_empty(),
+                _ => false,
+            }
+            && let Some(span) = self.spans.get(&canonical).cloned()
+            && let Some(at) = self
+                .edit_layout(layout)
+                .and_then(|layout| layout.empty_values.get(&canonical).cloned())
+        {
+            // An empty node (`key:`, `- &a`) has no text to replace; its
+            // recorded span sits on the token after it.
+            let rendered = renderer.render_replacement(&value, span.context, &[]);
+            let (mut replacement, mut value_offset) =
+                empty_node_replacement(&self.original_bytes[at.clone()], &rendered);
+            // `? key` with no `:` line: the value needs its indicator, on
+            // a line of its own at the `?` column.
+            let explicit_key = self
+                .edit_layout(layout)
+                .and_then(|layout| layout.entries.get(&canonical))
+                .map(|entry| entry.at)
+                .filter(|&entry| self.original_bytes[entry] == b'?');
+            let indicator = skip_blanks_back(&self.original_bytes, at.start);
+            if let Some(question) = explicit_key
+                && span.context == SpanContext::BlockMapValue
+                && at.is_empty()
+                && self.original_bytes[..indicator].last() != Some(&b':')
+            {
+                let mut line = b"\n".to_vec();
+                line.extend(std::iter::repeat_n(
+                    b' ',
+                    line_column(&self.original_bytes, question),
+                ));
+                line.extend_from_slice(b":");
+                let line = with_line_ending_at(&self.original_bytes, at.start, line);
+                value_offset += line.len();
+                line.into_iter()
+                    .rev()
+                    .for_each(|b| replacement.insert(0, b));
+            }
+            self.original_bytes
+                .splice(at.clone(), replacement.iter().copied());
+            apply_delta(
+                &mut self.spans,
+                SpanRecomputeDelta {
+                    at: at.start,
+                    old_len: at.len(),
+                    new_len: replacement.len(),
+                },
+            );
+            set_value_at(&mut self.value, pointer, value)?;
+            let start = at.start + value_offset;
+            self.spans.insert(
+                canonical,
+                ValueSpan {
+                    value_range: start..start + rendered.len(),
+                    ..span
+                },
+            );
+            self.provenance = provenance_from_spans(&self.spans);
+            return Ok(());
+        }
         if let Some(span) = self.spans.get(&canonical).cloned() {
             // Replace-in-span path: render the new value using the same
             // syntactic context as the original, splice into the source
             // buffer, then shift every span to the right of the edit.
-            let original_slice = &self.original_bytes[span.value_range.clone()];
-            let rendered = renderer.render_replacement(&value, span.context, original_slice);
+            //
+            // A `|` / `>` block scalar is rewritten whole as an inline
+            // scalar, header included: a block scalar can only hold a
+            // string, and its value depends on its header's chomping.
+            let block_scalar = (self.format == FormatTag::Yaml
+                && matches!(pointer.resolve(&self.value), Ok(Value::String(_))))
+            .then(|| crate::parsers::yaml_spans::block_scalar_extent(&self.original_bytes, &span))
+            .flatten();
+            let (mut replaced, mut rendered, value_len) = match block_scalar {
+                Some((extent, keep)) => {
+                    let mut rendered = renderer.render_replacement(&value, span.context, &[]);
+                    let value_len = rendered.len();
+                    rendered.extend_from_slice(&self.original_bytes[keep]);
+                    (extent, rendered, value_len)
+                }
+                None => {
+                    let original_slice = &self.original_bytes[span.value_range.clone()];
+                    let rendered =
+                        renderer.render_replacement(&value, span.context, original_slice);
+                    let value_len = rendered.len();
+                    (span.value_range.clone(), rendered, value_len)
+                }
+            };
+            // A `!!` tag fixes the type of what follows it (`!!int`,
+            // `!!binary`): the new value is written untagged, typed by what
+            // it is. dq's tree carries no tags; local tags (`!Ref`) and
+            // anchors stay.
+            let mut value_start = replaced.start;
+            if self.format == FormatTag::Yaml {
+                let props_start = yaml_properties_start(&self.original_bytes, replaced.start);
+                let props = &self.original_bytes[props_start..replaced.start];
+                if props
+                    .split(u8::is_ascii_whitespace)
+                    .any(|token| token.starts_with(b"!!"))
+                {
+                    let mut kept = kept_properties(props);
+                    value_start = props_start + kept.len();
+                    kept.append(&mut rendered);
+                    rendered = kept;
+                    replaced.start = props_start;
+                }
+            }
             let delta = SpanRecomputeDelta {
-                at: span.value_range.start,
-                old_len: span.value_range.end - span.value_range.start,
+                at: replaced.start,
+                old_len: replaced.end - replaced.start,
                 new_len: rendered.len(),
             };
             // `splice` requires an owned iterator; cloning into a Vec keeps
             // the operation straightforward and the cost is negligible for
             // human-scale documents.
             self.original_bytes
-                .splice(span.value_range.clone(), rendered.iter().copied());
+                .splice(replaced.clone(), rendered.iter().copied());
             apply_delta(&mut self.spans, delta);
             // Update the also-stored `Value` tree so subsequent reads via
             // `value()` reflect the write. Failures here are propagated as
@@ -732,9 +930,9 @@ impl Document {
             // Patch span metadata in place: keep `at` and `line_range.start`
             // anchored to the original byte position, but extend the end to
             // the new length.
-            let new_end = span.value_range.start + rendered.len();
+            let new_end = value_start + value_len;
             if let Some(updated) = self.spans.get_mut(&canonical) {
-                updated.value_range = span.value_range.start..new_end;
+                updated.value_range = value_start..new_end;
                 // For single-line scalars `line_range` typically equals
                 // `value_range` plus the trailing newline. Conservatively
                 // extend by the same delta so the line range stays anchored.
@@ -749,13 +947,21 @@ impl Document {
             // splice and span-recompute that already ran above.
             self.provenance = provenance_from_spans(&self.spans);
             Ok(())
+        } else if !pointer.is_root()
+            && matches!(
+                pointer.resolve(&self.value),
+                Ok(Value::Map(_) | Value::Array(_))
+            )
+        {
+            // A non-empty collection records no span of its own.
+            self.replace_collection(pointer, &canonical, value, layout, renderer)
         } else {
             // mkdir-p path: try the single-level insertion fallback before
             // surfacing `Error::Path { MissingKey }`. Multi-level chains
             // and empty-parent inserts fall through to the structured Path
             // error — the parsers do not yet record container-level spans
             // we'd need to splice into an empty `{}` body.
-            self.try_single_level_mkdir_p(pointer, &canonical, value)
+            self.try_single_level_mkdir_p(pointer, &canonical, value, layout)
         }
     }
 
@@ -805,6 +1011,7 @@ impl Document {
         pointer: &Pointer,
         canonical: &str,
         value: Value,
+        layout: &LayoutCache,
     ) -> Result<()> {
         // Bail-out helper — every unsupported shape funnels through here so
         // callers continue to see the structured Path diagnostic they
@@ -881,10 +1088,8 @@ impl Document {
         } else {
             format!("{parent_canonical}/")
         };
-        let sibling = self
-            .rightmost_direct_sibling(&sibling_prefix)
-            .map(|(k, span)| (k.to_owned(), span.clone()));
-        let Some((_sibling_key, sibling_span)) = sibling else {
+        let sibling = self.last_direct_child(&sibling_prefix, self.edit_layout(layout));
+        let Some((sibling_key, mut sibling_span)) = sibling else {
             // No sibling — try the empty-parent path. The parent's `{}` /
             // `[]` body must have a recorded container span for this branch
             // to succeed; if it doesn't, fall through to MissingKey.
@@ -894,6 +1099,32 @@ impl Document {
             // `missing_key` captures `self.value` via
             // `longest_existing_value_prefix` and so cannot coexist with
             // the `&mut self` we need for the splice).
+            if self.format == FormatTag::Toml {
+                // The root, or a `[table]` holding only tables: the new key
+                // goes before the first header, or right under its own.
+                let at = if parent_canonical.is_empty() {
+                    crate::parsers::toml::toml_root_insertion_point(&self.original_bytes)
+                } else {
+                    crate::parsers::toml::toml_tables(&self.original_bytes)
+                        .and_then(|tables| tables.header_line_ends.get(&parent_canonical).copied())
+                };
+                if let Some(at) = at {
+                    return self.toml_table_insertion(
+                        pointer,
+                        &new_key,
+                        value,
+                        insertion_renderer,
+                        at,
+                    );
+                }
+                if parent_canonical.is_empty() {
+                    return Err(Error::EditRejected {
+                        action: "set",
+                        pointer: pointer.as_canonical(),
+                        reason: "the document does not parse".to_owned(),
+                    });
+                }
+            }
             let parent_is_empty_map = parent_map.is_empty();
             let fallback_err = missing_key();
             return self.try_empty_parent_mkdir_p(
@@ -913,20 +1144,69 @@ impl Document {
         // of the parent's children (YAML's convention), or as the leading
         // indent count for JSON. The sibling's `indent` is the column of
         // the sibling's *value*, not its key, so we re-derive the key
-        // column by scanning back through the sibling's line.
-        let parent_children_indent =
-            sibling_key_column(&self.original_bytes, sibling_span.value_range.start);
-        let fragment = insertion_renderer.render_insertion(
-            &new_key,
-            &value,
-            parent_children_indent,
-            sibling_span.context,
-        );
+        // column by scanning back through the sibling's line. A YAML value
+        // can start lines below its key (a `|` / `>` block scalar's
+        // content, a value on the next line); its `line_range` starts on
+        // the key's line, so that is the line to scan.
+        let key_line = if self.format == FormatTag::Yaml {
+            sibling_span.line_range.start
+        } else {
+            sibling_span.value_range.start
+        };
+        let parent_children_indent = sibling_key_column(&self.original_bytes, key_line);
+        if self.format == FormatTag::Yaml {
+            if self.spans.contains_key(&sibling_key) {
+                self.strip_yaml_chomping_before_eof_append(&sibling_key, &mut sibling_span);
+            } else if sibling_span.line_range.end == self.original_bytes.len() {
+                // A collection ending the document: its last scalar may be
+                // a block scalar without a final line break.
+                let prefix = format!("{sibling_key}/");
+                if let Some((last_key, mut last_span)) = self
+                    .spans
+                    .iter()
+                    .filter(|(key, _)| key.starts_with(&prefix))
+                    .max_by_key(|(_, span)| span.value_range.end)
+                    .map(|(key, span)| (key.clone(), span.clone()))
+                {
+                    self.strip_yaml_chomping_before_eof_append(&last_key, &mut last_span);
+                    sibling_span.line_range.end = self.original_bytes.len();
+                }
+            }
+        }
+        let flow_layout = self.flow_layout(&sibling_span);
+        // A YAML entry in a flow mapping is written on one line, one in a
+        // block mapping as a block entry, whatever the sibling's own
+        // context (an empty `[]` carries a flow one).
+        let context = match (self.format, flow_layout) {
+            (FormatTag::Yaml, Some(_)) => SpanContext::FlowMapValue,
+            (FormatTag::Yaml, None) => SpanContext::BlockMapValue,
+            _ => sibling_span.context,
+        };
+        let mut fragment =
+            insertion_renderer.render_insertion(&new_key, &value, parent_children_indent, context);
+        if self.format == FormatTag::Toml && flow_layout.is_none() {
+            // A sibling written under a dotted key (`r0.k0 = 1`) has its
+            // parent in the key, not in a header: the new key needs it too.
+            let line_start = self.original_bytes[..sibling_span.value_range.start]
+                .iter()
+                .rposition(|&b| b == b'\n')
+                .map_or(0, |i| i + 1);
+            if let Some(prefix) = toml_dotted_key_parent(&self.original_bytes[line_start..]) {
+                let prefix = prefix.trim_ascii_start();
+                let at = fragment.len() - fragment.trim_ascii_start().len();
+                fragment.splice(at..at, prefix.iter().copied().chain(*b"."));
+            }
+        }
 
         // Compute the actual splice point + final bytes, format-aware so
         // we don't smear `\n`s or forget a `,` separator.
-        let (splice_at, splice_bytes) =
-            format_specific_splice(self.format, &fragment, &sibling_span, &self.original_bytes);
+        let (splice_at, splice_bytes) = match flow_layout {
+            Some(layout) => flow_sibling_splice(&fragment, &sibling_span, layout),
+            None => {
+                format_specific_splice(self.format, &fragment, &sibling_span, &self.original_bytes)
+            }
+        };
+        let splice_bytes = with_line_ending_at(&self.original_bytes, splice_at, splice_bytes);
 
         // Render the value through the scalar renderer so we can locate
         // its exact byte range inside the spliced bytes. Splicing the
@@ -984,6 +1264,222 @@ impl Document {
         // Re-sync the provenance side-channel.
         self.provenance = provenance_from_spans(&self.spans);
         Ok(())
+    }
+
+    /// Read the bytes as they are now — after a first step of a two-step
+    /// edit — so the next step sees their spans and layout.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::EditRejected`] when they do not parse.
+    fn adopt_reparse(&mut self, action: &'static str, canonical: &str) -> Result<()> {
+        match parse_again(self.format, &self.original_bytes) {
+            Some(Ok(fresh)) => {
+                self.value = fresh.value;
+                self.spans = fresh.spans;
+                self.provenance = fresh.provenance;
+                Ok(())
+            }
+            Some(Err(err)) => {
+                tracing::debug!(pointer = %canonical, action, %err, "edited bytes do not parse");
+                Err(Error::EditRejected {
+                    action,
+                    pointer: canonical.to_owned(),
+                    reason: "the edited document would not parse".to_owned(),
+                })
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// `set` of `value` where a non-empty collection is, which the span
+    /// map records no span for: a flow collection — a JSON value, a TOML
+    /// inline table or array, a YAML `{…}` / `[…]` — is replaced between
+    /// its brackets; a YAML block collection loses its children, leaving
+    /// an empty node that the value then goes into; a TOML `[table]` or
+    /// dotted table is deleted and the key written anew.
+    ///
+    /// The spans are left as they were: the read-back check that follows
+    /// parses the bytes again.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::EditRejected`] when the collection's bytes are not found.
+    fn replace_collection(
+        &mut self,
+        pointer: &Pointer,
+        canonical: &str,
+        value: Value,
+        layout: &LayoutCache,
+        renderer: &dyn crate::textual_edit::ScalarRenderer,
+    ) -> Result<()> {
+        let rejected = || Error::EditRejected {
+            action: "set",
+            pointer: canonical.to_owned(),
+            reason: "dq cannot find the bytes of the collection there".to_owned(),
+        };
+        let segments = pointer.segments();
+        let parent = Pointer::new(segments[..segments.len().saturating_sub(1)].to_vec());
+        let in_map = matches!(parent.resolve(&self.value), Ok(Value::Map(_)));
+        let brackets = match self.format {
+            FormatTag::Json => crate::parsers::json::json_container_ranges(&self.original_bytes)
+                .ok()
+                .and_then(|mut ranges| ranges.remove(canonical))
+                .map(|range| (range, SpanContext::BlockMapValue)),
+            FormatTag::Toml => crate::parsers::toml::toml_inline_collections(&self.original_bytes)
+                .and_then(|mut ranges| ranges.remove(canonical))
+                .map(|(range, in_flow)| {
+                    let context = match (in_flow, in_map) {
+                        (true, true) => SpanContext::FlowMapValue,
+                        (true, false) => SpanContext::FlowSeqItem,
+                        (false, _) => SpanContext::BlockMapValue,
+                    };
+                    (range, context)
+                }),
+            FormatTag::Yaml => {
+                let collection = self
+                    .edit_layout(layout)
+                    .and_then(|layout| layout.containers.get(canonical))
+                    .ok_or_else(rejected)?;
+                if collection.top_level {
+                    return Err(rejected());
+                }
+                if let Some(brackets) = collection.brackets.clone() {
+                    // In a block parent the range runs on to the next
+                    // token, past a comment.
+                    let brackets = if collection.flow_value.is_some() {
+                        brackets
+                    } else {
+                        brackets.start
+                            ..yaml_flow_end(&self.original_bytes, brackets.clone())
+                                .ok_or_else(rejected)?
+                    };
+                    let context = match (collection.flow_value.is_some(), in_map) {
+                        (true, true) => SpanContext::FlowMapValue,
+                        (true, false) => SpanContext::FlowSeqItem,
+                        (false, true) => SpanContext::BlockMapValue,
+                        (false, false) => SpanContext::BlockSeqItem,
+                    };
+                    if let Some(err) =
+                        self.anchor_removal_refused(layout, &brackets, "set", canonical)
+                    {
+                        return Err(err);
+                    }
+                    Some((brackets, context))
+                } else {
+                    // Its children go; the key or `-`, its properties and
+                    // any comment on that line stay as an empty node.
+                    let marker = collection.empty_marker_at.ok_or_else(rejected)?;
+                    let first = collection.first_child_line.ok_or_else(rejected)?;
+                    let children = if first >= marker {
+                        first..collection.end
+                    } else {
+                        // `- key: …` / `- - …`: the first child shares the
+                        // line with the `-`.
+                        let mut end = collection.end;
+                        while end > marker && self.original_bytes[end - 1].is_ascii_whitespace() {
+                            end -= 1;
+                        }
+                        marker..end
+                    };
+                    if let Some(err) =
+                        self.anchor_removal_refused(layout, &children, "set", canonical)
+                    {
+                        return Err(err);
+                    }
+                    self.original_bytes.drain(children);
+                    self.adopt_reparse("set", canonical)?;
+                    if !matches!(pointer.resolve(&self.value), Ok(Value::Null)) {
+                        return Err(rejected());
+                    }
+                    return self.set_at_unchecked(pointer, value, &LayoutCache::new());
+                }
+            }
+            _ => None,
+        };
+        if let Some((range, context)) = brackets {
+            let rendered = renderer.render_replacement(&value, context, &[]);
+            self.original_bytes.splice(range, rendered);
+            return set_value_at(&mut self.value, pointer, value);
+        }
+        if self.format == FormatTag::Toml {
+            let ranges = crate::parsers::toml::toml_tables(&self.original_bytes)
+                .map(|tables| tables.ranges_of(canonical))
+                .unwrap_or_default();
+            if ranges.is_empty() {
+                return Err(rejected());
+            }
+            for range in ranges.into_iter().rev() {
+                self.original_bytes.drain(range);
+            }
+            self.adopt_reparse("set", canonical)?;
+            if pointer.resolve(&self.value).is_ok() {
+                return Err(rejected());
+            }
+            // A parent only the removed sections made (`[a.b]` alone makes
+            // `a`) is gone with them: write the value at the first missing
+            // ancestor, wrapped in the tables down to the key.
+            let mut at = parent;
+            let mut value = value;
+            let mut key = segments.last().cloned();
+            while !at.is_root() && at.resolve(&self.value).is_err() {
+                let Some(Segment::Key(name)) = key.take() else {
+                    return Err(rejected());
+                };
+                value = Value::Map(IndexMap::from([(name, value)]));
+                key = at.pop_segment();
+            }
+            let mut target = at;
+            target.push_segment(key.ok_or_else(rejected)?);
+            return self
+                .set_at_unchecked(&target, value, &LayoutCache::new())
+                .map_err(|err| match err {
+                    // `a` still stands, made by another `[a.…]` section:
+                    // dq has no header to write the new key under.
+                    Error::Path { .. } => Error::EditRejected {
+                        action: "set",
+                        pointer: canonical.to_owned(),
+                        reason: "dq cannot write the key anew in a table with no header of its own"
+                            .to_owned(),
+                    },
+                    err => err,
+                });
+        }
+        Err(rejected())
+    }
+
+    /// Insert `key = value` at `at` into a TOML table that has no key of
+    /// its own to follow — the root, before its first table header or at
+    /// the end of a file without one; a `[table]` right under its header.
+    /// The read-back check settles the spans.
+    fn toml_table_insertion(
+        &mut self,
+        pointer: &Pointer,
+        new_key: &str,
+        value: Value,
+        insertion_renderer: &dyn crate::textual_edit::InsertionRenderer,
+        at: usize,
+    ) -> Result<()> {
+        let mut inserted = Vec::new();
+        if at > 0 && self.original_bytes[at - 1] != b'\n' {
+            inserted.push(b'\n');
+        }
+        inserted.extend(insertion_renderer.render_insertion(
+            new_key,
+            &value,
+            1,
+            SpanContext::BlockMapValue,
+        ));
+        let inserted = with_line_ending_at(&self.original_bytes, at, inserted);
+        let delta = SpanRecomputeDelta {
+            at,
+            old_len: 0,
+            new_len: inserted.len(),
+        };
+        self.original_bytes.splice(at..at, inserted);
+        apply_delta(&mut self.spans, delta);
+        self.spans.shift_remove("");
+        set_value_at(&mut self.value, pointer, value)
     }
 
     /// Empty-parent splice: insert `value` at `pointer` when the parent
@@ -1047,12 +1543,18 @@ impl Document {
             _ => parent_span.indent,
         };
         let children_indent = parent_span.indent.saturating_add(2);
-        let fragment = insertion_renderer.render_insertion(
-            &new_key,
-            &value,
-            renderer_indent,
-            parent_span.context,
-        );
+        // A YAML entry inside `{}` is written on one line.
+        let context = match self.format {
+            FormatTag::Yaml
+                if self.original_bytes.get(parent_span.value_range.start) == Some(&b'{') =>
+            {
+                SpanContext::FlowMapValue
+            }
+            FormatTag::Yaml => SpanContext::BlockMapValue,
+            _ => parent_span.context,
+        };
+        let fragment =
+            insertion_renderer.render_insertion(&new_key, &value, renderer_indent, context);
 
         let (splice_at, splice_bytes) = format_specific_empty_parent_splice(
             self.format,
@@ -1060,6 +1562,7 @@ impl Document {
             &parent_span,
             &self.original_bytes,
         );
+        let splice_bytes = with_line_ending_at(&self.original_bytes, splice_at, splice_bytes);
 
         // Resolve the scalar renderer so we can locate the value bytes
         // inside the spliced fragment — mirrors the sibling-anchored path
@@ -1122,6 +1625,140 @@ impl Document {
     /// the splice anchors against an actual sibling at the parent's depth
     /// rather than a deeply nested grand-child whose `value_range` could
     /// be inside an entirely different container.
+    /// How a new entry goes next to `sibling` when they share a flow
+    /// collection — or a JSON value, which is all flow — rather than a
+    /// block, where it takes a line of its own. `None` for a block sibling.
+    fn flow_layout(&self, sibling: &ValueSpan) -> Option<FlowLayout> {
+        match self.format {
+            FormatTag::Json => {
+                let bytes = &self.original_bytes;
+                let start = &sibling.value_range.start;
+                // The entry's start: its key when it has one.
+                let sep = skip_blanks_back(bytes, *start);
+                let entry = if sep > 0 && bytes[sep - 1] == b':' {
+                    flow_key_start(bytes, skip_blanks_back(bytes, sep - 1), self.format)?
+                } else {
+                    *start
+                };
+                let mut before = entry;
+                while before > 0 && matches!(bytes[before - 1], b' ' | b'\t') {
+                    before -= 1;
+                }
+                let shares_line = before > 0 && matches!(bytes[before - 1], b',' | b'{' | b'[');
+                Some(if shares_line {
+                    FlowLayout::SameLine
+                } else {
+                    FlowLayout::OwnLine {
+                        column: entry - before,
+                        crlf: before >= 2 && bytes[before - 2] == b'\r',
+                    }
+                })
+            }
+            // An empty `{}` / `[]` carries a flow context of its own even
+            // as a block entry: the token after the sibling tells.
+            FormatTag::Yaml | FormatTag::Toml => (matches!(
+                sibling.context,
+                SpanContext::FlowMapValue | SpanContext::FlowSeqItem
+            ) && matches!(
+                self.original_bytes.get(skip_blanks_and_comments(
+                    &self.original_bytes,
+                    sibling.value_range.end
+                )),
+                Some(b',' | b'}')
+            ))
+            .then_some(FlowLayout::SameLine),
+            _ => None,
+        }
+    }
+
+    /// The last direct child of the map whose children's pointers start
+    /// with `sibling_prefix` — the one a new key goes after — and its span.
+    /// A non-empty collection has no recorded span: its span is made up of
+    /// its entry's bytes (YAML) or its brackets (JSON), with `value_range`
+    /// empty at its end for a YAML block entry.
+    fn last_direct_child(
+        &self,
+        sibling_prefix: &str,
+        layout: Option<&crate::parsers::yaml_spans::EditLayout>,
+    ) -> Option<(String, ValueSpan)> {
+        let direct = |pointer: &str| {
+            pointer
+                .strip_prefix(sibling_prefix)
+                .is_some_and(|tail| !tail.contains('/'))
+        };
+        let scalar = || {
+            self.rightmost_direct_sibling(sibling_prefix)
+                .map(|(key, span)| (key.to_owned(), span.clone()))
+        };
+        match self.format {
+            FormatTag::Yaml => {
+                let Some(layout) = layout else {
+                    return scalar();
+                };
+                let last_entry = layout
+                    .entries
+                    .iter()
+                    .filter(|(pointer, _)| direct(pointer))
+                    .max_by_key(|(_, entry)| entry.at);
+                if let Some((pointer, entry)) = last_entry {
+                    if let Some(span) = self.spans.get(pointer) {
+                        return Some((pointer.clone(), span.clone()));
+                    }
+                    let collection = layout.containers.get(pointer)?;
+                    let line_start = self.original_bytes[..entry.at]
+                        .iter()
+                        .rposition(|&b| b == b'\n')
+                        .map_or(0, |i| i + 1);
+                    let end = collection.end;
+                    return Some((
+                        pointer.clone(),
+                        ValueSpan {
+                            value_range: end..end,
+                            line_range: line_start..end,
+                            indent: 1,
+                            context: SpanContext::BlockMapValue,
+                        },
+                    ));
+                }
+                // A flow mapping: the child that starts last.
+                let flow = layout
+                    .containers
+                    .iter()
+                    .filter(|(pointer, _)| direct(pointer))
+                    .filter_map(|(pointer, collection)| {
+                        Some((pointer.clone(), collection.flow_value.clone()?))
+                    })
+                    .max_by_key(|(_, value)| value.start);
+                last_by_start(scalar(), flow, SpanContext::FlowMapValue)
+            }
+            FormatTag::Json => {
+                let ranges = crate::parsers::json::json_container_ranges(&self.original_bytes)
+                    .unwrap_or_default();
+                let collection = ranges
+                    .into_iter()
+                    .filter(|(pointer, _)| direct(pointer))
+                    .max_by_key(|(_, value)| value.start);
+                last_by_start(scalar(), collection, SpanContext::BlockMapValue)
+            }
+            FormatTag::Toml => {
+                let collection =
+                    crate::parsers::toml::toml_inline_collections(&self.original_bytes)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|(pointer, _)| direct(pointer))
+                        .max_by_key(|(_, (value, _))| value.start);
+                // One inside an inline table is a flow entry.
+                let context = match collection {
+                    Some((_, (_, true))) => SpanContext::FlowMapValue,
+                    _ => SpanContext::BlockMapValue,
+                };
+                let collection = collection.map(|(pointer, (value, _))| (pointer, value));
+                last_by_start(scalar(), collection, context)
+            }
+            _ => scalar(),
+        }
+    }
+
     fn rightmost_direct_sibling(&self, sibling_prefix: &str) -> Option<(&str, &ValueSpan)> {
         self.spans
             .iter()
@@ -1129,15 +1766,66 @@ impl Document {
             .filter(|(k, _)| {
                 // Exclude grand-children: a direct sibling's pointer string
                 // has no further `/` after stripping the parent prefix.
+                // An empty tail is the empty key `""`.
                 let tail = &k.as_str()[sibling_prefix.len()..];
-                !tail.is_empty() && !tail.contains('/')
+                !tail.contains('/')
             })
             .max_by_key(|(_, span)| span.value_range.end)
             .map(|(k, span)| (k.as_str(), span))
     }
 
+    /// Before a YAML insertion after `sibling` at the end of a document that
+    /// lacks a final line break: when the sibling is a `|` / `>` block
+    /// scalar running to the end, switch its header to strip chomping so the
+    /// line break the insertion adds does not become part of its value.
+    /// Updates `sibling` (and its entry in `self.spans`) to the shifted
+    /// bytes.
+    fn strip_yaml_chomping_before_eof_append(
+        &mut self,
+        sibling_key: &str,
+        sibling: &mut ValueSpan,
+    ) {
+        let Some((at, old_len, replacement)) =
+            crate::parsers::yaml_spans::strip_chomping_before_eof_append(
+                &self.original_bytes,
+                sibling,
+            )
+        else {
+            return;
+        };
+        self.original_bytes
+            .splice(at..at + old_len, replacement.iter().copied());
+        apply_delta(
+            &mut self.spans,
+            SpanRecomputeDelta {
+                at,
+                old_len,
+                new_len: replacement.len(),
+            },
+        );
+        // `apply_delta` moved the whole span, but its entry still starts on
+        // the key's line, before the header.
+        if let Some(span) = self.spans.get_mut(sibling_key) {
+            span.line_range.start = sibling.line_range.start;
+            *sibling = span.clone();
+        }
+    }
+
     /// Remove the value at `pointer`, splicing out its physical line(s) and
     /// dropping every span beneath it.
+    ///
+    /// YAML adds three cases the span map alone cannot serve, all from one
+    /// re-parse of the current bytes ([`crate::parsers::yaml_spans::edit_layout`]):
+    ///
+    /// - a collection value outside flow collections is removed with its
+    ///   whole entry — the key (or `-`) line down to the collection's last
+    ///   line;
+    /// - a block collection left without children gets an explicit `{}` /
+    ///   `[]` (`key: {}`), so it stays a collection instead of reading back
+    ///   as `null`;
+    /// - removing bytes that define an anchor an alias outside them refers
+    ///   to is refused: the alias would dangle, or resolve to an earlier
+    ///   definition of the same name.
     ///
     /// # Errors
     ///
@@ -1146,13 +1834,262 @@ impl Document {
     /// - [`Error::Path`] with `kind = TypeMismatch` when `pointer` is
     ///   the root (the root is never deletable — it would empty the file).
     /// - [`Error::Path`] with `kind = MissingKey` when no span exists for
-    ///   the pointer.
+    ///   the pointer (and, for YAML, it is no removable collection).
+    /// - [`Error::EditRejected`] when the YAML bytes to remove define an
+    ///   anchor that an alias outside them refers to, or when the edited
+    ///   bytes fail the read-back check [`Document::set_at`] describes.
     pub fn del_at(&mut self, pointer: &Pointer) -> Result<()> {
+        let before = self.clone();
+        let layout = LayoutCache::new();
+        let result = self.del_at_unchecked(pointer, &layout);
+        self.check_edit(before, result, "delete", pointer, &layout, delete_value_at)
+    }
+
+    /// Finish an edit of `pointer` whose unchecked step returned `result`:
+    /// on success, parse the edited bytes again and compare them with
+    /// `before`'s tree after `apply` at `pointer` and, in YAML, at every
+    /// alias sharing the edited node. Any failure restores `before`.
+    fn check_edit(
+        &mut self,
+        before: Self,
+        result: Result<()>,
+        action: &'static str,
+        pointer: &Pointer,
+        layout: &LayoutCache,
+        apply: impl Fn(&mut Value, &Pointer) -> Result<()>,
+    ) -> Result<()> {
+        if let Err(err) = result {
+            *self = before;
+            let err = match err {
+                // A path `get` finds that runs through an alias: the alias
+                // node has no bytes of its own below it to edit.
+                Error::Path { .. } => self.through_alias(pointer, layout, action).unwrap_or(err),
+                err => err,
+            };
+            return Err(match err {
+                // Every refusal names the way around it.
+                Error::EditRejected {
+                    action,
+                    pointer,
+                    reason,
+                } if !reason.contains(JQ_REWRITE_HINT) && reason != JSON_NON_FINITE => {
+                    Error::EditRejected {
+                        action,
+                        pointer,
+                        reason: format!("{reason}; {JQ_REWRITE_HINT}"),
+                    }
+                }
+                err => err,
+            });
+        }
+        let canonical = pointer.as_canonical();
+        // No textual-edit renderer: the unchecked step refused already.
+        let Some(reparsed) = parse_again(self.format, &self.original_bytes) else {
+            return Ok(());
+        };
+        let reason = match reparsed {
+            Ok(fresh) => {
+                // The edit alone first: only when that does not read back
+                // does the YAML alias layout, a parse of its own, get
+                // worked out to expect the edit under the aliases too.
+                let compare = |aliases: Option<&LayoutCache>| {
+                    before
+                        .expected_after_edit(pointer, aliases, &apply)
+                        .map(|tree| first_difference(&tree, &fresh.value, ""))
+                };
+                let mut difference = compare(None);
+                if difference != Some(None)
+                    && before.format == FormatTag::Yaml
+                    && before.original_bytes.contains(&b'*')
+                {
+                    difference = compare(Some(layout));
+                }
+                match difference {
+                    Some(None) => {
+                        self.value = fresh.value;
+                        self.spans = fresh.spans;
+                        self.provenance = fresh.provenance;
+                        return Ok(());
+                    }
+                    Some(Some(at)) => {
+                        tracing::debug!(
+                            pointer = %canonical,
+                            action,
+                            difference = %at,
+                            "edited bytes read back as a different tree",
+                        );
+                        // An array that lost or gained an item reports
+                        // itself, the edited value's parent.
+                        let parent = canonical.rsplit_once('/').map_or("", |(parent, _)| parent);
+                        let at_the_edit = at == canonical
+                            || at.starts_with(&format!("{canonical}/"))
+                            || at == parent;
+                        if at_the_edit && action == "set" {
+                            "dq cannot write this value here as a textual edit"
+                        } else if at_the_edit {
+                            "dq cannot remove it as a textual edit"
+                        } else {
+                            "the edit would change other parts of the document"
+                        }
+                    }
+                    None => {
+                        tracing::debug!(
+                            pointer = %canonical,
+                            action,
+                            "no expected tree: the edit does not apply to every alias",
+                        );
+                        "the edit would change other parts of the document"
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::debug!(pointer = %canonical, action, %err, "edited bytes do not parse");
+                "the edited document would not parse"
+            }
+        };
+        *self = before;
+        Err(Error::EditRejected {
+            action,
+            pointer: canonical,
+            reason: format!("{reason}; {JQ_REWRITE_HINT}"),
+        })
+    }
+
+    /// The refusal of an edit that removes the YAML bytes `removed` when
+    /// they define an anchor an alias outside them refers to: the alias
+    /// would dangle, or resolve to an earlier definition of the name.
+    fn anchor_removal_refused(
+        &self,
+        cache: &LayoutCache,
+        removed: &std::ops::Range<usize>,
+        action: &'static str,
+        canonical: &str,
+    ) -> Option<Error> {
+        if !self.original_bytes.contains(&b'*') {
+            return None;
+        }
+        let alias = self.edit_layout(cache)?.aliases.iter().find(|alias| {
+            removed.contains(&alias.anchor_at) && !removed.contains(&alias.alias_at)
+        })?;
+        let line = 1 + self.original_bytes[..alias.alias_at]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count();
+        Some(Error::EditRejected {
+            action,
+            pointer: canonical.to_owned(),
+            reason: format!("it holds an anchor that the alias on line {line} refers to"),
+        })
+    }
+
+    /// The refusal of an edit at `pointer`, below a YAML alias, whose
+    /// target (or, for `set`, its parent) the value tree resolves — the
+    /// bytes there are the anchored node's.
+    fn through_alias(
+        &self,
+        pointer: &Pointer,
+        layout: &LayoutCache,
+        action: &'static str,
+    ) -> Option<Error> {
+        if self.format != FormatTag::Yaml || !self.original_bytes.contains(&b'*') {
+            return None;
+        }
+        let canonical = pointer.as_canonical();
+        // `set` may add a key; `del` needs one there.
+        let mut found = pointer.clone();
+        if action != "delete" {
+            found.pop_segment()?;
+        }
+        found.resolve(&self.value).ok()?;
+        let alias = self.edit_layout(layout)?.aliases.iter().find(|alias| {
+            alias.alias_pointer.as_deref().is_some_and(|at| {
+                canonical
+                    .strip_prefix(at)
+                    .is_some_and(|rest| rest.starts_with('/'))
+            })
+        })?;
+        let line = 1 + self.original_bytes[..alias.alias_at]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count();
+        let copied = match &alias.anchor_pointer {
+            Some(at) if at.is_empty() => " of the root".to_owned(),
+            Some(at) => format!(" of {at}"),
+            None => String::new(),
+        };
+        Some(Error::EditRejected {
+            action,
+            pointer: canonical,
+            reason: format!(
+                "it lies under the alias on line {line}, a copy{copied}; \
+                 an edit at the anchored node changes every copy"
+            ),
+        })
+    }
+
+    /// The value tree after applying an edit (`apply`) at `pointer` and,
+    /// with the YAML alias `layout`, at the copy of it under every alias
+    /// of an anchored node at or above it — nested aliases included.
+    /// `None` if `apply` fails at one of them.
+    fn expected_after_edit(
+        &self,
+        pointer: &Pointer,
+        layout: Option<&LayoutCache>,
+        apply: &impl Fn(&mut Value, &Pointer) -> Result<()>,
+    ) -> Option<Value> {
+        let mut targets = vec![pointer.as_canonical()];
+        if let Some(layout) = layout {
+            let aliases = self
+                .edit_layout(layout)
+                .map(|layout| layout.aliases.as_slice())
+                .unwrap_or_default();
+            // Alias pointers by the pointer of the anchored node they copy.
+            let mut copies: std::collections::HashMap<&str, Vec<&str>> =
+                std::collections::HashMap::new();
+            for alias in aliases {
+                if let (Some(alias_at), Some(anchor_at)) =
+                    (&alias.alias_pointer, &alias.anchor_pointer)
+                {
+                    copies
+                        .entry(anchor_at.as_str())
+                        .or_default()
+                        .push(alias_at.as_str());
+                }
+            }
+            let mut seen: std::collections::HashSet<String> = targets.iter().cloned().collect();
+            let mut i = 0;
+            while i < targets.len() {
+                let target = targets[i].clone();
+                // Every node at or above the target: cut at each `/`.
+                let cuts = target.match_indices('/').map(|(at, _)| at);
+                for cut in cuts.chain(std::iter::once(target.len())) {
+                    let (anchor_at, rest) = target.split_at(cut);
+                    for alias_at in copies.get(anchor_at).into_iter().flatten() {
+                        let copy = format!("{alias_at}{rest}");
+                        if seen.insert(copy.clone()) {
+                            targets.push(copy);
+                        }
+                    }
+                }
+                i += 1;
+            }
+        }
+        let mut tree = self.value.clone();
+        for target in &targets {
+            let target = Pointer::parse(target).ok()?;
+            apply(&mut tree, &target).ok()?;
+        }
+        Some(tree)
+    }
+
+    /// [`Document::del_at`] without the read-back check.
+    fn del_at_unchecked(&mut self, pointer: &Pointer, cache: &LayoutCache) -> Result<()> {
         // "Read-only" is signalled by empty `original_bytes` (`value_only`
         // constructor); an all-container document with zero leaf scalars
         // has an empty SpanMap but populated bytes — its del would
-        // legitimately fall through to MissingKey, not WriteUnavailable.
-        if self.original_bytes.is_empty() {
+        // legitimately fall through to MissingKey, not WriteUnavailable. An
+        // empty file parsed write-aware has a span for its root.
+        if self.original_bytes.is_empty() && self.spans.is_empty() {
             return Err(Error::WriteUnavailable {
                 reason: format!(
                     "{} document was loaded read-only; reload via a write-aware parser to enable del",
@@ -1172,27 +2109,268 @@ impl Document {
             });
         }
         let canonical = pointer.as_canonical();
-        let span = self
-            .spans
-            .get(&canonical)
-            .cloned()
-            .ok_or_else(|| Error::Path {
-                pointer: canonical.clone(),
-                // SpanMap only records scalar leaves; walk the in-memory
-                // Value tree so the diagnostic surfaces the longest matching
-                // container chain.
-                matched_prefix: longest_existing_value_prefix(&self.value, pointer),
-                kind: PathErrorKind::MissingKey,
-                did_you_mean: Vec::new(),
-            })?;
-        let line_range = span.line_range.clone();
+        let parent_ptr = Pointer::new(pointer.segments()[..pointer.segments().len() - 1].to_vec());
+        let target_is_collection = matches!(
+            pointer.resolve(&self.value),
+            Ok(Value::Map(_) | Value::Array(_))
+        );
+        let parent_loses_last_child = match parent_ptr.resolve(&self.value) {
+            Ok(Value::Map(map)) => map.len() == 1,
+            Ok(Value::Array(items)) => items.len() == 1,
+            _ => false,
+        };
+        // The YAML layout is a parse of its own: work it out only for a
+        // collection, an entry that may share its line with a `-` (or a
+        // `?` / `:` indicator), and an emptied parent. A line opening with
+        // a key cannot hold a compact entry.
+        let layout_needed = self.format == FormatTag::Yaml
+            && (target_is_collection
+                || parent_loses_last_child
+                || self.spans.get(&canonical).is_none_or(|span| {
+                    self.original_bytes[span.line_range.start..]
+                        .iter()
+                        .find(|&&b| b != b' ' && b != b'\t')
+                        .is_none_or(|b| matches!(b, b'-' | b'?' | b':'))
+                }));
+        let layout = if layout_needed {
+            self.edit_layout(cache)
+        } else {
+            None
+        };
+        let in_map = matches!(parent_ptr.resolve(&self.value), Ok(Value::Map(_)));
+        // What takes the place of the removed bytes: `{}` / `[]` for the
+        // only entry of a compact collection.
+        let mut inserted: Vec<u8> = Vec::new();
+        let compact_entry = match layout.as_ref() {
+            Some(layout) => self.compact_entry_removal(
+                layout,
+                &canonical,
+                &parent_ptr,
+                target_is_collection,
+                parent_loses_last_child,
+            )?,
+            None => None,
+        };
+        if compact_entry.is_some() && parent_loses_last_child {
+            inserted = if in_map { b"{}" } else { b"[]" }.to_vec();
+        }
+        let collection = layout
+            .as_ref()
+            .filter(|_| target_is_collection)
+            .and_then(|layout| layout.containers.get(&canonical));
+        let collection_entry = collection.and_then(|collection| {
+            collection.entry.clone().or_else(|| {
+                collection.flow_value.as_ref().and_then(|value| {
+                    flow_entry_removal(&self.original_bytes, value, in_map, self.format)
+                })
+            })
+        });
+        // JSON records no span for a non-empty collection.
+        let json_collection_entry = (self.format == FormatTag::Json && target_is_collection)
+            .then(|| crate::parsers::json::json_container_ranges(&self.original_bytes).ok())
+            .flatten()
+            .and_then(|mut ranges| ranges.remove(&canonical))
+            .and_then(|value| {
+                flow_entry_removal(&self.original_bytes, &value, in_map, self.format)
+            });
+        // Nor does TOML for a non-empty inline table or array: inside
+        // another one it is a flow entry, otherwise its `key = …` lines.
+        let toml_collection_entry = (self.format == FormatTag::Toml && target_is_collection)
+            .then(|| crate::parsers::toml::toml_inline_collections(&self.original_bytes))
+            .flatten()
+            .and_then(|mut ranges| ranges.remove(&canonical))
+            .and_then(|(value, in_flow)| {
+                if in_flow {
+                    flow_entry_removal(&self.original_bytes, &value, in_map, self.format)
+                } else {
+                    let line_start = self.original_bytes[..value.start]
+                        .iter()
+                        .rposition(|&b| b == b'\n')
+                        .map_or(0, |i| i + 1);
+                    Some(line_start..past_line_break(&self.original_bytes, value.end))
+                }
+            });
+        // A TOML `[table]`, `[[array]]` item or dotted table: its sections
+        // and lines, wherever they are.
+        if self.format == FormatTag::Toml
+            && target_is_collection
+            && toml_collection_entry.is_none()
+            && let Some(ranges) = crate::parsers::toml::toml_tables(&self.original_bytes)
+                .map(|tables| tables.ranges_of(&canonical))
+                .filter(|ranges| !ranges.is_empty())
+        {
+            for range in ranges.into_iter().rev() {
+                self.original_bytes.drain(range);
+            }
+            self.adopt_reparse("delete", &canonical)?;
+            // The last `[[array]]` item, or the last table under a table
+            // with no header of its own: the parent goes with it unless
+            // written as `key = []` / `key = {}`.
+            if parent_loses_last_child && parent_ptr.resolve(&self.value).is_err() {
+                let empty = if in_map {
+                    Value::Map(IndexMap::new())
+                } else {
+                    Value::Array(Vec::new())
+                };
+                return self
+                    .set_at_unchecked(&parent_ptr, empty, &LayoutCache::new())
+                    .map_err(|_| Error::EditRejected {
+                        action: "delete",
+                        pointer: canonical.clone(),
+                        reason: "dq cannot keep the table it empties".to_owned(),
+                    });
+            }
+            return Ok(());
+        }
+        // A dotted key inside an inline table (`{x."y z".w = 1}`, `/x`):
+        // the entry of its one value.
+        let toml_dotted_entry = (self.format == FormatTag::Toml
+            && target_is_collection
+            && toml_collection_entry.is_none())
+        .then(|| {
+            let prefix = format!("{canonical}/");
+            let mut leaves = self.spans.iter().filter(|(key, span)| {
+                key.starts_with(&prefix) && span.context == SpanContext::FlowMapValue
+            });
+            match (leaves.next(), leaves.next()) {
+                (Some((_, leaf)), None) => {
+                    flow_entry_removal(&self.original_bytes, &leaf.value_range, true, self.format)
+                }
+                _ => None,
+            }
+        })
+        .flatten();
+        let dotted_target = toml_dotted_entry.is_some();
+        // The value of a TOML entry inside an inline table.
+        let toml_flow_value = (self.format == FormatTag::Toml && !dotted_target)
+            .then(|| match self.spans.get(&canonical) {
+                Some(span) => {
+                    (span.context == SpanContext::FlowMapValue).then(|| span.value_range.clone())
+                }
+                None => crate::parsers::toml::toml_inline_collections(&self.original_bytes)
+                    .and_then(|mut ranges| ranges.remove(&canonical))
+                    .and_then(|(value, in_flow)| in_flow.then_some(value)),
+            })
+            .flatten();
+        let collection_entry = compact_entry
+            .or(collection_entry)
+            .or(json_collection_entry)
+            .or(toml_collection_entry)
+            .or(toml_dotted_entry);
+        if collection_entry.is_none()
+            && target_is_collection
+            && !self.spans.contains_key(&canonical)
+            && self.format != FormatTag::Yaml
+        {
+            // A JSON or TOML collection whose bytes were not found, such as
+            // a dotted key spread over several entries of an inline table.
+            return Err(Error::EditRejected {
+                action: "delete",
+                pointer: canonical,
+                reason: "dq cannot find the bytes of the collection there".to_owned(),
+            });
+        }
+        if collection.is_some_and(|collection| !collection.top_level) && collection_entry.is_none()
+        {
+            // `- key: {…}`, or a flow entry with a comment in between: the
+            // entry's bytes cannot be told from those around it.
+            return Err(Error::EditRejected {
+                action: "delete",
+                pointer: canonical,
+                reason: "it shares its line with the entry around it".to_owned(),
+            });
+        }
+        let mut line_range = match collection_entry {
+            Some(entry) => entry,
+            None => {
+                let span = self.spans.get(&canonical).ok_or_else(|| Error::Path {
+                    pointer: canonical.clone(),
+                    // SpanMap only records scalar leaves; walk the in-memory
+                    // Value tree so the diagnostic surfaces the longest
+                    // matching container chain.
+                    matched_prefix: longest_existing_value_prefix(&self.value, pointer),
+                    kind: PathErrorKind::MissingKey,
+                    did_you_mean: Vec::new(),
+                })?;
+                // An entry of a JSON value or of a flow collection shares its
+                // line with others: remove it with one separating comma.
+                let in_flow = self.format == FormatTag::Json
+                    || matches!(
+                        span.context,
+                        SpanContext::FlowMapValue | SpanContext::FlowSeqItem
+                    );
+                in_flow
+                    .then(|| {
+                        flow_entry_removal(
+                            &self.original_bytes,
+                            &span.value_range,
+                            in_map,
+                            self.format,
+                        )
+                    })
+                    .flatten()
+                    .unwrap_or_else(|| span.line_range.clone())
+            }
+        };
+        // `a.b = 1`, the only key under `a`: removing its line would remove
+        // `a` too, so it becomes `a = {}`.
+        if self.format == FormatTag::Toml
+            && parent_loses_last_child
+            && in_map
+            && let Some(value) = &toml_flow_value
+        {
+            // Inside an inline table (`{x.y = 1, b = 2}`): the entry turns
+            // into `x = {}`, its separators kept.
+            let sep = skip_blanks_back(&self.original_bytes, value.start);
+            if let Some(key) = (sep > 0 && self.original_bytes[sep - 1] == b'=')
+                .then(|| {
+                    flow_key_start(
+                        &self.original_bytes,
+                        skip_blanks_back(&self.original_bytes, sep - 1),
+                        self.format,
+                    )
+                })
+                .flatten()
+                && let Some(prefix) = toml_dotted_key_parent(&self.original_bytes[key..])
+            {
+                line_range = key..value.end;
+                inserted = prefix;
+                inserted.extend_from_slice(b" = {}");
+            }
+        } else if self.format == FormatTag::Toml
+            && parent_loses_last_child
+            && in_map
+            && !dotted_target
+            && let Some(prefix) = toml_dotted_key_parent(&self.original_bytes[line_range.clone()])
+        {
+            inserted = prefix;
+            inserted.extend_from_slice(b" = {}");
+            inserted.extend_from_slice(match &self.original_bytes[line_range.clone()] {
+                [.., b'\r', b'\n'] => b"\r\n",
+                [.., b'\n'] => b"\n",
+                _ => b"",
+            });
+        }
+        let removed = line_range.clone();
+        // An alias elsewhere would dangle — or resolve to an earlier
+        // definition of its anchor name — once the bytes defining its anchor
+        // are gone.
+        if let Some(err) = self.anchor_removal_refused(cache, &removed, "delete", &canonical) {
+            return Err(err);
+        }
+        // The line break the removed bytes end with, if any: `\r\n` or `\n`.
+        let removed_line_break: &'static [u8] = match &self.original_bytes[removed.clone()] {
+            [.., b'\r', b'\n'] => b"\r\n",
+            [.., b'\n'] => b"\n",
+            _ => b"",
+        };
         let delta = SpanRecomputeDelta {
             at: line_range.start,
             old_len: line_range.end - line_range.start,
-            new_len: 0,
+            new_len: inserted.len(),
         };
         self.original_bytes
-            .splice(line_range, std::iter::empty::<u8>());
+            .splice(line_range, inserted.iter().copied());
         // Drop every span at or below the deleted pointer, then shift the
         // remaining spans by the negative delta. We collect the keys to
         // remove first so we don't borrow `self.spans` mutably and
@@ -1209,10 +2387,381 @@ impl Document {
         }
         apply_delta(&mut self.spans, delta);
         delete_value_at(&mut self.value, pointer)?;
+        if parent_loses_last_child
+            && let Some(parent) = layout
+                .as_ref()
+                .and_then(|layout| layout.containers.get(&parent_ptr.as_canonical()))
+        {
+            self.mark_emptied_yaml_collection(&parent_ptr, parent, &removed, removed_line_break);
+        }
         // Mirror `set_at`: regenerate provenance from the post-edit span
         // map so the IR view stays consistent across writes.
         self.provenance = provenance_from_spans(&self.spans);
         Ok(())
+    }
+
+    /// The bytes `del` removes for the YAML value at `canonical` when its
+    /// entry shares its line with its parent's `-` (`- key: v`, `- - v`):
+    /// from the entry up to the next entry of the same parent, so that one
+    /// takes the `-`; for the only entry, up to the end of its value — the
+    /// caller writes `{}` / `[]` in its place. `None` for an entry that
+    /// owns its line.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::EditRejected`] when the end of the value is not known.
+    fn compact_entry_removal(
+        &self,
+        layout: &crate::parsers::yaml_spans::EditLayout,
+        canonical: &str,
+        parent_ptr: &Pointer,
+        target_is_collection: bool,
+        only_child: bool,
+    ) -> Result<Option<std::ops::Range<usize>>> {
+        let Some(entry) = layout
+            .entries
+            .get(canonical)
+            .filter(|entry| !entry.owns_line)
+        else {
+            return Ok(None);
+        };
+        let parent = parent_ptr.as_canonical();
+        let siblings = format!("{parent}/");
+        let next = layout
+            .entries
+            .iter()
+            .filter(|(pointer, start)| {
+                pointer
+                    .strip_prefix(&siblings)
+                    .is_some_and(|tail| !tail.is_empty() && !tail.contains('/'))
+                    && start.at > entry.at
+            })
+            .map(|(_, start)| start.at)
+            .min();
+        let value_end = if target_is_collection {
+            layout
+                .containers
+                .get(canonical)
+                .map(|collection| collection.end)
+        } else if let Some(empty) = layout.empty_values.get(canonical) {
+            Some(empty.end)
+        } else {
+            self.spans.get(canonical).map(|span| span.value_range.end)
+        };
+        if let Some(next) = next {
+            // A comment line before the next key stays: the item's `-`
+            // goes on to it (`- # mid`), the key on its own line below.
+            let comment = value_end
+                .and_then(|end| first_comment_line(&self.original_bytes, end.max(entry.at), next));
+            return Ok(Some(entry.at..comment.unwrap_or(next)));
+        }
+        let end = if only_child { value_end } else { None };
+        let Some(mut end) = end.filter(|&end| end > entry.at) else {
+            return Err(Error::EditRejected {
+                action: "delete",
+                pointer: canonical.to_owned(),
+                reason: "it shares its line with the entry around it".to_owned(),
+            });
+        };
+        while end > entry.at && self.original_bytes[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        Ok(Some(entry.at..end))
+    }
+
+    /// After `del_at` removed the bytes `removed` (ending in the line break
+    /// `removed_line_break`, empty if none) holding the last child of the
+    /// YAML block collection at `parent_ptr`, write an explicit `{}` / `[]`
+    /// for it — past its key's `:` (`key: {}`), its `-`, or its node
+    /// properties; where the child was for a document root — and record the
+    /// empty-container span a fresh parse would.
+    ///
+    /// Leaves the bytes alone for a flow collection (its brackets stay),
+    /// when the removed bytes do not hold the child's whole entry, and when
+    /// the marker position is unknown or was removed with the child
+    /// (`- key: value`, the child on its parent's `-` line).
+    fn mark_emptied_yaml_collection(
+        &mut self,
+        parent_ptr: &Pointer,
+        parent: &crate::parsers::yaml_spans::ContainerLayout,
+        removed: &std::ops::Range<usize>,
+        removed_line_break: &[u8],
+    ) {
+        let is_map = match parent_ptr.resolve(&self.value) {
+            Ok(Value::Map(map)) if map.is_empty() => true,
+            Ok(Value::Array(items)) if items.is_empty() => false,
+            _ => return,
+        };
+        // Only once the child's whole entry is gone: the removed bytes must
+        // start at or before the line its key or `-` is on.
+        let entry_removed = !removed.is_empty()
+            && parent
+                .first_child_line
+                .is_some_and(|line| removed.start <= line);
+        if !parent.block || !entry_removed {
+            return;
+        }
+        let marker: &[u8] = if is_map { b"{}" } else { b"[]" };
+        let (at, inserted) = if parent.top_level {
+            let mut inserted = marker.to_vec();
+            inserted.extend_from_slice(removed_line_break);
+            (removed.start, inserted)
+        } else {
+            match parent.empty_marker_at {
+                Some(at) if at < removed.start => {
+                    let mut inserted = b" ".to_vec();
+                    inserted.extend_from_slice(marker);
+                    (at, inserted)
+                }
+                _ => return,
+            }
+        };
+        self.original_bytes.splice(at..at, inserted.iter().copied());
+        apply_delta(
+            &mut self.spans,
+            SpanRecomputeDelta {
+                at,
+                old_len: 0,
+                new_len: inserted.len(),
+            },
+        );
+        // Past the separating space, if one was inserted.
+        let marker_start = if parent.top_level { at } else { at + 1 };
+        let marker_range = marker_start..marker_start + marker.len();
+        let line_start = self.original_bytes[..marker_start]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |i| i + 1);
+        self.spans
+            .entry(parent_ptr.as_canonical())
+            .or_insert_with(|| ValueSpan {
+                value_range: marker_range.clone(),
+                line_range: marker_range,
+                indent: u32::try_from(marker_start - line_start + 1).unwrap_or(u32::MAX),
+                context: if is_map {
+                    SpanContext::FlowMapValue
+                } else {
+                    SpanContext::FlowSeqItem
+                },
+            });
+    }
+}
+
+/// Bytes to remove to delete one entry of a flow collection — any JSON
+/// object or array, a YAML flow collection, a TOML inline table or array —
+/// whose value is at `value`: the entry (its key and YAML node properties
+/// included) and one separating comma, or everything between the brackets
+/// for the only entry. `None` when the surroundings are not the expected
+/// separators — a comment in between, say.
+fn flow_entry_removal(
+    bytes: &[u8],
+    value: &std::ops::Range<usize>,
+    map_entry: bool,
+    format: FormatTag,
+) -> Option<std::ops::Range<usize>> {
+    let yaml = format == FormatTag::Yaml;
+    let mut start = value.start;
+    if yaml {
+        start = yaml_properties_start(bytes, start);
+    }
+    if map_entry {
+        let indicator = if format == FormatTag::Toml {
+            b'='
+        } else {
+            b':'
+        };
+        let sep = skip_blanks_back(bytes, start);
+        if sep == 0 || bytes[sep - 1] != indicator {
+            return None;
+        }
+        start = flow_key_start(bytes, skip_blanks_back(bytes, sep - 1), format)?;
+        if yaml {
+            start = yaml_properties_start(bytes, start);
+            let explicit = skip_blanks_back(bytes, start);
+            if explicit > 0 && bytes[explicit - 1] == b'?' {
+                start = explicit - 1;
+            }
+        }
+    }
+    let after = skip_blanks(bytes, value.end);
+    let before = skip_blanks_back(bytes, start);
+    let preceding = before.checked_sub(1).map(|i| bytes[i]);
+    match bytes.get(after) {
+        Some(b',') => {
+            let next = skip_blanks(bytes, after + 1);
+            match bytes.get(next) {
+                // Keep the blank that makes a comment a comment.
+                Some(b'#') => return Some(start..after + 1),
+                Some(b'}' | b']') => {}
+                _ => return Some(start..next),
+            }
+            // A trailing comma: the entry is the last one.
+            match preceding {
+                Some(b',') => Some(before - 1..after + 1),
+                Some(b'{' | b'[') => Some(before..next),
+                _ => None,
+            }
+        }
+        Some(b'}' | b']') => match preceding {
+            Some(b',') => Some(before - 1..value.end),
+            Some(b'{' | b'[') => Some(before..after),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Start of the key that ends at `end` in a flow mapping: a quoted key, a
+/// TOML dotted key (`a."b".c`), or a plain key back to the flow indicator
+/// before it.
+fn flow_key_start(bytes: &[u8], end: usize, format: FormatTag) -> Option<usize> {
+    let mut end = end;
+    loop {
+        let last = *bytes.get(end.checked_sub(1)?)?;
+        let start = match last {
+            b'"' => {
+                // The opening quote: the nearest `"` before the closing one
+                // that no odd run of backslashes escapes.
+                let mut i = end - 1;
+                loop {
+                    i = bytes[..i].iter().rposition(|&b| b == b'"')?;
+                    let backslashes = bytes[..i].iter().rev().take_while(|&&b| b == b'\\').count();
+                    if backslashes % 2 == 0 {
+                        break i;
+                    }
+                }
+            }
+            b'\'' if format != FormatTag::Json => {
+                // `''` inside a single-quoted scalar is an escaped quote.
+                let mut i = end - 1;
+                loop {
+                    let quote = bytes[..i].iter().rposition(|&b| b == b'\'')?;
+                    if quote > 0 && bytes[quote - 1] == b'\'' {
+                        i = quote - 1;
+                        continue;
+                    }
+                    break quote;
+                }
+            }
+            _ => {
+                let toml = format == FormatTag::Toml;
+                let stops = |b: u8| {
+                    matches!(b, b'{' | b'[' | b',' | b'\n' | b'\r')
+                        || (toml && matches!(b, b'.' | b' ' | b'\t'))
+                };
+                let mut i = end;
+                while i > 0 && !stops(bytes[i - 1]) {
+                    i -= 1;
+                }
+                while i < end && matches!(bytes[i], b' ' | b'\t') {
+                    i += 1;
+                }
+                i
+            }
+        };
+        if format == FormatTag::Toml {
+            let dot = skip_blanks_back(bytes, start);
+            if dot > 0 && bytes[dot - 1] == b'.' {
+                end = skip_blanks_back(bytes, dot - 1);
+                continue;
+            }
+        }
+        return Some(start);
+    }
+}
+
+/// Start of the YAML node properties (`&anchor`, `!tag`) right before
+/// `start`, or `start` without any.
+fn yaml_properties_start(bytes: &[u8], start: usize) -> usize {
+    let mut start = start;
+    loop {
+        let end = skip_blanks_back(bytes, start);
+        let mut token = end;
+        while token > 0
+            && !matches!(
+                bytes[token - 1],
+                b' ' | b'\t' | b'\n' | b'\r' | b'{' | b'[' | b','
+            )
+        {
+            token -= 1;
+        }
+        if token < end && matches!(bytes[token], b'&' | b'!') {
+            start = token;
+        } else {
+            return start;
+        }
+    }
+}
+
+/// First byte at or after `pos` that is neither blank, a line break nor
+/// part of a `#` comment.
+fn skip_blanks_and_comments(bytes: &[u8], pos: usize) -> usize {
+    let mut pos = skip_blanks(bytes, pos);
+    while bytes.get(pos) == Some(&b'#') {
+        while bytes.get(pos).is_some_and(|&b| b != b'\n') {
+            pos += 1;
+        }
+        pos = skip_blanks(bytes, pos);
+    }
+    pos
+}
+
+/// First byte at or after `pos` that is not a space, tab or line break.
+fn skip_blanks(bytes: &[u8], pos: usize) -> usize {
+    let mut pos = pos;
+    while matches!(bytes.get(pos), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+        pos += 1;
+    }
+    pos
+}
+
+/// `pos` moved back over spaces, tabs and line breaks: `bytes[result - 1]`
+/// is the last other byte before `pos`.
+fn skip_blanks_back(bytes: &[u8], pos: usize) -> usize {
+    let mut pos = pos.min(bytes.len());
+    while pos > 0 && matches!(bytes[pos - 1], b' ' | b'\t' | b'\n' | b'\r') {
+        pos -= 1;
+    }
+    pos
+}
+
+/// Pointer (below `at`) of the first place `expected` and `actual`
+/// differ, `None` when they are the same tree. Map order does not count,
+/// and NaN equals NaN.
+fn first_difference(expected: &Value, actual: &Value, at: &str) -> Option<String> {
+    match (expected, actual) {
+        (Value::Map(want), Value::Map(got)) => {
+            let below = |key: &str| format!("{at}/{}", key.replace('~', "~0").replace('/', "~1"));
+            want.iter()
+                .find_map(|(key, want)| match got.get(key) {
+                    Some(got) => first_difference(want, got, &below(key)),
+                    None => Some(below(key)),
+                })
+                .or_else(|| {
+                    got.keys()
+                        .find(|key| !want.contains_key(*key))
+                        .map(|key| below(key))
+                })
+        }
+        (Value::Array(want), Value::Array(got)) => {
+            if want.len() != got.len() {
+                return Some(at.to_owned());
+            }
+            want.iter()
+                .zip(got)
+                .enumerate()
+                .find_map(|(i, (want, got))| first_difference(want, got, &format!("{at}/{i}")))
+        }
+        // NaN equals no float, and YAML holds `.nan` / `.inf` as literals
+        // a TOML `nan` / `inf` reads back as floats.
+        (want, got)
+            if let (Some(want), Some(got)) = (non_finite(want), non_finite(got))
+                && (want == got || (want.is_nan() && got.is_nan())) =>
+        {
+            None
+        }
+        (want, got) if want == got => None,
+        _ => Some(at.to_owned()),
     }
 }
 
@@ -1235,13 +2784,14 @@ fn provenance_from_spans(spans: &SpanMap) -> ProvenanceMap {
     let mut map = ProvenanceMap::with_capacity(spans.len());
     for (canonical, span) in spans {
         // Re-parse the canonical pointer string so the structured
-        // [`Pointer`] inside `Original` matches the canonical key. The
-        // canonical form was produced by [`Pointer::as_canonical`], so
-        // [`Pointer::parse`] is the exact inverse and cannot fail on
-        // well-formed input. Defensive `expect` documents the invariant
-        // for future readers.
-        let pointer = Pointer::parse(canonical)
-            .expect("canonical span keys are produced by Pointer::as_canonical");
+        // [`Pointer`] inside `Original` matches the canonical key. A span
+        // under an empty key (`{"": 1}`, YAML `? &a`) has a pointer with an
+        // empty segment, which `Pointer::parse` rejects: no pointer can
+        // address that node, so it gets no provenance.
+        let Ok(pointer) = Pointer::parse(canonical) else {
+            tracing::debug!(pointer = %canonical, "no provenance for an unaddressable span");
+            continue;
+        };
         map.insert(
             canonical.clone(),
             Provenance::original(pointer, Some(span.clone())),
@@ -1308,6 +2858,15 @@ fn sibling_key_column(bytes: &[u8], value_start: usize) -> u32 {
     while key_col < cap && matches!(bytes[key_col], b' ' | b'\t') {
         key_col += 1;
     }
+    // A YAML key of a compact mapping sits past its item's `-` (`- key:`,
+    // `- - key:`). No JSON or TOML key starts with `-` and a blank.
+    while key_col + 1 < cap && bytes[key_col] == b'-' && matches!(bytes[key_col + 1], b' ' | b'\t')
+    {
+        key_col += 1;
+        while key_col < cap && matches!(bytes[key_col], b' ' | b'\t') {
+            key_col += 1;
+        }
+    }
     // Column = (byte offset on line) + 1 to match the 1-indexed convention
     // saphyr-parser reports for `ValueSpan::indent`.
     u32::try_from(key_col - line_start + 1).unwrap_or(1)
@@ -1355,7 +2914,7 @@ fn format_specific_splice(
             // Strip a leading `\n` from the renderer output if present —
             // the splice point is already past the sibling's `\n`.
             let trimmed: &[u8] = fragment.strip_prefix(b"\n").unwrap_or(fragment);
-            let mut splice_at = sibling_span.line_range.end;
+            let mut splice_at = past_line_break(original_bytes, sibling_span.line_range.end);
             let mut out = Vec::with_capacity(trimmed.len() + 1);
             // Guard: the sibling's `line_range.end` should point past a
             // `\n`. If the source ends without one (e.g. final value with
@@ -1373,7 +2932,7 @@ fn format_specific_splice(
             (splice_at, out)
         }
         FormatTag::Toml => {
-            let mut splice_at = sibling_span.line_range.end;
+            let mut splice_at = past_line_break(original_bytes, sibling_span.line_range.end);
             let mut out = Vec::with_capacity(fragment.len() + 1);
             if splice_at == 0 || original_bytes.get(splice_at - 1) != Some(&b'\n') {
                 out.push(b'\n');
@@ -1402,6 +2961,277 @@ fn format_specific_splice(
             (sibling_span.line_range.end, trimmed.to_vec())
         }
     }
+}
+
+/// What replaces the node properties `props` of an empty node (empty
+/// without any) when it gets the value `rendered`, and the offset of the
+/// value in it. Anchors stay; `!!` tags of the core schema go, as they
+/// would retype the new value (`!!str` turns `5` into `"5"`). Without
+/// properties a blank separates the value from the `:` / `-` before it.
+fn empty_node_replacement(props: &[u8], rendered: &[u8]) -> (Vec<u8>, usize) {
+    let mut out = Vec::with_capacity(props.len() + rendered.len() + 1);
+    if props.is_empty() {
+        out.push(b' ');
+    }
+    out.append(&mut kept_properties(props));
+    let offset = out.len();
+    out.extend_from_slice(rendered);
+    (out, offset)
+}
+
+/// The `#` of the first line between the line holding `from` and `to`
+/// that holds only a comment; `None` when there is none.
+fn first_comment_line(bytes: &[u8], from: usize, to: usize) -> Option<usize> {
+    let line_start = bytes[..from]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |i| i + 1);
+    // A span can end inside the next line's indentation.
+    let mut line = if bytes[line_start..from]
+        .iter()
+        .all(|&b| matches!(b, b' ' | b'\t'))
+    {
+        line_start
+    } else {
+        from + bytes[from..to].iter().position(|&b| b == b'\n')? + 1
+    };
+    while line < to {
+        let content = line
+            + bytes[line..to]
+                .iter()
+                .position(|&b| !matches!(b, b' ' | b'\t'))?;
+        if bytes[content] == b'#' {
+            return Some(content);
+        }
+        line = content + bytes[content..to].iter().position(|&b| b == b'\n')? + 1;
+    }
+    None
+}
+
+/// Byte offset of `pos` from the start of its line.
+fn line_column(bytes: &[u8], pos: usize) -> usize {
+    pos - bytes[..pos]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |i| i + 1)
+}
+
+/// `inserted`, to go in `bytes` at `at`, with each bare `\n` turned into
+/// `\r\n` when the line break nearest `at` — the last one before it, or
+/// else the first after — is one.
+fn with_line_ending_at(bytes: &[u8], at: usize, inserted: Vec<u8>) -> Vec<u8> {
+    let at = at.min(bytes.len());
+    let nearest = bytes[..at]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .or_else(|| bytes[at..].iter().position(|&b| b == b'\n').map(|i| at + i));
+    let crlf = nearest.is_some_and(|i| i > 0 && bytes[i - 1] == b'\r');
+    if !crlf || !inserted.contains(&b'\n') {
+        return inserted;
+    }
+    let mut out = Vec::with_capacity(inserted.len() + 4);
+    for (i, &b) in inserted.iter().enumerate() {
+        if b == b'\n' && (i == 0 || inserted[i - 1] != b'\r') {
+            out.push(b'\r');
+        }
+        out.push(b);
+    }
+    out
+}
+
+/// For the TOML line `line` holding a dotted key (`  a."b.c".d = 1`), the
+/// key without its last part (`  a."b.c"`); `None` for a key of one part
+/// or a line that is not `key = value`.
+fn toml_dotted_key_parent(line: &[u8]) -> Option<Vec<u8>> {
+    let mut quote = None;
+    let mut last_dot = None;
+    for (i, &b) in line.iter().enumerate() {
+        match (quote, b) {
+            (Some(q), _) if b == q => quote = None,
+            (Some(b'"'), b'\\') => return None,
+            (Some(_), _) => {}
+            (None, b'"' | b'\'') => quote = Some(b),
+            (None, b'.') => last_dot = Some(i),
+            (None, b'=') => {
+                let mut end = last_dot?;
+                while end > 0 && matches!(line[end - 1], b' ' | b'\t') {
+                    end -= 1;
+                }
+                return Some(line[..end].to_vec());
+            }
+            (None, b'#' | b'\n' | b'[' | b'{') => return None,
+            (None, _) => {}
+        }
+    }
+    None
+}
+
+/// The anchor and local tags of the node properties `props`, each followed
+/// by a space; `!!` tags are dropped.
+fn kept_properties(props: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(props.len());
+    for token in props
+        .split(u8::is_ascii_whitespace)
+        .filter(|token| !token.is_empty() && !token.starts_with(b"!!"))
+    {
+        out.extend_from_slice(token);
+        out.push(b' ');
+    }
+    out
+}
+
+/// Of the recorded `scalar` child and the `collection` child spanning its
+/// brackets, the one that starts later, the collection with a span over
+/// its brackets in `context`.
+fn last_by_start(
+    scalar: Option<(String, ValueSpan)>,
+    collection: Option<(String, std::ops::Range<usize>)>,
+    context: SpanContext,
+) -> Option<(String, ValueSpan)> {
+    match (scalar, collection) {
+        (Some(scalar), Some((_, value))) if scalar.1.value_range.start > value.start => {
+            Some(scalar)
+        }
+        (_, Some((pointer, value))) => Some((
+            pointer,
+            ValueSpan {
+                line_range: value.clone(),
+                value_range: value,
+                indent: 1,
+                context,
+            },
+        )),
+        (scalar, None) => scalar,
+    }
+}
+
+/// Past the bracket closing the YAML flow collection that opens at
+/// `within.start`, found before `within.end`; quoted scalars and comments
+/// skipped.
+fn yaml_flow_end(bytes: &[u8], within: std::ops::Range<usize>) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = within.start;
+    while i < within.end {
+        let prev = i.checked_sub(1).map(|p| bytes[p]);
+        // A quote opens a scalar only where a scalar can begin.
+        let scalar_start = prev.is_none_or(|p| {
+            matches!(
+                p,
+                b'[' | b'{' | b',' | b':' | b'?' | b' ' | b'\t' | b'\n' | b'\r'
+            )
+        });
+        match bytes[i] {
+            b'[' | b'{' => depth += 1,
+            b']' | b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            b'"' if scalar_start => loop {
+                i += 1;
+                match bytes.get(i)? {
+                    b'\\' => i += 1,
+                    b'"' => break,
+                    _ => {}
+                }
+            },
+            b'\'' if scalar_start => loop {
+                i += 1;
+                if *bytes.get(i)? == b'\'' {
+                    if bytes.get(i + 1) == Some(&b'\'') {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+            },
+            b'#' if prev.is_some_and(|p| p.is_ascii_whitespace()) => {
+                while i < within.end && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `bytes` parsed again write-aware as `format`; `None` for a format
+/// without textual edits.
+fn parse_again(format: FormatTag, bytes: &[u8]) -> Option<Result<Document>> {
+    match format {
+        FormatTag::Yaml => Some(crate::parsers::parse_yaml_with_spans(bytes)),
+        FormatTag::Json => Some(crate::parsers::parse_json_with_spans(bytes)),
+        FormatTag::Toml => Some(crate::format::Format::parse(&crate::parsers::Toml, bytes)),
+        _ => None,
+    }
+}
+
+/// The YAML edit layout of a document before an edit, worked out at most
+/// once per edit — see [`Document::edit_layout`].
+type LayoutCache = std::cell::OnceCell<Option<crate::parsers::yaml_spans::EditLayout>>;
+
+/// Why a JSON `set` of NaN or Infinity is refused — by the JSON writer
+/// too, so with no way around it.
+const JSON_NON_FINITE: &str = "JSON has no NaN or Infinity";
+
+/// The way around an edit the read-back check refuses.
+const JQ_REWRITE_HINT: &str =
+    "`dq set --jq` rewrites the whole file through its writer instead, dropping comments";
+
+/// Where a new flow entry goes relative to the sibling it follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlowLayout {
+    /// On the sibling's line: `, k: v`.
+    SameLine,
+    /// On a line of its own, its key at `column` (0-based) like the
+    /// sibling's, after the line break the sibling's line ends in.
+    OwnLine { column: usize, crlf: bool },
+}
+
+/// `(splice_at, splice_bytes)` putting the entry the insertion renderer
+/// wrote as `fragment` right after the flow `sibling`, behind a comma. The
+/// renderers write a block entry (a line break, indentation, a trailing
+/// line break): only its `key: value` / `key = value` text is kept.
+fn flow_sibling_splice(
+    fragment: &[u8],
+    sibling: &ValueSpan,
+    layout: FlowLayout,
+) -> (usize, Vec<u8>) {
+    let start = fragment
+        .iter()
+        .position(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+        .unwrap_or(fragment.len());
+    let end = fragment
+        .iter()
+        .rposition(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+        .map_or(start, |last| last + 1);
+    let entry = &fragment[start..end.max(start)];
+    let mut out = Vec::with_capacity(entry.len() + 2);
+    match layout {
+        FlowLayout::SameLine => out.extend_from_slice(b", "),
+        FlowLayout::OwnLine { column, crlf } => {
+            out.extend_from_slice(if crlf { b",\r\n" } else { b",\n" });
+            out.extend(std::iter::repeat_n(b' ', column));
+        }
+    }
+    out.extend_from_slice(entry);
+    (sibling.value_range.end, out)
+}
+
+/// `pos`, or — when it is not at the start of a line — just past the line
+/// break that ends its line: the `line_range` of an empty `{}` / `[]`
+/// ends at its bracket. Stays at `pos` when no line break follows.
+fn past_line_break(bytes: &[u8], pos: usize) -> usize {
+    if pos == 0 || pos > bytes.len() || bytes[pos - 1] == b'\n' {
+        return pos;
+    }
+    bytes[pos..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(pos, |at| pos + at + 1)
 }
 
 /// Translate the per-format [`InsertionRenderer`] fragment into a final
@@ -1988,6 +3818,8 @@ impl serde::Serialize for Value {
             // handled by the dedicated JSON writer, not the generic
             // `Serialize` impl, because not every serializer can represent
             // them as numeric tokens without precision loss.
+            // `.nan` / `.inf` are floats every serializer has a token for.
+            Self::BigFloat(s) if let Some(f) = non_finite_literal(s) => serializer.serialize_f64(f),
             Self::BigInt(s) | Self::BigFloat(s) => serializer.serialize_str(s),
             Self::Array(items) => {
                 let mut seq = serializer.serialize_seq(Some(items.len()))?;
@@ -2755,6 +4587,170 @@ mod tests {
     }
 
     #[test]
+    fn first_difference_ignores_map_order_and_matches_nan() {
+        let tree = |json: serde_json::Value| Value::from_serde_json(&json);
+        let a = tree(serde_json::json!({"a": 1, "b": [1, {"c/d": 2}]}));
+        let b = tree(serde_json::json!({"b": [1, {"c/d": 2}], "a": 1}));
+        assert_eq!(first_difference(&a, &b, ""), None);
+        let c = tree(serde_json::json!({"a": 1, "b": [1, {"c/d": 3}]}));
+        assert_eq!(first_difference(&a, &c, ""), Some("/b/1/c~1d".to_owned()));
+        assert_eq!(
+            first_difference(&Value::Float(f64::NAN), &Value::Float(f64::NAN), ""),
+            None
+        );
+        assert_eq!(
+            first_difference(&Value::Int(1), &Value::Float(1.0), "/x"),
+            Some("/x".to_owned())
+        );
+    }
+
+    /// Byte offset of the first occurrence of `needle` in `src`.
+    fn at(src: &str, needle: &str) -> usize {
+        src.find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} in {src:?}"))
+    }
+
+    #[test]
+    fn flow_key_start_finds_quoted_and_dotted_keys() {
+        // (format, source, key text as written, the key ends where it ends)
+        let cases = [
+            (FormatTag::Json, r#"{"b": 2, "q\"x": 1}"#, r#""q\"x""#),
+            (FormatTag::Json, r#"{"b": 2, "a\\\"": 1}"#, r#""a\\\"""#),
+            (FormatTag::Json, r#"{"b": 2, "q\\": 1}"#, r#""q\\""#),
+            (FormatTag::Yaml, "{b: 2, 'it''s': 1}", "'it''s'"),
+            (FormatTag::Yaml, "{b: 2,'''': 1}", "''''"),
+            (FormatTag::Yaml, "{b: 2, '': 1}", "''"),
+            (FormatTag::Yaml, "{b: 2,  plain key: 1}", "plain key"),
+            (FormatTag::Yaml, "{b: 2,\n  k: 1}", "k"),
+            (
+                FormatTag::Toml,
+                "{b = 2, x . \"y z\" . w = 1}",
+                "x . \"y z\" . w",
+            ),
+            (FormatTag::Toml, "{b = 2, x.'y.z'.w = 1}", "x.'y.z'.w"),
+            (FormatTag::Toml, "{b = 2, \"x\" = 1}", "\"x\""),
+        ];
+        for (format, src, key) in cases {
+            let start = at(src, key);
+            assert_eq!(
+                flow_key_start(src.as_bytes(), start + key.len(), format),
+                Some(start),
+                "{format:?} {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn flow_entry_removal_takes_the_entry_and_one_comma() {
+        // (format, source, value of the entry to remove, map entry, what
+        // is left)
+        let cases = [
+            (FormatTag::Yaml, "{a: 1, b: 2}", "1", true, "{b: 2}"),
+            (FormatTag::Yaml, "{a: 1, b: 2}", "2", true, "{a: 1}"),
+            (FormatTag::Yaml, "{a: 1}", "1", true, "{}"),
+            (FormatTag::Yaml, "[1, 2]", "2", false, "[1]"),
+            // A trailing comma: the last entry takes the comma before it.
+            (FormatTag::Yaml, "{a: 1, b: 2,}", "2", true, "{a: 1}"),
+            (FormatTag::Yaml, "{a: 1,}", "1", true, "{}"),
+            // The blank before a comment stays, so it is still a comment.
+            (
+                FormatTag::Yaml,
+                "{a: 1, # c\n b: 2}",
+                "1",
+                true,
+                "{ # c\n b: 2}",
+            ),
+            // Node properties and an explicit key go with the entry.
+            (
+                FormatTag::Yaml,
+                "{? &k a : !!str 1, b: 2}",
+                "1",
+                true,
+                "{b: 2}",
+            ),
+            (
+                FormatTag::Json,
+                r#"{"q\"x": 1, "b": 2}"#,
+                "1",
+                true,
+                r#"{"b": 2}"#,
+            ),
+            (
+                FormatTag::Toml,
+                "{x . \"y z\" . w = 1, b = 2}",
+                "1",
+                true,
+                "{b = 2}",
+            ),
+            (FormatTag::Toml, "{b = 2, x.y = 1}", "1", true, "{b = 2}"),
+        ];
+        for (format, src, value, map_entry, want) in cases {
+            let start = src.rfind(value).expect("value in source");
+            let range = flow_entry_removal(
+                src.as_bytes(),
+                &(start..start + value.len()),
+                map_entry,
+                format,
+            )
+            .unwrap_or_else(|| panic!("{format:?} {src:?}: no removal"));
+            let mut left = src.to_owned();
+            left.replace_range(range, "");
+            assert_eq!(left, want, "{format:?} {src:?}");
+        }
+    }
+
+    #[test]
+    fn flow_entry_removal_refuses_what_it_does_not_recognise() {
+        // A comment before the closing bracket, a comment before the comma,
+        // a value that is not a flow entry at all.
+        let cases = [
+            ("{a: 1 # c\n}", "1"),
+            ("{a: 1 # c\n, b: 2}", "1"),
+            ("a: 1\n", "1"),
+        ];
+        for (src, value) in cases {
+            let start = src.find(value).expect("value in source");
+            assert_eq!(
+                flow_entry_removal(
+                    src.as_bytes(),
+                    &(start..start + value.len()),
+                    true,
+                    FormatTag::Yaml
+                ),
+                None,
+                "{src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn past_line_break_moves_to_the_next_line_start() {
+        let src = b"a: {}\r\nb: 1";
+        // Mid-line: past the `\n` of a CRLF.
+        assert_eq!(past_line_break(src, 5), 7);
+        // At a line start, at 0, past the end: stays.
+        assert_eq!(past_line_break(src, 7), 7);
+        assert_eq!(past_line_break(src, 0), 0);
+        assert_eq!(past_line_break(src, src.len() + 1), src.len() + 1);
+        // No line break after: stays.
+        assert_eq!(past_line_break(src, 9), 9);
+    }
+
+    #[test]
+    fn skip_blanks_and_comments_stops_at_content() {
+        let src = b"  # one\r\n\t# two\n\n  x # three";
+        assert_eq!(
+            skip_blanks_and_comments(src, 0),
+            at("  # one\r\n\t# two\n\n  x", "x")
+        );
+        // A `#` inside content is not skipped from: content is content.
+        assert_eq!(skip_blanks_and_comments(b"x # c", 0), 0);
+        // A comment to the end of the input ends there.
+        assert_eq!(skip_blanks_and_comments(b" # c", 0), 4);
+        assert_eq!(skip_blanks_and_comments(b"", 0), 0);
+    }
+
+    #[test]
     fn del_at_recompute_only_shifts_spans_after_edit_end() {
         // Three sibling spans on synthesized bytes — `/a` left of edit,
         // `/b` is the edit target, `/c` to the right. After del_at(/b)
@@ -2784,7 +4780,10 @@ mod tests {
             FormatTag::Yaml,
         );
         let pointer = Pointer::parse("/b").unwrap();
-        doc.del_at(&pointer).expect("del_at /b must succeed");
+        // The bytes are a synthetic layout that does not read back as the
+        // tree: exercise the splice without the read-back check.
+        doc.del_at_unchecked(&pointer, &LayoutCache::new())
+            .expect("del_at /b must succeed");
 
         let span_a = doc
             .span_at(&Pointer::parse("/a").unwrap())

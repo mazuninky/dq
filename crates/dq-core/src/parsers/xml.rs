@@ -40,6 +40,7 @@
 //! through to whatever the M2 contract dictates for non-span formats
 //! (best-effort re-emit through `Format::write`).
 
+use std::borrow::Cow;
 use std::io::{Cursor, Write};
 
 use camino::Utf8PathBuf;
@@ -48,6 +49,7 @@ use quick_xml::events::attributes::Attribute;
 use quick_xml::events::{
     BytesCData, BytesDecl, BytesEnd, BytesPI, BytesRef, BytesStart, BytesText, Event,
 };
+use quick_xml::name::QName;
 use quick_xml::reader::Reader;
 use quick_xml::{Writer, XmlVersion};
 
@@ -232,28 +234,19 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
             Ok(Event::Decl(decl)) => {
                 if !stack.is_empty() {
                     // Inner declarations are not standard XML; treat as PI.
-                    let raw = bytes_to_string(&decl);
+                    let raw = (*decl).to_owned();
                     push_pi(&mut stack, &mut top_pi, raw);
                     continue;
                 }
                 let mut decl_map: IndexMap<String, Value> = IndexMap::new();
                 if let Ok(v) = decl.version() {
-                    decl_map.insert(
-                        "version".to_owned(),
-                        Value::String(String::from_utf8_lossy(&v).into_owned()),
-                    );
+                    decl_map.insert("version".to_owned(), Value::String(v.into_owned()));
                 }
                 if let Some(Ok(enc)) = decl.encoding() {
-                    decl_map.insert(
-                        "encoding".to_owned(),
-                        Value::String(String::from_utf8_lossy(&enc).into_owned()),
-                    );
+                    decl_map.insert("encoding".to_owned(), Value::String(enc.into_owned()));
                 }
                 if let Some(Ok(sa)) = decl.standalone() {
-                    decl_map.insert(
-                        "standalone".to_owned(),
-                        Value::String(String::from_utf8_lossy(&sa).into_owned()),
-                    );
+                    decl_map.insert("standalone".to_owned(), Value::String(sa.into_owned()));
                 }
                 top.insert(KEY_XML_DECL.to_owned(), Value::Map(decl_map));
             }
@@ -266,11 +259,11 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                 );
             }
             Ok(Event::PI(pi)) => {
-                let raw = bytes_to_string(&pi);
+                let raw = (*pi).to_owned();
                 push_pi(&mut stack, &mut top_pi, raw);
             }
             Ok(Event::Comment(c)) => {
-                let txt = decode_text(&c)?;
+                let txt = decode_text(&c);
                 push_comment(&mut stack, &mut top_comments, txt);
             }
             Ok(Event::Start(start)) => {
@@ -308,11 +301,11 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                         snippet: snippet_for_pos(text, pos),
                         message: format!(
                             "XML parse error: unexpected closing tag </{}>",
-                            String::from_utf8_lossy(end.name().as_ref()),
+                            end.name().as_ref(),
                         ),
                     });
                 };
-                let end_name = String::from_utf8_lossy(end.name().as_ref()).into_owned();
+                let end_name = end.name().as_ref().to_owned();
                 if end_name != frame.tag {
                     let pos = reader.buffer_position() as usize;
                     let (line, col) = byte_pos_to_line_col(text, pos);
@@ -334,7 +327,7 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                 append_child(&mut stack, &mut top_children, &tag, value);
             }
             Ok(Event::Text(t)) => {
-                let s = decode_text(&t)?;
+                let s = decode_text(&t);
                 if let Some(frame) = stack.last_mut() {
                     if !s.trim().is_empty() {
                         if frame.saw_element {
@@ -353,7 +346,7 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
             Ok(Event::CData(c)) => {
                 // CData payload is stored verbatim (no escape decoding —
                 // CDATA bodies are not entity-encoded).
-                let s = String::from_utf8_lossy(c.as_ref()).into_owned();
+                let s = (*c).to_owned();
                 if let Some(frame) = stack.last_mut() {
                     frame.cdata.push(s);
                 }
@@ -420,7 +413,7 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
 
 /// Build a [`Frame`] from a `<tag attr="...">` event.
 fn build_start_frame(start: &BytesStart<'_>) -> Result<Frame> {
-    let tag = String::from_utf8_lossy(start.name().as_ref()).into_owned();
+    let tag = start.name().as_ref().to_owned();
     let mut frame = Frame::new(tag);
     for attr in start.attributes() {
         let attr = attr.map_err(|e| Error::Parse {
@@ -431,30 +424,25 @@ fn build_start_frame(start: &BytesStart<'_>) -> Result<Frame> {
             snippet: String::new(),
             message: format!("XML parse error: malformed attribute: {e}"),
         })?;
-        let name = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
+        let name = attr.key.as_ref().to_owned();
         let value = decode_attr(&attr)?;
         frame.attrs.insert(name, Value::String(value));
     }
     Ok(frame)
 }
 
-fn decode_text(t: &BytesText<'_>) -> Result<String> {
+fn decode_text(t: &BytesText<'_>) -> String {
     // quick-xml 0.38+ split entity resolution out of `Event::Text`: text events
-    // now carry the raw (un-entity-expanded) bytes and entities are reported as
+    // now carry the raw (un-entity-expanded) text and entities are reported as
     // a separate `Event::GeneralRef`. `xml_content` still applies EOL
     // normalisation per the XML 1.0 spec, which matches the pre-0.38 behaviour
     // for everything except entities (those are handled in the `GeneralRef`
     // arm above).
-    t.xml_content(XmlVersion::Implicit1_0)
-        .map(|c| c.into_owned())
-        .map_err(|e| Error::Parse {
-            file: None,
-            line: 0,
-            col: 0,
-            span: 0..0,
-            snippet: String::new(),
-            message: format!("XML parse error: malformed text/comment: {e}"),
-        })
+    //
+    // Since quick-xml 0.42 event content is already `str`, so `xml_content`
+    // is infallible. The pre-0.42 decoding error was unreachable for us
+    // anyway: `parse_xml` rejects non-UTF-8 input before the reader runs.
+    t.xml_content(XmlVersion::Implicit1_0).into_owned()
 }
 
 fn decode_attr(attr: &Attribute<'_>) -> Result<String> {
@@ -493,9 +481,9 @@ fn resolve_general_ref(r: &BytesRef<'_>, text: &str, pos: usize) -> Result<Strin
             message: msg,
         }
     };
-    let name = r
-        .decode()
-        .map_err(|e| make_parse_err(format!("XML parse error: malformed entity reference: {e}")))?;
+    // quick-xml 0.42: `BytesRef` derefs to the entity name as `str`; the
+    // fallible `decode()` step (UTF-8 only, so it never failed for us) is gone.
+    let name: &str = r;
     if r.is_char_ref() {
         // Numeric character reference — `&#48;` or `&#x30;`.
         let ch = r.resolve_char_ref().map_err(|e| {
@@ -505,16 +493,12 @@ fn resolve_general_ref(r: &BytesRef<'_>, text: &str, pos: usize) -> Result<Strin
         })?;
         return Ok(ch.map_or_else(String::new, |c| c.to_string()));
     }
-    if let Some(resolved) = quick_xml::escape::resolve_predefined_entity(&name) {
+    if let Some(resolved) = quick_xml::escape::resolve_predefined_entity(name) {
         return Ok(resolved.to_owned());
     }
     Err(make_parse_err(format!(
         "XML parse error: undeclared entity reference '&{name};'",
     )))
-}
-
-fn bytes_to_string(b: &[u8]) -> String {
-    String::from_utf8_lossy(b).into_owned()
 }
 
 fn push_pi(stack: &mut [Frame], top_pi: &mut Vec<String>, raw: String) {
@@ -649,7 +633,7 @@ fn render_xml(top: &Value) -> Result<Vec<u8>> {
         for it in items {
             if let Value::String(s) = it {
                 writer
-                    .write_event(Event::Comment(BytesText::new(s.as_str())))
+                    .write_event(Event::Comment(text_event(s)))
                     .map_err(map_write_err)?;
             }
         }
@@ -748,7 +732,10 @@ fn write_element(
                     });
                 }
             };
-            start.push_attribute(Attribute::from((k.as_str(), v.as_str())));
+            start.push_attribute(Attribute {
+                key: QName(k.as_str()),
+                value: escape_xml(&v).into_owned().into(),
+            });
         }
     }
 
@@ -799,7 +786,7 @@ fn write_element(
                     write_indent_break(writer, child_indent)?;
                 }
                 writer
-                    .write_event(Event::Comment(BytesText::new(s.as_str())))
+                    .write_event(Event::Comment(text_event(s)))
                     .map_err(map_write_err)?;
             }
         }
@@ -818,7 +805,7 @@ fn write_element(
     }
     if let Some(Value::String(s)) = body.get(KEY_TEXT) {
         writer
-            .write_event(Event::Text(BytesText::new(s.as_str())))
+            .write_event(Event::Text(text_event(s)))
             .map_err(map_write_err)?;
     }
     if let Some(Value::Array(items)) = body.get(KEY_CDATA) {
@@ -919,6 +906,41 @@ fn is_conventional(k: &str) -> bool {
 
 fn non_empty_array(v: &Value) -> bool {
     matches!(v, Value::Array(items) if !items.is_empty())
+}
+
+/// Escape `raw` for text, comment and attribute-value output.
+///
+/// Replaces exactly `<`, `>`, `&`, `'` and `"` — the set quick-xml's
+/// `escape` used up to 0.40, which is what `BytesText::new` and
+/// `Attribute::from((&str, &str))` applied on our write path. quick-xml
+/// 0.42 widened both: `BytesText::new` now also escapes `\r` as `&#13;`, and
+/// `Attribute::from` additionally escapes `\n` / `\t` as `&#10;` / `&#9;`.
+/// We pin the old set so `dq fmt` / `dq convert -F xml` output stays
+/// byte-identical across the dependency bump; adopting the wider escaping
+/// is a separate, user-visible writer change.
+fn escape_xml(raw: &str) -> Cow<'_, str> {
+    let needs_escape = |c: char| matches!(c, '<' | '>' | '&' | '\'' | '"');
+    let Some(first) = raw.find(needs_escape) else {
+        return Cow::Borrowed(raw);
+    };
+    let mut out = String::with_capacity(raw.len() + 8);
+    out.push_str(&raw[..first]);
+    for c in raw[first..].chars() {
+        match c {
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '&' => out.push_str("&amp;"),
+            '\'' => out.push_str("&apos;"),
+            '"' => out.push_str("&quot;"),
+            other => out.push(other),
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// `BytesText` for a text or comment body, escaped with [`escape_xml`].
+fn text_event(s: &str) -> BytesText<'_> {
+    BytesText::from_escaped(escape_xml(s))
 }
 
 fn map_write_err(e: std::io::Error) -> Error {

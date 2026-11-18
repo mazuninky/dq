@@ -115,6 +115,21 @@ pub enum Error {
         reason: String,
     },
 
+    /// `Document::set_at` / `Document::del_at` could not make the edit
+    /// without changing parts of the document other than the addressed
+    /// node — deleting a YAML anchor an alias elsewhere refers to, or a
+    /// textual edit whose result does not read back as the edited tree.
+    /// The document is left as it was.
+    #[error("cannot {action} '{pointer}': {reason}")]
+    EditRejected {
+        /// The operation: `set` or `delete`.
+        action: &'static str,
+        /// Canonical RFC 6901 form of the pointer the edit targeted.
+        pointer: String,
+        /// Why, for the user.
+        reason: String,
+    },
+
     /// File contains Go template syntax (Helm/Argo/GitHub Actions) that the
     /// parser cannot safely round-trip without explicit opt-in.
     ///
@@ -171,6 +186,7 @@ impl Error {
             Self::UnsupportedFormat { .. } => "unsupported_format",
             Self::Format { .. } => "format",
             Self::WriteUnavailable { .. } => "write_unavailable",
+            Self::EditRejected { .. } => "edit_rejected",
             Self::TemplatedFile { .. } => "templated_file",
             Self::PatchTestFailed { .. } => "patch_test_failed",
         }
@@ -244,6 +260,17 @@ mod tests {
             reason: "read-only".to_owned(),
         };
         assert_eq!(write_unavailable.kind_name(), "write_unavailable");
+
+        let edit_rejected = Error::EditRejected {
+            action: "delete",
+            pointer: "/a".to_owned(),
+            reason: "it holds an anchor".to_owned(),
+        };
+        assert_eq!(edit_rejected.kind_name(), "edit_rejected");
+        assert_eq!(
+            edit_rejected.to_string(),
+            "cannot delete '/a': it holds an anchor"
+        );
 
         let templated = Error::TemplatedFile {
             line: 1,

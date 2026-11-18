@@ -230,13 +230,13 @@ Full matrix, write-mode semantics, and pointer prefixes per format: [references/
 | Code | Meaning                                                                 |
 |-----:|-------------------------------------------------------------------------|
 |    0 | Success.                                                                |
-|    1 | Generic failure (`--check` saw pending changes; JSON Patch `test` op failed; `lint --strict` saw a warn). |
+|    1 | Generic failure (`--check` saw pending changes; JSON Patch `test` op failed; `lint --strict` saw a warn; `convert` cannot write a value in the target format, e.g. NaN/Infinity in JSON). |
 |    2 | NOT_FOUND — JSON Pointer addressed a node that does not exist.          |
 |    3 | PARSE_ERROR — input failed format parsing (or templated file without `--raw-template-strings`). |
 |    4 | LINT_FAIL / VALIDATE_FAIL — `lint` produced an error-severity diagnostic, or `validate` saw a parse error. |
 |    5 | IO_ERROR — read failed; `self check`/`update` network failure.          |
 |    6 | INVALID_INPUT — bad CLI flag combo, unknown format, read cmd + write flag. |
-|    7 | WRITE_FAILED — atomic write failed; bulk partial-failure mode; self-update replace failed. |
+|    7 | WRITE_FAILED — atomic write failed; `edit_rejected` (a `set`/`del` whose result would not read back as the requested change is refused, file untouched; `set --jq` rewrites through the writer instead); bulk partial-failure mode; self-update replace failed. |
 
 `--strict` promotes `warn`-severity lint findings to exit 1; error-severity always exits 4 regardless of `--strict`.
 
@@ -323,7 +323,7 @@ brew install mazuninky/tap/dq
 # Docker (multi-arch, GHCR with provenance)
 docker run --rm -v "$PWD:/work" ghcr.io/mazuninky/dq:latest get config.yaml /name
 
-# Cargo (MSRV 1.94)
+# Cargo (MSRV 1.100)
 cargo install --locked --git https://github.com/mazuninky/dq dq-cli
 
 # Verified GitHub Releases (SLSA attestation)

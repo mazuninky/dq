@@ -35,26 +35,38 @@ mod plugins_enabled {
     //!   sandboxed: no filesystem, no network, no process control.
     //! - Async disabled — the spec is sync-only; plugin invocation
     //!   blocks the calling thread.
+    //! - `wasm_custom_page_sizes(false)`, `wasm_memory64(false)` — plugins
+    //!   get 32-bit memories and tables with 64 KiB pages only. Custom page
+    //!   sizes are off by default; memory64 is on by default in wasmtime 50
+    //!   (part of the Wasm 3.0 feature set) and is switched off here. The
+    //!   limiter does not depend on either setting; they only narrow what a
+    //!   plugin may declare.
     //!
     //! # Per-invocation memory limit
     //!
-    //! Each `Store<HostState>` installs a [`wasmtime::StoreLimits`]
-    //! configured via [`wasmtime::StoreLimitsBuilder::memory_size`] capping
-    //! the plugin's linear memory at 64 MiB
-    //! (`MEMORY_LIMIT = 64 * 1024 * 1024`). When the plugin's `memory.grow`
-    //! would exceed the cap, the limiter returns `Ok(false)` so wasmtime
-    //! refuses the growth; the resulting [`wasmtime::Error`] is classified
-    //! by [`classify_trap_error`] into [`PluginError::Memory`]. The limiter
-    //! is plumbed through `Store::limiter` via [`HostState::limits_mut`].
+    //! Each `Store<HostState>` installs a [`PluginLimiter`] through
+    //! `Store::limiter` (via [`HostState::limits_mut`]). The 64 MiB cap
+    //! (`MEMORY_LIMIT = 64 * 1024 * 1024`) applies to the sum of all linear
+    //! memories in the store — every core module of the component counts,
+    //! including the initial size of each memory at instantiation. Table
+    //! elements are capped store-wide the same way, and the number of core
+    //! instances, memories and tables per store is bounded; the values and
+    //! their rationale live in [`crate::limits`].
+    //!
+    //! When a memory request would exceed the cap, the limiter refuses it
+    //! (`memory.grow` returns -1 to the guest) and records the refusal. If
+    //! the call or the instantiation then fails, the failure is reported as
+    //! [`PluginError::Memory`]; see [`classify_trap_error`].
 
     use camino::{Utf8Path, Utf8PathBuf};
     use dq_core::pointer::Segment;
     use dq_core::{EditScript, Ir, Pointer};
     use dq_exec::{Diagnostic, Severity as ExecSeverity};
     use wasmtime::component::{Component, HasSelf, Linker};
-    use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
+    use wasmtime::{Config, Engine, Store};
 
     use crate::error::{PluginError, Result};
+    use crate::limits::{MEMORY_LIMIT, PluginLimiter, TABLE_ELEMENTS_LIMIT};
 
     // Generate host-side bindings for the `dq:plugin` world from the WIT
     // schema. The macro expands at compile time; if the WIT file changes,
@@ -84,9 +96,6 @@ mod plugins_enabled {
     /// spec scenario "Infinite-loop plugin terminates with Exhausted".
     const FUEL_BUDGET: u64 = 100_000_000;
 
-    /// Per-instance memory cap (64 MiB).
-    const MEMORY_LIMIT: usize = 64 * 1024 * 1024;
-
     /// Maximum native stack the WASM module may consume (2 MiB).
     const STACK_LIMIT: usize = 2 * 1024 * 1024;
 
@@ -102,8 +111,8 @@ mod plugins_enabled {
     ///
     /// Owned by the wasmtime [`Store`] and exposed to the linker via
     /// [`HasSelf<HostState>`]. Holds the data the `interface ir` and
-    /// `interface jq` host imports project from, plus a memory limiter
-    /// so the [`StoreLimits`] cap is enforced uniformly.
+    /// `interface jq` host imports project from, plus the store-wide
+    /// [`PluginLimiter`].
     pub(crate) struct HostState {
         /// Pre-serialized JSON of the IR root. `interface ir`'s `get-root`
         /// returns a clone of these bytes; `get-at` walks the underlying
@@ -119,8 +128,8 @@ mod plugins_enabled {
         /// and returns its index as a `u32` handle; `jq::eval` looks the
         /// engine up by handle.
         jq_engines: Vec<dq_transform::JqEngine>,
-        /// Wasmtime resource limits attached via `Store::limiter`.
-        limits: StoreLimits,
+        /// Store-wide resource limiter attached via `Store::limiter`.
+        limits: PluginLimiter,
     }
 
     impl HostState {
@@ -131,7 +140,7 @@ mod plugins_enabled {
             // empty payload than panic mid-invocation. Plugins receive an
             // empty document in that case.
             let ir_root_bytes = serde_json::to_vec(&ir_root_value).unwrap_or_default();
-            let limits = StoreLimitsBuilder::new().memory_size(MEMORY_LIMIT).build();
+            let limits = PluginLimiter::new(MEMORY_LIMIT, TABLE_ELEMENTS_LIMIT);
             Self {
                 ir_root_bytes,
                 ir_root_value,
@@ -143,6 +152,12 @@ mod plugins_enabled {
 
         fn limits_mut(&mut self) -> &mut dyn wasmtime::ResourceLimiter {
             &mut self.limits
+        }
+
+        /// Whether the limiter refused a memory request for exceeding the
+        /// store-wide budget during this invocation.
+        fn memory_limit_hit(&self) -> bool {
+            self.limits.memory_limit_hit()
         }
     }
 
@@ -287,7 +302,13 @@ mod plugins_enabled {
             config
                 .consume_fuel(true)
                 .max_wasm_stack(STACK_LIMIT)
-                .wasm_component_model(true);
+                .wasm_component_model(true)
+                // 32-bit memories and tables with 64 KiB pages only. memory64
+                // is on by default in wasmtime 50; custom page sizes are off
+                // by default and pinned here so a future default cannot
+                // widen what plugins may declare.
+                .wasm_custom_page_sizes(false)
+                .wasm_memory64(false);
             let engine = Engine::new(&config).map_err(|e| PluginError::Load {
                 path: Utf8PathBuf::new(),
                 message: format!("engine init: {e}"),
@@ -365,7 +386,7 @@ mod plugins_enabled {
         /// - [`PluginError::Exhausted`] when the plugin exceeds
         ///   [`FUEL_BUDGET`].
         /// - [`PluginError::Memory`] when the plugin tries to grow past
-        ///   [`MEMORY_LIMIT`].
+        ///   [`MEMORY_LIMIT`] (summed over the store).
         /// - [`PluginError::Invoke`] for any other wasmtime trap.
         pub fn invoke_lint(
             &self,
@@ -374,9 +395,7 @@ mod plugins_enabled {
             file: Option<&Utf8Path>,
         ) -> Result<Vec<Diagnostic>> {
             let (mut store, plugin) = self.instantiate(handle, ir)?;
-            let raw = plugin
-                .call_lint(&mut store)
-                .map_err(|e| classify_trap_error(&e, &handle.rule_id))?;
+            let raw = call_in(&mut store, &handle.rule_id, |s| plugin.call_lint(s))?;
             let diagnostics = raw
                 .into_iter()
                 .map(|d| marshal_diagnostic(d, ir, file))
@@ -398,9 +417,7 @@ mod plugins_enabled {
         ///   classified the same way as [`Self::invoke_lint`].
         pub fn invoke_fix(&self, handle: &PluginHandle, ir: &Ir<'_>) -> Result<EditScript> {
             let (mut store, plugin) = self.instantiate(handle, ir)?;
-            let raw = plugin
-                .call_fix(&mut store)
-                .map_err(|e| classify_trap_error(&e, &handle.rule_id))?;
+            let raw = call_in(&mut store, &handle.rule_id, |s| plugin.call_fix(s))?;
             let bytes = raw.map_err(|message| PluginError::Invoke {
                 rule_id: handle.rule_id.clone(),
                 message,
@@ -413,28 +430,57 @@ mod plugins_enabled {
             })
         }
 
-        /// Build a fresh `Store<HostState>` with the spec-mandated fuel and
-        /// memory limits, then instantiate the component into the
-        /// pre-built linker. Returns the store and a typed
-        /// [`PluginBindings`] for issuing the actual export call.
+        /// Build a fresh store (see [`new_store`]), then instantiate the
+        /// component into the pre-built linker. Returns the store and a
+        /// typed [`PluginBindings`] for issuing the actual export call.
         fn instantiate(
             &self,
             handle: &PluginHandle,
             ir: &Ir<'_>,
         ) -> Result<(Store<HostState>, PluginBindings)> {
-            let host_state = HostState::new(ir);
-            let mut store = Store::new(&self.engine, host_state);
-            store.set_fuel(FUEL_BUDGET).map_err(|e| PluginError::Load {
-                path: Utf8PathBuf::new(),
-                message: format!("set_fuel: {e}"),
+            let mut store = new_store(&self.engine, ir)?;
+            let plugin = instantiate_in(&mut store, &handle.rule_id, |s| {
+                PluginBindings::instantiate(s, &handle.component, &self.linker)
             })?;
-            // Route memory-grow checks through `HostState::limits` so the
-            // 64 MiB cap is enforced uniformly.
-            store.limiter(HostState::limits_mut);
-            let plugin = PluginBindings::instantiate(&mut store, &handle.component, &self.linker)
-                .map_err(|e| classify_instantiation_error(&e, &handle.rule_id))?;
             Ok((store, plugin))
         }
+    }
+
+    /// Build the store for one invocation: host state for `ir`, the
+    /// spec-mandated fuel budget, and the store-wide [`PluginLimiter`].
+    fn new_store(engine: &Engine, ir: &Ir<'_>) -> Result<Store<HostState>> {
+        let mut store = Store::new(engine, HostState::new(ir));
+        store.set_fuel(FUEL_BUDGET).map_err(|e| PluginError::Load {
+            path: Utf8PathBuf::new(),
+            message: format!("set_fuel: {e}"),
+        })?;
+        // Route every memory / table allocation of the store through
+        // `HostState::limits` so the caps apply to the store as a whole.
+        store.limiter(HostState::limits_mut);
+        Ok(store)
+    }
+
+    /// Run `instantiate` in `store` and classify a failure with
+    /// [`classify_instantiation_error`], using the limiter's record of
+    /// refused memory requests.
+    fn instantiate_in<T>(
+        store: &mut Store<HostState>,
+        rule_id: &str,
+        instantiate: impl FnOnce(&mut Store<HostState>) -> wasmtime::Result<T>,
+    ) -> Result<T> {
+        instantiate(store)
+            .map_err(|e| classify_instantiation_error(&e, rule_id, store.data().memory_limit_hit()))
+    }
+
+    /// Run an export `call` in `store` and classify a failure with
+    /// [`classify_trap_error`], using the limiter's record of refused
+    /// memory requests.
+    fn call_in<T>(
+        store: &mut Store<HostState>,
+        rule_id: &str,
+        call: impl FnOnce(&mut Store<HostState>) -> wasmtime::Result<T>,
+    ) -> Result<T> {
+        call(store).map_err(|e| classify_trap_error(&e, rule_id, store.data().memory_limit_hit()))
     }
 
     /// Walk `value` along `pointer`, returning the addressed sub-value.
@@ -530,10 +576,24 @@ mod plugins_enabled {
     /// [`PluginError`] variant.
     ///
     /// - Fuel exhaustion (`Trap::OutOfFuel`) → [`PluginError::Exhausted`].
-    /// - Memory cap denial (limiter-rejected `memory.grow`) →
-    ///   [`PluginError::Memory`].
-    /// - Anything else → [`PluginError::Invoke`].
-    fn classify_trap_error(err: &wasmtime::Error, rule_id: &str) -> PluginError {
+    /// - Memory cap denial → [`PluginError::Memory`]. A refused
+    ///   `memory.grow` returns -1 to the guest rather than trapping; the
+    ///   guest's allocator then aborts with a generic trap (typically
+    ///   `unreachable`). `memory_limit_hit` is the limiter's record of the
+    ///   refusal and attributes that trap to the cap. Any trap after such a
+    ///   refusal counts, including one the guest hits after handling the
+    ///   -1 itself.
+    /// - Anything else → [`PluginError::Invoke`]. That includes a growth
+    ///   the host itself could not satisfy while the plugin was still
+    ///   under the cap.
+    ///
+    /// Fuel exhaustion takes priority over the memory record. `Memory`,
+    /// `Exhausted` and `Invoke` all map to the same exit code (4).
+    fn classify_trap_error(
+        err: &wasmtime::Error,
+        rule_id: &str,
+        memory_limit_hit: bool,
+    ) -> PluginError {
         if let Some(trap) = err.downcast_ref::<wasmtime::Trap>()
             && *trap == wasmtime::Trap::OutOfFuel
         {
@@ -541,11 +601,16 @@ mod plugins_enabled {
                 rule_id: rule_id.to_owned(),
             };
         }
+        if memory_limit_hit {
+            return PluginError::Memory {
+                rule_id: rule_id.to_owned(),
+            };
+        }
         let message = format!("{err}");
-        // The 64 MiB limiter denies `memory.grow` by returning `Ok(false)`
-        // — wasmtime then renders the failure as a generic error whose
-        // text mentions the memory growth. Detect via substring as a
-        // robust workaround that does not depend on a private type.
+        // Fallback for memory failures the limiter did not record (an
+        // error raised by wasmtime itself while growing memory): its text
+        // mentions the growth or the limit. Detected via substring because
+        // wasmtime does not expose a typed error for it.
         if message.contains("memory") && (message.contains("grow") || message.contains("limit")) {
             return PluginError::Memory {
                 rule_id: rule_id.to_owned(),
@@ -566,25 +631,33 @@ mod plugins_enabled {
     /// only registers `@0.1.0` — wasmtime renders this as an "unknown
     /// import" error. We surface it as `PluginError::Load` so the caller
     /// sees a clean message.
-    fn classify_instantiation_error(err: &wasmtime::Error, rule_id: &str) -> PluginError {
-        let message = format!("{err}");
+    ///
+    /// A memory whose initial size does not fit the store-wide cap fails
+    /// instantiation; `memory_limit_hit` reports that as
+    /// [`PluginError::Memory`].
+    fn classify_instantiation_error(
+        err: &wasmtime::Error,
+        rule_id: &str,
+        memory_limit_hit: bool,
+    ) -> PluginError {
         // Trap-shaped failures (rare during instantiation but possible if
         // a `start` function runs) route through the same classifier as
         // call-site errors.
-        if let Some(trap) = err.downcast_ref::<wasmtime::Trap>() {
-            if *trap == wasmtime::Trap::OutOfFuel {
-                return PluginError::Exhausted {
-                    rule_id: rule_id.to_owned(),
-                };
-            }
-            return PluginError::Invoke {
+        if let Some(trap) = err.downcast_ref::<wasmtime::Trap>()
+            && *trap == wasmtime::Trap::OutOfFuel
+        {
+            return PluginError::Exhausted {
                 rule_id: rule_id.to_owned(),
-                message,
+            };
+        }
+        if memory_limit_hit {
+            return PluginError::Memory {
+                rule_id: rule_id.to_owned(),
             };
         }
         PluginError::Invoke {
             rule_id: rule_id.to_owned(),
-            message,
+            message: format!("{err}"),
         }
     }
 
@@ -749,6 +822,280 @@ mod plugins_enabled {
             let ir = Ir::new(&value, &prov, FormatTag::Toml);
             let mut state = HostState::new(&ir);
             assert_eq!(state.get_format_tag(), "toml");
+        }
+
+        // ---- Store-wide limits, driven through wasmtime ----------------
+        //
+        // The fixtures below are core modules encoded by hand (wasmtime is
+        // built without its `wat` feature). They run on the runtime's own
+        // engine in a store built by `new_store`, and go through
+        // `instantiate_in` / `call_in` like the component calls do.
+
+        /// One wasm page, in bytes.
+        const PAGE: u32 = 64 * 1024;
+
+        fn leb_u32(mut value: u32) -> Vec<u8> {
+            let mut out = Vec::new();
+            loop {
+                let byte = u8::try_from(value & 0x7f).expect("seven bits fit in u8");
+                value >>= 7;
+                if value == 0 {
+                    out.push(byte);
+                    return out;
+                }
+                out.push(byte | 0x80);
+            }
+        }
+
+        fn section(id: u8, body: &[u8]) -> Vec<u8> {
+            let len = u32::try_from(body.len()).expect("test section fits in u32");
+            let mut out = vec![id];
+            out.extend(leb_u32(len));
+            out.extend_from_slice(body);
+            out
+        }
+
+        fn module(sections: &[Vec<u8>]) -> Vec<u8> {
+            let mut out = b"\0asm\x01\0\0\0".to_vec();
+            for s in sections {
+                out.extend_from_slice(s);
+            }
+            out
+        }
+
+        /// Memory section with one memory per entry of `min_pages`, no
+        /// declared maximum.
+        fn memory_section(min_pages: &[u32]) -> Vec<u8> {
+            let count = u32::try_from(min_pages.len()).expect("count fits in u32");
+            let mut body = leb_u32(count);
+            for &min in min_pages {
+                body.push(0x00); // limits: min only
+                body.extend(leb_u32(min));
+            }
+            section(5, &body)
+        }
+
+        /// Two empty memories plus exports `g0(pages) -> i32` and
+        /// `g1(pages) -> i32` (`memory.grow` on memory 0 / 1) and
+        /// `trap()` (`unreachable`).
+        fn two_memories_module() -> Vec<u8> {
+            let types = section(1, &[0x02, 0x60, 0x01, 0x7f, 0x01, 0x7f, 0x60, 0x00, 0x00]);
+            let funcs = section(3, &[0x03, 0x00, 0x00, 0x01]);
+            let memories = memory_section(&[0, 0]);
+            let exports = section(
+                7,
+                &[
+                    0x03, // three exports
+                    0x02, b'g', b'0', 0x00, 0x00, // func 0
+                    0x02, b'g', b'1', 0x00, 0x01, // func 1
+                    0x04, b't', b'r', b'a', b'p', 0x00, 0x02, // func 2
+                ],
+            );
+            let code = section(
+                10,
+                &[
+                    0x03, // three bodies
+                    0x06, 0x00, 0x20, 0x00, 0x40, 0x00, 0x0b, // memory.grow 0
+                    0x06, 0x00, 0x20, 0x00, 0x40, 0x01, 0x0b, // memory.grow 1
+                    0x03, 0x00, 0x00, 0x0b, // unreachable
+                ],
+            );
+            module(&[types, funcs, memories, exports, code])
+        }
+
+        /// A production store (see [`new_store`]) on the runtime's engine.
+        fn production_store(runtime: &PluginRuntime) -> Store<HostState> {
+            use dq_core::{FormatTag, ProvenanceMap};
+            let value = Value::Null;
+            let prov = ProvenanceMap::new();
+            let ir = Ir::new(&value, &prov, FormatTag::Json);
+            new_store(&runtime.engine, &ir).expect("store")
+        }
+
+        /// Compile and instantiate a core module the way the runtime
+        /// instantiates a component: through [`instantiate_in`].
+        fn instantiate_core(
+            store: &mut Store<HostState>,
+            bytes: &[u8],
+        ) -> Result<wasmtime::Instance> {
+            let module = wasmtime::Module::new(store.engine(), bytes).expect("valid module");
+            instantiate_in(store, "p", |s| wasmtime::Instance::new(s, &module, &[]))
+        }
+
+        fn memory_limit_pages() -> i32 {
+            i32::try_from(MEMORY_LIMIT / PAGE as usize).expect("page count fits in i32")
+        }
+
+        fn invoke_message(err: PluginError) -> String {
+            match err {
+                PluginError::Invoke { message, .. } => message,
+                other => panic!("expected Invoke, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn memory_limit_applies_to_the_sum_of_all_memories() {
+            let runtime = PluginRuntime::new().expect("runtime");
+            let mut store = production_store(&runtime);
+            let instance =
+                instantiate_core(&mut store, &two_memories_module()).expect("instantiate");
+            let g0 = instance
+                .get_typed_func::<i32, i32>(&mut store, "g0")
+                .expect("g0");
+            let g1 = instance
+                .get_typed_func::<i32, i32>(&mut store, "g1")
+                .expect("g1");
+            let half = memory_limit_pages() / 2;
+
+            // Each memory takes half of the budget: both fit exactly.
+            assert_eq!(g0.call(&mut store, half).expect("grow 0"), 0);
+            assert_eq!(g1.call(&mut store, half).expect("grow 1"), 0);
+            assert!(!store.data().memory_limit_hit());
+
+            // One more page in either memory goes over the store budget,
+            // although each memory alone is only at half of it.
+            assert_eq!(g1.call(&mut store, 1).expect("grow 1 again"), -1);
+            assert_eq!(g0.call(&mut store, 1).expect("grow 0 again"), -1);
+            assert!(store.data().memory_limit_hit());
+        }
+
+        #[test]
+        fn trap_after_refused_growth_classifies_as_memory() {
+            let runtime = PluginRuntime::new().expect("runtime");
+            let mut store = production_store(&runtime);
+            let instance =
+                instantiate_core(&mut store, &two_memories_module()).expect("instantiate");
+            let g0 = instance
+                .get_typed_func::<i32, i32>(&mut store, "g0")
+                .expect("g0");
+            let trap = instance
+                .get_typed_func::<(), ()>(&mut store, "trap")
+                .expect("trap");
+
+            // Before any refusal, a trap is an ordinary invocation failure.
+            let err = call_in(&mut store, "p", |s| trap.call(s, ())).expect_err("traps");
+            assert!(matches!(err, PluginError::Invoke { .. }), "{err:?}");
+
+            // A refused growth followed by the allocator's abort is the
+            // memory cap.
+            let grown = call_in(&mut store, "p", |s| g0.call(s, memory_limit_pages() + 1));
+            assert_eq!(grown.expect("grow returns"), -1);
+            let err = call_in(&mut store, "p", |s| trap.call(s, ())).expect_err("traps");
+            assert!(
+                matches!(err, PluginError::Memory { ref rule_id } if rule_id == "p"),
+                "{err:?}"
+            );
+        }
+
+        #[test]
+        fn initial_memories_over_the_store_budget_fail_instantiation_as_memory() {
+            let runtime = PluginRuntime::new().expect("runtime");
+            let mut store = production_store(&runtime);
+            // Two memories of 40 MiB each: each fits on its own, the sum
+            // does not.
+            let pages = 40 * 1024 * 1024 / PAGE;
+            let bytes = module(&[memory_section(&[pages, pages])]);
+            let err = instantiate_core(&mut store, &bytes).expect_err("over budget");
+            assert!(matches!(err, PluginError::Memory { .. }), "{err:?}");
+        }
+
+        #[test]
+        fn too_many_memories_fail_instantiation() {
+            let runtime = PluginRuntime::new().expect("runtime");
+            let mut store = production_store(&runtime);
+            let count = crate::limits::MEMORIES_LIMIT + 1;
+            let bytes = module(&[memory_section(&vec![0; count])]);
+            let err = instantiate_core(&mut store, &bytes).expect_err("too many memories");
+            let message = invoke_message(err);
+            assert!(message.contains("memory count"), "{message}");
+        }
+
+        #[test]
+        fn too_many_tables_fail_instantiation() {
+            let runtime = PluginRuntime::new().expect("runtime");
+            let mut store = production_store(&runtime);
+            let count = crate::limits::TABLES_LIMIT + 1;
+            let mut body = leb_u32(u32::try_from(count).expect("fits"));
+            for _ in 0..count {
+                body.extend([0x70, 0x00, 0x00]); // funcref table, min 0
+            }
+            let bytes = module(&[section(4, &body)]);
+            let err = instantiate_core(&mut store, &bytes).expect_err("too many tables");
+            let message = invoke_message(err);
+            assert!(message.contains("table count"), "{message}");
+        }
+
+        #[test]
+        fn too_many_instances_fail_instantiation() {
+            let runtime = PluginRuntime::new().expect("runtime");
+            let mut store = production_store(&runtime);
+            let empty = module(&[]);
+            for _ in 0..crate::limits::INSTANCE_LIMIT {
+                instantiate_core(&mut store, &empty).expect("within the instance limit");
+            }
+            let err = instantiate_core(&mut store, &empty).expect_err("one instance too many");
+            let message = invoke_message(err);
+            assert!(message.contains("instance count"), "{message}");
+        }
+
+        #[test]
+        fn table_over_the_element_budget_fails_instantiation() {
+            let runtime = PluginRuntime::new().expect("runtime");
+            let mut store = production_store(&runtime);
+            let over = u32::try_from(TABLE_ELEMENTS_LIMIT + 1).expect("fits");
+            let mut body = vec![0x01, 0x70, 0x00]; // one funcref table, min only
+            body.extend(leb_u32(over));
+            let bytes = module(&[section(4, &body)]);
+            let err = instantiate_core(&mut store, &bytes).expect_err("table over budget");
+            let message = invoke_message(err);
+            assert!(message.contains("table minimum size"), "{message}");
+        }
+
+        /// A memory with 64-bit addressing, a table with 64-bit indices,
+        /// and a memory with 1-byte pages, as single-section modules.
+        fn narrowed_feature_modules() -> [(&'static str, Vec<u8>); 3] {
+            [
+                // memory: flags 0x04 (memory64), min 1
+                ("memory64", module(&[section(5, &[0x01, 0x04, 0x01])])),
+                // table: funcref, flags 0x04 (table64), min 1
+                ("table64", module(&[section(4, &[0x01, 0x70, 0x04, 0x01])])),
+                // memory: flags 0x08 (page size present), min 1, log2 0
+                (
+                    "custom page size",
+                    module(&[section(5, &[0x01, 0x08, 0x01, 0x00])]),
+                ),
+            ]
+        }
+
+        #[test]
+        fn runtime_engine_rejects_64_bit_memories_tables_and_custom_pages() {
+            let runtime = PluginRuntime::new().expect("runtime");
+            // Control: the same bytes compile once the features are on, so
+            // the rejection below comes from the runtime's configuration.
+            let mut open = Config::new();
+            open.wasm_memory64(true).wasm_custom_page_sizes(true);
+            let open = Engine::new(&open).expect("control engine");
+            for (what, bytes) in narrowed_feature_modules() {
+                wasmtime::Module::new(&open, &bytes)
+                    .unwrap_or_else(|e| panic!("{what}: control engine rejects: {e}"));
+                assert!(
+                    wasmtime::Module::new(&runtime.engine, &bytes).is_err(),
+                    "{what}: the runtime engine must reject it",
+                );
+            }
+        }
+
+        #[test]
+        fn fuel_exhaustion_wins_over_the_memory_record() {
+            let err = wasmtime::Error::from(wasmtime::Trap::OutOfFuel);
+            assert!(matches!(
+                classify_trap_error(&err, "p", true),
+                PluginError::Exhausted { .. }
+            ));
+            assert!(matches!(
+                classify_instantiation_error(&err, "p", true),
+                PluginError::Exhausted { .. }
+            ));
         }
     }
 }

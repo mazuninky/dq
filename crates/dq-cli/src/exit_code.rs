@@ -18,7 +18,9 @@
 //! - 6 — `INVALID_INPUT` — bad CLI usage / unsupported flag combination.
 //! - 7 — `WRITE_FAILED` — read+resolve+render succeeded but writing the
 //!   result to the filesystem failed (atomic-rename collision, missing
-//!   textual-edit renderer, document loaded read-only, ...).
+//!   textual-edit renderer, document loaded read-only, an edit the
+//!   textual-edit writer cannot make without changing other parts of the
+//!   file, ...).
 //!
 //! ## Plugin error mapping (Phase 5 of `add-ir-foundation`)
 //!
@@ -172,7 +174,10 @@ pub fn exit_code_for_error(err: &anyhow::Error) -> i32 {
     };
     match domain.kind_name() {
         "io" => IO_ERROR,
-        "write_io" | "write_unavailable" => WRITE_FAILED,
+        // `edit_rejected`: the file and the pointer are fine, but dq cannot
+        // write this edit without changing other parts of the file — the
+        // same family as a missing textual-edit renderer.
+        "write_io" | "write_unavailable" | "edit_rejected" => WRITE_FAILED,
         "parse" | "templated_file" => PARSE_ERROR,
         "path" => NOT_FOUND,
         "unsupported_format" => INVALID_INPUT,
@@ -276,6 +281,16 @@ mod tests {
             exit_code_for_error(&anyhow::Error::from(write_unavailable_err())),
             WRITE_FAILED
         );
+    }
+
+    #[test]
+    fn maps_edit_rejected_to_write_failed() {
+        let err = Error::EditRejected {
+            action: "delete",
+            pointer: "/a".to_owned(),
+            reason: "it holds an anchor".to_owned(),
+        };
+        assert_eq!(exit_code_for_error(&anyhow::Error::from(err)), WRITE_FAILED);
     }
 
     #[test]

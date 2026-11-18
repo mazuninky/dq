@@ -15,3 +15,63 @@ tests:
       Body.
     expected:
       violations: []
+  - name: link reference definition after one blank line passes
+    input: |
+      # Title
+
+      [ref]: http://r
+      See [here](x).
+    expected:
+      violations: []
+  - name: two blank lines above a link reference definition fire
+    input: |
+      # Title
+
+
+      [ref]: http://r
+      See [here](x).
+    expected:
+      violations:
+        - rule: markdown.no-multiple-blank-lines
+          message_contains: "(2 blank lines)"
+          line: 4
+  # An unreferenced footnote definition is dropped from the tree, so its
+  # lines read as blank, as they did before comrak 1.0.
+  - name: unreferenced footnote between definition and paragraph counts as blank
+    input: |
+      p
+
+      [a]: /u
+      [^m]: # h
+      b
+    expected:
+      violations:
+        - rule: markdown.no-multiple-blank-lines
+          message_contains: "(3 blank lines)"
+          line: 5
+  - name: definition after an unreferenced footnote starts the paragraph
+    input: |
+      p
+
+
+      [^m]: # h
+      [a]: /u
+      b
+    expected:
+      violations:
+        - rule: markdown.no-multiple-blank-lines
+          message_contains: "(3 blank lines)"
+          line: 5
+  - name: unreferenced footnotes after a definition count as blank
+    input: |
+      p
+
+      [a]: /u
+      [^m]: ***
+      [^k]: ***
+      b
+    expected:
+      violations:
+        - rule: markdown.no-multiple-blank-lines
+          message_contains: "(4 blank lines)"
+          line: 6

@@ -171,6 +171,47 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `dq select` now follows RFC 9535 strictly (jsonpath-rust 0.7 → 1.0).
+  - Filters without parentheses (`$.items[?@.n > 1].name`), function
+    extensions such as `length(@.tags)`, and negative indices
+    (`$.items[-1]`) now work. They used to exit with code 1.
+  - The 0.7 extensions `.length()`, `.['x']` and `=~` are rejected with
+    exit code 1 and `invalid JSONPath expression:`. Use `length(@.x)`,
+    `['x']`, and `match()` or `search()` instead.
+  - `in` is not an RFC 9535 operator: `[?(@.name in ["x"])]` returns `[]`
+    with exit code 0 instead of matching. A space inside a dot-name is
+    part of the name, so `$.s y` looks up the key `"s y"`.
+  - `$..*` lists a node's children before descending into them. The
+    values are the same; the order differs.
+- `-F toon` writes TOON spec v4 (toon-format 0.4 → 0.7). An empty array
+  is written as `roles: []` instead of `roles[0]:`. Strings such as
+  `#bob` and `+1`, and non-ASCII keys such as `ключ`, are quoted. Tools
+  that read dq's TOON output need a v4 reader.
+- Markdown IR `position.end` moved for some nodes (comrak 0.52 → 1.0).
+  Lists and list items end at their last child: in `> - a\n>\n> b\n` the
+  list ends at `1:5`, not `2:1`. Indented code blocks end at their last
+  character instead of the start of the next line: a block on lines 8–9
+  ends at `9:8`, not `10:0`. Rules and scripts that compare these
+  positions need new expectations.
+- JSON Schema rules whose root `$schema` names draft-04, draft-06 or
+  draft-07 now validate (jsonschema 0.34 → 0.61). jsonschema 0.34 skipped
+  the root keywords of such schemas, so these rules reported nothing.
+  dq applies 2020-12 semantics to them, so syntax from the older drafts
+  fails to compile: array-form `items` (draft-07) and a boolean
+  `exclusiveMinimum` (draft-04) are rejected. Schemas copied from
+  SchemaStore often declare draft-07 and may start reporting violations.
+- Some JSON Schema messages read differently. `pattern` messages quote
+  the regex as written in the schema (`\w+@\w+`) instead of a rewritten
+  form, a `type` list is printed in a different order (`"null",
+  "integer"`), and `$dynamicRef` paths include every evaluation step.
+  Exit codes and positions are unchanged.
+- TOML parse errors use the toml_edit 0.25 wording. For `bad = ` the
+  message is now `string values must be quoted, expected literal string`.
+- Building from source needs Rust 1.100 (was 1.94). The Docker images
+  build on `rust:1.100-alpine` and run on `alpine:3.24`.
+- The plugin host runs on wasmtime 50. The WIT contract
+  `dq:plugin@0.1.0` is unchanged, and plugins built with wit-bindgen 0.57
+  still load.
 - `dq_exec::Evaluator::evaluate_file` now takes `&dq_core::Ir<'_>` instead
   of `&serde_json::Value`. Internally the evaluator still feeds `serde`
   values into jaq; the `Ir` is required so the new `loc.pointer` chain has
@@ -194,6 +235,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `RuleFix` schema now accepts both `jq` (legacy) and `ops` (new) fields,
   each `Option<String>`. At least one must be set; both is allowed and
   `ops` wins at runtime (with a `tracing::warn!` shadowing log).
+- Plugins are limited in the number of core instances, memories and
+  tables they create, and plugins with 64-bit memories or tables are no
+  longer accepted.
 
 ### Deprecated
 
@@ -203,3 +247,182 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `fix.jq` whole-document jq fixes. Backwards-compatible; new rules
   should prefer `fix.ops` for comment preservation. Removal is deferred
   to a future change once the `@std/*` rule library has fully migrated.
+
+### Fixed
+
+- A YAML file with a UTF-8 BOM parses and can be edited, the BOM kept on
+  write. With one key, `set /key` used to fail with `path '/key' not
+  found`; with more, parsing failed with "did not find expected
+  <document start>". Some other documents that saphyr-parser 0.0.6
+  rejected parse too (saphyr-parser 0.0.6 → 0.3).
+- Plugins: the 64 MiB memory limit applies to all of a plugin's memories
+  together, and a plugin stopped by it reports `exceeded memory limit`.
+- Log messages (`WARN` and the `-v` levels) go to stderr instead of
+  stdout, so `dq -F json … | jq` gets clean JSON. They are coloured only
+  when stderr is a terminal and colour is not turned off.
+- `dq lint` of a YAML file no longer prints four `check.jq raised a
+  runtime error` warnings from the `@std/dockerfile` rules: they skip any
+  YAML that is not a list of Dockerfile instructions. They skip a
+  Dockerfile with no instructions too (empty, or comments only), which
+  no longer gets `@std/dockerfile/has-healthcheck`.
+- `dq set` / `del` / `lint` no longer panic on a file with an empty or
+  null key: `"": 1` in YAML, `{"": 1}` in JSON, `"" = 1` in TOML,
+  `f: {? &a}` in YAML. `set` of a new key next to an empty key that is
+  its map's only key writes it after that key; it used to fail with
+  "not found".
+- YAML `.nan` / `.inf` / `-.inf`: `convert -F json` fails, as it already
+  did for TOML `nan`, since JSON has no such number; it used to print
+  `.nan` into the JSON. `convert -F yaml` writes them as floats again (it
+  wrote the strings `'.nan'`), `convert -F toml` and TOML `set` write
+  `nan` / `inf` (they failed). JSON `set` of NaN or infinity fails with
+  exit 7 and leaves the file alone; it used to crash.
+
+Textual edits — `set` and `del` on YAML, JSON and TOML:
+
+- They check that the edited file reads back as the requested change.
+  When it does not, they fail with exit 7, print nothing and leave the
+  file alone; they used to write the damaged output. The message says
+  why — dq cannot write the value there as a textual edit, the edit
+  would change other parts of the document, or the edited document would
+  not parse — and points to `dq set --jq`, which rewrites the whole file
+  through its writer and drops comments.
+- `set` where a non-empty collection is replaces it; it used to fail
+  with "not found" though `get` found the path. A JSON value, a TOML
+  inline table or array and a YAML flow collection are replaced between
+  their brackets; a YAML block collection loses its lines, the key
+  keeping its comment and anchor (`a: &x 5 # c`). An anchored node
+  replaced this way stays anchored, so its aliases change with it: with
+  `a: &m {x: 1}` and `b: *m`, `set /a 42` makes `b` read 42 too. A TOML
+  `[table]` or dotted table is removed and the key written anew among
+  the keys of its table; when no other key or section makes its parent
+  table, the parent is written inline (`[a.b]` + `c = 1`, `set /a/b 5`
+  gives `a = { b = 5 }`). When another section still makes the parent
+  (`[a.b]` next to `[a.d]`), there is no header to write the key under
+  and the edit fails with exit 7.
+- `del` of an entry that shares its line with others — any JSON member
+  or item, a YAML flow collection, a TOML inline table or array —
+  removes the entry and one comma: `{"a": 1, "b": 2}` `del /a` gives
+  `{"b": 2}`. It used to remove the whole line (an empty file for
+  single-line JSON), or leave `{x: , y: 2}` / `[, 2]` behind; `del` of
+  the last member of a multi-line JSON object left a trailing comma. A
+  collection inside a YAML flow collection or a JSON value can be
+  deleted too; it used to fail with "not found".
+- `set` of a new key next to such an entry keeps it on the line
+  (`{"a": 1, "c": 3}`, `a: {x: 1, z: 3}`, `a = {x = 1, z = 3}`), or on a
+  line of its own at the sibling's column in multi-line JSON. YAML and
+  TOML used to write it as a block line inside the braces, which did not
+  parse; JSON started a new line indented two columns too far. After an
+  empty `[]` / `{}` value of a block entry the new key no longer gets a
+  blank line after it.
+- `set` of a new key in YAML or JSON goes after the map's last child,
+  also when that child is a collection: `set /spec/replicas 3` next to
+  `template:` works, and in `a: 1` + `b:` + `  x: 1`, `set /c 3` adds
+  `c` after `b`. It used to fail with "not found" when every child was a
+  collection, and otherwise put the key after the last scalar child.
+- `set` of a new key in a YAML or TOML file with CRLF line breaks ends
+  the lines it adds with CRLF, as JSON already did; it used to add LF
+  lines to the file.
+
+YAML:
+
+- `set` of a string a YAML reader would take as something else writes
+  it quoted. That covers what dq itself types — `.nan`, `.inf`, `0x10`,
+  `0o17`, `~`, `Null`, `+1` — and what YAML 1.1 readers such as go-yaml
+  (Kubernetes, GitHub Actions) and PyYAML type: `1_000`, `017`, `1:20`,
+  `2001-12-14`, `y`, `n`, `<<`, `=`. It used to write them plain, so
+  they read back as a number, a date, a bool or `null`. The same goes
+  for a new key such as `null` or `<<`.
+- `set` of an object or array where a scalar was writes it in flow style
+  (`a: {"x": 1}`); it used to write `null`. A new key's value holding a
+  collection gets one in flow style too (`b:` + `  - {"x": 1}`), not
+  `{}` / `[]`. Inside a flow mapping the new entry stays on its line
+  (`a: {x: 1, z: [1]}`); one holding a collection used to break the
+  file.
+- `set` on an empty value — `key:`, `key: # c`, `key: &a`,
+  `key: !!str`, an empty `-` item — writes the value after the `:` / `-`
+  (`key: 5`); it used to write it before the `:` (`key5:`). On a `|` /
+  `>` block scalar it replaces the scalar, header included, with an
+  inline value: `k: |` + `  x` set to `42` gives `k: 42`; it used to
+  glue the value to the next line (`k: |` + `  42r: 1`). A string that
+  needs several lines is written double-quoted. On an explicit key with
+  no value (`? v` alone) it writes `: 42` on a line of its own; it used
+  to append it to the key. Anchors and comments on the line stay; a `!!`
+  tag (`!!binary |`, `!!int 5`) goes, so the new value is typed by what
+  it is — it used to stay, and `!!binary hi` no longer parses. Local
+  tags (`!Ref`) stay.
+- `set` of a new key after a block scalar (`|`, `>`) or a value on the
+  next line puts the key at the mapping's indent instead of inside the
+  value. When the file ends inside that block scalar without a final
+  line break, its header turns to strip chomping (`|` → `|-`, `|+` →
+  `|-`), so the value stays as it was.
+- `set` / `del` after an alias (`*name`) edit the node you point at; they
+  used to edit the node after it, or fail with "not found". Lint
+  diagnostics on such files point at the right line instead of line 1.
+  An edit under an anchor also changes its aliases (`<<: *base`), as
+  YAML defines. An edit below an alias (`b: *m`, `set /b/x 1`) fails
+  with exit 7 and names the anchored node to edit instead; it used to
+  fail with "not found" though `get` found the path.
+- `del` of a key whose value is a collection, a block scalar or a value
+  on the next line removes the whole entry; for a block collection it
+  used to fail with "not found", for `{}` / `[]` it left the key with a
+  `null` value. `del` of an empty value — `key: |` with no lines,
+  `key: !!str`, `key: &a`, `- &a` — removes its own entry; it used to
+  remove the entry after it and keep its own.
+- `del` of the last key or item writes `a: {}` / `a: []` instead of
+  leaving `a:`, which reads as `null`; an emptied document becomes `{}`.
+- `del` of the first key of a compact sequence item (`- name: web` over
+  `  image: x`) hands the `-` on to the next key: `- image: x`. It used
+  to remove the line with the `-`, merging the item's other keys into
+  the item before it. A comment line between the two keys stays, with
+  the `-` before it (`- # note`). The only key leaves `- {}`, the only
+  item of `- - 1` leaves `- []`. A new key of such an item lines up with
+  its keys instead of with the `-`.
+- `del` of a node that holds an anchor (`&name`) an alias elsewhere
+  refers to fails with exit 7 and leaves the file alone; it used to
+  leave the alias dangling, so the file no longer parsed. `lint --fix`
+  skips such a fix with a warning. `set` over a collection that holds
+  such an anchor fails the same way and names the alias's line.
+
+TOML:
+
+- `set` of a table or array writes it inline (`a = { x = 1 }`,
+  `b = [{ c = 1 }]`), over a scalar or as a new key; it used to write
+  `""` or `{}` / `[]`.
+- `set` of a new key next to a dotted one (`r0.k0 = 1`) writes it under
+  the same dotted key (`r0.zq = 7`), and after an inline table or array
+  when that is the last child. It was refused, or failed with "not
+  found" when the only sibling was an inline collection.
+- `set` of a new key in a table with no key of its own — the root or a
+  `[table]` holding only tables, or nothing — writes it right under the
+  header, or for the root before the first table header (and the
+  comments right above it) or at the end. It used to fail with "not
+  found", and an empty file was reported as read-only.
+- `del` of a `[table]`, an `[[array]]` item or a dotted table
+  (`a.b = 1`) removes its sections and lines, subtables included; `del`
+  of a non-empty inline table or array removes its `key = …` lines, or
+  the entry and one comma inside another inline collection. They used
+  to fail with "not found". So did `del` of a dotted key inside an
+  inline table (`{x."y z".w = 1}`), which now removes its entry. The last
+  item of an array of tables leaves `arr = []`, and `del` of `key = {}`
+  removes the line instead of leaving `key = `.
+- `del` of the only key under a dotted key (`a.b = 1`) writes `a = {}`;
+  it used to remove `a` with it. Inside an inline table, the last key
+  under a dotted key that comes first leaves `{x = {}, b = 2}`; it used
+  to lose the comma.
+
+### Security
+
+- `cargo audit` reports no advisories; it reported 37 vulnerabilities
+  and 3 unsound warnings before these updates.
+  - wasmtime 44 → 50 in the plugin runtime: RUSTSEC-2026-0222, -0269,
+    -0316, -0327, -0359, -0362, -0363, -0379, -0424.
+  - self_update 0.44 → 1.3 for `dq self update` drops zip 6
+    (RUSTSEC-2026-0367, -0368, -0369, -0429, -0545, -0547, -0548) and
+    quick-xml 0.38.
+  - quick-xml 0.40 → 0.42 in the XML parser: RUSTSEC-2026-0194, -0195.
+  - rustls, rustls-webpki, webpki-roots and webpki-root-certs, used by
+    `dq self check` and `dq self update`: RUSTSEC-2026-0285, -0346,
+    -0348, -0349, -0381, -0382, -0383.
+  - The remaining advisories (crossbeam-epoch, h2, quinn-proto,
+    quinn-udp, and the unsound warnings for anyhow, rustix and tokio)
+    were closed by updating `Cargo.lock`.

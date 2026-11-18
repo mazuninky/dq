@@ -18,8 +18,9 @@
 //!   pipeline pays per file once the evaluator is warm).
 
 use camino::Utf8PathBuf;
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use dq_exec::{Evaluator, RuleSet, RuleSource};
+use std::hint::black_box;
 
 /// Ten inline rules — minimum payload for the `from_str` bench. Each
 /// rule has a trivially-passing `check.jq` (`null` / `false`) so the

@@ -526,7 +526,9 @@ mod tests {
             path: Pointer::parse("/a").unwrap(),
         }];
         apply_patch(&mut doc, &ops).expect("remove succeeds");
-        assert_eq!(doc.original_bytes(), b"");
+        // The emptied root mapping is written as `{}`, so the bytes read
+        // back as the empty map the value tree holds, not as `null`.
+        assert_eq!(doc.original_bytes(), b"{}\n");
         match doc.value() {
             Value::Map(m) => assert!(m.is_empty()),
             other => panic!("expected empty map, got {other:?}"),

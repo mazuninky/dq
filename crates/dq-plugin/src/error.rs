@@ -61,8 +61,8 @@ pub enum PluginError {
         rule_id: String,
     },
 
-    /// The plugin tried to allocate beyond the per-instance memory limit
-    /// (64 MiB), enforced via `Store::limiter`.
+    /// The plugin tried to allocate beyond the memory limit (64 MiB across
+    /// all of its linear memories), enforced via `Store::limiter`.
     #[error("plugin rule {rule_id} exceeded memory limit")]
     Memory {
         /// `rule-id` of the offending plugin invocation.

@@ -19,3 +19,23 @@ tests:
     format: yaml
     expected:
       violations: []
+  - name: an ordinary YAML mapping is not a Dockerfile
+    input: |
+      name: web
+      image: nginx
+    format: yaml
+    expected:
+      violations: []
+  - name: a YAML list of strings is not a Dockerfile
+    input: |
+      - FROM
+      - ADD
+    format: yaml
+    expected:
+      violations: []
+  - name: an empty YAML list is not a Dockerfile
+    input: |
+      []
+    format: yaml
+    expected:
+      violations: []

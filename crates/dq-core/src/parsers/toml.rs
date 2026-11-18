@@ -47,7 +47,8 @@ use std::ops::Range;
 
 use indexmap::IndexMap;
 use toml_edit::{
-    Array as TomlArray, ArrayOfTables, ImDocument, InlineTable, Item, Table, Value as TomlValue,
+    Array as TomlArray, ArrayOfTables, Document as TomlDocument, InlineTable, Item, Table,
+    Value as TomlValue,
 };
 
 use crate::Result;
@@ -81,15 +82,15 @@ impl Format for Toml {
             snippet: String::new(),
             message: format!("invalid UTF-8 in TOML input: {e}"),
         })?;
-        // We parse via `ImDocument` (immutable) rather than `DocumentMut`
-        // because only `ImDocument::parse` preserves the byte spans on
-        // every node (see toml_edit 0.22 docs — `DocumentMut::from_str`
-        // explicitly drops span information). The §4 baseline never
-        // mutates the parsed DOM — splices land in `original_bytes` —
-        // so the lack of mutation API is no constraint.
-        let doc = ImDocument::parse(text).map_err(|e| {
+        // We parse via the immutable `toml_edit::Document` (named
+        // `ImDocument` before 0.23) rather than `DocumentMut` because only
+        // `Document::parse` preserves the byte spans on every node
+        // (`DocumentMut::from_str` explicitly drops span information). The
+        // §4 baseline never mutates the parsed DOM — splices land in
+        // `original_bytes` — so the lack of mutation API is no constraint.
+        let doc = TomlDocument::parse(text).map_err(|e| {
             // `toml_edit::TomlError::span()` returns the byte range of the
-            // failing construct. The 0.22 API does not expose a `line_col`
+            // failing construct. The 0.25 API does not expose a `line_col`
             // helper, so we re-derive the 1-indexed position by counting
             // newlines up to the span's start. `message()` is the canonical
             // human-friendly summary the CLI's diagnostic renderer expects.
@@ -202,14 +203,305 @@ impl Format for Toml {
 /// Walk the parsed document, populating `spans` with one [`ValueSpan`] per
 /// scalar leaf and returning the equivalent [`Value`] tree.
 fn build_value_and_spans<S: AsRef<str>>(
-    doc: &ImDocument<S>,
+    doc: &TomlDocument<S>,
     bytes: &[u8],
     spans: &mut SpanMap,
 ) -> Value {
     let mut path: Vec<String> = Vec::new();
     let mut map: IndexMap<String, Value> = IndexMap::new();
     walk_table(doc.as_table(), bytes, &mut path, spans, &mut map);
+    if map.is_empty() {
+        // An empty root is an empty container like any other; its span
+        // also tells an empty file apart from a read-only document.
+        spans.insert(
+            String::new(),
+            ValueSpan {
+                value_range: 0..0,
+                line_range: 0..0,
+                indent: 1,
+                context: SpanContext::BlockMapValue,
+            },
+        );
+    }
     Value::Map(map)
+}
+
+/// Byte offset where a new key of the root table goes when the root has
+/// no key of its own to follow: the start of the first table header
+/// (`[t]`, `[[t]]`), before the comment lines right above it, or the end
+/// of the file. `None` when the bytes do not parse.
+pub(crate) fn toml_root_insertion_point(bytes: &[u8]) -> Option<usize> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let doc = TomlDocument::parse(text).ok()?;
+    let Some(header) = first_header(doc.as_table()) else {
+        return Some(bytes.len());
+    };
+    // Comment lines directly above the header belong to it.
+    Some(section_start(bytes, header))
+}
+
+/// The non-empty inline tables and arrays (`k = { … }`, `k = [ … ]`), by
+/// canonical pointer: the bytes of their brackets, and whether they sit
+/// inside another inline collection rather than on a `key = value` line.
+/// The span map records none of them. `None` when the bytes do not parse.
+pub(crate) fn toml_inline_collections(
+    bytes: &[u8],
+) -> Option<std::collections::HashMap<String, (Range<usize>, bool)>> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let doc = TomlDocument::parse(text).ok()?;
+    let mut out = std::collections::HashMap::new();
+    collect_inline_in_table(doc.as_table(), &mut Vec::new(), &mut out);
+    Some(out)
+}
+
+fn collect_inline_in_table(
+    table: &Table,
+    path: &mut Vec<String>,
+    out: &mut std::collections::HashMap<String, (Range<usize>, bool)>,
+) {
+    for (key, item) in table.iter() {
+        path.push(pointer_escape(key));
+        match item {
+            Item::Value(value) => collect_inline(value, false, path, out),
+            Item::Table(child) => collect_inline_in_table(child, path, out),
+            Item::ArrayOfTables(tables) => {
+                for (i, child) in tables.iter().enumerate() {
+                    path.push(i.to_string());
+                    collect_inline_in_table(child, path, out);
+                    path.pop();
+                }
+            }
+            Item::None => {}
+        }
+        path.pop();
+    }
+}
+
+fn collect_inline(
+    value: &TomlValue,
+    in_flow: bool,
+    path: &mut Vec<String>,
+    out: &mut std::collections::HashMap<String, (Range<usize>, bool)>,
+) {
+    let mut note = |span: Option<Range<usize>>, path: &[String]| {
+        if let Some(span) = span {
+            out.insert(pointer_for(path), (span, in_flow));
+        }
+    };
+    match value {
+        TomlValue::Array(items) if !items.is_empty() => {
+            note(value.span(), path);
+            for (i, item) in items.iter().enumerate() {
+                path.push(i.to_string());
+                collect_inline(item, true, path, out);
+                path.pop();
+            }
+        }
+        TomlValue::InlineTable(table) if !table.is_empty() => {
+            note(value.span(), path);
+            for (key, item) in table.iter() {
+                path.push(pointer_escape(key));
+                collect_inline(item, true, path, out);
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Where the tables the span map records nothing for lie in a TOML
+/// document: `[table]` / `[[array]]` sections and the lines of keys
+/// written under a dotted key (`a.b = 1`).
+#[derive(Debug, Default)]
+pub(crate) struct TomlTables {
+    /// Every `[table]` and `[[array]]` item, by canonical pointer: from its
+    /// header line — and the comment lines right above it — to where the
+    /// next section begins, or the end of the file.
+    pub(crate) sections: Vec<(String, Range<usize>)>,
+    /// Past the line break of every header's line, by canonical pointer:
+    /// where the table's first key goes.
+    pub(crate) header_line_ends: std::collections::HashMap<String, usize>,
+    /// The line(s) of every value written under a dotted key outside an
+    /// inline table, by the canonical pointer of the value.
+    pub(crate) dotted_lines: Vec<(String, Range<usize>)>,
+}
+
+impl TomlTables {
+    /// The bytes that hold the table at `canonical` and everything under
+    /// it, merged and in order; empty when it has none of its own (an
+    /// inline table, or a table the walk does not know).
+    pub(crate) fn ranges_of(&self, canonical: &str) -> Vec<Range<usize>> {
+        let prefix = format!("{canonical}/");
+        let under = |pointer: &str| pointer == canonical || pointer.starts_with(&prefix);
+        let mut ranges: Vec<Range<usize>> = self
+            .sections
+            .iter()
+            .chain(&self.dotted_lines)
+            .filter(|(pointer, _)| under(pointer))
+            .map(|(_, range)| range.clone())
+            .collect();
+        ranges.sort_by_key(|range| range.start);
+        let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            match merged.last_mut() {
+                Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+                _ => merged.push(range),
+            }
+        }
+        merged
+    }
+}
+
+/// The [`TomlTables`] of `bytes`; `None` when they do not parse.
+pub(crate) fn toml_tables(bytes: &[u8]) -> Option<TomlTables> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let doc = TomlDocument::parse(text).ok()?;
+    let mut headers: Vec<(String, Range<usize>)> = Vec::new();
+    let mut tables = TomlTables::default();
+    collect_tables(
+        doc.as_table(),
+        bytes,
+        &mut Vec::new(),
+        &mut headers,
+        &mut tables.dotted_lines,
+    );
+    headers.sort_by_key(|(_, header)| header.start);
+    let starts: Vec<usize> = headers
+        .iter()
+        .map(|(_, header)| section_start(bytes, header.start))
+        .collect();
+    for (i, (pointer, header)) in headers.into_iter().enumerate() {
+        let end = starts.get(i + 1).copied().unwrap_or(bytes.len());
+        tables
+            .header_line_ends
+            .insert(pointer.clone(), past_line_break(bytes, header.end));
+        tables.sections.push((pointer, starts[i]..end));
+    }
+    Some(tables)
+}
+
+fn collect_tables(
+    table: &Table,
+    bytes: &[u8],
+    path: &mut Vec<String>,
+    headers: &mut Vec<(String, Range<usize>)>,
+    dotted_lines: &mut Vec<(String, Range<usize>)>,
+) {
+    for (key, item) in table.iter() {
+        path.push(pointer_escape(key));
+        match item {
+            Item::Table(child) => {
+                if !child.is_dotted()
+                    && !child.is_implicit()
+                    && let Some(span) = child.span()
+                {
+                    headers.push((pointer_for(path), span));
+                }
+                if child.is_dotted() {
+                    collect_dotted_lines(child, bytes, path, dotted_lines);
+                }
+                collect_tables(child, bytes, path, headers, dotted_lines);
+            }
+            Item::ArrayOfTables(items) => {
+                for (i, child) in items.iter().enumerate() {
+                    path.push(i.to_string());
+                    if let Some(span) = child.span() {
+                        headers.push((pointer_for(path), span));
+                    }
+                    collect_tables(child, bytes, path, headers, dotted_lines);
+                    path.pop();
+                }
+            }
+            Item::Value(_) | Item::None => {}
+        }
+        path.pop();
+    }
+}
+
+/// The lines of the values of the dotted table `table`, nested dotted
+/// tables included.
+fn collect_dotted_lines(
+    table: &Table,
+    bytes: &[u8],
+    path: &mut Vec<String>,
+    out: &mut Vec<(String, Range<usize>)>,
+) {
+    for (key, item) in table.iter() {
+        path.push(pointer_escape(key));
+        match item {
+            Item::Value(value) => {
+                if let Some(span) = value.span() {
+                    let start = bytes[..span.start]
+                        .iter()
+                        .rposition(|&b| b == b'\n')
+                        .map_or(0, |i| i + 1);
+                    out.push((pointer_for(path), start..past_line_break(bytes, span.end)));
+                }
+            }
+            Item::Table(child) if child.is_dotted() => {
+                collect_dotted_lines(child, bytes, path, out);
+            }
+            _ => {}
+        }
+        path.pop();
+    }
+}
+
+/// Start of the line holding `header`, or of the comment lines right
+/// above it.
+fn section_start(bytes: &[u8], header: usize) -> usize {
+    let mut at = bytes[..header]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |i| i + 1);
+    while at > 0 {
+        let prev = bytes[..at - 1]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |i| i + 1);
+        if bytes[prev..at].trim_ascii_start().starts_with(b"#") {
+            at = prev;
+        } else {
+            break;
+        }
+    }
+    at
+}
+
+/// Past the line break that ends the line holding `at`, or the end of
+/// `bytes`.
+fn past_line_break(bytes: &[u8], at: usize) -> usize {
+    bytes[at..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(bytes.len(), |i| at + i + 1)
+}
+
+/// Start of the earliest `[table]` / `[[table]]` header under `table`.
+fn first_header(table: &Table) -> Option<usize> {
+    table
+        .iter()
+        .filter_map(|(_, item)| match item {
+            Item::Table(child) => {
+                let own = (!child.is_dotted() && !child.is_implicit())
+                    .then(|| child.span().map(|span| span.start))
+                    .flatten();
+                own.into_iter().chain(first_header(child)).min()
+            }
+            Item::ArrayOfTables(tables) => tables
+                .iter()
+                .filter_map(|child| {
+                    child
+                        .span()
+                        .map(|span| span.start)
+                        .into_iter()
+                        .chain(first_header(child))
+                        .min()
+                })
+                .min(),
+            Item::None | Item::Value(_) => None,
+        })
+        .min()
 }
 
 /// Walk a `[table]` (or the top-level document table). Children are pushed
@@ -283,13 +575,17 @@ fn walk_value(
             record_scalar(value.span(), bytes, path, SpanContext::BlockMapValue, spans);
             Value::String(dt.value().to_string())
         }
-        TomlValue::Array(arr) => walk_inline_array(arr, bytes, path, spans),
-        TomlValue::InlineTable(it) => walk_inline_table(it, bytes, path, spans),
+        TomlValue::Array(arr) => {
+            walk_inline_array(arr, bytes, path, spans, SpanContext::BlockMapValue)
+        }
+        TomlValue::InlineTable(it) => {
+            walk_inline_table(it, bytes, path, spans, SpanContext::BlockMapValue)
+        }
     }
 }
 
 /// Record a scalar's `ValueSpan` if `toml_edit` reported a byte span. The
-/// 0.22 API guarantees `span()` is `Some` for parsed values; the `None`
+/// 0.25 API guarantees `span()` is `Some` for parsed values; the `None`
 /// branch only fires for synthesized values produced by mutation, which
 /// cannot occur here because we only walk freshly-parsed documents.
 fn record_scalar(
@@ -314,17 +610,27 @@ fn record_scalar(
     );
 }
 
+/// `entry` is the context of the entry holding the array — block for
+/// `key = [...]`, flow inside another inline value.
 fn walk_inline_array(
     arr: &TomlArray,
     bytes: &[u8],
     path: &mut Vec<String>,
     spans: &mut SpanMap,
+    entry: SpanContext,
 ) -> Value {
     if arr.is_empty() {
         // Record an empty-container span for the empty inline array `[]`
         // so the empty-parent mkdir-p path in
         // [`crate::document::Document::set_at`] can locate the `[]` body.
-        record_empty_container(arr.span(), bytes, path, SpanContext::FlowSeqItem, spans);
+        record_empty_container(
+            arr.span(),
+            bytes,
+            path,
+            SpanContext::FlowSeqItem,
+            entry,
+            spans,
+        );
         return Value::Array(Vec::new());
     }
     let mut out: Vec<Value> = Vec::with_capacity(arr.len());
@@ -338,16 +644,25 @@ fn walk_inline_array(
     Value::Array(out)
 }
 
+/// `entry`: see [`walk_inline_array`].
 fn walk_inline_table(
     it: &InlineTable,
     bytes: &[u8],
     path: &mut Vec<String>,
     spans: &mut SpanMap,
+    entry: SpanContext,
 ) -> Value {
     if it.is_empty() {
         // Empty inline table `{}` — see [`walk_inline_array`] for the
         // rationale. The splicer uses the recorded span as its anchor.
-        record_empty_container(it.span(), bytes, path, SpanContext::FlowMapValue, spans);
+        record_empty_container(
+            it.span(),
+            bytes,
+            path,
+            SpanContext::FlowMapValue,
+            entry,
+            spans,
+        );
         return Value::Map(IndexMap::new());
     }
     let mut out: IndexMap<String, Value> = IndexMap::new();
@@ -371,11 +686,14 @@ fn record_empty_container(
     bytes: &[u8],
     path: &[String],
     context: SpanContext,
+    entry: SpanContext,
     spans: &mut SpanMap,
 ) {
     let Some(value_range) = span else { return };
     let pointer = pointer_for(path);
-    let line_range = compute_line_range(bytes, &value_range, context);
+    // The container's own context is flow; its `line_range` follows the
+    // entry holding it, so `del` of `key = {}` removes the line.
+    let line_range = compute_line_range(bytes, &value_range, entry);
     let indent = compute_indent(bytes, value_range.start);
     spans.insert(
         pointer,
@@ -416,8 +734,8 @@ fn walk_value_with_context(
             record_scalar(value.span(), bytes, path, context, spans);
             Value::String(dt.value().to_string())
         }
-        TomlValue::Array(arr) => walk_inline_array(arr, bytes, path, spans),
-        TomlValue::InlineTable(it) => walk_inline_table(it, bytes, path, spans),
+        TomlValue::Array(arr) => walk_inline_array(arr, bytes, path, spans, context),
+        TomlValue::InlineTable(it) => walk_inline_table(it, bytes, path, spans, context),
     }
 }
 
@@ -556,6 +874,9 @@ fn value_to_toml(v: &Value) -> Result<toml::Value> {
         }
         Value::Bool(b) => toml::Value::Boolean(*b),
         Value::Int(i) => toml::Value::Integer(*i),
+        Value::BigFloat(s) if let Some(f) = crate::document::non_finite_literal(s) => {
+            toml::Value::Float(f)
+        }
         Value::BigInt(s) | Value::BigFloat(s) => {
             return Err(Error::Format {
                 format: "toml",
@@ -623,12 +944,11 @@ impl ScalarRenderer for TomlScalarRenderer {
             Value::Int(i) => i.to_string().into_bytes(),
             Value::BigInt(s) => s.clone().into_bytes(),
             Value::Float(f) => render_float(*f),
-            Value::BigFloat(s) => s.clone().into_bytes(),
+            Value::BigFloat(s) => render_big_float(s),
             Value::String(s) => render_string(s, original_style, context),
-            // Replacing a scalar span with a structural value at this layer
-            // is out of scope (D14 / mkdir-p path). Fall through to a
-            // well-formed empty string to keep the splice valid.
-            Value::Array(_) | Value::Map(_) => b"\"\"".to_vec(),
+            // A collection where a scalar was: an inline table or array,
+            // valid wherever a value is.
+            Value::Array(_) | Value::Map(_) => render_inline_scalar(value),
         }
     }
 }
@@ -682,9 +1002,9 @@ fn toml_key_token(key: &str) -> String {
     }
 }
 
-/// Render a leaf value as its inline TOML form. Containers fall back to an
-/// empty inline literal so the result is well-formed; full nested rendering
-/// is the caller's responsibility.
+/// Render a value as its inline TOML form: a collection as an inline
+/// array (`[1, "x"]`) or table (`{ a = 1, b = [2] }`). A `null`, which
+/// TOML cannot spell, is written as `""`; the read-back check refuses it.
 fn render_inline_scalar(value: &Value) -> Vec<u8> {
     match value {
         Value::Null => b"\"\"".to_vec(),
@@ -698,10 +1018,33 @@ fn render_inline_scalar(value: &Value) -> Vec<u8> {
         Value::Int(i) => i.to_string().into_bytes(),
         Value::BigInt(s) => s.clone().into_bytes(),
         Value::Float(f) => render_float(*f),
-        Value::BigFloat(s) => s.clone().into_bytes(),
+        Value::BigFloat(s) => render_big_float(s),
         Value::String(s) => render_basic_string(s),
-        Value::Array(_) => b"[]".to_vec(),
-        Value::Map(_) => b"{}".to_vec(),
+        Value::Array(items) => {
+            let mut out = b"[".to_vec();
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.extend_from_slice(b", ");
+                }
+                out.extend_from_slice(&render_inline_scalar(item));
+            }
+            out.push(b']');
+            out
+        }
+        Value::Map(map) if map.is_empty() => b"{}".to_vec(),
+        Value::Map(map) => {
+            let mut out = b"{ ".to_vec();
+            for (i, (key, item)) in map.iter().enumerate() {
+                if i > 0 {
+                    out.extend_from_slice(b", ");
+                }
+                out.extend_from_slice(toml_key_token(key).as_bytes());
+                out.extend_from_slice(b" = ");
+                out.extend_from_slice(&render_inline_scalar(item));
+            }
+            out.extend_from_slice(b" }");
+            out
+        }
     }
 }
 
@@ -731,6 +1074,15 @@ fn detect_string_style(bytes: &[u8]) -> StringStyle {
 /// Render an `f64` as a TOML float literal. NaN / infinity use TOML's
 /// canonical forms; finite values use `Display` and add `.0` when the
 /// printed form would otherwise look like an integer.
+/// A big-float literal as TOML: a YAML `.nan` / `.inf` as `nan` / `inf`,
+/// any other as written.
+fn render_big_float(literal: &str) -> Vec<u8> {
+    match crate::document::non_finite_literal(literal) {
+        Some(f) => render_float(f),
+        None => literal.as_bytes().to_vec(),
+    }
+}
+
 fn render_float(f: f64) -> Vec<u8> {
     if f.is_nan() {
         return b"nan".to_vec();

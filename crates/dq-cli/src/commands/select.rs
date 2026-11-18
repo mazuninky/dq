@@ -1,18 +1,21 @@
 //! `dq select FILE EXPR` — JSONPath query (RFC 9535 subset) over the document.
 //!
-//! Reaches for `jsonpath_rust = "0.7"` because that crate's API is what the
-//! workspace pins. Notes on the API:
-//! - `JsonPath::try_from(&str)` parses the expression.
-//! - `path.find_slice_ptr(&value)` returns `Vec<JsonPtr<Value>>` — an empty
-//!   `Vec` means "no matches" (in contrast with `find_slice`, which inserts a
-//!   sentinel `NoValue` for "no matches").
+//! Reaches for `jsonpath_rust = "1.0"` (RFC 9535 grammar) because that
+//! crate's API is what the workspace pins. Notes on the API:
+//! - `JsonPath::query(&value, &str)` parses and evaluates in one call and
+//!   returns `Vec<&Value>`; a parse failure is the `Err`. Descendant
+//!   segments (`$..*`) list a node's children before descending into them.
+//! - Blanks are allowed between segments and inside a member-name shorthand,
+//!   where they stay part of the name: `$.a b` looks up the key `"a b"`
+//!   instead of failing to parse.
+//! - An empty `Vec` means "no matches" — there is no sentinel value.
 //!
 //! Per spec, an empty match list is NOT an error: stdout becomes `[]` and the
 //! exit code is 0.
 
 use std::io::Write;
 
-use jsonpath_rust::{JsonPath, JsonPtr};
+use jsonpath_rust::JsonPath;
 
 use super::io_helpers::load_document_with_path;
 use crate::cli::{Cli, SelectArgs};
@@ -49,16 +52,11 @@ pub fn run(
         doc.value().to_serde_json()
     };
 
-    let path = JsonPath::try_from(args.jsonpath.as_str())
-        .map_err(|e| anyhow::anyhow!("invalid JSONPath expression: {e}"))?;
-
-    let matched: Vec<serde_json::Value> = path
-        .find_slice_ptr(&value)
+    let matched: Vec<serde_json::Value> = value
+        .query(args.jsonpath.as_str())
+        .map_err(|e| anyhow::anyhow!("invalid JSONPath expression: {e}"))?
         .into_iter()
-        .map(|ptr| match ptr {
-            JsonPtr::Slice(v) => v.clone(),
-            JsonPtr::NewValue(v) => v,
-        })
+        .cloned()
         .collect();
 
     let arr = serde_json::Value::Array(matched);
@@ -151,6 +149,37 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let err = run(&cli, &args, None, &reporter, &mut out).unwrap_err();
         assert!(err.to_string().contains("invalid JSONPath"));
+    }
+
+    #[test]
+    fn select_evaluates_rfc_9535_filters_and_negative_indices() {
+        let tmp = write_yaml("items:\n  - {name: x, n: 1}\n  - {name: y, n: 2}\n");
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
+        let cli = cli_no_flags(path.as_str());
+        for expr in ["$.items[?@.n > 1].name", "$.items[-1].name"] {
+            let args = SelectArgs {
+                file: path.clone(),
+                jsonpath: expr.to_owned(),
+            };
+            let mut out: Vec<u8> = Vec::new();
+            run(&cli, &args, None, &JsonReporter, &mut out).unwrap();
+            let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(parsed, serde_json::json!(["y"]), "{expr}");
+        }
+    }
+
+    #[test]
+    fn select_rejects_non_rfc_9535_length_method() {
+        let tmp = write_yaml("items: [1, 2]\n");
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
+        let cli = cli_no_flags(path.as_str());
+        let args = SelectArgs {
+            file: path,
+            jsonpath: "$.items.length()".to_owned(),
+        };
+        let mut out: Vec<u8> = Vec::new();
+        let err = run(&cli, &args, None, &JsonReporter, &mut out).unwrap_err();
+        assert!(err.to_string().contains("invalid JSONPath"), "{err}");
     }
 
     #[test]

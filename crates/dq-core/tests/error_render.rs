@@ -55,6 +55,12 @@ enum ErrorView<'a> {
     Format { format: &'a str, message: &'a str },
     #[serde(rename = "write_unavailable")]
     WriteUnavailable { reason: &'a str },
+    #[serde(rename = "edit_rejected")]
+    EditRejected {
+        action: &'a str,
+        pointer: &'a str,
+        reason: &'a str,
+    },
     #[serde(rename = "templated_file")]
     TemplatedFile {
         line: u32,
@@ -135,6 +141,15 @@ fn view<'a>(e: &'a Error) -> ErrorView<'a> {
         Error::UnsupportedFormat { name } => ErrorView::UnsupportedFormat { name },
         Error::Format { format, message } => ErrorView::Format { format, message },
         Error::WriteUnavailable { reason } => ErrorView::WriteUnavailable { reason },
+        Error::EditRejected {
+            action,
+            pointer,
+            reason,
+        } => ErrorView::EditRejected {
+            action,
+            pointer,
+            reason,
+        },
         Error::TemplatedFile {
             line,
             snippet,

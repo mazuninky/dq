@@ -35,6 +35,8 @@
 //! 5.4–5.8.
 
 pub mod error;
+#[cfg(feature = "plugins")]
+mod limits;
 pub mod runtime;
 
 pub use error::{PluginError, Result};

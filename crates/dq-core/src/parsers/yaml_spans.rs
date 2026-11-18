@@ -30,14 +30,15 @@
 //!   downgrades any literal/folded scalar to double-quoted on replacement; the
 //!   original bytes for unrelated values are byte-preserved so the cost is
 //!   localized to the edited line. Round-tripping `|` / `>` lands in M3.
-//! - Alias rewrites. `Event::Alias` is logged at debug level and skipped — no
-//!   span is recorded, so `set_at` on an alias surfaces the missing-pointer
-//!   path. The spike report covers this finding.
+//! - Alias rewrites through the anchor. An alias value gets the span of its
+//!   own `*name`: `set_at` replaces the alias with the new value and leaves
+//!   the anchored node alone; nodes under an alias of a collection have no
+//!   spans.
 //! - Tagged scalars. The tag is preserved by virtue of being outside the
 //!   value_range; replacement renders the value only. M3 will revisit if a
 //!   user reports a real-world case where this matters.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use saphyr_parser::{Event, Parser as YamlParser, ScalarStyle, Span};
@@ -161,8 +162,13 @@ fn build_provenance_with_inline_offsets(
 ) -> ProvenanceMap {
     let mut map = ProvenanceMap::with_capacity(spans.len());
     for (canonical, span) in spans {
-        let pointer = Pointer::parse(canonical)
-            .expect("canonical span keys are produced by Pointer::as_canonical");
+        // An empty key (`"": v`, a null key `? &a`) gives a pointer with an
+        // empty segment, which `Pointer::parse` rejects: no pointer can
+        // address that node, so it gets no provenance.
+        let Ok(pointer) = Pointer::parse(canonical) else {
+            tracing::debug!(pointer = %canonical, "no provenance for an unaddressable span");
+            continue;
+        };
         let inline_offset = if block_scalar_pointers.contains(canonical) {
             // YAML block-scalar contract: body starts at byte 0, line 1, col 1
             // of the inner content (after the indicator + newline). The
@@ -197,23 +203,218 @@ fn build_provenance_with_inline_offsets(
 /// or [`ScalarStyle::Folded`]).
 ///
 /// Implementation mirrors the spike's state machine (see file-level docs).
-/// Step 1 counts documents (so we know whether to namespace pointers under
-/// `/{doc_idx}`); step 2 walks events recording one [`ValueSpan`] per scalar
-/// value (not per scalar key) and, alongside, recording the canonical pointer
-/// of every block-style leaf for the inline-offset enrichment in
-/// [`parse_yaml_with_spans`].
+/// Step 1 ([`prescan`]) counts documents (so we know whether to namespace
+/// pointers under `/{doc_idx}`) and collects the block scalars with node
+/// properties; step 2 ([`replay_block_scalar_body_starts`]) finds their
+/// 0.0.6 span starts in one extra pass, skipped when there are none; step 3
+/// walks events recording one [`ValueSpan`] per scalar value (not per scalar
+/// key) and, alongside, recording the canonical pointer of every block-style
+/// leaf for the inline-offset enrichment in [`parse_yaml_with_spans`]. The
+/// pass count does not grow with the number of scalars.
 ///
 /// # saphyr-parser char-vs-byte caveat
 ///
 /// `saphyr_parser::Marker::index()` reports a **character** index (count of
 /// Unicode scalars seen so far) despite the rustdoc claiming bytes — see the
-/// `index` field comment in `saphyr-parser` 0.0.6 `src/scanner.rs`. The splice
+/// `index` field comment on `Marker` in `saphyr-parser`'s `src/scanner.rs`
+/// (0.0.6 and 0.3 alike). The splice
 /// path needs byte offsets, so we precompute a char-index → byte-offset map
 /// up front and translate every marker through [`char_index_to_byte`] before
 /// constructing a [`Range<usize>`]. Without this, any non-ASCII byte before a
 /// span (em-dash in a comment, accented identifier, …) shifts every later
 /// span's `value_range` by `(utf8_len - 1)` bytes per multi-byte codepoint.
 fn build_span_map_and_block_scalars(bytes: &[u8]) -> Result<(SpanMap, HashSet<String>)> {
+    let built = build_span_map_with_stats(bytes, false)?;
+    tracing::trace!(
+        parser_passes = built.parser_passes,
+        spans = built.spans.len(),
+        "built YAML span map",
+    );
+    Ok((built.spans, built.block_scalars))
+}
+
+/// What an edit of `bytes` needs to know beyond the span map: the
+/// [`ContainerLayout`] of every collection and every alias with the anchor
+/// it refers to.
+///
+/// [`crate::document::Document::del_at`] re-parses the current bytes with
+/// this when it removes a whole collection or empties one — the span map
+/// keeps scalar leaves only, and a collection's entry (its key line down to
+/// its last line) is not derivable from them — and when the bytes hold an
+/// alias. The walk is the same single span-building pass
+/// `parse_yaml_with_spans` makes.
+///
+/// # Errors
+///
+/// Same as [`parse_with_spans`]; on bytes a write produced this only fails
+/// if that write broke the document.
+pub(crate) fn edit_layout(bytes: &[u8]) -> Result<EditLayout> {
+    Ok(build_span_map_with_stats(bytes, true)?
+        .layout
+        .unwrap_or_default())
+}
+
+/// The edit that keeps a block scalar's value when a line is appended after
+/// it: `Some((at, old_len, replacement))` when `span` is a literal / folded
+/// scalar whose last content line ends the input without a line break and
+/// whose header does not already strip (`-`).
+///
+/// Appending `\nkey: value` turns that unterminated last line into a
+/// terminated one, which clip (`|`) and keep (`|+`) chomping then add to
+/// the value. Switching the header to strip (`|-`, `|2-`) keeps the value
+/// as it was. The header is the last `|` / `>` indicator on the last
+/// non-blank line before the content, outside quotes and comments.
+pub(crate) fn strip_chomping_before_eof_append(
+    bytes: &[u8],
+    span: &ValueSpan,
+) -> Option<(usize, usize, &'static [u8])> {
+    let content = &span.value_range;
+    if content.is_empty()
+        || content.end != bytes.len()
+        || span.line_range.end != bytes.len()
+        || bytes.last() == Some(&b'\n')
+        || !starts_line(bytes, content.start)
+    {
+        return None;
+    }
+    let (indicator, _) = block_scalar_header(bytes, span)?;
+    let modifiers = indicator + 1;
+    let mut end = modifiers;
+    while matches!(bytes.get(end), Some(b'1'..=b'9' | b'+' | b'-')) {
+        end += 1;
+    }
+    match bytes[modifiers..end]
+        .iter()
+        .position(|&b| b == b'+' || b == b'-')
+    {
+        Some(at) if bytes[modifiers + at] == b'-' => None,
+        Some(at) => Some((modifiers + at, 1, b"-")),
+        None => Some((modifiers, 0, b"-")),
+    }
+}
+
+/// The `|` / `>` header of the block scalar whose content `span` covers:
+/// the indicator's byte offset and the header's line (without its line
+/// break). The header sits on the last non-blank line above the content —
+/// only blank lines may separate them — and within the entry. `None` when
+/// that line holds no indicator: the value is not a block scalar.
+fn block_scalar_header(bytes: &[u8], span: &ValueSpan) -> Option<(usize, Range<usize>)> {
+    let content = &span.value_range;
+    let mut line_end = line_start_at(bytes, content.start);
+    let header_line = loop {
+        if line_end == 0 || line_end <= span.line_range.start {
+            return None;
+        }
+        let start = line_start_at(bytes, line_end - 1);
+        let line = start..line_end - 1;
+        if bytes[line.clone()]
+            .iter()
+            .any(|&b| !matches!(b, b' ' | b'\t' | b'\r'))
+        {
+            break line;
+        }
+        line_end = start;
+    };
+    let indicator = block_scalar_indicator(bytes, header_line.clone())?;
+    Some((indicator, header_line))
+}
+
+/// What replacing the `|` / `>` block scalar whose content `span` covers
+/// with an inline scalar takes: the bytes from its header's indicator
+/// through its last non-blank content line, and the part of the header
+/// line to put back after the new value — the blanks and comment that
+/// follow the indicators, empty without a comment. Blank lines after the
+/// content stay, as blank lines. `None` when the value is not a block
+/// scalar (see [`block_scalar_header`]).
+pub(crate) fn block_scalar_extent(
+    bytes: &[u8],
+    span: &ValueSpan,
+) -> Option<(Range<usize>, Range<usize>)> {
+    if !starts_line(bytes, span.value_range.start) {
+        return None;
+    }
+    let (indicator, header_line) = block_scalar_header(bytes, span)?;
+    let mut header_end = header_line.end;
+    while header_end > header_line.start && bytes[header_end - 1] == b'\r' {
+        header_end -= 1;
+    }
+    let mut indicators_end = indicator + 1;
+    while indicators_end < header_end && matches!(bytes[indicators_end], b'1'..=b'9' | b'+' | b'-')
+    {
+        indicators_end += 1;
+    }
+    let comment = bytes[indicators_end..header_end].contains(&b'#');
+    let keep = if comment {
+        indicators_end..header_end
+    } else {
+        header_end..header_end
+    };
+    let content = &span.value_range;
+    let content_end = bytes[content.start.min(bytes.len())..content.end.min(bytes.len())]
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(header_end, |last| content.start + last + 1);
+    Some((indicator..content_end.max(header_end), keep))
+}
+
+/// Byte offset of the last block-scalar indicator (`|` / `>` starting a
+/// token, followed by indentation / chomping indicators only) in `line`,
+/// skipping quoted scalars and stopping at a comment.
+fn block_scalar_indicator(bytes: &[u8], line: Range<usize>) -> Option<usize> {
+    let mut found = None;
+    let mut pos = line.start;
+    let token_start = |pos: usize| pos == line.start || matches!(bytes[pos - 1], b' ' | b'\t');
+    while pos < line.end {
+        match bytes[pos] {
+            b'#' if pos == line.start || matches!(bytes[pos - 1], b' ' | b'\t') => break,
+            quote @ (b'"' | b'\'') if token_start(pos) => {
+                pos += 1;
+                while pos < line.end {
+                    match bytes[pos] {
+                        b'\\' if quote == b'"' => pos += 1,
+                        b'\'' if quote == b'\'' && bytes.get(pos + 1) == Some(&b'\'') => pos += 1,
+                        b if b == quote => break,
+                        _ => {}
+                    }
+                    pos += 1;
+                }
+            }
+            b'|' | b'>' if token_start(pos) => {
+                let mut end = pos + 1;
+                while end < line.end && matches!(bytes[end], b'1'..=b'9' | b'+' | b'-') {
+                    end += 1;
+                }
+                if end == line.end || matches!(bytes[end], b' ' | b'\t' | b'\r') {
+                    found = Some(pos);
+                }
+            }
+            _ => {}
+        }
+        pos += 1;
+    }
+    found
+}
+
+/// Output of [`build_span_map_with_stats`].
+struct BuiltSpans {
+    spans: SpanMap,
+    block_scalars: HashSet<String>,
+    /// Number of `saphyr-parser` passes over the source (or a blanked copy
+    /// of it). Two without block scalars carrying node properties, three
+    /// with them — independent of how many there are.
+    parser_passes: usize,
+    /// Layout of every collection and alias, when asked for.
+    layout: Option<EditLayout>,
+}
+
+/// [`build_span_map_and_block_scalars`], also reporting how many parser
+/// passes the build took.
+///
+/// The passes are: [`prescan`] (document count, block scalars with node
+/// properties, aliases), at most one [`replay_block_scalar_body_starts`]
+/// over a blanked copy, and the main [`State`] walk, which also collects
+/// the [`ContainerLayout`] of every collection when `collect_layout` is set.
+fn build_span_map_with_stats(bytes: &[u8], collect_layout: bool) -> Result<BuiltSpans> {
     let text = std::str::from_utf8(bytes).map_err(|err| Error::Parse {
         file: None,
         line: 0,
@@ -223,16 +424,23 @@ fn build_span_map_and_block_scalars(bytes: &[u8]) -> Result<(SpanMap, HashSet<St
         message: format!("source is not valid UTF-8: {err}"),
     })?;
 
-    let n_docs = count_documents(text, bytes)?;
-    let multi_doc = n_docs > 1;
-
     // One-time O(N) precompute. Lookup by char-index then becomes O(1).
     let char_to_byte = build_char_to_byte_map(text);
 
+    let mut parser_passes = 1;
+    let prescan = prescan(text, bytes, &char_to_byte)?;
+    let multi_doc = prescan.n_docs > 1;
+    let body_starts =
+        replay_block_scalar_body_starts(text, &char_to_byte, &prescan, &mut parser_passes);
+
     let mut spans = SpanMap::new();
     let mut block_scalars: HashSet<String> = HashSet::new();
-    let mut state = State::new(bytes, multi_doc, &char_to_byte);
+    let mut state = State::new(text, multi_doc, &char_to_byte, &body_starts);
+    if collect_layout {
+        state.layout = Some(EditLayout::default());
+    }
 
+    parser_passes += 1;
     let mut parser = YamlParser::new_from_str(text);
     while let Some(item) = parser.next_event() {
         let (event, span) =
@@ -240,7 +448,12 @@ fn build_span_map_and_block_scalars(bytes: &[u8]) -> Result<(SpanMap, HashSet<St
         state.observe(event, span, &mut spans, &mut block_scalars)?;
     }
 
-    Ok((spans, block_scalars))
+    Ok(BuiltSpans {
+        spans,
+        block_scalars,
+        parser_passes,
+        layout: state.layout,
+    })
 }
 
 /// Build a `Vec<usize>` whose entry `i` is the byte offset of the `i`-th
@@ -269,25 +482,202 @@ fn char_index_to_byte(char_to_byte: &[usize], char_idx: usize) -> usize {
         .unwrap_or_else(|| char_to_byte.last().copied().unwrap_or(0))
 }
 
-/// First pass: count `Event::DocumentStart` occurrences. Required to decide
-/// whether the second pass should prefix pointers with `/{doc_idx}`.
-fn count_documents(text: &str, bytes: &[u8]) -> Result<usize> {
-    // The first pass walks events purely to count documents. If a scan
-    // error fires here, the marker is converted via a fresh char-to-byte
-    // map: the cost is paid only on the (rare) error path, so we don't
-    // bother threading the precomputed map through.
+/// What the first pass learns before the main walk.
+struct Prescan {
+    /// Number of `Event::DocumentStart` events. Decides whether the main
+    /// walk prefixes pointers with `/{doc_idx}`.
+    n_docs: usize,
+    /// Every block scalar (`|` / `>`) carrying node properties, in stream
+    /// order — the scalars whose 0.0.6 span start needs the replay.
+    propertied_block_scalars: Vec<PropertiedBlockScalar>,
+    /// Byte range of every alias (`*name`), in stream order.
+    aliases: Vec<Range<usize>>,
+}
+
+/// A block scalar with node properties, as seen by [`prescan`].
+struct PropertiedBlockScalar {
+    /// Position of the scalar's event in the stream (`StreamStart` is 0).
+    ordinal: usize,
+    /// Byte range of the node properties (`&a`, `!t`, `&a !t`, …).
+    props: Range<usize>,
+    /// Character index where the scalar's span ends. Blanking the properties
+    /// leaves it unchanged, so the replay uses it to confirm it is looking
+    /// at the same scalar.
+    end_char: usize,
+}
+
+/// First pass: count documents and collect what
+/// [`replay_block_scalar_body_starts`] needs.
+fn prescan(text: &str, bytes: &[u8], char_to_byte: &[usize]) -> Result<Prescan> {
+    let mut prescan = Prescan {
+        n_docs: 0,
+        propertied_block_scalars: Vec::new(),
+        aliases: Vec::new(),
+    };
     let mut parser = YamlParser::new_from_str(text);
-    let mut n = 0_usize;
+    let mut ordinal = 0_usize;
     while let Some(item) = parser.next_event() {
-        let (event, _) = item.map_err(|scan_err| {
-            let char_to_byte = build_char_to_byte_map(text);
-            scan_to_parse_error(&scan_err, bytes, &char_to_byte)
-        })?;
-        if matches!(event, Event::DocumentStart(_)) {
-            n += 1;
+        let (event, span) =
+            item.map_err(|scan_err| scan_to_parse_error(&scan_err, bytes, char_to_byte))?;
+        match event {
+            Event::DocumentStart(_) => prescan.n_docs += 1,
+            Event::Scalar(_, ScalarStyle::Literal | ScalarStyle::Folded, anchor, tag)
+                if anchor != 0 || tag.is_some() =>
+            {
+                let n_properties = usize::from(anchor != 0) + usize::from(tag.is_some());
+                let props_start = char_index_to_byte(char_to_byte, span.start.index());
+                let props_end = skip_node_properties(bytes, props_start, n_properties).0;
+                prescan
+                    .propertied_block_scalars
+                    .push(PropertiedBlockScalar {
+                        ordinal,
+                        props: props_start..props_end,
+                        end_char: span.end.index(),
+                    });
+            }
+            Event::Alias(_) => prescan.aliases.push(span_to_range(span, char_to_byte)),
+            _ => {}
+        }
+        ordinal += 1;
+    }
+    Ok(prescan)
+}
+
+/// Byte offset where saphyr-parser 0.0.6 started the span of each block
+/// scalar with node properties — the first content line, not the `|` / `>`
+/// indicator — keyed by the scalar's event ordinal.
+///
+/// The scanner's block-scalar rules (indentation auto-detection, explicit
+/// indentation indicators, leading blank lines) are not re-implemented
+/// here. Instead the stream is replayed once over a copy of the source in
+/// which every such scalar's properties are blanked out (line breaks kept,
+/// so character indices and lines stay put): without properties
+/// saphyr-parser reports the 0.0.6 start as it is. Blanking an anchor would
+/// make its aliases dangling, so every alias is overwritten with a plain
+/// scalar of the same length — one event for one event, so ordinals line
+/// up.
+///
+/// A scalar the combined replay cannot confirm (wrong event at its ordinal,
+/// a different span end, or a replay error) falls back to
+/// [`replay_one_block_scalar`], which blanks only that scalar and stops at
+/// it. A scalar missing from the map means even that diverged, which would
+/// be a parser bug; the caller then uses the indicator position.
+///
+/// Costs one parser pass (none when there are no such scalars), plus one per
+/// fallback.
+fn replay_block_scalar_body_starts(
+    text: &str,
+    char_to_byte: &[usize],
+    prescan: &Prescan,
+    parser_passes: &mut usize,
+) -> HashMap<usize, usize> {
+    let targets = &prescan.propertied_block_scalars;
+    let mut starts = HashMap::with_capacity(targets.len());
+    if targets.is_empty() {
+        return starts;
+    }
+    let mut unconfirmed: Vec<&PropertiedBlockScalar> = Vec::new();
+    if let Some(blanked) = blank_for_replay(text, targets, &prescan.aliases) {
+        *parser_passes += 1;
+        let mut parser = YamlParser::new_from_str(&blanked);
+        let mut pending = targets.iter().peekable();
+        let mut ordinal = 0_usize;
+        while let Some(target) = pending.peek().copied() {
+            let Some(Ok((event, span))) = parser.next_event() else {
+                break;
+            };
+            if ordinal == target.ordinal {
+                match event {
+                    Event::Scalar(_, ScalarStyle::Literal | ScalarStyle::Folded, _, _)
+                        if span.end.index() == target.end_char =>
+                    {
+                        starts.insert(
+                            target.ordinal,
+                            char_index_to_byte(char_to_byte, span.start.index()),
+                        );
+                    }
+                    other => {
+                        tracing::debug!(
+                            ?other,
+                            ordinal,
+                            "combined block-scalar span replay diverged; replaying the scalar alone",
+                        );
+                        unconfirmed.push(target);
+                    }
+                }
+                pending.next();
+            }
+            ordinal += 1;
+        }
+        unconfirmed.extend(pending);
+    } else {
+        unconfirmed.extend(targets);
+    }
+    for target in unconfirmed {
+        *parser_passes += 1;
+        if let Some(start) = replay_one_block_scalar(text, char_to_byte, target) {
+            starts.insert(target.ordinal, start);
         }
     }
-    Ok(n)
+    starts
+}
+
+/// Copy of `text` with the properties of every scalar in `targets` turned
+/// into spaces and every alias in `aliases` turned into a run of `x` — each
+/// character replaced by one ASCII character, line breaks kept, so character
+/// indices and line numbers match the source. `None` if two ranges overlap
+/// or one is not on a character boundary, which would be a prescan bug.
+fn blank_for_replay(
+    text: &str,
+    targets: &[PropertiedBlockScalar],
+    aliases: &[Range<usize>],
+) -> Option<String> {
+    let mut edits: Vec<(&Range<usize>, char)> = targets
+        .iter()
+        .map(|target| (&target.props, ' '))
+        .chain(aliases.iter().map(|alias| (alias, 'x')))
+        .collect();
+    edits.sort_by_key(|(range, _)| range.start);
+    let mut out = String::with_capacity(text.len());
+    let mut pos = 0;
+    for (range, fill) in edits {
+        out.push_str(text.get(pos..range.start)?);
+        for ch in text.get(range.clone())?.chars() {
+            out.push(if matches!(ch, '\n' | '\r') { ch } else { fill });
+        }
+        pos = range.end;
+    }
+    out.push_str(text.get(pos..)?);
+    Some(out)
+}
+
+/// The 0.0.6 span start of one block scalar with properties: replay the
+/// stream with only its properties blanked, up to its ordinal. Events before
+/// the ordinal are unaffected by the blanking — an alias of the blanked
+/// anchor can only come later. Fallback of
+/// [`replay_block_scalar_body_starts`]; `None` if this replay diverges too.
+fn replay_one_block_scalar(
+    text: &str,
+    char_to_byte: &[usize],
+    target: &PropertiedBlockScalar,
+) -> Option<usize> {
+    let blanked = blank_for_replay(text, std::slice::from_ref(target), &[])?;
+    let mut parser = YamlParser::new_from_str(&blanked);
+    for _ in 0..target.ordinal {
+        parser.next_event()?.ok()?;
+    }
+    match parser.next_event()?.ok()? {
+        (Event::Scalar(_, ScalarStyle::Literal | ScalarStyle::Folded, _, _), span) => {
+            Some(char_index_to_byte(char_to_byte, span.start.index()))
+        }
+        (other, _) => {
+            tracing::debug!(
+                ?other,
+                "block-scalar span replay diverged; using the indicator position",
+            );
+            None
+        }
+    }
 }
 
 /// Convert a `saphyr_parser::ScanError` into our domain [`Error::Parse`],
@@ -339,6 +729,11 @@ enum Frame {
     /// for the value event.
     Mapping {
         pending_key: Option<String>,
+        /// Byte range of the pending key's node (properties included), set
+        /// alongside `pending_key` and taken by [`State::entry_anchor`]. The
+        /// entry of a mapping value starts on the key's line, whatever line
+        /// the value itself starts on.
+        pending_key_range: Option<Range<usize>>,
         style: ContextStyle,
         /// Byte offset of the `MappingStart` event — used to record an
         /// empty-container span when `MappingEnd` fires with no children.
@@ -347,6 +742,8 @@ enum Frame {
         /// frame, so `MappingEnd` can tell empty from non-empty without
         /// re-walking the SpanMap.
         saw_child: bool,
+        /// Where this container sits in its parent; see [`ContainerFrame`].
+        container: ContainerFrame,
     },
     /// `index` is the position of the *next* item.
     Sequence {
@@ -355,7 +752,152 @@ enum Frame {
         /// Byte offset of the `SequenceStart` event — mirrors
         /// [`Frame::Mapping::start_byte`].
         start_byte: usize,
+        /// `true` for an indentless block sequence — a mapping value whose
+        /// `-` entries sit at the key's column (`key:` then `- item`). The
+        /// 0.0.6 scanner opens no indentation level for it; see
+        /// [`State::block_indent`].
+        indentless: bool,
+        /// Where this container sits in its parent; see [`ContainerFrame`].
+        container: ContainerFrame,
     },
+}
+
+/// Layout bookkeeping a container frame carries for [`ContainerLayout`].
+#[derive(Debug)]
+struct ContainerFrame {
+    /// The entry the container is the value of, `None` for a top-level
+    /// container or one inside a flow collection.
+    entry: Option<EntryAnchor>,
+    /// End of the container's node properties, if it has any.
+    props_end: Option<usize>,
+    /// Largest `line_range.end` among the spans and entries recorded inside
+    /// the container so far — where a block container's last line ends.
+    content_end: usize,
+    /// Where the first child's entry begins (its line start), once a child
+    /// was seen: `Some(None)` when that entry could not be located.
+    first_entry: Option<Option<usize>>,
+}
+
+impl Frame {
+    fn container_mut(&mut self) -> &mut ContainerFrame {
+        match self {
+            Self::Mapping { container, .. } | Self::Sequence { container, .. } => container,
+        }
+    }
+
+    fn style(&self) -> ContextStyle {
+        match self {
+            Self::Mapping { style, .. } | Self::Sequence { style, .. } => *style,
+        }
+    }
+}
+
+/// Where the entry holding a value of a block collection begins: a mapping
+/// entry at its key, a sequence item at its `-`.
+#[derive(Debug, Clone, Copy)]
+struct EntryAnchor {
+    /// Start of the line the entry begins on.
+    line_start: usize,
+    /// `true` if the entry is the first thing on its line, so that the
+    /// lines from `line_start` hold this entry and nothing of its parent's.
+    /// `false` for a key of a compact mapping (`- key: …`) or an item of a
+    /// compact sequence (`- - item`).
+    owns_line: bool,
+    /// Where an inline value would go: just past the key's `:` or the
+    /// item's `-`. `None` if the indicator could not be located.
+    indicator_end: Option<usize>,
+    /// Where the value's own text can begin: [`EntryAnchor::indicator_end`]
+    /// when located, else the end of the key (an explicit `? key` without a
+    /// `:`) or the item's start.
+    value_from: usize,
+    /// Where the entry itself begins: its key (node properties included)
+    /// or its `-`, else the item's start.
+    start: usize,
+}
+
+/// What [`edit_layout`] reports.
+#[derive(Debug, Default)]
+pub(crate) struct EditLayout {
+    /// Layout of every collection, keyed by canonical pointer.
+    pub(crate) containers: HashMap<String, ContainerLayout>,
+    /// Every alias, in document order.
+    pub(crate) aliases: Vec<AliasRef>,
+    /// For every empty node of a block collection (`key:`, `-`, `key: &a`,
+    /// `key: !!str`), keyed by canonical pointer: the bytes a value set
+    /// there replaces — its node properties, or without any the empty range
+    /// just past the key's `:` / the item's `-`.
+    pub(crate) empty_values: HashMap<String, Range<usize>>,
+    /// Where the entry of every value of a block collection begins, keyed
+    /// by canonical pointer.
+    pub(crate) entries: HashMap<String, EntryStart>,
+}
+
+/// Where an entry of a block collection begins, as [`edit_layout`] reports
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EntryStart {
+    /// Its key (node properties included) or its `-`.
+    pub(crate) at: usize,
+    /// `false` when the entry shares its line with its parent's `-`: the
+    /// first key of a compact mapping (`- key: …`) or the first item of a
+    /// compact sequence (`- - item`).
+    pub(crate) owns_line: bool,
+}
+
+/// An alias and the anchored node it refers to. A redefined anchor name
+/// refers to its latest definition before the alias, as YAML resolves it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AliasRef {
+    /// Byte offset of the alias (its `*`).
+    pub(crate) alias_at: usize,
+    /// Canonical pointer of the alias node; `None` for an alias used as a
+    /// mapping key, which the value tree holds as a key's text.
+    pub(crate) alias_pointer: Option<String>,
+    /// Byte offset where the anchored node starts: its first node
+    /// property, so the `&anchor` lies in any range that holds the node.
+    pub(crate) anchor_at: usize,
+    /// Canonical pointer of the anchored node; `None` for an anchored
+    /// mapping key.
+    pub(crate) anchor_pointer: Option<String>,
+}
+
+/// Where an anchored node is, for [`AliasRef`].
+#[derive(Debug, Clone)]
+struct AnchorDef {
+    at: usize,
+    pointer: Option<String>,
+}
+
+/// Layout of one collection node, as [`edit_layout`] reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContainerLayout {
+    /// `true` for a block collection, `false` for a flow one (`{…}` / `[…]`).
+    pub(crate) block: bool,
+    /// `true` for the root collection of a document.
+    pub(crate) top_level: bool,
+    /// Bytes of the whole entry holding the collection, from the start of
+    /// the line its key or `-` is on to the end of its last line — what
+    /// `del` removes. `None` for a top-level collection, one inside a flow
+    /// collection, one whose key or `-` shares its line with its parent's
+    /// `-` (`- key:` / `- -`), and one whose key or `-` could not be located.
+    pub(crate) entry: Option<Range<usize>>,
+    /// Where ` {}` / ` []` goes once a block collection loses its last
+    /// child: past its node properties, else past its key's `:` or its
+    /// `-`. `None` for a top-level collection and when not located.
+    pub(crate) empty_marker_at: Option<usize>,
+    /// Start of the line the first child's entry (its key or `-`) begins
+    /// on. `None` without children and when not located.
+    pub(crate) first_child_line: Option<usize>,
+    /// Bytes of a flow collection inside another flow collection, from its
+    /// opening bracket through its closing one. `None` otherwise.
+    pub(crate) flow_value: Option<Range<usize>>,
+    /// Bytes of any flow collection, from its opening bracket through its
+    /// closing one. `None` for a block collection.
+    pub(crate) brackets: Option<Range<usize>>,
+    /// Where the collection's entry ends: past its last line for a block
+    /// collection or one in a block parent, past its closing bracket in a
+    /// flow parent.
+    pub(crate) end: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -365,6 +907,8 @@ enum ContextStyle {
 }
 
 struct State<'src> {
+    /// The source text; `bytes` is the same buffer viewed as bytes.
+    text: &'src str,
     bytes: &'src [u8],
     /// Map from `Marker::index()` (character offset) to byte offset. See
     /// [`build_char_to_byte_map`] for the rationale.
@@ -374,19 +918,217 @@ struct State<'src> {
     seen_first_doc: bool,
     stack: Vec<Frame>,
     path: Vec<String>,
+    /// Position of the next event in the parser's stream (`StreamStart` is
+    /// 0). Keys [`State::block_body_starts`].
+    next_ordinal: usize,
+    /// 0.0.6 span start of each block scalar with node properties, keyed by
+    /// event ordinal — see [`replay_block_scalar_body_starts`].
+    block_body_starts: &'src HashMap<usize, usize>,
+    /// Text of every anchored scalar, keyed by anchor id, so an alias used
+    /// as a mapping key resolves to the key the value tree holds.
+    anchored_scalars: HashMap<usize, String>,
+    /// Number of flow frames on `self.stack`.
+    flow_depth: usize,
+    /// Layout of every collection and alias — collected only for
+    /// [`edit_layout`].
+    layout: Option<EditLayout>,
+    /// Every anchored node seen so far, keyed by anchor id — collected
+    /// with `layout`. saphyr-parser gives each definition its own id, a
+    /// redefinition included.
+    anchor_defs: HashMap<usize, AnchorDef>,
 }
 
 impl<'src> State<'src> {
-    fn new(bytes: &'src [u8], multi_doc: bool, char_to_byte: &'src [usize]) -> Self {
+    fn new(
+        text: &'src str,
+        multi_doc: bool,
+        char_to_byte: &'src [usize],
+        block_body_starts: &'src HashMap<usize, usize>,
+    ) -> Self {
         Self {
-            bytes,
+            text,
+            bytes: text.as_bytes(),
             char_to_byte,
             multi_doc,
             doc_index: 0,
             seen_first_doc: false,
             stack: Vec::new(),
             path: Vec::new(),
+            next_ordinal: 0,
+            block_body_starts,
+            anchored_scalars: HashMap::new(),
+            flow_depth: 0,
+            layout: None,
+            anchor_defs: HashMap::new(),
         }
+    }
+
+    /// `true` if the next key or value event is a mapping key.
+    fn expects_key(&self) -> bool {
+        matches!(
+            self.stack.last(),
+            Some(Frame::Mapping {
+                pending_key: None,
+                ..
+            })
+        )
+    }
+
+    /// Record `key` (escaped) as the pending key of the innermost mapping;
+    /// `range` is the key node's byte range.
+    fn set_pending_key(&mut self, key: String, range: Range<usize>) {
+        if let Some(Frame::Mapping {
+            pending_key,
+            pending_key_range,
+            saw_child,
+            ..
+        }) = self.stack.last_mut()
+        {
+            *pending_key = Some(key);
+            *pending_key_range = Some(range);
+            // A key event proves the mapping is non-empty, so `MappingEnd`
+            // should NOT record an empty-container span. Setting `saw_child`
+            // here keeps the bookkeeping consistent even if the matching
+            // value event turns out to be another container or scalar.
+            *saw_child = true;
+        }
+    }
+
+    /// Where the entry holding the value about to be recorded begins, for a
+    /// value of a block collection outside any flow collection. `item_start`
+    /// is where the value's node starts (its properties included).
+    ///
+    /// Takes the pending key's range, so it must run once per value.
+    fn entry_anchor(&mut self, item_start: usize) -> Option<EntryAnchor> {
+        let anchor = self.locate_entry(item_start);
+        if let Some(frame) = self.stack.last_mut() {
+            let container = frame.container_mut();
+            if container.first_entry.is_none() {
+                container.first_entry = Some(anchor.map(|anchor| anchor.line_start));
+            }
+        }
+        anchor
+    }
+
+    /// [`State::entry_anchor`] without the bookkeeping.
+    fn locate_entry(&mut self, item_start: usize) -> Option<EntryAnchor> {
+        let bytes = self.bytes;
+        let in_flow = self.flow_depth > 0;
+        match self.stack.last_mut()? {
+            Frame::Mapping {
+                pending_key_range, ..
+            } => {
+                let key = pending_key_range.take()?;
+                if in_flow {
+                    return None;
+                }
+                let colon = skip_separation(bytes, key.end);
+                let indicator_end = (bytes.get(colon) == Some(&b':')).then_some(colon + 1);
+                // An explicit key (`? key`) begins at its `?`.
+                let mut start = key.start;
+                while start > 0 && matches!(bytes[start - 1], b' ' | b'\t') {
+                    start -= 1;
+                }
+                let start = if start > 0 && bytes[start - 1] == b'?' {
+                    start - 1
+                } else {
+                    key.start
+                };
+                Some(EntryAnchor {
+                    line_start: line_start_at(bytes, key.start),
+                    owns_line: starts_line_after_bom(bytes, start),
+                    indicator_end,
+                    value_from: indicator_end.unwrap_or(key.end),
+                    start,
+                })
+            }
+            Frame::Sequence { .. } if in_flow => None,
+            Frame::Sequence { .. } => {
+                if starts_line(bytes, item_start) {
+                    let (line_start, dash) = dash_line_above(bytes, item_start)?;
+                    Some(EntryAnchor {
+                        line_start,
+                        owns_line: starts_line_after_bom(bytes, dash),
+                        indicator_end: Some(dash + 1),
+                        value_from: dash + 1,
+                        start: dash,
+                    })
+                } else {
+                    let dash = dash_before(bytes, item_start);
+                    Some(EntryAnchor {
+                        line_start: line_start_at(bytes, item_start),
+                        owns_line: dash.is_some_and(|dash| starts_line_after_bom(bytes, dash)),
+                        indicator_end: dash.map(|dash| dash + 1),
+                        value_from: dash.map_or(item_start, |dash| dash + 1),
+                        start: dash.unwrap_or(item_start),
+                    })
+                }
+            }
+        }
+    }
+
+    /// Fold a recorded child's line end into the innermost container's
+    /// [`ContainerFrame::content_end`].
+    fn note_child_end(&mut self, end: usize) {
+        if let Some(frame) = self.stack.last_mut() {
+            let container = frame.container_mut();
+            container.content_end = container.content_end.max(end);
+        }
+    }
+
+    /// Push a container frame for a `MappingStart` / `SequenceStart` whose
+    /// event span is `span` and which carries `n_properties` properties.
+    fn open_container(&mut self, span: Span, n_properties: usize, mapping: bool) {
+        let event_start = char_index_to_byte(self.char_to_byte, span.start.index());
+        let start_byte = self.legacy_container_start(span, n_properties);
+        let style = detect_container_style(self.bytes, start_byte);
+        let indentless = !mapping
+            && style == ContextStyle::Block
+            && matches!(
+                self.stack.last(),
+                Some(Frame::Mapping {
+                    style: ContextStyle::Block,
+                    ..
+                })
+            )
+            && !starts_line(self.bytes, start_byte);
+        let entry = self.entry_anchor(event_start);
+        let props_end = (n_properties > 0)
+            .then(|| skip_node_properties(self.bytes, event_start, n_properties).0);
+        self.enter_container();
+        let pointer = if self.path.is_empty() {
+            String::new()
+        } else {
+            format!("/{}", self.path.join("/"))
+        };
+        self.note_entry(&pointer, entry);
+        let container = ContainerFrame {
+            entry,
+            props_end,
+            content_end: 0,
+            first_entry: None,
+        };
+        if style == ContextStyle::Flow {
+            self.flow_depth += 1;
+        }
+        self.stack.push(if mapping {
+            Frame::Mapping {
+                pending_key: None,
+                pending_key_range: None,
+                style,
+                start_byte,
+                saw_child: false,
+                container,
+            }
+        } else {
+            Frame::Sequence {
+                index: 0,
+                style,
+                start_byte,
+                indentless,
+                container,
+            }
+        });
     }
 
     fn observe(
@@ -396,6 +1138,8 @@ impl<'src> State<'src> {
         spans: &mut SpanMap,
         block_scalars: &mut HashSet<String>,
     ) -> std::result::Result<(), Error> {
+        let ordinal = self.next_ordinal;
+        self.next_ordinal += 1;
         match event {
             Event::StreamStart | Event::StreamEnd | Event::Nothing => {}
             Event::DocumentStart(_) => {
@@ -412,36 +1156,46 @@ impl<'src> State<'src> {
                     self.path.pop();
                 }
             }
-            Event::Scalar(value, style, _anchor, _tag) => {
-                let is_key = matches!(
-                    self.stack.last(),
-                    Some(Frame::Mapping {
-                        pending_key: None,
-                        ..
-                    })
-                );
-                if is_key {
-                    let key_str = pointer_escape(value.as_ref());
-                    if let Some(Frame::Mapping {
-                        pending_key,
-                        saw_child,
-                        ..
-                    }) = self.stack.last_mut()
-                    {
-                        *pending_key = Some(key_str);
-                        // A key event proves the mapping is non-empty, so
-                        // `MappingEnd` should NOT record an empty-container
-                        // span. Setting `saw_child` here keeps the
-                        // bookkeeping consistent even if the matching value
-                        // event turns out to be another container or scalar.
-                        *saw_child = true;
-                    }
+            Event::Scalar(value, style, anchor, tag) => {
+                let n_properties = usize::from(anchor != 0) + usize::from(tag.is_some());
+                if anchor != 0 {
+                    self.anchored_scalars.insert(anchor, value.to_string());
+                }
+                if self.expects_key() {
+                    let key_str =
+                        pointer_escape(legacy_key_text(value.as_ref(), style, n_properties));
+                    self.note_anchor(anchor, span, None);
+                    self.set_pending_key(key_str, span_to_range(span, self.char_to_byte));
                 } else {
+                    let entry = self
+                        .entry_anchor(char_index_to_byte(self.char_to_byte, span.start.index()));
                     let pointer = self.value_pointer();
-                    let value_range = span_to_range(span, self.char_to_byte);
+                    self.note_entry(&pointer, entry);
+                    self.note_anchor(anchor, span, Some(pointer.clone()));
+                    let (value_range, col) = if n_properties == 0 {
+                        (span_to_range(span, self.char_to_byte), span.start.col())
+                    } else {
+                        let is_empty_node = style == ScalarStyle::Plain && value.is_empty();
+                        self.legacy_scalar_span(span, style, is_empty_node, n_properties, ordinal)
+                    };
                     let context = self.value_context();
-                    let line_range = self.compute_line_range(&value_range, context, style);
-                    let indent = u32::try_from(span.start.col()).unwrap_or(u32::MAX);
+                    let node_end = char_index_to_byte(self.char_to_byte, span.end.index());
+                    if style == ScalarStyle::Plain
+                        && value.is_empty()
+                        && let Some(anchor) = entry
+                        && let Some(layout) = self.layout.as_mut()
+                    {
+                        let end = empty_node_end(self.bytes, anchor.value_from, node_end);
+                        let start = if end == anchor.value_from {
+                            end
+                        } else {
+                            skip_separation(self.bytes, anchor.value_from)
+                        };
+                        layout.empty_values.insert(pointer.clone(), start..end);
+                    }
+                    let line_range =
+                        self.compute_line_range(&value_range, context, style, entry, node_end);
+                    let indent = u32::try_from(col).unwrap_or(u32::MAX);
                     if matches!(style, ScalarStyle::Literal | ScalarStyle::Folded) {
                         // Record the canonical pointer alongside the span
                         // so [`build_provenance_with_inline_offsets`] can
@@ -454,6 +1208,7 @@ impl<'src> State<'src> {
                         // `add-validation-and-extended-formats` requires.
                         block_scalars.insert(pointer.clone());
                     }
+                    self.note_child_end(line_range.end);
                     spans.insert(
                         pointer,
                         ValueSpan {
@@ -466,38 +1221,60 @@ impl<'src> State<'src> {
                     self.complete_value();
                 }
             }
-            Event::Alias(_) => {
-                tracing::debug!(
-                    line = span.start.line(),
-                    col = span.start.col(),
-                    "skipping alias span (aliases are not editable in M2)",
-                );
-                self.complete_value();
+            Event::Alias(anchor) => {
+                // An alias is a node like any other: as a key it names the
+                // entry (the value tree keys it by the anchored scalar's
+                // text), as a value it is a span `set` can overwrite.
+                let range = span_to_range(span, self.char_to_byte);
+                if self.expects_key() {
+                    self.note_alias(anchor, range.start, None);
+                    // An alias of a collection keys the value tree by its
+                    // debug rendering, which no pointer can spell; the
+                    // empty segment keeps the entry unaddressable.
+                    let key = self
+                        .anchored_scalars
+                        .get(&anchor)
+                        .map_or_else(String::new, |text| pointer_escape(text));
+                    self.set_pending_key(key, range);
+                } else {
+                    let entry = self.entry_anchor(range.start);
+                    let pointer = self.value_pointer();
+                    self.note_entry(&pointer, entry);
+                    self.note_alias(anchor, range.start, Some(pointer.clone()));
+                    let context = self.value_context();
+                    let line_range = self.compute_line_range(
+                        &range,
+                        context,
+                        ScalarStyle::Plain,
+                        entry,
+                        range.end,
+                    );
+                    self.note_child_end(line_range.end);
+                    spans.insert(
+                        pointer,
+                        ValueSpan {
+                            value_range: range,
+                            line_range,
+                            indent: u32::try_from(span.start.col()).unwrap_or(u32::MAX),
+                            context,
+                        },
+                    );
+                    self.complete_value();
+                }
             }
-            Event::SequenceStart(_anchor, _tag) => {
-                let start_byte = char_index_to_byte(self.char_to_byte, span.start.index());
-                let style = detect_container_style(self.bytes, start_byte);
-                self.enter_container();
-                self.stack.push(Frame::Sequence {
-                    index: 0,
-                    style,
-                    start_byte,
-                });
+            Event::SequenceStart(anchor, tag) => {
+                let n_properties = usize::from(anchor != 0) + usize::from(tag.is_some());
+                self.open_container(span, n_properties, false);
+                self.note_container_anchor(anchor, span);
             }
             Event::SequenceEnd => {
                 let end_byte = char_index_to_byte(self.char_to_byte, span.end.index());
                 self.leave_container_recording_empty(spans, end_byte);
             }
-            Event::MappingStart(_anchor, _tag) => {
-                let start_byte = char_index_to_byte(self.char_to_byte, span.start.index());
-                let style = detect_container_style(self.bytes, start_byte);
-                self.enter_container();
-                self.stack.push(Frame::Mapping {
-                    pending_key: None,
-                    style,
-                    start_byte,
-                    saw_child: false,
-                });
+            Event::MappingStart(anchor, tag) => {
+                let n_properties = usize::from(anchor != 0) + usize::from(tag.is_some());
+                self.open_container(span, n_properties, true);
+                self.note_container_anchor(anchor, span);
             }
             Event::MappingEnd => {
                 let end_byte = char_index_to_byte(self.char_to_byte, span.end.index());
@@ -505,6 +1282,215 @@ impl<'src> State<'src> {
             }
         }
         Ok(())
+    }
+
+    /// Record where the entry of the value at `pointer` begins, when
+    /// collecting the [`EditLayout`].
+    fn note_entry(&mut self, pointer: &str, entry: Option<EntryAnchor>) {
+        if let (Some(layout), Some(entry)) = (self.layout.as_mut(), entry) {
+            layout.entries.insert(
+                pointer.to_owned(),
+                EntryStart {
+                    at: entry.start,
+                    owns_line: entry.owns_line,
+                },
+            );
+        }
+    }
+
+    /// Record the node whose event span is `span` as the definition of
+    /// `anchor` (0: none), when collecting the [`EditLayout`].
+    fn note_anchor(&mut self, anchor: usize, span: Span, pointer: Option<String>) {
+        if anchor != 0 && self.layout.is_some() {
+            let at = char_index_to_byte(self.char_to_byte, span.start.index());
+            self.anchor_defs.insert(anchor, AnchorDef { at, pointer });
+        }
+    }
+
+    /// [`State::note_anchor`] for the collection just opened: its pointer
+    /// is the current path.
+    fn note_container_anchor(&mut self, anchor: usize, span: Span) {
+        if anchor != 0 && self.layout.is_some() {
+            let pointer = if self.path.is_empty() {
+                String::new()
+            } else {
+                format!("/{}", self.path.join("/"))
+            };
+            self.note_anchor(anchor, span, Some(pointer));
+        }
+    }
+
+    /// Record an alias of `anchor` at byte `at`, when collecting the
+    /// [`EditLayout`].
+    fn note_alias(&mut self, anchor: usize, at: usize, pointer: Option<String>) {
+        let Some(layout) = self.layout.as_mut() else {
+            return;
+        };
+        if let Some(def) = self.anchor_defs.get(&anchor) {
+            layout.aliases.push(AliasRef {
+                alias_at: at,
+                alias_pointer: pointer,
+                anchor_at: def.at,
+                anchor_pointer: def.pointer.clone(),
+            });
+        }
+    }
+
+    /// Byte range and 0-based character column of a scalar that carries
+    /// `n_properties` (> 0) node properties, in the saphyr-parser 0.0.6 shape.
+    /// See the "saphyr-parser 0.0.6 span compatibility" section below.
+    fn legacy_scalar_span(
+        &self,
+        span: Span,
+        style: ScalarStyle,
+        is_empty_node: bool,
+        n_properties: usize,
+        ordinal: usize,
+    ) -> (Range<usize>, usize) {
+        let props_start = char_index_to_byte(self.char_to_byte, span.start.index());
+        let end = char_index_to_byte(self.char_to_byte, span.end.index());
+        let content_start = skip_node_properties(self.bytes, props_start, n_properties).1;
+        let range = if is_empty_node {
+            // 0.0.6 reported the span of the token that follows the
+            // properties.
+            return self.legacy_empty_node_span(content_start);
+        } else if matches!(style, ScalarStyle::Literal | ScalarStyle::Folded) {
+            self.block_body_starts
+                .get(&ordinal)
+                .copied()
+                .unwrap_or(content_start)..end
+        } else {
+            content_start..end
+        };
+        let col = char_column(self.text, range.start);
+        (range, col)
+    }
+
+    /// Start byte of a container that carries `n_properties` node properties,
+    /// in the saphyr-parser 0.0.6 shape: the start of the container's first
+    /// token.
+    ///
+    /// Since 0.1 the event span runs from the first property to the end of
+    /// that token. A flow container's first token is the indicator plus the
+    /// blanks after it, so its start is the `{` / `[` itself. The block
+    /// tokens (`BlockMappingStart`, `BlockSequenceStart`, and the
+    /// `BlockEntry` that opens an indentless sequence) are zero-width, so the
+    /// end of the span is their start — for an indentless sequence that is
+    /// past the `- `, not at the `-`.
+    fn legacy_container_start(&self, span: Span, n_properties: usize) -> usize {
+        let start = char_index_to_byte(self.char_to_byte, span.start.index());
+        if n_properties == 0 {
+            return start;
+        }
+        let content_start = skip_node_properties(self.bytes, start, n_properties).1;
+        if matches!(self.bytes.get(content_start), Some(b'{' | b'[')) {
+            content_start
+        } else {
+            char_index_to_byte(self.char_to_byte, span.end.index())
+        }
+    }
+
+    /// Byte range and 0-based character column saphyr-parser 0.0.6 reported
+    /// for an empty node with properties: the span of the token that follows
+    /// the properties. `pos` is where the scanner resumes after them (past
+    /// separating blanks, line breaks and comments); the parent container is
+    /// the top of `self.stack`.
+    ///
+    /// Mirrors the 0.0.6 scanner's token spans (unchanged in 0.3, which no
+    /// longer exposes them):
+    ///
+    /// - end of input (`StreamEnd`, or a `BlockEnd` emitted there): empty at
+    ///   the end, column forced to 0;
+    /// - a token left of the innermost block indentation is preceded by a
+    ///   `BlockEnd`, empty at `pos`;
+    /// - `-` (`BlockEntry`): empty, past the `-` and the blanks / comment
+    ///   that follow it on the line;
+    /// - `,` `]` `}` (`FlowEntry`, flow end): the indicator plus the blanks /
+    ///   comment after it — unless an implicit flow mapping (`[a: &x, …]`)
+    ///   ends first, which is an empty `FlowMappingEnd` at `pos`;
+    /// - `?` (`Key`): the indicator plus the whitespace, line breaks and
+    ///   comments after it;
+    /// - `---` / `...` after a root node: the 3-byte marker;
+    /// - anything else — `:` (`Value`), an implicit key, a `BlockEnd`: empty
+    ///   at `pos`.
+    fn legacy_empty_node_span(&self, pos: usize) -> (Range<usize>, usize) {
+        let bytes = self.bytes;
+        let Some(&first) = bytes.get(pos) else {
+            return (bytes.len()..bytes.len(), 0);
+        };
+        let followed_by_blank = matches!(
+            bytes.get(pos + 1),
+            None | Some(b' ' | b'\t' | b'\n' | b'\r')
+        );
+        let in_flow = self.stack.iter().any(|frame| {
+            matches!(
+                frame,
+                Frame::Mapping {
+                    style: ContextStyle::Flow,
+                    ..
+                } | Frame::Sequence {
+                    style: ContextStyle::Flow,
+                    ..
+                }
+            )
+        });
+        let end = match self.stack.last() {
+            None => {
+                let is_document_marker = line_offset(bytes, pos) == 0
+                    && matches!(bytes.get(pos..pos + 3), Some(b"---" | b"..."))
+                    && matches!(
+                        bytes.get(pos + 3),
+                        None | Some(b' ' | b'\t' | b'\n' | b'\r')
+                    );
+                if is_document_marker { pos + 3 } else { pos }
+            }
+            Some(top) if in_flow => {
+                // A block-styled mapping inside a flow collection is an
+                // implicit flow mapping (`[a: b]`); `,` and `]` end it first.
+                let implicit_mapping = matches!(
+                    top,
+                    Frame::Mapping {
+                        style: ContextStyle::Block,
+                        ..
+                    }
+                );
+                match first {
+                    b',' | b']' if implicit_mapping => pos,
+                    b',' | b']' | b'}' => skip_ws_to_eol(bytes, pos + 1),
+                    b'?' => skip_yaml_whitespace(bytes, pos + 1),
+                    _ => pos,
+                }
+            }
+            Some(_) if line_offset(bytes, pos) < self.block_indent() => pos,
+            Some(_) => match first {
+                b'-' if followed_by_blank => {
+                    // `BlockEntry` is empty, at the end of what it skips.
+                    let end = skip_ws_to_eol(bytes, pos + 1);
+                    return (end..end, char_column(self.text, end));
+                }
+                b'?' if followed_by_blank => skip_yaml_whitespace(bytes, pos + 1),
+                _ => pos,
+            },
+        };
+        (pos..end, char_column(self.text, pos))
+    }
+
+    /// Byte column of the innermost block indentation level the 0.0.6
+    /// scanner tracks: a block mapping's first key, or a block sequence's
+    /// first `-`. An indentless sequence (`key:` followed by `- item` at the
+    /// key's column) opens no level of its own.
+    fn block_indent(&self) -> usize {
+        for frame in self.stack.iter().rev() {
+            match frame {
+                Frame::Sequence {
+                    indentless: true, ..
+                } => {}
+                Frame::Mapping { start_byte, .. } | Frame::Sequence { start_byte, .. } => {
+                    return line_offset(self.bytes, *start_byte);
+                }
+            }
+        }
+        0
     }
 
     fn value_pointer(&mut self) -> String {
@@ -561,8 +1547,92 @@ impl<'src> State<'src> {
         }
     }
 
+    /// At the end event of the innermost container (`end_byte` is where the
+    /// event span ends): work out where its entry ends, fold that into the
+    /// parent's [`ContainerFrame::content_end`], and record its
+    /// [`ContainerLayout`] when collecting.
+    ///
+    /// A block collection ends with the last line of its last child — not
+    /// at its end event, which sits on the next token, past any comments in
+    /// between. A flow collection ends at its closing bracket; in a block
+    /// parent its entry runs to the end of that line.
+    fn record_container_end(&mut self, end_byte: usize) {
+        let Some(frame) = self.stack.last() else {
+            return;
+        };
+        let style = frame.style();
+        let in_flow_parent = self.flow_depth > usize::from(style == ContextStyle::Flow);
+        let (entry, props_end, content_end, first_entry, start_byte) = match frame {
+            Frame::Mapping {
+                container,
+                start_byte,
+                ..
+            }
+            | Frame::Sequence {
+                container,
+                start_byte,
+                ..
+            } => (
+                container.entry,
+                container.props_end,
+                container.content_end,
+                container.first_entry,
+                *start_byte,
+            ),
+        };
+        let end = match style {
+            ContextStyle::Block => content_end,
+            ContextStyle::Flow if in_flow_parent => end_byte,
+            ContextStyle::Flow => line_end_after(self.bytes, end_byte),
+        };
+        if let Some(parent) = self
+            .stack
+            .len()
+            .checked_sub(2)
+            .and_then(|i| self.stack.get_mut(i))
+        {
+            let container = parent.container_mut();
+            container.content_end = container.content_end.max(end);
+        }
+        if let Some(layout) = self.layout.as_mut().map(|layout| &mut layout.containers) {
+            let top_level = self.stack.len() == 1;
+            let block = style == ContextStyle::Block;
+            let pointer = if self.path.is_empty() {
+                String::new()
+            } else {
+                format!("/{}", self.path.join("/"))
+            };
+            layout.insert(
+                pointer,
+                ContainerLayout {
+                    block,
+                    top_level,
+                    entry: entry
+                        .filter(|anchor| anchor.owns_line && end > anchor.line_start)
+                        .map(|anchor| anchor.line_start..end),
+                    empty_marker_at: if block {
+                        props_end.or(entry.and_then(|anchor| anchor.indicator_end))
+                    } else {
+                        None
+                    },
+                    first_child_line: first_entry.flatten(),
+                    end,
+                    flow_value: (style == ContextStyle::Flow && in_flow_parent)
+                        .then_some(start_byte..end_byte),
+                    brackets: (style == ContextStyle::Flow).then_some(start_byte..end_byte),
+                },
+            );
+        }
+    }
+
     fn leave_container(&mut self) {
-        let _ = self.stack.pop();
+        if self
+            .stack
+            .pop()
+            .is_some_and(|frame| frame.style() == ContextStyle::Flow)
+        {
+            self.flow_depth -= 1;
+        }
         let target_len = self.doc_prefix_len();
         if self.path.len() > target_len {
             self.path.pop();
@@ -578,6 +1648,7 @@ impl<'src> State<'src> {
     /// The pointer is read **before** popping `self.path` so we key the
     /// span at the empty container itself, not at its parent.
     fn leave_container_recording_empty(&mut self, spans: &mut SpanMap, end_byte: usize) {
+        self.record_container_end(end_byte);
         let top = self.stack.last();
         let (is_empty, start_byte, context) = match top {
             Some(Frame::Mapping {
@@ -597,6 +1668,7 @@ impl<'src> State<'src> {
                 start_byte,
                 style,
                 index,
+                ..
             }) => (
                 *index == 0,
                 *start_byte,
@@ -619,7 +1691,13 @@ impl<'src> State<'src> {
             // documents the invariant.
             if !spans.contains_key(&pointer) {
                 let value_range = start_byte.min(self.bytes.len())..end_byte.min(self.bytes.len());
-                let line_range = self.compute_line_range(&value_range, context, ScalarStyle::Plain);
+                let line_range = self.compute_line_range(
+                    &value_range,
+                    context,
+                    ScalarStyle::Plain,
+                    None,
+                    value_range.end,
+                );
                 // `indent` is the column of the container's opening byte,
                 // which mirrors the parser convention for scalar `indent`.
                 let indent =
@@ -664,14 +1742,30 @@ impl<'src> State<'src> {
         }
     }
 
-    /// Compute the line range for a value span. Block contexts span the full
-    /// physical line(s); flow contexts have no logical line so the line range
-    /// degenerates to the value range.
+    /// Compute the line range for a value span — the bytes `del_at` removes
+    /// and the line insertions go after. Block contexts span the full
+    /// physical line(s) of the entry; flow contexts have no logical line so
+    /// the line range degenerates to the value range.
+    ///
+    /// `entry` is where the entry holding the value begins
+    /// ([`State::entry_anchor`]). A value can start on a later line than its
+    /// key or `-` — always for a block scalar, whose content follows the
+    /// `|` / `>` line, and for any node written on the next line — so the
+    /// range starts on the entry's line, not the value's.
+    ///
+    /// An empty `value_range` — an empty node, with or without properties,
+    /// or a block scalar with no content lines — sits on the token after
+    /// the node, often the next entry's line. Its entry ends with the line
+    /// of the last thing the node does have (its properties, its `|` / `>`
+    /// header): [`empty_node_end`] scans for them from the entry's
+    /// indicator up to `node_end`, where the parser's event span ends.
     fn compute_line_range(
         &self,
         value_range: &Range<usize>,
         context: SpanContext,
         scalar_style: ScalarStyle,
+        entry: Option<EntryAnchor>,
+        node_end: usize,
     ) -> Range<usize> {
         // For flow contexts a single value is part of `{a: 1, b: 2}` on one
         // line — there is no "delete this physical line" semantics. Returning
@@ -683,25 +1777,25 @@ impl<'src> State<'src> {
         ) {
             return value_range.clone();
         }
-        // Block scalars (`|` / `>`) already include trailing-newline content
-        // in the value range. We still want `del_at` to pull the entire
-        // logical entry; expand to the next newline boundary like a regular
-        // value, since the value range typically ends at end-of-line already.
-        let _ = scalar_style;
 
         let bytes = self.bytes;
-        let mut start = value_range.start.min(bytes.len());
-        while start > 0 && bytes[start - 1] != b'\n' {
-            start -= 1;
+        if value_range.is_empty()
+            && let Some(anchor) = entry
+        {
+            let end = empty_node_end(bytes, anchor.value_from, node_end);
+            return anchor.line_start..line_end_after(bytes, end);
         }
-        let mut end = value_range.end.min(bytes.len());
-        while end < bytes.len() && bytes[end] != b'\n' {
-            end += 1;
+        let value_line_start = line_start_at(bytes, value_range.start);
+        let start = match entry {
+            Some(anchor) if !value_range.is_empty() => anchor.line_start.min(value_line_start),
+            _ => value_line_start,
+        };
+        if matches!(scalar_style, ScalarStyle::Literal | ScalarStyle::Folded)
+            && let Some(end) = block_scalar_line_end(bytes, value_range)
+        {
+            return start..end;
         }
-        if end < bytes.len() {
-            end += 1; // include trailing newline
-        }
-        start..end
+        start..line_end_after(bytes, value_range.end)
     }
 }
 
@@ -753,6 +1847,289 @@ fn span_to_range(span: Span, char_to_byte: &[usize]) -> Range<usize> {
 }
 
 // ---------------------------------------------------------------------------
+// saphyr-parser 0.0.6 span compatibility
+// ---------------------------------------------------------------------------
+//
+// The span builder was validated against saphyr-parser 0.0.6. Later releases
+// changed two things the `SpanMap` depends on; the helpers below map the new
+// events back to the 0.0.6 shape so spans stay byte-identical:
+//
+// 1. Since 0.1 a node's span starts at its first node property (`&anchor`,
+//    `!tag`), not at its content. 0.0.6 started it at the content token: the
+//    first non-separation byte for flow scalars and containers, the first
+//    content line for block scalars. An empty node with properties
+//    (`key: &a` followed by a newline) got the span of the token after the
+//    properties; 0.3 gives the span of the properties themselves.
+// 2. Since 0.1 an empty node (`: value`, `key:`) is the scalar `""`; 0.0.6
+//    reported `~`. Only keys use the scalar text.
+
+/// Key text in the saphyr-parser 0.0.6 shape: an empty key node without
+/// properties was reported as `~` (pointer segment `~0`).
+fn legacy_key_text(value: &str, style: ScalarStyle, n_properties: usize) -> &str {
+    // A plain scalar token is never empty, so a plain `""` is an empty node.
+    if value.is_empty() && style == ScalarStyle::Plain && n_properties == 0 {
+        "~"
+    } else {
+        value
+    }
+}
+
+/// Skip `n_properties` node properties starting at byte `pos` (the first
+/// property). Returns `(end of the last property, start of the content
+/// token)`; the content start is past any separating whitespace, line breaks
+/// and comments.
+fn skip_node_properties(bytes: &[u8], pos: usize, n_properties: usize) -> (usize, usize) {
+    let mut pos = pos;
+    for i in 0..n_properties {
+        if i > 0 {
+            pos = skip_separation(bytes, pos);
+        }
+        pos = skip_property(bytes, pos);
+    }
+    (pos, skip_separation(bytes, pos))
+}
+
+/// Skip one `&anchor`, `!tag` or `!<verbatim>` property at byte `pos`.
+/// Anchor and tag characters end at whitespace, a line break or a flow
+/// indicator (YAML 1.2 `ns-anchor-char` / `ns-tag-char`); a verbatim tag ends
+/// after its `>`.
+fn skip_property(bytes: &[u8], pos: usize) -> usize {
+    let ends_property = |b: u8| {
+        matches!(
+            b,
+            b' ' | b'\t' | b'\n' | b'\r' | b',' | b'[' | b']' | b'{' | b'}'
+        )
+    };
+    match (bytes.get(pos), bytes.get(pos + 1)) {
+        (Some(b'!'), Some(b'<')) => bytes[pos..]
+            .iter()
+            .position(|&b| b == b'>')
+            .map_or(bytes.len(), |off| pos + off + 1),
+        (Some(b'&' | b'!'), _) => {
+            let mut end = pos + 1;
+            while end < bytes.len() && !ends_property(bytes[end]) {
+                end += 1;
+            }
+            end
+        }
+        _ => pos,
+    }
+}
+
+/// End of what an empty node has, scanning from `from` (where its text can
+/// begin) over separation and the tokens the node can be made of — node
+/// properties and a `|` / `>` header with its indicators — that start
+/// before `limit`. `from` when there are none.
+fn empty_node_end(bytes: &[u8], from: usize, limit: usize) -> usize {
+    let mut last = from;
+    loop {
+        let start = skip_separation(bytes, last);
+        if start >= limit {
+            return last;
+        }
+        let end = match bytes[start] {
+            b'&' | b'!' => skip_property(bytes, start),
+            b'|' | b'>' => {
+                let mut end = start + 1;
+                while matches!(bytes.get(end), Some(b'1'..=b'9' | b'+' | b'-')) {
+                    end += 1;
+                }
+                end
+            }
+            _ => start,
+        };
+        if end == start {
+            return last;
+        }
+        last = end;
+    }
+}
+
+/// Skip whitespace, line breaks and comments starting at byte `pos`.
+fn skip_separation(bytes: &[u8], pos: usize) -> usize {
+    let mut pos = pos;
+    while let Some(&b) = bytes.get(pos) {
+        match b {
+            b' ' | b'\t' | b'\n' | b'\r' => pos += 1,
+            b'#' => {
+                while pos < bytes.len() && !matches!(bytes[pos], b'\n' | b'\r') {
+                    pos += 1;
+                }
+            }
+            _ => break,
+        }
+    }
+    pos
+}
+
+/// Skip the blanks and the comment that follow a token on its line, the way
+/// the 0.0.6 scanner's `skip_ws_to_eol` does: spaces and tabs, then a `#`
+/// comment if blanks preceded it. Stops before the line break.
+fn skip_ws_to_eol(bytes: &[u8], pos: usize) -> usize {
+    let mut pos = pos;
+    let mut saw_blank = false;
+    while let Some(&b) = bytes.get(pos) {
+        match b {
+            b' ' | b'\t' => {
+                saw_blank = true;
+                pos += 1;
+            }
+            b'#' if saw_blank => {
+                while pos < bytes.len() && !matches!(bytes[pos], b'\n' | b'\r') {
+                    pos += 1;
+                }
+            }
+            _ => break,
+        }
+    }
+    pos
+}
+
+/// Skip spaces, line breaks and comments the way the 0.0.6 scanner's
+/// `skip_yaml_whitespace` does after a `?` indicator. Tabs end the skip.
+fn skip_yaml_whitespace(bytes: &[u8], pos: usize) -> usize {
+    let mut pos = pos;
+    while let Some(&b) = bytes.get(pos) {
+        match b {
+            b' ' | b'\n' | b'\r' => pos += 1,
+            b'#' => {
+                while pos < bytes.len() && !matches!(bytes[pos], b'\n' | b'\r') {
+                    pos += 1;
+                }
+            }
+            _ => break,
+        }
+    }
+    pos
+}
+
+/// `true` if only spaces and tabs precede byte `pos` on its line.
+fn starts_line(bytes: &[u8], pos: usize) -> bool {
+    let pos = pos.min(bytes.len());
+    bytes[..pos]
+        .iter()
+        .rev()
+        .take_while(|&&b| !matches!(b, b'\n' | b'\r'))
+        .all(|&b| matches!(b, b' ' | b'\t'))
+}
+
+/// `true` if only blanks (and, on the first line, a byte-order mark) come
+/// before byte `pos` on its line.
+fn starts_line_after_bom(bytes: &[u8], pos: usize) -> bool {
+    let pos = pos.min(bytes.len());
+    let start = line_start_at(bytes, pos);
+    bytes[start..pos].iter().all(|&b| matches!(b, b' ' | b'\t'))
+}
+
+/// Start of the line holding byte `pos`: just past the previous `\n`. On the
+/// first line that is past a byte-order mark, so that removing a whole line
+/// never takes the mark with it.
+fn line_start_at(bytes: &[u8], pos: usize) -> usize {
+    const BOM: &[u8] = "\u{feff}".as_bytes();
+    let pos = pos.min(bytes.len());
+    let first_line = if pos >= BOM.len() && bytes.starts_with(BOM) {
+        BOM.len()
+    } else {
+        0
+    };
+    bytes[..pos]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(first_line, |i| i + 1)
+}
+
+/// End of the line holding byte `pos`, past its `\n` (or the end of input).
+fn line_end_after(bytes: &[u8], pos: usize) -> usize {
+    let pos = pos.min(bytes.len());
+    bytes[pos..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(bytes.len(), |i| pos + i + 1)
+}
+
+/// Where the last line of a block scalar ends, given its event span.
+///
+/// The span of a `|` / `>` scalar runs past its final line break, over
+/// trailing blank lines, and on to the indentation of the next line when
+/// that line is indented — so `line_end_after` its end would swallow the
+/// next entry. The scalar's last line ends at the last line break in the
+/// span when only blanks follow it. `None` when the span holds no line
+/// break or content follows the last one: the scalar ends at the end of
+/// input without a final line break.
+fn block_scalar_line_end(bytes: &[u8], value_range: &Range<usize>) -> Option<usize> {
+    let slice = bytes.get(value_range.clone())?;
+    let last_break = slice.iter().rposition(|&b| b == b'\n')?;
+    slice[last_break + 1..]
+        .iter()
+        .all(|&b| matches!(b, b' ' | b'\t'))
+        .then_some(value_range.start + last_break + 1)
+}
+
+/// For a sequence item whose node starts its own line (`pos`), the line of
+/// the item's `-`: the nearest line above holding a `-` indicator, with
+/// only blank, comment, node-property and block-scalar-header lines in
+/// between. Returns `(line start, byte offset of the -)`, or `None` when
+/// another line comes first.
+fn dash_line_above(bytes: &[u8], pos: usize) -> Option<(usize, usize)> {
+    let mut line_start = line_start_at(bytes, pos);
+    while line_start > 0 && bytes[line_start - 1] == b'\n' {
+        let prev_start = line_start_at(bytes, line_start - 1);
+        let line = &bytes[prev_start..line_start - 1];
+        line_start = prev_start;
+        let Some(first) = line
+            .iter()
+            .position(|&b| !matches!(b, b' ' | b'\t' | b'\r'))
+        else {
+            continue;
+        };
+        match line[first] {
+            b'-' if matches!(line.get(first + 1), None | Some(b' ' | b'\t' | b'\r')) => {
+                return Some((prev_start, prev_start + first));
+            }
+            b'#' | b'&' | b'!' | b'|' | b'>' => {}
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Byte offset of the `-` indicator that precedes `pos` on its line, past
+/// blanks only.
+fn dash_before(bytes: &[u8], pos: usize) -> Option<usize> {
+    let pos = pos.min(bytes.len());
+    let dash = bytes[..pos]
+        .iter()
+        .rposition(|&b| !matches!(b, b' ' | b'\t'))?;
+    (bytes[dash] == b'-').then_some(dash)
+}
+
+/// Byte offset of `pos` from the start of its line.
+fn line_offset(bytes: &[u8], pos: usize) -> usize {
+    let pos = pos.min(bytes.len());
+    let line_start = bytes[..pos]
+        .iter()
+        .rposition(|&b| matches!(b, b'\n' | b'\r'))
+        .map_or(0, |i| i + 1);
+    pos - line_start
+}
+
+/// 0-based character column of byte `pos`, counted the way saphyr-parser
+/// counts `Marker::col()`: a byte-order mark opening the stream is not a
+/// column.
+fn char_column(text: &str, pos: usize) -> usize {
+    let pos = pos.min(text.len());
+    let mut line_start = text.as_bytes()[..pos]
+        .iter()
+        .rposition(|&b| matches!(b, b'\n' | b'\r'))
+        .map_or(0, |i| i + 1);
+    if line_start == 0 && text.starts_with('\u{feff}') {
+        line_start = '\u{feff}'.len_utf8();
+    }
+    text.get(line_start..pos)
+        .map_or(0, |line| line.chars().count())
+}
+
+// ---------------------------------------------------------------------------
 // Renderers
 // ---------------------------------------------------------------------------
 
@@ -792,14 +2169,9 @@ impl ScalarRenderer for YamlScalarRenderer {
             Value::Float(f) => render_float(*f),
             Value::BigFloat(s) => s.clone().into_bytes(),
             Value::String(s) => render_string_in_style(s, original_style, context),
-            // Replacing a scalar span with a structural value is
-            // intentionally out of scope for the M2 baseline: the mkdir-p /
-            // structural-edit path lives in §3.3+ for individual leaves, and
-            // wholesale tree replacement at a scalar position would require
-            // re-running the parser to refresh spans. We render a bare value
-            // that keeps the splice well-formed (`null`) so callers see the
-            // anomaly downstream rather than a panic mid-write.
-            Value::Array(_) | Value::Map(_) => render_null(original_style),
+            // A collection at a scalar's position is written in flow style
+            // on the scalar's line.
+            Value::Array(_) | Value::Map(_) => render_flow(value),
         }
     }
 }
@@ -823,14 +2195,19 @@ impl InsertionRenderer for YamlInsertionRenderer {
         parent_indent: u32,
         parent_context: SpanContext,
     ) -> Vec<u8> {
-        // Flow contexts use a different splice strategy (insert before `}` or
-        // `]` with `, ` separators) which the M2 baseline does not yet
-        // implement. For now we render a block-style fragment and let the
-        // caller decide whether to splice it into a flow container; in
-        // practice `Document::set_at`'s mkdir-p path only fires for block
-        // contexts because that's what `value_only`-shaped docs lack and
-        // those documents always reflect block-style configs.
-        let _ = parent_context;
+        // Inside a flow mapping the entry stays on one line; the caller
+        // trims the blanks around it and adds the separator.
+        if matches!(
+            parent_context,
+            SpanContext::FlowMapValue | SpanContext::FlowSeqItem
+        ) {
+            let mut out = b"\n".to_vec();
+            out.extend_from_slice(&render_double_quoted_if(key, needs_quoting_in_flow(key)));
+            out.extend_from_slice(b": ");
+            out.extend_from_slice(&render_flow_item(value));
+            out.push(b'\n');
+            return out;
+        }
 
         let outer_spaces = parent_indent.saturating_sub(1) as usize;
         let inner_spaces = outer_spaces + 2;
@@ -893,9 +2270,71 @@ impl InsertionRenderer for YamlInsertionRenderer {
     }
 }
 
-/// Render a scalar (leaf) value as its inline YAML form. Containers fall back
-/// to a flow-style empty literal to keep the result well-formed; full nested
-/// rendering is the caller's responsibility.
+/// `s` in double quotes when `quote`, as it is otherwise.
+fn render_double_quoted_if(s: &str, quote: bool) -> Vec<u8> {
+    if quote {
+        render_double_quoted(s)
+    } else {
+        s.as_bytes().to_vec()
+    }
+}
+
+/// Whether `s` written plain inside a flow collection would not read
+/// back as the string `s`.
+fn needs_quoting_in_flow(s: &str) -> bool {
+    needs_quoting_for_plain(s) || needs_flow_quoting(s) || s.contains(['[', '{'])
+}
+
+/// `value` as an entry of a flow collection: a scalar plain where it
+/// reads back as itself, a collection in flow style.
+fn render_flow_item(value: &Value) -> Vec<u8> {
+    match value {
+        Value::String(s) => render_double_quoted_if(s, needs_quoting_in_flow(s)),
+        Value::Array(_) | Value::Map(_) => render_flow(value),
+        scalar => render_scalar_inline(scalar),
+    }
+}
+
+/// A collection in flow style, JSON-shaped with spaces after the
+/// separators — `{"x": [1, {"y": null}]}` — which YAML reads as the same
+/// tree. Floats JSON cannot spell (`.nan`, `.inf`) use YAML's form.
+fn render_flow(value: &Value) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_flow(&mut out, value);
+    out
+}
+
+fn push_flow(out: &mut Vec<u8>, value: &Value) {
+    match value {
+        Value::Array(items) => {
+            out.push(b'[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.extend_from_slice(b", ");
+                }
+                push_flow(out, item);
+            }
+            out.push(b']');
+        }
+        Value::Map(map) => {
+            out.push(b'{');
+            for (i, (key, item)) in map.iter().enumerate() {
+                if i > 0 {
+                    out.extend_from_slice(b", ");
+                }
+                out.extend_from_slice(&render_double_quoted(key));
+                out.extend_from_slice(b": ");
+                push_flow(out, item);
+            }
+            out.push(b'}');
+        }
+        Value::String(s) => out.extend_from_slice(&render_double_quoted(s)),
+        scalar => out.extend_from_slice(&render_scalar_inline(scalar)),
+    }
+}
+
+/// Render a value as its inline YAML form: a scalar as itself, a
+/// collection in flow style.
 fn render_scalar_inline(value: &Value) -> Vec<u8> {
     match value {
         Value::Null => b"null".to_vec(),
@@ -913,8 +2352,7 @@ fn render_scalar_inline(value: &Value) -> Vec<u8> {
         Value::String(s) => {
             render_string_in_style(s, ScalarStyle::Plain, SpanContext::BlockMapValue)
         }
-        Value::Array(_) => b"[]".to_vec(),
-        Value::Map(_) => b"{}".to_vec(),
+        Value::Array(_) | Value::Map(_) => render_flow(value),
     }
 }
 
@@ -1144,7 +2582,46 @@ fn needs_quoting_for_plain(s: &str) -> bool {
         // A numeric literal would round-trip as a number, not a string.
         return true;
     }
-    false
+    if typed_by_another_schema(s) {
+        return true;
+    }
+    // Whatever else the reader types — `.nan`, `.inf`, `0x10`, `0o17`,
+    // `1e3` — or reads as more than one scalar: ask the reader itself.
+    !matches!(
+        serde_norway::from_str::<serde_norway::Value>(s),
+        Ok(serde_norway::Value::String(read)) if read == s
+    )
+}
+
+/// Whether a YAML 1.1 reader (go-yaml, as in Kubernetes and GitHub
+/// Actions; PyYAML) or a YAML 1.2 core / JSON schema one would take the
+/// plain scalar `s` for something other than a string — a bool, null,
+/// int (`1_000`, `0b1`, `017`, `1:20`), float (`1.`, `1e3`), timestamp
+/// (`2001-12-14`), or the `<<` / `=` keys — though dq's own reader may
+/// not.
+fn typed_by_another_schema(s: &str) -> bool {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(concat!(
+            r"^(?:",
+            r"~|null|Null|NULL",
+            r"|y|Y|yes|Yes|YES|n|N|no|No|NO|true|True|TRUE|false|False|FALSE",
+            r"|on|On|ON|off|Off|OFF",
+            r"|[-+]?0b[01_]+|[-+]?0o?[0-7_]+|[-+]?0x[0-9a-fA-F_]+",
+            r"|[-+]?(?:0|[1-9][0-9_]*)(?::[0-5]?[0-9])*",
+            r"|[-+]?(?:[0-9][0-9_]*)?\.[0-9_]*(?:[eE][-+]?[0-9]+)?",
+            r"|[-+]?[0-9][0-9_]*[eE][-+]?[0-9]+",
+            r"|[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+\.[0-9_]*",
+            r"|[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN)",
+            r"|[0-9]{4}-[0-9]{2}-[0-9]{2}",
+            r"|[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}(?:[Tt]|[ \t]+)[0-9]{1,2}:[0-9]{2}:[0-9]{2}",
+            r"(?:\.[0-9]*)?(?:[ \t]*(?:Z|[-+][0-9]{1,2}(?::[0-9]{2})?))?",
+            r"|<<|=",
+            r")$",
+        ))
+        .expect("the YAML type regex compiles")
+    })
+    .is_match(s)
 }
 
 /// `: ` and ` #` cause YAML key/comment confusion in plain scalars.
@@ -1185,6 +2662,60 @@ mod tests {
         });
         let slice = &bytes[span.value_range.clone()];
         assert_eq!(slice, expected_value, "value bytes mismatch at {pointer}");
+    }
+
+    #[test]
+    fn block_scalar_extent_runs_from_the_indicator_to_the_last_content() {
+        // (source, pointer, bytes a new value replaces, the part of the
+        // header line put back after it)
+        type Case = (&'static [u8], &'static str, &'static [u8], &'static [u8]);
+        let cases: [Case; 9] = [
+            (b"k: |\n  x\nr: 1\n", "/k", b"|\n  x", b""),
+            (b"k: |\r\n  x\r\nr: 1\r\n", "/k", b"|\r\n  x", b""),
+            (b"r: 1\nk: |\r\n  x", "/k", b"|\r\n  x", b""),
+            (b"k: |2-\n   x\nr: 1\n", "/k", b"|2-\n   x", b""),
+            // Trailing blank lines of keep chomping stay outside.
+            (b"k: |+\n  x\n\n\nr: 1\n", "/k", b"|+\n  x", b""),
+            (b"k: | # a | b\n  x\n", "/k", b"| # a | b\n  x", b" # a | b"),
+            (b"k: | # c\r\n  x\r\n", "/k", b"| # c\r\n  x", b" # c"),
+            (b"k: &a !t |\r\n  x\r\n", "/k", b"|\r\n  x", b""),
+            // The header on a line of its own.
+            (b"k:\n  |\n  x\nr: 1\n", "/k", b"|\n  x", b""),
+        ];
+        for (src, pointer, replaced, keep) in cases {
+            let (_, spans) = parse_with_spans(src).expect("parse");
+            let span = spans.get(pointer).expect("span");
+            let (range, kept) = block_scalar_extent(src, span).unwrap_or_else(|| {
+                panic!("{:?}: not a block scalar", String::from_utf8_lossy(src))
+            });
+            assert_eq!(
+                (&src[range], &src[kept]),
+                (replaced, keep),
+                "{:?}",
+                String::from_utf8_lossy(src)
+            );
+        }
+    }
+
+    #[test]
+    fn block_scalar_extent_is_none_for_other_scalars() {
+        for src in [
+            &b"k: x\n"[..],
+            b"k: \"|\"\n",
+            b"k: 'a |'\n",
+            b"k: a |\n",
+            b"k: x # |\n",
+            b"k:\n  x\n  y\n",
+        ] {
+            let (_, spans) = parse_with_spans(src).expect("parse");
+            let span = spans.get("/k").expect("span");
+            assert_eq!(
+                block_scalar_extent(src, span),
+                None,
+                "{:?}",
+                String::from_utf8_lossy(src)
+            );
+        }
     }
 
     // -- span builder ---------------------------------------------------
@@ -1777,5 +3308,80 @@ mod tests {
             }),
             "block scalar inside nested mapping MUST still carry inline_offset",
         );
+    }
+
+    // -- block scalars with node properties: one replay pass ------------
+
+    #[test]
+    fn propertied_block_scalars_span_from_first_content_line() {
+        // The alias sits last: an alias value leaves the pending key in
+        // place, so anything after it in the mapping would shift.
+        let bytes = b"a: &x |\n  body\n  two\nb: !t >-\n  fold\nc: !!str &y |2\n   ind\nd: *x\n";
+        let (_, spans) = parse_with_spans(bytes).expect("parse");
+        assert_span(&spans, "/a", bytes, b"body\n  two\n");
+        assert_span(&spans, "/b", bytes, b"fold\n");
+        assert_span(&spans, "/c", bytes, b" ind\n");
+    }
+
+    #[test]
+    fn propertied_block_scalar_replay_is_a_single_pass() {
+        // Regression guard for the per-scalar replay, which re-parsed the
+        // stream once per block scalar with properties (O(N * file size)).
+        let mut src = String::new();
+        for i in 0..500 {
+            src.push_str(&format!(
+                "k{i}: &a{i} |\n  body {i}\nt{i}: !Sub >-\n  fold {i}\n"
+            ));
+        }
+        src.push_str("last: *a0\n");
+        let built = build_span_map_with_stats(src.as_bytes(), false).expect("parse");
+        assert_eq!(
+            built.parser_passes, 3,
+            "prescan + one combined replay + main walk"
+        );
+        assert_span(&built.spans, "/k0", src.as_bytes(), b"body 0\n");
+        assert_span(&built.spans, "/t499", src.as_bytes(), b"fold 499\n");
+    }
+
+    #[test]
+    fn span_build_without_propertied_block_scalars_skips_the_replay() {
+        let bytes = b"a: &x 1\nb: |\n  body\nc: *x\n";
+        let built = build_span_map_with_stats(bytes, false).expect("parse");
+        assert_eq!(built.parser_passes, 2, "prescan + main walk only");
+    }
+
+    #[test]
+    fn unconfirmed_block_scalar_falls_back_to_a_solo_replay() {
+        let text = "a: &x |\n  body\nb: !t |\n  two\nc: *x\n";
+        let char_to_byte = build_char_to_byte_map(text);
+        let mut prescan = prescan(text, text.as_bytes(), &char_to_byte).expect("prescan");
+        assert_eq!(prescan.propertied_block_scalars.len(), 2);
+        let mut passes = 0;
+        let confirmed = replay_block_scalar_body_starts(text, &char_to_byte, &prescan, &mut passes);
+        assert_eq!(passes, 1);
+        // A wrong span end makes the combined replay reject the first
+        // scalar; the solo replay must still find the same start.
+        prescan.propertied_block_scalars[0].end_char += 1;
+        let mut passes = 0;
+        let with_fallback =
+            replay_block_scalar_body_starts(text, &char_to_byte, &prescan, &mut passes);
+        assert_eq!(passes, 2, "combined replay + one solo replay");
+        assert_eq!(with_fallback, confirmed);
+        let first = prescan.propertied_block_scalars[0].ordinal;
+        assert_eq!(
+            with_fallback.get(&first),
+            Some(&text.find("body").expect("body"))
+        );
+    }
+
+    #[test]
+    fn blank_for_replay_keeps_character_positions() {
+        let text = "k: &аб |\n  é\nr: *аб\n";
+        let char_to_byte = build_char_to_byte_map(text);
+        let prescan = prescan(text, text.as_bytes(), &char_to_byte).expect("prescan");
+        let blanked = blank_for_replay(text, &prescan.propertied_block_scalars, &prescan.aliases)
+            .expect("ranges are disjoint");
+        assert_eq!(blanked, "k:     |\n  é\nr: xxx\n");
+        assert_eq!(blanked.chars().count(), text.chars().count());
     }
 }

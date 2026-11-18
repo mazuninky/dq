@@ -8,9 +8,10 @@
 //! Sizes mirror `parse.rs`: `[100, 1_000, 10_000]` records (xml at
 //! `[100, 1_000]`).
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use dq_core::{Document, Format};
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
+use std::hint::black_box;
 
 const SIZES: &[usize] = &[100, 1_000, 10_000];
 
@@ -18,9 +19,9 @@ fn synth_record(rng: &mut StdRng, idx: usize) -> (String, i32, String, bool) {
     let names = [
         "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
     ];
-    let name = names[rng.gen_range(0..names.len())];
-    let age = rng.gen_range(18..90);
-    let active = rng.r#gen::<bool>();
+    let name = names[rng.random_range(0..names.len())];
+    let age = rng.random_range(18..90);
+    let active = rng.random::<bool>();
     let email = format!("{name}{idx}@example.com");
     (name.to_owned(), age, email, active)
 }

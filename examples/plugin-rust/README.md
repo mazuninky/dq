@@ -78,11 +78,11 @@ wasm-tools component new \
 The wrapped artifact at
 `target/dq_plugin_example_noop.component.wasm` is what the dq host loads.
 
-> **Compatibility note.** As of `wasmtime 44.x` the host accepts both the
+> **Compatibility note.** As of `wasmtime 50.x` the host accepts both the
 > `wasm32-wasip2` (Component-Model) and the manually-wrapped
 > `wasm32-unknown-unknown` artifact shapes. If `cargo component build`
 > fails because `cargo-component` is not yet on a release that matches
-> wit-bindgen 0.57, fall back to Path B.
+> wit-bindgen 0.63, fall back to Path B.
 
 ## Using the plugin with `dq`
 

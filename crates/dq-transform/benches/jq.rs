@@ -16,12 +16,14 @@
 //! `cargo bench --no-default-features` build still compiles to an empty
 //! `criterion_main!`.
 
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
 #[cfg(feature = "embedded-jq")]
 use dq_transform::JqEngine;
 #[cfg(feature = "embedded-jq")]
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
+#[cfg(feature = "embedded-jq")]
+use std::hint::black_box;
 
 /// Three filters of increasing complexity. Kept as one constant so the
 /// compile and recompile benches share the exact same strings — the
@@ -41,7 +43,7 @@ fn synth_run_input(n: usize) -> serde_json::Value {
     let items: Vec<serde_json::Value> = (0..n)
         .map(|i| {
             serde_json::json!({
-                "x": rng.gen_range(-50i32..50),
+                "x": rng.random_range(-50i32..50),
                 "name": format!("item_{i}"),
             })
         })

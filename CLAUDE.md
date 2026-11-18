@@ -50,7 +50,7 @@ cargo fmt --all -- --check
 cargo deny check
 ```
 
-CI mirrors this exactly ([.github/workflows/ci.yml](.github/workflows/ci.yml)). MSRV is **1.94**, pinned in [rust-toolchain.toml](rust-toolchain.toml).
+CI mirrors this exactly ([.github/workflows/ci.yml](.github/workflows/ci.yml)). MSRV is **1.100**, pinned in [rust-toolchain.toml](rust-toolchain.toml).
 
 Plugin runtime tests are gated:
 

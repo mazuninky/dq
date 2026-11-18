@@ -696,7 +696,7 @@ fn run_schema_check(
     // `(instance_path, error_text)` against the same file.
     let mut seen: IndexSet<(String, String, String)> = IndexSet::new();
     for error in compiled.validator.iter_errors(value) {
-        let pointer_str = error.instance_path.as_str();
+        let pointer_str = error.instance_path().as_str();
         // The validator's error text (without the schema_path prefix)
         // is what the user sees as the actual violation. Use it for
         // dedup so duplicates at different `schema_path` locations
@@ -744,7 +744,12 @@ fn run_schema_check(
             }
         };
         let prefix = compiled.message_prefix.as_deref().unwrap_or("");
-        let keyword = error.schema_path.as_str();
+        // `evaluation_path()` is the dynamic path *including* `$ref`
+        // traversals (`/properties/x/$ref/enum`) — what jsonschema
+        // ≤ 0.38 exposed as `schema_path`. Since 0.39 `schema_path()` is
+        // the canonical location without `$ref` (`/$defs/codes/enum`);
+        // using it would silently change every diagnostic under a `$ref`.
+        let keyword = error.evaluation_path().as_str();
         let message = format!("{prefix}{keyword}: {error_text}");
         out.push(Diagnostic {
             rule_id: rule.rule.id.clone(),
@@ -1558,6 +1563,174 @@ check:
             diags[0].message.to_lowercase().contains("metadata"),
             "expected the surviving diagnostic to mention the missing property, got: {}",
             diags[0].message,
+        );
+    }
+
+    #[test]
+    fn schema_check_message_keyword_location_keeps_ref_traversal() {
+        // Pins the `<keyword_location>: <error>` message shape for an
+        // error reached through `$ref`. jsonschema ≥ 0.39 split the old
+        // `schema_path` (which included `$ref`) into `evaluation_path()`
+        // (still includes it) and `schema_path()` (canonical target,
+        // `/$defs/code/enum`). The diagnostic must keep the former.
+        let yaml = r##"
+id: test.schema-ref-location
+description: x
+severity: error
+match:
+  format: json
+check:
+  schema:
+    type: object
+    properties:
+      code:
+        $ref: "#/$defs/code"
+    $defs:
+      code:
+        enum: [AA, BB]
+"##;
+        let eval = evaluator_from_yaml(yaml);
+        let value = json!({"code": "CC"});
+        let owned = ir_for_test(&value, "json");
+        let diags = eval.evaluate_file(&Utf8PathBuf::from("d.json"), &owned.to_borrowed(), "json");
+        assert_eq!(diags.len(), 1, "expected one diagnostic, got: {diags:?}");
+        assert_eq!(
+            diags[0].message,
+            r#"/properties/code/$ref/enum: "CC" is not one of "AA" or "BB""#,
+        );
+    }
+
+    /// Build an evaluator around a one-rule ruleset whose `check.schema` is
+    /// the given inline JSON text.
+    fn compile_root_schema(schema: &str) -> Result<Evaluator> {
+        Evaluator::new(vec![ruleset_from_yaml(&format!(
+            "id: test.schema-root-draft\ndescription: x\nseverity: error\nmatch:\n  format: \
+             json\ncheck:\n  schema: {schema}\n"
+        ))])
+    }
+
+    /// Diagnostic messages the schema produces for `value`.
+    fn root_schema_messages(schema: &str, value: serde_json::Value) -> Vec<String> {
+        let owned = ir_for_test(&value, "json");
+        compile_root_schema(schema)
+            .expect("build evaluator")
+            .evaluate_file(&Utf8PathBuf::from("d.json"), &owned.to_borrowed(), "json")
+            .into_iter()
+            .map(|diag| diag.message)
+            .collect()
+    }
+
+    /// The compile error the schema is rejected with, rendered.
+    fn root_schema_compile_error(schema: &str) -> String {
+        match compile_root_schema(schema) {
+            Ok(_) => panic!("schema must fail to compile: {schema}"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    #[test]
+    fn schema_check_validates_a_root_draft_07_schema_as_2020_12() {
+        // jsonschema 0.34 compiled a root `$schema` of draft-04/06/07 but
+        // validated nothing. 0.61 validates it — with 2020-12 semantics,
+        // since the validator is built with an explicit 2020-12 draft. The
+        // owner kept the new behaviour; this pins it.
+        let draft7 = r##""http://json-schema.org/draft-07/schema#""##;
+
+        assert_eq!(
+            root_schema_messages(
+                &format!(r#"{{"$schema": {draft7}, "required": ["zz"]}}"#),
+                json!({}),
+            ),
+            vec![r#"/required: "zz" is a required property"#.to_owned()],
+        );
+        assert_eq!(
+            root_schema_messages(
+                &format!(r#"{{"$schema": {draft7}, "type": "object"}}"#),
+                json!([1]),
+            ),
+            vec![r#"/type: [1] is not of type "object""#.to_owned()],
+        );
+        // 2020-12, not draft-07: a keyword next to `$ref` still applies...
+        assert_eq!(
+            root_schema_messages(
+                &format!(
+                    r##"{{"$schema": {draft7}, "$ref": "#/definitions/x",
+                        "definitions": {{"x": {{}}}}, "required": ["zz"]}}"##
+                ),
+                json!({}),
+            ),
+            vec![r#"/required: "zz" is a required property"#.to_owned()],
+        );
+        // ...and the draft-07 array form of `items` fails the compile.
+        let err = root_schema_compile_error(&format!(
+            r#"{{"$schema": {draft7}, "items": [{{"type": "string"}}]}}"#
+        ));
+        assert!(
+            err.contains("schema failed to compile")
+                && err.contains(r#"[{"type":"string"}] is not of types "boolean", "object""#),
+            "array-form `items` must be rejected as under 2020-12, got: {err}",
+        );
+    }
+
+    #[test]
+    fn schema_check_validates_root_draft_04_and_06_schemas_as_2020_12() {
+        // Same silent-to-validating change as draft-07 (see above): the
+        // root `$schema` of an older draft no longer disables validation.
+        for draft in [
+            "http://json-schema.org/draft-04/schema#",
+            "http://json-schema.org/draft-06/schema#",
+        ] {
+            assert_eq!(
+                root_schema_messages(
+                    &format!(r#"{{"$schema": "{draft}", "required": ["zz"]}}"#),
+                    json!({}),
+                ),
+                vec![r#"/required: "zz" is a required property"#.to_owned()],
+                "{draft}: `required` must produce a diagnostic",
+            );
+            assert_eq!(
+                root_schema_messages(
+                    &format!(r#"{{"$schema": "{draft}", "type": "object"}}"#),
+                    json!([1]),
+                ),
+                vec![r#"/type: [1] is not of type "object""#.to_owned()],
+                "{draft}: `type` must produce a diagnostic",
+            );
+            // Negative of the pair: a conforming instance stays clean.
+            assert!(
+                root_schema_messages(
+                    &format!(r#"{{"$schema": "{draft}", "required": ["zz"], "type": "object"}}"#),
+                    json!({"zz": 1}),
+                )
+                .is_empty(),
+                "{draft}: a conforming instance must not be flagged",
+            );
+        }
+    }
+
+    #[test]
+    fn schema_check_rejects_boolean_exclusive_minimum_under_a_root_draft_04_schema() {
+        // Draft-04 spelled `exclusiveMinimum` as a boolean modifier of
+        // `minimum`. Under the 2020-12 semantics the schema is compiled with
+        // it is a number keyword, so the draft-04 form no longer compiles
+        // (the rule fails to load, exit 3); jsonschema 0.34 accepted it.
+        let err = root_schema_compile_error(
+            r#"{"$schema": "http://json-schema.org/draft-04/schema#", "exclusiveMinimum": true}"#,
+        );
+        assert!(
+            err.contains("schema failed to compile")
+                && err.contains(r#"true is not of type "number""#),
+            "boolean `exclusiveMinimum` must be rejected as non-numeric, got: {err}",
+        );
+        // Pair: the 2020-12 numeric form of the same keyword compiles and validates.
+        assert_eq!(
+            root_schema_messages(
+                r#"{"$schema": "http://json-schema.org/draft-04/schema#", "exclusiveMinimum": 5}"#,
+                json!(5),
+            )
+            .len(),
+            1,
+            "numeric `exclusiveMinimum` must compile and flag the boundary value",
         );
     }
 

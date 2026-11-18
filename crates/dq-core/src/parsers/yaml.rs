@@ -34,6 +34,10 @@ impl Format for Yaml {
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<Document> {
+        // A byte order mark is not content. serde_norway's scanner reads a
+        // leading one as part of the first line, and a second top-level key
+        // then fails with "did not find expected <document start>".
+        let bytes = bytes.strip_prefix("\u{feff}".as_bytes()).unwrap_or(bytes);
         let mut documents: Vec<Value> = Vec::new();
         for de_result in serde_norway::Deserializer::from_slice(bytes) {
             let yaml: YamlValue = YamlValue::deserialize(de_result).map_err(map_yaml_err)?;
@@ -203,6 +207,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_skips_a_byte_order_mark_before_several_keys() {
+        let doc = parse("\u{feff}a: 1\nb: 2\n");
+        let Value::Map(m) = doc.value() else { panic!() };
+        let keys: Vec<&str> = m.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["a", "b"]);
+    }
+
+    #[test]
     fn parse_multi_doc_yields_multi() {
         let doc = parse("---\na: 1\n---\nb: 2\n");
         let docs = doc
@@ -219,6 +231,20 @@ mod tests {
         assert_eq!(m.get("b"), Some(&Value::Int(1)));
         assert_eq!(m.get("d"), Some(&Value::Null));
         assert_eq!(m.get("e"), Some(&Value::String("hello".into())));
+    }
+
+    #[test]
+    fn write_quotes_keys_that_would_read_back_as_null() {
+        // `""`, `~` and `null` keys all read as the empty key; `"null"`
+        // and `"~"` stay strings.
+        let doc = parse("\"\": 1\n\"null\": 2\n\"~\": 3\n");
+        let mut buf: Vec<u8> = Vec::new();
+        Yaml.write(&doc, &mut buf).unwrap();
+        assert_eq!(
+            String::from_utf8(buf.clone()).unwrap(),
+            "'': 1\n'null': 2\n'~': 3\n"
+        );
+        assert_eq!(Yaml.parse(&buf).unwrap().value(), doc.value());
     }
 
     #[test]

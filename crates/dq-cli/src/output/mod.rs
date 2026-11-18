@@ -179,16 +179,41 @@ pub trait Reporter {
 /// parallel test execution.
 #[must_use]
 pub fn resolve_color(no_color_flag: bool) -> bool {
-    if no_color_flag {
+    color_for_stream(no_color_flag, std::io::stdout().is_terminal())
+}
+
+/// Resolve whether log output should be coloured.
+///
+/// Logs go to stderr, so this is [`resolve_color`] with stderr in place of
+/// stdout: `--no-color`, then `NO_COLOR`, then `CLICOLOR_FORCE`, then
+/// whether stderr is a TTY.
+#[must_use]
+pub fn resolve_log_color(no_color_flag: bool) -> bool {
+    color_for_stream(no_color_flag, std::io::stderr().is_terminal())
+}
+
+/// Shared precedence of [`resolve_color`] and [`resolve_log_color`];
+/// `is_terminal` is the answer for the stream being coloured.
+fn color_for_stream(no_color_flag: bool, is_terminal: bool) -> bool {
+    color_decision(
+        no_color_flag,
+        std::env::var_os("NO_COLOR").is_some(),
+        std::env::var_os("CLICOLOR_FORCE").is_some(),
+        is_terminal,
+    )
+}
+
+/// The colour precedence as a pure function of its inputs.
+fn color_decision(
+    no_color_flag: bool,
+    no_color_env: bool,
+    clicolor_force_env: bool,
+    is_terminal: bool,
+) -> bool {
+    if no_color_flag || no_color_env {
         return false;
     }
-    if std::env::var_os("NO_COLOR").is_some() {
-        return false;
-    }
-    if std::env::var_os("CLICOLOR_FORCE").is_some() {
-        return true;
-    }
-    std::io::stdout().is_terminal()
+    clicolor_force_env || is_terminal
 }
 
 /// Convert a `serde_json::Value` into a `dq_core::Value` so the reporter can
@@ -236,6 +261,25 @@ mod tests {
     #[test]
     fn output_format_default_is_console() {
         assert_eq!(OutputFormat::default(), OutputFormat::Console);
+    }
+
+    #[test]
+    fn color_decision_follows_the_precedence() {
+        // (flag, NO_COLOR, CLICOLOR_FORCE, terminal) -> colour
+        let cases = [
+            ((false, false, false, true), true),
+            ((false, false, false, false), false),
+            ((false, false, true, false), true),
+            ((false, true, true, true), false),
+            ((true, false, true, true), false),
+        ];
+        for ((flag, no_color, force, tty), expected) in cases {
+            assert_eq!(
+                color_decision(flag, no_color, force, tty),
+                expected,
+                "flag={flag} NO_COLOR={no_color} CLICOLOR_FORCE={force} tty={tty}",
+            );
+        }
     }
 
     #[test]

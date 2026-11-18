@@ -14,9 +14,10 @@
 //! cheap to bench and doubles as a regression sentinel for the canonical
 //! escaping path.
 
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use dq_core::{Pointer, Segment, Value};
 use indexmap::IndexMap;
+use std::hint::black_box;
 
 const DEPTHS: &[usize] = &[1, 4, 16, 64];
 

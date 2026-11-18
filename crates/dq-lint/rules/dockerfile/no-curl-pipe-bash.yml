@@ -7,6 +7,9 @@ description: |
 severity: warn
 match:
   format: [dockerfile, yaml]
+  # `yaml` lets the fixtures spell the instruction list; the filter
+  # keeps the rule off any YAML that is not one.
+  filter: 'type == "array" and length > 0 and all(.[]; type == "object" and (.instruction | type) == "string")'
 check:
   jq: '.[] | select(.instruction == "RUN") | select(.arguments | tostring | test("(curl|wget)[^|]*\\|\\s*(ba)?sh"))'
   message: "RUN line {{ .line }} pipes curl/wget into a shell"

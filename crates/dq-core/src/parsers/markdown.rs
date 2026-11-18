@@ -35,10 +35,11 @@
 //! `comrak::format_commonmark` would silently strip trailing whitespace,
 //! flip fence characters, and reorder reference-link definitions.
 
+use std::collections::HashMap;
 use std::io::Write;
 
 use camino::Utf8PathBuf;
-use comrak::nodes::{AstNode, NodeValue, Sourcepos};
+use comrak::nodes::{AstNode, LineColumn, NodeValue, Sourcepos};
 use comrak::{Arena, Options, parse_document};
 use indexmap::IndexMap;
 
@@ -159,6 +160,7 @@ fn parse_to_value(bytes: &[u8]) -> Result<Value> {
         message: format!("invalid UTF-8 in Markdown input: {e}"),
     })?;
     let root = parse_document(&arena, body_str, &opts);
+    restore_link_definition_starts(root, body_str, &opts);
 
     // 3. Walk the AST. The comrak top-level node is always `NodeValue::Document`;
     //    we want a `{ "type": "document", "frontmatter": …, "children": [...] }`
@@ -174,6 +176,352 @@ fn parse_to_value(bytes: &[u8]) -> Result<Value> {
     doc_map.insert("position".to_owned(), sourcepos_to_value(pos));
 
     Ok(Value::Map(doc_map))
+}
+
+/// Move the start of every paragraph / setext heading that was preceded by
+/// consumed link reference definitions back onto the first definition, the
+/// way comrak 0.52 reported it.
+///
+/// comrak strips leading `[label]: url` definitions out of a paragraph, and
+/// since 1.0 the paragraph's `sourcepos.start` points at the first line left
+/// after them; 0.52 reported the line of the first definition and the byte
+/// column where it begins. The M9 IR has no node for a definition, so keeping
+/// the 1.0 value would make the definition lines look like blank lines to
+/// rules that measure gaps between blocks
+/// (`@std/markdown/no-multiple-blank-lines`).
+///
+/// The consumed definitions are recovered from the source: they are the
+/// non-blank lines directly above the node that lie inside the node's
+/// containers and are claimed by no block node other than those containers,
+/// because nothing but a consumed definition can sit there without being a
+/// node of its own. Only the start is touched; `end` is left as comrak
+/// reports it.
+///
+/// comrak moves every referenced footnote definition to the end of the
+/// document and drops the unreferenced ones, so in `root` a footnote neither
+/// sits in the containers it was written in nor, when dropped, claims its
+/// lines. When the source can hold a footnote, the scan runs on a second
+/// parse that leaves the definitions where they were written, and its
+/// results are carried over to `root` by the nodes' unchanged comrak
+/// positions.
+fn restore_link_definition_starts<'a>(root: &'a AstNode<'a>, source: &str, opts: &Options<'_>) {
+    let lines = split_lines(source);
+    let restored = if source.contains("[^") {
+        let arena = Arena::new();
+        let mut in_place = opts.clone();
+        in_place.parse.leave_footnote_definitions = true;
+        restored_starts(parse_document(&arena, source, &in_place), &lines)
+    } else {
+        restored_starts(root, &lines)
+    };
+    if restored.is_empty() {
+        return;
+    }
+    for node in root.descendants() {
+        let mut data = node.data.borrow_mut();
+        if !is_restorable(&data.value) {
+            continue;
+        }
+        if let Some(&(line, column)) = restored.get(&position_key(data.sourcepos)) {
+            data.sourcepos.start.line = line;
+            data.sourcepos.start.column = column;
+        }
+    }
+}
+
+/// Paragraphs and setext headings can open with consumed definitions. ATX
+/// headings interrupt a paragraph, so a definition above one is a standalone
+/// block and not part of the heading.
+fn is_restorable(value: &NodeValue) -> bool {
+    match value {
+        NodeValue::Paragraph => true,
+        NodeValue::Heading(h) => h.setext,
+        _ => false,
+    }
+}
+
+/// A node's comrak position as a map key.
+fn position_key(pos: Sourcepos) -> (usize, usize, usize, usize) {
+    (
+        pos.start.line,
+        pos.start.column,
+        pos.end.line,
+        pos.end.column,
+    )
+}
+
+/// The restored `(line, column)` start of every restorable node under `root`
+/// that opens with consumed definitions, keyed by its comrak position.
+fn restored_starts<'a>(
+    root: &'a AstNode<'a>,
+    lines: &[&str],
+) -> HashMap<(usize, usize, usize, usize), (usize, usize)> {
+    let cover = block_cover(root, lines.len());
+    let mut restored = HashMap::new();
+    for node in root.descendants() {
+        let pos = node.data.borrow().sourcepos;
+        if !is_restorable(&node.data.borrow().value) {
+            continue;
+        }
+        let scope = ContainerScope::of(node);
+        let Some((line, column)) = first_definition(lines, &cover, &scope, pos.start.line) else {
+            continue;
+        };
+        let column = column + task_box_width(node, pos.start);
+        restored.insert(position_key(pos), (line, column));
+    }
+    restored
+}
+
+/// Split `source` into lines the way comrak does: `\n`, `\r\n` and a lone
+/// `\r` each end a line. Terminators are not part of the returned lines.
+fn split_lines(source: &str) -> Vec<&str> {
+    let bytes = source.as_bytes();
+    let mut lines = Vec::new();
+    let mut line_start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' => {
+                lines.push(&source[line_start..i]);
+                i += 1;
+                line_start = i;
+            }
+            b'\r' => {
+                lines.push(&source[line_start..i]);
+                i += if bytes.get(i + 1) == Some(&b'\n') {
+                    2
+                } else {
+                    1
+                };
+                line_start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    if line_start < bytes.len() {
+        lines.push(&source[line_start..]);
+    }
+    lines
+}
+
+/// For every 1-based line, the number of block nodes (the document aside)
+/// whose source range covers it, as comrak reported the ranges.
+fn block_cover<'a>(root: &'a AstNode<'a>, line_count: usize) -> Vec<usize> {
+    let mut delta = vec![0_isize; line_count + 2];
+    for node in root.descendants().skip(1) {
+        let data = node.data.borrow();
+        if !data.value.block() {
+            continue;
+        }
+        let pos = data.sourcepos;
+        let first = pos.start.line;
+        let last = pos.end.line.min(line_count);
+        if first == 0 || first > last {
+            continue;
+        }
+        delta[first] += 1;
+        delta[last + 1] -= 1;
+    }
+    let mut cover = Vec::with_capacity(delta.len());
+    let mut running = 0_isize;
+    for d in delta {
+        running += d;
+        cover.push(running.unsigned_abs());
+    }
+    cover
+}
+
+/// Width of the task box (`[x] `) comrak found on the first line left after
+/// the consumed definitions of a task item's paragraph, or 0.
+///
+/// comrak 0.52 shifted such a paragraph's start column right by the width of
+/// the box even though the box sat on a later line than the definition the
+/// start pointed at; keep that so columns match 0.52.
+fn task_box_width<'a>(node: &'a AstNode<'a>, start: LineColumn) -> usize {
+    let Some(item) = node.parent() else {
+        return 0;
+    };
+    let is_first_child = item
+        .first_child()
+        .is_some_and(|first| first.same_node(node));
+    let NodeValue::TaskItem(task) = &item.data.borrow().value else {
+        return 0;
+    };
+    let symbol = task.symbol_sourcepos.start;
+    if !is_first_child || symbol.line != start.line || symbol.column < 2 {
+        return 0;
+    }
+    // The box opens one byte before the symbol; comrak starts the paragraph
+    // right after the box and its trailing blank.
+    start.column.saturating_sub(symbol.column - 1)
+}
+
+/// A container whose marker or indentation prefixes the source lines of the
+/// blocks inside it.
+#[derive(Debug, Clone, Copy)]
+enum Container {
+    BlockQuote,
+    /// A list item (task item or not) whose marker sits on `line`. A task
+    /// box is never stripped: it always sits on the first line comrak left
+    /// in the paragraph, which the scan does not reach.
+    Item {
+        line: usize,
+    },
+    /// A footnote definition whose `[^label]:` sits on `line`.
+    Footnote {
+        line: usize,
+    },
+}
+
+/// Where a restorable block sits: its prefixing containers (outermost
+/// first), how many block ancestors cover its lines, and the first line it
+/// may extend up to.
+#[derive(Debug)]
+struct ContainerScope {
+    containers: Vec<Container>,
+    depth: usize,
+    first_line: usize,
+}
+
+impl Container {
+    fn of<'a>(node: &'a AstNode<'a>) -> Option<Self> {
+        let data = node.data.borrow();
+        let line = data.sourcepos.start.line;
+        match &data.value {
+            NodeValue::BlockQuote => Some(Self::BlockQuote),
+            NodeValue::Item(_) | NodeValue::TaskItem(_) => Some(Self::Item { line }),
+            NodeValue::FootnoteDefinition(_) => Some(Self::Footnote { line }),
+            _ => None,
+        }
+    }
+}
+
+impl ContainerScope {
+    fn of<'a>(node: &'a AstNode<'a>) -> Self {
+        let mut containers = Vec::new();
+        let mut depth = 0;
+        let mut first_line = 1;
+        for ancestor in node.ancestors().skip(1) {
+            if matches!(ancestor.data.borrow().value, NodeValue::Document) {
+                break;
+            }
+            if depth == 0 {
+                first_line = ancestor.data.borrow().sourcepos.start.line.max(1);
+            }
+            depth += 1;
+            containers.extend(Container::of(ancestor));
+        }
+        containers.reverse();
+        Self {
+            containers,
+            depth,
+            first_line,
+        }
+    }
+}
+
+/// `(line, column)` of the first consumed link reference definition directly
+/// above a block that comrak starts on `start_line`: 1-based line and byte
+/// column of the definition's `[`. `None` when no definition was consumed.
+fn first_definition(
+    lines: &[&str],
+    cover: &[usize],
+    scope: &ContainerScope,
+    start_line: usize,
+) -> Option<(usize, usize)> {
+    let mut first = None;
+    for line in (scope.first_line..start_line).rev() {
+        // A line claimed by a block outside the node's containers — the
+        // previous sibling or a footnote definition — is not one of the
+        // node's definitions. A `[^label]: url` line inside the run is: comrak
+        // consumes it as a link reference definition with label `^label`.
+        if cover.get(line).copied().unwrap_or(0) > scope.depth {
+            break;
+        }
+        let Some(offset) = lines
+            .get(line - 1)
+            .and_then(|text| content_offset(text, line, &scope.containers))
+        else {
+            break;
+        };
+        first = Some((line, offset));
+    }
+    let (line, offset) = first?;
+    // The topmost line must open a definition; otherwise the span belongs to
+    // a previous block whose `end` comrak under-reported. A `[^label]:` that
+    // opens a block is a footnote definition, not a link reference one.
+    let rest = &lines[line - 1][offset..];
+    (rest.starts_with('[') && !rest.starts_with("[^")).then_some((line, offset + 1))
+}
+
+/// Byte offset of the first content character on source line `line_no`
+/// (`text`) once the prefixes of `containers` are stripped, or `None` when
+/// nothing but container markers and whitespace is left.
+fn content_offset(text: &str, line_no: usize, containers: &[Container]) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut pos = if line_no == 1 && text.starts_with('\u{feff}') {
+        '\u{feff}'.len_utf8()
+    } else {
+        0
+    };
+    for container in containers {
+        pos = skip_blanks(bytes, pos);
+        match *container {
+            Container::BlockQuote => {
+                if bytes.get(pos) != Some(&b'>') {
+                    // A lazy continuation line carries no further markers.
+                    break;
+                }
+                pos += 1;
+            }
+            Container::Item { line } if line == line_no => {
+                pos = skip_list_marker(bytes, pos);
+            }
+            Container::Footnote { line } if line == line_no => {
+                pos = skip_footnote_label(bytes, pos);
+            }
+            // Continuation lines of items and footnotes are only indented.
+            Container::Item { .. } | Container::Footnote { .. } => {}
+        }
+    }
+    let pos = skip_blanks(bytes, pos);
+    (pos < bytes.len()).then_some(pos)
+}
+
+fn skip_blanks(bytes: &[u8], pos: usize) -> usize {
+    pos + bytes.get(pos..).map_or(0, |rest| {
+        rest.iter()
+            .take_while(|b| matches!(b, b' ' | b'\t'))
+            .count()
+    })
+}
+
+/// Skip a bullet (`-`, `+`, `*`) or ordered (`1.`, `1)`) list marker.
+fn skip_list_marker(bytes: &[u8], pos: usize) -> usize {
+    let rest = bytes.get(pos..).unwrap_or_default();
+    match rest {
+        [b'-' | b'+' | b'*', ..] => pos + 1,
+        _ => {
+            let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+            match rest.get(digits) {
+                Some(b'.' | b')') if digits > 0 => pos + digits + 1,
+                _ => pos,
+            }
+        }
+    }
+}
+
+/// Skip a `[^label]:` footnote definition label.
+fn skip_footnote_label(bytes: &[u8], pos: usize) -> usize {
+    let rest = bytes.get(pos..).unwrap_or_default();
+    if !rest.starts_with(b"[^") {
+        return pos;
+    }
+    match rest.iter().position(|&b| b == b']') {
+        Some(close) if rest.get(close + 1) == Some(&b':') => pos + close + 2,
+        _ => pos,
+    }
 }
 
 /// Build the `comrak::Options` configuration shared by every parse.
@@ -308,7 +656,7 @@ fn node_fields<'a>(
             fields.insert("children".to_owned(), children_of(node));
             ("list_item", fields, true)
         }
-        NodeValue::ThematicBreak => ("thematic_break", fields, true),
+        NodeValue::ThematicBreak(_) => ("thematic_break", fields, true),
         NodeValue::HtmlBlock(h) => {
             fields.insert("value".to_owned(), Value::String(h.literal.clone()));
             ("html_block", fields, true)
@@ -317,8 +665,8 @@ fn node_fields<'a>(
             fields.insert("children".to_owned(), children_of(node));
             ("table", fields, true)
         }
-        NodeValue::TableRow(is_header) => {
-            fields.insert("header".to_owned(), Value::Bool(*is_header));
+        NodeValue::TableRow(row) => {
+            fields.insert("header".to_owned(), Value::Bool(row.header));
             fields.insert("children".to_owned(), children_of(node));
             ("table_row", fields, true)
         }
@@ -346,15 +694,15 @@ fn node_fields<'a>(
             fields.insert("value".to_owned(), Value::String(s.clone()));
             ("html_inline", fields, false)
         }
-        NodeValue::Emph => {
+        NodeValue::Emph(_) => {
             fields.insert("children".to_owned(), children_of(node));
             ("emphasis", fields, false)
         }
-        NodeValue::Strong => {
+        NodeValue::Strong(_) => {
             fields.insert("children".to_owned(), children_of(node));
             ("strong", fields, false)
         }
-        NodeValue::Strikethrough => {
+        NodeValue::Strikethrough(_) => {
             fields.insert("children".to_owned(), children_of(node));
             ("strikethrough", fields, false)
         }
@@ -685,6 +1033,223 @@ mod tests {
         assert_eq!(node_type(cb), "code_block");
         assert_eq!(field(cb, "fenced"), &Value::Bool(false));
         assert_eq!(field(cb, "lang"), &Value::Null);
+    }
+
+    #[test]
+    fn indented_code_block_position_ends_at_its_last_character() {
+        // comrak 1.0: the block ends on its last line, not at the start of
+        // the next one.
+        let doc = Markdown.parse(b"    code\n    more\n").expect("parse");
+        let position = field(&doc_children(&doc)[0], "position");
+        let point = |key: &str| {
+            (
+                field(field(position, key), "line").clone(),
+                field(field(position, key), "column").clone(),
+            )
+        };
+        assert_eq!(point("start"), (Value::Int(1), Value::Int(5)));
+        assert_eq!(point("end"), (Value::Int(2), Value::Int(8)));
+    }
+
+    /// `(line, column)` of `position.start` for the block child at `index`.
+    fn start_of(doc: &Document, index: usize) -> (Value, Value) {
+        let start = field(field(&doc_children(doc)[index], "position"), "start");
+        (field(start, "line").clone(), field(start, "column").clone())
+    }
+
+    #[test]
+    fn paragraph_start_points_at_first_consumed_link_definition() {
+        // comrak 1.0 reports the line after the definitions; 0.52 reported
+        // the first definition. The IR has no definition node, so the gap to
+        // the heading must stay one blank line.
+        let doc = Markdown
+            .parse(b"# T\n\n[a]: http://a\n[b]: http://b\nSee [here](x).\n")
+            .expect("parse");
+        assert_eq!(start_of(&doc, 1), (Value::Int(3), Value::Int(1)));
+        let doc = Markdown.parse(b"[ref]: http://r\nSee x.\n").expect("parse");
+        assert_eq!(start_of(&doc, 0), (Value::Int(1), Value::Int(1)));
+    }
+
+    #[test]
+    fn paragraph_start_ignores_definitions_separated_by_a_blank_line() {
+        let doc = Markdown.parse(b"[a]: http://a\n\nSee x.\n").expect("parse");
+        assert_eq!(start_of(&doc, 0), (Value::Int(3), Value::Int(1)));
+    }
+
+    #[test]
+    fn paragraph_start_after_definition_keeps_indentation_and_crlf() {
+        let doc = Markdown
+            .parse(b"# T\r\n\r\n  [a]: http://a\r\nSee x.\r\n")
+            .expect("parse");
+        assert_eq!(start_of(&doc, 1), (Value::Int(3), Value::Int(3)));
+    }
+
+    #[test]
+    fn nested_paragraph_start_points_at_consumed_link_definition() {
+        let doc = Markdown
+            .parse(b"> [a]: http://a\n> See x.\n")
+            .expect("parse");
+        let quote = &doc_children(&doc)[0];
+        let Value::Array(items) = field(quote, "children") else {
+            panic!("block_quote children must be an array");
+        };
+        let start = field(field(&items[0], "position"), "start");
+        assert_eq!(field(start, "line"), &Value::Int(1));
+        assert_eq!(field(start, "column"), &Value::Int(3));
+    }
+
+    #[test]
+    fn setext_heading_start_points_at_first_consumed_link_definition() {
+        let doc = Markdown
+            .parse(b"[a]: http://a\nTitle\n=====\n")
+            .expect("parse");
+        assert_eq!(start_of(&doc, 0), (Value::Int(1), Value::Int(1)));
+    }
+
+    #[test]
+    fn atx_heading_start_is_not_moved_onto_a_preceding_definition() {
+        let doc = Markdown.parse(b"[a]: http://a\n# H\n").expect("parse");
+        assert_eq!(start_of(&doc, 0), (Value::Int(2), Value::Int(1)));
+    }
+
+    /// `(line, column)` of `position.start` for the node reached from the
+    /// document by following `path` through `children` arrays.
+    fn start_at(src: &[u8], path: &[usize]) -> (i64, i64) {
+        let doc = Markdown.parse(src).expect("parse");
+        let mut node = doc.value();
+        for &index in path {
+            let Value::Array(children) = field(node, "children") else {
+                panic!("children must be an array");
+            };
+            node = &children[index];
+        }
+        let start = field(field(node, "position"), "start");
+        let (Value::Int(line), Value::Int(column)) = (field(start, "line"), field(start, "column"))
+        else {
+            panic!("start must carry integer line and column");
+        };
+        (*line, *column)
+    }
+
+    // comrak moves footnote definitions to the end of the tree, so the tree
+    // sibling before these paragraphs is the block above the footnote.
+
+    #[test]
+    fn paragraph_after_footnote_with_atx_heading_keeps_its_start() {
+        let src = b"# T\n\nx[^1]\n\n[^1]: # H\npara\n";
+        assert_eq!(start_at(src, &[2]), (6, 1));
+    }
+
+    #[test]
+    fn paragraph_after_footnote_with_fenced_code_keeps_its_start() {
+        let src = b"# T\n\nx[^1]\n\n[^1]:\n    ```\n    c\n    ```\npara\n";
+        assert_eq!(start_at(src, &[2]), (9, 1));
+    }
+
+    #[test]
+    fn definition_scan_stops_at_lines_of_a_preceding_block() {
+        // The setext heading's lines are not definitions, even though its
+        // first line opens with `[`.
+        assert_eq!(start_at(b"[x] title\n===\n[a]: /u\npara\n", &[1]), (3, 1));
+        // Same for a footnote definition comrak moved to the end of the tree.
+        let src = b"# T\n\nx[^1]\n\n[^1]: [y] t\n    ===\n[a]: /u\npara\n";
+        assert_eq!(start_at(src, &[2]), (7, 1));
+    }
+
+    #[test]
+    fn block_inside_footnote_is_not_moved_onto_the_footnote_label() {
+        assert_eq!(start_at(b"x[^1]\n\n[^1]:\n    para\n", &[1, 0]), (4, 5));
+        assert_eq!(
+            start_at(b"x[^1]\n\n[^1]:\n    T\n    ==\n", &[1, 0]),
+            (4, 5)
+        );
+    }
+
+    #[test]
+    fn paragraph_inside_footnote_starts_at_its_consumed_definition() {
+        let src = b"x[^1]\n\n[^1]:\n    [a]: /u\n    para\n";
+        assert_eq!(start_at(src, &[1, 0]), (4, 5));
+        // A definition on the label line itself, after `[^1]: `.
+        let src = b"[^1]: [a]: /u\n    para\n\nx[^1]\n";
+        assert_eq!(start_at(src, &[1, 0]), (1, 7));
+    }
+
+    #[test]
+    fn item_paragraph_after_a_bare_marker_line_starts_at_its_definition() {
+        assert_eq!(start_at(b"-\n  [a]: /u\n  b\n", &[0, 0, 0]), (2, 3));
+        assert_eq!(start_at(b"- \n  [a]: /u\n  b\n", &[0, 0, 0]), (2, 3));
+        assert_eq!(start_at(b"1.\n   [a]: /u\n   b\n", &[0, 0, 0]), (2, 4));
+    }
+
+    #[test]
+    fn paragraph_start_after_definition_with_cr_only_line_breaks() {
+        assert_eq!(start_at(b"# T\r\r[a]: /u\rpara\r", &[1]), (3, 1));
+    }
+
+    #[test]
+    fn paragraph_start_after_definition_counts_the_bom_in_the_column() {
+        assert_eq!(start_at("\u{feff}[a]: /u\npara\n".as_bytes(), &[0]), (1, 4));
+    }
+
+    #[test]
+    fn nested_paragraph_start_takes_the_definition_column() {
+        // Lazy continuation: the definition sits after `> `.
+        assert_eq!(start_at(b"> [a]: /u\npara\n", &[0, 0]), (1, 3));
+        assert_eq!(
+            start_at(b"> > x\n> >\n> >  [a]: /u\n> > p\n", &[0, 0, 1]),
+            (3, 6)
+        );
+        // The definition is indented past the item's content column.
+        assert_eq!(start_at(b"- x\n\n   [a]: /u\n  p\n", &[0, 0, 1]), (3, 4));
+    }
+
+    // comrak drops a footnote definition nothing references, so the parsed
+    // tree has no node over its lines.
+
+    #[test]
+    fn paragraph_after_unreferenced_footnote_keeps_its_start() {
+        assert_eq!(start_at(b"[a]: /u\n[^m]: # h\nb\n", &[0]), (3, 1));
+        assert_eq!(start_at(b"[a]: /u\n[^m]: ***\nb\n", &[0]), (3, 1));
+        // The footnote's lazy continuation lines are not definitions either.
+        let src = b"[^m]:\t[x] y\r  [e]: <a b>\r\t<!-- c -->\r\nx\n";
+        assert_eq!(start_at(src, &[0]), (4, 1));
+    }
+
+    #[test]
+    fn paragraph_after_unreferenced_footnote_starts_at_its_definition() {
+        assert_eq!(start_at(b"[^m]: # h\n[a]: /u\nb\n", &[0]), (2, 1));
+    }
+
+    #[test]
+    fn caret_label_inside_a_definition_run_is_a_consumed_definition() {
+        // Inside a paragraph `[^1]: f` cannot open a footnote, so comrak
+        // consumes it as a link reference definition labelled `^1`.
+        let src = b"> [h]: /h\n\t[^1]: f\n>\t\t---\n\nx[^1]\n";
+        assert_eq!(start_at(src, &[0, 0]), (1, 3));
+    }
+
+    #[test]
+    fn task_item_paragraph_starts_at_the_definition_above_its_box() {
+        // 0.52 shifted the column right by the width of the box (`[x] `).
+        assert_eq!(start_at(b"- [a]: /u\n[x] y\n", &[0, 0, 0]), (1, 7));
+        assert_eq!(start_at(b"- [a]: /u\n  [x] y\n", &[0, 0, 0]), (1, 7));
+        assert_eq!(start_at(b"> - [a]: /u\n[x] y\n", &[0, 0, 0, 0]), (1, 9));
+    }
+
+    #[test]
+    fn footnote_written_in_a_container_strips_the_container_prefix() {
+        // comrak moves the footnote definition to the document root.
+        let src = b"> [^1]: [a]: /u\n>     b\n\nx[^1]\n";
+        assert_eq!(start_at(src, &[2, 0]), (1, 9));
+        let src = b"- [^1]: [a]: /u\n      b\n\nx[^1]\n";
+        assert_eq!(start_at(src, &[2, 0]), (1, 9));
+    }
+
+    #[test]
+    fn split_lines_breaks_on_lf_crlf_and_lone_cr() {
+        assert_eq!(split_lines("a\nb\r\nc\rd"), vec!["a", "b", "c", "d"]);
+        assert_eq!(split_lines("a\n\n"), vec!["a", ""]);
+        assert!(split_lines("").is_empty());
     }
 
     #[test]
