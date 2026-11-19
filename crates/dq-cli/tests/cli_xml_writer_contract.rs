@@ -545,6 +545,20 @@ fn a_refused_xml_write_leaves_the_file_untouched() {
         (1, Vec::new(), format!("{ASCII_REFUSAL}\n"))
     );
     assert_eq!(read(&dir, "a.xml"), ASCII_XML);
+    assert_eq!(
+        run(
+            &dir,
+            &["-i", "set", "c.xml", "--jq", ".r[0].\"#text\" = \"ж\""]
+        ),
+        (
+            1,
+            Vec::new(),
+            "xml format error: XML write: '#xml' declares encoding \"ISO-8859-1\", which cannot \
+             hold U+0436 in <r>\n"
+                .to_owned()
+        )
+    );
+    assert_eq!(read(&dir, "c.xml"), LATIN_XML);
 
     assert_eq!(
         run(&dir, &["-i", "set", "*.xml", "--jq", SET_E_ACUTE]),
@@ -1015,5 +1029,397 @@ fn undeclaring_a_prefix_needs_xml_1_1() {
                 refused("'xmlns:p' on <r> is empty: XML namespaces 1.0 cannot undeclare a prefix"),
             ),
         ],
+    );
+}
+
+const SET_ZHE: &str = ".r[0].\"#text\" = \"ж\"";
+
+/// `#xml.detected` survives every road that writes a file back: `set
+/// --jq` to stdout, `set -i --jq`, `fmt -i` and a bulk `-i` run, which
+/// counts every file Modified. A file led by a processing instruction,
+/// not a declaration, keeps its byte order too. Before, each BOM-less
+/// UTF-16 file came back as UTF-8, and the UTF-8 one under a UTF-16 label
+/// as UTF-16 with a BOM.
+#[test]
+fn detected_survives_set_fmt_and_a_bulk_run() {
+    let decl = "<?xml version=\"1.0\"?>";
+    let pi = "<?xml-stylesheet type=\"text/xsl\" href=\"s.xsl\"?>";
+    let net = |text: &str| format!("<?xml version=\"1.0\" encoding=\"utf-16\"?><r>{text}</r>");
+    let le = utf16(&format!("{decl}<r>\u{e9}</r>"), false);
+    let be = utf16(&format!("{decl}<r>\u{e9}</r>"), true);
+    let pi_be = utf16(&format!("{pi}<r>\u{e9}</r>"), true);
+    let net_e = net("\u{e9}");
+    let files: [(&str, &[u8]); 5] = [
+        ("le.xml", &le),
+        ("be.xml", &be),
+        ("pi.xml", &pi_be),
+        ("net.xml", net_e.as_bytes()),
+        ("plain.xml", "<r>\u{e9}</r>".as_bytes()),
+    ];
+    let dir = dir_with(&files);
+    assert_eq!(
+        run(&dir, &["set", "le.xml", "--jq", SET_ZHE]),
+        (0, utf16(&format!("{decl}<r>ж</r>"), false), String::new())
+    );
+    assert_eq!(read(&dir, "le.xml"), le);
+    for args in [
+        ["-i", "set", "be.xml", "--jq", SET_ZHE],
+        ["-i", "set", "pi.xml", "--jq", SET_ZHE],
+    ] {
+        assert_eq!(run(&dir, &args), (0, Vec::new(), String::new()), "{args:?}");
+    }
+    assert_eq!(
+        read(&dir, "be.xml"),
+        utf16(&format!("{decl}<r>ж</r>"), true)
+    );
+    assert_eq!(read(&dir, "pi.xml"), utf16(&format!("{pi}<r>ж</r>"), true));
+    assert_eq!(
+        run(&dir, &["fmt", "le.xml", "-i"]),
+        (0, Vec::new(), String::new())
+    );
+    assert_eq!(read(&dir, "le.xml"), le);
+
+    let dir = dir_with(&files);
+    let (code, stdout, stderr) = run(&dir, &["-i", "set", "*.xml", "--jq", SET_ZHE]);
+    assert_eq!(
+        (code, String::from_utf8_lossy(&stdout).into_owned(), stderr),
+        (
+            0,
+            "Modified: 5, Skipped: 0, Failed: 0\n".to_owned(),
+            String::new()
+        )
+    );
+    assert_eq!(
+        ["le.xml", "be.xml", "pi.xml", "net.xml", "plain.xml"].map(|file| read(&dir, file)),
+        [
+            utf16(&format!("{decl}<r>ж</r>"), false),
+            utf16(&format!("{decl}<r>ж</r>"), true),
+            utf16(&format!("{pi}<r>ж</r>"), true),
+            net("ж").into_bytes(),
+            "<r>ж</r>".as_bytes().to_vec(),
+        ]
+    );
+}
+
+/// `detected` is one of three names or null: a number, a boolean, a map or
+/// an array is refused naming what it got, a null is no field at all, and
+/// `detected: UTF-8` under a label that is not UTF-16 is refused as it is
+/// under `UTF-8`.
+#[test]
+fn detected_is_one_of_three_names_or_null() {
+    let tree = |detected: &str| format!("\"#xml\": {{detected: {detected}}}\nr:\n- {{}}\n");
+    let files = [
+        ("number.yaml", tree("5")),
+        ("bool.yaml", tree("true")),
+        ("map.yaml", tree("{a: 1}")),
+        ("array.yaml", tree("[UTF-8]")),
+        ("null.yaml", tree("null")),
+        (
+            "latin.yaml",
+            "\"#xml\": {encoding: ISO-8859-1, detected: UTF-8}\nr:\n- {}\n".to_owned(),
+        ),
+    ];
+    let dir = dir_with(&files.each_ref().map(|(name, src)| (*name, src.as_bytes())));
+    let not_a_name = |got: &str| {
+        refused(&format!(
+            "'#xml' field 'detected' must be UTF-8, UTF-16LE or UTF-16BE (got \"{got}\")"
+        ))
+    };
+    assert_cases(
+        &dir,
+        &[
+            (convert("number.yaml", "xml"), not_a_name("5")),
+            (convert("bool.yaml", "xml"), not_a_name("true")),
+            (convert("map.yaml", "xml"), not_a_name("object")),
+            (convert("array.yaml", "xml"), not_a_name("array")),
+            (convert("null.yaml", "xml"), ok("<r/>")),
+            (
+                convert("latin.yaml", "xml"),
+                refused(
+                    "'#xml' field 'detected' is UTF-8, which only a UTF-16 label needs, but the \
+                     declared encoding is \"ISO-8859-1\"",
+                ),
+            ),
+        ],
+    );
+}
+
+/// The generic `UTF-16` label starts with the BOM `bom` names, big-endian
+/// included, and `UTF-16LE` takes one when `bom` names it.
+#[test]
+fn a_utf16_label_writes_the_bom_its_bom_field_names() {
+    let dir = dir_with(&[
+        (
+            "generic.yaml",
+            b"\"#xml\": {encoding: UTF-16, bom: UTF-16BE}\nr:\n- {}\n",
+        ),
+        (
+            "le.yaml",
+            b"\"#xml\": {encoding: UTF-16LE, bom: UTF-16LE}\nr:\n- {}\n",
+        ),
+    ]);
+    let written = |label: &str, big_endian: bool| {
+        utf16(
+            &format!("<?xml version=\"1.0\" encoding=\"{label}\"?><r/>"),
+            big_endian,
+        )
+    };
+    assert_cases(
+        &dir,
+        &[
+            (
+                convert("generic.yaml", "xml"),
+                ok(with_bom(&[0xFE, 0xFF], written("UTF-16", true))),
+            ),
+            (
+                convert("le.yaml", "xml"),
+                ok(with_bom(&[0xFF, 0xFE], written("UTF-16LE", false))),
+            ),
+        ],
+    );
+}
+
+/// Every namespace declaration the writer refuses, the reader refuses
+/// too, exit 3, on a start tag or an empty one: `xmlns:xmlns`, `xmlns:xml`
+/// bound elsewhere, another prefix bound to the `xml` or `xmlns` URI,
+/// `xmlns` naming an element, and `xmlns:p=""` with no declaration. Under
+/// XML 1.1 the undeclared prefix is out of scope on the undeclaring element
+/// itself, for its name and its attributes. A prefix declared on a
+/// grandparent is in scope, and the nearest declaration wins. Before, the
+/// reader took every one of these.
+#[test]
+fn the_reader_refuses_every_declaration_the_writer_does() {
+    let v11 = "<?xml version=\"1.1\"?>";
+    let files = [
+        ("xmlns.xml", "<r xmlns:xmlns=\"u\"/>".to_owned()),
+        ("xml.xml", "<r xmlns:xml=\"urn:x\"></r>".to_owned()),
+        (
+            "xml_uri.xml",
+            "<r xmlns:p=\"http://www.w3.org/XML/1998/namespace\"></r>".to_owned(),
+        ),
+        (
+            "xmlns_uri.xml",
+            "<r xmlns:p=\"http://www.w3.org/2000/xmlns/\"/>".to_owned(),
+        ),
+        ("element.xml", "<xmlns/>".to_owned()),
+        ("prefixed.xml", "<r><xmlns:k></xmlns:k></r>".to_owned()),
+        ("empty.xml", "<r xmlns:p=\"\"></r>".to_owned()),
+        (
+            "self.xml",
+            format!("{v11}<r xmlns:p=\"u\"><p:k xmlns:p=\"\"></p:k></r>"),
+        ),
+        (
+            "self_attr.xml",
+            format!("{v11}<r xmlns:p=\"u\"><k xmlns:p=\"\" p:a=\"1\"/></r>"),
+        ),
+        (
+            "grandparent.xml",
+            "<r xmlns:p=\"u\"><a><b><p:c p:x=\"1\"/></b></a></r>".to_owned(),
+        ),
+        (
+            "nearest.xml",
+            "<r xmlns:p=\"u\"><a xmlns:p=\"v\"><p:c/></a></r>".to_owned(),
+        ),
+    ];
+    let dir = dir_with(&files.each_ref().map(|(name, src)| (*name, src.as_bytes())));
+    let refused_on_read =
+        |file: &str, message: &str| unreadable(file, &format!("XML parse error: {message}"));
+    let undeclared = "uses the prefix 'p', which no 'xmlns:p' declares in scope";
+    assert_cases(
+        &dir,
+        &[
+            (
+                convert("xmlns.xml", "json"),
+                refused_on_read(
+                    "xmlns.xml",
+                    "'xmlns:xmlns' on <r> cannot be declared: the xmlns prefix is reserved",
+                ),
+            ),
+            (
+                convert("xml.xml", "json"),
+                refused_on_read(
+                    "xml.xml",
+                    "'xmlns:xml' on <r> must bind http://www.w3.org/XML/1998/namespace (got \
+                     \"urn:x\")",
+                ),
+            ),
+            (
+                convert("xml_uri.xml", "json"),
+                refused_on_read(
+                    "xml_uri.xml",
+                    "'xmlns:p' on <r> binds http://www.w3.org/XML/1998/namespace, which only the \
+                     xml prefix may",
+                ),
+            ),
+            (
+                convert("xmlns_uri.xml", "json"),
+                refused_on_read(
+                    "xmlns_uri.xml",
+                    "'xmlns:p' on <r> binds http://www.w3.org/2000/xmlns/, which nothing may",
+                ),
+            ),
+            (
+                convert("element.xml", "json"),
+                refused_on_read(
+                    "element.xml",
+                    "'xmlns' cannot name an element: the xmlns prefix is reserved for namespace \
+                     declarations",
+                ),
+            ),
+            (
+                convert("prefixed.xml", "json"),
+                refused_on_read(
+                    "prefixed.xml",
+                    "'xmlns:k' cannot name an element: the xmlns prefix is reserved for namespace \
+                     declarations",
+                ),
+            ),
+            (
+                convert("empty.xml", "json"),
+                refused_on_read(
+                    "empty.xml",
+                    "'xmlns:p' on <r> is empty: XML namespaces 1.0 cannot undeclare a prefix",
+                ),
+            ),
+            (
+                convert("self.xml", "json"),
+                refused_on_read("self.xml", &format!("element <p:k> {undeclared}")),
+            ),
+            (
+                convert("self_attr.xml", "json"),
+                refused_on_read(
+                    "self_attr.xml",
+                    &format!("attribute 'p:a' on <k> {undeclared}"),
+                ),
+            ),
+            (
+                convert("grandparent.xml", "xml"),
+                ok(
+                    "<r xmlns:p=\"u\">\n  <a>\n    <b>\n      <p:c p:x=\"1\"/>\n    </b>\n  \
+                     </a>\n</r>",
+                ),
+            ),
+            (
+                convert("nearest.xml", "xml"),
+                ok("<r xmlns:p=\"u\">\n  <a xmlns:p=\"v\">\n    <p:c/>\n  </a>\n</r>"),
+            ),
+        ],
+    );
+}
+
+/// `dq validate` reports on stderr where the reader met an undeclared
+/// prefix: the line of the tag and the column just past its end.
+#[test]
+fn an_undeclared_prefix_is_reported_with_its_line_and_column() {
+    let dir = dir_with(&[
+        ("start.xml", b"<r>\n  <a:b>t</a:b>\n</r>\n"),
+        ("empty.xml", b"<r>\n\n <k a:x=\"1\"/>\n</r>\n"),
+    ]);
+    let report = |file: &str, line: u32, col: u32, message: &str, snippet: &str| {
+        (
+            4,
+            Vec::new(),
+            format!(
+                "kind: parse\nfile: {file}\nline: {line}\ncol: {col}\nmessage: XML parse error: \
+                 {message}\nsnippet: {snippet}\n"
+            ),
+        )
+    };
+    assert_cases(
+        &dir,
+        &[
+            (
+                vec!["validate", "start.xml"],
+                report(
+                    "start.xml",
+                    2,
+                    8,
+                    "element <a:b> uses the prefix 'a', which no 'xmlns:a' declares in scope",
+                    "<r>\\n  <a:b>t</a:b>\\n</r>\\n",
+                ),
+            ),
+            (
+                vec!["validate", "empty.xml"],
+                report(
+                    "empty.xml",
+                    3,
+                    14,
+                    "attribute 'a:x' on <k> uses the prefix 'a', which no 'xmlns:a' declares in \
+                     scope",
+                    "<r>\\n\\n <k a:x=\"1\"/>\\n</r>\\n",
+                ),
+            ),
+        ],
+    );
+}
+
+/// Every label of the WHATWG `replacement` encoding is one dq cannot read,
+/// exit 3, and bytes that are no ISO-2022-JP under that label are a parse
+/// error naming it. Before, each read as UTF-8: the labels without a word,
+/// the bad bytes as invalid UTF-8.
+#[test]
+fn replacement_labels_and_bad_iso_2022_jp_are_refused_on_read() {
+    let encoding = |label: &str| format!("<?xml version=\"1.0\" encoding=\"{label}\"?><r/>");
+    let (hz, kr) = (encoding("hz-gb-2312"), encoding("csiso2022kr"));
+    let dir = dir_with(&[
+        ("hz.xml", hz.as_bytes()),
+        ("kr.xml", kr.as_bytes()),
+        (
+            "jis.xml",
+            b"<?xml version=\"1.0\" encoding=\"ISO-2022-JP\"?><r>\x1b$B\xff\xff\x1b(B</r>",
+        ),
+    ]);
+    let cannot = |file: &str, label: &str| {
+        unreadable(
+            file,
+            &format!("the XML declaration's encoding \"{label}\" is one dq cannot read"),
+        )
+    };
+    assert_cases(
+        &dir,
+        &[
+            (convert("hz.xml", "json"), cannot("hz.xml", "hz-gb-2312")),
+            (convert("kr.xml", "json"), cannot("kr.xml", "csiso2022kr")),
+            (
+                convert("jis.xml", "json"),
+                unreadable("jis.xml", "invalid ISO-2022-JP in XML input"),
+            ),
+        ],
+    );
+}
+
+/// Whitespace-only text mixing CR, CRLF, space and tab keeps every
+/// character through `set` and `set -i`, and a `#text` of U+2028 alone
+/// reads back as itself. Before, `set` wrote the CR and LF raw, and the
+/// reader took the written text for indentation.
+#[test]
+fn whitespace_only_text_survives_set_and_in_place() {
+    let dir = dir_with(&[
+        ("ws.xml", b"<r><d>&#13;&#10; &#13;\t&#10;</d><e>x</e></r>"),
+        ("sep.json", "{\"d\":[{\"#text\":\"\u{2028}\"}]}".as_bytes()),
+    ]);
+    let set_e = ".r[0].e[0].\"#text\" = \"y\"";
+    let written = "<r>\n  <d>&#13;&#10;&#32;&#13;&#9;&#10;</d>\n  <e>y</e>\n</r>";
+    assert_cases(
+        &dir,
+        &[
+            (vec!["set", "ws.xml", "--jq", set_e], ok(written)),
+            (vec!["-i", "set", "ws.xml", "--jq", set_e], ok("")),
+            (
+                convert("ws.xml", "json"),
+                ok(
+                    "{\n  \"r\": [\n    {\n      \"d\": [\n        {\n          \"#text\": \
+                     \"\\r\\n \\r\\t\\n\"\n        }\n      ],\n      \"e\": [\n        {\n          \
+                     \"#text\": \"y\"\n        }\n      ]\n    }\n  ]\n}\n",
+                ),
+            ),
+            (convert("sep.json", "xml"), ok("<d>&#x2028;</d>")),
+        ],
+    );
+    assert_eq!(read(&dir, "ws.xml"), written.as_bytes());
+    std::fs::write(dir.path().join("sep.xml"), "<d>&#x2028;</d>").expect("write sep.xml");
+    assert_eq!(
+        run(&dir, &convert("sep.xml", "json")),
+        ok("{\n  \"d\": [\n    {\n      \"#text\": \"\u{2028}\"\n    }\n  ]\n}\n")
     );
 }
