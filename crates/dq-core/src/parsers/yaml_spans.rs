@@ -52,7 +52,7 @@ use crate::ir::{InlineBaseline, Provenance, ProvenanceMap};
 use crate::pointer::Pointer;
 use crate::textual_edit::{InsertionRenderer, ScalarRenderer};
 
-use super::yaml_emit::typed_by_another_schema;
+use super::yaml_emit::{single_quotable, typed_by_another_schema};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -3040,6 +3040,9 @@ fn detect_scalar_style(bytes: &[u8]) -> ScalarStyle {
 ///   `context` is flow (flow context promotes any bare scalar containing `,`,
 ///   `]`, `}` to double-quoted).
 /// - `SingleQuoted`: wrap in single quotes; embedded `'` is doubled.
+///   A string holding a character a single-quoted scalar cannot hold as
+///   it is — a line break (NEL, LS and PS included), a control — is
+///   double-quoted instead.
 /// - `DoubleQuoted`: wrap in double quotes; control chars escape per YAML
 ///   1.2 §5.7.
 /// - `Literal` / `Folded`: downgrade to double-quoted (lose multi-line
@@ -3057,8 +3060,12 @@ fn render_string_in_style(s: &str, style: ScalarStyle, context: SpanContext) -> 
                 s.as_bytes().to_vec()
             }
         }
-        ScalarStyle::SingleQuoted => render_single_quoted(s),
-        ScalarStyle::DoubleQuoted => render_double_quoted(s),
+        // A single-quoted scalar holds no escape: a line break in it folds,
+        // and LS / PS are line breaks to a YAML 1.1 reader only.
+        ScalarStyle::SingleQuoted if s.chars().all(|c| c == '\t' || single_quotable(c)) => {
+            render_single_quoted(s)
+        }
+        ScalarStyle::SingleQuoted | ScalarStyle::DoubleQuoted => render_double_quoted(s),
         ScalarStyle::Literal | ScalarStyle::Folded => render_double_quoted(s),
     }
 }
@@ -3103,6 +3110,11 @@ fn push_double_quoted_char(out: &mut String, ch: char) {
         '\x0b' => out.push_str(r"\v"),
         '\x0c' => out.push_str(r"\f"),
         '\x1b' => out.push_str(r"\e"),
+        // Line breaks to a YAML 1.1 reader, content to a 1.2 one; escaped,
+        // every reader reads them alike.
+        '\u{85}' => out.push_str(r"\N"),
+        '\u{2028}' => out.push_str(r"\L"),
+        '\u{2029}' => out.push_str(r"\P"),
         c if (c as u32) < 0x20 => {
             // Other ASCII control chars: \xNN form.
             use std::fmt::Write as _;
@@ -3181,7 +3193,8 @@ fn needs_quoting_for_plain(s: &str) -> bool {
         // but the safe choice is to quote.
         return true;
     }
-    if s.contains('\n') || s.contains('\r') || s.contains('\t') {
+    // NEL, LS and PS are line breaks to a YAML 1.1 reader.
+    if s.contains(['\n', '\r', '\t', '\u{85}', '\u{2028}', '\u{2029}']) {
         return true;
     }
     if contains_unsafe_colon_or_hash(s) {
@@ -3230,6 +3243,24 @@ mod tests {
     use super::*;
     use crate::Pointer;
     use indexmap::IndexMap;
+
+    #[test]
+    fn a_string_with_line_and_paragraph_separators_is_rendered_escaped() {
+        let ctx = SpanContext::BlockMapValue;
+        let ls = "a\u{2028}b";
+        for style in [
+            ScalarStyle::Plain,
+            ScalarStyle::SingleQuoted,
+            ScalarStyle::Literal,
+        ] {
+            assert_eq!(render_string_in_style(ls, style, ctx), b"\"a\\Lb\"");
+        }
+        assert_eq!(yaml_key_token("\u{2029}"), "\"\\P\"");
+        assert_eq!(
+            render_string_in_style("a\tb", ScalarStyle::SingleQuoted, ctx),
+            b"'a\tb'"
+        );
+    }
 
     fn assert_span(spans: &SpanMap, pointer: &str, bytes: &[u8], expected_value: &[u8]) {
         let span = spans.get(pointer).unwrap_or_else(|| {

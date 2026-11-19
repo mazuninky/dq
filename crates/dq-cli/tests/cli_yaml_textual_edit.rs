@@ -173,3 +173,50 @@ fn del_in_place_on_single_line_json_keeps_the_other_members() {
         r#"{"b": 2}"#
     );
 }
+
+/// `set` writes a string holding LS, PS or NEL (U+2028, U+2029, U+0085) —
+/// line breaks to a YAML 1.1 reader, content to a YAML 1.2 one —
+/// double-quoted with `\L` / `\P` / `\N`, over a plain, a single-quoted,
+/// a double-quoted or a block scalar, in a flow collection, and as a new
+/// key. Before, every such `set` was refused: the value was written raw,
+/// and the edited document did not read back as the value set.
+#[test]
+fn set_writes_line_and_paragraph_separators_escaped() {
+    let src = "a: x\nb: 'y'\nc: \"z\"\nd: |\n  w\ne: [x, 'y']\nf: {g: h}\n";
+    let value = "l\u{2028}m\u{2029}n\u{85}o";
+    let quoted = "\"l\\Lm\\Pn\\No\"";
+    for (pointer, expected) in [
+        (
+            "/a",
+            format!("a: {quoted}\nb: 'y'\nc: \"z\"\nd: |\n  w\ne: [x, 'y']\nf: {{g: h}}\n"),
+        ),
+        (
+            "/b",
+            format!("a: x\nb: {quoted}\nc: \"z\"\nd: |\n  w\ne: [x, 'y']\nf: {{g: h}}\n"),
+        ),
+        (
+            "/c",
+            format!("a: x\nb: 'y'\nc: {quoted}\nd: |\n  w\ne: [x, 'y']\nf: {{g: h}}\n"),
+        ),
+        (
+            "/d",
+            format!("a: x\nb: 'y'\nc: \"z\"\nd: {quoted}\ne: [x, 'y']\nf: {{g: h}}\n"),
+        ),
+        (
+            "/e/1",
+            format!("a: x\nb: 'y'\nc: \"z\"\nd: |\n  w\ne: [x, {quoted}]\nf: {{g: h}}\n"),
+        ),
+        (
+            "/f/g",
+            format!("a: x\nb: 'y'\nc: \"z\"\nd: |\n  w\ne: [x, 'y']\nf: {{g: {quoted}}}\n"),
+        ),
+    ] {
+        assert_eq!(edit(src, &["set", pointer, value]), expected, "{pointer}");
+    }
+    assert_eq!(
+        edit("a: x\n", &["set", "/k\u{2028}", "1"]),
+        "a: x\n\"k\\L\": 1\n"
+    );
+    // A multi-line value over a single-quoted scalar, which would fold.
+    assert_eq!(edit("b: 'y'\n", &["set", "/b", "p\nq"]), "b: \"p\\nq\"\n");
+}

@@ -419,3 +419,32 @@ fn get_and_query_yaml_output_quote_a_root_scalar() {
         "- 'on': 'off'\n"
     );
 }
+
+/// LS and PS (U+2028, U+2029) are line breaks to a YAML 1.1 reader and
+/// content to a YAML 1.2 one. A string holding one is written
+/// double-quoted with `\L` / `\P` — a value, a key, a one-character
+/// string, a multi-line string (no block scalar), an item, and what XML
+/// read — so every reader reads it alike. Before, the writer put them raw
+/// in a single-quoted or a block scalar and indented the line after
+/// (`t: 't<LS>  v'`), which a YAML 1.2 reader keeps as content.
+#[test]
+fn line_and_paragraph_separators_are_written_escaped() {
+    let json = r#"{"t": "t\u2028v", "p": "c\u2029d", "n": "a\u0085b", "k\u2028": 1, "m": "x\u2028\ny", "o": "\u2028", "l": ["\u2029x"]}"#;
+    let dir = dir_with(&[
+        ("s.json", json),
+        ("s.xml", "<r a=\"x\u{2028}y\">t\u{2029}v</r>"),
+    ]);
+    let yaml = to_yaml(&dir, "s.json");
+    assert_eq!(
+        yaml,
+        "t: \"t\\Lv\"\np: \"c\\Pd\"\n'n': \"a\\Nb\"\n\"k\\L\": 1\nm: \"x\\L\\ny\"\no: \"\\L\"\nl:\n- \"\\Px\"\n"
+    );
+    assert_eq!(
+        read_back(&yaml),
+        serde_json::from_str::<serde_json::Value>(json).expect("JSON")
+    );
+    assert_eq!(
+        to_yaml(&dir, "s.xml"),
+        "r:\n- '@attrs':\n    a: \"x\\Ly\"\n  '#text': \"t\\Pv\"\n"
+    );
+}

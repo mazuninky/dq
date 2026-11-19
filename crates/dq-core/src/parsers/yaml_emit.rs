@@ -328,8 +328,9 @@ fn is_merge(key: &str, value: &Value) -> bool {
         }
 }
 
-/// How a string the emitter would write plain, though another YAML reader
-/// types it, is written instead.
+/// How a string is written in place of the emitter's spelling: one it
+/// would write plain though another YAML reader types it, and one holding
+/// LS or PS (U+2028, U+2029).
 enum Quoted {
     /// One character: `serialize_char` single-quotes it.
     Char(char),
@@ -338,6 +339,13 @@ enum Quoted {
 }
 
 fn quoted_for_other_readers(s: &str) -> Option<Quoted> {
+    // The emitter takes LS and PS for line breaks, as YAML 1.1 does: it
+    // writes them raw, in a single-quoted or a block scalar, and indents
+    // the next line, which a YAML 1.2 reader, for which they are no line
+    // breaks, keeps as content. Escaped, every reader reads them alike.
+    if s.contains(['\u{2028}', '\u{2029}']) {
+        return Some(Quoted::Text(double_quoted(s)));
+    }
     if !typed_by_another_schema(s) || !emitted_plain(s) {
         return None;
     }
@@ -522,32 +530,42 @@ fn write_flow_string(s: &str, out: &mut String) {
         out.push_str(&s.replace('\'', "''"));
         out.push('\'');
     } else {
-        out.push('"');
-        for c in s.chars() {
-            match c {
-                '"' => out.push_str("\\\""),
-                '\\' => out.push_str("\\\\"),
-                '\n' => out.push_str("\\n"),
-                '\t' => out.push_str("\\t"),
-                '\r' => out.push_str("\\r"),
-                '\0' => out.push_str("\\0"),
-                '\u{85}' => out.push_str("\\N"),
-                '\u{2028}' => out.push_str("\\L"),
-                '\u{2029}' => out.push_str("\\P"),
-                c if single_quotable(c) => out.push(c),
-                c if u32::from(c) <= 0xFF => out.push_str(&format!("\\x{:02X}", u32::from(c))),
-                c if u32::from(c) <= 0xFFFF => out.push_str(&format!("\\u{:04X}", u32::from(c))),
-                c => out.push_str(&format!("\\U{:08X}", u32::from(c))),
-            }
-        }
-        out.push('"');
+        out.push_str(&double_quoted(s));
     }
+}
+
+/// `s` as a double-quoted scalar on one line: every character a
+/// single-quoted scalar cannot hold escaped — line breaks (`\n`, `\N`,
+/// `\L`, `\P`), controls, U+FEFF — so it reads back alike under YAML 1.1
+/// and 1.2.
+fn double_quoted(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\0' => out.push_str("\\0"),
+            '\u{85}' => out.push_str("\\N"),
+            '\u{2028}' => out.push_str("\\L"),
+            '\u{2029}' => out.push_str("\\P"),
+            c if single_quotable(c) => out.push(c),
+            c if u32::from(c) <= 0xFF => out.push_str(&format!("\\x{:02X}", u32::from(c))),
+            c if u32::from(c) <= 0xFFFF => out.push_str(&format!("\\u{:04X}", u32::from(c))),
+            c => out.push_str(&format!("\\U{:08X}", u32::from(c))),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Whether a single-quoted scalar holds `c` as it is: a printable
 /// character (as libyaml, serde_norway's emitter, counts them) that is no
 /// line break.
-fn single_quotable(c: char) -> bool {
+pub(super) fn single_quotable(c: char) -> bool {
     matches!(
         c,
         ' '..='~' | '\u{A0}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..
@@ -730,6 +748,15 @@ mod tests {
                 assert_eq!(read.value(), &v, "{text:?} as {flow:?}");
             }
         }
+    }
+
+    #[test]
+    fn escapes_line_and_paragraph_separators_in_double_quotes() {
+        let v = map(&[
+            ("\u{2028}", s("a\u{2029}\nb")),
+            ("c", Value::Array(vec![s("\u{2028}")])),
+        ]);
+        assert_eq!(yaml(&v), "\"\\L\": \"a\\P\\nb\"\nc:\n- \"\\L\"\n");
     }
 
     #[test]

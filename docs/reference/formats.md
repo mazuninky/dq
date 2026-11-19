@@ -122,6 +122,11 @@ The YAML writer (used by `convert -F yaml`, `set --jq` / `fix.jq` on YAML,
   also read as numbers;
 - writes collections set into a flow context in YAML flow style (`{b: 2}`),
   quoting strings only when needed;
+- writes a string holding NEL, LS or PS (U+0085, U+2028, U+2029) —
+  line breaks to a YAML 1.1 reader, content to a YAML 1.2 one —
+  double-quoted with `\N` / `\L` / `\P`, never raw nor in a block
+  scalar, so both read it alike; textual-edit `set` writes such a value
+  the same way;
 - ignores `--indent` (two spaces always).
 
 Known limit shared by every YAML reader (saphyr, libyaml, PyYAML): `{n:
