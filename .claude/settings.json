@@ -5,7 +5,7 @@
       "Bash(git*commit*-n*)",
       "Bash(git*push*--no-verify*)",
       "Bash(git*push*--force*)",
-      "Bash(git*push*-f*)",
+      "Bash(git*push* -f*)",
       "Bash(*LEFTHOOK_EXCLUDE=*)",
       "Bash(*LEFTHOOK=0*)"
     ]
