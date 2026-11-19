@@ -1882,3 +1882,439 @@ fn the_writer_refuses_a_line_end_markup_would_read_back_as_a_line_feed() {
         ],
     );
 }
+
+/// `#xml` that is an array is refused naming what it got, as every other
+/// field is (4243a61; before: `(got array)`). An attribute holding a
+/// boolean or a number is written as its text, and an empty child list is
+/// no child — guards.
+#[test]
+fn xml_shapes_the_writer_takes_or_names_what_it_got() {
+    let dir = dir_with(&[
+        ("decl.json", br##"{"#xml": [1], "r": [{}]}"##),
+        (
+            "attrs.json",
+            br##"{"r": [{"@attrs": {"b": true, "n": 5, "f": 1.5}}]}"##,
+        ),
+        ("empty.json", br##"{"r": [{"c": []}]}"##),
+    ]);
+    assert_cases(
+        &dir,
+        &[
+            (
+                convert("decl.json", "xml"),
+                refused("'#xml' must be a map of declaration fields (got an array)"),
+            ),
+            (
+                convert("attrs.json", "xml"),
+                ok(r#"<r b="true" n="5" f="1.5"/>"#),
+            ),
+            (convert("empty.json", "xml"), ok("<r/>")),
+        ],
+    );
+}
+
+/// A 1.1 document's restricted characters survive `fmt -i` as references,
+/// and an NEL in a 1.1 attribute next to one reads as a space and the
+/// restricted character stays a reference. A YAML `version: 1.1` (a
+/// float) makes a 1.1 document as the string does. Before (bedfcab), each
+/// was refused as "a character XML 1.0 does not allow".
+#[test]
+fn a_1_1_document_keeps_its_restricted_characters_through_fmt_and_yaml() {
+    let doc = "<?xml version=\"1.1\"?>\n<r a=\"&#1;\">&#x7F;&#2;</r>\n";
+    let dir = dir_with(&[
+        ("doc.xml", doc.as_bytes()),
+        (
+            "nel.xml",
+            "<?xml version=\"1.1\"?><r a=\"&#1;\u{85}b\"/>".as_bytes(),
+        ),
+        (
+            "float.yaml",
+            b"\"#xml\": {version: 1.1}\nr: [{\"#text\": \"\\x01\"}]\n",
+        ),
+    ]);
+    assert_cases(
+        &dir,
+        &[
+            (vec!["fmt", "-i", "doc.xml"], ok("")),
+            (
+                convert("nel.xml", "xml"),
+                ok("<?xml version=\"1.1\"?><r a=\"&#1; b\"/>"),
+            ),
+            (
+                convert("nel.xml", "json"),
+                ok(
+                    "{\n  \"#xml\": {\n    \"version\": \"1.1\"\n  },\n  \"r\": [\n    {\n      \
+                    \"@attrs\": {\n        \"a\": \"\\u0001 b\"\n      }\n    }\n  ]\n}\n",
+                ),
+            ),
+            (
+                convert("float.yaml", "xml"),
+                ok("<?xml version=\"1.1\"?><r>&#1;</r>"),
+            ),
+        ],
+    );
+    assert_eq!(
+        String::from_utf8(read(&dir, "doc.xml")).expect("UTF-8"),
+        "<?xml version=\"1.1\"?><r a=\"&#1;\">&#127;&#2;</r>"
+    );
+}
+
+/// More places a line end would read back as a line feed: LS in 1.1
+/// CDATA, a CR in a top-level comment, in PI data, and as the separator
+/// between a PI's target and its data. Before (25f773f), each was written
+/// raw: `<![CDATA[a<LS>b]]>`, `<!--a<CR>b-->`, `<?t a<CR>b?>`,
+/// `<?t<CR>data?>`.
+#[test]
+fn the_writer_refuses_a_line_end_in_every_markup_place() {
+    let dir = dir_with(&[
+        (
+            "ls_cdata_11.json",
+            br##"{"#xml": {"version": "1.1"}, "r": [{"#cdata": ["a\u2028b"]}]}"##,
+        ),
+        (
+            "top_comment.json",
+            br##"{"#comments": ["a\rb"], "r": [{}]}"##,
+        ),
+        ("pi_data.json", br##"{"r": [{"#pi": ["t a\rb"]}]}"##),
+        ("pi_separator.json", br##"{"r": [{"#pi": ["t\rdata"]}]}"##),
+        ("pi_space.json", br##"{"r": [{"#pi": ["t data"]}]}"##),
+    ]);
+    let line_end = |what: &str, c: &str, version: &str| {
+        refused(&format!(
+            "{what} holds {c}, which XML {version} reads back as a line feed, and a comment, \
+             a processing instruction or CDATA holds no character reference"
+        ))
+    };
+    assert_cases(
+        &dir,
+        &[
+            (
+                convert("ls_cdata_11.json", "xml"),
+                line_end("'#cdata' of <r>", "U+2028", "1.1"),
+            ),
+            (
+                convert("top_comment.json", "xml"),
+                line_end("'#comments' at the top level", "U+000D", "1.0"),
+            ),
+            (
+                convert("pi_data.json", "xml"),
+                line_end("'#pi' of <r>", "U+000D", "1.0"),
+            ),
+            (
+                convert("pi_separator.json", "xml"),
+                line_end("'#pi' of <r>", "U+000D", "1.0"),
+            ),
+            (convert("pi_space.json", "xml"), ok("<r><?t data?></r>")),
+        ],
+    );
+}
+
+/// A raw character the version does not allow is refused inside a PI and
+/// inside CDATA too, at its line and column, which count decoded
+/// characters — a UTF-16 file's as a UTF-8 file's, an astral character as
+/// one — and leave a UTF-8 BOM out. Allowed characters there read.
+/// Before (7d12839), each read.
+#[test]
+fn a_raw_character_is_refused_in_markup_and_placed_by_characters() {
+    let v11 = "<?xml version=\"1.1\"?>";
+    let astral = "<r>\n\u{1F600}\u{e9}\u{1}</r>";
+    let files: Vec<(&str, Vec<u8>)> = vec![
+        ("pi.xml", b"<r><?p a\x01b?></r>".to_vec()),
+        ("cdata.xml", b"<r><![CDATA[a\x01b]]></r>".to_vec()),
+        (
+            "cdata_11.xml",
+            format!("{v11}<r><![CDATA[\u{80}]]></r>").into_bytes(),
+        ),
+        ("pi_11.xml", format!("{v11}<r><?p \u{1}?></r>").into_bytes()),
+        (
+            "bom_11.xml",
+            with_bom(b"\xEF\xBB\xBF", format!("{v11}<r>\u{80}</r>").into_bytes()),
+        ),
+        ("utf8.xml", astral.as_bytes().to_vec()),
+        ("utf16.xml", with_bom(b"\xFF\xFE", utf16(astral, false))),
+        (
+            "ok.xml",
+            "<r><?p a\tb\u{80}?><![CDATA[a\tb\u{80}]]></r>"
+                .as_bytes()
+                .to_vec(),
+        ),
+    ];
+    let borrowed: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(name, body)| (*name, body.as_slice()))
+        .collect();
+    let dir = dir_with(&borrowed);
+    let not_10 = |c: &str| format!("the document holds {c}, a character XML 1.0 does not allow");
+    let raw_11 = |c: &str| {
+        format!("the document holds {c}, which XML 1.1 allows only as a character reference")
+    };
+    assert_cases(
+        &dir,
+        &[
+            (
+                convert("pi.xml", "json"),
+                unreadable_at("pi.xml", 1, 9, &not_10("U+0001")),
+            ),
+            (
+                convert("cdata.xml", "json"),
+                unreadable_at("cdata.xml", 1, 14, &not_10("U+0001")),
+            ),
+            (
+                convert("cdata_11.xml", "json"),
+                unreadable_at("cdata_11.xml", 1, 34, &raw_11("U+0080")),
+            ),
+            (
+                convert("pi_11.xml", "json"),
+                unreadable_at("pi_11.xml", 1, 29, &raw_11("U+0001")),
+            ),
+            (
+                convert("bom_11.xml", "json"),
+                unreadable_at("bom_11.xml", 1, 25, &raw_11("U+0080")),
+            ),
+            (
+                convert("utf8.xml", "json"),
+                unreadable_at("utf8.xml", 2, 3, &not_10("U+0001")),
+            ),
+            (
+                convert("utf16.xml", "json"),
+                unreadable_at("utf16.xml", 2, 3, &not_10("U+0001")),
+            ),
+            (
+                convert("ok.xml", "xml"),
+                ok("<r><?p a\tb\u{80}?><![CDATA[a\tb\u{80}]]></r>"),
+            ),
+        ],
+    );
+}
+
+/// A malformed reference and a malformed attribute are placed: a
+/// reference at its `&` — `&#X41;` (only a lowercase `x` makes a hex
+/// reference) and one split across lines alike — and an attribute error
+/// at its tag's `<`. Before (c7bb838), none had a position.
+#[test]
+fn a_malformed_reference_or_attribute_is_placed() {
+    let dir = dir_with(&[
+        ("upper_x.xml", b"<r>&#X41;</r>"),
+        ("upper_x_11.xml", b"<?xml version=\"1.1\"?><r>&#X1;</r>"),
+        ("split.xml", b"<r>&#x\n41;</r>"),
+        ("split_name.xml", b"<r>&am\np;</r>"),
+        ("duplicate.xml", b"<r>\n  <c a=\"1\" a=\"2\"/></r>"),
+        ("unquoted.xml", b"<r>\n  <c a=1/></r>"),
+        ("ok.xml", b"<r>&#x41;&#65;</r>"),
+    ]);
+    let malformed_ref =
+        "malformed character reference: invalid character reference: invalid digit found in string";
+    assert_cases(
+        &dir,
+        &[
+            (
+                convert("upper_x.xml", "json"),
+                unreadable_at("upper_x.xml", 1, 4, malformed_ref),
+            ),
+            (
+                convert("upper_x_11.xml", "json"),
+                unreadable_at("upper_x_11.xml", 1, 25, malformed_ref),
+            ),
+            (
+                convert("split.xml", "json"),
+                unreadable_at("split.xml", 1, 4, malformed_ref),
+            ),
+            (
+                convert("split_name.xml", "json"),
+                unreadable_at(
+                    "split_name.xml",
+                    1,
+                    4,
+                    "undeclared entity reference '&am\np;'",
+                ),
+            ),
+            (
+                convert("duplicate.xml", "json"),
+                unreadable_at(
+                    "duplicate.xml",
+                    2,
+                    3,
+                    "malformed attribute: position 8: duplicated attribute, previous \
+                     declaration at position 2",
+                ),
+            ),
+            (
+                convert("unquoted.xml", "json"),
+                unreadable_at(
+                    "unquoted.xml",
+                    2,
+                    3,
+                    "malformed attribute: position 4: attribute value must be enclosed in \
+                     `\"` or `'`",
+                ),
+            ),
+            (convert("ok.xml", "xml"), ok("<r>AA</r>")),
+        ],
+    );
+}
+
+/// A refused encoding label is placed at its first character however the
+/// declaration is written: single-quoted, after `standalone`, on the
+/// second line of a UTF-16 file with a BOM (counted in characters, the
+/// BOM left out). Before (aa41529), none had a position.
+#[test]
+fn a_refused_label_is_placed_however_the_declaration_is_written() {
+    let dir = dir_with(&[
+        ("single.xml", b"<?xml version='1.0' encoding='UTF-32'?><r/>"),
+        (
+            "standalone_first.xml",
+            b"<?xml version=\"1.0\" standalone=\"yes\" encoding=\"UTF-32\"?><r/>",
+        ),
+        (
+            "utf16_second_line.xml",
+            &with_bom(
+                b"\xFF\xFE",
+                utf16("<?xml version=\"1.0\"\n  encoding=\"UTF-32\"?><r/>", false),
+            ),
+        ),
+        ("known.xml", b"<?xml version='1.0' encoding='UTF-8'?><r/>"),
+    ]);
+    let unknown = "the XML declaration's encoding \"UTF-32\" is one dq does not know";
+    assert_cases(
+        &dir,
+        &[
+            (
+                convert("single.xml", "json"),
+                unreadable_at("single.xml", 1, 31, unknown),
+            ),
+            (
+                convert("standalone_first.xml", "json"),
+                unreadable_at("standalone_first.xml", 1, 48, unknown),
+            ),
+            (
+                convert("utf16_second_line.xml", "json"),
+                unreadable_at("utf16_second_line.xml", 2, 13, unknown),
+            ),
+            (
+                convert("known.xml", "xml"),
+                ok("<?xml version=\"1.0\" encoding=\"UTF-8\"?><r/>"),
+            ),
+        ],
+    );
+}
+
+/// `dq validate` refuses each of these with exit 4 and reports the same
+/// line and column in its `line` / `col` fields as the message names: a
+/// raw character (7d12839), a refused label (aa41529) and an attribute
+/// error (c7bb838). Before each, `line` / `col` were 0 or pointed past the
+/// tag. A well-formed document validates.
+#[test]
+fn validate_reports_the_line_and_column_its_message_names() {
+    let dir = dir_with(&[
+        ("pi.xml", b"<r><?p a\x01b?></r>"),
+        (
+            "label.xml",
+            b"<?xml version=\"1.0\"\n  encoding=\"UTF-32\"?><r/>",
+        ),
+        ("attr.xml", b"<r>\n  <c a=\"1\" a=\"2\"/></r>"),
+        ("ok.xml", b"<r><?p a?></r>"),
+    ]);
+    for (file, line, col, message) in [
+        (
+            "pi.xml",
+            1,
+            9,
+            "the document holds U+0001, a character XML 1.0 does not allow",
+        ),
+        (
+            "label.xml",
+            2,
+            13,
+            "the XML declaration's encoding \"UTF-32\" is one dq does not know",
+        ),
+        (
+            "attr.xml",
+            2,
+            3,
+            "malformed attribute: position 8: duplicated attribute, previous declaration at \
+             position 2",
+        ),
+    ] {
+        let (code, stdout, stderr) = run(&dir, &["validate", file]);
+        assert_eq!((code, stdout.as_slice()), (4, &b""[..]), "{file}: {stderr}");
+        let fields = format!(
+            "file: {file}\nline: {line}\ncol: {col}\n\
+             message: XML parse error at line {line}, column {col}: {message}\n"
+        );
+        assert!(stderr.contains(&fields), "{file}: {stderr}");
+    }
+    let (code, _, stderr) = run(&dir, &["validate", "ok.xml"]);
+    assert_eq!(code, 0, "{stderr}");
+}
+
+/// Line ends: CR NEL in a 1.1 attribute reads as one space; a document of
+/// lone CRs reads each as a line feed in text, comments, PIs and CDATA;
+/// `set -i --jq` on a CRLF file writes its CDATA back with a line feed —
+/// what the reader read. Before (d76a9be), the CR-only document's PI and
+/// CDATA kept their CRs, and `set -i --jq` wrote `a\r\nb` into the CDATA.
+/// The 1.1 attribute read `x \u{85}y`, and a lone NEL or LS in a 1.1 PI
+/// read as itself.
+#[test]
+fn every_line_end_reads_as_a_line_feed_and_set_writes_what_it_read() {
+    let dir = dir_with(&[
+        (
+            "cr_nel_11.xml",
+            "<?xml version=\"1.1\"?><r a=\"x\r\u{85}y\"/>".as_bytes(),
+        ),
+        (
+            "pi_11.xml",
+            "<?xml version=\"1.1\"?><?p a\u{85}b\u{2028}c?><r><?q d\u{85}e?></r>".as_bytes(),
+        ),
+        (
+            "cr_only.xml",
+            b"<r>\r<c>a\rb</c><![CDATA[c\rd]]><?p e\rf?>\r<!--x\ry-->\r</r>\r",
+        ),
+        (
+            "crlf.xml",
+            b"<r>\r\n<c>x</c>\r\n<![CDATA[a\r\nb]]>\r\n</r>\r\n",
+        ),
+    ]);
+    assert_cases(
+        &dir,
+        &[
+            (
+                convert("cr_nel_11.xml", "json"),
+                ok(
+                    "{\n  \"#xml\": {\n    \"version\": \"1.1\"\n  },\n  \"r\": [\n    {\n      \
+                    \"@attrs\": {\n        \"a\": \"x y\"\n      }\n    }\n  ]\n}\n",
+                ),
+            ),
+            (
+                convert("pi_11.xml", "json"),
+                ok(
+                    "{\n  \"#xml\": {\n    \"version\": \"1.1\"\n  },\n  \"#pi\": [\n    \
+                    \"p a\\nb\\nc\"\n  ],\n  \"r\": [\n    {\n      \"#pi\": [\n        \
+                    \"q d\\ne\"\n      ]\n    }\n  ]\n}\n",
+                ),
+            ),
+            (
+                convert("cr_only.xml", "json"),
+                ok(
+                    "{\n  \"r\": [\n    {\n      \"#cdata\": [\n        \"c\\nd\"\n      ],\n      \
+                    \"#pi\": [\n        \"p e\\nf\"\n      ],\n      \"#comments\": [\n        \
+                    \"x\\ny\"\n      ],\n      \"c\": [\n        {\n          \"#text\": \
+                    \"a\\nb\"\n        }\n      ]\n    }\n  ]\n}\n",
+                ),
+            ),
+            (
+                vec![
+                    "set",
+                    "-i",
+                    "--jq",
+                    ".r[0].c[0][\"#text\"] = \"y\"",
+                    "crlf.xml",
+                ],
+                ok(""),
+            ),
+        ],
+    );
+    assert_eq!(
+        String::from_utf8(read(&dir, "crlf.xml")).expect("UTF-8"),
+        "<r><![CDATA[a\nb]]>\n  <c>y</c>\n</r>"
+    );
+}
