@@ -1,7 +1,7 @@
 # Spike results — saphyr round-trip viability
 
 **Date:** 2026-05-03
-**Change:** [add-safe-writes](../../openspec/changes/add-safe-writes/) Task 1.1–1.5
+**Change:** add-safe-writes (M2), spike tasks 1.1–1.5 — decisions recorded in [docs/decisions.md](../../docs/decisions.md#2026-05-03--safe-writes-add-safe-writes)
 **Verdict:** ❌ **Fail.** D11 criterion #1 (byte-exact round-trip) fails on all 5 fixtures with `saphyr` 0.0.6 and with both candidate alternatives (`yaml-rust2` 0.11.0, `marked-yaml` 0.8.0).
 
 ---
@@ -107,7 +107,7 @@ Three forward paths, ranked by cost vs. coverage of the M2 promise:
 
 Release M2 *without* round-trip preservation. `set` and `del` work, but they reformat the entire file to `serde_yml`'s output style. README.md and the man page state the limitation honestly: "`dq set` does not preserve YAML formatting in M2; round-trip preservation is tracked under M2.5". Costs:
 - 4–5 weeks to ship `set`/`del` + atomic write + template guard + DoD coverage.
-- Loses the main differentiator vs. `yq` (the Helm chart formatting issue from [dq-plan.md:13-14](../../dq-plan.md)). **DevOps users who care about preserved comments will keep using `yq` and live with its bugs.**
+- Loses the main differentiator vs. `yq` (the Helm chart formatting issue from [dq-plan.md:13-14](../../docs/archive/dq-plan-2026-05.md)). **DevOps users who care about preserved comments will keep using `yq` and live with its bugs.**
 - Honest disclosure does not undo the M2 marketing framing as "the round-trip safety milestone".
 
 ### Option B — `m2-textual-edit` (middle scope, middle risk) — **my recommendation**
@@ -164,7 +164,7 @@ After the user chose Option B, the spike binary was rewired (see commit history 
 - (4) performance: 46.4 ms median for 1 MB (budget 100 ms)
 - (5) API ergonomics: spike main.rs compiles clean with `-D warnings`, no unsafe, no >3-level nested matches outside the insertion heuristic itself
 
-Section 2 (Document model) of [tasks.md](../../openspec/changes/add-safe-writes/tasks.md) is unblocked.
+Section 2 (Document model) of the add-safe-writes task list is unblocked.
 
 ## Decision
 
@@ -172,4 +172,4 @@ Section 2 (Document model) of [tasks.md](../../openspec/changes/add-safe-writes/
 
 Option B uses `saphyr-parser` for **structural understanding only** — events with positions are folded into a `Pointer → ByteRange` span map that the document carries alongside its original bytes. `Document::set_at` rewrites only the bytes in the relevant span (mirroring exactly what `toml_edit` does for TOML, which is why TOML round-trip is a solved problem in the Rust ecosystem). No YAML emitter is written; comments, blank lines, and quote style survive because they are never re-emitted — the bytes around them are never touched. New-key insertion at arbitrary depth uses a small heuristic emitter only for the inserted region; formatting of new keys won't match a hand-written equivalent (acceptable — M3 fmt will polish).
 
-The OpenSpec change [add-safe-writes](../../openspec/changes/add-safe-writes/) is being rewritten under Option B assumptions: `proposal.md` (minor), `design.md` D1/D4/D11 + new D14 on insertion semantics, `tasks.md` §1 (spike pivots to textual-edit POC) / §2 (Document holds spans, not metadata map) / §3 (read path keeps `serde_yml`; write path uses `saphyr-parser` for span discovery only). Sections 4–14 carry through with minor edits.
+The add-safe-writes change (decisions now in [docs/decisions.md](../../docs/decisions.md#2026-05-03--safe-writes-add-safe-writes)) was rewritten under Option B assumptions: `proposal.md` (minor), `design.md` D1/D4/D11 + new D14 on insertion semantics, `tasks.md` §1 (spike pivots to textual-edit POC) / §2 (Document holds spans, not metadata map) / §3 (read path keeps `serde_yml`; write path uses `saphyr-parser` for span discovery only). Sections 4–14 carry through with minor edits.

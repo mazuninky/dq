@@ -2,7 +2,7 @@
 
 Minimal Rust reference plugin for the `dq` v0.1.0 plugin ABI. Demonstrates
 the smallest possible implementation of the WIT contract documented in
-[`openspec/changes/add-ir-foundation/specs/data-query-plugin-abi/spec.md`](../../openspec/changes/add-ir-foundation/specs/data-query-plugin-abi/spec.md).
+[`docs/plugin-abi.md`](../../docs/plugin-abi.md).
 
 ## What it does
 

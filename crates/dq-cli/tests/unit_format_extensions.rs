@@ -231,7 +231,8 @@ fn get_frontmatter_title_returns_yaml_header_value() {
     // (M5) to `Markdown` (M9). The frontmatter header is now folded into
     // the AST's top-level `frontmatter.value.<key>` shape, so the M5
     // pointer `/title` becomes `/frontmatter/value/title`. The migration
-    // plan in the M9 OpenSpec change documents both alternatives — the
+    // plan in the markdown-tree section of `docs/decisions.md` documents both
+    // alternatives — the
     // longer pointer (here) and the explicit `-F frontmatter` opt-in
     // (covered by the M5 frontmatter parser's own tests).
     let tmp = write_with_extension(

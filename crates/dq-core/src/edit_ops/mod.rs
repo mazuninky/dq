@@ -30,8 +30,8 @@
 //!   plumbing in the apply path.
 //!
 //! Convergence between the two types is left to a future change. They
-//! coexist as separate types per design decision D3 in
-//! `openspec/changes/add-ir-foundation/design.md`.
+//! coexist as separate types (see `docs/reference/ir-and-edit-ops.md` and
+//! the add-ir-foundation section of `docs/decisions.md`).
 //!
 //! # Layering on top of `Document::set_at` / `del_at`
 //!
@@ -844,8 +844,7 @@ mod tests {
     /// `Document::set_at` (which `Add` calls into) returns `MissingKey` for
     /// pointers whose parent doesn't already contain that key — full
     /// mkdir-p insertion is a separate change (see
-    /// `openspec/changes/add-ir-foundation/tasks.md` Phase 3 task 3.7
-    /// caveat). Two Replaces strictly exercise the "ops apply in declaration
+    /// `docs/reference/ir-and-edit-ops.md`). Two Replaces strictly exercise the "ops apply in declaration
     /// order" guarantee without hitting the mkdir-p limitation.
     #[test]
     fn multi_op_script_applies_in_declaration_order() {

@@ -7,8 +7,8 @@
 //! exact byte ranges that `Document::set_at` and `Document::del_at` splice.
 //!
 //! The architecture follows the saphyr spike at
-//! `spikes/saphyr/src/main.rs` — see also OpenSpec change
-//! `add-safe-writes/design.md` D1 / D4 / D11 for the rationale on why we
+//! `spikes/saphyr/src/main.rs` — see also the safe-writes section of
+//! `docs/decisions.md` for the rationale on why we
 //! splice raw bytes instead of round-tripping through an emitter.
 //!
 //! # Public surface

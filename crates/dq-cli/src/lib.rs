@@ -176,8 +176,8 @@ fn dispatch(
 /// Reporter factory — wires an [`OutputFormat`] selection to a concrete reporter.
 ///
 /// Lives in `lib.rs` (the wiring layer) so command handlers stay
-/// dependency-injected per design D1
-/// (`openspec/changes/add-exec-engine/design.md`): they receive a
+/// dependency-injected (see the add-exec-engine section of
+/// `docs/decisions.md`): they receive a
 /// `&dyn Reporter` and never decide which concrete implementation to
 /// instantiate.
 ///

@@ -121,7 +121,7 @@ pub enum SyntheticReason {
 /// formats with non-zero offsets (e.g. JSON strings consumed by a composite
 /// extract) can populate them without changing the type shape.
 ///
-/// [`data-query-composite-rules`]: ../../../openspec/specs/data-query-composite-rules/spec.md
+/// [`data-query-composite-rules`]: ../../../../docs/reference/rule-checks.md
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InlineBaseline {
     /// Byte offset within the parent scalar's content where this node's

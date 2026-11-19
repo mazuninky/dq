@@ -375,5 +375,5 @@ For the full picture, read the relevant file:
 ## Project links
 
 - Homepage: <https://github.com/mazuninky/dq>
-- Plan / roadmap: [dq-plan.md](https://github.com/mazuninky/dq/blob/master/dq-plan.md)
+- Roadmap: [docs/roadmap.md](https://github.com/mazuninky/dq/blob/master/docs/roadmap.md); architecture: [docs/architecture.md](https://github.com/mazuninky/dq/blob/master/docs/architecture.md)
 - Issues: <https://github.com/mazuninky/dq/issues>

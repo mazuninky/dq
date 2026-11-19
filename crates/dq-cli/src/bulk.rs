@@ -11,8 +11,8 @@
 //! matched-file order at the end of the run. This satisfies the spec's
 //! "per-file output ordering matches matched-file order regardless of
 //! execution order" requirement (see
-//! `openspec/changes/add-bulk-and-ci/specs/data-query-bulk/spec.md`,
-//! requirement "`--parallel <N>` for bulk throughput").
+//! `docs/reference/bulk.md`, and the `--parallel` decision in the
+//! add-bulk-and-ci section of `docs/decisions.md`).
 
 use std::io::{self, Write};
 

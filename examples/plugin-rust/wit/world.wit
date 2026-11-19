@@ -25,7 +25,7 @@
 //                     `PluginError::SchemaVersion`).
 //
 // The full contract is in
-// `openspec/changes/add-ir-foundation/specs/data-query-plugin-abi/spec.md`.
+// `docs/plugin-abi.md`.
 package dq:plugin@0.1.0;
 
 // Host-imported: read-only access to the document under lint/fix.

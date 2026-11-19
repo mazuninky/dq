@@ -33,14 +33,15 @@ pub use yaml::YamlReporter;
 /// Output format selectable via the global `-F/--format` flag.
 ///
 /// M5 deliberately does NOT include `dockerfile` or `ignore-list`: both are
-/// read-only formats per design D9 (`openspec/changes/add-format-extensions/design.md`).
+/// read-only formats (see the add-format-extensions section of
+/// `docs/decisions.md`).
 /// Because `clap::ValueEnum` only accepts variants present in this enum, the
 /// `-F dockerfile` / `-F ignore-list` invocations are rejected at the clap
 /// parse step with the standard "invalid value" error — no runtime guard
 /// needed in the convert handler.
 ///
-/// M6 adds the [`OutputFormat::Sarif`] variant — see design D4 in
-/// `openspec/changes/add-distribution/design.md`. SARIF is **output-only**
+/// M6 adds the [`OutputFormat::Sarif`] variant — see the add-distribution
+/// section of `docs/decisions.md`. SARIF is **output-only**
 /// (it is a diagnostic report format, not a parseable source format) and is
 /// only valid for diagnostic-shaped commands like `validate` and the future
 /// M8 lint engine. Selecting `-F sarif` for a query verb produces the same
@@ -51,8 +52,8 @@ pub use yaml::YamlReporter;
 /// Anything Protocol 13, consumed by `prove` and CI dashboards). Both follow
 /// the same discipline as `Sarif`: they are output-only, expect the canonical
 /// `{ "diagnostics": [...] }` shape, and surface `InvalidInput` (exit 6) when
-/// fed any other value. See design D8 / D9 in
-/// `openspec/changes/add-exec-engine/design.md`.
+/// fed any other value. See the add-exec-engine section of
+/// `docs/decisions.md` and `docs/reference/cli.md`.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default, clap::ValueEnum)]
 pub enum OutputFormat {
     /// Human-readable colored output (default).
@@ -100,7 +101,7 @@ pub enum OutputFormat {
     /// JUnit XML — diagnostic-only output format consumed by GitLab CI,
     /// Jenkins, and other test-result aggregators.
     ///
-    /// Per design D8 in `openspec/changes/add-exec-engine/design.md`, M8's
+    /// Per the add-exec-engine section of `docs/decisions.md`, M8's
     /// lint engine populates the `{ "diagnostics": [...] }` shape and the
     /// reporter renders one `<testcase>` per diagnostic. Selecting
     /// `-F junit` for a non-diagnostic command surfaces an `InvalidInput`
@@ -110,7 +111,7 @@ pub enum OutputFormat {
     /// TAP version 13 — diagnostic-only output format consumed by `prove`,
     /// GitLab CI, and other TAP-aware harnesses.
     ///
-    /// Per design D9 in `openspec/changes/add-exec-engine/design.md`, M8's
+    /// Per the add-exec-engine section of `docs/decisions.md`, M8's
     /// lint engine populates the `{ "diagnostics": [...] }` shape and the
     /// reporter renders each diagnostic as `not ok` with a YAML detail
     /// block. Selecting `-F tap` for a non-diagnostic command surfaces an

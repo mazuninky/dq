@@ -99,8 +99,8 @@ pub struct Evaluator {
 ///   intentional: a global cache would leak in long-lived processes and
 ///   would have to thread test isolation through every fixture that
 ///   pokes at a bad expression on purpose. See
-///   [`openspec/changes/perf-jq-compile-cache/design.md`] §3 for the
-///   full rationale.
+///   `docs/plans/perf-jq-compile-cache.md` ("Why not a process-wide cache")
+///   for the full rationale.
 /// - **Exact-string cache key.** No hashing, no whitespace
 ///   normalisation — `". + 1"` and ".+1" are different keys. The miss
 ///   cost is one compile; the hit cost is an `Arc::clone` (refcount

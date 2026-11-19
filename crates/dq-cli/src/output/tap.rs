@@ -1,6 +1,7 @@
 //! TAP (Test Anything Protocol) version 13 output reporter.
 //!
-//! Per design D9 in `openspec/changes/add-exec-engine/design.md`, the reporter
+//! Per the add-exec-engine section of `docs/decisions.md` (behaviour in
+//! `docs/reference/cli.md`), the reporter
 //! consumes the canonical lint-engine output shape `{ "diagnostics": [...] }`
 //! — the same shape produced by `dq_lint::Diagnostic::to_serde_json` and
 //! consumed by [`crate::output::sarif::SarifReporter`] and

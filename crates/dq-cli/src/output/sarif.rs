@@ -1,6 +1,6 @@
 //! SARIF 2.1.0 output reporter.
 //!
-//! Per design D4 in `openspec/changes/add-distribution/design.md`, the
+//! Per the add-distribution section of `docs/decisions.md`, the
 //! reporter expects an input value shaped as `{ "diagnostics": [...] }`
 //! where each diagnostic carries `path`, `line`, `col`, `message`, and
 //! `severity`. M6 ships exactly one consumer — the `validate` handler —

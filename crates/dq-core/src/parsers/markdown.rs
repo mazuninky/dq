@@ -1,7 +1,7 @@
 //! M9 Markdown parser — CommonMark + GFM AST as a typed-discriminator-Map tree.
 //!
-//! See `openspec/changes/add-markdown-tree-format/{proposal,design,specs}.md`
-//! for the full contract. The short version:
+//! See the markdown-tree section of `docs/decisions.md` and
+//! `docs/reference/formats.md` for the full contract. The short version:
 //!
 //! - Parsing produces a `Document` whose `value()` is a top-level
 //!   `Value::Map { "type": "document", "frontmatter": …, "children": …,

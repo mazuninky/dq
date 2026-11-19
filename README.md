@@ -306,7 +306,7 @@ dq fix  --plugins ./plugins config.yaml
 
 > **v0.1.0 experimental WIT preview.** Breaking changes to the WIT schema, host-imported interfaces, and diagnostic / EditScript marshalling are possible before `v1.0.0`. Pin a specific dq version in CI until the ABI stabilizes.
 
-See [examples/plugin-rust/](examples/plugin-rust/) for a minimal Rust reference plugin and [openspec/changes/add-ir-foundation/specs/data-query-plugin-abi/spec.md](openspec/changes/add-ir-foundation/specs/data-query-plugin-abi/spec.md) for the authoritative WIT contract.
+See [examples/plugin-rust/](examples/plugin-rust/) for a minimal Rust reference plugin. The contract is [docs/plugin-abi.md](docs/plugin-abi.md) together with the WIT file [crates/dq-plugin/wit/dq-plugin.wit](crates/dq-plugin/wit/dq-plugin.wit).
 
 ## CI integration
 
@@ -389,8 +389,7 @@ For an overview of the source tree, conventions, and explicit anti-scope, see [`
 
 - **[CLAUDE.md](CLAUDE.md)** — repo orientation for contributors and Claude Code: crate layout, conventions, anti-scope, how to extend.
 - **[skills/dq/SKILL.md](skills/dq/SKILL.md)** — Claude Code skill: install + common patterns + format coverage + exit codes.
-- **[openspec/changes/](openspec/changes/)** — active and archived OpenSpec changes (specs + design + tasks).
-- **[dq-plan.md](dq-plan.md)** — design doc: architecture, roadmap, anti-scope.
+- **[docs/](docs/README.md)** — contributor documentation: [architecture](docs/architecture.md), [reference](docs/README.md#reference) for every command, format and the lint engine, [roadmap](docs/roadmap.md) (plans in flight and open work), [decision log](docs/decisions.md), [plugin ABI](docs/plugin-abi.md).
 - **[CHANGELOG.md](CHANGELOG.md)** — release notes.
 
 ## Releases & versioning

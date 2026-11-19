@@ -278,7 +278,7 @@ fn smoke_unknown_subcommand_exits_with_clap_error() {
 //
 // These exercise the binary contract for write commands end-to-end:
 // fixture → `assert_cmd` invocation → on-disk side effects + exit code.
-// They mirror the M2 DoD scenarios from `dq-plan.md`. Each test seeds a
+// They mirror the M2 DoD scenarios from `docs/archive/dq-plan-2026-05.md`. Each test seeds a
 // tempfile so the source fixtures are not mutated.
 // ---------------------------------------------------------------------------
 

@@ -110,8 +110,8 @@ pub struct BulkPartialFailure {
 /// The diagnostics themselves are already rendered through the configured
 /// reporter before this marker bubbles up; the marker only carries the
 /// aggregate count for the shell to branch on. The lint exit-code mapping
-/// is documented in design D7
-/// (`openspec/changes/add-exec-engine/design.md`).
+/// is documented in the add-exec-engine section of `docs/decisions.md`
+/// and in `docs/reference/cli.md`.
 #[derive(Debug, thiserror::Error)]
 #[error("lint reported {count} error-severity diagnostic(s)")]
 pub struct LintFail {

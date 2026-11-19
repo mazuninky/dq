@@ -22,11 +22,11 @@ use crate::diagnostic::Severity;
 
 /// One rule, parsed from a YAML document.
 ///
-/// See `openspec/changes/add-exec-engine/proposal.md` "What Changes" for
+/// See `docs/reference/lint-engine.md` for
 /// the full schema. The fields below mirror that document one-for-one.
 ///
 /// M10 typed the `fix` field as [`RuleFix`] — a whole-document jq
-/// transformation. See `openspec/changes/add-autofix/`.
+/// transformation. See `docs/reference/lint-engine.md`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {

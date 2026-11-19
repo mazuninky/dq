@@ -7,7 +7,7 @@
 //!   clusters; M1 simplifies this to `chars().count()` which counts Unicode
 //!   scalar values rather than user-perceived characters. Real grapheme
 //!   counting requires `unicode-segmentation` and is deferred — see the
-//!   workspace-level `dq-plan.md` M2/M9 notes.
+//!   `docs/archive/dq-plan-2026-05.md` (M2/M9 notes) and `docs/roadmap.md`.
 //! - Anything else (null, bool, int, float, big-int, big-float) is a
 //!   [`WrongType`] error (exit 1).
 

@@ -279,7 +279,8 @@ impl<'de> Visitor<'de> for PatchOpVisitor {
 /// The function clones `doc` once, applies every op to the clone in order,
 /// and only commits the result back into `doc` on success. Any error during
 /// any op (including a failing `test`) leaves `doc` byte-identical to its
-/// pre-call state — see [Decision D2 in the M3 design][D2].
+/// pre-call state — see the atomic-patch decision in the [add-bulk-and-ci
+/// section of the decision log][D2].
 ///
 /// On a YAML stream the patch addresses each document as `/N`, as
 /// `Document::set_at` and `Document::del_at` do; a document removed by an
@@ -292,7 +293,7 @@ impl<'de> Visitor<'de> for PatchOpVisitor {
 ///   indices encountered during any op.
 /// - [`Error::WriteUnavailable`] when the document was loaded read-only.
 ///
-/// [D2]: ../../../openspec/changes/add-bulk-and-ci/design.md
+/// [D2]: ../../../../docs/decisions.md
 pub fn apply_patch(doc: &mut Document, ops: &[PatchOp]) -> Result<()> {
     let mut working = doc.clone();
     let stream = working.values().is_some();

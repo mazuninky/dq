@@ -693,8 +693,8 @@ impl<'a> Scanner<'a> {
 ///
 /// This type is module-local on purpose: only the JSON parser needs it,
 /// and exposing it as a public utility would require a wider refactor of
-/// the other parsers' span builders. See the perf-json-parse-linear
-/// OpenSpec change for the full design rationale.
+/// the other parsers' span builders. See
+/// `docs/plans/perf-json-parse-linear.md` for the full design rationale.
 struct LineIndex {
     /// Sorted byte offsets of every `\n` in the source. Line 0 starts at
     /// offset 0; line `i` (`i ≥ 1`) starts at `newline_offsets[i-1] + 1`.
@@ -709,7 +709,7 @@ impl LineIndex {
     /// Build the line table for `bytes` in a single forward pass.
     ///
     /// Intentionally does **not** depend on the `memchr` crate as a direct
-    /// dependency — see the OpenSpec design doc §2.1 — even though it is
+    /// dependency — see `docs/plans/perf-json-parse-linear.md` — even though it is
     /// already pulled in transitively by `serde_json` / `regex`. On top of
     /// the unavoidable `serde_json::from_slice` cost the linear scan here
     /// is negligible.

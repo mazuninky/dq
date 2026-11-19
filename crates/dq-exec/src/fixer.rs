@@ -24,8 +24,12 @@
 //!   [`EditScript::under`] and applied as a textual edit, so the rest of
 //!   the file — other documents, comments, every `---` — keeps its bytes.
 //!   A script that adds, replaces or removes the document itself (path
-//!   `""`) is a [`ExecError::FixApply`], in a stream and in a single
-//!   document alike: whole-document edits are not textual edits yet.
+//!   `""`) addresses the document itself: `replace ""` / `add ""` write the
+//!   whole document (through the YAML writer) and apply like any other op.
+//!   `remove ""` drops that document with its `---` line; it is a
+//!   [`ExecError::FixApply`] (exit 3) where it cannot be done — a single
+//!   file (the document is the whole file), the last document left of a
+//!   stream, or when another op follows it in the same script.
 //! - A `fix.jq` output is written into the file with
 //!   [`Document::reemit_stream_document`]: that document's content is
 //!   re-emitted through the YAML writer in the file's line ending

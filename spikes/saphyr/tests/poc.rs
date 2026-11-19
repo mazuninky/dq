@@ -1,5 +1,5 @@
 //! Integration test for the textual-edit POC. This is the gate referenced
-//! in `openspec/changes/add-safe-writes/design.md` D11 criterion 2:
+//! in the add-safe-writes design, D11 criterion 2 (see `docs/decisions.md`):
 //! single-scalar mutation must be byte-perfect (exactly one line removed
 //! and one line inserted) on all 5 representative fixtures.
 //!

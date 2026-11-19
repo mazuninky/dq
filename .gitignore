@@ -19,17 +19,6 @@ Cargo.lock.bak
 # Node (skill-build tooling, mdbook output)
 /node_modules/
 
-# OpenSpec runtime cache
-openspec/changes/.openspec.cache/
-
-# Subagent scratch memory (rust-cli-writer / rust-cli-test-writer)
-.claude/agent-memory/
-
-# Local-only Claude Code agent setup (agents, delegation rules, conventions) — not published
-.claude/agents/
-.claude/conventions/
-.claude/rules/rust-cli-delegation.md
-.claude/rules/agent-delegation.md
 .claude/settings.local.json
 .worktreeinclude
 

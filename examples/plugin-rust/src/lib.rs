@@ -10,8 +10,7 @@
 //! # WIT contract
 //!
 //! See `wit/world.wit` (a mirror of `crates/dq-plugin/wit/dq-plugin.wit`).
-//! Authoritative spec: `openspec/changes/add-ir-foundation/specs/
-//! data-query-plugin-abi/spec.md`.
+//! Authoritative spec: `docs/plugin-abi.md`.
 //!
 //! # Build recipe
 //!

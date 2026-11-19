@@ -52,7 +52,7 @@ with the same `wasmtime` / `wit-bindgen` versions pinned in
 
 The full plugin ABI contract — sandbox limits, error variants, exit-code
 mapping, semver rules — lives in
-[`openspec/changes/add-ir-foundation/specs/data-query-plugin-abi/spec.md`](../../openspec/changes/add-ir-foundation/specs/data-query-plugin-abi/spec.md).
+[`docs/plugin-abi.md`](../../docs/plugin-abi.md).
 The WIT schema in `wit/dq-plugin.wit` is the authoritative wire format.
 
 ## Versioning

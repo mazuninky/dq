@@ -1,7 +1,7 @@
 //! Integration test: JSONL parsers emit empty provenance.
 //!
 //! Spec scenario covered: "JSONL parse produces empty provenance"
-//! ([`openspec/changes/add-ir-foundation/specs/data-query-ir/spec.md`]).
+//! (see [`docs/reference/ir-and-edit-ops.md`]).
 //!
 //! The JSONL parser is a read-only format — it does not record byte spans.
 //! `Document::as_ir()` for a JSONL document must therefore surface an empty

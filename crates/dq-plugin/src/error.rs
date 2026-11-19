@@ -5,7 +5,7 @@
 //! stable category string via [`PluginError::kind_name`].
 //!
 //! The set of variants is fixed by
-//! `openspec/changes/add-ir-foundation/specs/data-query-plugin-abi/spec.md`
+//! `docs/plugin-abi.md`
 //! — the `kind_name()` strings are part of the CLI exit-code contract and
 //! must not be renamed.
 
