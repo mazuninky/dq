@@ -19,7 +19,7 @@ use camino::Utf8Path;
 use dq_core::{Document, Format, Pointer, Segment, Value};
 
 use crate::cli::DocSelector;
-use crate::error::{DocOutOfRange, InvalidInput};
+use crate::error::{DocOutOfRange, DocOutOfRangeEverywhere, InvalidInput};
 
 /// Load and parse a file (or stdin when `file == "-"`), returning the chosen
 /// [`Format`] together with the parsed [`Document`].
@@ -217,18 +217,40 @@ pub(crate) fn checked_index(
 /// when the run covers several files.
 ///
 /// Over several files (`several`), a file without the document `--doc N`
-/// names is not an error: `Ok(Err(reason))` says why to skip it, and the
+/// names is not an error: `Ok(Err(missing))` says why to skip it, and the
 /// run goes on with the next file. Over exactly one file — and for every
 /// other error — `result` is returned as it is: a single file lacking
-/// document N is exit 2, as for every single-file command.
+/// document N is exit 2, as for every single-file command. A run in which
+/// *every* file lacks document N is exit 2 as well —
+/// [`DocOutOfRangeEverywhere`] — raised by the caller once it has seen
+/// them all ([`every_file_lacks`]).
 pub(crate) fn skip_out_of_range<T>(
     result: anyhow::Result<T>,
     several: bool,
-) -> anyhow::Result<Result<T, String>> {
+) -> anyhow::Result<Result<T, DocOutOfRange>> {
     match result {
-        Ok(value) => Ok(Ok(value)),
-        Err(err) if several && err.is::<DocOutOfRange>() => Ok(Err(err.to_string())),
-        Err(err) => Err(err),
+        Err(err) if several && err.is::<DocOutOfRange>() => match err.downcast::<DocOutOfRange>() {
+            Ok(missing) => Ok(Err(missing)),
+            Err(err) => Err(err),
+        },
+        other => other.map(Ok),
+    }
+}
+
+/// [`DocOutOfRangeEverywhere`] when each of the `files` files of a run
+/// was skipped for lacking the document `--doc N` names — `missing` holds
+/// one `(file, reason)` entry per skipped file; `None` when at least one
+/// file held it.
+pub(crate) fn every_file_lacks<P>(
+    missing: &[(P, DocOutOfRange)],
+    files: usize,
+) -> Option<DocOutOfRangeEverywhere> {
+    match missing.first() {
+        Some((_, first)) if missing.len() == files => Some(DocOutOfRangeEverywhere {
+            index: first.index,
+            files,
+        }),
+        _ => None,
     }
 }
 

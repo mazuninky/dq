@@ -27,9 +27,11 @@
 //!   `""`) is a [`ExecError::FixApply`], in a stream and in a single
 //!   document alike: whole-document edits are not textual edits yet.
 //! - A `fix.jq` output is written into the file with
-//!   [`Document::reemit_stream_document`]: that document's body is
-//!   re-emitted through the YAML writer (its comments are dropped), its
-//!   `---` line and every other document keep their bytes, and the
+//!   [`Document::reemit_stream_document`]: that document's content is
+//!   re-emitted through the YAML writer in the file's line ending
+//!   (comments among it are dropped); its `---` line — node properties on
+//!   it included, while they still fit — the comment lines after its last
+//!   content line and every other document keep their bytes, and the
 //!   stream stays write-aware, so `fix.ops` rules after it — in any
 //!   document — still apply. Only when that re-emit is refused does the
 //!   whole stream fall back to a value-only

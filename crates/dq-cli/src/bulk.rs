@@ -22,7 +22,8 @@ use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use walkdir::WalkDir;
 
 use crate::cli::Cli;
-use crate::error::{BulkPartialFailure, CheckPending};
+use crate::commands::io_helpers::every_file_lacks;
+use crate::error::{BulkPartialFailure, CheckPending, DocOutOfRange};
 
 /// Per-file outcome reported by an [`FileOp`] implementation.
 #[derive(Debug)]
@@ -41,11 +42,13 @@ pub enum FileOpResult {
     },
     /// File is byte-identical to its prospective output (idempotent run).
     Unchanged,
-    /// File was skipped for a non-error reason — in a bulk run, a file
-    /// without the document `--doc N` names. The driver counts it under
-    /// `Skipped` and notes the reason on stderr (a `tracing::warn!`
-    /// line), keeping stdout for the files' output.
-    Skipped(String),
+    /// In a bulk run, the file lacks the document `--doc N` names. The
+    /// driver counts it under `Skipped` and notes the reason on stderr (a
+    /// `tracing::warn!` line), keeping stdout for the files' output — or,
+    /// when *every* file of the run lacks it, fails the run with
+    /// [`DocOutOfRangeEverywhere`](crate::error::DocOutOfRangeEverywhere)
+    /// (exit 2) before writing anything.
+    Skipped(DocOutOfRange),
 }
 
 /// Strategy interface implemented by each command handler. The trait is
@@ -215,6 +218,9 @@ fn resolve_parallel(n: Option<usize>) -> usize {
 /// - [`CheckPending`] when `--check` finds files that would be modified.
 /// - [`BulkPartialFailure`] when `--continue-on-error` completes with one
 ///   or more file failures.
+/// - [`DocOutOfRangeEverywhere`](crate::error::DocOutOfRangeEverywhere)
+///   when every file of a bulk run lacks the document `--doc N` names
+///   (each op returned [`FileOpResult::Skipped`]).
 /// - The first per-file error verbatim when `--continue-on-error` is off.
 /// - I/O errors from writing to `out` or from the per-file atomic write.
 pub fn run_per_file(
@@ -250,6 +256,7 @@ pub fn run_per_file(
     let mut failed: Vec<(Utf8PathBuf, anyhow::Error)> = Vec::new();
     let mut would_modify: Vec<Utf8PathBuf> = Vec::new();
     let mut buffer: Vec<u8> = Vec::new();
+    let mut missing: Vec<(Utf8PathBuf, DocOutOfRange)> = Vec::new();
 
     for (path, result) in results {
         match result {
@@ -291,7 +298,7 @@ pub fn run_per_file(
             }
             Ok(FileOpResult::Skipped(reason)) => {
                 skipped += 1;
-                tracing::warn!("skipped {path}: {reason}");
+                missing.push((path, reason));
             }
             Err(e) => {
                 if cli.continue_on_error && is_bulk {
@@ -305,6 +312,16 @@ pub fn run_per_file(
                 }
             }
         }
+    }
+
+    // Every file lacked the `--doc N` document: nothing was done, so the
+    // run fails as a single such file does. Skipped files are never
+    // written, so nothing reached the disk either.
+    if let Some(err) = every_file_lacks(&missing, files.len()) {
+        return Err(anyhow::Error::new(err));
+    }
+    for (path, reason) in &missing {
+        tracing::warn!("skipped {path}: {reason}");
     }
 
     out.write_all(&buffer)?;

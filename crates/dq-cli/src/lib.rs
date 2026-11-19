@@ -14,7 +14,7 @@ pub mod exit_code;
 pub mod output;
 
 pub use cli::{Cli, Command};
-pub use error::{DocOutOfRange, LintFail, SilentError, ValidateFail};
+pub use error::{DocOutOfRange, DocOutOfRangeEverywhere, LintFail, SilentError, ValidateFail};
 
 use std::io::Write;
 

@@ -200,6 +200,15 @@ pub(crate) struct DocumentExtent {
     /// body begins on the marker line (`--- {a: 1}`), or the marker is the
     /// last line and has no newline.
     pub(crate) needs_line_break: bool,
+    /// End of the body's last content line (`body.start` for a document
+    /// with no content): from here to `body.end` the body holds only
+    /// comment lines and blank lines — the lead-in of whatever follows.
+    pub(crate) content_end: usize,
+    /// Where text replacing the body may begin to keep the node
+    /// properties (`!tag`, `&anchor`) written on the marker line
+    /// (`--- !!map`), with whether it must then start with a line break;
+    /// `None` when the marker line carries none.
+    pub(crate) after_properties: Option<(usize, bool)>,
 }
 
 /// One [`DocumentExtent`] per document of the YAML source `bytes`, in
@@ -213,52 +222,138 @@ pub(crate) struct DocumentExtent {
 pub(crate) fn document_extents(bytes: &[u8]) -> Option<Vec<DocumentExtent>> {
     let text = std::str::from_utf8(bytes).ok()?;
     let char_to_byte = build_char_to_byte_map(text);
-    let line_start_of = |at: usize| {
-        bytes[..at]
-            .iter()
-            .rposition(|&b| b == b'\n')
-            .map_or(0, |newline| newline + 1)
-    };
     let mut extents: Vec<DocumentExtent> = Vec::new();
+    // Byte spans of the scalars and aliases of the current document.
+    let mut content: Vec<Range<usize>> = Vec::new();
     let mut parser = YamlParser::new_from_str(text);
     while let Some(item) = parser.next_event() {
         let (event, span) = item.ok()?;
         match event {
             Event::DocumentStart(explicit) => {
                 let range = span_to_range(span, &char_to_byte);
-                let line_start = line_start_of(range.start);
-                let (body_start, needs_line_break) = if explicit {
-                    let line_end = bytes[range.end..]
-                        .iter()
-                        .position(|&b| b == b'\n')
-                        .map(|offset| range.end + offset);
-                    let rest = &bytes[range.end..line_end.unwrap_or(bytes.len())];
-                    let rest = rest.trim_ascii_start();
-                    let only_a_comment = rest.is_empty() || rest.starts_with(b"#");
-                    match line_end {
-                        Some(line_end) if only_a_comment => (line_end + 1, false),
-                        None if only_a_comment => (bytes.len(), true),
-                        _ => (range.end, true),
-                    }
+                let line_start = line_start_before(bytes, range.start);
+                let (body_start, needs_line_break, after_properties) = if explicit {
+                    marker_line_body(bytes, range.end)
                 } else {
-                    (range.start, false)
+                    (range.start, false, None)
                 };
+                content.clear();
                 extents.push(DocumentExtent {
                     line_start,
                     body: body_start..body_start,
                     needs_line_break,
+                    content_end: body_start,
+                    after_properties,
                 });
+            }
+            Event::Scalar(..) | Event::Alias(_) => {
+                content.push(span_to_range(span, &char_to_byte));
             }
             Event::DocumentEnd => {
                 let end = char_index_to_byte(&char_to_byte, span.start.index());
                 if let Some(extent) = extents.last_mut() {
                     extent.body.end = end.max(extent.body.start);
+                    extent.content_end = content_end(bytes, &extent.body, &content);
                 }
             }
             _ => {}
         }
     }
     Some(extents)
+}
+
+/// Start of the line `at` sits on.
+fn line_start_before(bytes: &[u8], at: usize) -> usize {
+    bytes[..at]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |newline| newline + 1)
+}
+
+/// Where the body of an explicit document whose `---` ends at
+/// `marker_end` begins, whether text replacing it must start with a line
+/// break, and the same pair for keeping the node properties written on
+/// the marker line (see [`DocumentExtent::after_properties`]).
+fn marker_line_body(bytes: &[u8], marker_end: usize) -> (usize, bool, Option<(usize, bool)>) {
+    let line_end = bytes[marker_end..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|offset| marker_end + offset);
+    let next_line = |line_end: Option<usize>| match line_end {
+        Some(line_end) => (line_end + 1, false),
+        None => (bytes.len(), true),
+    };
+    let only_a_comment = |rest: &[u8]| {
+        let rest = rest.trim_ascii();
+        rest.is_empty() || rest.starts_with(b"#")
+    };
+    let line = &bytes[marker_end..line_end.unwrap_or(bytes.len())];
+    if only_a_comment(line) {
+        let (start, needs_line_break) = next_line(line_end);
+        return (start, needs_line_break, None);
+    }
+    // `!tag` and `&anchor` — at most one of each — before any content.
+    let mut properties_end = 0;
+    let mut at = 0;
+    for _ in 0..2 {
+        while line.get(at).is_some_and(|b| matches!(b, b' ' | b'\t')) {
+            at += 1;
+        }
+        if !line.get(at).is_some_and(|b| matches!(b, b'!' | b'&')) {
+            break;
+        }
+        while line.get(at).is_some_and(|b| !b.is_ascii_whitespace()) {
+            at += 1;
+        }
+        properties_end = at;
+    }
+    let after_properties = (properties_end > 0).then(|| {
+        if only_a_comment(&line[properties_end..]) {
+            next_line(line_end)
+        } else {
+            (marker_end + properties_end, true)
+        }
+    });
+    (marker_end, true, after_properties)
+}
+
+/// End of the last content line of `body`, whose scalars and aliases are
+/// spanned at `content`: trailing comment lines and blank lines are left
+/// out. A span at or past `body.end` (an empty document's null, spanned at
+/// the next event) is not content of this body.
+fn content_end(bytes: &[u8], body: &Range<usize>, content: &[Range<usize>]) -> usize {
+    let mut floor = content
+        .iter()
+        .filter(|span| span.start < body.end)
+        .map(|span| span.end.min(body.end))
+        .fold(body.start, usize::max);
+    // A block scalar's span may end inside the next line's indentation;
+    // that line is not part of the scalar.
+    let line_start = line_start_before(bytes, floor);
+    if bytes[line_start..floor]
+        .iter()
+        .all(|b| matches!(b, b' ' | b'\t'))
+    {
+        floor = line_start.max(body.start);
+    }
+    let mut end = body.end;
+    while end > floor {
+        let last = if bytes[end - 1] == b'\n' {
+            end - 1
+        } else {
+            end
+        };
+        let line_start = line_start_before(bytes, last);
+        if line_start < floor {
+            break;
+        }
+        let line = bytes[line_start..end].trim_ascii();
+        if !(line.is_empty() || line.starts_with(b"#")) {
+            break;
+        }
+        end = line_start;
+    }
+    end
 }
 
 /// The write-aware [`Document`] for a [`SpanParse`] of `bytes`.
@@ -3571,5 +3666,63 @@ mod tests {
             (22, &b" {c: 3}\n"[..])
         );
         assert!(extents[2].needs_line_break, "content on the marker line");
+    }
+
+    #[test]
+    fn document_extents_end_content_before_trailing_comments() {
+        let cases: [(&[u8], &[&[u8]]); 6] = [
+            (
+                b"a: 1\n---\nfixme: 1 # k\n\n# next\n---\nb: 2\n# tail\n",
+                &[b"a: 1\n", b"fixme: 1 # k\n", b"b: 2\n"],
+            ),
+            (
+                b"a: 1\r\n# c\r\n---\r\nb: 2\r\n",
+                &[b"a: 1\r\n", b"b: 2\r\n"],
+            ),
+            (b"a: 1\n---\n# only\n---\nb: 2", &[b"a: 1\n", b"", b"b: 2"]),
+            // `#` lines inside a block scalar are content.
+            (
+                b"k: |\n  x\n  # in\n# out\n---\nb: 2\n",
+                &[b"k: |\n  x\n  # in\n", b"b: 2\n"],
+            ),
+            (
+                b"a:\n  k: |\n    x\n  # out\n---\nb: 2\n",
+                &[b"a:\n  k: |\n    x\n", b"b: 2\n"],
+            ),
+            (b"a: [1,\n  2\n]\n# c\n...\n", &[b"a: [1,\n  2\n]\n"]),
+        ];
+        for (bytes, contents) in cases {
+            let extents = document_extents(bytes).expect("parses");
+            let found: Vec<&[u8]> = extents
+                .iter()
+                .map(|extent| &bytes[extent.body.start..extent.content_end])
+                .collect();
+            assert_eq!(found, contents, "{:?}", String::from_utf8_lossy(bytes));
+        }
+    }
+
+    #[test]
+    fn document_extents_find_node_properties_on_the_marker_line() {
+        let bytes =
+            b"--- !!map\na: 1\n--- &x # c\nb: 2\n--- !t &y {c: 3}\n--- # c\nd: 4\n--- {e: 5}\n";
+        let extents = document_extents(bytes).expect("parses");
+        let kept: Vec<Option<(&[u8], bool)>> = extents
+            .iter()
+            .map(|extent| {
+                extent
+                    .after_properties
+                    .map(|(start, needs)| (&bytes[extent.line_start..start], needs))
+            })
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                Some((&b"--- !!map\n"[..], false)),
+                Some((&b"--- &x # c\n"[..], false)),
+                Some((&b"--- !t &y"[..], true)),
+                None,
+                None,
+            ]
+        );
     }
 }

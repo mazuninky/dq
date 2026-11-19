@@ -150,6 +150,19 @@ pub struct DocOutOfRange {
     pub file: String,
 }
 
+/// `--doc N` over several files, none of which holds document N. Maps to
+/// exit code 2 (`NOT_FOUND`), as [`DocOutOfRange`] does for one file: a
+/// run where every file would be skipped did nothing, so it is the same
+/// error, not a success.
+#[derive(Debug, thiserror::Error)]
+#[error("--doc {index} is out of range: none of the {files} files holds document {index}")]
+pub struct DocOutOfRangeEverywhere {
+    /// The requested index.
+    pub index: usize,
+    /// How many files the run covered.
+    pub files: usize,
+}
+
 /// `" (0..=N)"` — the valid `--doc` indices for `count` documents.
 fn index_hint(count: usize) -> String {
     match count {

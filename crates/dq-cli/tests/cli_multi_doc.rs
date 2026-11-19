@@ -1382,6 +1382,92 @@ fn bulk_lint_and_fix_doc_skip_the_file_without_that_document() {
     assert_eq!(code, 2);
 }
 
+/// `--doc N` over several files, none of which holds document N, did
+/// nothing: exit 2 naming that no file holds it, from every command that
+/// honours `--doc`, also under `-q`; no file is written.
+#[test]
+fn bulk_doc_that_no_file_holds_is_exit_2() {
+    let scratch = Scratch::new();
+    for name in ["g/a.yaml", "g/b.yaml", "g/c.yaml"] {
+        scratch.write(name, SINGLE);
+    }
+    let files = ["g/a.yaml", "g/b.yaml", "g/c.yaml"];
+    let runs: [&[&str]; 7] = [
+        &["--doc", "7", "lint", "--rules", "rule.yml"],
+        &["--doc", "7", "check", "--rule", "rule.yml"],
+        &["-i", "--doc", "7", "fix", "--rules", "rule.yml"],
+        &["-q", "-i", "--doc", "7", "set", "g/*.yaml", "/kind", "Job"],
+        &[
+            "-i",
+            "--doc",
+            "7",
+            "set",
+            "g/*.yaml",
+            "--jq",
+            ".kind = \"Job\"",
+        ],
+        &["-i", "--doc", "7", "del", "g/*.yaml", "/kind"],
+        &["--doc", "7", "--diff", "del", "g/*.yaml", "/kind"],
+    ];
+    for args in runs {
+        let mut argv = args.to_vec();
+        if !args.contains(&"g/*.yaml") {
+            argv.extend(files);
+        }
+        let (code, stderr) = scratch.run(&argv).unwrap_err();
+        assert_eq!(code, 2, "dq {argv:?}: {stderr}");
+        assert!(
+            stderr.contains("--doc 7 is out of range: none of the 3 files holds document 7"),
+            "dq {argv:?}: {stderr}"
+        );
+        assert!(!stderr.contains("skipped"), "dq {argv:?}: {stderr}");
+        for name in files {
+            assert_eq!(scratch.read(name), SINGLE, "dq {argv:?} wrote {name}");
+        }
+    }
+
+    // One file holding document 1 is enough: the others are skipped.
+    scratch.write("g/b.yaml", STREAM);
+    let out = scratch
+        .run(&["-i", "--doc", "1", "set", "g/*.yaml", "/kind", "Job"])
+        .expect("one file holds document 1");
+    assert_eq!(out, "Modified: 1, Skipped: 2, Failed: 0\n");
+}
+
+/// A `fix.jq` keeps the comment and blank lines between a document's
+/// last content line and the next `---` (or the end of the file), in LF
+/// and CRLF files, and the node properties written on its `---` line.
+#[test]
+fn fix_jq_keeps_trailing_comments_and_marker_properties() {
+    let scratch = Scratch::new();
+    scratch.write("jq.yml", JQ_NAME_RULE);
+    let cases = [
+        (
+            "a: 1\n---\nx: 1\n# header of next\n---\nb: 2\n",
+            "a: 1\n---\nx: 1\nname: fixed\n# header of next\n---\nb: 2\n",
+        ),
+        (
+            "a: 1\n---\nx: 1 # gone\n\n# tail\n",
+            "a: 1\n---\nx: 1\nname: fixed\n\n# tail\n",
+        ),
+        (
+            "x: 1\r\n# next\r\n---\r\nb: 2\r\n",
+            "x: 1\r\nname: fixed\r\n# next\r\n---\r\nb: 2\r\n",
+        ),
+        (
+            "--- !!map\nx: 1\n--- &anc # c\nx: 2\n",
+            "--- !!map\nx: 1\nname: fixed\n--- &anc # c\nx: 2\nname: fixed\n",
+        ),
+    ];
+    for (before, after) in cases {
+        scratch.write("m.yaml", before);
+        scratch
+            .run(&["-i", "fix", "--rules", "jq.yml", "m.yaml"])
+            .expect("fix -i");
+        assert_eq!(scratch.read("m.yaml"), after, "{before:?}");
+    }
+}
+
 /// `set --jq` returning an empty array for a whole stream would write a
 /// file with no document: refused (exit 6), the file untouched. With
 /// `--doc N` an empty array is that document's value.

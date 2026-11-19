@@ -54,8 +54,8 @@ use dq_exec::ExecError;
 use dq_plugin::PluginError;
 
 use crate::error::{
-    BulkPartialFailure, CheckPending, DocOutOfRange, InvalidInput, LintFail, LintWarnStrict,
-    ValidateFail,
+    BulkPartialFailure, CheckPending, DocOutOfRange, DocOutOfRangeEverywhere, InvalidInput,
+    LintFail, LintWarnStrict, ValidateFail,
 };
 
 /// Successful exit.
@@ -111,7 +111,9 @@ pub fn exit_code_for_error(err: &anyhow::Error) -> i32 {
     if let Some(usage) = err.downcast_ref::<clap::Error>() {
         return usage.exit_code();
     }
-    if err.downcast_ref::<DocOutOfRange>().is_some() {
+    if err.downcast_ref::<DocOutOfRange>().is_some()
+        || err.downcast_ref::<DocOutOfRangeEverywhere>().is_some()
+    {
         return NOT_FOUND;
     }
     // Bulk-mode markers from the M3 §3 driver. `CheckPending` is the
