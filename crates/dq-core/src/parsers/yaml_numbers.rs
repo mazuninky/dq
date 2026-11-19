@@ -193,11 +193,14 @@ pub(super) fn untag_foreign(bytes: &[u8]) -> Option<String> {
 /// `- !!null`) or an empty quoted scalar (`!!null ""`), both null to YAML's
 /// core schema — read as the null it is: its tag made a local tag of the
 /// same length (`!xxxxx`), which serde_norway reads as untagged, and an
-/// empty quoted scalar made a `~` and a blank. serde_norway refuses an
-/// empty `!!null` ("expected null"). Every node keeps its position.
+/// empty quoted scalar made a `~` and a blank — or, as a key with its `:`
+/// right after it (`{!!null "":1}`), the whole node and that `:` made `~:`
+/// and blanks. serde_norway refuses an empty `!!null` ("expected null").
+/// Every node keeps its position, and every collection its shape.
 ///
-/// `None` when there is none, or when `bytes` is no UTF-8 or saphyr-parser
-/// fails on it.
+/// `None` when there is none, when `bytes` is no UTF-8 or saphyr-parser
+/// fails on it, or when a quoted one is followed by what no stand-in
+/// keeps the shape of (`""#c`, a key on another line than its `:`).
 pub(super) fn untag_empty_nulls(bytes: &[u8]) -> Option<String> {
     if !bytes.windows(4).any(|w| w == b"null") || !bytes.contains(&b'!') {
         return None;
@@ -234,8 +237,31 @@ pub(super) fn untag_empty_nulls(bytes: &[u8]) -> Option<String> {
         if !matches!(&out[quote..], [b'"', b'"', ..] | [b'\'', b'\'', ..]) {
             return None;
         }
-        out[quote] = b'~';
-        out[quote + 1] = b' ';
+        match out.get(quote + 2) {
+            // A `:` right after a quoted key is a value indicator, after a
+            // plain `~` only with a blank after it (`~ :1` is one scalar):
+            // the tag's place holds the `~:`, and blanks the rest up to the
+            // value, which keeps its position. A key and its `:` share a line.
+            Some(b':') => {
+                let colon = quote + 2;
+                if out[tag.start..colon]
+                    .iter()
+                    .any(|&b| matches!(b, b'\n' | b'\r'))
+                {
+                    return None;
+                }
+                out[tag.start] = b'~';
+                out[tag.start + 1] = b':';
+                out[tag.start + 2..=colon].fill(b' ');
+            }
+            None | Some(b' ' | b'\t' | b'\n' | b'\r' | b',' | b']' | b'}') => {
+                out[quote] = b'~';
+                out[quote + 1] = b' ';
+            }
+            // Anything else (`""#c`) is no null to the reader either: its
+            // error stands.
+            Some(_) => return None,
+        }
     }
     String::from_utf8(out).ok()
 }
@@ -903,6 +929,56 @@ mod tests {
         assert!(crate::parsers::Yaml.parse(b"n: !!null x\n").is_err());
         // A tag right before `}`: no reader of dq (nor libyaml) scans it.
         assert!(crate::parsers::Yaml.parse(b"{n: !!str}\n").is_err());
+    }
+
+    /// Every stand-in keeps the shape of the collection around it: the
+    /// node next to a `:` stays a key, next to a flow indicator an item.
+    /// The null key reads as dq names it, `""`.
+    #[test]
+    fn stand_ins_keep_the_shape_next_to_a_colon_and_a_flow_indicator() {
+        let seq = |items: &[Value]| Value::Array(items.to_vec());
+        // untag_empty_nulls: an empty quoted `!!null`, then an empty one.
+        assert_eq!(read("{!!null \"\":1}\n"), map(&[("", Value::Int(1))]));
+        assert_eq!(
+            read("[!!null \"\":1]\n"),
+            seq(&[map(&[("", Value::Int(1))])])
+        );
+        assert_eq!(
+            read("{&x !!null '':, b: *x}\n"),
+            map(&[("", Value::Null), ("b", Value::Null)])
+        );
+        assert_eq!(
+            read("[!!null \"\",1]\n"),
+            seq(&[Value::Null, Value::Int(1)])
+        );
+        assert_eq!(read("{!!null : 1}\n"), map(&[("", Value::Int(1))]));
+        assert_eq!(read("[!!null ,1]\n"), seq(&[Value::Null, Value::Int(1)]));
+        // A key on another line than its `:`, a `#` right after: no reader
+        // takes them as null, and the reader's error stands.
+        assert!(crate::parsers::Yaml.parse(b"{!!null\n  \"\":1}\n").is_err());
+        assert!(crate::parsers::Yaml.parse(b"[!!null \"\"#c]\n").is_err());
+        // untag_foreign: `x:1` is one plain scalar in flow, `x: 1` a pair.
+        assert_eq!(
+            read("%TAG !e! tag:example.com,2000:\n--- {!e!a x: 1, b: [!e!a 3,4]}\n"),
+            map(&[
+                ("x", Value::Int(1)),
+                ("b", seq(&[Value::Int(3), Value::Int(4)]))
+            ])
+        );
+        assert_eq!(
+            read("--- {!<tag:example.com:x> a:1}\n"),
+            map(&[("a:1", Value::Null)])
+        );
+        // untag_numbers: a refused `!!float` key before `:`, item before `,`.
+        let got = read("{!!float 1e400: 1, b: [!!float 1e400,2]}\n");
+        let Value::Map(m) = &got else {
+            panic!("{got:?}")
+        };
+        assert_eq!(m.keys().collect::<Vec<_>>(), ["1e400", "b"]);
+        assert_eq!(m["1e400"], Value::Int(1));
+        assert!(
+            matches!(&m["b"], Value::Array(items) if items.len() == 2 && items[1] == Value::Int(2))
+        );
     }
 
     #[test]

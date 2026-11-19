@@ -103,18 +103,17 @@ fn del_root_pointer_returns_type_mismatch() {
         .downcast_ref::<dq_core::Error>()
         .expect("expected dq_core::Error");
     // Outer kind is `path` (so it maps to exit 2), inner detail is
-    // TypeMismatch with `found = "root"`. We pin both so a regression that
-    // turned root deletion into a silent success would surface here.
+    // `DeleteRoot`. We pin both so a regression that turned root deletion
+    // into a silent success would surface here.
     assert_eq!(domain.kind_name(), "path");
     let dq_core::Error::Path { kind, .. } = domain else {
         panic!("expected Path variant, got: {domain:?}");
     };
-    match kind {
-        dq_core::PathErrorKind::TypeMismatch { found, .. } => {
-            assert_eq!(*found, "root", "root rejection must report `found = root`");
-        }
-        other => panic!("expected TypeMismatch, got: {other:?}"),
-    }
+    assert_eq!(
+        *kind,
+        dq_core::PathErrorKind::DeleteRoot,
+        "root rejection must report DeleteRoot"
+    );
 }
 
 #[test]

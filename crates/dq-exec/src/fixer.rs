@@ -213,6 +213,7 @@ impl Fixer {
                 // Down to one document, which is no stream any more: the
                 // second, when the first went.
                 if !doc.is_multi() && index == 0 {
+                    audit.rest_of_stream = true;
                     self.fix_slot(path, doc, None, format_name, &mut audit)?;
                 }
             }
@@ -339,6 +340,9 @@ struct Audit {
     applied_rules: Vec<String>,
     skipped_non_idempotent: Vec<String>,
     legacy_jq_applied: bool,
+    /// Whether the document is what is left of a stream whose other
+    /// documents a `fix.ops` `remove ""` took away.
+    rest_of_stream: bool,
 }
 
 /// How many documents `doc` holds: one unless it is a stream.
@@ -389,7 +393,7 @@ fn apply_ops_branch(
     if script.is_noop() {
         return Ok(());
     }
-    refuse_document_removal(&script, slot, &rule.rule.id)?;
+    refuse_document_removal(&script, slot, audit.rest_of_stream, &rule.rule.id)?;
     // The script addresses the document's root as `""`; in a stream that
     // document is `/N`.
     let script = match slot {
@@ -498,7 +502,9 @@ fn apply_ops_branch(
 
 /// Refuse a `fix.ops` script that removes its document (`remove` of the
 /// path `""`) where that cannot be done: a document that is not part of
-/// a stream is the whole file, and in a stream any op after the removal
+/// a stream is the whole file, the last one left of a stream
+/// (`rest_of_stream`) would take every document with it, and in a stream
+/// any op after the removal
 /// would address the document that moves into its place.
 ///
 /// `add` / `replace` of `""` write the whole document, and `remove ""`
@@ -508,14 +514,23 @@ fn apply_ops_branch(
 /// # Errors
 ///
 /// [`ExecError::FixApply`] (exit 3) naming the rule and the document.
-fn refuse_document_removal(script: &EditScript, slot: Slot, rule_id: &str) -> Result<()> {
+fn refuse_document_removal(
+    script: &EditScript,
+    slot: Slot,
+    rest_of_stream: bool,
+    rule_id: &str,
+) -> Result<()> {
     let ops = script.ops();
     let Some(at) = ops.iter().position(
         |op| matches!(op, dq_core::EditOp::Remove { path } if path.segments().is_empty()),
     ) else {
         return Ok(());
     };
-    let message = if slot.is_none() {
+    let message = if slot.is_none() && rest_of_stream {
+        "fix.ops would remove the last document left of the stream (remove \"\"): \
+         every document of the stream would go; only some of them can be removed"
+            .to_owned()
+    } else if slot.is_none() {
         format!(
             "fix.ops would remove {} as a whole (remove \"\"): it is the whole file; \
              only a document of a stream can be removed",
@@ -1808,14 +1823,17 @@ fix:
             "ok: 1\n---\nok: 2\n"
         );
         // Down to one document: the one left is fixed as a document, and
-        // a document that is no stream cannot be removed.
+        // it cannot go too — every document of the stream would.
         let err = fixed(&fixer, "bad: true\n---\nbad: true\n").expect_err("refused");
         let ExecError::FixApply { rule_id, message } = err else {
             panic!("expected FixApply, got {err:?}");
         };
         assert_eq!(rule_id, "test.whole");
         assert!(
-            message.starts_with("fix.ops would remove the document as a whole"),
+            message.starts_with(
+                "fix.ops would remove the last document left of the stream (remove \"\"): \
+                 every document of the stream would go"
+            ),
             "{message}"
         );
     }

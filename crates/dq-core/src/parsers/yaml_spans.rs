@@ -124,7 +124,22 @@ fn parse_with_spans_and_block_scalars(bytes: &[u8]) -> Result<SpanParse> {
     } else {
         read_doc.value().clone()
     };
-    let (spans, block_scalars) = build_span_map_and_block_scalars(bytes)?;
+    // The span builder finds lines by their `\n`. A file whose lines all
+    // end in a lone `\r` has none: its spans come from the same bytes with
+    // each `\r` a `\n` — the same length, so every offset holds, and the
+    // same lines to saphyr-parser — or each line lookup would scan to the
+    // end of the file.
+    let lf;
+    let span_bytes = if !bytes.contains(&b'\n') && bytes.contains(&b'\r') {
+        lf = bytes
+            .iter()
+            .map(|&b| if b == b'\r' { b'\n' } else { b })
+            .collect::<Vec<u8>>();
+        lf.as_slice()
+    } else {
+        bytes
+    };
+    let (spans, block_scalars) = build_span_map_and_block_scalars(span_bytes)?;
     Ok(SpanParse {
         value,
         spans,

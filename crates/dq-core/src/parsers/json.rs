@@ -111,7 +111,7 @@ impl Format for Json {
         } else {
             write_value_pretty(doc.value(), w, 0)?;
         }
-        Ok(())
+        end_line(w)
     }
 
     fn write_with_options(
@@ -149,15 +149,25 @@ impl Format for Json {
             // shape `serde_json::to_writer` would emit with the default
             // `CompactFormatter`. We use the local helper so big-numeric
             // literals stay byte-perfect.
-            Some(0) => write_value_compact(&value, w),
+            Some(0) => write_value_compact(&value, w)?,
             // `Some(n)` (n >= 1) → pretty-print with `n` spaces per level.
-            Some(n) => write_value_pretty_with_step(&value, w, 0, n as usize),
+            Some(n) => write_value_pretty_with_step(&value, w, 0, n as usize)?,
             // `None` → preserve the M2 default whitespace shape (2-space
             // indent, surrounding newlines). This is the shape `dq fmt`
             // produces when only `--sort-keys` was passed.
-            None => write_value_pretty(&value, w, 0),
+            None => write_value_pretty(&value, w, 0)?,
         }
+        end_line(w)
     }
+}
+
+/// The line break a re-emitted JSON file ends with, as the YAML and TOML
+/// writers end theirs.
+fn end_line(w: &mut dyn Write) -> Result<()> {
+    w.write_all(b"\n").map_err(|source| Error::Io {
+        path: camino::Utf8PathBuf::from("<json-writer>"),
+        source,
+    })
 }
 
 /// Parse `bytes` as JSON, returning the read-pat [`Value`] tree alongside the
@@ -1340,7 +1350,7 @@ mod tests {
         map.insert("a".into(), arr);
         let doc = Document::single(Value::Map(map));
         let out = write(&doc);
-        assert_eq!(out, "{\n  \"a\": [\n    1,\n    2\n  ]\n}");
+        assert_eq!(out, "{\n  \"a\": [\n    1,\n    2\n  ]\n}\n");
     }
 
     #[test]

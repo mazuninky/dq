@@ -43,10 +43,7 @@ impl Document {
             return Err(Error::Path {
                 pointer: canonical,
                 matched_prefix: String::new(),
-                kind: PathErrorKind::TypeMismatch {
-                    expected: "an array item",
-                    found: "root",
-                },
+                kind: PathErrorKind::InsertAtRoot,
                 did_you_mean: Vec::new(),
             });
         };
@@ -82,6 +79,9 @@ impl Document {
     /// Insert `value` at `index` of the array at `parent`: first a
     /// placeholder item, checked to read back, then `value` set over it.
     fn insert_unchecked(&mut self, parent: &Pointer, index: usize, value: Value) -> Result<()> {
+        if crate::textual_edit::renderer_for_format(self.format).is_none() {
+            return Err(self.no_textual_edits("insert an item into it"));
+        }
         if !self.write_aware {
             return Err(Error::WriteUnavailable {
                 reason: format!(
@@ -97,6 +97,15 @@ impl Document {
             action: "insert",
             pointer: canonical.clone(),
             reason: format!("dq cannot write a new item here as a textual edit; {JQ_REWRITE_HINT}"),
+        };
+        // The item is written by `set_at`: a refusal of it is the insert's.
+        let as_insert = |err: Error| match err {
+            Error::EditRejected { reason, .. } => Error::EditRejected {
+                action: "insert",
+                pointer: canonical.clone(),
+                reason,
+            },
+            other => other,
         };
         let parent_canonical = parent.as_canonical();
         let len = match parent.resolve(&self.value) {
@@ -118,7 +127,7 @@ impl Document {
                     let Value::Map(map) = value else {
                         return Err(Error::EditRejected {
                             action: "insert",
-                            pointer: canonical,
+                            pointer: canonical.clone(),
                             reason: format!(
                                 "an array of tables holds only tables; {JQ_REWRITE_HINT}"
                             ),
@@ -129,7 +138,7 @@ impl Document {
                     for (key, value) in map {
                         let mut at = item.clone();
                         at.push_segment(Segment::Key(key));
-                        self.set_at(&at, value)?;
+                        self.set_at(&at, value).map_err(as_insert)?;
                     }
                     return Ok(());
                 }
@@ -162,7 +171,7 @@ impl Document {
         if value.same_data(&placeholder) && !matches!(placeholder, Value::Int(_)) {
             return Ok(());
         }
-        self.set_at(&item, value)
+        self.set_at(&item, value).map_err(as_insert)
     }
 
     /// Splice `splice`'s text in and adopt the bytes when they read back
@@ -611,6 +620,21 @@ mod tests {
                 }
             ),
             "{err:?}"
+        );
+        let err = inserted("yaml", "- 1\n", "", Value::Int(9)).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                Error::Path {
+                    kind: PathErrorKind::InsertAtRoot,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string().starts_with("cannot insert at the root ''"),
+            "{err}"
         );
         let err = inserted("yaml", "a: 1\n", "/a/0", Value::Int(9)).unwrap_err();
         assert!(

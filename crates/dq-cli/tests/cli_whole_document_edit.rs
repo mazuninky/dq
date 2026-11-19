@@ -661,8 +661,9 @@ fn fix_ops_remove_cannot_take_every_document_of_a_stream() {
     assert_eq!(out.code, 3, "{}", out.stderr);
     assert_eq!(
         out.stderr,
-        "rule test.whole fix failed: fix.ops would remove the document as a whole \
-         (remove \"\"): it is the whole file; only a document of a stream can be removed\n"
+        "rule test.whole fix failed: fix.ops would remove the last document left of the \
+         stream (remove \"\"): every document of the stream would go; only some of them \
+         can be removed\n"
     );
     assert_eq!(out.file, src, "untouched");
 }
@@ -2528,12 +2529,12 @@ fn patch_add_into_a_toml_array_refuses_what_it_cannot_hold() {
         (
             "a = [1, 2]\n",
             op("add", "/a/0", "null"),
-            "cannot set '/a/0'",
+            "cannot insert '/a/0'",
         ),
         (
             "a = [1, 2]\n",
             op("add", "/a/-", "null"),
-            "cannot set '/a/2'",
+            "cannot insert '/a/2'",
         ),
     ] {
         let stderr = refused("f.toml", src, &["-i", "patch", "f.toml", &ops], 7);
@@ -3116,19 +3117,19 @@ fn json_byte_order_mark_is_dropped_by_a_writer_rewrite() {
             "f.json",
             "\u{feff}{\"a\": 1}\n",
             &["set", "f.json", "--jq", ".a = 2"][..],
-            "{\n  \"a\": 2\n}",
+            "{\n  \"a\": 2\n}\n",
         ),
         (
             "f.json",
             "\u{feff}{\"a\":1}\n",
             &["fmt", "--indent", "2", "f.json"][..],
-            "{\n  \"a\": 1\n}",
+            "{\n  \"a\": 1\n}\n",
         ),
         (
             "f.json",
             "\u{feff}{\"b\":1,\"a\":2}\n",
             &["fmt", "--sort-keys", "f.json"][..],
-            "{\n  \"a\": 2,\n  \"b\": 1\n}",
+            "{\n  \"a\": 2,\n  \"b\": 1\n}\n",
         ),
         (
             "f.json",
@@ -3267,4 +3268,220 @@ fn fix_jq_reemit_of_a_single_document_with_an_anchored_or_scalar_root() {
         assert_eq!(out.file, want, "{src:?}");
         assert_eq!(read("s.yaml", &out.file), reads, "{:?}", out.file);
     }
+}
+
+// ---- review fixes: reader stand-ins, directives, wording, layout -------
+
+/// An empty quoted `!!null` key right before its `:` is the null key, in a
+/// flow mapping and as a mapping of one pair in a flow sequence, as PyYAML
+/// reads it (dq names the null key `""`); where no reader takes it as null
+/// (a key on another line than its `:`, a `#` right after it), the file
+/// stays refused with exit 3.
+#[test]
+fn an_empty_quoted_null_key_before_its_colon_reads_as_null() {
+    for (src, want) in [
+        ("{!!null \"\":1}\n", json!({"": 1})),
+        ("[!!null \"\":1]\n", json!([{"": 1}])),
+        ("{!!null '':, a: 1}\n", json!({"": null, "a": 1})),
+        ("{&x !!null \"\":[1], b: *x}\n", json!({"": [1], "b": null})),
+        ("[!!null \"\", 1]\n", json!([null, 1])),
+    ] {
+        assert_eq!(read("s.yaml", src), want, "{src:?}");
+    }
+    for src in ["{!!null\n  \"\":1}\n", "[!!null \"\"#c]\n"] {
+        let out = run("s.yaml", src, &["-q", "-F", "json", "convert", "s.yaml"]);
+        assert_eq!(
+            (out.code, out.stdout.as_str()),
+            (3, ""),
+            "{src:?}: {}",
+            out.stderr
+        );
+    }
+}
+
+/// `del /N` takes the directives that lead into document N with it, and
+/// the `...` line that ended the document before them when no directives
+/// of the next document need it.
+#[test]
+fn del_of_a_stream_document_takes_its_directives() {
+    let two = "%YAML 1.2\n---\na: 1\n...\n%YAML 1.2\n---\nb: 2\n";
+    let tag = "%TAG !e! tag:example.com,2000:\r\n";
+    let three = format!(
+        "{tag}---\r\na: !e!x 1\r\n...\r\n{tag}---\r\nb: !e!x 2\r\n...\r\n%YAML 1.2\r\n---\r\nc: 3\r\n"
+    );
+    let three_less = format!("{tag}---\r\na: !e!x 1\r\n...\r\n%YAML 1.2\r\n---\r\nc: 3\r\n");
+    check(&[
+        Case {
+            name: "s.yaml",
+            src: two,
+            args: &["del", "s.yaml", "/1"],
+            want: "%YAML 1.2\n---\na: 1\n",
+            reads: json!({"a": 1}),
+        },
+        Case {
+            name: "s.yaml",
+            src: two,
+            args: &["del", "s.yaml", "/0"],
+            want: "%YAML 1.2\n---\nb: 2\n",
+            reads: json!({"b": 2}),
+        },
+        Case {
+            name: "s.yaml",
+            src: &three,
+            args: &["del", "s.yaml", "/1"],
+            want: &three_less,
+            reads: json!([{"a": 1}, {"c": 3}]),
+        },
+    ]);
+}
+
+/// The words of three refusals: an insert's refused value names the
+/// insert at the op's path, and a format with no textual edits says so.
+#[test]
+fn insert_and_markdown_refusals_say_what_was_refused() {
+    let stderr = refused(
+        "f.toml",
+        "[[arr]]\nk = 1\n",
+        &[
+            "-i",
+            "patch",
+            "f.toml",
+            r#"[{"op":"add","path":"/arr/1","value":{"k":null}}]"#,
+        ],
+        7,
+    );
+    assert!(stderr.starts_with("cannot insert '/arr/1': "), "{stderr}");
+    for (args, what) in [
+        (&["-i", "set", "m.md", "/a", "1"][..], "set a value in it"),
+        (&["-i", "del", "m.md", "/a"][..], "delete a value from it"),
+    ] {
+        let stderr = refused("m.md", "# T\n\ntext\n", args, 7);
+        assert!(
+            stderr.contains(&format!(
+                "markdown has no textual edits: dq can read a markdown file but cannot {what}"
+            )),
+            "{stderr}"
+        );
+    }
+}
+
+/// An edit of a file whose lines end in a lone `\r` costs about what one
+/// of a `\n` file does: no line lookup scans to the end of the file.
+#[test]
+fn an_edit_of_a_large_lone_cr_file_is_linear() {
+    let src: String = (0..10_000).map(|i| format!("k{i}: {i}\r")).collect();
+    let started = std::time::Instant::now();
+    let got = edit("s.yaml", &src, &["set", "s.yaml", "/k5000", "x"]);
+    let took = started.elapsed();
+    assert_eq!(got, src.replace("k5000: 5000\r", "k5000: x\r"));
+    assert!(took.as_secs() < 8, "took {took:?}");
+}
+
+/// A table created by `set` gets the blank line the file puts before its
+/// headers, also before one that comment lines lead into; a comment on a
+/// `---` line stays when the node properties there go.
+#[test]
+fn set_keeps_header_spacing_and_the_marker_line_comment() {
+    check(&[
+        Case {
+            name: "f.toml",
+            src: "[t]\na = 1\n\n# lead\n[u]\nb = 2\n",
+            args: &["set", "f.toml", "/t/n/x", "1"],
+            want: "[t]\na = 1\n\n[t.n]\nx = 1\n\n# lead\n[u]\nb = 2\n",
+            reads: json!({"t": {"a": 1, "n": {"x": 1}}, "u": {"b": 2}}),
+        },
+        Case {
+            name: "s.yaml",
+            src: "--- !!map # c\na: 1\n",
+            args: &["set", "s.yaml", "", "[1]"],
+            want: "--- # c\n- 1\n",
+            reads: json!([1]),
+        },
+        Case {
+            name: "s.yaml",
+            src: "x: 0\r\n--- !!map # c\r\n# lead\r\na: 1\r\n",
+            args: &["set", "s.yaml", "/1", "5"],
+            want: "x: 0\r\n--- # c\r\n# lead\r\n5\r\n",
+            reads: json!([{"x": 0}, 5]),
+        },
+    ]);
+}
+
+/// JSON output ends with one line break: a same-format `convert` of a file
+/// that has one adds none, and a re-emit (`set --jq`, `fmt --indent`)
+/// ends the file with one, as the YAML and TOML writers do.
+#[test]
+fn json_output_ends_with_one_line_break() {
+    let out = run(
+        "f.json",
+        "{\"a\": 1}\n",
+        &["-q", "-F", "json", "convert", "f.json"],
+    );
+    assert_eq!(
+        (out.code, out.stdout.as_str()),
+        (0, "{\"a\": 1}\n"),
+        "{}",
+        out.stderr
+    );
+    let out = run(
+        "f.json",
+        "{\"a\": 1}",
+        &["-q", "-F", "json", "convert", "f.json"],
+    );
+    assert_eq!(
+        (out.code, out.stdout.as_str()),
+        (0, "{\"a\": 1}\n"),
+        "{}",
+        out.stderr
+    );
+    check(&[
+        Case {
+            name: "f.json",
+            src: "{\"a\": 1}\n",
+            args: &["set", "f.json", "--jq", ".a = 2"],
+            want: "{\n  \"a\": 2\n}\n",
+            reads: json!({"a": 2}),
+        },
+        Case {
+            name: "f.json",
+            src: "{\"a\": 1}",
+            args: &["fmt", "--indent", "2", "f.json"],
+            want: "{\n  \"a\": 1\n}\n",
+            reads: json!({"a": 1}),
+        },
+    ]);
+}
+
+/// A value inserted into an empty object of a JSON container written on
+/// one line is written on that line; in a multi-line file it gets lines
+/// of its own, indented from the line the `{` is on.
+#[test]
+fn a_json_insert_into_an_empty_object_follows_the_layout() {
+    check(&[
+        Case {
+            name: "f.json",
+            src: "{\"ab\": 1, \"a\": {}}\n",
+            args: &[
+                "patch",
+                "f.json",
+                r#"[{"op":"move","from":"/ab","path":"/a/b"}]"#,
+            ],
+            want: "{\"a\": {\"b\": 1}}\n",
+            reads: json!({"a": {"b": 1}}),
+        },
+        Case {
+            name: "f.json",
+            src: "{\"x\": [{}]}\n",
+            args: &["set", "f.json", "/x/0/b", "1"],
+            want: "{\"x\": [{\"b\": 1}]}\n",
+            reads: json!({"x": [{"b": 1}]}),
+        },
+        Case {
+            name: "f.json",
+            src: "{\n  \"a\": {},\n  \"c\": 1\n}\n",
+            args: &["set", "f.json", "/a/b", "1"],
+            want: "{\n  \"a\": {\n    \"b\": 1\n  },\n  \"c\": 1\n}\n",
+            reads: json!({"a": {"b": 1}, "c": 1}),
+        },
+    ]);
 }

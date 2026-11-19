@@ -437,9 +437,11 @@ fn render_to_format(
             let json = dq_core::by_name("json").expect("json format always registered");
             json.write_with_options(doc, &mut buf, opts)
                 .map_err(anyhow::Error::new)?;
-            // The dq-core JSON writer does not append a trailing newline;
-            // shell-friendly output gets one.
-            writeln!(buf)?;
+            // A re-emit ends with a line break; source bytes copied as
+            // they are may not, and shell-friendly output gets one.
+            if !buf.ends_with(b"\n") {
+                writeln!(buf)?;
+            }
         }
         OutputFormat::Yaml => {
             let yaml = dq_core::by_name("yaml").expect("yaml format always registered");

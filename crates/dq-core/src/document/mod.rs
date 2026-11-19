@@ -907,10 +907,7 @@ impl Document {
                         return Err(Error::Path {
                             pointer: String::new(),
                             matched_prefix: String::new(),
-                            kind: PathErrorKind::TypeMismatch {
-                                expected: "a document of the stream",
-                                found: "stream",
-                            },
+                            kind: PathErrorKind::StreamRoot,
                             did_you_mean: Vec::new(),
                         });
                     }
@@ -964,8 +961,11 @@ impl Document {
                 .for_each(|b| *b = to);
         };
         swap(&mut self.original_bytes, b'\r', b'\n');
-        // The spans of the `\n` form: a line range ends past a `\n`.
-        if let Some(Ok(fresh)) = parse_again(self.format, &self.original_bytes) {
+        // The spans of the `\n` form: a line range ends past a `\n`. The
+        // YAML reader builds a lone-`\r` file's spans so already.
+        if self.format == FormatTag::Json
+            && let Some(Ok(fresh)) = parse_again(self.format, &self.original_bytes)
+        {
             self.spans = fresh.spans;
             self.provenance = fresh.provenance;
         }
@@ -989,6 +989,18 @@ impl Document {
                     reason: format!("the edited document would not parse; {JQ_REWRITE_HINT}"),
                 })
             }
+        }
+    }
+
+    /// The refusal of a textual edit — `what` it would do, as "set a value
+    /// in it" — in a format dq writes no textual edits for (Markdown, INI,
+    /// CSV, …: the ones with no scalar renderer).
+    pub(crate) fn no_textual_edits(&self, what: &str) -> Error {
+        let name = self.format.name();
+        Error::WriteUnavailable {
+            reason: format!(
+                "{name} has no textual edits: dq can read a {name} file but cannot {what}"
+            ),
         }
     }
 
@@ -1150,6 +1162,9 @@ impl Document {
         value: Value,
         layout: &LayoutCache,
     ) -> Result<()> {
+        let Some(renderer) = renderer_for_format(self.format) else {
+            return Err(self.no_textual_edits("set a value in it"));
+        };
         // Read-only parsers go through `value_only` / `multi_value_only`;
         // neither bytes nor spans tell, since an empty YAML file parsed
         // write-aware has none of either.
@@ -1161,12 +1176,6 @@ impl Document {
                 ),
             });
         }
-        let renderer = renderer_for_format(self.format).ok_or_else(|| Error::WriteUnavailable {
-            reason: format!(
-                "renderer not registered for format {:?}; this format will gain write support in Section 3+",
-                self.format,
-            ),
-        })?;
 
         let canonical = pointer.as_canonical();
         if self.format == FormatTag::Json && value.holds_non_finite() {
@@ -1503,8 +1512,7 @@ impl Document {
             out.push(b'\n');
         }
         // A blank line before the header when the file puts one there.
-        let blank_lines =
-            bytes.windows(3).any(|w| w == b"\n\n[") || bytes.windows(4).any(|w| w == b"\n\r\n[");
+        let blank_lines = blank_line_before_a_header(bytes);
         let after_blank = bytes[..at].ends_with(b"\n\n") || bytes[..at].ends_with(b"\n\r\n");
         if blank_lines && at > bom_end(bytes) && !after_blank {
             out.push(b'\n');
@@ -2185,8 +2193,13 @@ impl Document {
         //   is a safe default; the block-form path inherits it as
         //   children indent.
         // - TOML: ignored by [`TomlInsertionRenderer`].
+        let json_indent = u32::try_from(json_line_indent(
+            &self.original_bytes,
+            parent_span.value_range.start,
+        ))
+        .unwrap_or(u32::MAX);
         let renderer_indent = match self.format {
-            FormatTag::Json => parent_span.indent.saturating_sub(1),
+            FormatTag::Json => json_indent,
             FormatTag::Yaml => parent_span.indent.saturating_add(2),
             _ => parent_span.indent,
         };
@@ -2204,11 +2217,25 @@ impl Document {
         let fragment =
             insertion_renderer.render_insertion(&new_key, &value, renderer_indent, context);
 
+        // In a JSON container written on one line the new entry is written
+        // on that line too.
+        let one_line = self.format == FormatTag::Json
+            && parent_canonical.rfind('/').is_some_and(|cut| {
+                crate::parsers::json::json_container_ranges(&self.original_bytes)
+                    .ok()
+                    .and_then(|ranges| ranges.get(&parent_canonical[..cut]).cloned())
+                    .is_some_and(|range| {
+                        !self.original_bytes[range]
+                            .iter()
+                            .any(|&b| matches!(b, b'\n' | b'\r'))
+                    })
+            });
         let (splice_at, splice_bytes) = format_specific_empty_parent_splice(
             self.format,
             &fragment,
             &parent_span,
             &self.original_bytes,
+            one_line,
         );
         let splice_bytes = with_line_ending_at(&self.original_bytes, splice_at, splice_bytes);
 
@@ -2739,6 +2766,9 @@ impl Document {
 
     /// [`Document::del_at`] without the read-back check.
     fn del_at_unchecked(&mut self, pointer: &Pointer, cache: &LayoutCache) -> Result<()> {
+        if renderer_for_format(self.format).is_none() {
+            return Err(self.no_textual_edits("delete a value from it"));
+        }
         // Read-only parsers go through `value_only` / `multi_value_only`.
         if !self.write_aware {
             return Err(Error::WriteUnavailable {
@@ -2752,10 +2782,7 @@ impl Document {
             return Err(Error::Path {
                 pointer: pointer.as_canonical(),
                 matched_prefix: String::new(),
-                kind: PathErrorKind::TypeMismatch {
-                    expected: "non-root pointer",
-                    found: "root",
-                },
+                kind: PathErrorKind::DeleteRoot,
                 did_you_mean: Vec::new(),
             });
         }
@@ -4104,6 +4131,24 @@ fn first_comment_line(bytes: &[u8], from: usize, to: usize) -> Option<usize> {
     None
 }
 
+/// Whether a TOML file puts a blank line before a table header — right
+/// before it, or before the comment lines that lead into it.
+fn blank_line_before_a_header(bytes: &[u8]) -> bool {
+    // Whether the last line before the comment lines just seen is blank.
+    let mut blank_before = false;
+    // A header starts its line, as the items of a multi-line array
+    // seldom do.
+    for line in bytes.split(|&b| b == b'\n') {
+        if line.starts_with(b"[") && blank_before {
+            return true;
+        }
+        if !line.trim_ascii_start().starts_with(b"#") {
+            blank_before = line.trim_ascii().is_empty();
+        }
+    }
+    false
+}
+
 /// Byte offset of `pos` from the start of its line.
 fn line_column(bytes: &[u8], pos: usize) -> usize {
     pos - line_start(bytes, pos)
@@ -4647,9 +4692,12 @@ fn format_specific_empty_parent_splice(
     fragment: &[u8],
     parent_span: &ValueSpan,
     original_bytes: &[u8],
+    one_line: bool,
 ) -> (usize, Vec<u8>) {
     match format {
-        FormatTag::Json => json_empty_parent_splice(fragment, parent_span, original_bytes),
+        FormatTag::Json => {
+            json_empty_parent_splice(fragment, parent_span, original_bytes, one_line)
+        }
         FormatTag::Yaml => yaml_empty_parent_splice(fragment, parent_span, original_bytes),
         FormatTag::Toml => toml_empty_parent_splice(fragment, parent_span, original_bytes),
         // Read-only formats don't reach here — callers gate on the
@@ -4671,36 +4719,45 @@ fn format_specific_empty_parent_splice(
 }
 
 /// JSON empty-parent splice. Parent's `value_range` covers `{}` (or `{}` with
-/// interior whitespace like `{ }` / `{\n}`). We splice between the `{` and
-/// `}` so the result is `{<fragment>\n}` (or analog).
+/// interior whitespace like `{ }` / `{\n}`). We splice before the `}`: the
+/// fragment (`\n` + indent + `"k": v`) and a line break with the indent of
+/// the line the `{` is on, so the `}` lines up with that line — or, when
+/// `one_line` (the container around the `{}` is written on one line), the
+/// entry alone, `{"k": v}`.
 fn json_empty_parent_splice(
     fragment: &[u8],
     parent_span: &ValueSpan,
     original_bytes: &[u8],
+    one_line: bool,
 ) -> (usize, Vec<u8>) {
-    // Find the closing `}` (or `]`) inside the parent's body, scanning
-    // back from `value_range.end - 1`. The literal `{}` has the closing
-    // brace at exactly `value_range.end - 1`; flexibility for `{ }` etc.
-    // The trailing fragment must keep the `}` on its own line at the
-    // parent's column for readability.
+    // The literal `{}` has the closing brace at `value_range.end - 1`.
     let close_pos = parent_span
         .value_range
         .end
         .saturating_sub(1)
         .min(original_bytes.len());
-    // The fragment already starts with `\n` + indent + `"k": v`; we append
-    // `\n` + parent_indent_spaces + `}` worth of suffix. Actually we just
-    // need to ensure the closing brace ends up on its own line at the
-    // parent's column. Easier: append `\n` + (parent_indent - 1) spaces
-    // before splicing; the existing `}` stays put. parent_span.indent is
-    // 1-indexed column of the opening `{`, so the closing `}` lands at the
-    // same column. Children are at indent + 2 (which the renderer used).
-    let parent_col = parent_span.indent.saturating_sub(1) as usize;
-    let mut out = Vec::with_capacity(fragment.len() + parent_col + 1);
+    if one_line {
+        let entry = fragment
+            .iter()
+            .position(|&b| !matches!(b, b'\n' | b' '))
+            .unwrap_or(fragment.len());
+        return (close_pos, fragment[entry..].to_vec());
+    }
+    let indent = json_line_indent(original_bytes, parent_span.value_range.start);
+    let mut out = Vec::with_capacity(fragment.len() + indent + 1);
     out.extend_from_slice(fragment);
     out.push(b'\n');
-    out.extend(std::iter::repeat_n(b' ', parent_col));
+    out.extend(std::iter::repeat_n(b' ', indent));
     (close_pos, out)
+}
+
+/// The number of blanks the line holding byte `at` begins with.
+fn json_line_indent(bytes: &[u8], at: usize) -> usize {
+    let start = line_start(bytes, at.min(bytes.len()));
+    bytes[start..]
+        .iter()
+        .take_while(|&&b| matches!(b, b' ' | b'\t'))
+        .count()
 }
 
 /// YAML empty-parent splice. The parent's recorded `value_range` either
@@ -5010,10 +5067,7 @@ fn delete_value_at(root: &mut Value, pointer: &Pointer) -> Result<()> {
         return Err(Error::Path {
             pointer: String::new(),
             matched_prefix: String::new(),
-            kind: PathErrorKind::TypeMismatch {
-                expected: "non-root pointer",
-                found: "root",
-            },
+            kind: PathErrorKind::DeleteRoot,
             did_you_mean: Vec::new(),
         });
     }
@@ -5724,8 +5778,8 @@ mod tests {
         match result {
             Err(Error::WriteUnavailable { reason }) => {
                 assert!(
-                    reason.contains("renderer not registered"),
-                    "JSONL write must surface a renderer-missing diagnostic; got: {reason}",
+                    reason.contains("jsonl has no textual edits"),
+                    "JSONL write must say it has no textual edits; got: {reason}",
                 );
             }
             other => panic!("expected WriteUnavailable, got: {other:?}"),
@@ -5910,7 +5964,31 @@ mod tests {
     }
 
     #[test]
-    fn del_at_root_returns_type_mismatch() {
+    fn blank_line_before_a_header_looks_past_its_comment_lines() {
+        assert!(blank_line_before_a_header(b"a = 1\n\n[t]\n"));
+        assert!(blank_line_before_a_header(b"a = 1\n\n# lead\n[t]\n"));
+        assert!(blank_line_before_a_header(
+            b"a = 1\r\n\r\n# lead\r\n[t]\r\n"
+        ));
+        assert!(!blank_line_before_a_header(b"a = 1\n# lead\n[t]\n"));
+        assert!(!blank_line_before_a_header(b"a = [\n\n  [1],\n]\n"));
+    }
+
+    #[test]
+    fn markdown_has_no_textual_edits() {
+        let mut doc =
+            crate::format::Format::parse(&crate::parsers::Markdown, b"# T\n\ntext\n").unwrap();
+        let err = doc
+            .set_at(&Pointer::parse("/a").unwrap(), Value::Int(1))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("markdown has no textual edits"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn del_at_root_returns_delete_root() {
         // Even on a write-aware document the root pointer cannot be
         // deleted — that would empty the file. A populated `spans` map
         // proves the early `WriteUnavailable` check is past, so we know
@@ -5925,13 +6003,11 @@ mod tests {
         );
         let result = doc.del_at(&Pointer::default());
         match result {
-            Err(Error::Path { kind, .. }) => match kind {
-                PathErrorKind::TypeMismatch { expected, found } => {
-                    assert_eq!(found, "root", "root pointer must be flagged distinctly");
-                    assert_eq!(expected, "non-root pointer");
-                }
-                other => panic!("expected TypeMismatch, got: {other:?}"),
-            },
+            Err(Error::Path { kind, .. }) => assert_eq!(
+                kind,
+                PathErrorKind::DeleteRoot,
+                "root pointer must be flagged distinctly"
+            ),
             other => panic!("expected Path error, got: {other:?}"),
         }
     }

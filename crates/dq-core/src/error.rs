@@ -33,6 +33,13 @@ pub enum PathErrorKind {
         /// The `from` of the move, in canonical form.
         from: String,
     },
+    /// A delete of the root pointer: it names the whole document.
+    DeleteRoot,
+    /// A `set` of the root pointer of a stream of documents, where it
+    /// names no one document.
+    StreamRoot,
+    /// An insert at the root pointer, which names no item of an array.
+    InsertAtRoot,
 }
 
 /// All errors `dq-core` may produce.
@@ -184,15 +191,17 @@ pub enum Error {
 /// The message of an [`Error::Path`].
 fn path_message(pointer: &str, matched_prefix: &str, kind: &PathErrorKind) -> String {
     match kind {
-        PathErrorKind::TypeMismatch { found: "root", .. } => format!(
+        PathErrorKind::DeleteRoot => format!(
             "cannot delete the root '{pointer}': it is the whole document; delete a value \
              inside it, or one document of a stream as /N"
         ),
-        PathErrorKind::TypeMismatch {
-            found: "stream", ..
-        } => format!(
+        PathErrorKind::StreamRoot => format!(
             "cannot set the root '{pointer}' of a stream of documents: set one document \
              as /N, or pass --doc N"
+        ),
+        PathErrorKind::InsertAtRoot => format!(
+            "cannot insert at the root '{pointer}': it is the whole document, no item of \
+             an array; name an index of an array, as /a/0"
         ),
         PathErrorKind::IntoItsOwnChild { from } => format!(
             "cannot move '{from}' to '{pointer}': a value cannot move into one of its own \

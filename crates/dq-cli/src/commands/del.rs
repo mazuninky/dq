@@ -265,17 +265,15 @@ mod tests {
         let err = run(&cli, &args, None, false, &mut out).unwrap_err();
         let domain = err.downcast_ref::<dq_core::Error>().unwrap();
         assert_eq!(domain.kind_name(), "path");
-        // The Path error's kind is TypeMismatch with `found = "root"` —
-        // pin it via the Display message, which `dq-core` already exposes.
+        // The Path error's kind is `DeleteRoot`.
         let dq_core::Error::Path { kind, .. } = domain else {
             panic!("expected Path error variant, got: {domain:?}");
         };
-        match kind {
-            dq_core::PathErrorKind::TypeMismatch { found, .. } => {
-                assert_eq!(*found, "root", "expected root rejection");
-            }
-            other => panic!("expected TypeMismatch, got: {other:?}"),
-        }
+        assert_eq!(
+            *kind,
+            dq_core::PathErrorKind::DeleteRoot,
+            "expected root rejection"
+        );
     }
 
     #[test]

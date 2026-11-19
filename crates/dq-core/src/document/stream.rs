@@ -125,16 +125,32 @@ impl Document {
                 &emitted,
             )
         }) {
-            attempts.push((past_lead(after_properties), extent.content_end));
+            attempts.push((past_lead(after_properties), extent.content_end, Vec::new()));
         }
-        attempts.push((past_lead(body), extent.content_end));
-        attempts.push((past_lead(body), extent.body.end));
-        attempts.push((body, extent.body.end));
+        // Without the properties, a comment after them on the marker line
+        // (`--- !!map # c`) stays, and so do the lines leading into the
+        // content: written again before the new content.
+        if let Some((after, false)) = extent.after_properties {
+            let line = &bytes[extent.body.start..after];
+            if let Some(comment) = line
+                .windows(2)
+                .position(|w| matches!(w[0], b' ' | b'\t') && w[1] == b'#')
+            {
+                let lead_end = past_lead_in(bytes, after, extent.content_end);
+                let mut kept = line[comment..].to_vec();
+                kept.extend_from_slice(&bytes[after..lead_end]);
+                attempts.push(((extent.body.start, false), extent.content_end, kept));
+            }
+        }
+        attempts.push((past_lead(body), extent.content_end, Vec::new()));
+        attempts.push((past_lead(body), extent.body.end, Vec::new()));
+        attempts.push((body, extent.body.end, Vec::new()));
         attempts.dedup();
 
         let mut rejected = None;
-        for ((start, needs_line_break), end) in attempts {
-            let bytes = self.splice(start..end.max(start), needs_line_break, &emitted);
+        for ((start, needs_line_break), end, mut kept) in attempts {
+            kept.extend_from_slice(&emitted);
+            let bytes = self.splice(start..end.max(start), needs_line_break, &kept);
             match read_back(&bytes, &expected, index.is_some(), &pointer, "set") {
                 Ok(reparsed) => {
                     *self = reparsed;
@@ -191,19 +207,44 @@ impl Document {
                     .map_or(next, |newline| extent.body.end + newline + 1)
             })
         };
+        let bytes = &self.original_bytes;
+        // The first directive line (`%YAML`, `%TAG`) that leads into
+        // document `at`, between the document before and its `---` line.
+        let directives = |at: usize| {
+            let from = match at.checked_sub(1) {
+                Some(before) => end_marker(before).unwrap_or(extents[before].content_end),
+                None => super::bom_end(bytes),
+            };
+            // `from` starts a line, or ends the content of one.
+            lines_from(bytes, from)
+                .take_while(|&line| line < extents[at].line_start)
+                .find(|&line| bytes[line] == b'%')
+        };
+        let own = directives(index);
         let start = match index.checked_sub(1) {
             // The lead-in after the document before: unless that one ends
             // with a `...` line, which stays to end it.
             Some(before) if end_marker(before).is_none() => extents[before].content_end,
-            Some(_) => extent.line_start,
-            None => extent.line_start.max(super::bom_end(&self.original_bytes)),
+            // That `...` line is there for these directives, when no
+            // directives of the next document need it: it goes with them.
+            Some(before)
+                if own.is_some()
+                    && (index + 1 == extents.len() || directives(index + 1).is_none()) =>
+            {
+                extents[before].body.end
+            }
+            // The directives go with their document.
+            Some(_) => own.unwrap_or(extent.line_start),
+            None => own.unwrap_or(extent.line_start.max(super::bom_end(bytes))),
         };
         let mut end = extent.content_end.max(extent.body.start).max(start);
         // Its own `...` line goes too where nothing is left for it to end:
-        // before the first document, or after another `...` line.
-        if (index == 0 || start == extent.line_start)
-            && let Some(marker_end) = end_marker(index)
-        {
+        // before the first document, or after another `...` line (or where
+        // that line went too).
+        let ends_the_one_before = index
+            .checked_sub(1)
+            .is_some_and(|before| end_marker(before).is_none());
+        if !ends_the_one_before && let Some(marker_end) = end_marker(index) {
             end = marker_end;
         }
         let mut bytes = self.original_bytes[..start].to_vec();
@@ -478,7 +519,7 @@ fn read_back(
     Ok(reparsed)
 }
 
-/// The starts of the lines of `bytes` from `at`, a line start, on.
+/// `at`, then the starts of the lines of `bytes` after it.
 fn lines_from(bytes: &[u8], at: usize) -> impl Iterator<Item = usize> + '_ {
     std::iter::successors(Some(at), move |&line| {
         bytes[line..]
@@ -516,6 +557,25 @@ mod tests {
         let mut map = indexmap::IndexMap::new();
         map.insert(key.to_owned(), Value::String(value.to_owned()));
         Value::Map(map)
+    }
+
+    #[test]
+    fn removes_a_document_with_its_directives() {
+        let src = "%YAML 1.2\n---\na: 1\n...\n%YAML 1.2\n---\nb: 2\n";
+        let mut doc = stream(src);
+        doc.remove_stream_document(1).expect("remove /1");
+        assert_eq!(text(&doc), "%YAML 1.2\n---\na: 1\n");
+        let mut doc = stream(src);
+        doc.remove_stream_document(0).expect("remove /0");
+        assert_eq!(text(&doc), "%YAML 1.2\n---\nb: 2\n");
+    }
+
+    #[test]
+    fn keeps_a_marker_line_comment_when_the_properties_go() {
+        let mut doc = stream("x: 0\n--- !!map # c\na: 1\n");
+        doc.reemit_stream_document(1, Value::Int(5))
+            .expect("re-emit");
+        assert_eq!(text(&doc), "x: 0\n--- # c\n5\n");
     }
 
     #[test]

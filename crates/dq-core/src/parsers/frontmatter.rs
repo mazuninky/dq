@@ -126,7 +126,7 @@ impl Format for Frontmatter {
             FrontmatterKind::Json => {
                 let inner = Document::value_only(doc.value().clone(), FormatTag::Json);
                 Json.write(&inner, w)?;
-                write_io(w, b"\n\n")?;
+                write_io(w, b"\n")?;
                 write_io(w, &payload.body)?;
             }
         }

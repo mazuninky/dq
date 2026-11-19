@@ -385,9 +385,9 @@ fn set_dockerfile_returns_write_unavailable_mapped_to_exit_seven() {
     let domain = e
         .downcast_ref::<dq_core::Error>()
         .expect("error must downcast to dq_core::Error");
-    // The handler-emitted variant: WriteUnavailable from the read-only
-    // value-only document. The reason names the format "dockerfile" so
-    // the user-visible message explains why the rejection happened.
+    // The handler-emitted variant: WriteUnavailable, as the format has no
+    // textual edits. The reason names the format "dockerfile" so the
+    // user-visible message explains why the rejection happened.
     let dq_core::Error::WriteUnavailable { reason } = domain else {
         panic!("expected WriteUnavailable, got: {domain:?}");
     };
@@ -396,8 +396,8 @@ fn set_dockerfile_returns_write_unavailable_mapped_to_exit_seven() {
         "WriteUnavailable reason must name the format `dockerfile`, got: {reason}",
     );
     assert!(
-        reason.contains("read-only"),
-        "WriteUnavailable reason must still flag the document as read-only, got: {reason}",
+        reason.contains("has no textual edits"),
+        "WriteUnavailable reason must say the format has no textual edits, got: {reason}",
     );
 }
 

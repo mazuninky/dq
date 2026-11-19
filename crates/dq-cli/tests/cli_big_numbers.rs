@@ -389,7 +389,7 @@ fn set_jq_keeps_the_untouched_big_numbers_exact() {
     assert_eq!(
         stdout_of(&dir, &["set", "--jq", ".y = 1", "big.json"]),
         format!(
-            "{{\n  \"u\": {U64_PLUS_ONE},\n  \"f\": {LONG_FLOAT},\n  \"e\": 1e+400,\n  \"y\": 1\n}}"
+            "{{\n  \"u\": {U64_PLUS_ONE},\n  \"f\": {LONG_FLOAT},\n  \"e\": 1e+400,\n  \"y\": 1\n}}\n"
         )
     );
     // In place, and read back as the same numbers.

@@ -304,7 +304,7 @@ fn set_jq_writing_nan_into_json_exits_1_and_leaves_the_file() {
         .args(["--no-color", "set", "--jq", ".x = 1.5", "-i", "s.json"])
         .assert()
         .success();
-    assert_eq!(read(&dir, "s.json"), "{\n  \"y\": 1,\n  \"x\": 1.5\n}");
+    assert_eq!(read(&dir, "s.json"), "{\n  \"y\": 1,\n  \"x\": 1.5\n}\n");
 }
 
 #[test]
@@ -316,7 +316,10 @@ fn set_jq_keeps_a_json_float_no_f64_holds_a_number() {
         .assert()
         .success()
         .stdout("");
-    assert_eq!(read(&dir, "big.json"), "{\n  \"e\": 1e+400,\n  \"i\": 4\n}");
+    assert_eq!(
+        read(&dir, "big.json"),
+        "{\n  \"e\": 1e+400,\n  \"i\": 4\n}\n"
+    );
     assert_eq!(stdout_of(&dir, &["type", "big.json", "/e"]), "float\n");
 }
 
