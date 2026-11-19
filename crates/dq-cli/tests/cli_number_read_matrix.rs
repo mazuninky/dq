@@ -743,7 +743,7 @@ fn xml_writes_a_scalar_text_and_refuses_a_container() {
                 (
                     1,
                     "",
-                    "xml format error: XML write: '#text' of <x> must be a scalar (got array)\n",
+                    "xml format error: XML write: '#text' of <x> must be a scalar (got an array)\n",
                 ),
             ),
             (
@@ -751,7 +751,7 @@ fn xml_writes_a_scalar_text_and_refuses_a_container() {
                 (
                     1,
                     "",
-                    "xml format error: XML write: '#text' of <x> must be a scalar (got object)\n",
+                    "xml format error: XML write: '#text' of <x> must be a scalar (got a map)\n",
                 ),
             ),
             (
@@ -760,7 +760,7 @@ fn xml_writes_a_scalar_text_and_refuses_a_container() {
                     1,
                     "",
                     "xml format error: XML write: '@attrs' of <r> must be a map of attributes \
-                     (got int)\n",
+                     (got a number 5)\n",
                 ),
             ),
         ],
@@ -801,7 +801,7 @@ fn xml_writes_scalar_comments_pis_and_cdata_and_refuses_containers() {
                 (
                     1,
                     "",
-                    "xml format error: XML write: '#cdata' of <r> must hold scalars (got object)\n",
+                    "xml format error: XML write: '#cdata' of <r> must hold scalars (got a map)\n",
                 ),
             ),
             (
@@ -809,7 +809,7 @@ fn xml_writes_scalar_comments_pis_and_cdata_and_refuses_containers() {
                 (
                     1,
                     "",
-                    "xml format error: XML write: '#pi' of <r> must hold scalars (got object)\n",
+                    "xml format error: XML write: '#pi' of <r> must hold scalars (got a map)\n",
                 ),
             ),
             (
@@ -818,7 +818,87 @@ fn xml_writes_scalar_comments_pis_and_cdata_and_refuses_containers() {
                     1,
                     "",
                     "xml format error: XML write: '#comments' at the top level must hold scalars \
-                     (got array)\n",
+                     (got an array)\n",
+                ),
+            ),
+        ],
+    );
+}
+
+/// Every XML writer refusal names what it got the same way: a string
+/// quoted, a number or a boolean by kind and text, anything else by kind.
+/// A child entry that is no list is refused, never dropped: before,
+/// `r: [{c: 5}]` was written `<r/>`, and the other refusals named a bare
+/// type (`(got object)`, `(got int)`) or nothing at all.
+#[test]
+fn every_xml_writer_refusal_names_what_it_got() {
+    let dir = dir_with(&[
+        ("top.yaml", "- 1\n"),
+        ("root.yaml", "r: 5\n"),
+        ("root_item.yaml", "r: [true]\n"),
+        ("child.yaml", "r:\n- c: 5\n"),
+        ("child_map.yaml", "r:\n- c: {d: x}\n"),
+        ("child_null.yaml", "r:\n- c: null\n  d: []\n"),
+        ("attr.yaml", "r:\n- \"@attrs\": {a: [1]}\n"),
+        (
+            "text.yaml",
+            "r:\n- \"#text\": null\n  \"#cdata\": [x]\n  e:\n  - \"#text\": {}\n",
+        ),
+    ]);
+    let refused = |message: &'static str| (1, "", message);
+    assert_cases(
+        &dir,
+        &[
+            (
+                vec!["-q", "convert", "top.yaml", "-F", "xml"],
+                refused(
+                    "xml format error: XML write: the top-level value must be a map \
+                     (got an array)\n",
+                ),
+            ),
+            (
+                vec!["-q", "convert", "root.yaml", "-F", "xml"],
+                refused(
+                    "xml format error: XML write: root 'r' must be a one-element Array \
+                     (got a number 5)\n",
+                ),
+            ),
+            (
+                vec!["-q", "convert", "root_item.yaml", "-F", "xml"],
+                refused(
+                    "xml format error: XML write: root element 'r' must be a Map \
+                     (got a boolean true)\n",
+                ),
+            ),
+            (
+                vec!["-q", "convert", "child.yaml", "-F", "xml"],
+                refused(
+                    "xml format error: XML write: child 'c' under <r> must be an Array of \
+                     element maps (got a number 5)\n",
+                ),
+            ),
+            (
+                vec!["-q", "convert", "child_map.yaml", "-F", "xml"],
+                refused(
+                    "xml format error: XML write: child 'c' under <r> must be an Array of \
+                     element maps (got a map)\n",
+                ),
+            ),
+            (
+                vec!["-q", "convert", "child_null.yaml", "-F", "xml"],
+                ok("<r/>"),
+            ),
+            (
+                vec!["-q", "convert", "attr.yaml", "-F", "xml"],
+                refused(
+                    "xml format error: XML write: attribute 'a' on <r> must be a scalar \
+                     (got an array)\n",
+                ),
+            ),
+            (
+                vec!["-q", "convert", "text.yaml", "-F", "xml"],
+                refused(
+                    "xml format error: XML write: '#text' of <e> must be a scalar (got a map)\n",
                 ),
             ),
         ],
@@ -860,7 +940,7 @@ fn xml_writes_the_declaration_fields_and_refuses_what_a_document_cannot_hold() {
                     1,
                     "",
                     "xml format error: XML write: '#xml' must be a map of declaration fields \
-                     (got string)\n",
+                     (got \"1.0\")\n",
                 ),
             ),
             (
@@ -896,7 +976,7 @@ fn xml_writes_the_declaration_fields_and_refuses_what_a_document_cannot_hold() {
                     1,
                     "",
                     "xml format error: XML write: '#text' cannot stand at the top level, \
-                     outside the root element (got string)\n",
+                     outside the root element (got \"hi\")\n",
                 ),
             ),
             (vec!["-q", "convert", "empty.yaml", "-F", "xml"], ok("<r/>")),

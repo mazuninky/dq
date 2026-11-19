@@ -302,7 +302,12 @@ encoding error has no position:
   XML 1.1 allow it, and the prefix is then undeclared inside that element.
 
 The writer refuses the same, and a character the declared encoding cannot
-hold, with exit 1, leaving an `-i` file as it was.
+hold, with exit 1, leaving an `-i` file as it was. It refuses a value of the
+wrong shape rather than drop it — a map for `#text` or an attribute, a
+child entry that is no list of elements (`c: 5`; a null one is no
+content) — and names what it got: a string quoted (`(got "1.0")`), a
+number or a boolean by kind and text (`(got a number 5)`), anything else
+by kind (`(got a map)`, `(got an array)`).
 
 ### Dockerfile
 

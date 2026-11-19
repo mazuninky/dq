@@ -1135,7 +1135,10 @@ fn render_xml(top: &Value) -> Result<Vec<u8>> {
     let Value::Map(top) = top else {
         return Err(Error::Format {
             format: "xml",
-            message: "top-level XML value must be a map (object)".to_owned(),
+            message: format!(
+                "XML write: the top-level value must be a map (got {})",
+                what_it_is(top)
+            ),
         });
     };
     let mut writer = Writer::new(Cursor::new(Vec::<u8>::new()));
@@ -1151,7 +1154,7 @@ fn render_xml(top: &Value) -> Result<Vec<u8>> {
                 format: "xml",
                 message: format!(
                     "XML write: '{key}' cannot stand at the top level, outside the root element (got {})",
-                    v.type_name(),
+                    what_it_is(v),
                 ),
             });
         }
@@ -1209,13 +1212,17 @@ fn render_xml(top: &Value) -> Result<Vec<u8>> {
                 .to_owned(),
         });
     };
-    let Some(Value::Array(roots)) = top.get(root_tag) else {
-        return Err(Error::Format {
-            format: "xml",
-            message: format!(
-                "XML write: root '{root_tag}' must be a one-element Array (got non-array)"
-            ),
-        });
+    let roots = match top.get(root_tag) {
+        Some(Value::Array(roots)) => roots,
+        other => {
+            return Err(Error::Format {
+                format: "xml",
+                message: format!(
+                    "XML write: root '{root_tag}' must be a one-element Array (got {})",
+                    other.map_or_else(|| "nothing".to_owned(), what_it_is),
+                ),
+            });
+        }
     };
     if roots.len() != 1 {
         return Err(Error::Format {
@@ -1229,7 +1236,10 @@ fn render_xml(top: &Value) -> Result<Vec<u8>> {
     let Value::Map(root_body) = &roots[0] else {
         return Err(Error::Format {
             format: "xml",
-            message: format!("XML write: root element '{root_tag}' must be a Map"),
+            message: format!(
+                "XML write: root element '{root_tag}' must be a Map (got {})",
+                what_it_is(&roots[0])
+            ),
         });
     };
     write_element(
@@ -1664,7 +1674,7 @@ fn write_element(
                 format: "xml",
                 message: format!(
                     "XML write: '{KEY_ATTRS}' of <{tag}> must be a map of attributes (got {})",
-                    other.type_name(),
+                    what_it_is(other),
                 ),
             });
         }
@@ -1679,7 +1689,7 @@ fn write_element(
                     format: "xml",
                     message: format!(
                         "XML write: attribute '{k}' on <{tag}> must be a scalar (got {})",
-                        scalar.type_name(),
+                        what_it_is(scalar),
                     ),
                 })?,
             };
@@ -1711,7 +1721,7 @@ fn write_element(
             format: "xml",
             message: format!(
                 "XML write: '{KEY_TEXT}' of <{tag}> must be a scalar (got {})",
-                v.type_name(),
+                what_it_is(v),
             ),
         })?),
     };
@@ -1728,6 +1738,21 @@ fn write_element(
     let cdata = item_texts(KEY_CDATA, &owner, body.get(KEY_CDATA))?;
     for s in comments.iter().chain(&pis).chain(&cdata) {
         unencodable.note(s, place);
+    }
+    // A child entry is a list of elements; a null one is no content. Any
+    // other value is refused here, before an element with no list child
+    // would be written empty and the value dropped.
+    if let Some((k, v)) = body
+        .iter()
+        .find(|(k, v)| !is_conventional(k) && !matches!(v, Value::Array(_) | Value::Null))
+    {
+        return Err(Error::Format {
+            format: "xml",
+            message: format!(
+                "XML write: child '{k}' under <{tag}> must be an Array of element maps (got {})",
+                what_it_is(v),
+            ),
+        });
     }
     let has_text = text.is_some();
     let has_cdata = !cdata.is_empty();
@@ -1800,13 +1825,9 @@ fn write_element(
         if is_conventional(k) {
             continue;
         }
+        // Checked above: anything else is a null, no content.
         let Value::Array(items) = v else {
-            return Err(Error::Format {
-                format: "xml",
-                message: format!(
-                    "XML write: child '{k}' under <{tag}> must be an Array of element maps",
-                ),
-            });
+            continue;
         };
         for child in items {
             if pretty {
@@ -1899,7 +1920,7 @@ fn item_texts(key: &str, owner: &str, entry: Option<&Value>) -> Result<Vec<Strin
             format: "xml",
             message: format!(
                 "XML write: '{key}' {owner} must hold scalars (got {})",
-                item.type_name(),
+                what_it_is(item),
             ),
         })?;
         check_item(key, owner, &text)?;
@@ -2069,7 +2090,7 @@ fn declaration(entry: Option<&Value>) -> Result<Option<Declaration>> {
                 format: "xml",
                 message: format!(
                     "XML write: '{KEY_XML_DECL}' must be a map of declaration fields (got {})",
-                    other.type_name(),
+                    what_it_is(other),
                 ),
             });
         }
@@ -2356,7 +2377,25 @@ mod tests {
         }
         let err = render_xml(&element(Value::Array(vec![]))).expect_err("refused");
         assert!(
-            err.to_string().contains("must be a scalar (got array)"),
+            err.to_string().contains("must be a scalar (got an array)"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_child_entry_that_is_no_list_is_refused_and_a_null_one_is_empty() {
+        let element = |child: Value| {
+            let mut body = IndexMap::new();
+            body.insert("c".to_owned(), child);
+            let mut top = IndexMap::new();
+            top.insert("x".to_owned(), Value::Array(vec![Value::Map(body)]));
+            Value::Map(top)
+        };
+        assert_eq!(render(&element(Value::Null)), "<x/>");
+        let err = render_xml(&element(Value::String("v".to_owned()))).expect_err("refused");
+        assert!(
+            err.to_string()
+                .contains("child 'c' under <x> must be an Array of element maps (got \"v\")"),
             "{err}"
         );
     }
@@ -2385,7 +2424,7 @@ mod tests {
             .expect_err("refused");
         assert!(
             err.to_string()
-                .contains("'#pi' of <x> must hold scalars (got array)"),
+                .contains("'#pi' of <x> must hold scalars (got an array)"),
             "{err}"
         );
     }
@@ -2412,7 +2451,7 @@ mod tests {
         let err = render_xml(&doc(Value::Map(decl))).expect_err("refused");
         assert!(err.to_string().contains("has no field 'doctype'"), "{err}");
         let err = render_xml(&doc(Value::Int(1))).expect_err("refused");
-        assert!(err.to_string().contains("(got int)"), "{err}");
+        assert!(err.to_string().contains("(got a number 1)"), "{err}");
     }
 
     #[test]
