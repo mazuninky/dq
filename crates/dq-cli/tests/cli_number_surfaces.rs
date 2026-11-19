@@ -180,3 +180,113 @@ fn schema_rules_read_non_finite_and_big_numbers_as_numbers() {
         assert!(stdout.contains(message), "{schema} on {doc:?}: {stdout}");
     }
 }
+
+#[test]
+fn schema_rules_hold_exact_and_non_finite_numbers_of_their_own() {
+    for (schema, doc) in [
+        ("{const: 18446744073709551616}", "x: 18446744073709551616\n"),
+        (
+            "{maximum: 18446744073709551616}",
+            "x: 18446744073709551616\n",
+        ),
+        ("{maximum: 1e400}", "x: 1e399\n"),
+        ("{exclusiveMaximum: 0.10000000000000000001}", "x: 0.1\n"),
+        ("{enum: [.inf, 2]}", "x: .inf\n"),
+    ] {
+        let (code, stdout) = schema_check(schema, doc);
+        assert_eq!(code, 0, "{schema} on {doc:?}: {stdout}");
+    }
+    for (schema, doc, message) in [
+        (
+            "{const: 18446744073709551616}",
+            "x: 18446744073709551617\n",
+            "/properties/x/const: 18446744073709551616 was expected",
+        ),
+        (
+            "{maximum: 18446744073709551616}",
+            "x: 18446744073709551617\n",
+            "/properties/x/maximum: 18446744073709551617 is greater than the maximum of \
+             18446744073709551616",
+        ),
+        (
+            "{maximum: 1e400}",
+            "x: .inf\n",
+            ".inf is greater than the maximum of 1e+400",
+        ),
+        (
+            "{const: 0.10000000000000000001}",
+            "x: 0.1\n",
+            "0.10000000000000000001 was expected",
+        ),
+        (
+            "{enum: [.inf, 2]}",
+            "x: -.inf\n",
+            "-.inf is not one of .inf or 2",
+        ),
+    ] {
+        let (code, stdout) = schema_check(schema, doc);
+        assert_eq!(code, 4, "{schema} on {doc:?}: {stdout}");
+        assert!(stdout.contains(message), "{schema} on {doc:?}: {stdout}");
+    }
+}
+
+#[test]
+fn an_exact_bound_behind_a_ref_names_the_ref_path() {
+    let rule = "id: t.ref\ndescription: x\nseverity: error\nmatch: { format: yaml }\n\
+                check:\n  schema:\n    $defs: { n: { maximum: 18446744073709551616 } }\n    \
+                properties: { x: { $ref: '#/$defs/n' } }\n";
+    let dir = dir_with(&[
+        ("rule.yml", rule),
+        ("doc.yaml", "x: 18446744073709551617\n"),
+    ]);
+    let (code, stdout, stderr) = run(&dir, &["check", "--rule", "rule.yml", "doc.yaml"]);
+    assert_eq!(code, 4, "{stdout}{stderr}");
+    assert!(
+        stdout.contains("/properties/x/$ref/maximum: 18446744073709551617 is greater"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn a_schema_file_holds_exact_numbers() {
+    let rule = "id: t.file\ndescription: x\nseverity: error\nmatch: { format: yaml }\n\
+                check:\n  schema_file: s.json\n";
+    let schema = r##"{"$defs": {"n": {"maximum": 18446744073709551616}},
+                      "properties": {"x": {"$ref": "#/$defs/n"}}}"##;
+    let dir = dir_with(&[
+        ("rule.yml", rule),
+        ("s.json", schema),
+        ("ok.yaml", "x: 18446744073709551616\n"),
+        ("bad.yaml", "x: 18446744073709551617\n"),
+    ]);
+    let (code, stdout, stderr) = run(&dir, &["check", "--rule", "rule.yml", "ok.yaml"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    let (code, stdout, stderr) = run(&dir, &["check", "--rule", "rule.yml", "bad.yaml"]);
+    assert_eq!(code, 4, "{stdout}{stderr}");
+    assert!(
+        stdout.contains(
+            "/properties/x/$ref/maximum: 18446744073709551617 is greater than the maximum of \
+             18446744073709551616"
+        ),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn select_filters_compare_non_finite_and_big_numbers_as_numbers() {
+    let doc = "- {n: .nan, k: nan}\n- {n: .inf, k: inf}\n- {n: -.inf, k: ninf}\n\
+               - {n: 1, k: one}\n- {n: 18446744073709551616, k: big}\n- {n: '.nan', k: str}\n";
+    let dir = dir_with(&[("d.yaml", doc)]);
+    for (expr, expected) in [
+        ("$[?@.n > 1].k", "- inf\n- big\n"),
+        ("$[?@.n < 1].k", "- ninf\n"),
+        ("$[?@.n == '.nan'].k", "- str\n"),
+        ("$[?@.n > 1].n", "- .inf\n- 18446744073709551616\n"),
+    ] {
+        assert_eq!(
+            stdout_of(&dir, &["select", "d.yaml", expr, "-F", "yaml"]),
+            expected,
+            "{expr}"
+        );
+    }
+}

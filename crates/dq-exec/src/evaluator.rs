@@ -704,10 +704,13 @@ fn run_schema_check(
     // because two legitimately-distinct rules can produce the same
     // `(instance_path, error_text)` against the same file.
     let mut seen: IndexSet<(String, String, String)> = IndexSet::new();
+    let mut evaluation_paths =
+        crate::schema_value::EvaluationPaths::new(&compiled.validator, value);
     for error in compiled
         .validator
         .iter_errors(crate::schema_value::DqNode(value))
     {
+        let evaluation_path = evaluation_paths.of(&error);
         let pointer_str = error.instance_path().as_str();
         // The validator's error text (without the schema_path prefix)
         // is what the user sees as the actual violation. Use it for
@@ -762,7 +765,8 @@ fn run_schema_check(
         // ≤ 0.38 exposed as `schema_path`. Since 0.39 `schema_path()` is
         // the canonical location without `$ref` (`/$defs/codes/enum`);
         // using it would silently change every diagnostic under a `$ref`.
-        let keyword = error.evaluation_path().as_str();
+        // dq's own keywords get theirs from `EvaluationPaths`.
+        let keyword = evaluation_path.as_str();
         let message = format!("{prefix}{keyword}: {error_text}");
         out.push(Diagnostic {
             rule_id: rule.rule.id.clone(),

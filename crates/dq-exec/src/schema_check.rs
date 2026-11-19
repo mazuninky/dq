@@ -55,21 +55,17 @@ pub(crate) struct CompiledSchemaCheck {
     pub(crate) message_prefix: Option<String>,
 }
 
-/// Compile an inline `serde_norway::Value` schema into a
-/// [`CompiledSchemaCheck`].
+/// Compile an inline schema — a rule's `check.schema`, see
+/// [`crate::rule::Check::Schema`] — into a [`CompiledSchemaCheck`].
 ///
 /// `rule_id` flows into the [`ExecError::SchemaCompile`] payload so the
 /// error message names the offending rule.
 pub(crate) fn compile_inline(
     rule_id: &str,
-    schema_yaml: &serde_norway::Value,
+    schema_json: &serde_json::Value,
     message_prefix: Option<String>,
 ) -> Result<CompiledSchemaCheck> {
-    let schema_json = yaml_to_serde_json(schema_yaml).map_err(|err| ExecError::SchemaCompile {
-        rule_id: rule_id.to_owned(),
-        message: format!("could not convert YAML schema to JSON: {err}"),
-    })?;
-    compile_json(rule_id, &schema_json, message_prefix)
+    compile_json(rule_id, schema_json, message_prefix)
 }
 
 /// Compile an already-JSON-shaped schema. Shared by inline and
@@ -108,9 +104,10 @@ fn compile_json(
         jsonschema::error::ValidationErrorKind::Referencing(
             jsonschema::ReferencingError::Unretrievable { uri, .. },
         ) => external_ref_error(rule_id, uri),
+        // A YAML schema's `.inf` where a number must stand reads `.inf`.
         _ => ExecError::SchemaCompile {
             rule_id: rule_id.to_owned(),
-            message: format!("{err}"),
+            message: crate::schema_value::restore(&err.to_string()).into_owned(),
         },
     })?;
     Ok(CompiledSchemaCheck {
@@ -612,10 +609,12 @@ pub(crate) fn resolve_schema_file_path(
     let rule_dir = if rule_path.is_dir() {
         rule_path.clone()
     } else {
+        // A bare `rule.yml` has the parent `""`, which names no
+        // directory: it is the current one.
         rule_path
             .parent()
-            .map(Utf8Path::to_path_buf)
-            .unwrap_or_else(|| Utf8PathBuf::from("."))
+            .filter(|parent| !parent.as_str().is_empty())
+            .map_or_else(|| Utf8PathBuf::from("."), Utf8Path::to_path_buf)
     };
     let canonical_rule_dir = canonicalize_utf8(&rule_dir).map_err(|err| ExecError::Io {
         path: rule_dir,
@@ -646,27 +645,6 @@ fn canonicalize_utf8(path: &Utf8Path) -> std::io::Result<Utf8PathBuf> {
     })
 }
 
-/// Convert a `serde_norway::Value` to a `serde_json::Value`.
-///
-/// `serde_norway`'s `Value` is YAML-shaped: it carries tagged variants and
-/// allows non-string mapping keys. The `jsonschema` crate consumes
-/// `serde_json::Value`, so we round-trip through `serde_norway::to_string`
-/// then `serde_norway::from_str::<serde_json::Value>` — which mirrors
-/// what the test runner does for fixture inputs and gives us identical
-/// key-coercion semantics.
-fn yaml_to_serde_json(
-    value: &serde_norway::Value,
-) -> std::result::Result<serde_json::Value, String> {
-    // Round-trip via the YAML serializer to handle tagged values and
-    // non-string keys cleanly. `serde_norway::from_str::<serde_json::Value>`
-    // accepts the YAML text and emits a JSON-shaped value (or fails
-    // with a typed error if a non-string key sneaks through).
-    let yaml_text =
-        serde_norway::to_string(value).map_err(|err| format!("yaml serialize: {err}"))?;
-    serde_norway::from_str::<serde_json::Value>(&yaml_text)
-        .map_err(|err| format!("yaml→json transcode: {err}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -683,7 +661,7 @@ mod tests {
 
     #[test]
     fn compile_inline_with_valid_schema_succeeds() {
-        let yaml: serde_norway::Value = serde_norway::from_str(
+        let yaml: serde_json::Value = serde_norway::from_str(
             r#"
 type: object
 required: [name]
@@ -708,7 +686,7 @@ properties:
         // schema that declares `$ref: https://...` must fail compile
         // because no HTTP resolver is wired up (resolve-http feature
         // is off in our `default-features = false` configuration).
-        let yaml: serde_norway::Value = serde_norway::from_str(
+        let yaml: serde_json::Value = serde_norway::from_str(
             r#"
 $ref: "https://json-schema.org/draft/2020-12/schema"
 "#,
@@ -726,7 +704,7 @@ $ref: "https://json-schema.org/draft/2020-12/schema"
     /// Compile `schema` inline and return the `SchemaCompile` message,
     /// panicking on any other outcome.
     fn compile_error_message(schema: serde_json::Value) -> String {
-        let yaml: serde_norway::Value =
+        let yaml: serde_json::Value =
             serde_norway::from_str(&schema.to_string()).expect("json is valid yaml");
         match compile_inline("test.bad", &yaml, None) {
             Err(ExecError::SchemaCompile { rule_id, message }) => {
@@ -797,7 +775,7 @@ $ref: "https://json-schema.org/draft/2020-12/schema"
             serde_json::json!({"default": {"$schema": "https://example.com/m"}}),
             serde_json::json!({"x-ext": {"$schema": "https://example.com/m"}}),
         ] {
-            let yaml: serde_norway::Value =
+            let yaml: serde_json::Value =
                 serde_norway::from_str(&schema.to_string()).expect("json is valid yaml");
             assert!(
                 compile_inline("test.ok", &yaml, None).is_ok(),
@@ -813,7 +791,7 @@ $ref: "https://json-schema.org/draft/2020-12/schema"
             serde_json::json!({"$schema": "http://json-schema.org/draft-07/schema#"}),
             serde_json::json!({"$id": "https://example.com/m", "$schema": "https://example.com/m#"}),
         ] {
-            let yaml: serde_norway::Value =
+            let yaml: serde_json::Value =
                 serde_norway::from_str(&schema.to_string()).expect("json is valid yaml");
             assert!(
                 compile_inline("test.ok", &yaml, None).is_ok(),
@@ -824,7 +802,7 @@ $ref: "https://json-schema.org/draft/2020-12/schema"
 
     #[test]
     fn compile_inline_accepts_internal_ref() {
-        let yaml: serde_norway::Value = serde_norway::from_str(
+        let yaml: serde_json::Value = serde_norway::from_str(
             r##"
 properties:
   code: {$ref: "#/$defs/code"}
@@ -963,7 +941,7 @@ $defs:
 
     /// Compile `schema` inline, panicking with the error when it fails.
     fn assert_compiles(schema: &serde_json::Value) {
-        let yaml: serde_norway::Value =
+        let yaml: serde_json::Value =
             serde_norway::from_str(&schema.to_string()).expect("json is valid yaml");
         if let Err(err) = compile_inline("test.ok", &yaml, None) {
             panic!("{schema} should compile, got {err:?}");
@@ -1384,7 +1362,7 @@ $defs:
             assert_compiles(&schema);
         }
         // And the schema still validates as 2020-12.
-        let yaml: serde_norway::Value =
+        let yaml: serde_json::Value =
             serde_norway::from_str(r#"{"$schema": "", "type": "integer"}"#).expect("yaml");
         let compiled = compile_inline("test.ok", &yaml, None).expect("compiles");
         assert!(holds(&compiled, &serde_json::json!(1)));

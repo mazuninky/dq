@@ -11,6 +11,7 @@
 //! the rounding of its `f64` (`0.10000000000000004`), or a value past the
 //! `f64` range (`1e400`, `1e-400`).
 
+use std::cmp::Ordering;
 use std::fmt;
 
 use super::Value;
@@ -186,6 +187,27 @@ impl<'a> Normal<'a> {
             && self.digits().eq(other.digits())
     }
 
+    /// The power of ten of the first significant digit, at any size. Only
+    /// for a nonzero number.
+    fn leading_power(&self) -> BigWhole {
+        let above_last = self.len.saturating_sub(1);
+        let adjust = i128::try_from(above_last).unwrap_or(i128::MAX);
+        match &self.exponent {
+            Exponent::Small(last) => match last.checked_add(adjust) {
+                Some(power) => BigWhole::of_i128(power),
+                // Past `i128` only when `last` is near its edge: 39 digits.
+                None => BigWhole {
+                    negative: *last < 0,
+                    digits: add_small(*last < 0, &last.unsigned_abs().to_string(), adjust),
+                },
+            },
+            Exponent::Big(negative, digits) => BigWhole {
+                negative: *negative,
+                digits: add_small(*negative, digits, adjust),
+            },
+        }
+    }
+
     /// The power of ten of the first significant digit, when it is small.
     fn leading_exponent(&self) -> Option<i128> {
         match self.exponent {
@@ -249,6 +271,64 @@ pub(crate) fn decimal_is_whole(literal: &str) -> bool {
                 Exponent::Big(negative, _) => !negative,
             }
     })
+}
+
+/// How two decimal literals order by their exact value, at any size:
+/// `0.1` is below `0.10000000000000000001`, `1e400` above
+/// `18446744073709551616`, `-0.0` equal to `0`. `None` when either is
+/// not a decimal literal.
+pub(crate) fn compare_decimal(a: &str, b: &str) -> Option<Ordering> {
+    let (a, b) = (DecimalParts::parse(a)?, DecimalParts::parse(b)?);
+    let (a, b) = (Normal::of(&a), Normal::of(&b));
+    let sign = |n: &Normal<'_>| match (n.len, n.negative) {
+        (0, _) => 0,
+        (_, true) => -1,
+        (_, false) => 1,
+    };
+    let order = sign(&a).cmp(&sign(&b));
+    if order != Ordering::Equal || a.len == 0 {
+        return Some(order);
+    }
+    // Same sign, neither zero: the larger magnitude has the higher first
+    // digit's power of ten, or the same power and the larger digits —
+    // which have no trailing zeros, so a longer run past a common prefix
+    // is the larger.
+    let magnitude = a
+        .leading_power()
+        .compare(&b.leading_power())
+        .then_with(|| a.digits().cmp(b.digits()));
+    Some(if a.negative {
+        magnitude.reverse()
+    } else {
+        magnitude
+    })
+}
+
+/// A signed whole number of any size: sign and digits without leading
+/// zeros (`0` is `false`, `"0"`).
+#[derive(Debug, PartialEq, Eq)]
+struct BigWhole {
+    negative: bool,
+    digits: String,
+}
+
+impl BigWhole {
+    fn of_i128(n: i128) -> Self {
+        Self {
+            negative: n < 0,
+            digits: n.unsigned_abs().to_string(),
+        }
+    }
+
+    fn compare(&self, other: &Self) -> Ordering {
+        let magnitude = |n: &Self| (n.digits.len(), n.digits.clone());
+        match (self.negative, other.negative) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            (false, false) => magnitude(self).cmp(&magnitude(other)),
+            (true, true) => magnitude(other).cmp(&magnitude(self)),
+        }
+    }
 }
 
 /// The value of a decimal literal: an `i64` integer is a [`Value::Int`],
@@ -450,6 +530,48 @@ mod tests {
         for bad in ["", "-", ".", "1e", "NaN", "1_0", "1.2.3"] {
             assert!(!same_decimal(bad, bad), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn compare_decimal_orders_exact_values_of_any_size() {
+        use Ordering::{Equal, Greater, Less};
+        let cases = [
+            ("0.1", "0.10000000000000000001", Less),
+            ("1e400", "18446744073709551616", Greater),
+            ("-1e400", "-18446744073709551616", Less),
+            ("-0.0", "0", Equal),
+            ("0", "1e-400", Less),
+            ("-1e-400", "0", Less),
+            ("1.10", "1.1", Equal),
+            ("1e3", "999.9999999999999999999", Greater),
+            ("12", "1.2e1", Equal),
+            (
+                "1e99999999999999999999999999999999999999999",
+                "1e400",
+                Greater,
+            ),
+            (
+                "1e-99999999999999999999999999999999999999999",
+                "1e-400",
+                Less,
+            ),
+            (
+                "1e170141183460469231731687303715884105727",
+                "1e170141183460469231731687303715884105728",
+                Less,
+            ),
+            (
+                "12e170141183460469231731687303715884105727",
+                "1e170141183460469231731687303715884105728",
+                Greater,
+            ),
+            ("-2", "-10", Greater),
+        ];
+        for (a, b, order) in cases {
+            assert_eq!(compare_decimal(a, b), Some(order), "{a} vs {b}");
+            assert_eq!(compare_decimal(b, a), Some(order.reverse()), "{b} vs {a}");
+        }
+        assert_eq!(compare_decimal("x", "1"), None);
     }
 
     #[test]

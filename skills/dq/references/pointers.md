@@ -256,6 +256,8 @@ dq select deploy.yaml '$.spec.containers[?(@.name == "app")].image'
 
 Output is a stream of matches. `-F json` gives an array of values; `-F toon` is compact.
 
+A filter compares numbers in `f64`: `.nan` / `.inf` are numbers (`[?@.n > 1]` matches `.inf`, never `.nan`), a NaN equals nothing, two infinities are not `==`, and integers past 2^53 compare approximately. For exact numeric tests use `query` (jq).
+
 ## jq (jaq dialect)
 
 Used by `dq query`, `dq set --jq`, rule `check.jq`, rule `fix.jq`.

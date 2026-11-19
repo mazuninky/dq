@@ -167,7 +167,7 @@ pub struct RuleMatch {
 /// id in hand.
 ///
 /// `PartialEq` is intentionally NOT derived: `Rule` itself has no
-/// `PartialEq` impl, and the `serde_norway::Value` carried by `Schema`
+/// `PartialEq` impl, and the `serde_json::Value` carried by `Schema`
 /// already provides one if a caller ever needs structural comparison.
 #[derive(Debug, Clone)]
 pub enum Check {
@@ -185,8 +185,15 @@ pub enum Check {
     /// arbitrary YAML/JSON value that compiles into a
     /// `jsonschema::Validator` at `Evaluator::new`.
     Schema {
-        /// Inline JSON Schema 2020-12 document.
-        schema: serde_norway::Value,
+        /// Inline JSON Schema 2020-12 document, as JSON. A rule loaded
+        /// through [`crate::RuleSet::from_str`] holds the schema dq's own
+        /// YAML reader read: every number keeps its exact literal
+        /// (`18446744073709551616`, `1e400`, `0.10000000000000000001`), and
+        /// a NaN or an infinity, which JSON has no number for, is a marker
+        /// string the validator reads back as that number. A `Rule`
+        /// deserialized on its own holds what `serde_norway` read, which
+        /// rounds a float to an `f64` and reads `1e400` as a string.
+        schema: serde_json::Value,
         /// Optional message prefix — when set, prepended to the
         /// auto-generated `keywordLocation`-based message.
         message: Option<String>,
@@ -305,7 +312,7 @@ struct RawCheck {
     #[serde(default)]
     jq: Option<String>,
     #[serde(default)]
-    schema: Option<serde_norway::Value>,
+    schema: Option<serde_json::Value>,
     #[serde(default)]
     schema_file: Option<Utf8PathBuf>,
     #[serde(default)]
@@ -693,7 +700,7 @@ check:
         match rule.check {
             Check::Schema { schema, message } => {
                 assert!(message.is_none());
-                let mapping = schema.as_mapping().expect("schema is a mapping");
+                let mapping = schema.as_object().expect("schema is a mapping");
                 assert!(mapping.contains_key("type"));
                 assert!(mapping.contains_key("required"));
             }

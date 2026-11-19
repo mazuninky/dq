@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_norway::Value as YamlValue;
 
 use crate::error::{ExecError, Result};
-use crate::rule::{CheckParseError, Rule};
+use crate::rule::{Check, CheckParseError, Rule};
 
 /// Provenance marker for a [`RuleSet`].
 ///
@@ -100,6 +100,7 @@ impl RuleSet {
                 }
             }
         }
+        exact_schemas(yaml, &mut rules);
         Ok(Self { source, rules })
     }
 
@@ -198,6 +199,82 @@ impl RuleSet {
         let yaml =
             dq_lint::std_ruleset(static_name).expect("namespace verified by list_std_rulesets");
         Self::from_str(yaml, RuleSource::Std(static_name))
+    }
+}
+
+/// Give every inline `check.schema` of `rules` — parsed from `yaml` by
+/// `serde_norway`, which rounds a float to an `f64`, reads `1e400` as a
+/// string and refuses an integer past `u128` — the value dq's own YAML
+/// reader reads there, every number exact (see
+/// [`crate::rule::Check::Schema`]).
+///
+/// The YAML reader sees the same documents as `serde_norway`; should the
+/// two ever disagree on how many there are, or where a schema sits, the
+/// rule keeps the schema `serde_norway` read.
+fn exact_schemas(yaml: &str, rules: &mut [Rule]) {
+    if !rules.iter().any(has_inline_schema) {
+        return;
+    }
+    let Some(format) = dq_core::by_name("yaml") else {
+        return;
+    };
+    let doc = match format.parse(yaml.as_bytes()) {
+        Ok(doc) => doc,
+        Err(err) => {
+            tracing::debug!(error = %err, "rule schemas keep serde_norway's numbers");
+            return;
+        }
+    };
+    let documents = doc
+        .values()
+        .unwrap_or_else(|| std::slice::from_ref(doc.value()));
+    if documents.len() != rules.len() {
+        tracing::debug!(
+            documents = documents.len(),
+            rules = rules.len(),
+            "rule schemas keep serde_norway's numbers"
+        );
+        return;
+    }
+    for (rule, document) in rules.iter_mut().zip(documents) {
+        exact_schema(rule, document);
+    }
+}
+
+/// Whether `rule`, or a rule `nested:` in it, has an inline schema.
+fn has_inline_schema(rule: &Rule) -> bool {
+    match &rule.check {
+        Check::Schema { .. } => true,
+        Check::Composite { nested, .. } => has_inline_schema(nested),
+        _ => false,
+    }
+}
+
+/// [`exact_schemas`] for one rule and the YAML reader's value of it.
+fn exact_schema(rule: &mut Rule, document: &dq_core::Value) {
+    let Some(check) = member(document, "check") else {
+        return;
+    };
+    match &mut rule.check {
+        Check::Schema { schema, .. } => {
+            if let Some(exact) = member(check, "schema") {
+                *schema = crate::schema_value::schema_json(exact);
+            }
+        }
+        Check::Composite { nested, .. } => {
+            if let Some(nested_document) = member(check, "nested") {
+                exact_schema(nested, nested_document);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The member `key` of a map value.
+fn member<'v>(value: &'v dq_core::Value, key: &str) -> Option<&'v dq_core::Value> {
+    match value {
+        dq_core::Value::Map(map) => map.get(key),
+        _ => None,
     }
 }
 
@@ -313,6 +390,38 @@ mod tests {
         assert_eq!(set.rules.len(), 1);
         assert_eq!(set.rules[0].id, "a.one");
         assert!(matches!(set.source, RuleSource::Inline));
+    }
+
+    #[test]
+    fn from_str_keeps_the_exact_numbers_of_a_schema() {
+        let stream = format!(
+            "{RULE_A}---\n\
+             id: n.one\ndescription: x\nseverity: error\nmatch: {{ format: yaml }}\n\
+             check:\n  schema: {{ const: 18446744073709551616, maximum: 1e400, \
+             minimum: 0.10000000000000000001, enum: [.inf] }}\n---\n\
+             id: n.two\ndescription: x\nseverity: error\nmatch: {{ format: yaml }}\n\
+             check:\n  extract: '[]'\n  message: m\n  nested:\n    id: n.inner\n    \
+             description: x\n    severity: error\n    match: {{ format: json }}\n    \
+             check:\n      schema: {{ const: 340282366920938463463374607431768211456 }}\n"
+        );
+        let set = RuleSet::from_str(&stream, RuleSource::Inline).expect("parse rule stream");
+        let Check::Schema { schema, .. } = &set.rules[1].check else {
+            panic!("expected a schema check: {:?}", set.rules[1].check);
+        };
+        assert_eq!(
+            schema.to_string(),
+            r#"{"const":18446744073709551616,"maximum":1e+400,"minimum":0.10000000000000000001,"enum":["\u0000dq.inf\u0000"]}"#
+        );
+        let Check::Composite { nested, .. } = &set.rules[2].check else {
+            panic!("expected a composite check: {:?}", set.rules[2].check);
+        };
+        let Check::Schema { schema, .. } = &nested.check else {
+            panic!("expected a nested schema check: {:?}", nested.check);
+        };
+        assert_eq!(
+            schema.to_string(),
+            r#"{"const":340282366920938463463374607431768211456}"#
+        );
     }
 
     #[test]

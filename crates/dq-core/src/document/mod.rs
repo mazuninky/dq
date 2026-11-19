@@ -329,6 +329,26 @@ impl Value {
         }
     }
 
+    /// How `self` and `other` order as numbers, by their exact value and
+    /// whatever their variant: `0.1` is below `0.10000000000000000001`,
+    /// `1e400` above every `f64`, an infinity past every finite number on
+    /// its side. `None` when either is a NaN — unordered, as every IEEE
+    /// comparison with one is false — or is not a number.
+    #[must_use]
+    pub fn compare_number(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        match (self.non_finite_float(), other.non_finite_float()) {
+            (Some(a), _) if a.is_nan() => None,
+            (_, Some(b)) if b.is_nan() => None,
+            (Some(a), Some(b)) => a.partial_cmp(&b),
+            // An infinity against a finite number: the sign decides.
+            (Some(a), None) => other.finite_literal().map(|_| a.total_cmp(&0.0)),
+            (None, Some(b)) => self.finite_literal().map(|_| 0.0_f64.total_cmp(&b)),
+            (None, None) => {
+                number::compare_decimal(&self.finite_literal()?, &other.finite_literal()?)
+            }
+        }
+    }
+
     /// A finite number as a decimal literal of its exact value: an `f64`
     /// in its shortest round-trip form (`1.5e-1`); `None` for anything
     /// else.
@@ -6231,6 +6251,40 @@ mod tests {
             Value::String("1".into()),
         ] {
             assert!(!other.is_whole_number(), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn compare_number_orders_values_across_variants() {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        let big = |s: &str| Value::BigFloat(s.to_owned());
+        let cases = [
+            (Value::Int(1), Value::Float(1.0), Some(Equal)),
+            (Value::Float(0.1), big("0.10000000000000000001"), Some(Less)),
+            (
+                Value::BigInt("18446744073709551617".into()),
+                big("1.8446744073709551616e19"),
+                Some(Greater),
+            ),
+            (big(".inf"), big("1e400"), Some(Greater)),
+            (
+                Value::Float(f64::NEG_INFINITY),
+                Value::Int(i64::MIN),
+                Some(Less),
+            ),
+            (big("-.inf"), Value::Float(f64::NEG_INFINITY), Some(Equal)),
+            (big(".nan"), Value::Int(1), None),
+            (Value::Int(1), Value::Float(f64::NAN), None),
+            (Value::Int(1), Value::String("1".into()), None),
+            (big(".inf"), Value::Null, None),
+        ];
+        for (a, b, order) in cases {
+            assert_eq!(a.compare_number(&b), order, "{a:?} vs {b:?}");
+            assert_eq!(
+                b.compare_number(&a),
+                order.map(std::cmp::Ordering::reverse),
+                "{b:?} vs {a:?}"
+            );
         }
     }
 

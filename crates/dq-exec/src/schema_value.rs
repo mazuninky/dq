@@ -14,26 +14,34 @@
 //!   for `18446744073709551616` and `1e400` and fails for a NaN, an
 //!   infinity and `1e-400`;
 //! - the bounds (`minimum`, `maximum`, `exclusiveMinimum`,
-//!   `exclusiveMaximum`) compare an infinity as the infinity of its sign
-//!   (`.inf` fails every maximum and passes every minimum) and a NaN as
-//!   unordered: it fails every bound, as every IEEE comparison with a NaN
-//!   is false. `multipleOf` fails on both, and on a number past the
-//!   `f64` range (`1e400`), which jsonschema has no exact arithmetic for;
+//!   `exclusiveMaximum`) compare the instance and the limit by their exact
+//!   value ([`dq_core::Value::compare_number`]): `18446744073709551617`
+//!   is past `maximum: 18446744073709551616`, `0.1` below
+//!   `exclusiveMaximum: 0.10000000000000000001`; an infinity is past every
+//!   finite limit on its side (`.inf` fails every maximum and meets every
+//!   minimum), and a NaN, unordered as every IEEE comparison with one is
+//!   false, fails every bound;
+//! - `multipleOf` computes in `f64`, as jsonschema does: it fails on a
+//!   NaN, an infinity and a number past the `f64` range (`1e400`), and
+//!   reads any other number, and the divisor, as the `f64` nearest it;
 //! - `enum` and `const` compare numbers by their exact value
 //!   ([`dq_core::Value::same_number`]: `1` is `1.0`, a 40-digit integer is
-//!   only itself). A NaN or an infinity equals no value a schema can hold
-//!   (a schema is JSON, which has neither), so it fails every `enum` and
-//!   `const`; under `uniqueItems` two NaNs are the same item;
-//! - a big number past `f64` (`1e400`) is past every finite bound, of its
-//!   own sign; one inside the range compares as the `f64` nearest it, as
-//!   the limit itself does (jsonschema reads a limit as `u64` / `i64` /
-//!   `f64`).
+//!   only itself); an infinity equals only the infinity of its sign (which
+//!   only a YAML schema can hold), a NaN nothing; under `uniqueItems` two
+//!   NaNs are the same item.
+//!
+//! The schema itself is JSON whose numbers keep their literal (the
+//! workspace builds `serde_json` with `arbitrary_precision`); a YAML
+//! schema's NaN or infinity is a [`marker`] string ([`schema_json`]), so
+//! where a number must stand (`maximum: .inf`) the schema does not compile.
 //!
 //! The validator renders an error's instance as JSON, which has no NaN;
 //! [`instance_json`] spells one as a marker string and [`restore`] puts
 //! `.nan` / `.inf` / `-.inf` back into the message.
 
 use std::borrow::Cow;
+use std::cmp::Ordering;
+use std::collections::{HashMap, VecDeque};
 
 use dq_core::Value;
 use indexmap::IndexMap;
@@ -314,67 +322,167 @@ impl<'i> jsonschema::Keyword<'i, DqJson> for Const {
     }
 }
 
-/// A numeric keyword around jsonschema's own, which reads a number as an
-/// `f64` and so answers wrongly for some: a NaN met every bound and came
-/// out a multiple of any fraction (`.nan` of `0.5`). The numbers
-/// [`Guarded::refuses`] fail with [`Guarded::explain`]'s message; every
-/// other value gets jsonschema's answer and message.
-struct Guarded {
-    /// jsonschema's validator for the keyword alone.
-    builtin: jsonschema::Validator<DqJson>,
-    /// The keyword, as the schema spells it.
-    keyword: &'static str,
-    /// The keyword's value in the schema.
-    limit: serde_json::Value,
-    /// Whether a number — as the `f64` nearest it — fails outright.
-    refuses: Refuses,
-}
+/// `enum`, in place of jsonschema's own, for the reason of [`Const`] and
+/// so that a schema's `.inf` (a [`marker`]) matches an infinity. Same
+/// message.
+struct Enum(Vec<serde_json::Value>);
 
-/// Whether a number, as the `f64` nearest it, fails a guarded keyword.
-type Refuses = fn(f64) -> bool;
+impl Enum {
+    /// How many options a message lists, as jsonschema's does.
+    const LISTED: usize = 3;
 
-impl Guarded {
-    /// The numeric keywords dq guards, each with the numbers it refuses:
-    /// the bounds a NaN (unordered), `multipleOf` a NaN, an infinity and a
-    /// number past the `f64` range (no exact arithmetic for them).
-    const KEYWORDS: [(&'static str, Refuses); 5] = [
-        ("minimum", f64::is_nan),
-        ("maximum", f64::is_nan),
-        ("exclusiveMinimum", f64::is_nan),
-        ("exclusiveMaximum", f64::is_nan),
-        ("multipleOf", |f| !f.is_finite()),
-    ];
-
-    fn refused(&self, instance: DqNode<'_>) -> bool {
-        instance
-            .as_number()
-            .is_some_and(|number| number.as_f64().is_none_or(self.refuses))
+    fn holds(&self, instance: &Value) -> bool {
+        self.0.iter().any(|option| equals(instance, option))
     }
 
-    /// Why a refused number fails, worded as jsonschema words the keyword.
-    fn explain(&self, instance: DqNode<'_>) -> String {
-        let instance = instance_json(instance.0);
-        let limit = &self.limit;
+    /// `x is not one of a, b or c`, or `… a, b or 5 other candidates`.
+    fn explain(&self, instance: &Value) -> String {
+        let mut out = format!("{} is not one of ", instance_json(instance));
+        let total = self.0.len();
+        let shown = if total <= Self::LISTED {
+            total
+        } else {
+            Self::LISTED - 1
+        };
+        for (i, option) in self.0.iter().take(shown).enumerate() {
+            if i > 0 {
+                out.push_str(if total <= Self::LISTED && i == total - 1 {
+                    " or "
+                } else {
+                    ", "
+                });
+            }
+            out.push_str(&option.to_string());
+        }
+        if total > Self::LISTED {
+            out.push_str(&format!(" or {} other candidates", total - shown));
+        }
+        out
+    }
+}
+
+impl<'i> jsonschema::Keyword<'i, DqJson> for Enum {
+    fn validate(&self, instance: DqNode<'i>) -> Result<(), jsonschema::ValidationError<'i>> {
+        if self.holds(instance.0) {
+            Ok(())
+        } else {
+            Err(jsonschema::ValidationError::custom(
+                self.explain(instance.0),
+            ))
+        }
+    }
+
+    fn is_valid(&self, instance: DqNode<'i>) -> bool {
+        self.holds(instance.0)
+    }
+}
+
+/// A bound — `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`
+/// — in place of jsonschema's own, which reads both numbers as `u64`,
+/// `i64` or else the `f64` nearest them: `18446744073709551617` met
+/// `maximum: 18446744073709551616`, and a NaN met every bound. Here both
+/// compare by their exact value ([`Value::compare_number`]); a NaN, which
+/// has no order, fails every bound. jsonschema's messages.
+struct Bound {
+    keyword: &'static str,
+    /// The limit as the schema spells it.
+    limit: serde_json::Value,
+    /// The limit's exact value.
+    exact: Value,
+}
+
+impl Bound {
+    const KEYWORDS: [&'static str; 4] =
+        ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"];
+
+    /// Whether `ordering` — the instance's against the limit — holds.
+    fn admits(&self, ordering: Ordering) -> bool {
         match self.keyword {
-            "multipleOf" => format!("{instance} is not a multiple of {limit}"),
-            "minimum" => {
-                format!("{instance} has no order, so it is not at least the minimum of {limit}")
+            "minimum" => ordering != Ordering::Less,
+            "maximum" => ordering != Ordering::Greater,
+            "exclusiveMinimum" => ordering == Ordering::Greater,
+            _ => ordering == Ordering::Less,
+        }
+    }
+
+    /// `None` when `instance` meets the bound (a value that is not a
+    /// number meets every one), else why it does not.
+    fn check(&self, instance: &Value) -> Option<String> {
+        let ordered = match instance {
+            Value::Int(_) | Value::BigInt(_) | Value::Float(_) | Value::BigFloat(_) => {
+                instance.compare_number(&self.exact)
             }
-            "maximum" => {
-                format!("{instance} has no order, so it is not at most the maximum of {limit}")
-            }
-            "exclusiveMinimum" => {
-                format!("{instance} has no order, so it is not above the minimum of {limit}")
-            }
-            _ => format!("{instance} has no order, so it is not below the maximum of {limit}"),
+            _ => return None,
+        };
+        let instance = instance_json(instance);
+        let limit = &self.limit;
+        match ordered {
+            Some(ordering) if self.admits(ordering) => None,
+            Some(_) => Some(match self.keyword {
+                "minimum" => format!("{instance} is less than the minimum of {limit}"),
+                "maximum" => format!("{instance} is greater than the maximum of {limit}"),
+                "exclusiveMinimum" => {
+                    format!("{instance} is less than or equal to the minimum of {limit}")
+                }
+                _ => format!("{instance} is greater than or equal to the maximum of {limit}"),
+            }),
+            None => Some(match self.keyword {
+                "minimum" => {
+                    format!("{instance} has no order, so it is not at least the minimum of {limit}")
+                }
+                "maximum" => {
+                    format!("{instance} has no order, so it is not at most the maximum of {limit}")
+                }
+                "exclusiveMinimum" => {
+                    format!("{instance} has no order, so it is not above the minimum of {limit}")
+                }
+                _ => format!("{instance} has no order, so it is not below the maximum of {limit}"),
+            }),
         }
     }
 }
 
-impl<'i> jsonschema::Keyword<'i, DqJson> for Guarded {
+impl<'i> jsonschema::Keyword<'i, DqJson> for Bound {
     fn validate(&self, instance: DqNode<'i>) -> Result<(), jsonschema::ValidationError<'i>> {
-        if self.refused(instance) {
-            return Err(jsonschema::ValidationError::custom(self.explain(instance)));
+        match self.check(instance.0) {
+            None => Ok(()),
+            Some(message) => Err(jsonschema::ValidationError::custom(message)),
+        }
+    }
+
+    fn is_valid(&self, instance: DqNode<'i>) -> bool {
+        self.check(instance.0).is_none()
+    }
+}
+
+/// `multipleOf` around jsonschema's own, which computes in `f64` and so
+/// came out true for a NaN, an infinity and a number past the `f64` range
+/// (`.nan` a multiple of `0.5`). Those fail; every other number gets
+/// jsonschema's answer and message.
+struct MultipleOf {
+    /// jsonschema's validator for the keyword alone.
+    builtin: jsonschema::Validator<DqJson>,
+    /// The divisor as the schema spells it.
+    divisor: serde_json::Value,
+}
+
+impl MultipleOf {
+    /// A number no `f64` holds: no arithmetic for it.
+    fn refused(instance: DqNode<'_>) -> bool {
+        instance
+            .as_number()
+            .is_some_and(|number| number.as_f64().is_none_or(|f| !f.is_finite()))
+    }
+}
+
+impl<'i> jsonschema::Keyword<'i, DqJson> for MultipleOf {
+    fn validate(&self, instance: DqNode<'i>) -> Result<(), jsonschema::ValidationError<'i>> {
+        if Self::refused(instance) {
+            return Err(jsonschema::ValidationError::custom(format!(
+                "{} is not a multiple of {}",
+                instance_json(instance.0),
+                self.divisor
+            )));
         }
         match self.builtin.iter_errors(instance).next() {
             None => Ok(()),
@@ -383,7 +491,99 @@ impl<'i> jsonschema::Keyword<'i, DqJson> for Guarded {
     }
 
     fn is_valid(&self, instance: DqNode<'i>) -> bool {
-        !self.refused(instance) && self.builtin.is_valid(instance)
+        !Self::refused(instance) && self.builtin.is_valid(instance)
+    }
+}
+
+/// The keywords [`options`] puts in place of jsonschema's own.
+const OVERRIDDEN: [&str; 7] = [
+    "const",
+    "enum",
+    "multipleOf",
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+];
+
+/// The evaluation paths — the keywords followed to an error, a `$ref`
+/// included (`/properties/x/$ref/enum`) — of the errors that dq's own
+/// keywords raise.
+///
+/// jsonschema gives a custom keyword's error its schema location as its
+/// evaluation path (`/$defs/x/enum`: it holds that a custom keyword is
+/// never reached through a `$ref`), so these come from its `evaluate`
+/// output instead, which follows the `$ref`. Built on the first such
+/// error only; every other error carries its own.
+pub(crate) struct EvaluationPaths<'v> {
+    validator: &'v jsonschema::Validator<DqJson>,
+    instance: &'v Value,
+    /// `(instance location, keyword, message)` to the evaluation paths of
+    /// the errors with them, in evaluation order.
+    paths: Option<HashMap<(String, String, String), VecDeque<String>>>,
+}
+
+impl<'v> EvaluationPaths<'v> {
+    pub(crate) fn new(validator: &'v jsonschema::Validator<DqJson>, instance: &'v Value) -> Self {
+        Self {
+            validator,
+            instance,
+            paths: None,
+        }
+    }
+
+    /// The evaluation path of `error`, an error of `instance` under
+    /// `validator`. Call it once per error, in `iter_errors` order: two
+    /// errors alike take the paths in turn.
+    pub(crate) fn of(&mut self, error: &jsonschema::ValidationError<'_>) -> String {
+        let jsonschema::error::ValidationErrorKind::Custom { keyword, message } = error.kind()
+        else {
+            return error.evaluation_path().as_str().to_owned();
+        };
+        if !OVERRIDDEN.contains(&keyword.as_str()) {
+            return error.evaluation_path().as_str().to_owned();
+        }
+        let (validator, instance) = (self.validator, self.instance);
+        let paths = self.paths.get_or_insert_with(|| {
+            let evaluation = validator.evaluate(DqNode(instance));
+            let mut paths = HashMap::new();
+            collect_paths(evaluation.root(), &mut paths);
+            paths
+        });
+        let key = (
+            error.instance_path().as_str().to_owned(),
+            keyword.clone(),
+            message.clone(),
+        );
+        paths
+            .get_mut(&key)
+            .and_then(VecDeque::pop_front)
+            .unwrap_or_else(|| error.evaluation_path().as_str().to_owned())
+    }
+}
+
+/// File the errors of `unit` and of every unit below it, in order.
+fn collect_paths(
+    unit: jsonschema::OutputUnit<'_>,
+    paths: &mut HashMap<(String, String, String), VecDeque<String>>,
+) {
+    for error in unit.errors() {
+        let mut path = unit.evaluation_path().as_str().to_owned();
+        if !path.ends_with(&format!("/{}", error.keyword())) {
+            path.push('/');
+            path.push_str(error.keyword());
+        }
+        paths
+            .entry((
+                unit.instance_location().as_str().to_owned(),
+                error.keyword().to_owned(),
+                error.message().to_owned(),
+            ))
+            .or_default()
+            .push_back(path);
+    }
+    for child in unit.children() {
+        collect_paths(child, paths);
     }
 }
 
@@ -401,24 +601,39 @@ fn builtin_options<'i>()
 }
 
 /// Options for an offline JSON Schema 2020-12 validator over [`DqJson`],
-/// with `const`, the bounds and `multipleOf` that read NaN, infinities and
-/// big numbers as the module docs say.
+/// with `const`, `enum`, the bounds and `multipleOf` that read NaN,
+/// infinities and big numbers as the module docs say.
 pub(crate) fn options<'i>()
 -> jsonschema::ValidationOptions<'i, std::sync::Arc<dyn jsonschema::Retrieve>, DqJson> {
-    let mut options = builtin_options().with_keyword("const", |_, expected, _| {
-        Ok(Box::new(Const(expected.clone())))
-    });
-    for (keyword, refuses) in Guarded::KEYWORDS {
-        options = options.with_keyword(keyword, move |_, limit, _| {
+    let mut options = builtin_options()
+        .with_keyword("const", |_, expected, _| {
+            Ok(Box::new(Const(expected.clone())))
+        })
+        .with_keyword("enum", |_, options, _| match options {
+            serde_json::Value::Array(options) => Ok(Box::new(Enum(options.clone()))),
+            other => Err(jsonschema::ValidationError::custom(format!(
+                "{other} is not of type \"array\""
+            ))),
+        })
+        .with_keyword("multipleOf", |_, divisor, _| {
             let builtin = builtin_options()
-                .build(&serde_json::json!({ keyword: limit }))
+                .build(&serde_json::json!({ "multipleOf": divisor }))
                 .map_err(|error| jsonschema::ValidationError::custom(error.to_string()))?;
-            Ok(Box::new(Guarded {
+            Ok(Box::new(MultipleOf {
                 builtin,
+                divisor: divisor.clone(),
+            }))
+        });
+    for keyword in Bound::KEYWORDS {
+        options = options.with_keyword(keyword, move |_, limit, _| match limit {
+            serde_json::Value::Number(_) => Ok(Box::new(Bound {
                 keyword,
                 limit: limit.clone(),
-                refuses,
-            }))
+                exact: Value::from_serde_json(limit),
+            })),
+            other => Err(jsonschema::ValidationError::custom(format!(
+                "{other} is not of type \"number\""
+            ))),
         });
     }
     options
@@ -483,7 +698,8 @@ impl JsonNumber for DqNumber<'_> {
 }
 
 /// `value` equals the schema value `expected` (`enum`, `const`): numbers
-/// by their exact value, a NaN or an infinity never.
+/// by their exact value, an infinity only the infinity of its sign, a
+/// NaN nothing.
 fn equals(value: &Value, expected: &serde_json::Value) -> bool {
     match (value, expected) {
         (Value::Null, serde_json::Value::Null) => true,
@@ -500,6 +716,9 @@ fn equals(value: &Value, expected: &serde_json::Value) -> bool {
         (number, serde_json::Value::Number(n)) => number.same_number(&Value::from_serde_json(
             &serde_json::Value::Number(n.clone()),
         )),
+        // A schema's own NaN or infinity, which only a YAML schema holds.
+        (number, serde_json::Value::String(s)) => unmarker(s)
+            .is_some_and(|spelling| number.same_number(&Value::BigFloat(spelling.to_owned()))),
         _ => false,
     }
 }
@@ -508,6 +727,23 @@ fn equals(value: &Value, expected: &serde_json::Value) -> bool {
 /// document holds, which JSON renders as `"\u0000dq.nan\u0000"`.
 fn marker(spelling: &str) -> String {
     format!("\u{0}dq{spelling}\u{0}")
+}
+
+/// The spelling (`.nan`, `.inf`, `-.inf`) a [`marker`] stands for.
+fn unmarker(s: &str) -> Option<&str> {
+    s.strip_prefix("\u{0}dq")?
+        .strip_suffix('\u{0}')
+        .filter(|spelling| matches!(*spelling, ".nan" | ".inf" | "-.inf"))
+}
+
+/// A schema read as a [`Value`] (from YAML) as the JSON the validator
+/// compiles: every number keeps its exact literal (the workspace's
+/// `serde_json` is built with `arbitrary_precision`), and a NaN or an
+/// infinity, which JSON has no number for, becomes its [`marker`] — a
+/// string the validator matches only against that number (`const`,
+/// `enum`) and refuses where a number must stand (`maximum: .inf`).
+pub(crate) fn schema_json(schema: &Value) -> serde_json::Value {
+    instance_json(schema)
 }
 
 /// `value` as the JSON an error reports, a NaN or an infinity as a
@@ -665,6 +901,90 @@ mod tests {
             "a".to_owned(),
             Value::Array(vec![Value::Float(1.0), Value::Null]),
         )])))));
+    }
+
+    /// A validator for `schema`, read the way a YAML rule's schema is.
+    fn yaml_validator(schema: &str) -> jsonschema::Validator<DqJson> {
+        let doc = dq_core::by_name("yaml")
+            .expect("yaml format")
+            .parse(schema.as_bytes())
+            .expect("yaml schema");
+        options()
+            .build(&schema_json(doc.value()))
+            .expect("schema compiles")
+    }
+
+    #[test]
+    fn bounds_compare_exact_values() {
+        let int = |s: &str| Value::BigInt(s.to_owned());
+        let maximum = yaml_validator("maximum: 18446744073709551616\n");
+        assert!(maximum.is_valid(DqNode(&int("18446744073709551616"))));
+        assert!(!maximum.is_valid(DqNode(&int("18446744073709551617"))));
+        let exclusive = yaml_validator("exclusiveMaximum: 0.10000000000000000001\n");
+        assert!(exclusive.is_valid(DqNode(&Value::Float(0.1))));
+        assert!(!exclusive.is_valid(DqNode(&big("0.10000000000000000001"))));
+        let minimum = yaml_validator("minimum: 1e400\n");
+        assert!(minimum.is_valid(DqNode(&big(".inf"))));
+        assert!(minimum.is_valid(DqNode(&big("1e400"))));
+        assert!(!minimum.is_valid(DqNode(&big("1e399"))));
+        assert!(!minimum.is_valid(DqNode(&big(".nan"))));
+        assert!(minimum.is_valid(DqNode(&Value::String("x".into()))));
+        let exclusive_min = yaml_validator("exclusiveMinimum: -1\n");
+        assert!(!exclusive_min.is_valid(DqNode(&Value::Float(-1.0))));
+        let message = maximum
+            .iter_errors(DqNode(&int("18446744073709551617")))
+            .next()
+            .expect("error")
+            .to_string();
+        assert_eq!(
+            message,
+            "18446744073709551617 is greater than the maximum of 18446744073709551616"
+        );
+        let message = exclusive_min
+            .iter_errors(DqNode(&Value::Int(-1)))
+            .next()
+            .expect("error")
+            .to_string();
+        assert_eq!(message, "-1 is less than or equal to the minimum of -1");
+    }
+
+    #[test]
+    fn a_yaml_schema_holds_exact_and_non_finite_numbers() {
+        let huge = yaml_validator("const: 18446744073709551616\n");
+        assert!(huge.is_valid(DqNode(&Value::BigInt("18446744073709551616".into()))));
+        assert!(!huge.is_valid(DqNode(&Value::BigInt("18446744073709551617".into()))));
+        let inf = yaml_validator("enum: [.inf, 1e400]\n");
+        assert!(inf.is_valid(DqNode(&Value::Float(f64::INFINITY))));
+        assert!(inf.is_valid(DqNode(&big("1.0e400"))));
+        assert!(!inf.is_valid(DqNode(&big("-.inf"))));
+        let message = inf
+            .iter_errors(DqNode(&big("-.inf")))
+            .next()
+            .expect("error")
+            .to_string();
+        assert_eq!(restore(&message), "-.inf is not one of .inf or 1e+400");
+        let nan = yaml_validator("const: .nan\n");
+        assert!(!nan.is_valid(DqNode(&big(".nan"))));
+        let many = yaml_validator("enum: [1, 2, 3, 4]\n");
+        let message = many
+            .iter_errors(DqNode(&Value::Int(5)))
+            .next()
+            .expect("error")
+            .to_string();
+        assert_eq!(message, "5 is not one of 1, 2 or 2 other candidates");
+        let error = options()
+            .build(&schema_json(
+                dq_core::by_name("yaml")
+                    .expect("yaml")
+                    .parse(b"maximum: .inf\n")
+                    .expect("yaml")
+                    .value(),
+            ))
+            .expect_err("no infinite bound");
+        assert_eq!(
+            restore(&error.to_string()),
+            r#".inf is not of type "number""#
+        );
     }
 
     #[test]
