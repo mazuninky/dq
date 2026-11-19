@@ -71,13 +71,17 @@
 //!
 //! The reader decodes a file per its UTF-16 byte order mark, else per the
 //! declaration's `encoding` when that encoding keeps ASCII as ASCII
-//! (ISO-8859-1, windows-1252, Shift_JIS, …), else as UTF-8; an unknown
-//! label reads as UTF-8. The writer encodes its output in the encoding
-//! `#xml` declares (UTF-8 without one), beginning UTF-16 with the BOM
-//! `bom` names — little-endian by default — and refuses a label encoding_rs
-//! does not know, a character the encoding cannot hold, and a `bom` the
-//! label contradicts. Labels follow the WHATWG Encoding Standard, so
-//! `ISO-8859-1` and `US-ASCII` mean windows-1252.
+//! (US-ASCII, ISO-8859-1, windows-1252, Shift_JIS, …), else as UTF-8; an
+//! unknown label reads as UTF-8. The writer encodes its output in the
+//! encoding `#xml` declares (UTF-8 without one), beginning UTF-16 with the
+//! BOM `bom` names — little-endian by default — and refuses a label dq does
+//! not know, a character the encoding cannot hold, and a `bom` the label
+//! contradicts. Labels are encoding_rs's (the WHATWG Encoding
+//! Standard) except two, which follow IANA and the XML spec as other XML
+//! parsers do: `US-ASCII` (`ASCII`, …) is strict 7-bit — a byte from 0x80
+//! up is a parse error — and `ISO-8859-1` (`latin1`, `l1`, …) maps byte to
+//! code point, 0x80–0x9F being C1 controls. WHATWG would read both as
+//! windows-1252, which keeps its own mapping under its own labels.
 //!
 //! ## Read-only edit operations
 //!
@@ -488,23 +492,30 @@ impl Bom {
 /// The text of an XML file and the UTF-16 BOM it began with. The encoding
 /// is the BOM's, else UTF-16 when the file starts `<?` in 16-bit units,
 /// else the one the declaration names if that encoding keeps ASCII as
-/// ASCII (ISO-8859-1, windows-1252, Shift_JIS, …), else UTF-8. A label
-/// encoding_rs does not know, or a UTF-16 label over 8-bit bytes, reads as
+/// ASCII (US-ASCII, ISO-8859-1, windows-1252, Shift_JIS, …), else UTF-8. A
+/// label dq does not know, or a UTF-16 label over 8-bit bytes, reads as
 /// UTF-8, as it did before dq decoded other encodings.
 fn decode_input(bytes: &[u8]) -> Result<(Cow<'_, str>, Option<Bom>)> {
     use quick_xml::encoding::{DetectedEncoding, detect_encoding};
-    let (encoding, body, bom) = match detect_encoding(bytes) {
-        Some(DetectedEncoding::Utf16LeBom) => (UTF_16LE, &bytes[2..], Some(Bom::Utf16Le)),
-        Some(DetectedEncoding::Utf16BeBom) => (UTF_16BE, &bytes[2..], Some(Bom::Utf16Be)),
-        Some(DetectedEncoding::Utf16LeLike) => (UTF_16LE, bytes, None),
-        Some(DetectedEncoding::Utf16BeLike) => (UTF_16BE, bytes, None),
+    let (charset, body, bom) = match detect_encoding(bytes) {
+        Some(DetectedEncoding::Utf16LeBom) => {
+            (Charset::Whatwg(UTF_16LE), &bytes[2..], Some(Bom::Utf16Le))
+        }
+        Some(DetectedEncoding::Utf16BeBom) => {
+            (Charset::Whatwg(UTF_16BE), &bytes[2..], Some(Bom::Utf16Be))
+        }
+        Some(DetectedEncoding::Utf16LeLike) => (Charset::Whatwg(UTF_16LE), bytes, None),
+        Some(DetectedEncoding::Utf16BeLike) => (Charset::Whatwg(UTF_16BE), bytes, None),
         // The reader drops a UTF-8 BOM itself.
-        Some(DetectedEncoding::Utf8Bom) => (UTF_8, bytes, None),
+        Some(DetectedEncoding::Utf8Bom) => (Charset::Whatwg(UTF_8), bytes, None),
         _ => {
             let declared = declared_label(bytes)
-                .and_then(|label| Encoding::for_label(label.as_bytes()))
-                .filter(|encoding| encoding.is_ascii_compatible());
-            (declared.unwrap_or(UTF_8), bytes, None)
+                .and_then(Charset::for_label)
+                .filter(|charset| match charset {
+                    Charset::Whatwg(encoding) => encoding.is_ascii_compatible(),
+                    Charset::Ascii | Charset::Latin1 => true,
+                });
+            (declared.unwrap_or(Charset::Whatwg(UTF_8)), bytes, None)
         }
     };
     let invalid = |message: String| Error::Parse {
@@ -515,14 +526,123 @@ fn decode_input(bytes: &[u8]) -> Result<(Cow<'_, str>, Option<Bom>)> {
         snippet: String::new(),
         message,
     };
-    if encoding == UTF_8 {
-        let text = std::str::from_utf8(body)
-            .map_err(|e| invalid(format!("invalid UTF-8 in XML input: {e}")))?;
-        return Ok((Cow::Borrowed(text), bom));
-    }
-    let text = quick_xml::encoding::decode(body, encoding)
-        .map_err(|_| invalid(format!("invalid {} in XML input", encoding.name())))?;
+    let text = match charset {
+        Charset::Ascii => {
+            if let Some(index) = body.iter().position(|b| !b.is_ascii()) {
+                return Err(invalid(format!(
+                    "invalid US-ASCII in XML input: byte 0x{:02X} at index {index}",
+                    body[index],
+                )));
+            }
+            let text = std::str::from_utf8(body)
+                .map_err(|e| invalid(format!("invalid US-ASCII in XML input: {e}")))?;
+            Cow::Borrowed(text)
+        }
+        Charset::Latin1 => Cow::Owned(body.iter().map(|&b| char::from(b)).collect()),
+        Charset::Whatwg(encoding) if encoding == UTF_8 => {
+            let text = std::str::from_utf8(body)
+                .map_err(|e| invalid(format!("invalid UTF-8 in XML input: {e}")))?;
+            Cow::Borrowed(text)
+        }
+        Charset::Whatwg(encoding) => quick_xml::encoding::decode(body, encoding)
+            .map_err(|_| invalid(format!("invalid {} in XML input", encoding.name())))?,
+    };
     Ok((text, bom))
+}
+
+/// The character set an `encoding` label names. US-ASCII and ISO-8859-1
+/// follow IANA and the XML spec — strict 7-bit, and byte = code point —
+/// where the WHATWG labels encoding_rs resolves would make both
+/// windows-1252, which other XML parsers do not; every other label is
+/// encoding_rs's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Charset {
+    Ascii,
+    Latin1,
+    Whatwg(&'static Encoding),
+}
+
+/// IANA names and aliases of US-ASCII, lower case.
+const ASCII_LABELS: &[&str] = &[
+    "us-ascii",
+    "ascii",
+    "ansi_x3.4-1968",
+    "ansi_x3.4-1986",
+    "iso-ir-6",
+    "iso_646.irv:1991",
+    "iso646-us",
+    "us",
+    "ibm367",
+    "cp367",
+    "csascii",
+];
+
+/// IANA names and aliases of ISO-8859-1, and the spellings WHATWG adds for
+/// it, lower case.
+const LATIN1_LABELS: &[&str] = &[
+    "iso-8859-1",
+    "iso_8859-1",
+    "iso_8859-1:1987",
+    "iso-ir-100",
+    "iso8859-1",
+    "iso88591",
+    "latin1",
+    "l1",
+    "ibm819",
+    "cp819",
+    "csisolatin1",
+];
+
+impl Charset {
+    /// The character set `label` names, ignoring case and surrounding ASCII
+    /// whitespace; `None` for a label neither IANA's two nor encoding_rs
+    /// knows.
+    fn for_label(label: &str) -> Option<Self> {
+        let trimmed = label.trim_matches(|c: char| c.is_ascii_whitespace());
+        let is = |labels: &[&str]| labels.iter().any(|l| trimmed.eq_ignore_ascii_case(l));
+        if is(ASCII_LABELS) {
+            Some(Self::Ascii)
+        } else if is(LATIN1_LABELS) {
+            Some(Self::Latin1)
+        } else {
+            Encoding::for_label(label.as_bytes()).map(Self::Whatwg)
+        }
+    }
+
+    /// Whether the character set holds `c`.
+    fn holds(self, c: char) -> bool {
+        match self {
+            Self::Ascii => c.is_ascii(),
+            Self::Latin1 => u32::from(c) <= 0xFF,
+            Self::Whatwg(encoding) => {
+                let mut buf = [0; 4];
+                let (_, _, unmappable) = encoding.encode(c.encode_utf8(&mut buf));
+                c.is_ascii() || !unmappable
+            }
+        }
+    }
+
+    /// `text` in this character set; `None` if a character does not fit.
+    fn encode(self, text: &str) -> Option<Vec<u8>> {
+        match self {
+            Self::Ascii | Self::Latin1 => text
+                .chars()
+                .map(|c| u8::try_from(u32::from(c)).ok().filter(|_| self.holds(c)))
+                .collect(),
+            Self::Whatwg(encoding) => {
+                let (bytes, _, unmappable) = encoding.encode(text);
+                (!unmappable).then(|| bytes.into_owned())
+            }
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Ascii => "US-ASCII",
+            Self::Latin1 => "ISO-8859-1",
+            Self::Whatwg(encoding) => encoding.name(),
+        }
+    }
 }
 
 /// The `encoding` value of an XML declaration at the very start of `bytes`,
@@ -852,8 +972,8 @@ enum Output {
         big_endian: bool,
         bom: bool,
     },
-    /// An encoding encoding_rs writes, ASCII-compatible or not.
-    Other(&'static Encoding),
+    /// Any other character set dq writes, ASCII-compatible or not.
+    Other(Charset),
 }
 
 impl Output {
@@ -862,8 +982,8 @@ impl Output {
     /// (`UTF-16`) begins with a BOM — XML requires one — in the byte order
     /// `bom` names, little-endian by default; `UTF-16LE` / `UTF-16BE` fix
     /// the byte order and begin with a BOM only if `bom` says so. Refused:
-    /// a label encoding_rs does not know or cannot encode to, and a `bom`
-    /// that contradicts the label.
+    /// a label dq does not know or cannot encode to, and a `bom` that
+    /// contradicts the label.
     fn for_declaration(decl: Option<&Declaration>) -> Result<Self> {
         let (label, bom) = decl.map_or((None, None), |d| (d.encoding.as_deref(), d.bom));
         let refuse = |message: String| {
@@ -881,7 +1001,7 @@ impl Output {
                 },
             });
         };
-        let Some(encoding) = Encoding::for_label(label.as_bytes()) else {
+        let Some(charset) = Charset::for_label(label) else {
             return refuse(format!(
                 "declares encoding {label:?}, which dq does not know"
             ));
@@ -891,6 +1011,15 @@ impl Output {
                 "field '{KEY_BOM}' is {} but the declared encoding is {label:?}",
                 bom.label(),
             ))
+        };
+        let encoding = match charset {
+            Charset::Whatwg(encoding) => encoding,
+            Charset::Ascii | Charset::Latin1 => {
+                return match bom {
+                    Some(bom) => contradicts(bom),
+                    None => Ok(Self::Other(charset)),
+                };
+            }
         };
         if encoding == UTF_16LE || encoding == UTF_16BE {
             let explicit =
@@ -918,15 +1047,15 @@ impl Output {
                 "declares encoding {label:?}, which dq cannot write"
             ))
         } else {
-            Ok(Self::Other(encoding))
+            Ok(Self::Other(charset))
         }
     }
 
-    /// The encoding whose characters need checking: `None` for UTF-8 and
-    /// UTF-16, which hold every character.
-    fn limited_to(&self) -> Option<&'static Encoding> {
+    /// The character set whose characters need checking: `None` for UTF-8
+    /// and UTF-16, which hold every character.
+    fn limited_to(&self) -> Option<Charset> {
         match self {
-            Self::Other(encoding) => Some(encoding),
+            Self::Other(charset) => Some(*charset),
             Self::Utf8 | Self::Utf16 { .. } => None,
         }
     }
@@ -952,19 +1081,13 @@ impl Output {
                     })
                     .collect())
             }
-            Self::Other(encoding) => {
-                let (bytes, _, unmappable) = encoding.encode(&text);
-                if unmappable {
-                    return Err(Error::Format {
-                        format: "xml",
-                        message: format!(
-                            "XML write error: the output holds a character {} cannot encode",
-                            encoding.name(),
-                        ),
-                    });
-                }
-                Ok(bytes.into_owned())
-            }
+            Self::Other(charset) => charset.encode(&text).ok_or_else(|| Error::Format {
+                format: "xml",
+                message: format!(
+                    "XML write error: the output holds a character {} cannot encode",
+                    charset.name(),
+                ),
+            }),
         }
     }
 }
@@ -972,39 +1095,30 @@ impl Output {
 /// The first character the writer emitted that the output encoding cannot
 /// hold, and where: `in <tag>` or `at the top level`.
 struct Unencodable {
-    encoding: Option<&'static Encoding>,
+    charset: Option<Charset>,
     first: Option<(char, String)>,
 }
 
 impl Unencodable {
     fn new(output: &Output) -> Self {
         Self {
-            encoding: output.limited_to(),
+            charset: output.limited_to(),
             first: None,
         }
     }
 
-    /// Remember the first character of `text` the encoding cannot hold,
-    /// unless one is already remembered. `place` is built only then.
+    /// Remember the first character of `text` the character set cannot
+    /// hold, unless one is already remembered. `place` is built only then.
     fn note(&mut self, text: &str, place: impl FnOnce() -> String) {
-        let Some(encoding) = self.encoding else {
+        let Some(charset) = self.charset else {
             return;
         };
         if self.first.is_none()
-            && let Some(c) = text
-                .chars()
-                .find(|&c| !c.is_ascii() && !can_encode(encoding, c))
+            && let Some(c) = text.chars().find(|&c| !charset.holds(c))
         {
             self.first = Some((c, place()));
         }
     }
-}
-
-/// Whether `encoding` holds `c` (encoding_rs reports an unmappable one).
-fn can_encode(encoding: &'static Encoding, c: char) -> bool {
-    let mut buf = [0; 4];
-    let (_, _, unmappable) = encoding.encode(c.encode_utf8(&mut buf));
-    !unmappable
 }
 
 /// The namespace URI the `xml` prefix is bound to, always and only.
@@ -1923,6 +2037,30 @@ mod tests {
         let (text, bom) = decode_input(&utf16).expect("decodes");
         assert_eq!((text.as_ref(), bom), ("<r>\u{e9}</r>", Some(Bom::Utf16Be)));
 
+        // ISO-8859-1 is byte = code point (0x80 a C1 control), windows-1252
+        // its own mapping (0x80 the euro sign), US-ASCII strictly 7-bit.
+        for (label, expected) in [
+            ("ISO-8859-1", '\u{80}'),
+            ("latin1", '\u{80}'),
+            ("windows-1252", '\u{20ac}'),
+        ] {
+            let mut xml = format!("<?xml version='1.0' encoding='{label}'?><r>").into_bytes();
+            xml.extend(b"\x80</r>");
+            let (text, _) = decode_input(&xml).expect("decodes");
+            assert!(
+                text.ends_with(&format!("<r>{expected}</r>")),
+                "{label}: {text}"
+            );
+        }
+        let ascii = b"<?xml version='1.0' encoding='US-ASCII'?><r>caf\xe9</r>";
+        let Err(Error::Parse { message, .. }) = decode_input(ascii) else {
+            panic!("US-ASCII with a byte above 0x7F must be a parse error");
+        };
+        assert_eq!(
+            message,
+            "invalid US-ASCII in XML input: byte 0xE9 at index 47"
+        );
+
         // A UTF-16 label over 8-bit bytes, and an unknown label, read as UTF-8.
         for label in ["UTF-16", "no-such"] {
             let xml = format!("<?xml version=\"1.0\" encoding='{label}'?><r>\u{e9}</r>");
@@ -1981,10 +2119,19 @@ mod tests {
             latin.encode("caf\u{e9}".into()).expect("encodes"),
             b"caf\xe9"
         );
+        assert_eq!(latin.encode("\u{80}".into()).expect("encodes"), b"\x80");
         let mut unencodable = Unencodable::new(&latin);
-        unencodable.note("caf\u{e9}", || unreachable!("encodable"));
-        unencodable.note("\u{3c0}", || "in <k>".to_owned());
-        assert_eq!(unencodable.first, Some(('\u{3c0}', "in <k>".to_owned())));
+        unencodable.note("caf\u{e9}\u{80}", || unreachable!("encodable"));
+        // U+20AC is windows-1252's 0x80, not Latin-1's.
+        unencodable.note("\u{20ac}\u{3c0}", || "in <k>".to_owned());
+        assert_eq!(unencodable.first, Some(('\u{20ac}', "in <k>".to_owned())));
+
+        let ascii = Output::for_declaration(Some(&decl(Some("ascii"), None))).expect("ok");
+        let mut unencodable = Unencodable::new(&ascii);
+        unencodable.note("cafe", || unreachable!("encodable"));
+        unencodable.note("caf\u{e9}", || "in <r>".to_owned());
+        assert_eq!(unencodable.first, Some(('\u{e9}', "in <r>".to_owned())));
+        assert!(ascii.encode("\u{e9}".into()).is_err());
     }
 
     #[test]

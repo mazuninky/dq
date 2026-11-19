@@ -1173,8 +1173,7 @@ fn xml_reads_and_writes_files_in_their_declared_encoding() {
     );
     let be = utf16("<?xml version=\"1.0\" encoding=\"UTF-16\"?><r>é</r>", true);
     let bare = utf16("<r>é</r>", false);
-    let dir = TempDir::new().expect("tempdir");
-    let files: [(&str, &[u8]); 8] = [
+    let dir = dir_with_bytes(&[
         ("latin.xml", &latin),
         ("windows.xml", &windows),
         ("sjis.xml", &sjis),
@@ -1189,10 +1188,7 @@ fn xml_reads_and_writes_files_in_their_declared_encoding() {
             "utf16.yaml",
             "\"#xml\": {encoding: UTF-16}\nr:\n- \"#text\": é\n".as_bytes(),
         ),
-    ];
-    for (name, bytes) in files {
-        std::fs::write(dir.path().join(name), bytes).expect("write fixture");
-    }
+    ]);
     let cases: [(&str, &str, &[u8]); 9] = [
         ("latin.xml", "xml", &latin),
         ("windows.xml", "xml", &windows),
@@ -1219,8 +1215,26 @@ fn xml_reads_and_writes_files_in_their_declared_encoding() {
             &utf16("<?xml version=\"1.0\" encoding=\"UTF-16\"?><r>é</r>", false),
         ),
     ];
+    assert_byte_cases(
+        &dir,
+        &cases.map(|(file, to, expected)| (file, to, 0, expected, "")),
+    );
+}
+
+/// A temp dir holding `files`, given as bytes.
+fn dir_with_bytes(files: &[(&str, &[u8])]) -> TempDir {
+    let dir = TempDir::new().expect("tempdir");
+    for (name, bytes) in files {
+        std::fs::write(dir.path().join(name), bytes).expect("write fixture");
+    }
+    dir
+}
+
+/// Run `dq --no-color -q convert <file> -F <to>` in `dir` for each case and
+/// compare exit code, stdout as bytes and stderr; report every mismatch.
+fn assert_byte_cases(dir: &TempDir, cases: &[(&str, &str, i32, &[u8], &str)]) {
     let mut wrong = Vec::new();
-    for (file, to, expected) in cases {
+    for &(file, to, code, stdout, stderr) in cases {
         let out = dq()
             .current_dir(dir.path())
             .args(["--no-color", "-q", "convert", file, "-F", to])
@@ -1231,10 +1245,10 @@ fn xml_reads_and_writes_files_in_their_declared_encoding() {
             out.stdout.as_slice(),
             out.stderr.as_slice(),
         );
-        if actual != (Some(0), expected, b"".as_slice()) {
+        if actual != (Some(code), stdout, stderr.as_bytes()) {
             wrong.push(format!(
-                "{file} -F {to}\n  expected {:?}\n  actual   {:?} {:?} {}",
-                String::from_utf8_lossy(expected),
+                "{file} -F {to}\n  expected {code} {:?} {stderr:?}\n  actual   {:?} {:?} {:?}",
+                String::from_utf8_lossy(stdout),
                 actual.0,
                 String::from_utf8_lossy(actual.1),
                 String::from_utf8_lossy(actual.2),
@@ -1246,6 +1260,70 @@ fn xml_reads_and_writes_files_in_their_declared_encoding() {
         "{} case(s) differ:\n{}",
         wrong.len(),
         wrong.join("\n")
+    );
+}
+
+/// `US-ASCII` and `ISO-8859-1` follow IANA and the XML spec, not WHATWG
+/// (which makes both windows-1252): US-ASCII is strict 7-bit, a byte from
+/// 0x80 up a parse error and a non-ASCII character refused on write;
+/// ISO-8859-1 maps byte to code point both ways, so 0x80 is U+0080 and €
+/// is refused. windows-1252 keeps 0x80 = €.
+#[test]
+fn xml_reads_us_ascii_strictly_and_iso_8859_1_byte_for_code_point() {
+    let latin = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><r>\x80\xe9</r>".to_vec();
+    let windows = b"<?xml version=\"1.0\" encoding=\"windows-1252\"?><r>\x80</r>".to_vec();
+    let ascii = b"<?xml version=\"1.0\" encoding=\"US-ASCII\"?><r>caf\xe9</r>".to_vec();
+    let dir = dir_with_bytes(&[
+        ("latin.xml", &latin),
+        ("windows.xml", &windows),
+        ("ascii.xml", &ascii),
+        (
+            "latin_c1.yaml",
+            b"\"#xml\": {encoding: latin1}\nr:\n- \"#text\": \"\\x80\"\n",
+        ),
+        (
+            "latin_euro.yaml",
+            "\"#xml\": {encoding: ISO-8859-1}\nr:\n- \"#text\": €\n".as_bytes(),
+        ),
+        (
+            "ascii_e.yaml",
+            "\"#xml\": {encoding: ascii}\nr:\n- \"#text\": é\n".as_bytes(),
+        ),
+    ]);
+    let json = |encoding: &str, text: &str| {
+        format!(
+            "{{\n  \"#xml\": {{\n    \"version\": \"1.0\",\n    \"encoding\": \"{encoding}\"\n  \
+             }},\n  \"r\": [\n    {{\n      \"#text\": \"{text}\"\n    }}\n  ]\n}}\n"
+        )
+    };
+    let latin_json = json("ISO-8859-1", "\u{80}é");
+    let windows_json = json("windows-1252", "€");
+    let refused = |message: &str| format!("xml format error: XML write: {message}\n");
+    let euro = refused("'#xml' declares encoding \"ISO-8859-1\", which cannot hold U+20AC in <r>");
+    let e_acute = refused("'#xml' declares encoding \"ascii\", which cannot hold U+00E9 in <r>");
+    assert_byte_cases(
+        &dir,
+        &[
+            ("latin.xml", "xml", 0, &latin, ""),
+            ("latin.xml", "json", 0, latin_json.as_bytes(), ""),
+            ("windows.xml", "json", 0, windows_json.as_bytes(), ""),
+            (
+                "ascii.xml",
+                "json",
+                3,
+                b"",
+                "parse error in ascii.xml: invalid US-ASCII in XML input: byte 0xE9 at index 47\n",
+            ),
+            (
+                "latin_c1.yaml",
+                "xml",
+                0,
+                b"<?xml version=\"1.0\" encoding=\"latin1\"?><r>\x80</r>",
+                "",
+            ),
+            ("latin_euro.yaml", "xml", 1, b"", &euro),
+            ("ascii_e.yaml", "xml", 1, b"", &e_acute),
+        ],
     );
 }
 
