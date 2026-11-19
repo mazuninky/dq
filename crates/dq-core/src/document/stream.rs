@@ -1,6 +1,6 @@
 //! Re-emitting one document of a write-aware YAML stream.
 
-use super::{Document, FormatTag, Value, first_difference};
+use super::{Document, FormatTag, Value, first_difference, with_line_ending_at};
 use crate::Result;
 use crate::error::Error;
 use crate::format::Format as _;
@@ -15,6 +15,8 @@ impl Document {
     /// comment on it) and every other document — separators, comments,
     /// quoting and all — stay byte for byte. Comments inside the
     /// rewritten document are dropped, as any writer re-emit drops them.
+    /// The rewritten body breaks lines the way the file does around it:
+    /// `\r\n` in a CRLF file, `\n` otherwise.
     /// The result is parsed again and must read back as the requested
     /// stream, so the document stays write-aware: later textual edits
     /// (`set_at`, `del_at`, a `fix.ops` script) apply to it as before.
@@ -52,11 +54,14 @@ impl Document {
             &Document::value_only(expected[index].clone(), FormatTag::Yaml),
             &mut emitted,
         )?;
-        let mut bytes = Vec::with_capacity(self.original_bytes.len() + emitted.len() + 1);
-        bytes.extend_from_slice(&self.original_bytes[..extent.body.start]);
         if extent.needs_line_break {
-            bytes.push(b'\n');
+            emitted.insert(0, b'\n');
         }
+        // The writer breaks lines with `\n`; a CRLF file gets `\r\n`, the
+        // same way a textual edit's inserted lines do.
+        let emitted = with_line_ending_at(&self.original_bytes, extent.body.start, emitted);
+        let mut bytes = Vec::with_capacity(self.original_bytes.len() + emitted.len());
+        bytes.extend_from_slice(&self.original_bytes[..extent.body.start]);
         bytes.extend_from_slice(&emitted);
         bytes.extend_from_slice(&self.original_bytes[extent.body.end..]);
 
@@ -150,6 +155,20 @@ mod tests {
         doc.reemit_stream_document(1, map("name", "b"))
             .expect("empty");
         assert_eq!(text(&doc), "name: a\n---\nname: b\n");
+    }
+
+    #[test]
+    fn keeps_crlf_line_ends_in_the_rewritten_document_and_its_block_scalar() {
+        let mut doc = stream("x: 1\r\n---\r\nname: b # k\r\n");
+        doc.reemit_stream_document(1, map("text", "one\ntwo\n"))
+            .expect("re-emit");
+        assert_eq!(text(&doc), "x: 1\r\n---\r\ntext: |\r\n  one\r\n  two\r\n");
+        assert_eq!(doc.values().unwrap()[1], map("text", "one\ntwo\n"));
+
+        let mut doc = stream("--- {a: 1}\r\n---\r\nb: 2\r\n");
+        doc.reemit_stream_document(0, map("a", "2"))
+            .expect("marker line");
+        assert_eq!(text(&doc), "---\r\na: '2'\r\n---\r\nb: 2\r\n");
     }
 
     #[test]

@@ -1513,6 +1513,22 @@ fix:
   jq: '{name: "filled"}'
 "#;
 
+/// The document a `fix.jq` rewrites in a CRLF stream keeps CRLF line
+/// ends, like every other document and like a textual edit.
+#[test]
+fn fix_jq_in_a_crlf_stream_keeps_crlf_line_ends() {
+    let scratch = Scratch::new();
+    scratch.write("jq.yml", JQ_NAME_RULE);
+    scratch.write("m.yaml", "x: 1\r\n---\r\nname: b # k\r\n");
+    scratch
+        .run(&["-i", "fix", "--rules", "jq.yml", "m.yaml"])
+        .expect("fix -i");
+    assert_eq!(
+        scratch.read("m.yaml"),
+        "x: 1\r\nname: fixed\r\n---\r\nname: b # k\r\n"
+    );
+}
+
 /// A `fix.jq` in one document rewrites only that document's body: the
 /// BOM, a `%YAML` directive, `---` lines and their comments, a `...` end
 /// and every other document keep their bytes. Content on the marker line
