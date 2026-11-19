@@ -729,3 +729,140 @@ fn xml_writes_a_scalar_text_and_refuses_a_container() {
         ],
     );
 }
+
+/// A tree that did not come from XML may hold any scalar in `#comments`,
+/// `#pi` and `#cdata`, or a lone scalar instead of the list: each is written
+/// as its text, a null item skipped. A container there is refused, never
+/// dropped.
+#[test]
+fn xml_writes_scalar_comments_pis_and_cdata_and_refuses_containers() {
+    let dir = dir_with(&[
+        (
+            "items.yaml",
+            "r:\n- \"#comments\": [42, c]\n  \"#pi\": [true]\n  \"#cdata\": [1.5e20, null]\n",
+        ),
+        ("lone.yaml", "r:\n- \"#comments\": only\n  \"#cdata\": 7\n"),
+        ("nulls.yaml", "r:\n- \"#cdata\": [null]\n  \"#pi\": null\n"),
+        ("item.yaml", "r:\n- \"#cdata\": [{a: 1}]\n"),
+        ("entry.yaml", "r:\n- \"#pi\": {a: 1}\n"),
+        ("top.yaml", "\"#comments\": [[1]]\nr:\n- {}\n"),
+    ]);
+    assert_cases(
+        &dir,
+        &[
+            (
+                vec!["-q", "convert", "items.yaml", "-F", "xml"],
+                ok("<r><!--42--><!--c--><?true?><![CDATA[1.5e20]]></r>"),
+            ),
+            (
+                vec!["-q", "convert", "lone.yaml", "-F", "xml"],
+                ok("<r><!--only--><![CDATA[7]]></r>"),
+            ),
+            (vec!["-q", "convert", "nulls.yaml", "-F", "xml"], ok("<r/>")),
+            (
+                vec!["-q", "convert", "item.yaml", "-F", "xml"],
+                (
+                    1,
+                    "",
+                    "xml format error: XML write: '#cdata' of <r> must hold scalars (got object)\n",
+                ),
+            ),
+            (
+                vec!["-q", "convert", "entry.yaml", "-F", "xml"],
+                (
+                    1,
+                    "",
+                    "xml format error: XML write: '#pi' of <r> must hold scalars (got object)\n",
+                ),
+            ),
+            (
+                vec!["-q", "convert", "top.yaml", "-F", "xml"],
+                (
+                    1,
+                    "",
+                    "xml format error: XML write: '#comments' at the top level must hold scalars \
+                     (got array)\n",
+                ),
+            ),
+        ],
+    );
+}
+
+/// The document level: `#xml` fields are written as their scalar text (a
+/// YAML `version: 1.1` is a float), top-level PIs and comments as in an
+/// element. What the document cannot hold — an `#xml` that is not a map or
+/// has a foreign field, a second root, text outside the root — is refused.
+#[test]
+fn xml_writes_the_declaration_fields_and_refuses_what_a_document_cannot_hold() {
+    let dir = dir_with(&[
+        (
+            "decl.yaml",
+            "\"#xml\": {version: 1.1, encoding: UTF-8, standalone: null}\n\
+             \"#pi\": [x]\n\"#comments\": [1]\nr:\n- {}\n",
+        ),
+        ("decl_str.yaml", "\"#xml\": \"1.0\"\nr:\n- {}\n"),
+        (
+            "decl_key.yaml",
+            "\"#xml\": {version: \"1.0\", foo: bar}\nr:\n- {}\n",
+        ),
+        ("decl_list.yaml", "\"#xml\": {version: [1]}\nr:\n- {}\n"),
+        ("two.yaml", "a:\n- {}\nb:\n- {}\n"),
+        ("text.yaml", "\"#text\": hi\nr:\n- {}\n"),
+        ("empty.yaml", "\"@attrs\": {}\n\"#cdata\": []\nr:\n- {}\n"),
+    ]);
+    assert_cases(
+        &dir,
+        &[
+            (
+                vec!["-q", "convert", "decl.yaml", "-F", "xml"],
+                ok("<?xml version=\"1.1\" encoding=\"UTF-8\"?><?x?><!--1--><r/>"),
+            ),
+            (
+                vec!["-q", "convert", "decl_str.yaml", "-F", "xml"],
+                (
+                    1,
+                    "",
+                    "xml format error: XML write: '#xml' must be a map of declaration fields \
+                     (got string)\n",
+                ),
+            ),
+            (
+                vec!["-q", "convert", "decl_key.yaml", "-F", "xml"],
+                (
+                    1,
+                    "",
+                    "xml format error: XML write: '#xml' has no field 'foo' \
+                     (only version, encoding, standalone)\n",
+                ),
+            ),
+            (
+                vec!["-q", "convert", "decl_list.yaml", "-F", "xml"],
+                (
+                    1,
+                    "",
+                    "xml format error: XML write: '#xml' field 'version' must be a scalar \
+                     (got array)\n",
+                ),
+            ),
+            (
+                vec!["-q", "convert", "two.yaml", "-F", "xml"],
+                (
+                    1,
+                    "",
+                    "xml format error: XML write: a document has one root element; \
+                     the top-level map holds 'a' and 'b'\n",
+                ),
+            ),
+            (
+                vec!["-q", "convert", "text.yaml", "-F", "xml"],
+                (
+                    1,
+                    "",
+                    "xml format error: XML write: '#text' cannot stand at the top level, \
+                     outside the root element (got string)\n",
+                ),
+            ),
+            (vec!["-q", "convert", "empty.yaml", "-F", "xml"], ok("<r/>")),
+        ],
+    );
+}

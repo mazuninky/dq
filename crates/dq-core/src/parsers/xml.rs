@@ -33,6 +33,19 @@
 //! - Mixed-content detection emits a `tracing::warn!` so users know their
 //!   file is partially round-trippable.
 //!
+//! ## Writing a tree that did not come from XML
+//!
+//! The writer takes any scalar where the reader produces a string: an
+//! attribute value, `#text`, the `#xml` fields, and the items of `#comments`
+//! / `#pi` / `#cdata` (a lone scalar there counts as a one-item list) are
+//! written as the scalar's text — a float in its shortest round-trip
+//! spelling. A null is no content: no text, an empty attribute value, an
+//! item skipped, no declaration. Anything the writer could not put into the
+//! XML is refused with `Error::Format` instead of dropped: a container where
+//! a scalar belongs, an `#xml` key other than `version` / `encoding` /
+//! `standalone`, a second root element, and `@attrs` / `#text` / `#cdata`
+//! with content at the top level, outside the root.
+//!
 //! ## Read-only edit operations
 //!
 //! `XmlFormat` does **not** register a textual-edit `ScalarRenderer` /
@@ -596,56 +609,61 @@ fn render_xml(top: &Value) -> Result<Vec<u8>> {
     };
     let mut writer = Writer::new(Cursor::new(Vec::<u8>::new()));
 
+    // Outside the root there is nowhere to put attributes, text or CDATA:
+    // refuse them rather than drop them. A null or an empty container
+    // carries nothing and passes.
+    for key in [KEY_ATTRS, KEY_TEXT, KEY_CDATA] {
+        if let Some(v) = top.get(key)
+            && !is_empty_content(v)
+        {
+            return Err(Error::Format {
+                format: "xml",
+                message: format!(
+                    "XML write: '{key}' cannot stand at the top level, outside the root element (got {})",
+                    v.type_name(),
+                ),
+            });
+        }
+    }
+
     // 1. XML declaration.
-    if let Some(Value::Map(decl)) = top.get(KEY_XML_DECL) {
-        let version = match decl.get("version") {
-            Some(Value::String(s)) => s.clone(),
-            _ => "1.0".to_owned(),
-        };
-        let encoding = match decl.get("encoding") {
-            Some(Value::String(s)) => Some(s.clone()),
-            _ => None,
-        };
-        let standalone = match decl.get("standalone") {
-            Some(Value::String(s)) => Some(s.clone()),
-            _ => None,
-        };
+    if let Some(decl) = declaration(top.get(KEY_XML_DECL))? {
         writer
             .write_event(Event::Decl(BytesDecl::new(
-                &version,
-                encoding.as_deref(),
-                standalone.as_deref(),
+                &decl.version,
+                decl.encoding.as_deref(),
+                decl.standalone.as_deref(),
             )))
             .map_err(map_write_err)?;
     }
 
     // 2. Top-level processing instructions and comments (kept above root).
-    if let Some(Value::Array(items)) = top.get(KEY_PI) {
-        for it in items {
-            if let Value::String(s) = it {
-                writer
-                    .write_event(Event::PI(BytesPI::new(s.as_str())))
-                    .map_err(map_write_err)?;
-            }
-        }
+    const TOP: &str = "at the top level";
+    for s in item_texts(KEY_PI, TOP, top.get(KEY_PI))? {
+        writer
+            .write_event(Event::PI(BytesPI::new(s.as_str())))
+            .map_err(map_write_err)?;
     }
-    if let Some(Value::Array(items)) = top.get(KEY_COMMENTS) {
-        for it in items {
-            if let Value::String(s) = it {
-                writer
-                    .write_event(Event::Comment(text_event(s)))
-                    .map_err(map_write_err)?;
-            }
-        }
+    for s in item_texts(KEY_COMMENTS, TOP, top.get(KEY_COMMENTS))? {
+        writer
+            .write_event(Event::Comment(text_event(&s)))
+            .map_err(map_write_err)?;
     }
 
-    // 3. Root element. Pick the first non-conventional key as the root tag.
-    let mut root_tag: Option<&str> = None;
-    for (k, _) in top {
-        if !is_conventional(k) {
-            root_tag = Some(k.as_str());
-            break;
-        }
+    // 3. Root element: the one non-conventional key. An XML document has
+    // exactly one root, so a second element-shaped key is refused rather
+    // than dropped.
+    let mut element_keys = top.keys().filter(|k| !is_conventional(k));
+    let root_tag = element_keys.next().map(String::as_str);
+    if let Some(second) = element_keys.next()
+        && let Some(first) = root_tag
+    {
+        return Err(Error::Format {
+            format: "xml",
+            message: format!(
+                "XML write: a document has one root element; the top-level map holds '{first}' and '{second}'",
+            ),
+        });
     }
     let Some(root_tag) = root_tag else {
         return Err(Error::Format {
@@ -762,10 +780,14 @@ fn write_element(
 
     // Determine if the element has any body content. If not, emit as
     // self-closing `<tag/>`.
+    let owner = format!("of <{tag}>");
+    let comments = item_texts(KEY_COMMENTS, &owner, body.get(KEY_COMMENTS))?;
+    let pis = item_texts(KEY_PI, &owner, body.get(KEY_PI))?;
+    let cdata = item_texts(KEY_CDATA, &owner, body.get(KEY_CDATA))?;
     let has_text = text.is_some();
-    let has_cdata = body.get(KEY_CDATA).is_some_and(non_empty_array);
-    let has_pi = body.get(KEY_PI).is_some_and(non_empty_array);
-    let has_comments = body.get(KEY_COMMENTS).is_some_and(non_empty_array);
+    let has_cdata = !cdata.is_empty();
+    let has_pi = !pis.is_empty();
+    let has_comments = !comments.is_empty();
     let has_children = body
         .iter()
         .any(|(k, v)| !is_conventional(k) && non_empty_array(v));
@@ -798,43 +820,31 @@ fn write_element(
     // Comments first, then PIs, then text, then CDATA, then children.
     // Inner ordering is best-effort only; mixed content is documented as
     // lossy on round-trip (per spec D5).
-    if let Some(Value::Array(items)) = body.get(KEY_COMMENTS) {
-        for it in items {
-            if let Value::String(s) = it {
-                if pretty {
-                    write_indent_break(writer, child_indent)?;
-                }
-                writer
-                    .write_event(Event::Comment(text_event(s)))
-                    .map_err(map_write_err)?;
-            }
+    for s in &comments {
+        if pretty {
+            write_indent_break(writer, child_indent)?;
         }
+        writer
+            .write_event(Event::Comment(text_event(s)))
+            .map_err(map_write_err)?;
     }
-    if let Some(Value::Array(items)) = body.get(KEY_PI) {
-        for it in items {
-            if let Value::String(s) = it {
-                if pretty {
-                    write_indent_break(writer, child_indent)?;
-                }
-                writer
-                    .write_event(Event::PI(BytesPI::new(s.as_str())))
-                    .map_err(map_write_err)?;
-            }
+    for s in &pis {
+        if pretty {
+            write_indent_break(writer, child_indent)?;
         }
+        writer
+            .write_event(Event::PI(BytesPI::new(s.as_str())))
+            .map_err(map_write_err)?;
     }
     if let Some(s) = &text {
         writer
             .write_event(Event::Text(text_event(s)))
             .map_err(map_write_err)?;
     }
-    if let Some(Value::Array(items)) = body.get(KEY_CDATA) {
-        for it in items {
-            if let Value::String(s) = it {
-                writer
-                    .write_event(Event::CData(BytesCData::new(s.as_str())))
-                    .map_err(map_write_err)?;
-            }
-        }
+    for s in &cdata {
+        writer
+            .write_event(Event::CData(BytesCData::new(s.as_str())))
+            .map_err(map_write_err)?;
     }
 
     for (k, v) in body {
@@ -915,6 +925,109 @@ fn scalar_text(v: &Value) -> Option<String> {
         Value::Int(i) => Some(i.to_string()),
         Value::Float(f) => Some(crate::document::shortest_float(*f)),
         Value::Null | Value::Array(_) | Value::Map(_) => None,
+    }
+}
+
+/// The texts of a `#comments` / `#pi` / `#cdata` entry, in order. The
+/// reader always produces a list of strings; a tree from elsewhere may hold
+/// any scalar there, written as its [`scalar_text`], and a lone scalar
+/// counts as a one-item list. A null — the entry or an item — is no content.
+/// A container, as the entry or as an item, is refused: it has no text.
+///
+/// `owner` completes the message: `of <tag>` or `at the top level`.
+fn item_texts(key: &str, owner: &str, entry: Option<&Value>) -> Result<Vec<String>> {
+    let items = match entry {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(items)) => items.as_slice(),
+        Some(lone) => std::slice::from_ref(lone),
+    };
+    let mut texts = Vec::with_capacity(items.len());
+    for item in items {
+        if matches!(item, Value::Null) {
+            continue;
+        }
+        let text = scalar_text(item).ok_or_else(|| Error::Format {
+            format: "xml",
+            message: format!(
+                "XML write: '{key}' {owner} must hold scalars (got {})",
+                item.type_name(),
+            ),
+        })?;
+        texts.push(text);
+    }
+    Ok(texts)
+}
+
+/// The fields of an `<?xml …?>` declaration.
+struct Declaration {
+    version: String,
+    encoding: Option<String>,
+    standalone: Option<String>,
+}
+
+/// The declaration a top-level `#xml` entry asks for: `None` without one
+/// (absent or null). Each field is written as its [`scalar_text`] — a YAML
+/// `version: 1.1` is a float and stays `1.1` — and a missing or null
+/// `version` is `1.0`. A non-map entry, a key other than `version` /
+/// `encoding` / `standalone`, and a container as a field are refused.
+fn declaration(entry: Option<&Value>) -> Result<Option<Declaration>> {
+    let decl = match entry {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Map(decl)) => decl,
+        Some(other) => {
+            return Err(Error::Format {
+                format: "xml",
+                message: format!(
+                    "XML write: '{KEY_XML_DECL}' must be a map of declaration fields (got {})",
+                    other.type_name(),
+                ),
+            });
+        }
+    };
+    let mut fields = Declaration {
+        version: "1.0".to_owned(),
+        encoding: None,
+        standalone: None,
+    };
+    for (k, v) in decl {
+        let slot = match k.as_str() {
+            "version" => None,
+            "encoding" => Some(&mut fields.encoding),
+            "standalone" => Some(&mut fields.standalone),
+            _ => {
+                return Err(Error::Format {
+                    format: "xml",
+                    message: format!(
+                        "XML write: '{KEY_XML_DECL}' has no field '{k}' (only version, encoding, standalone)",
+                    ),
+                });
+            }
+        };
+        if matches!(v, Value::Null) {
+            continue;
+        }
+        let text = scalar_text(v).ok_or_else(|| Error::Format {
+            format: "xml",
+            message: format!(
+                "XML write: '{KEY_XML_DECL}' field '{k}' must be a scalar (got {})",
+                v.type_name(),
+            ),
+        })?;
+        match slot {
+            Some(slot) => *slot = Some(text),
+            None => fields.version = text,
+        }
+    }
+    Ok(Some(fields))
+}
+
+/// A top-level value that carries nothing: a null or an empty container.
+fn is_empty_content(v: &Value) -> bool {
+    match v {
+        Value::Null => true,
+        Value::Array(items) => items.is_empty(),
+        Value::Map(map) => map.is_empty(),
+        _ => false,
     }
 }
 
@@ -1011,6 +1124,80 @@ mod tests {
         let err = render_xml(&element(Value::Array(vec![]))).expect_err("refused");
         assert!(
             err.to_string().contains("must be a scalar (got array)"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn scalar_items_are_written_and_a_container_item_refused() {
+        let element = |key: &str, entry: Value| {
+            let mut body = IndexMap::new();
+            body.insert(key.to_owned(), entry);
+            let mut top = IndexMap::new();
+            top.insert("x".to_owned(), Value::Array(vec![Value::Map(body)]));
+            Value::Map(top)
+        };
+        for (key, entry, xml) in [
+            (
+                KEY_CDATA,
+                Value::Array(vec![Value::Float(3.0), Value::Null, Value::Int(1)]),
+                "<x><![CDATA[3.0]]><![CDATA[1]]></x>",
+            ),
+            (KEY_COMMENTS, Value::Bool(true), "<x><!--true--></x>"),
+            (KEY_PI, Value::Array(vec![Value::Null]), "<x/>"),
+        ] {
+            assert_eq!(render(&element(key, entry)), xml);
+        }
+        let err = render_xml(&element(KEY_PI, Value::Array(vec![Value::Array(vec![])])))
+            .expect_err("refused");
+        assert!(
+            err.to_string()
+                .contains("'#pi' of <x> must hold scalars (got array)"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn declaration_fields_are_scalar_text_and_a_foreign_one_refused() {
+        let doc = |decl: Value| {
+            let mut top = IndexMap::new();
+            top.insert(KEY_XML_DECL.to_owned(), decl);
+            top.insert(
+                "r".to_owned(),
+                Value::Array(vec![Value::Map(IndexMap::new())]),
+            );
+            Value::Map(top)
+        };
+        let mut decl = IndexMap::new();
+        decl.insert("version".to_owned(), Value::Float(1.1));
+        assert_eq!(
+            render(&doc(Value::Map(decl.clone()))),
+            "<?xml version=\"1.1\"?><r/>"
+        );
+        assert_eq!(render(&doc(Value::Null)), "<r/>");
+        decl.insert("doctype".to_owned(), Value::String("html".to_owned()));
+        let err = render_xml(&doc(Value::Map(decl))).expect_err("refused");
+        assert!(err.to_string().contains("has no field 'doctype'"), "{err}");
+        let err = render_xml(&doc(Value::Int(1))).expect_err("refused");
+        assert!(err.to_string().contains("(got int)"), "{err}");
+    }
+
+    #[test]
+    fn a_second_root_and_top_level_text_are_refused() {
+        let empty = || Value::Array(vec![Value::Map(IndexMap::new())]);
+        let mut top = IndexMap::new();
+        top.insert("a".to_owned(), empty());
+        top.insert("b".to_owned(), empty());
+        let err = render_xml(&Value::Map(top)).expect_err("refused");
+        assert!(err.to_string().contains("holds 'a' and 'b'"), "{err}");
+
+        let mut top = IndexMap::new();
+        top.insert(KEY_CDATA.to_owned(), Value::Array(vec![Value::Int(1)]));
+        top.insert("r".to_owned(), empty());
+        let err = render_xml(&Value::Map(top)).expect_err("refused");
+        assert!(
+            err.to_string()
+                .contains("'#cdata' cannot stand at the top level"),
             "{err}"
         );
     }
