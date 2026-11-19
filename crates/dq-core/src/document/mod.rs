@@ -320,6 +320,12 @@ impl Value {
     /// equals no number. `false` when either is not a number.
     #[must_use]
     pub fn same_number(&self, other: &Self) -> bool {
+        if let (Self::Int(a), Self::Int(b)) = (self, other) {
+            return a == b;
+        }
+        if let (Some(a), Some(b)) = (self.exact_f64(), other.exact_f64()) {
+            return a == b;
+        }
         match (self.non_finite_float(), other.non_finite_float()) {
             (Some(a), Some(b)) => a == b,
             (Some(_), None) | (None, Some(_)) => false,
@@ -337,6 +343,12 @@ impl Value {
     /// comparison with one is false — or is not a number.
     #[must_use]
     pub fn compare_number(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        if let (Self::Int(a), Self::Int(b)) = (self, other) {
+            return Some(a.cmp(b));
+        }
+        if let (Some(a), Some(b)) = (self.exact_f64(), other.exact_f64()) {
+            return a.partial_cmp(&b);
+        }
         match (self.non_finite_float(), other.non_finite_float()) {
             (Some(a), _) if a.is_nan() => None,
             (_, Some(b)) if b.is_nan() => None,
@@ -357,7 +369,41 @@ impl Value {
     /// zero.
     #[must_use]
     pub fn is_multiple_of(&self, divisor: &Self) -> Option<bool> {
+        if let (Some(x), Some(d)) = (self.decimal_parts(), divisor.decimal_parts()) {
+            return Some(number::parts_are_multiple(x, d));
+        }
         number::decimal_is_multiple(&self.finite_literal()?, &divisor.finite_literal()?)
+    }
+
+    /// The `f64` that is this number's value exactly, for the fast paths
+    /// of the comparisons above: a [`Value::Float`], or a [`Value::Int`]
+    /// below 2^53 in magnitude. `None` for anything else.
+    ///
+    /// Comparing two such `f64`s is comparing the values the slow path
+    /// reads — an `Int`'s digits, a float's [`shortest_float`] literal —
+    /// because a float's shortest literal lies in the interval of reals
+    /// that round to it; those intervals do not overlap and order as their
+    /// floats do; and an `Int` below 2^53, an `f64` itself, is the shortest
+    /// literal of its own interval.
+    fn exact_f64(&self) -> Option<f64> {
+        const TWO_TO_53: u64 = 1 << 53;
+        match self {
+            Self::Float(f) => Some(*f),
+            Self::Int(i) if i.unsigned_abs() < TWO_TO_53 => Some(*i as f64),
+            _ => None,
+        }
+    }
+
+    /// This nonzero number as `m · 10^e`, `m` whole, for the fast path of
+    /// [`Value::is_multiple_of`]: an [`Value::Int`], or a [`Value::Float`]
+    /// by its [`shortest_float`] literal's digits
+    /// ([`number::float_decimal`]). `None` for zero and anything else.
+    fn decimal_parts(&self) -> Option<(u64, i32)> {
+        match self {
+            Self::Int(i) if *i != 0 => Some((i.unsigned_abs(), 0)),
+            Self::Float(f) => number::float_decimal(*f),
+            _ => None,
+        }
     }
 
     /// A finite number as a decimal literal of its exact value: an `f64`
@@ -6984,5 +7030,61 @@ mod tests {
         // every document and confusing the writer dispatch.
         let doc = Document::value_only(Value::Null, FormatTag::Yaml);
         assert!(doc.frontmatter_payload().is_none());
+    }
+}
+
+/// The fast paths of [`Value::compare_number`], [`Value::same_number`] and
+/// [`Value::is_multiple_of`] against the exact, literal-reading ones.
+#[cfg(test)]
+mod number_fast_path_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// A number the fast paths take: a float of any bit pattern, a short
+    /// decimal, or an integer — some at 2^53, where an `f64` stops holding
+    /// every integer.
+    fn fast_number() -> impl Strategy<Value = Value> {
+        const TWO_TO_53: i64 = 1 << 53;
+        prop_oneof![
+            any::<f64>().prop_map(Value::Float),
+            (-1_000_000_i64..1_000_000, 0_i32..4)
+                .prop_map(|(n, b)| Value::Float(n as f64 / 10_f64.powi(b))),
+            any::<i64>().prop_map(Value::Int),
+            (-3_i64..3).prop_map(|d| Value::Int(TWO_TO_53 + d)),
+            (-3_i64..3).prop_map(|d| Value::Float((TWO_TO_53 + d) as f64)),
+            (-3_i64..3).prop_map(Value::Int),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn fast_comparisons_agree_with_the_literals(a in fast_number(), b in fast_number()) {
+            if let (Some(x), Some(y)) = (a.finite_literal(), b.finite_literal()) {
+                prop_assert_eq!(a.compare_number(&b), number::compare_decimal(&x, &y));
+                prop_assert_eq!(a.same_number(&b), number::same_decimal(&x, &y));
+                prop_assert_eq!(a.is_multiple_of(&b), number::decimal_is_multiple(&x, &y));
+            }
+        }
+    }
+
+    #[test]
+    fn fast_comparisons_keep_the_edges() {
+        let two_to_53 = 1_i64 << 53;
+        // 2^53 + 1 is no `f64`: the nearest, 2^53, is below it.
+        assert_eq!(
+            Value::Int(two_to_53 + 1).compare_number(&Value::Float(2f64.powi(53))),
+            Some(std::cmp::Ordering::Greater)
+        );
+        assert!(Value::Float(-0.0).same_number(&Value::Int(0)));
+        assert_eq!(
+            Value::Float(f64::NAN).compare_number(&Value::Float(1.0)),
+            None
+        );
+        assert_eq!(
+            Value::Float(0.3).is_multiple_of(&Value::Float(0.1)),
+            Some(true)
+        );
+        assert_eq!(Value::Int(0).is_multiple_of(&Value::Float(0.1)), Some(true));
+        assert_eq!(Value::Int(3).is_multiple_of(&Value::Int(0)), None);
     }
 }

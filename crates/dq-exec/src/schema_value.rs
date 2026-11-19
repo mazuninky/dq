@@ -417,10 +417,12 @@ impl Bound {
             }
             _ => return None,
         };
+        if ordered.is_some_and(|ordering| self.admits(ordering)) {
+            return None;
+        }
         let instance = instance_json(instance);
         let limit = &self.limit;
         match ordered {
-            Some(ordering) if self.admits(ordering) => None,
             Some(_) => Some(match self.keyword {
                 "minimum" => format!("{instance} is less than the minimum of {limit}"),
                 "maximum" => format!("{instance} is greater than the maximum of {limit}"),

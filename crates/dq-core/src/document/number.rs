@@ -317,6 +317,61 @@ pub(crate) fn compare_decimal(a: &str, b: &str) -> Option<Ordering> {
     })
 }
 
+/// A nonzero finite `f` as `m · 10^e`, `m` whole with no trailing zero,
+/// by the digits of its [`shortest_float`] literal: `0.3` is `(3, -1)`,
+/// `1e300` is `(1, 300)`. Without the sign, which no multiple test needs.
+/// `None` for zero, NaN and the infinities.
+pub(crate) fn float_decimal(f: f64) -> Option<(u64, i32)> {
+    if f == 0.0 {
+        return None;
+    }
+    let text = serde_json::Number::from_f64(f.abs())?.to_string();
+    let (mantissa, exponent) = match text.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, exponent.parse::<i32>().ok()?),
+        None => (text.as_str(), 0),
+    };
+    let (mut whole, mut exponent) = (0_u64, exponent);
+    let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    for digit in int.bytes().chain(frac.bytes()) {
+        whole = whole
+            .checked_mul(10)?
+            .checked_add(u64::from(digit.checked_sub(b'0')?))?;
+    }
+    exponent = exponent.checked_sub(i32::try_from(frac.len()).ok()?)?;
+    while whole % 10 == 0 && whole != 0 {
+        whole /= 10;
+        exponent += 1;
+    }
+    (whole != 0).then_some((whole, exponent))
+}
+
+/// Whether `x = X · 10^ex` is a whole multiple of `d = D · 10^ed`, both
+/// nonzero with `X`, `D` whole: `x / d = X · 10^(ex - ed) / D` is whole.
+pub(crate) fn parts_are_multiple((x, ex): (u64, i32), (d, ed): (u64, i32)) -> bool {
+    let (x, d) = (u128::from(x), u128::from(d));
+    let k = i64::from(ex) - i64::from(ed);
+    if let Ok(steps) = u32::try_from(-k) {
+        // D · 10^steps must divide X; past `u128` it is past X too.
+        return 10_u128
+            .checked_pow(steps)
+            .and_then(|power| power.checked_mul(d))
+            .is_some_and(|divisor| x % divisor == 0);
+    }
+    // D divides X · 10^k: (X mod D) · (10^k mod D) ≡ 0 (mod D). Every
+    // product of two residues stays below D² < 2^128.
+    let mut power = 1 % d;
+    let mut base = 10 % d;
+    let mut k = k.unsigned_abs();
+    while k > 0 {
+        if k & 1 == 1 {
+            power = power * base % d;
+        }
+        base = base * base % d;
+        k >>= 1;
+    }
+    x % d * power % d == 0
+}
+
 /// Whether the decimal literal `x` is a whole multiple of the decimal
 /// literal `d`, by their exact values and at any size: `x / d` is an
 /// integer. `0.3` is a multiple of `0.1`, `18446744073709551616` of `2`,
@@ -704,6 +759,76 @@ impl fmt::Write for StackText {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    #[test]
+    fn float_decimal_reads_the_shortest_digits() {
+        for (f, parts) in [
+            (0.3, Some((3, -1))),
+            (-2.5, Some((25, -1))),
+            (1200.0, Some((12, 2))),
+            (1e300, Some((1, 300))),
+            (5e-324, Some((5, -324))),
+            (1_658_206_780_088_562.2, Some((16_582_067_800_885_622, -1))),
+            (0.0, None),
+            (f64::NAN, None),
+            (f64::INFINITY, None),
+        ] {
+            assert_eq!(float_decimal(f), parts, "{f:e}");
+        }
+    }
+
+    #[test]
+    fn parts_are_multiple_divides_exactly() {
+        let parts = |f: f64| float_decimal(f).expect("nonzero and finite");
+        for (x, d, multiple) in [
+            (0.3, 0.1, true),
+            (0.35, 0.1, false),
+            (662_936_471_232_937.2, 0.2, true),
+            (1e300, 2.0, true),
+            (1e300, 3.0, false),
+            (1e-300, 1e-301, true),
+            (2.0, 1e300, false),
+        ] {
+            assert_eq!(
+                parts_are_multiple(parts(x), parts(d)),
+                multiple,
+                "{x:e} / {d:e}"
+            );
+        }
+        // The largest `u64`, and a divisor whose `D · 10^steps` is past `u128`.
+        assert!(parts_are_multiple((u64::MAX, 0), (5, 0)));
+        assert!(!parts_are_multiple((7, 0), (7, 40)));
+    }
+
+    /// A finite `f64`: any bit pattern, or a short decimal `n / 10^b` —
+    /// where multiples are common.
+    fn finite_float() -> impl Strategy<Value = f64> {
+        prop_oneof![
+            any::<f64>().prop_filter("finite", |f| f.is_finite() && *f != 0.0),
+            (-1_000_000_000_i64..1_000_000_000, 0_i32..12)
+                .prop_filter("nonzero", |(n, _)| *n != 0)
+                .prop_map(|(n, b)| n as f64 / 10_f64.powi(b)),
+            prop::sample::select(vec![0.01, 0.1, 0.2, 0.25, 1e-11, 3.0, 7.0, 1e20]),
+        ]
+    }
+
+    proptest! {
+        /// The integer multiple test reads the same decimals the string
+        /// one does, and agrees with it.
+        #[test]
+        fn the_integer_multiple_test_agrees_with_the_decimal_one(
+            x in finite_float(),
+            d in finite_float(),
+        ) {
+            let (xp, dp) = (float_decimal(x).unwrap(), float_decimal(d).unwrap());
+            prop_assert_eq!(
+                Some(parts_are_multiple(xp, dp)),
+                decimal_is_multiple(&shortest_float(x), &shortest_float(d)),
+                "{:e} / {:e}", x, d
+            );
+        }
+    }
 
     #[test]
     fn plain_float_keeps_shortest_digits_without_an_exponent() {
