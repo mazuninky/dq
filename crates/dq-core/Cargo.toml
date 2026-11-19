@@ -63,8 +63,12 @@ comrak = { workspace = true }
 
 # M11 XML — `quick-xml` powers the read+write XmlFormat in `parsers/xml.rs`.
 # Event-based parser; `serialize` feature is enabled for `BytesDecl::new`
-# (used to re-emit the XML declaration on round-trip). License: MIT.
+# (used to re-emit the XML declaration on round-trip), `encoding` decodes
+# non-UTF-8 input. License: MIT.
 quick-xml = { workspace = true }
+# XML output in the encoding `#xml` declares. License: (Apache-2.0 OR MIT)
+# AND BSD-3-Clause.
+encoding_rs = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true, features = ["redactions"] }

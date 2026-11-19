@@ -124,8 +124,14 @@ comrak = { version = "1.0", default-features = false }
 # `dq-core/src/parsers/xml.rs`. The `serialize` feature is enabled so the
 # crate's `BytesDecl::new` constructor is available for re-emitting the
 # XML declaration on the write path; the parse path uses only the core
-# event-reader API. License: MIT.
-quick-xml = { version = "0.42", features = ["serialize"] }
+# event-reader API. The `encoding` feature (encoding_rs) decodes an XML file
+# in UTF-16 or a declared non-UTF-8 encoding before parsing. License: MIT.
+quick-xml = { version = "0.42", features = ["serialize", "encoding"] }
+# Encoding labels and the encoders behind XML output in a declared encoding
+# (`#xml` `encoding`); the same crate quick-xml's `encoding` feature pulls
+# in, already in the lock via ureq. License: (Apache-2.0 OR MIT) AND
+# BSD-3-Clause.
+encoding_rs = "0.8.44"
 
 # M11 Phase 3 — JSON Schema 2020-12 validator used by `dq-exec` for the
 # `Check::Schema` / `Check::SchemaFile` rule variants. `default-features =

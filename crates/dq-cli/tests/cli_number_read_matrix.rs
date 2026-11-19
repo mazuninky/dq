@@ -832,7 +832,7 @@ fn xml_writes_the_declaration_fields_and_refuses_what_a_document_cannot_hold() {
                     1,
                     "",
                     "xml format error: XML write: '#xml' has no field 'foo' \
-                     (only version, encoding, standalone)\n",
+                     (only version, encoding, standalone, bom)\n",
                 ),
             ),
             (
@@ -1063,14 +1063,14 @@ fn xml_refuses_content_xml_cannot_hold_and_round_trips_a_read_tree() {
     );
 }
 
-/// dq writes UTF-8, so `#xml` may declare UTF-8 in any spelling, or an
-/// ASCII-compatible encoding when the whole document is ASCII; any other
-/// declaration is refused, naming the first non-ASCII character and where it
-/// is. A CR in text and a tab / LF / CR in an attribute value are written as
-/// character references, so they read back unchanged — and a file holding
-/// those references writes back byte for byte.
+/// `#xml`'s `encoding` names the output encoding: UTF-8 in any spelling
+/// stays UTF-8; a label encoding_rs does not know, a character the encoding
+/// cannot hold (named with its place) and a `bom` that contradicts the
+/// label are refused. A CR in text and a tab / LF / CR in an attribute value
+/// are written as character references, so they read back unchanged — and a
+/// file holding those references writes back byte for byte.
 #[test]
-fn xml_declares_only_an_encoding_its_utf8_bytes_satisfy_and_keeps_whitespace() {
+fn xml_writes_the_declared_encoding_and_keeps_whitespace() {
     let refs = "<r a=\"x&#10;y&#9;z&#13;w\">p&#13;q\ns</r>";
     let latin = "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><r>cafe</r>";
     let dir = dir_with(&[
@@ -1083,18 +1083,18 @@ fn xml_declares_only_an_encoding_its_utf8_bytes_satisfy_and_keeps_whitespace() {
             "\"#xml\": {encoding: ISO-8859-1}\nr:\n- \"#text\": cafe\n",
         ),
         (
-            "latin.yaml",
-            "\"#xml\": {encoding: ISO-8859-1}\nr:\n- \"#text\": café\n",
-        ),
-        (
-            "windows.yaml",
-            "\"#xml\": {encoding: windows-1252}\n\"#comments\": [ü]\nr:\n- {}\n",
-        ),
-        (
             "ascii.yaml",
             "\"#xml\": {encoding: US-ASCII}\nr:\n- k: [{\"@attrs\": {a: π}}]\n",
         ),
-        ("utf16.yaml", "\"#xml\": {encoding: UTF-16}\nr:\n- {}\n"),
+        (
+            "windows.yaml",
+            "\"#xml\": {encoding: windows-1252}\n\"#comments\": [π]\nr:\n- {}\n",
+        ),
+        ("unknown.yaml", "\"#xml\": {encoding: no-such}\nr:\n- {}\n"),
+        (
+            "bom.yaml",
+            "\"#xml\": {encoding: ISO-8859-1, bom: UTF-16LE}\nr:\n- {}\n",
+        ),
         (
             "ws.yaml",
             "r:\n- \"@attrs\": {a: \"x\\ny\\tz\\rw\"}\n  \"#text\": \"p\\rq\\ns\"\n",
@@ -1112,29 +1112,23 @@ fn xml_declares_only_an_encoding_its_utf8_bytes_satisfy_and_keeps_whitespace() {
             ok("<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><r>cafe</r>"),
         ),
         (
-            "latin.yaml",
-            refused!(
-                "'#xml' declares encoding \"ISO-8859-1\" but dq writes UTF-8 and the document \
-                 holds U+00E9 in <r>"
-            ),
+            "ascii.yaml",
+            refused!("'#xml' declares encoding \"US-ASCII\", which cannot hold U+03C0 in <k>"),
         ),
         (
             "windows.yaml",
             refused!(
-                "'#xml' declares encoding \"windows-1252\" but dq writes UTF-8 and the document \
-                 holds U+00FC at the top level"
+                "'#xml' declares encoding \"windows-1252\", which cannot hold U+03C0 at the top \
+                 level"
             ),
         ),
         (
-            "ascii.yaml",
-            refused!(
-                "'#xml' declares encoding \"US-ASCII\" but dq writes UTF-8 and the document \
-                 holds U+03C0 in <k>"
-            ),
+            "unknown.yaml",
+            refused!("'#xml' declares encoding \"no-such\", which dq does not know"),
         ),
         (
-            "utf16.yaml",
-            refused!("'#xml' declares encoding \"UTF-16\" but dq writes UTF-8"),
+            "bom.yaml",
+            refused!("'#xml' field 'bom' is UTF-16LE but the declared encoding is \"ISO-8859-1\""),
         ),
         ("ws.yaml", ok(refs)),
         ("refs.xml", ok(refs)),
@@ -1143,6 +1137,115 @@ fn xml_declares_only_an_encoding_its_utf8_bytes_satisfy_and_keeps_whitespace() {
     assert_cases(
         &dir,
         &cases.map(|(file, outcome)| (vec!["-q", "convert", file, "-F", "xml"], outcome)),
+    );
+}
+
+/// The UTF-16 bytes of `text`, byte order mark first, big- or
+/// little-endian.
+fn utf16(text: &str, big_endian: bool) -> Vec<u8> {
+    std::iter::once(0xFEFF)
+        .chain(text.encode_utf16())
+        .flat_map(|unit| {
+            if big_endian {
+                unit.to_be_bytes()
+            } else {
+                unit.to_le_bytes()
+            }
+        })
+        .collect()
+}
+
+/// A file in ISO-8859-1, windows-1252, Shift_JIS or UTF-16 (either byte
+/// order, with or without a declaration) reads in its encoding and writes
+/// back byte for byte; a tree declaring such an encoding is written in it.
+/// Before, every one of these files was a parse error (exit 3).
+#[test]
+fn xml_reads_and_writes_files_in_their_declared_encoding() {
+    let latin =
+        b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><r a=\"\xe9\">caf\xe9</r>".to_vec();
+    let windows =
+        b"<?xml version=\"1.0\" encoding=\"windows-1252\"?><r>\x93q\x94 \x80</r>".to_vec();
+    // "日本" in Shift_JIS.
+    let sjis = b"<?xml version=\"1.0\" encoding=\"Shift_JIS\"?><r>\x93\xfa\x96\x7b</r>".to_vec();
+    let le = utf16(
+        "<?xml version=\"1.0\" encoding=\"UTF-16\"?><r>é ☃</r>",
+        false,
+    );
+    let be = utf16("<?xml version=\"1.0\" encoding=\"UTF-16\"?><r>é</r>", true);
+    let bare = utf16("<r>é</r>", false);
+    let dir = TempDir::new().expect("tempdir");
+    let files: [(&str, &[u8]); 8] = [
+        ("latin.xml", &latin),
+        ("windows.xml", &windows),
+        ("sjis.xml", &sjis),
+        ("le.xml", &le),
+        ("be.xml", &be),
+        ("bare.xml", &bare),
+        (
+            "latin.yaml",
+            "\"#xml\": {encoding: ISO-8859-1}\nr:\n- \"#text\": café\n".as_bytes(),
+        ),
+        (
+            "utf16.yaml",
+            "\"#xml\": {encoding: UTF-16}\nr:\n- \"#text\": é\n".as_bytes(),
+        ),
+    ];
+    for (name, bytes) in files {
+        std::fs::write(dir.path().join(name), bytes).expect("write fixture");
+    }
+    let cases: [(&str, &str, &[u8]); 9] = [
+        ("latin.xml", "xml", &latin),
+        ("windows.xml", "xml", &windows),
+        ("sjis.xml", "xml", &sjis),
+        ("le.xml", "xml", &le),
+        ("be.xml", "xml", &be),
+        ("bare.xml", "xml", &bare),
+        (
+            "le.xml",
+            "json",
+            "{\n  \"#xml\": {\n    \"version\": \"1.0\",\n    \"encoding\": \"UTF-16\",\n    \
+             \"bom\": \"UTF-16LE\"\n  },\n  \"r\": [\n    {\n      \"#text\": \"é ☃\"\n    }\n  \
+             ]\n}\n"
+                .as_bytes(),
+        ),
+        (
+            "latin.yaml",
+            "xml",
+            b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><r>caf\xe9</r>",
+        ),
+        (
+            "utf16.yaml",
+            "xml",
+            &utf16("<?xml version=\"1.0\" encoding=\"UTF-16\"?><r>é</r>", false),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (file, to, expected) in cases {
+        let out = dq()
+            .current_dir(dir.path())
+            .args(["--no-color", "-q", "convert", file, "-F", to])
+            .output()
+            .expect("dq runs");
+        let actual = (
+            out.status.code(),
+            out.stdout.as_slice(),
+            out.stderr.as_slice(),
+        );
+        if actual != (Some(0), expected, b"".as_slice()) {
+            wrong.push(format!(
+                "{file} -F {to}\n  expected {:?}\n  actual   {:?} {:?} {}",
+                String::from_utf8_lossy(expected),
+                actual.0,
+                String::from_utf8_lossy(actual.1),
+                String::from_utf8_lossy(actual.2),
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} case(s) differ:\n{}",
+        wrong.len(),
+        wrong.join("\n")
     );
 }
 
