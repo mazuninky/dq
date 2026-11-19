@@ -2201,8 +2201,10 @@ enum Spelled {
 /// character reference to one is not well-formed either. XML 1.1's `Char`
 /// takes every C0 control but NUL, and takes them and the C1 controls but
 /// NEL (its `RestrictedChar`, [`is_restricted_11`]) only as character
-/// references, which a comment, a PI or CDATA cannot hold. `what` names the
-/// place (`'#text' of <r>`).
+/// references, which a comment, a PI or CDATA cannot hold. Nor can they
+/// hold a line end other than LF — a CR, and in 1.1 NEL and LS — which
+/// end-of-line handling reads back as LF. `what` names the place
+/// (`'#text' of <r>`).
 fn check_chars(what: &str, text: &str, xml11: bool, spelled: Spelled) -> Result<()> {
     let char_10 = |c: char| {
         matches!(c,
@@ -2216,21 +2218,30 @@ fn check_chars(what: &str, text: &str, xml11: bool, spelled: Spelled) -> Result<
             message: format!("XML write: {what} holds U+{:04X}, {why}", u32::from(c)),
         })
     };
-    if !xml11 {
-        return match text.chars().find(|&c| !char_10(c)) {
-            None => Ok(()),
-            Some(c) => refuse(c, "a character XML 1.0 does not allow"),
-        };
-    }
+    let version = if xml11 { "1.1" } else { "1.0" };
+    // What end-of-line handling reads as a line feed.
+    let line_end = |c: char| c == '\r' || (xml11 && matches!(c, '\u{85}' | '\u{2028}'));
     for c in text.chars() {
-        if !char_11(c) {
-            return refuse(c, "a character XML 1.1 does not allow");
+        if !(if xml11 { char_11(c) } else { char_10(c) }) {
+            return refuse(c, &format!("a character XML {version} does not allow"));
         }
-        if spelled == Spelled::Raw && is_restricted_11(c) {
+        if spelled == Spelled::Escaped {
+            continue;
+        }
+        if xml11 && is_restricted_11(c) {
             return refuse(
                 c,
                 "which XML 1.1 allows only as a character reference, and a comment, a \
                  processing instruction or CDATA holds none",
+            );
+        }
+        if line_end(c) {
+            return refuse(
+                c,
+                &format!(
+                    "which XML {version} reads back as a line feed, and a comment, a \
+                     processing instruction or CDATA holds no character reference"
+                ),
             );
         }
     }
@@ -3054,6 +3065,10 @@ mod tests {
         assert_eq!(escape_text("\u{7F}\u{9F}", false), "\u{7F}\u{9F}");
         assert!(check_item(KEY_CDATA, "of <r>", "\u{7F}", true).is_err());
         assert!(check_item(KEY_CDATA, "of <r>", "\u{7F}", false).is_ok());
+        assert!(check_item(KEY_CDATA, "of <r>", "a\r\nb", false).is_err());
+        assert!(check_item(KEY_COMMENTS, "of <r>", "\u{85}\u{2028}", false).is_ok());
+        assert!(check_item(KEY_COMMENTS, "of <r>", "\u{2028}", true).is_err());
+        assert!(check_chars("'#text' of <r>", "\r\u{85}", true, Spelled::Escaped).is_ok());
         assert!(matches!(escape_attr("plain", false), Cow::Borrowed(_)));
     }
 

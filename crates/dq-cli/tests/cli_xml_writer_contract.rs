@@ -1789,3 +1789,96 @@ fn a_line_end_reads_as_a_line_feed_wherever_it_stands() {
         ],
     );
 }
+
+/// The writer refuses a line end that end-of-line handling would read back
+/// as a line feed where no character reference can stand for it — a
+/// comment, a PI, CDATA, the top level's included: a CR in either version,
+/// and NEL and LS in XML 1.1. In XML 1.0 NEL and LS are characters, and
+/// written raw there; text and attribute values write each line end as a
+/// reference. Before, all of them were written raw, and read back as LF.
+#[test]
+fn the_writer_refuses_a_line_end_markup_would_read_back_as_a_line_feed() {
+    let v10 = "{\"r\": [";
+    let v11 = "{\"#xml\": {\"version\": \"1.1\"}, \"r\": [";
+    let files: Vec<(&str, String)> = vec![
+        (
+            "comment.json",
+            format!("{v10}{{\"#comments\": [\"a\\r\\nb\"]}}]}}"),
+        ),
+        ("pi.json", format!("{v10}{{\"#pi\": [\"t a\\rb\"]}}]}}")),
+        ("cdata.json", format!("{v10}{{\"#cdata\": [\"a\\rb\"]}}]}}")),
+        ("top.json", "{\"#pi\": [\"t \\r\"], \"r\": [{}]}".into()),
+        ("cr_11.json", format!("{v11}{{\"#cdata\": [\"\\r\"]}}]}}")),
+        (
+            "nel_11.json",
+            format!("{v11}{{\"#comments\": [\"a\\u0085b\"]}}]}}"),
+        ),
+        (
+            "ls_11_top.json",
+            "{\"#xml\": {\"version\": \"1.1\"}, \"#pi\": [\"t \\u2028\"], \"r\": [{}]}".into(),
+        ),
+        (
+            "nel_ls_10.json",
+            format!(
+                "{v10}{{\"#comments\": [\"\\u0085\"], \"#pi\": [\"t \\u2028\"], \
+                 \"#cdata\": [\"\\u0085\\u2028\"]}}]}}"
+            ),
+        ),
+        (
+            "text.json",
+            format!("{v11}{{\"@attrs\": {{\"a\": \"\\r\\u0085\"}}, \"#text\": \"\\r\\u2028\"}}]}}"),
+        ),
+    ];
+    let borrowed: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(name, body)| (*name, body.as_bytes()))
+        .collect();
+    let dir = dir_with(&borrowed);
+    let line_end = |what: &str, c: &str, version: &str| {
+        refused(&format!(
+            "{what} holds {c}, which XML {version} reads back as a line feed, and a comment, \
+             a processing instruction or CDATA holds no character reference"
+        ))
+    };
+    assert_cases(
+        &dir,
+        &[
+            (
+                convert("comment.json", "xml"),
+                line_end("'#comments' of <r>", "U+000D", "1.0"),
+            ),
+            (
+                convert("pi.json", "xml"),
+                line_end("'#pi' of <r>", "U+000D", "1.0"),
+            ),
+            (
+                convert("cdata.json", "xml"),
+                line_end("'#cdata' of <r>", "U+000D", "1.0"),
+            ),
+            (
+                convert("top.json", "xml"),
+                line_end("'#pi' at the top level", "U+000D", "1.0"),
+            ),
+            (
+                convert("cr_11.json", "xml"),
+                line_end("'#cdata' of <r>", "U+000D", "1.1"),
+            ),
+            (
+                convert("nel_11.json", "xml"),
+                line_end("'#comments' of <r>", "U+0085", "1.1"),
+            ),
+            (
+                convert("ls_11_top.json", "xml"),
+                line_end("'#pi' at the top level", "U+2028", "1.1"),
+            ),
+            (
+                convert("nel_ls_10.json", "xml"),
+                ok("<r><!--\u{85}--><?t \u{2028}?><![CDATA[\u{85}\u{2028}]]></r>"),
+            ),
+            (
+                convert("text.json", "xml"),
+                ok("<?xml version=\"1.1\"?><r a=\"&#13;&#x85;\">&#13;&#x2028;</r>"),
+            ),
+        ],
+    );
+}
