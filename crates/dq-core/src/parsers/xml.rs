@@ -416,7 +416,7 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
             Ok(Event::Text(t)) => {
                 let s = decode_text(&t);
                 if let Some(frame) = stack.last_mut() {
-                    if !s.trim().is_empty() {
+                    if !is_xml_whitespace(&s) {
                         if frame.saw_element {
                             frame.saw_mixed = true;
                         }
@@ -2107,33 +2107,49 @@ fn non_empty_array(v: &Value) -> bool {
     matches!(v, Value::Array(items) if !items.is_empty())
 }
 
+/// Whether `s` is all XML whitespace — space, tab, CR and LF, the `S` of
+/// XML 1.0 §2.3 — and so indentation the reader drops when it stands
+/// alone. Unicode's other spaces (U+3000, U+2028, U+0085, which
+/// [`str::trim`] would strip) are text.
+fn is_xml_whitespace(s: &str) -> bool {
+    s.bytes().all(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+}
+
 /// Escape `raw` for a text body: `<`, `>`, `&`, `'` and `"` — the set
 /// quick-xml's `escape` used up to 0.40, kept so output stays byte-stable —
-/// and CR as `&#13;`. A raw CR in text reads back as LF (XML end-of-line
-/// handling); the reference reads back as CR.
+/// CR as `&#13;`, and NEL and LS as `&#x85;` / `&#x2028;`. A raw CR in text
+/// reads back as LF (XML end-of-line handling); the reference reads back as
+/// CR. XML 1.1 reads a raw NEL or LS back as LF too, so they are written as
+/// references whatever the version; XML 1.0 reads the references the same.
 ///
-/// Text that is all whitespace by [`str::trim`] (`"\t"`, `"\n"`,
-/// `"\u{85}"`) is written as character references, every character of
-/// it: the reader drops whitespace-only text written as it is — it is
-/// indentation — but keeps what references spell.
+/// Text that is all XML whitespace ([`is_xml_whitespace`]: `"\t"`,
+/// `"\n "`) is written as character references, every character of it:
+/// the reader drops whitespace-only text written as it is — it is
+/// indentation — but keeps what references spell. Other Unicode spaces
+/// (U+3000) are text to XML and are written as they are.
 fn escape_text(raw: &str) -> Cow<'_, str> {
-    if !raw.is_empty() && raw.trim().is_empty() {
+    if !raw.is_empty() && is_xml_whitespace(raw) {
         return Cow::Owned(raw.chars().map(char_reference).collect());
     }
     escape_with(raw, |c| match c {
         '\r' => Some("&#13;"),
+        '\u{85}' => Some("&#x85;"),
+        '\u{2028}' => Some("&#x2028;"),
         _ => None,
     })
 }
 
 /// Escape `raw` for an attribute value: [`escape_text`]'s set plus LF and
 /// tab as `&#10;` / `&#9;`. Attribute-value normalization reads a raw tab,
-/// LF or CR back as a space; the references read back as themselves.
+/// LF or CR back as a space — and in XML 1.1 a raw NEL or LS — the
+/// references read back as themselves.
 fn escape_attr(raw: &str) -> Cow<'_, str> {
     escape_with(raw, |c| match c {
         '\r' => Some("&#13;"),
         '\n' => Some("&#10;"),
         '\t' => Some("&#9;"),
+        '\u{85}' => Some("&#x85;"),
+        '\u{2028}' => Some("&#x2028;"),
         _ => None,
     })
 }
@@ -2598,6 +2614,11 @@ mod tests {
         // All whitespace: every character a reference.
         assert_eq!(escape_text("\t \n\r"), "&#9;&#32;&#10;&#13;");
         assert_eq!(escape_text("\u{85}\u{2028}"), "&#x85;&#x2028;");
+        // Line ends in XML 1.1, wherever they stand; U+3000 is text.
+        assert_eq!(escape_text("a\u{85}b\u{2028} "), "a&#x85;b&#x2028; ");
+        assert!(matches!(escape_text("\u{3000}"), Cow::Borrowed("\u{3000}")));
+        assert!(is_xml_whitespace(" \t\r\n") && !is_xml_whitespace("\u{3000}"));
+        assert_eq!(escape_attr("a\u{85}b\u{2028}"), "a&#x85;b&#x2028;");
         assert_eq!(escape_text(""), "");
         assert_eq!(escape_attr("a\tb\nc\rd\""), "a&#9;b&#10;c&#13;d&quot;");
         assert!(matches!(escape_attr("plain"), Cow::Borrowed(_)));

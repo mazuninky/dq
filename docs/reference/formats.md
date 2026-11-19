@@ -259,9 +259,11 @@ So `<project><version>1</version></project>` is read as
 `/project/0/version/0/#text`. Round trip is partial: structure, attributes,
 comments, CDATA, PIs, prefixes and the declaration survive; whitespace
 between elements is normalised; mixed content (`<p>Hello <b>w</b>!</p>`) is
-folded into `#text` with a warning. Text that is only whitespace is
-written as character references (`&#32;`), so it reads back as text, not
-as indentation.
+folded into `#text` with a warning. Whitespace is XML's: space, tab, CR
+and LF. Text of nothing else is indentation on read, and is written as
+character references (`&#32;`) so it reads back as text; U+3000 and other
+Unicode spaces are text. NEL and LS (U+0085, U+2028) are always written as
+references, as XML 1.1 reads them raw as line ends.
 
 Encodings. A file is decoded per its byte order mark, else per the
 declaration's `encoding`, else as UTF-8. Labels are the WHATWG Encoding

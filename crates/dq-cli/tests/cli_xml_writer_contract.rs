@@ -685,7 +685,9 @@ fn whitespace_only_text_is_written_as_character_references() {
         ("lf.xml", "<d>&#10;</d>"),
         ("nel.xml", "<d>&#x85;</d>"),
         ("cdata.xml", "<a>&#10;<![CDATA[]]><![CDATA[x]]></a>"),
-        ("mixed.xml", "<d>&#x2028;&#32;&#13;</d>"),
+        // Not all XML whitespace: the space stays raw, the LS and the CR
+        // are references wherever they stand.
+        ("mixed.xml", "<d>&#x2028; &#13;</d>"),
     ];
     assert_cases(
         &dir,
@@ -1421,5 +1423,32 @@ fn whitespace_only_text_survives_set_and_in_place() {
     assert_eq!(
         run(&dir, &convert("sep.xml", "json")),
         ok("{\n  \"d\": [\n    {\n      \"#text\": \"\u{2028}\"\n    }\n  ]\n}\n")
+    );
+}
+
+/// XML whitespace is space, tab, CR and LF (XML 1.0 §2.3 `S`); U+3000,
+/// U+2028 and U+0085 written raw are text, not indentation, and read as
+/// `#text`. Only `S` between elements is dropped.
+#[test]
+fn text_of_unicode_spaces_that_are_no_xml_whitespace_is_kept() {
+    let dir = dir_with(&[
+        ("ideographic.xml", "<d>\u{3000}</d>".as_bytes()),
+        ("separator.xml", "<d>\u{2028}</d>".as_bytes()),
+        ("nel.xml", "<d>\u{85}</d>".as_bytes()),
+        ("indent.xml", b"<d>\n  \t</d>"),
+    ]);
+    let text =
+        |c: char| format!("{{\n  \"d\": [\n    {{\n      \"#text\": \"{c}\"\n    }}\n  ]\n}}\n");
+    assert_cases(
+        &dir,
+        &[
+            (convert("ideographic.xml", "json"), ok(text('\u{3000}'))),
+            (convert("separator.xml", "json"), ok(text('\u{2028}'))),
+            (convert("nel.xml", "json"), ok(text('\u{85}'))),
+            (
+                convert("indent.xml", "json"),
+                ok("{\n  \"d\": [\n    {}\n  ]\n}\n"),
+            ),
+        ],
     );
 }
