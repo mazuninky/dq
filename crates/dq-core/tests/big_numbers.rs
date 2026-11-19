@@ -51,8 +51,40 @@ fn a_float_no_f64_rounds_to_keeps_its_exact_value() {
         ("1.8e308", big("1.8e308")),
         ("0.10000000000000004", big("0.10000000000000004")),
         ("0.100000000000000000001", big("0.100000000000000000001")),
+        // 18 digits are a literal even where the `f64` printed at 18
+        // digits spells it (0.1 is 1.00000000000000006e-1).
+        ("0.100000000000000006", big("0.100000000000000006")),
         ("1e-400", big("1e-400")),
         ("-1E+400", big("-1E+400")),
+    ] {
+        for got in read_a(literal) {
+            assert_eq!(got, want, "{literal}");
+        }
+    }
+}
+
+/// serde_norway reads an integer up to `u128` itself and rounds a longer
+/// one, or one under `!!float`, to an `f64`; the reader keeps those exact.
+#[test]
+fn an_integer_past_u128_or_under_a_float_tag_keeps_its_exact_value() {
+    for (literal, want) in [
+        // 39 digits, the largest `u128` and one past it.
+        (
+            "340282366920938463463374607431768211455",
+            Value::BigInt("340282366920938463463374607431768211455".into()),
+        ),
+        (
+            "999999999999999999999999999999999999999",
+            Value::BigInt("999999999999999999999999999999999999999".into()),
+        ),
+        // 20 digits under `!!float`: past what an `f64` holds (the writers
+        // add the `.0`).
+        ("!!float 18446744073709551617", big("18446744073709551617")),
+        // 16 digits an `f64` holds, under the same tag.
+        (
+            "!!float 1234567890123456",
+            Value::Float(1_234_567_890_123_456.0),
+        ),
     ] {
         for got in read_a(literal) {
             assert_eq!(got, want, "{literal}");

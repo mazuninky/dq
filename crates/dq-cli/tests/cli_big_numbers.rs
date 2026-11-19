@@ -675,3 +675,429 @@ fn pyyaml_reads_the_yaml_writers_big_numbers_with_their_types() {
         "{yaml}"
     );
 }
+
+// ---- colliding keys ---------------------------------------------------
+
+/// Mapping keys that become the same dq key: each case is a parse error
+/// (exit 3) in serde_norway's duplicate-entry words, naming the first key
+/// and pointing at the repeated one, through `get` (the plain reader) and
+/// through `set` / `del` (the span-aware reader of textual edits). None
+/// overwrites the other.
+#[test]
+fn keys_that_become_the_same_dq_key_fail_at_the_repeated_key() {
+    let cases: &[(&str, &str)] = &[
+        // A number and its quoted text, either order.
+        (
+            "1: a\n\"1\": b\n",
+            "duplicate entry with key 1 at line 2 column 1",
+        ),
+        (
+            "\"1\": a\n1: b\n",
+            "duplicate entry with key \"1\" at line 2 column 1",
+        ),
+        (
+            "true: a\n\"true\": b\n",
+            "duplicate entry with key `true` at line 2 column 1",
+        ),
+        (
+            "~: a\n\"\": b\n",
+            "duplicate entry with null key at line 2 column 1",
+        ),
+        (
+            "18446744073709551616: a\n\"18446744073709551616\": b\n",
+            "duplicate entry with key 18446744073709551616 at line 2 column 1",
+        ),
+        (
+            "\"18446744073709551616\": a\n18446744073709551616: b\n",
+            "duplicate entry with key \"18446744073709551616\" at line 2 column 1",
+        ),
+        (
+            "0.1000000000000000000000000001: a\n\"0.1000000000000000000000000001\": b\n",
+            "duplicate entry with key 0.1000000000000000000000000001 at line 2 column 1",
+        ),
+        // `f64` keys repeat by value, as serde_norway decides it.
+        (
+            "-0.0: a\n0.0: b\n",
+            "duplicate entry with key -0.0 at line 2 column 1",
+        ),
+        (
+            "0.1: a\n0.10: b\n",
+            "duplicate entry with key 0.1 at line 2 column 1",
+        ),
+        // Flow maps, nested paths, a later document of a stream.
+        (
+            "{1: a, \"1\": b}\n",
+            "duplicate entry with key 1 at line 1 column 8",
+        ),
+        (
+            "x:\n- 1: a\n  \"1\": b\n",
+            "x[0]: duplicate entry with key 1 at line 3 column 3",
+        ),
+        (
+            "x: [{1: a, \"1\": b}]\n",
+            "x[0]: duplicate entry with key 1 at line 1 column 12",
+        ),
+        (
+            "x:\n  y:\n    true: a\n    \"true\": b\n",
+            "x.y: duplicate entry with key `true` at line 4 column 5",
+        ),
+        (
+            "x:\n  - {1e400: a, \"1e400\": b}\n",
+            "x[0]: duplicate entry with key 1e400 at line 2 column 16",
+        ),
+        (
+            "---\na: 1\n---\n1: a\n\"1\": b\n",
+            "duplicate entry with key 1 at line 5 column 1",
+        ),
+    ];
+    for (src, message) in cases {
+        let dir = dir_with(&[("k.yaml", src)]);
+        let want = format!("parse error in k.yaml: {message}\n");
+        for args in [
+            &["get", "k.yaml", "/x"][..],
+            &["set", "k.yaml", "/zz", "1"],
+            &["set", "-i", "k.yaml", "/zz", "1"],
+            &["del", "-i", "k.yaml", "/x"],
+        ] {
+            let (code, stdout, stderr) = failure_of(&dir, args);
+            assert_eq!(code, Some(3), "{src:?} {args:?}");
+            assert_eq!(stdout, "", "{src:?} {args:?}");
+            assert_eq!(stderr, want, "{src:?} {args:?}");
+        }
+        assert_eq!(read(&dir, "k.yaml"), *src, "file untouched");
+    }
+}
+
+/// Keys whose dq text differs are two keys, also where the two literals
+/// spell numbers close to each other.
+#[test]
+fn big_number_keys_with_different_text_are_two_keys() {
+    let dir = dir_with(&[
+        (
+            "long.yaml",
+            "0.1000000000000000000000000001: a\n0.1000000000000000000000000002: b\n",
+        ),
+        ("near.yaml", "0.10000000000000000000001: a\n0.1: b\n"),
+        ("int.yaml", "1: a\n1.0: b\n"),
+    ]);
+    for (file, want) in [
+        (
+            "long.yaml",
+            "{\n  \"0.1000000000000000000000000001\": \"a\",\n  \"0.1000000000000000000000000002\": \"b\"\n}\n",
+        ),
+        (
+            "near.yaml",
+            "{\n  \"0.10000000000000000000001\": \"a\",\n  \"0.1\": \"b\"\n}\n",
+        ),
+        ("int.yaml", "{\n  \"1\": \"a\",\n  \"1.0\": \"b\"\n}\n"),
+    ] {
+        assert_eq!(
+            stdout_of(&dir, &["-q", "-F", "json", "convert", file]),
+            want,
+            "{file}"
+        );
+        // The span-aware reader agrees.
+        assert_eq!(
+            stdout_of(&dir, &["set", file, "/zz", "1"]),
+            format!("{}zz: 1\n", read(&dir, file)),
+            "{file}"
+        );
+    }
+}
+
+#[test]
+fn hcl_object_keys_a_and_quoted_a_are_a_parse_error() {
+    let dir = dir_with(&[
+        ("a.hcl", "x = { a = 1, \"a\" = 2 }\n"),
+        ("b.hcl", "x = { \"a\" = 1, a = 2 }\n"),
+        ("ok.hcl", "x = { a = 1, \"a b\" = 2 }\n"),
+    ]);
+    for file in ["a.hcl", "b.hcl"] {
+        let (code, stdout, stderr) = failure_of(&dir, &["-F", "json", "convert", file]);
+        assert_eq!(code, Some(3), "{file}");
+        assert_eq!(stdout, "", "{file}");
+        assert_eq!(
+            stderr,
+            format!(
+                "parse error in {file}: invalid object item; expected unique object key; found redefined object key \"a\"\n"
+            )
+        );
+    }
+    assert_eq!(
+        stdout_of(&dir, &["-q", "-F", "json", "convert", "ok.hcl"]),
+        "{\n  \"x\": {\n    \"a\": 1,\n    \"a b\": 2\n  }\n}\n"
+    );
+}
+
+// ---- tagged numbers ---------------------------------------------------
+
+/// `!!float` / `!!int` numbers serde_norway has no type for (past `f64` /
+/// `u128`), in each spelling of the core-schema tag, read as numbers.
+#[test]
+fn float_and_int_tags_read_a_big_number_as_a_number() {
+    let tags = "\
+a: !!float 1e400
+b: !!float \"1e400\"
+c: !!int 1234567890123456789012345678901234567890
+d: !<tag:yaml.org,2002:float> 1e400
+e: !!float 18446744073709551617
+f: !!float +1e400
+g: !!int +1234567890123456789012345678901234567890
+";
+    let directive = "\
+%TAG !y! tag:yaml.org,2002:
+---
+a: !y!float 1e400
+b: !y!int 1234567890123456789012345678901234567890
+";
+    let dir = dir_with(&[("tags.yaml", tags), ("directive.yaml", directive)]);
+    let int40 = "1234567890123456789012345678901234567890";
+    assert_eq!(
+        stdout_of(&dir, &["-q", "-F", "json", "convert", "tags.yaml"]),
+        format!(
+            "{{\n  \"a\": 1e400,\n  \"b\": 1e400,\n  \"c\": {int40},\n  \"d\": 1e400,\n  \"e\": 18446744073709551617.0,\n  \"f\": 1e400,\n  \"g\": {int40}\n}}\n"
+        )
+    );
+    assert_eq!(
+        stdout_of(&dir, &["-F", "yaml", "convert", "tags.yaml"]),
+        format!(
+            "a: 1.0e+400\nb: 1.0e+400\nc: {int40}\nd: 1.0e+400\ne: 18446744073709551617.0\nf: 1.0e+400\ng: {int40}\n"
+        )
+    );
+    for (key, printed, type_name) in [
+        ("/a", "1e+400", "float"),
+        ("/b", "1e+400", "float"),
+        ("/c", int40, "int"),
+        ("/d", "1e+400", "float"),
+        ("/e", "18446744073709551617.0", "float"),
+    ] {
+        assert_eq!(
+            stdout_of(&dir, &["get", "tags.yaml", key]),
+            format!("{printed}\n"),
+            "{key}"
+        );
+        assert_eq!(
+            stdout_of(&dir, &["type", "tags.yaml", key]),
+            format!("{type_name}\n"),
+            "{key}"
+        );
+    }
+    assert_eq!(
+        stdout_of(&dir, &["-q", "-F", "json", "convert", "directive.yaml"]),
+        format!("{{\n  \"a\": 1e400,\n  \"b\": {int40}\n}}\n")
+    );
+    // A textual edit next to them keeps them as written.
+    assert_eq!(
+        stdout_of(&dir, &["set", "tags.yaml", "/zz", "1"]),
+        format!("{tags}zz: 1\n")
+    );
+}
+
+/// `!!float` over an integer past what an `f64` holds keeps its digits,
+/// and the YAML and JSON writers write it as a float.
+#[test]
+fn a_float_tagged_integer_past_f64_is_written_as_a_float() {
+    let dir = dir_with(&[("t.yaml", "e: !!float 18446744073709551617\n")]);
+    assert_eq!(
+        stdout_of(&dir, &["-F", "yaml", "convert", "t.yaml"]),
+        "e: 18446744073709551617.0\n"
+    );
+    assert_eq!(
+        stdout_of(&dir, &["-q", "-F", "json", "convert", "t.yaml"]),
+        "{\n  \"e\": 18446744073709551617.0\n}\n"
+    );
+    let back = dir_with(&[("b.yaml", "e: 18446744073709551617.0\n")]);
+    assert_eq!(stdout_of(&back, &["type", "b.yaml", "/e"]), "float\n");
+    assert_eq!(
+        stdout_of(&back, &["get", "b.yaml", "/e"]),
+        "18446744073709551617.0\n"
+    );
+}
+
+/// A big literal with a leading `+` is that number without the `+`; on
+/// the command line it stays the string it is (dq's inline value guess).
+#[test]
+fn a_leading_plus_big_literal_is_the_number_without_the_plus() {
+    let dir = dir_with(&[
+        (
+            "plus.yaml",
+            "a: +1e400\nb: +18446744073709551616\nc: !!float +1e400\n",
+        ),
+        ("p.json", "{\"a\": 1}\n"),
+    ]);
+    assert_eq!(
+        stdout_of(&dir, &["-q", "-F", "json", "convert", "plus.yaml"]),
+        "{\n  \"a\": 1e400,\n  \"b\": 18446744073709551616,\n  \"c\": 1e400\n}\n"
+    );
+    for (format, name) in [("toml", "TOML"), ("toon", "TOON")] {
+        let (code, stdout, stderr) =
+            failure_of(&dir, &["-q", "-F", format, "convert", "plus.yaml"]);
+        assert_eq!((code, stdout.as_str()), (Some(1), ""), "{format}");
+        assert_eq!(
+            stderr,
+            format!(
+                "{format} format error: {name} cannot represent arbitrary-precision number 1e400\n"
+            )
+        );
+    }
+    assert_eq!(
+        stdout_of(&dir, &["set", "p.json", "/a", "+1e400"]),
+        "{\"a\": \"+1e400\"}\n"
+    );
+}
+
+// ---- ordinary floats and huge exponents --------------------------------
+
+/// 17-digit data (`%.17g` output) is an `f64`: TOML, HCL and TOON write
+/// it. A 17-digit literal no `f64` rounds to at 17 digits stays exact,
+/// and those formats refuse it.
+#[test]
+fn seventeen_digit_floats_convert_to_toml_hcl_and_toon() {
+    let dir = dir_with(&[
+        (
+            "g.json",
+            "{\"a\": 0.10000000000000001, \"b\": 37.774929499999999, \"d\": 0.30000000000000004}\n",
+        ),
+        (
+            "g.yaml",
+            "a: 0.10000000000000001\nb: 37.774929499999999\nd: 0.30000000000000004\n",
+        ),
+        ("bad.json", "{\"a\": 37.774929499999998}\n"),
+        ("bad.yaml", "a: 37.774929499999998\n"),
+        ("sub.yaml", "c: 4.9e-324\n"),
+    ]);
+    for file in ["g.json", "g.yaml"] {
+        for (format, want) in [
+            ("toml", "a = 0.1\nb = 37.7749295\nd = 0.30000000000000004\n"),
+            ("hcl", "a = 0.1\nb = 37.7749295\nd = 0.30000000000000004\n"),
+            ("toon", "a: 0.1\nb: 37.7749295\nd: 0.30000000000000004\n"),
+        ] {
+            assert_eq!(
+                stdout_of(&dir, &["-q", "-F", format, "convert", file]),
+                want,
+                "{format} {file}"
+            );
+        }
+    }
+    for file in ["bad.json", "bad.yaml"] {
+        assert_eq!(
+            stdout_of(&dir, &["get", file, "/a"]),
+            "37.774929499999998\n"
+        );
+        let (code, stdout, stderr) = failure_of(&dir, &["-q", "-F", "toml", "convert", file]);
+        assert_eq!((code, stdout.as_str()), (Some(1), ""), "{file}");
+        assert_eq!(
+            stderr,
+            "toml format error: TOML cannot represent arbitrary-precision number 37.774929499999998\n"
+        );
+    }
+    // The smallest subnormal is an `f64` too.
+    assert_eq!(
+        stdout_of(&dir, &["-q", "-F", "hcl", "convert", "sub.yaml"]),
+        "c = 5e-324\n"
+    );
+}
+
+#[test]
+fn a_huge_exponent_is_set_and_read_back() {
+    let dir = dir_with(&[("y.yaml", "g: 1  # c\n"), ("y.json", "{\"g\": 1}\n")]);
+    assert_eq!(
+        stdout_of(&dir, &["set", "y.yaml", "/g", "1e99999999999999999999"]),
+        "g: 1.0e+99999999999999999999  # c\n"
+    );
+    assert_eq!(
+        stdout_of(&dir, &["set", "y.json", "/g", "1e99999999999999999999"]),
+        "{\"g\": 1e99999999999999999999}\n"
+    );
+    dq().current_dir(dir.path())
+        .args([
+            "--no-color",
+            "set",
+            "-i",
+            "y.yaml",
+            "/g",
+            "1e99999999999999999999",
+        ])
+        .assert()
+        .success()
+        .stdout("");
+    assert_eq!(read(&dir, "y.yaml"), "g: 1.0e+99999999999999999999  # c\n");
+    assert_eq!(
+        stdout_of(&dir, &["get", "y.yaml", "/g"]),
+        "1.0e+99999999999999999999\n"
+    );
+    assert_eq!(stdout_of(&dir, &["type", "y.yaml", "/g"]), "float\n");
+}
+
+// ---- TOML set and TOON spelling -----------------------------------------
+
+/// A textual `set` on TOML of a number TOML cannot hold names that
+/// number, with no `set --jq` hint (it fails the same way), and leaves
+/// the file as it was; a 17-digit `f64` is written.
+#[test]
+fn a_toml_set_of_a_number_toml_cannot_hold_is_refused_by_name() {
+    let src = "g = 1 # keep\n";
+    for literal in [U64_PLUS_ONE, "1e400", "1E+400"] {
+        let dir = dir_with(&[("f.toml", src)]);
+        for args in [
+            &["set", "f.toml", "/g", literal][..],
+            &["set", "-i", "f.toml", "/g", literal],
+        ] {
+            let (code, stdout, stderr) = failure_of(&dir, args);
+            assert_eq!(code, Some(7), "{args:?}");
+            assert_eq!(stdout, "", "{args:?}");
+            assert_eq!(
+                stderr,
+                format!(
+                    "cannot set '/g': TOML cannot represent arbitrary-precision number {literal}\n"
+                )
+            );
+        }
+        assert_eq!(read(&dir, "f.toml"), src, "{literal}: file untouched");
+    }
+    let dir = dir_with(&[("f.toml", src)]);
+    dq().current_dir(dir.path())
+        .args([
+            "--no-color",
+            "set",
+            "-i",
+            "f.toml",
+            "/g",
+            "0.10000000000000001",
+        ])
+        .assert()
+        .success()
+        .stdout("");
+    assert_eq!(read(&dir, "f.toml"), "g = 0.1 # keep\n");
+}
+
+/// TOON's refusal names the number as dq read it — `1e400` from YAML,
+/// from any document of a stream — where JSON input shows serde_json's
+/// `1e+400` (pinned in `toml_hcl_and_toon_output_refuse_…`).
+#[test]
+fn toon_names_a_yaml_big_number_as_written() {
+    let dir = dir_with(&[
+        ("t.yaml", "a: 1e400\nb: 1\n"),
+        ("s.yaml", "---\na: 1\n---\nb: [1e400]\n"),
+    ]);
+    let want = "toon format error: TOON cannot represent arbitrary-precision number 1e400\n";
+    for args in [
+        &["-q", "-F", "toon", "convert", "t.yaml"][..],
+        &["-q", "query", "-F", "toon", ".", "t.yaml"],
+        &["-q", "--doc", "1", "-F", "toon", "convert", "s.yaml"],
+        &["-q", "--doc", "all", "-F", "toon", "convert", "s.yaml"],
+        &["-q", "--doc", "all", "query", "-F", "toon", ".", "s.yaml"],
+    ] {
+        let (code, stdout, stderr) = failure_of(&dir, args);
+        assert_eq!((code, stdout.as_str()), (Some(1), ""), "{args:?}");
+        assert_eq!(stderr, want, "{args:?}");
+    }
+    // The document without one converts.
+    assert_eq!(
+        stdout_of(
+            &dir,
+            &["-q", "--doc", "0", "-F", "toon", "convert", "s.yaml"]
+        ),
+        "a: 1\n"
+    );
+}
