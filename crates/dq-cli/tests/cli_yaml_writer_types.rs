@@ -287,8 +287,8 @@ fn a_big_float_is_written_as_a_yaml_1_1_float() {
 }
 
 #[test]
-fn data_holding_the_placeholder_nonce_is_written_exactly() {
-    // `Zq`, `Zj`, `Zx` — the first nonces the writer tries — occur as keys
+fn data_holding_the_placeholder_marker_is_written_exactly() {
+    // `Zq`, `Zj`, `Zx` — the first markers the writer tries — occur as keys
     // and inside strings, next to values the writer quotes; strings shaped
     // like a placeholder (`Zqxx`, `Zjxx`, `Zqxxxx`) stay as they are.
     let src = r#"{"Zq": "on", "Zqx": "Zj", "Zqxxxx": ["y", "Zqxx", "Zjxx"], "on": "Zqxxxx", "k": "Zj Zqx", "Zjx": "off", "n": 1e16, "Zx": "1:20", "Zjxxx": {"yes": "no"}, "Zz": "Zz"}"#;

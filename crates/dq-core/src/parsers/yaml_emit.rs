@@ -14,12 +14,12 @@
 //! - otherwise a *placeholder* — a plain token, swapped for the right text
 //!   after emission.
 //!
-//! A placeholder is the nonce `Z<lowercase letters>` padded with `x`. The
-//! nonce is chosen so that no string, key or number literal of the tree
+//! A placeholder is the marker `Z<lowercase letters>` padded with `x`. The
+//! marker is chosen so that no string, key or number literal of the tree
 //! contains it; the emitter copies printable ASCII verbatim and never makes
 //! an uppercase `Z` itself (escapes are `\x..` with `0-9A-F`, `\N`, `\L`, …),
-//! so the nonce occurs in the output only where a placeholder was written.
-//! The substitution checks that anyway: it runs only when the nonce occurs
+//! so the marker occurs in the output only where a placeholder was written.
+//! The substitution checks that anyway: it runs only when the marker occurs
 //! exactly once per placeholder, at a placeholder. As `Z` occurs in a
 //! placeholder only at its start, two occurrences cannot overlap, and the
 //! emitter writes scalars in tree order, so the n-th occurrence is the n-th
@@ -42,9 +42,9 @@ use crate::document::{Value, non_finite_literal};
 /// Writes `v` as one YAML document — what `serde_norway::to_string` writes,
 /// except for the scalars listed in the module docs.
 pub(super) fn to_yaml_string(v: &Value) -> Result<String, serde_norway::Error> {
-    for nonce in free_nonces(v).take(MAX_ATTEMPTS) {
+    for marker in free_markers(v).take(MAX_ATTEMPTS) {
         let ctx = Ctx {
-            nonce,
+            marker,
             fixes: RefCell::new(Vec::new()),
         };
         let out = serde_norway::to_string(&Node {
@@ -55,7 +55,7 @@ pub(super) fn to_yaml_string(v: &Value) -> Result<String, serde_norway::Error> {
         if fixes.is_empty() {
             return Ok(out);
         }
-        if let Some(done) = substitute(&out, &ctx.nonce, &fixes) {
+        if let Some(done) = substitute(&out, &ctx.marker, &fixes) {
             return Ok(done);
         }
     }
@@ -95,7 +95,7 @@ pub(super) fn typed_by_another_schema(s: &str) -> bool {
     .is_match(s)
 }
 
-/// Emissions tried with a nonce the tree does not contain. The first one
+/// Emissions tried with a marker the tree does not contain. The first one
 /// succeeds — the emitter makes no `Z` of its own — so a failure means that
 /// reasoning broke, and the writer errs instead of looping.
 const MAX_ATTEMPTS: usize = 4;
@@ -103,15 +103,15 @@ const MAX_ATTEMPTS: usize = 4;
 /// The longest key content the emitter writes as a simple key.
 const MAX_SIMPLE_KEY: usize = 128;
 
-/// The nonce letters, rare ones first, so the first nonce is almost always
+/// The marker letters, rare ones first, so the first marker is almost always
 /// free.
 const LETTERS: &[u8; 26] = b"qjxzvkwyfbgpmhdcultsnreoai";
 
 /// The longest run of lowercase letters after a `Z` that is kept: 26^13
-/// windows are more than any tree has `Z`s, so a nonce is never longer.
+/// windows are more than any tree has `Z`s, so a marker is never longer.
 const MAX_RUN: usize = 13;
 
-/// The nonces `Z` + `len` letters that no key, string or number literal of
+/// The markers `Z` + `len` letters that no key, string or number literal of
 /// `v` contains, in [`LETTERS`] order, for the shortest `len` that leaves
 /// one.
 ///
@@ -120,7 +120,7 @@ const MAX_RUN: usize = 13;
 /// `len` of those letters after some `Z`, so the occupied words of a length
 /// are a set no larger than the number of `Z`s, and the first length with a
 /// word outside the set is found without scanning the tree again.
-fn free_nonces(v: &Value) -> impl Iterator<Item = String> {
+fn free_markers(v: &Value) -> impl Iterator<Item = String> {
     let mut runs = Vec::new();
     collect_runs(v, &mut runs);
     let (len, taken) = (1..=MAX_RUN as u32)
@@ -186,15 +186,15 @@ struct Fix {
     text: String,
 }
 
-/// The nonce of one emission attempt and the placeholders it wrote, in
+/// The marker of one emission attempt and the placeholders it wrote, in
 /// emission order.
 struct Ctx {
-    nonce: String,
+    marker: String,
     fixes: RefCell<Vec<Fix>>,
 }
 
 impl Ctx {
-    /// Writes a placeholder `len` bytes long (or the bare nonce, if that is
+    /// Writes a placeholder `len` bytes long (or the bare marker, if that is
     /// longer) to stand for `text`.
     fn placeholder<S: Serializer>(
         &self,
@@ -202,7 +202,7 @@ impl Ctx {
         text: String,
         len: usize,
     ) -> Result<S::Ok, S::Error> {
-        let mut placeholder = self.nonce.clone();
+        let mut placeholder = self.marker.clone();
         while placeholder.len() < len {
             placeholder.push('x');
         }
@@ -434,9 +434,9 @@ fn yaml11_float(literal: &str) -> Option<String> {
 }
 
 /// Replaces the placeholders of `out` with their text, or `None` unless
-/// the nonce occurs exactly once per placeholder, each time at one.
-fn substitute(out: &str, nonce: &str, fixes: &[Fix]) -> Option<String> {
-    let hits: Vec<usize> = out.match_indices(nonce).map(|(at, _)| at).collect();
+/// the marker occurs exactly once per placeholder, each time at one.
+fn substitute(out: &str, marker: &str, fixes: &[Fix]) -> Option<String> {
+    let hits: Vec<usize> = out.match_indices(marker).map(|(at, _)| at).collect();
     if hits.len() != fixes.len() {
         return None;
     }
@@ -600,13 +600,13 @@ mod tests {
     }
 
     #[test]
-    fn avoids_a_nonce_the_tree_contains() {
+    fn avoids_a_marker_the_tree_contains() {
         let v = map(&[("Zq", s("Zj Zqx")), ("k", s("on"))]);
         assert_eq!(yaml(&v), "Zq: Zj Zqx\nk: 'on'\n");
     }
 
     #[test]
-    fn substitute_refuses_a_stray_nonce() {
+    fn substitute_refuses_a_stray_marker() {
         let fixes = [Fix {
             placeholder: "Zq".into(),
             text: "'y'".into(),
@@ -620,18 +620,18 @@ mod tests {
     }
 
     #[test]
-    fn free_nonces_take_the_first_free_word_of_the_shortest_free_length() {
+    fn free_markers_take_the_first_free_word_of_the_shortest_free_length() {
         let none = Value::Null;
-        let first: Vec<String> = free_nonces(&none).take(2).collect();
+        let first: Vec<String> = free_markers(&none).take(2).collect();
         assert_eq!(first, ["Zq", "Zj"]);
-        // Every `Z` + one letter is taken: the nonce gets two letters, and
+        // Every `Z` + one letter is taken: the marker gets two letters, and
         // `Zqq` (inside `Zqqx`) is taken too.
         let mut words: Vec<Value> = LETTERS
             .iter()
             .map(|&b| Value::String(format!("Z{}", char::from(b))))
             .collect();
         words.push(s("Zqqx"));
-        let first: Vec<String> = free_nonces(&Value::Array(words)).take(2).collect();
+        let first: Vec<String> = free_markers(&Value::Array(words)).take(2).collect();
         assert_eq!(first, ["Zjq", "Zxq"]);
     }
 
