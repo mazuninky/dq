@@ -118,6 +118,7 @@ pub(super) fn read_exact(bytes: &[u8]) -> Result<Vec<Value>> {
     let walk = Walk {
         events: YamlParser::new_from_str(text),
         anchors: HashMap::new(),
+        literals: HashMap::new(),
     };
     match walk.documents(nodes) {
         Ok(values) => Ok(values),
@@ -138,17 +139,79 @@ pub(super) fn read_exact(bytes: &[u8]) -> Result<Vec<Value>> {
 /// serde_norway reads as untagged; the events of `text` give the value.
 /// Every node keeps its column, so a tagged block-map key stays a key:
 /// spaces in the tag's place would move the key right of its siblings.
-/// `None` when there is none, or saphyr-parser fails on `text`.
+/// `None` when there is none, or saphyr-parser fails on `text` — and
+/// when such a scalar sits in a collection used as a mapping key
+/// (`[!!float 1e400]: a`): dq names such a key by its debug text, which
+/// would show the stand-in tag, so the file stays refused, as before.
 fn untag_numbers(text: &str) -> Option<String> {
+    /// An open collection: whether it is a mapping whose next node is a
+    /// key, whether it is (in) a collection used as a key, its anchor, and
+    /// whether it holds a scalar whose tag is rewritten.
+    struct Open {
+        key_next: Option<bool>,
+        in_key: bool,
+        anchor: usize,
+        rewritten: bool,
+    }
+    fn advance(open: &mut [Open], rewritten: bool) {
+        if let Some(top) = open.last_mut() {
+            top.rewritten |= rewritten;
+            if let Some(key_next) = &mut top.key_next {
+                *key_next = !*key_next;
+            }
+        }
+    }
     let mut starts = Vec::new();
+    let mut open: Vec<Open> = Vec::new();
+    // Anchors of nodes holding a rewritten tag: whether each is a collection.
+    let mut rewritten_anchors: HashMap<usize, bool> = HashMap::new();
     let mut events = YamlParser::new_from_str(text);
     while let Some(item) = events.next_event() {
         let (event, span) = item.ok()?;
-        if let Event::Scalar(literal, _, _, Some(tag)) = &event
-            && let Some(typing) = core_typing(tag)
-            && serde_norway_refuses(literal, typing)
-        {
-            starts.push(span.start.index());
+        let in_key = open.last().is_some_and(|o| o.in_key);
+        let at_key = open.last().is_some_and(|o| o.key_next == Some(true));
+        match &event {
+            Event::Scalar(literal, _, anchor, tag) => {
+                let rewrite = tag.as_ref().is_some_and(|tag| {
+                    core_typing(tag).is_some_and(|typing| serde_norway_refuses(literal, typing))
+                });
+                if rewrite {
+                    if in_key {
+                        return None;
+                    }
+                    starts.push(span.start.index());
+                    if *anchor != 0 {
+                        rewritten_anchors.insert(*anchor, false);
+                    }
+                }
+                advance(&mut open, rewrite);
+            }
+            Event::Alias(id) => {
+                let rewritten = rewritten_anchors.get(id).copied();
+                if let Some(collection) = rewritten
+                    && (in_key || (at_key && collection))
+                {
+                    return None;
+                }
+                advance(&mut open, rewritten.is_some());
+            }
+            Event::SequenceStart(anchor, _) | Event::MappingStart(anchor, _) => {
+                let key_next = matches!(event, Event::MappingStart(..)).then_some(true);
+                open.push(Open {
+                    key_next,
+                    in_key: in_key || at_key,
+                    anchor: *anchor,
+                    rewritten: false,
+                });
+            }
+            Event::SequenceEnd | Event::MappingEnd => {
+                let closed = open.pop()?;
+                if closed.rewritten && closed.anchor != 0 {
+                    rewritten_anchors.insert(closed.anchor, true);
+                }
+                advance(&mut open, closed.rewritten);
+            }
+            _ => {}
         }
     }
     if starts.is_empty() {
@@ -410,9 +473,25 @@ fn repeated(path: &Path<'_>, message: &str, span: &Span) -> Stop {
 struct Walk<'t> {
     events: YamlParser<'t, StrInput<'t>>,
     anchors: HashMap<usize, Value>,
+    /// The literal of each anchored scalar that got its exact number: an
+    /// alias of it as a mapping key is that key as written (`+1e400`), as
+    /// the anchored key itself is.
+    literals: HashMap<usize, String>,
 }
 
 impl<'t> Walk<'t> {
+    /// Keep the literal of an anchored scalar that got its exact number.
+    fn note_literal(&mut self, anchor: usize, exact: bool, literal: &str) {
+        if anchor == 0 {
+            return;
+        }
+        if exact {
+            self.literals.insert(anchor, literal.to_owned());
+        } else {
+            self.literals.remove(&anchor);
+        }
+    }
+
     fn next(&mut self) -> Step<(Event<'t>, Span)> {
         match self.events.next_event() {
             Some(Ok(item)) => Ok(item),
@@ -460,6 +539,7 @@ impl<'t> Walk<'t> {
         let (value, anchor) = match event {
             Event::Scalar(literal, style, anchor, tag) => {
                 let exact = exact_value(&literal, style, tag.as_deref(), &SerdeRead::of(&node));
+                self.note_literal(anchor, exact.is_some(), &literal);
                 let value = match (exact, node) {
                     (Some(exact), _) => exact,
                     (
@@ -531,6 +611,7 @@ impl<'t> Walk<'t> {
                         None => SerdeRead::Str(&key),
                     };
                     let exact = exact_value(&literal, style, tag.as_deref(), &read);
+                    self.note_literal(anchor, exact.is_some(), &literal);
                     let (key, kind, id, anchored) = match exact {
                         Some(exact) => (
                             literal.to_string(),
@@ -556,7 +637,7 @@ impl<'t> Walk<'t> {
                     let anchored = self.anchors.get(&id).ok_or(Stop::Disagree)?;
                     match anchored {
                         Value::BigInt(s) | Value::BigFloat(s) => (
-                            s.clone(),
+                            self.literals.get(&id).unwrap_or(s).clone(),
                             KeyKind::Number,
                             FloatKey::of_value(anchored),
                             None,
@@ -810,6 +891,42 @@ mod tests {
             error("b: !!int\n  12345678901234567890\n  123456789012345678901\n")
                 .contains("expected an integer")
         );
+    }
+
+    #[test]
+    fn an_alias_key_is_its_anchored_number_as_written() {
+        assert_eq!(
+            error("k: &x +1e400\n*x : v\n+1e400: w\n"),
+            "duplicate entry with key +1e400 at line 3 column 1"
+        );
+        assert_eq!(
+            error("{&x +1e400: a, *x : b}\n"),
+            "duplicate entry with key +1e400 at line 1 column 16"
+        );
+        let Value::Map(m) = read("k: &x +1e400\n*x : v\n") else {
+            panic!()
+        };
+        let keys: Vec<&str> = m.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["k", "+1e400"]);
+    }
+
+    #[test]
+    fn a_tagged_big_number_in_a_collection_key_stays_refused() {
+        for text in [
+            "[!!float 1e400]: a\n",
+            "? {k: !!float 1e400}\n: a\n",
+            "a: &x !!float 1e400\n[*x]: b\n",
+            "a: &x [!!float 1e400]\n? *x\n: b\n",
+        ] {
+            let message = error(text);
+            assert!(message.contains("expected a float"), "{text}: {message}");
+            assert!(!message.contains("xxx"), "{text}: {message}");
+        }
+        // A scalar alias as a key is a plain key.
+        let Value::Map(m) = read("a: &x !!float 1e400\n*x : b\n") else {
+            panic!()
+        };
+        assert_eq!(m["1e400"], Value::String("b".into()));
     }
 
     #[test]

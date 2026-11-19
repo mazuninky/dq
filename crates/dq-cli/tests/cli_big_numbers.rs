@@ -1114,3 +1114,45 @@ fn a_float_tagged_big_key_reads_in_a_block_map() {
     );
     assert_eq!(stdout_of(&dir, &["get", "n.yaml", "/x/b"]), "1\n");
 }
+
+/// An alias used as a key is the key its anchor was written as, so it
+/// repeats that key; a tagged big number inside a collection key is
+/// refused as it was, never shown with a stand-in tag.
+#[test]
+fn an_alias_key_repeats_its_anchor_and_a_tagged_collection_key_stays_refused() {
+    let dir = dir_with(&[
+        ("alias.yaml", "k: &x +1e400\n*x : v\n+1e400: w\n"),
+        ("flow.yaml", "{&x +1e400: a, *x : b}\n"),
+        ("seq.yaml", "[!!float 1e400]: a\n"),
+    ]);
+    for (file, message) in [
+        (
+            "alias.yaml",
+            "duplicate entry with key +1e400 at line 3 column 1",
+        ),
+        (
+            "flow.yaml",
+            "duplicate entry with key +1e400 at line 1 column 16",
+        ),
+    ] {
+        let (code, stdout, stderr) = failure_of(&dir, &["get", file, ""]);
+        assert_eq!(code, Some(3), "{file}");
+        assert_eq!(stdout, "", "{file}");
+        assert_eq!(stderr, format!("parse error in {file}: {message}\n"));
+    }
+    let (code, _, stderr) = failure_of(&dir, &["get", "seq.yaml", ""]);
+    assert_eq!(code, Some(3));
+    assert!(stderr.contains("expected a float"), "{stderr}");
+    assert!(!stderr.contains("xxx"), "{stderr}");
+}
+
+/// Exponents compare by value at any size, on either side of where one
+/// stops fitting a fixed number of digits.
+#[test]
+fn diff_sees_one_number_in_two_spellings_of_a_huge_exponent() {
+    let dir = dir_with(&[
+        ("a.json", r#"{"a": 1e1000000000000000000000000000000}"#),
+        ("b.json", r#"{"a": 10e999999999999999999999999999999}"#),
+    ]);
+    assert_eq!(stdout_of(&dir, &["diff", "a.json", "b.json"]), "[]\n");
+}

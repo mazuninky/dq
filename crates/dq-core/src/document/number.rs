@@ -85,7 +85,7 @@ impl<'a> DecimalParts<'a> {
 /// A decimal literal's value in normal form: sign, the significant digits
 /// (leading and trailing zeros dropped), and the power of ten of the last
 /// of them. `-0.0120e2` (-1.2) is `-`, `12`, `-1`. Built without
-/// allocating unless the exponent has more than 30 digits.
+/// allocating unless the exponent is past `i128`.
 struct Normal<'a> {
     negative: bool,
     int: &'a str,
@@ -101,7 +101,7 @@ struct Normal<'a> {
 #[derive(Debug, PartialEq, Eq)]
 enum Exponent {
     Small(i128),
-    /// Past 30 digits, in decimal: sign and digits without leading zeros.
+    /// Past `i128`, in decimal: sign and digits without leading zeros.
     Big(bool, String),
 }
 
@@ -142,11 +142,21 @@ impl<'a> Normal<'a> {
             None => (false, "0"),
         };
         let exp_digits = exp_digits.trim_start_matches('0');
-        let exponent = if exp_digits.len() <= 30 {
-            let magnitude = exp_digits.parse::<i128>().unwrap_or(0);
-            Exponent::Small(if exp_negative { -magnitude } else { magnitude } + adjust)
-        } else {
-            Exponent::Big(exp_negative, add_small(exp_negative, exp_digits, adjust))
+        // One form per value: `Small` whenever the adjusted exponent fits an
+        // `i128`, so `1e1…0` (31 digits) and `10e9…9` (30) compare equal.
+        let signed = |magnitude: i128| if exp_negative { -magnitude } else { magnitude };
+        let small = (exp_digits.len() <= 38)
+            .then(|| exp_digits.parse::<i128>().unwrap_or(0))
+            .and_then(|magnitude| signed(magnitude).checked_add(adjust));
+        let exponent = match small {
+            Some(exponent) => Exponent::Small(exponent),
+            None => {
+                let digits = add_small(exp_negative, exp_digits, adjust);
+                match digits.parse::<i128>() {
+                    Ok(magnitude) => Exponent::Small(signed(magnitude)),
+                    Err(_) => Exponent::Big(exp_negative, digits),
+                }
+            }
         };
         Self {
             negative: parts.negative,
@@ -179,13 +189,13 @@ impl<'a> Normal<'a> {
     /// The power of ten of the first significant digit, when it is small.
     fn leading_exponent(&self) -> Option<i128> {
         match self.exponent {
-            Exponent::Small(last) => Some(last + i128::try_from(self.len).ok()? - 1),
+            Exponent::Small(last) => last.checked_add(i128::try_from(self.len).ok()? - 1),
             Exponent::Big(..) => None,
         }
     }
 }
 
-/// `digits` (over 30 of them, so larger than `adjust` by far) with
+/// `digits` (39 or more of them, so larger than `adjust` by far) with
 /// `adjust` added to the signed number they spell: the digits of the sum,
 /// whose sign is the same.
 fn add_small(negative: bool, digits: &str, adjust: i128) -> String {
@@ -405,6 +415,20 @@ mod tests {
         assert!(!same_decimal(
             "1e99999999999999999999",
             "1e99999999999999999998"
+        ));
+        // Either side of where an exponent stops fitting a digit count.
+        assert!(same_decimal(
+            "1e1000000000000000000000000000000",
+            "10e999999999999999999999999999999"
+        ));
+        let past_i128 = "1000000000000000000000000000000000000000";
+        assert!(same_decimal(
+            &format!("1e{past_i128}"),
+            &format!("10e{}", "9".repeat(past_i128.len() - 1))
+        ));
+        assert!(same_decimal(
+            "1e170141183460469231731687303715884105728",
+            "10e170141183460469231731687303715884105727"
         ));
         assert!(same_decimal("-0.0120e2", "-1.2"));
         assert!(same_decimal("0.0", "-0e7"));
