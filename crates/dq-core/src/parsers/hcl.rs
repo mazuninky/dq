@@ -257,19 +257,34 @@ fn hcl_value_to_value(v: HclValue) -> Value {
 /// literal (`3.0`, `1e16`), which `hcl-rs` reads as an integer. `hcl-rs`
 /// keeps no literal; `hcl-edit`, which it parses with, does, so `text` is
 /// parsed once more with it and walked alongside `value`.
+///
+/// Blocks that repeat merge into one map, the last block's attribute
+/// winning ([`merge_into`]); so the walk goes from the last structure to
+/// the first and puts back each attribute's number only the first time it
+/// meets that attribute — the literal the value was read from. An earlier
+/// literal that reads as the same `f64` (`0.10000000000000000001` before
+/// `0.1`) would otherwise put back the wrong number.
 fn restore_exact_numbers(text: &str, value: &mut Value) {
     let (Ok(body), Value::Map(map)) = (text.parse::<hcl::edit::structure::Body>(), value) else {
         return;
     };
-    restore_in_body(&body, map);
+    restore_in_body(&body, map, &mut std::collections::HashSet::new());
 }
 
-fn restore_in_body(body: &hcl::edit::structure::Body, map: &mut IndexMap<String, Value>) {
+/// `restored` holds the address of each attribute value already put back.
+fn restore_in_body(
+    body: &hcl::edit::structure::Body,
+    map: &mut IndexMap<String, Value>,
+    restored: &mut std::collections::HashSet<usize>,
+) {
     use hcl::edit::structure::{BlockLabel as EditLabel, Structure as EditStructure};
-    for structure in body.iter() {
+    let structures: Vec<_> = body.iter().collect();
+    for structure in structures.into_iter().rev() {
         match structure {
             EditStructure::Attribute(attr) => {
-                if let Some(value) = map.get_mut(attr.key.as_str()) {
+                if let Some(value) = map.get_mut(attr.key.as_str())
+                    && restored.insert(std::ptr::from_ref::<Value>(value) as usize)
+                {
                     restore_in_expression(&attr.value, value);
                 }
             }
@@ -287,7 +302,7 @@ fn restore_in_body(body: &hcl::edit::structure::Body, map: &mut IndexMap<String,
                     };
                 }
                 if let Some(Value::Map(inner)) = cursor {
-                    restore_in_body(&block.body, inner);
+                    restore_in_body(&block.body, inner, restored);
                 }
             }
         }
@@ -303,9 +318,9 @@ fn restore_in_expression(expr: &hcl::edit::expr::Expression, value: &mut Value) 
             };
             // `- 5` is a number too.
             let literal: String = repr.chars().filter(|c| !c.is_whitespace()).collect();
-            // Only the number `hcl-rs` read from this very literal: a later
-            // block merged over it may have put another one there. It reads
-            // a whole float (`3.0`, `-0.0`) as an integer.
+            // Only the number `hcl-rs` read from this very literal: an
+            // attribute and a block of one name may have put another one
+            // there. It reads a whole float (`3.0`, `-0.0`) as an integer.
             let Ok(parsed) = literal.parse::<f64>() else {
                 return;
             };
@@ -552,6 +567,32 @@ mod tests {
             map["b"],
             Value::Map([("x".to_owned(), Value::Float(2.5))].into_iter().collect())
         );
+        // ... also when the earlier literal reads as the same `f64`, or the
+        // last one is a big number too.
+        for (text, path, last) in [
+            (
+                "b {\n x = 18446744073709551617\n}\nb {\n x = 18446744073709551616\n}\n",
+                &["b", "x"][..],
+                int("18446744073709551616"),
+            ),
+            (
+                "b {x = 18446744073709551617}\nb {x = 1.8446744073709552e19}\n",
+                &["b", "x"],
+                Value::Float(1.844_674_407_370_955_2e19),
+            ),
+            (
+                "p \"a\" {\n v = 0.10000000000000000001\n}\np \"a\" {\n v = 0.1\n}\n",
+                &["p", "a", "v"],
+                Value::Float(0.1),
+            ),
+        ] {
+            let doc = Hcl.parse(text.as_bytes()).expect("parse");
+            let found = path.iter().try_fold(doc.value(), |value, key| match value {
+                Value::Map(map) => map.get(*key),
+                _ => None,
+            });
+            assert_eq!(found, Some(&last), "{text}");
+        }
     }
 
     #[test]
