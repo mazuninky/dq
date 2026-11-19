@@ -273,6 +273,11 @@ references in text and attribute values, and refuses one in a comment, a
 PI or CDATA, which hold no references. XML 1.0 has no C0 controls but
 tab, LF and CR, so the writer refuses them, and writes C1 controls raw.
 
+A line end reads as a line feed wherever it stands — text, comments, PIs
+and CDATA — as XML's end-of-line handling has it: CR LF and a lone CR,
+and in a `version="1.1"` document NEL, LS and CR NEL too. An attribute
+value reads each as a space.
+
 Encodings. A file is decoded per its byte order mark, else per the
 declaration's `encoding`, else as UTF-8. Labels are the WHATWG Encoding
 Standard's (UTF-16, Shift_JIS, ISO-2022-JP, windows-1252, …), except

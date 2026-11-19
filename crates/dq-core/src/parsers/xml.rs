@@ -278,9 +278,11 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
     let text: &str = &text;
     // The characters a document may hold depend on its version, which
     // its declaration, ahead of every other character, gives.
-    let chars_11 = declared_pseudo_attribute(text.as_bytes(), "version")
+    // Its line ends, and its namespaces (Namespaces in XML 1.1 for a 1.1
+    // document only), too.
+    let xml11 = declared_pseudo_attribute(text.as_bytes(), "version")
         .is_some_and(|(version, _)| version == "1.1");
-    check_raw_chars(text, chars_11)?;
+    check_raw_chars(text, xml11)?;
     let mut reader = Reader::from_str(text);
     let cfg = reader.config_mut();
     // We deliberately preserve text whitespace verbatim — XML config-doc
@@ -293,8 +295,6 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
     let mut top_pi: Vec<String> = Vec::new();
     let mut top_comments: Vec<String> = Vec::new();
     let mut stack: Vec<Frame> = Vec::new();
-    // Namespaces in XML 1.1 hold for an XML 1.1 document only.
-    let mut xml11 = false;
     // Where the second root element begins, to report it there.
     let mut roots = 0_usize;
     let mut extra_root = None;
@@ -322,13 +322,12 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
             Ok(Event::Decl(decl)) => {
                 if !stack.is_empty() {
                     // Inner declarations are not standard XML; treat as PI.
-                    let raw = (*decl).to_owned();
+                    let raw = normalize_line_ends(&decl, xml11);
                     push_pi(&mut stack, &mut top_pi, raw);
                     continue;
                 }
                 let mut decl_map: IndexMap<String, Value> = IndexMap::new();
                 if let Ok(v) = decl.version() {
-                    xml11 = v == "1.1";
                     decl_map.insert("version".to_owned(), Value::String(v.into_owned()));
                 }
                 if let Some(Ok(enc)) = decl.encoding() {
@@ -348,17 +347,17 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                 );
             }
             Ok(Event::PI(pi)) => {
-                let raw = (*pi).to_owned();
+                let raw = normalize_line_ends(&pi, xml11);
                 push_pi(&mut stack, &mut top_pi, raw);
             }
             Ok(Event::Comment(c)) => {
-                let txt = decode_text(&c);
+                let txt = decode_text(&c, xml11);
                 push_comment(&mut stack, &mut top_comments, txt);
             }
             Ok(Event::Start(start)) => {
-                check_attribute_references(text, &start, chars_11)?;
+                check_attribute_references(text, &start, xml11)?;
                 let mut frame =
-                    build_start_frame(&start).map_err(|e| place(e, text, event_start))?;
+                    build_start_frame(&start, xml11).map_err(|e| place(e, text, event_start))?;
                 check_namespaces(&stack, &mut frame, xml11).map_err(|(message, attr)| {
                     let pos = name_offset(text, &start, event_start, attr.as_deref());
                     parse_error_at(text, pos, message)
@@ -378,9 +377,9 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                 stack.push(frame);
             }
             Ok(Event::Empty(start)) => {
-                check_attribute_references(text, &start, chars_11)?;
+                check_attribute_references(text, &start, xml11)?;
                 let mut frame =
-                    build_start_frame(&start).map_err(|e| place(e, text, event_start))?;
+                    build_start_frame(&start, xml11).map_err(|e| place(e, text, event_start))?;
                 check_namespaces(&stack, &mut frame, xml11).map_err(|(message, attr)| {
                     let pos = name_offset(text, &start, event_start, attr.as_deref());
                     parse_error_at(text, pos, message)
@@ -440,7 +439,7 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                 append_child(&mut stack, &mut top_children, &tag, value);
             }
             Ok(Event::Text(t)) => {
-                let s = decode_text(&t);
+                let s = decode_text(&t, xml11);
                 if let Some(frame) = stack.last_mut() {
                     if !is_xml_whitespace(&s) {
                         if frame.saw_element {
@@ -458,8 +457,9 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
             }
             Ok(Event::CData(c)) => {
                 // CData payload is stored verbatim (no escape decoding —
-                // CDATA bodies are not entity-encoded).
-                let s = (*c).to_owned();
+                // CDATA bodies are not entity-encoded), but for its line
+                // ends.
+                let s = c.xml_content(xml_version(xml11)).into_owned();
                 if let Some(frame) = stack.last_mut() {
                     frame.cdata.push(s);
                 }
@@ -472,7 +472,7 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                 // the reference here and append to the current frame's text so
                 // the parsed `Value` matches the pre-0.38 behaviour (entities
                 // are folded into the surrounding text body).
-                let s = resolve_general_ref(&r, text, event_start, chars_11)?;
+                let s = resolve_general_ref(&r, text, event_start, xml11)?;
                 if let Some(frame) = stack.last_mut() {
                     if frame.saw_element {
                         frame.saw_mixed = true;
@@ -979,7 +979,7 @@ fn check_namespaces(
     Ok(())
 }
 
-fn build_start_frame(start: &BytesStart<'_>) -> Result<Frame> {
+fn build_start_frame(start: &BytesStart<'_>, xml11: bool) -> Result<Frame> {
     let tag = start.name().as_ref().to_owned();
     let mut frame = Frame::new(tag);
     for attr in start.attributes() {
@@ -992,13 +992,13 @@ fn build_start_frame(start: &BytesStart<'_>) -> Result<Frame> {
             message: format!("XML parse error: malformed attribute: {e}"),
         })?;
         let name = attr.key.as_ref().to_owned();
-        let value = decode_attr(&attr)?;
+        let value = decode_attr(&attr, xml11)?;
         frame.attrs.insert(name, Value::String(value));
     }
     Ok(frame)
 }
 
-fn decode_text(t: &BytesText<'_>) -> String {
+fn decode_text(t: &BytesText<'_>, xml11: bool) -> String {
     // quick-xml 0.38+ split entity resolution out of `Event::Text`: text events
     // now carry the raw (un-entity-expanded) text and entities are reported as
     // a separate `Event::GeneralRef`. `xml_content` still applies EOL
@@ -1009,15 +1009,47 @@ fn decode_text(t: &BytesText<'_>) -> String {
     // Since quick-xml 0.42 event content is already `str`, so `xml_content`
     // is infallible. The pre-0.42 decoding error was unreachable for us
     // anyway: `parse_xml` rejects non-UTF-8 input before the reader runs.
-    t.xml_content(XmlVersion::Implicit1_0).into_owned()
+    t.xml_content(xml_version(xml11)).into_owned()
 }
 
-fn decode_attr(attr: &Attribute<'_>) -> Result<String> {
+/// The version whose end-of-line handling and attribute-value
+/// normalization quick-xml applies: XML 1.1's also reads NEL and LS, and
+/// CR before NEL, as a line feed.
+fn xml_version(xml11: bool) -> XmlVersion {
+    if xml11 {
+        XmlVersion::Explicit1_1
+    } else {
+        XmlVersion::Implicit1_0
+    }
+}
+
+/// `s` with XML end-of-line handling applied, as quick-xml applies it to
+/// text but not to a PI: CR LF and a lone CR read as LF, and in XML 1.1
+/// (`xml11`) CR NEL, NEL and LS too. A parser applies it to the whole
+/// document before it parses, so no place keeps a CR.
+fn normalize_line_ends(s: &str, xml11: bool) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                // CR LF, and CR NEL in 1.1, is one line end.
+                chars.next_if(|&n| n == '\n' || (xml11 && n == '\u{85}'));
+                out.push('\n');
+            }
+            '\u{85}' | '\u{2028}' if xml11 => out.push('\n'),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn decode_attr(attr: &Attribute<'_>, xml11: bool) -> Result<String> {
     // `unescape_value` was deprecated in quick-xml 0.38 in favour of
     // `normalized_value`, which does the same predefined-entity resolution
     // plus the spec-mandated whitespace normalisation. The wire-level output
     // is the same for the predefined-entity set we care about.
-    attr.normalized_value(XmlVersion::Implicit1_0)
+    attr.normalized_value(xml_version(xml11))
         .map(|c| c.into_owned())
         .map_err(|e| Error::Parse {
             file: None,
@@ -2534,6 +2566,17 @@ mod tests {
             err.to_string().contains("must be a scalar (got an array)"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn line_ends_are_read_as_the_version_has_them() {
+        let all = "a\r\nb\rc\r\u{85}d\u{85}e\u{2028}f\n";
+        assert_eq!(
+            normalize_line_ends(all, false),
+            "a\nb\nc\n\u{85}d\u{85}e\u{2028}f\n"
+        );
+        assert_eq!(normalize_line_ends(all, true), "a\nb\nc\nd\ne\nf\n");
+        assert_eq!(normalize_line_ends("\r\r\n", false), "\n\n");
     }
 
     #[test]

@@ -1741,11 +1741,50 @@ fn the_reader_refuses_characters_the_version_does_not_allow() {
             (convert("ok_c1_10.xml", "xml"), ok("<r>\u{80}</r>")),
             (
                 convert("ok_nel_11.xml", "xml"),
-                ok(format!("{v11}<r>a&#x85;b</r>")),
+                ok(format!("{v11}<r>a\nb</r>")),
             ),
             (
                 convert("ok_ref_11.xml", "xml"),
                 ok(format!("{v11}<r a=\"&#1;\">&#1;&#127;</r>")),
+            ),
+        ],
+    );
+}
+
+/// A line end reads as a line feed wherever it stands, as XML's
+/// end-of-line handling, applied to the whole document before it is
+/// parsed, has it: CR LF and a lone CR, and in XML 1.1 NEL, LS and CR NEL
+/// too, in text, comments, PIs and CDATA; an attribute value then reads
+/// each as a space. In XML 1.0 NEL and LS are characters like any other.
+/// Before, a PI and CDATA kept their CRs, and XML 1.1 line ends read as
+/// themselves everywhere.
+#[test]
+fn a_line_end_reads_as_a_line_feed_wherever_it_stands() {
+    let dir = dir_with(&[
+        ("crlf.xml", "<!--a\r\nb\rc--><?p a\r\nb\rc?><r a=\"x\r\ny\"><![CDATA[a\r\nb\rc]]>t\r\nu\rv<?q x\ry?></r>".as_bytes()),
+        ("nel_11.xml", "<?xml version=\"1.1\"?><!--a\u{85}b\u{2028}c--><?p a\r\u{85}b?><r a=\"x\u{85}y\u{2028}z\"><![CDATA[a\u{85}b]]>t\u{85}u\u{2028}v</r>".as_bytes()),
+        ("nel_10.xml", "<!--a\u{85}b\u{2028}c--><r a=\"x\u{85}y\"><![CDATA[a\u{85}b]]>t\u{2028}v</r>".as_bytes()),
+    ]);
+    assert_cases(
+        &dir,
+        &[
+            (
+                convert("crlf.xml", "json"),
+                ok(
+                    "{\n  \"#pi\": [\n    \"p a\\nb\\nc\"\n  ],\n  \"#comments\": [\n    \"a\\nb\\nc\"\n  ],\n  \"r\": [\n    {\n      \"@attrs\": {\n        \"a\": \"x y\"\n      },\n      \"#text\": \"t\\nu\\nv\",\n      \"#cdata\": [\n        \"a\\nb\\nc\"\n      ],\n      \"#pi\": [\n        \"q x\\ny\"\n      ]\n    }\n  ]\n}\n",
+                ),
+            ),
+            (
+                convert("nel_11.xml", "json"),
+                ok(
+                    "{\n  \"#xml\": {\n    \"version\": \"1.1\"\n  },\n  \"#pi\": [\n    \"p a\\nb\"\n  ],\n  \"#comments\": [\n    \"a\\nb\\nc\"\n  ],\n  \"r\": [\n    {\n      \"@attrs\": {\n        \"a\": \"x y z\"\n      },\n      \"#text\": \"t\\nu\\nv\",\n      \"#cdata\": [\n        \"a\\nb\"\n      ]\n    }\n  ]\n}\n",
+                ),
+            ),
+            (
+                convert("nel_10.xml", "json"),
+                ok(
+                    "{\n  \"#comments\": [\n    \"a\u{85}b\u{2028}c\"\n  ],\n  \"r\": [\n    {\n      \"@attrs\": {\n        \"a\": \"x\u{85}y\"\n      },\n      \"#text\": \"t\u{2028}v\",\n      \"#cdata\": [\n        \"a\u{85}b\"\n      ]\n    }\n  ]\n}\n",
+                ),
             ),
         ],
     );
