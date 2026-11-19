@@ -546,11 +546,12 @@ pub(crate) fn compile_from_file(
         path: path.clone(),
         source: err,
     })?;
-    let schema_json: serde_json::Value =
+    let mut schema_json: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|err| ExecError::SchemaCompile {
             rule_id: rule_id.to_owned(),
             message: format!("could not parse {path} as JSON: {err}"),
         })?;
+    note_source_spellings(&bytes, &mut schema_json);
     compile_json(rule_id, &schema_json, message_prefix)
 }
 
@@ -566,12 +567,38 @@ pub(crate) fn compile_from_embedded(
     schema_text: &str,
     message_prefix: Option<String>,
 ) -> Result<CompiledSchemaCheck> {
-    let schema_json: serde_json::Value =
+    let mut schema_json: serde_json::Value =
         serde_json::from_str(schema_text).map_err(|err| ExecError::SchemaCompile {
             rule_id: rule_id.to_owned(),
             message: format!("could not parse embedded schema as JSON: {err}"),
         })?;
+    note_source_spellings(schema_text.as_bytes(), &mut schema_json);
     compile_json(rule_id, &schema_json, message_prefix)
+}
+
+/// Note in `schema`, read from the JSON `text`, every limit's source text
+/// (see [`crate::schema_value::note_limit_spellings`]), so a message
+/// quotes `1e2` as the file writes it rather than serde_json's `1e+2`.
+/// Should dq's JSON span parse refuse `text`, which serde_json read, the
+/// limits keep serde_json's spelling.
+fn note_source_spellings(text: &[u8], schema: &mut serde_json::Value) {
+    let doc = match dq_core::parse_json_with_spans(text) {
+        Ok(doc) => doc,
+        Err(err) => {
+            tracing::debug!(error = %err, "schema limits keep serde_json's spelling");
+            return;
+        }
+    };
+    let literal_at = |at: &dq_core::Pointer| {
+        let span = doc.span_at(at)?;
+        let source = text.get(span.value_range.clone())?;
+        std::str::from_utf8(source).ok().map(str::to_owned)
+    };
+    crate::schema_value::note_limit_spellings(
+        schema,
+        &mut dq_core::Pointer::default(),
+        &literal_at,
+    );
 }
 
 /// Resolve a relative schema-file path against the rule's directory.

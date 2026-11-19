@@ -264,7 +264,7 @@ fn every_bound_compares_a_big_limit_exactly_at_its_edge() {
             "{minimum: 1e400}",
             "1.7976931348623157e308",
             Fails(
-                "/properties/x/minimum: 1.7976931348623157e+308 is less than the minimum of 1e+400",
+                "/properties/x/minimum: 1.7976931348623157e+308 is less than the minimum of 1e400",
             ),
         ),
         ("{minimum: 1e400}", ".inf", None),
@@ -274,7 +274,7 @@ fn every_bound_compares_a_big_limit_exactly_at_its_edge() {
             "1.0e+400",
             Fails(
                 "/properties/x/exclusiveMaximum: 1.0e+400 is greater than or equal to the maximum \
-                 of 1e+400",
+                 of 1e400",
             ),
         ),
     ]);
@@ -975,12 +975,12 @@ fn multiple_of_a_divisor_past_f64_holds_no_finite_number_but_zero() {
         (
             "{multipleOf: 1e400}",
             "4",
-            Fails("/properties/x/multipleOf: 4 is not a multiple of 1e+400"),
+            Fails("/properties/x/multipleOf: 4 is not a multiple of 1e400"),
         ),
         (
             "{multipleOf: 1e400}",
             "18446744073709551616",
-            Fails("/properties/x/multipleOf: 18446744073709551616 is not a multiple of 1e+400"),
+            Fails("/properties/x/multipleOf: 18446744073709551616 is not a multiple of 1e400"),
         ),
     ]);
 }
@@ -1019,7 +1019,7 @@ fn a_schema_file_multiple_of_past_f64_divides_exactly() {
         (
             4,
             vec![
-                "/properties/big/multipleOf: 4 is not a multiple of 1e+400".to_owned(),
+                "/properties/big/multipleOf: 4 is not a multiple of 1e400".to_owned(),
                 "/properties/tiny/multipleOf: 2.5e-400 is not a multiple of 1e-400".to_owned(),
             ]
         )
@@ -1299,12 +1299,12 @@ fn a_float_on_a_17th_digit_tie_compares_by_its_even_spelling() {
     ]);
 }
 
-/// A limit in a message is spelled as the rule writes it — the rule's
-/// numbers are held exactly, so `1e-11` for `0.00000000001` would misquote
-/// the rule. An exponent comes out as serde_json reads it (`1e2` as
-/// `1e+2`, as a `schema_file` gives it); text that is no JSON number
-/// (`+5`) keeps the number's own spelling. Before, every limit came out in
-/// its shortest spelling.
+/// A limit in a message is spelled as the rule writes it, its source
+/// text — the rule's numbers are held exactly, so `1e-11` for
+/// `0.00000000001` would misquote the rule, and so would serde_json's
+/// `1e+2` for `1e2`. Text that is no JSON number (`+5`) keeps the number's
+/// own spelling. Before, every limit came out in its shortest spelling,
+/// then an exponent as serde_json reads it.
 #[test]
 fn a_limit_is_quoted_in_a_message_as_the_rule_spells_it() {
     use Some as Fails;
@@ -1328,8 +1328,18 @@ fn a_limit_is_quoted_in_a_message_as_the_rule_spells_it() {
             "{exclusiveMinimum: 1e2}",
             "100",
             Fails(
-                "/properties/x/exclusiveMinimum: 100 is less than or equal to the minimum of 1e+2",
+                "/properties/x/exclusiveMinimum: 100 is less than or equal to the minimum of 1e2",
             ),
+        ),
+        (
+            "{maximum: 1E-1}",
+            "1",
+            Fails("/properties/x/maximum: 1 is greater than the maximum of 1E-1"),
+        ),
+        (
+            "{multipleOf: 25e-1}",
+            "1",
+            Fails("/properties/x/multipleOf: 1 is not a multiple of 25e-1"),
         ),
         (
             "{minimum: +5}",
@@ -1367,6 +1377,67 @@ fn lint_quotes_a_limit_as_each_rule_of_a_stream_spells_it() {
                 "/properties/x/multipleOf: 1.5e-11 is not a multiple of 0.00000000001".to_owned(),
                 "/properties/y/maximum: 3 is greater than the maximum of 2.50".to_owned(),
             ]
+        )
+    );
+}
+
+/// A `schema_file` limit is quoted as the file spells it too, through a
+/// `$ref` as well. The spelling travels next to the keyword, never into
+/// data (`const`) or into a schema a message prints (`not`). Before, an
+/// exponent came out as serde_json reads it, `1e2` as `1e+2`.
+#[test]
+fn a_schema_file_limit_is_quoted_as_the_file_spells_it() {
+    let schema = r##"{
+      "$defs": {"m": {"minimum": 5e0}},
+      "properties": {
+        "a": {"maximum": 1e2},
+        "b": {"multipleOf": 2.50},
+        "c": {"exclusiveMaximum": 1E-1},
+        "d": {"$ref": "#/$defs/m"},
+        "e": {"const": {"maximum": 1e2}},
+        "f": {"not": {"maximum": 1e2}}
+      }
+    }"##;
+    let dir = dir_with(&[
+        ("rule.yml", FILE_RULE),
+        ("s.json", schema),
+        (
+            "bad.yaml",
+            "a: 101
+b: 1
+c: 1
+d: 4
+f: 5
+",
+        ),
+        (
+            "ok.yaml",
+            "a: 100
+b: 5
+c: 0.05
+d: 5
+e: {maximum: 100}
+f: 101
+",
+        ),
+    ]);
+    assert_eq!(
+        messages_in(dir.path(), &["check", "--rule", "rule.yml", "ok.yaml"]),
+        (0, Vec::new())
+    );
+    assert_eq!(
+        messages_in(dir.path(), &["check", "--rule", "rule.yml", "bad.yaml"]),
+        (
+            4,
+            [
+                "/properties/a/maximum: 101 is greater than the maximum of 1e2",
+                "/properties/b/multipleOf: 1 is not a multiple of 2.50",
+                "/properties/c/exclusiveMaximum: 1 is greater than or equal to the maximum of 1E-1",
+                "/properties/d/$ref/minimum: 4 is less than the minimum of 5e0",
+                "/properties/f/not: {\"maximum\":1e+2} is not allowed for 5",
+            ]
+            .map(str::to_owned)
+            .to_vec()
         )
     );
 }

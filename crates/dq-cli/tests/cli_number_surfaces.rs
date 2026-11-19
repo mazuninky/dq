@@ -211,7 +211,7 @@ fn schema_rules_hold_exact_and_non_finite_numbers_of_their_own() {
         (
             "{maximum: 1e400}",
             "x: .inf\n",
-            ".inf is greater than the maximum of 1e+400",
+            ".inf is greater than the maximum of 1e400",
         ),
         (
             "{const: 0.10000000000000000001}",

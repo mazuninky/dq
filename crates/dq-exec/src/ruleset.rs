@@ -212,8 +212,10 @@ impl RuleSet {
 /// two ever disagree on how many there are, or where a schema sits, the
 /// rule keeps the schema `serde_norway` read.
 ///
-/// A number keeps the rule's spelling too (`0.00000000001`, `2.50`), so a
-/// message prints a limit as the rule writes it: see [`Literals`].
+/// A number keeps the rule's spelling too (`0.00000000001`, `2.50`), and a
+/// limit its source text (`1e2`), so a message prints a limit as the rule
+/// writes it: see [`Literals`] and
+/// [`crate::schema_value::note_limit_spellings`].
 fn exact_schemas(yaml: &str, rules: &mut [Rule]) {
     if !rules.iter().any(has_inline_schema) {
         return;
@@ -259,6 +261,12 @@ struct Literals<'a> {
 }
 
 impl Literals<'_> {
+    /// The source text of the value at `at`.
+    fn text_at(&self, at: &dq_core::Pointer) -> Option<String> {
+        let span = self.doc.span_at(at)?;
+        self.yaml.get(span.value_range.clone()).map(str::to_owned)
+    }
+
     /// `json`, a schema read from the rule file at `at`, with every number
     /// spelled as the file spells it — when that text is a JSON number of
     /// the same value. Any other text (`+5`, `.5`, `0x10`) keeps the
@@ -266,11 +274,7 @@ impl Literals<'_> {
     fn respell(&self, json: &mut serde_json::Value, at: &mut dq_core::Pointer) {
         match json {
             serde_json::Value::Number(number) => {
-                let Some(text) = self
-                    .doc
-                    .span_at(at)
-                    .and_then(|span| self.yaml.get(span.value_range.clone()))
-                else {
+                let Some(text) = self.text_at(at) else {
                     return;
                 };
                 let Ok(literal) = text.parse::<serde_json::Number>() else {
@@ -331,6 +335,9 @@ fn exact_schema(
                 if let Some(literals) = literals {
                     at.push_segment(dq_core::Segment::Key("schema".to_owned()));
                     literals.respell(schema, at);
+                    crate::schema_value::note_limit_spellings(schema, at, &|place| {
+                        literals.text_at(place)
+                    });
                     at.pop_segment();
                 }
             }
@@ -488,7 +495,7 @@ mod tests {
         };
         assert_eq!(
             schema.to_string(),
-            r#"{"const":18446744073709551616,"maximum":1e+400,"minimum":0.10000000000000000001,"enum":["\u0000dq.inf\u0000"],"multipleOf":2.50}"#
+            r#"{"const":18446744073709551616,"maximum":1e+400,"minimum":0.10000000000000000001,"enum":["\u0000dq.inf\u0000"],"multipleOf":2.50,"\u0000dq.spelling":{"maximum":"1e400"}}"#
         );
         let Check::Composite { nested, .. } = &set.rules[2].check else {
             panic!("expected a composite check: {:?}", set.rules[2].check);

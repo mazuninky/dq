@@ -190,7 +190,10 @@ pub enum Check {
         /// YAML reader read: every number keeps its exact literal
         /// (`18446744073709551616`, `1e400`, `0.10000000000000000001`), and
         /// a NaN or an infinity, which JSON has no number for, is a marker
-        /// string the validator reads back as that number. A `Rule`
+        /// string the validator reads back as that number. A limit whose
+        /// text serde_json spells otherwise (`1e2`, read as `1e+2`) has its
+        /// text noted in a `"\u{0}dq.spelling"` member next to it, which the
+        /// validator ignores and a message quotes. A `Rule`
         /// deserialized on its own holds what `serde_norway` read, which
         /// rounds a float to an `f64` and reads `1e400` as a string.
         schema: serde_json::Value,

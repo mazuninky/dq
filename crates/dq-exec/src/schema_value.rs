@@ -388,8 +388,9 @@ impl<'i> jsonschema::Keyword<'i, DqJson> for Enum {
 /// has no order, fails every bound. jsonschema's messages.
 struct Bound {
     keyword: &'static str,
-    /// The limit as the schema spells it.
-    limit: serde_json::Value,
+    /// The limit as the schema's source text spells it ([`SPELLINGS`]),
+    /// else as serde_json does.
+    limit: String,
     /// The limit's exact value.
     exact: Value,
 }
@@ -510,6 +511,103 @@ impl<'i> jsonschema::Keyword<'i, DqJson> for MultipleOf {
 /// stand-in [`stand_in_tiny_divisors`] puts in its place.
 const TINY_DIVISOR: &str = "\u{0}dq.multipleOf";
 
+/// The member of a schema that maps a limit keyword (`maximum`,
+/// `multipleOf`, …) to the limit's source text, where serde_json cannot
+/// keep it: it reads `1e2` as `1e+2` and `1E-1` as `1e-1`. dq's bounds and
+/// `multipleOf` quote the limit from here ([`note_limit_spellings`]).
+const SPELLINGS: &str = "\u{0}dq.spelling";
+
+/// The keywords whose limit a message quotes.
+const LIMIT_KEYWORDS: [&str; 5] = [
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "multipleOf",
+];
+
+/// The source text [`note_limit_spellings`] noted for `keyword` in
+/// `schema`.
+fn noted_spelling(
+    schema: &serde_json::Map<String, serde_json::Value>,
+    keyword: &str,
+) -> Option<String> {
+    schema
+        .get(SPELLINGS)?
+        .get(keyword)?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// Note, in each schema of `node`, the source text of every limit
+/// ([`LIMIT_KEYWORDS`]) that serde_json spells otherwise, under
+/// [`SPELLINGS`], so a message quotes the limit as the rule or the schema
+/// file writes it (`1e2`, not `1e+2`).
+///
+/// `at` is where `node` sits in the source and `literal_at` gives the
+/// source text of the value at a place. The text is noted only when it is
+/// a JSON number of the limit's value: other text (`+5`, `.5`) keeps the
+/// number's own spelling. Data (`const`, `enum`, `default`, `examples`)
+/// gets no member: there `maximum` is no keyword, and a member would
+/// change the value.
+pub(crate) fn note_limit_spellings(
+    node: &mut serde_json::Value,
+    at: &mut dq_core::Pointer,
+    literal_at: &dyn Fn(&dq_core::Pointer) -> Option<String>,
+) {
+    match node {
+        serde_json::Value::Object(schema) => {
+            let mut noted = serde_json::Map::new();
+            for (keyword, value) in schema.iter_mut() {
+                at.push_segment(dq_core::Segment::Key(keyword.clone()));
+                match keyword.as_str() {
+                    k if LIMIT_KEYWORDS.contains(&k) => {
+                        if let Some(text) = source_spelling(value, &literal_at(at)) {
+                            noted.insert(k.to_owned(), serde_json::Value::String(text));
+                        }
+                    }
+                    k if DATA_KEYWORDS.contains(&k) => {}
+                    k if SCHEMA_MAPS.contains(&k) => {
+                        if let Some(map) = value.as_object_mut() {
+                            for (name, schema) in map.iter_mut() {
+                                at.push_segment(dq_core::Segment::Key(name.clone()));
+                                note_limit_spellings(schema, at, literal_at);
+                                at.pop_segment();
+                            }
+                        }
+                    }
+                    _ => note_limit_spellings(value, at, literal_at),
+                }
+                at.pop_segment();
+            }
+            if !noted.is_empty() {
+                schema.insert(SPELLINGS.to_owned(), serde_json::Value::Object(noted));
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (index, item) in items.iter_mut().enumerate() {
+                at.push_segment(dq_core::Segment::Index(index));
+                note_limit_spellings(item, at, literal_at);
+                at.pop_segment();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `text`, the source text of the limit `value`, when it is a JSON number
+/// of the same value that serde_json spells otherwise.
+fn source_spelling(value: &serde_json::Value, text: &Option<String>) -> Option<String> {
+    let serde_json::Value::Number(number) = value else {
+        return None;
+    };
+    let text = text.as_deref()?;
+    let literal = text.parse::<serde_json::Number>().ok()?;
+    let same = Value::from_serde_json(&serde_json::Value::Number(literal))
+        .same_number(&Value::from_serde_json(value));
+    (same && text != number.to_string()).then(|| text.to_owned())
+}
+
 /// `schema` with every positive `multipleOf` divisor that the `f64`
 /// nearest it reads as `0` (`1e-400`) replaced by `1`, its literal kept
 /// next to it under [`TINY_DIVISOR`].
@@ -601,8 +699,8 @@ fn replace_tiny_divisors(node: &mut serde_json::Value) {
 }
 
 /// `schema` with every [`stand_in_tiny_divisors`] stand-in turned back
-/// into the divisor as written, for a message that prints a schema (`not`).
-/// Borrowed when there is none.
+/// into the divisor as written, and every [`SPELLINGS`] member dropped, for
+/// a message that prints a schema (`not`). Borrowed when there is none.
 fn restore_tiny_divisors(schema: &serde_json::Value) -> Cow<'_, serde_json::Value> {
     fn walk(node: &mut serde_json::Value) {
         match node {
@@ -615,6 +713,7 @@ fn restore_tiny_divisors(schema: &serde_json::Value) -> Cow<'_, serde_json::Valu
                     schema.shift_remove(TINY_DIVISOR);
                     schema.insert("multipleOf".to_owned(), literal);
                 }
+                schema.shift_remove(SPELLINGS);
                 for (keyword, value) in schema.iter_mut() {
                     match keyword.as_str() {
                         k if DATA_KEYWORDS.contains(&k) => {}
@@ -631,7 +730,8 @@ fn restore_tiny_divisors(schema: &serde_json::Value) -> Cow<'_, serde_json::Valu
             _ => {}
         }
     }
-    if !serde_json::to_string(schema).is_ok_and(|text| text.contains("\\u0000dq.multipleOf")) {
+    // Both members dq adds begin `\u{0}dq.`.
+    if !serde_json::to_string(schema).is_ok_and(|text| text.contains("\\u0000dq.")) {
         return Cow::Borrowed(schema);
     }
     let mut owned = schema.clone();
@@ -782,7 +882,8 @@ pub(crate) fn options<'i>()
                 .and_then(|literal| serde_json::from_str::<serde_json::Value>(literal).ok());
             match literal.as_ref().unwrap_or(divisor) {
                 divisor @ serde_json::Value::Number(_) => Ok(Box::new(MultipleOf {
-                    spelling: divisor.to_string(),
+                    spelling: noted_spelling(schema, "multipleOf")
+                        .unwrap_or_else(|| divisor.to_string()),
                     exact: Value::from_serde_json(divisor),
                 })),
                 other => Err(jsonschema::ValidationError::custom(format!(
@@ -791,10 +892,10 @@ pub(crate) fn options<'i>()
             }
         });
     for keyword in Bound::KEYWORDS {
-        options = options.with_keyword(keyword, move |_, limit, _| match limit {
+        options = options.with_keyword(keyword, move |schema, limit, _| match limit {
             serde_json::Value::Number(_) => Ok(Box::new(Bound {
                 keyword,
-                limit: limit.clone(),
+                limit: noted_spelling(schema, keyword).unwrap_or_else(|| limit.to_string()),
                 exact: Value::from_serde_json(limit),
             })),
             other => Err(jsonschema::ValidationError::custom(format!(
@@ -1259,5 +1360,66 @@ mod tests {
             .to_string();
         assert_eq!(restore(&message), r#"-.inf is not of type "string""#);
         assert_eq!(restore("plain"), "plain");
+    }
+
+    #[test]
+    fn a_limit_keeps_the_text_serde_json_spells_otherwise() {
+        let text = r#"{"maximum": 1e2, "minimum": 5, "multipleOf": 2.5E0,
+            "const": {"maximum": 1e2}, "properties": {"maximum": {"minimum": 1E1}},
+            "prefixItems": [{"exclusiveMinimum": 1E-1}, {"maximum": 1e-1}]}"#;
+        let mut schema: serde_json::Value = serde_json::from_str(text).expect("schema");
+        let doc = dq_core::parse_json_with_spans(text.as_bytes()).expect("spans");
+        let literal_at = |at: &dq_core::Pointer| {
+            let span = doc.span_at(at)?;
+            text.get(span.value_range.clone()).map(str::to_owned)
+        };
+        note_limit_spellings(&mut schema, &mut dq_core::Pointer::default(), &literal_at);
+        assert_eq!(
+            schema[SPELLINGS],
+            serde_json::json!({"maximum": "1e2", "multipleOf": "2.5E0"})
+        );
+        // Data and a property named like a keyword get no member.
+        assert_eq!(schema["const"].to_string(), r#"{"maximum":1e+2}"#);
+        assert!(schema["properties"].get(SPELLINGS).is_none());
+        assert_eq!(
+            schema["properties"]["maximum"][SPELLINGS],
+            serde_json::json!({"minimum": "1E1"})
+        );
+        assert_eq!(
+            schema["prefixItems"][0][SPELLINGS],
+            serde_json::json!({"exclusiveMinimum": "1E-1"})
+        );
+        // Text serde_json spells the same way needs no note.
+        assert!(schema["prefixItems"][1].get(SPELLINGS).is_none());
+
+        let validator = options().build(&schema).expect("compiles");
+        let message = validator
+            .iter_errors(DqNode(&Value::Int(101)))
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            message,
+            [
+                "101 is greater than the maximum of 1e2",
+                "101 is not a multiple of 2.5E0",
+                r#"{"maximum":1e+2} was expected"#,
+            ]
+        );
+        assert!(
+            !restore_tiny_divisors(&schema)
+                .to_string()
+                .contains("dq.spelling")
+        );
+    }
+
+    #[test]
+    fn text_of_another_value_or_no_json_number_is_not_noted() {
+        let mut schema = serde_json::json!({"maximum": 100, "minimum": 5});
+        let literal_at = |at: &dq_core::Pointer| match at.as_canonical().as_str() {
+            "/maximum" => Some("1e3".to_owned()),
+            _ => Some("+5".to_owned()),
+        };
+        note_limit_spellings(&mut schema, &mut dq_core::Pointer::default(), &literal_at);
+        assert!(schema.get(SPELLINGS).is_none());
     }
 }
