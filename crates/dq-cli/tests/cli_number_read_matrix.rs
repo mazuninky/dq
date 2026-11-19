@@ -1420,3 +1420,186 @@ fn xml_refuses_names_outside_the_namespaces_in_scope() {
         &cases.map(|(file, outcome)| (vec!["-q", "convert", file, "-F", "xml"], outcome)),
     );
 }
+
+/// `diff` printed a patch value as serde_json does (`1e+300`, `1.5e+20`)
+/// on the console and with `-F json`, as 301 digits with `-F jsonl`, and
+/// `--unified` compared serde_json's text. Every JSON spelling of a patch
+/// is now the shortest round-trip one; `-F yaml` keeps the YAML writer's.
+#[test]
+fn diff_spells_a_patch_float_as_its_output_format_does() {
+    let dir = dir_with(&[
+        ("a.yaml", "a: 1\nb: 3.0\n"),
+        ("b.yaml", "a: 1e300\nb: 1.5e20\nc: 1e-7\n"),
+    ]);
+    let json_patch = "[\n  {\n    \"op\": \"add\",\n    \"path\": \"/c\",\n    \"value\": 1e-7\n  \
+                      },\n  {\n    \"op\": \"replace\",\n    \"path\": \"/a\",\n    \
+                      \"value\": 1e300\n  },\n  {\n    \"op\": \"replace\",\n    \
+                      \"path\": \"/b\",\n    \"value\": 1.5e20\n  }\n]\n";
+    let diff = |extra: &[&'static str]| {
+        let mut args = vec!["diff", "a.yaml", "b.yaml"];
+        args.extend_from_slice(extra);
+        args
+    };
+    assert_cases(
+        &dir,
+        &[
+            (diff(&[]), ok(json_patch)),
+            (diff(&["-F", "json"]), ok(json_patch)),
+            (
+                diff(&["-F", "jsonl"]),
+                ok("{\"op\":\"add\",\"path\":\"/c\",\"value\":1e-7}\n\
+                    {\"op\":\"replace\",\"path\":\"/a\",\"value\":1e300}\n\
+                    {\"op\":\"replace\",\"path\":\"/b\",\"value\":1.5e20}\n"),
+            ),
+            (
+                diff(&["-F", "yaml"]),
+                ok(
+                    "- op: add\n  path: /c\n  value: 1.0e-7\n- op: replace\n  path: /a\n  \
+                    value: 1.0e+300\n- op: replace\n  path: /b\n  value: 1.5e+20\n",
+                ),
+            ),
+            (
+                diff(&["--unified"]),
+                ok(
+                    "--- a/a.yaml -> b.yaml\n+++ b/a.yaml -> b.yaml\n@@ -1,4 +1,5 @@\n {\n\
+                    -  \"a\": 1,\n-  \"b\": 3.0\n+  \"a\": 1e300,\n+  \"b\": 1.5e20,\n\
+                    +  \"c\": 1e-7\n }\n\\ No newline at end of file\n",
+                ),
+            ),
+        ],
+    );
+}
+
+/// `fmt` with `--indent` / `--sort-keys` and `set --jq` re-emit through
+/// the JSON and TOML writers, which printed `1e300` as 301 digits and
+/// `-1e-300` as `-0.` and 299 zeros and a 1, nested values included. The
+/// `-i` write lands the same bytes in the file.
+#[test]
+fn fmt_and_set_jq_re_emit_a_float_in_its_shortest_form() {
+    let source = "{\"z\": 1e300, \"a\": [1.5e20, 3.0], \"m\": {\"k\": -1e-300}}\n";
+    let dir = dir_with(&[
+        ("f.json", source),
+        ("g.json", source),
+        ("s.toml", "a = 1 # kept\n[t]\nb = 2\n"),
+    ]);
+    let set_json = "{\n  \"z\": 1e300,\n  \"a\": [\n    1.5e20,\n    2.5e-10\n  ],\n  \
+                    \"m\": {\n    \"k\": -1e-300\n  },\n  \"n\": 1e-7\n}\n";
+    assert_cases(
+        &dir,
+        &[
+            (
+                vec!["fmt", "f.json", "--indent", "4", "--sort-keys"],
+                ok(
+                    "{\n    \"a\": [\n        1.5e20,\n        3.0\n    ],\n    \"m\": {\n        \
+                    \"k\": -1e-300\n    },\n    \"z\": 1e300\n}\n",
+                ),
+            ),
+            (
+                vec!["fmt", "f.json", "--indent", "0"],
+                ok("{\"z\":1e300,\"a\":[1.5e20,3.0],\"m\":{\"k\":-1e-300}}\n"),
+            ),
+            (
+                vec!["set", "f.json", "--jq", ".n = 1e-7 | .a[1] = 2.5e-10"],
+                ok(set_json),
+            ),
+            (
+                vec![
+                    "set",
+                    "s.toml",
+                    "--jq",
+                    ".t.c = 1e300 | .t.d = [3.0, 1.5e20]",
+                ],
+                ok("a = 1\n\n[t]\nb = 2\nc = 1e300\nd = [\n    3.0,\n    1.5e20,\n]\n"),
+            ),
+            (
+                vec!["-i", "set", "g.json", "--jq", ".n = 1e-7 | .a[1] = 2.5e-10"],
+                ok(""),
+            ),
+        ],
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("g.json")).expect("read g.json"),
+        set_json
+    );
+}
+
+/// HCL reads big integers and whole floats exactly at any depth: inside
+/// labelled blocks, blocks merged by name, object attributes with a quoted
+/// key, arrays and objects in arrays. Writing keeps a whole float a float
+/// and still refuses a big integer, wherever it sits.
+#[test]
+fn hcl_keeps_big_integers_and_whole_floats_inside_blocks() {
+    let blocks = "resource \"aws_x\" \"a\" {\n  big = 18446744073709551617\n  w   = 3.0\n  \
+                  e   = 1e16\n  nested = {\n    \"quoted key\" = 2.0\n    \
+                  inner = [1.0, 18446744073709551618, { z = -0.0 }]\n  }\n}\n\
+                  resource \"aws_x\" \"b\" {\n  w = 4.0\n}\nlocals {\n  n = 5.0\n}\n\
+                  locals {\n  m = 7\n}\n";
+    let small = "resource \"aws_x\" \"a\" {\n  w = 3.0\n  e = 1e16\n  nested = {\n    \
+                 \"quoted key\" = 2.0\n  }\n}\nresource \"aws_x\" \"b\" {\n  w = 4.0\n}\n\
+                 locals {\n  n = 5.0\n}\nlocals {\n  m = 7\n}\n";
+    let dir = dir_with(&[("h.tf", blocks), ("s.tf", small)]);
+    let small_hcl = |b_w: &str, extra: &str| {
+        format!(
+            "resource = {{\n  \"aws_x\" = {{\n    \"a\" = {{\n      \"w\" = 3.0\n      \
+             \"e\" = 1e16\n      \"nested\" = {{\n        \"quoted key\" = 2.0\n      }}\n    \
+             }}\n    \"b\" = {{\n      \"w\" = {b_w}\n    }}\n  }}\n}}\nlocals = {{\n  \
+             \"n\" = 5.0\n  \"m\" = 7\n{extra}}}\n"
+        )
+    };
+    let converted = small_hcl("4.0", "");
+    let set = small_hcl("1e300", "  \"q\" = 2.0\n");
+    assert_cases(
+        &dir,
+        &[
+            (
+                vec!["convert", "h.tf", "-F", "json"],
+                ok(
+                    "{\n  \"resource\": {\n    \"aws_x\": {\n      \"a\": {\n        \
+                    \"big\": 18446744073709551617,\n        \"w\": 3.0,\n        \"e\": 1e16,\n        \
+                    \"nested\": {\n          \"quoted key\": 2.0,\n          \"inner\": [\n            \
+                    1.0,\n            18446744073709551618,\n            {\n              \
+                    \"z\": -0.0\n            }\n          ]\n        }\n      },\n      \
+                    \"b\": {\n        \"w\": 4.0\n      }\n    }\n  },\n  \"locals\": {\n    \
+                    \"n\": 5.0,\n    \"m\": 7\n  }\n}\n",
+                ),
+            ),
+            (vec!["type", "h.tf", "/locals/n"], ok("float\n")),
+            (vec!["type", "h.tf", "/locals/m"], ok("int\n")),
+            (
+                vec!["type", "h.tf", "/resource/aws_x/a/nested/quoted key"],
+                ok("float\n"),
+            ),
+            (
+                vec!["get", "h.tf", "/resource/aws_x/a/nested/inner/1"],
+                ok("18446744073709551618\n"),
+            ),
+            (
+                vec![
+                    "query",
+                    ".resource.aws_x.a.big == 18446744073709551616",
+                    "h.tf",
+                ],
+                ok("false\n"),
+            ),
+            (
+                vec!["convert", "h.tf", "-F", "hcl"],
+                (
+                    1,
+                    "",
+                    "hcl format error: HCL cannot represent arbitrary-precision number \
+                     18446744073709551617\n",
+                ),
+            ),
+            (vec!["convert", "s.tf", "-F", "hcl"], ok(&converted)),
+            (
+                vec![
+                    "set",
+                    "s.tf",
+                    "--jq",
+                    ".locals.q = 2.0 | .resource.aws_x.b.w = 1e300",
+                ],
+                ok(&set),
+            ),
+        ],
+    );
+}

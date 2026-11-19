@@ -1046,3 +1046,214 @@ fn dq_test_reads_yaml_and_json_inputs_as_check_does() {
         "{stdout}"
     );
 }
+
+/// `multipleOf: 1e-400` reaches the validator as a stand-in: `multipleOf: 1`
+/// next to a hidden keyword holding the literal. The rule author sees only
+/// what they wrote: messages and schema paths name `1e-400` where it
+/// stands — under `$ref`, `then`, `items`, `prefixItems`,
+/// `patternProperties`, `dependentSchemas` — a `const` / `enum` / `default`
+/// holding a `multipleOf` object is data compared as written, and a
+/// property named `multipleOf` or `const` is a property. Before, every one of these
+/// schemas failed to compile (exit 3).
+#[test]
+fn a_divisor_below_f64_shows_the_rule_author_only_what_they_wrote() {
+    use Some as Fails;
+    assert_schema_cases(&[
+        (
+            "{const: {multipleOf: 1e-400}}",
+            "{multipleOf: 1e-400}",
+            None,
+        ),
+        (
+            "{const: {multipleOf: 1e-400}}",
+            "{multipleOf: 2e-400}",
+            Fails("/properties/x/const: {\"multipleOf\":1e-400} was expected"),
+        ),
+        (
+            "{enum: [{multipleOf: 1e-400}, 1]}",
+            "{multipleOf: 1e-400}",
+            None,
+        ),
+        (
+            "{enum: [{multipleOf: 1e-400}]}",
+            "{multipleOf: 1}",
+            Fails("/properties/x/enum: {\"multipleOf\":1} is not one of {\"multipleOf\":1e-400}"),
+        ),
+        (
+            "{default: {multipleOf: 1e-400}, examples: [{multipleOf: 1e-400}], \
+             multipleOf: 1e-400}",
+            "1.5e-400",
+            Fails("/properties/x/multipleOf: 1.5e-400 is not a multiple of 1e-400"),
+        ),
+        (
+            "{properties: {multipleOf: {multipleOf: 1e-400}}, required: [multipleOf]}",
+            "{multipleOf: 3e-400}",
+            None,
+        ),
+        (
+            "{properties: {multipleOf: {multipleOf: 1e-400}}}",
+            "{multipleOf: 1.5e-400}",
+            Fails(
+                "/properties/x/properties/multipleOf/multipleOf: 1.5e-400 is not a multiple of \
+                 1e-400",
+            ),
+        ),
+        (
+            "{additionalProperties: false, properties: {multipleOf: {multipleOf: 1e-400}}}",
+            "{multipleOf: 3e-400}",
+            None,
+        ),
+        (
+            "{properties: {const: {multipleOf: 1e-400}, enum: {multipleOf: 1e-400}}}",
+            "{const: 1.5e-400, enum: 3e-400}",
+            Fails(
+                "/properties/x/properties/const/multipleOf: 1.5e-400 is not a multiple of 1e-400",
+            ),
+        ),
+        (
+            "{$defs: {t: {multipleOf: 1e-400}}, $ref: \"#/properties/x/$defs/t\"}",
+            "1.5e-400",
+            Fails("/properties/x/$ref/multipleOf: 1.5e-400 is not a multiple of 1e-400"),
+        ),
+        (
+            "{if: {type: number}, then: {multipleOf: 1e-400}}",
+            "1.5e-400",
+            Fails("/properties/x/then/multipleOf: 1.5e-400 is not a multiple of 1e-400"),
+        ),
+        (
+            "{items: {multipleOf: 1e-400}}",
+            "[2e-400, 1.5e-400]",
+            Fails("/properties/x/items/multipleOf: 1.5e-400 is not a multiple of 1e-400"),
+        ),
+        (
+            "{prefixItems: [{multipleOf: 1e-400}]}",
+            "[1.5e-400]",
+            Fails("/properties/x/prefixItems/0/multipleOf: 1.5e-400 is not a multiple of 1e-400"),
+        ),
+        (
+            "{patternProperties: {'^m': {multipleOf: 1e-400}}}",
+            "{m: 1.5e-400}",
+            Fails(
+                "/properties/x/patternProperties/^m/multipleOf: 1.5e-400 is not a multiple of \
+                 1e-400",
+            ),
+        ),
+        (
+            "{dependentSchemas: {k: {properties: {m: {multipleOf: 1e-400}}}}}",
+            "{k: 1, m: 1.5e-400}",
+            Fails(
+                "/properties/x/dependentSchemas/k/properties/m/multipleOf: 1.5e-400 is not a \
+                 multiple of 1e-400",
+            ),
+        ),
+        (
+            "{anyOf: [{multipleOf: 1e-400}, {type: string}]}",
+            "1.5e-400",
+            Fails(
+                "/properties/x/anyOf: 1.5e-400 is not valid under any of the schemas listed in \
+                 the 'anyOf' keyword",
+            ),
+        ),
+    ]);
+}
+
+/// `dq test` reads each fixture input with dq's reader for its format: a
+/// YAML stream of several documents is an error naming the count, and TOML
+/// is still not a fixture format. Both are errored cases (exit 4), the
+/// others in the file still run.
+#[test]
+fn dq_test_errors_on_a_yaml_stream_and_a_toml_input() {
+    let rule = "id: t.nan\ndescription: x\nseverity: error\nmatch: { format: [yaml, toml] }\n\
+                check:\n  jq: 'select(.x | isnan) | .x'\n  message: 'x is {{ . }}'\n";
+    let cases = "tests:\n  - name: stream\n    input: |\n      x: 1\n      ---\n      \
+                 x: .nan\n    expected:\n      violations: []\n  - name: toml\n    \
+                 format: toml\n    input: |\n      x = nan\n    expected:\n      \
+                 violations: []\n  - name: nan\n    input: |\n      x: .NaN\n    expected:\n      \
+                 violations:\n        - rule: t.nan\n          message_contains: \"x is .nan\"\n";
+    let dir = dir_with(&[("r/nan.yml", rule), ("r/nan.test.yml", cases)]);
+    let (code, stdout, stderr) = run_in(dir.path(), &["test", "r"]);
+    assert_eq!(
+        (code, stdout.as_str(), stderr.as_str()),
+        (
+            4,
+            "ERROR r/nan.test.yml: stream (yaml parse error: a fixture input holds one document, \
+             this one holds 2)\n\
+             ERROR r/nan.test.yml: toml (format not yet supported in test runner: toml \
+             (supported: yaml, json, markdown, hcl, dockerfile; add it to SUPPORTED in \
+             test_runner::parse_input if dq_core::by_name reads it))\n\
+             ok r/nan.test.yml: nan\n\
+             summary: 1 passed, 0 failed, 2 errored, 3 total\n",
+            "lint reported 2 error-severity diagnostic(s)\n"
+        )
+    );
+}
+
+/// A composite `extract` item field that is there but not a string is
+/// named with its type — before, any of them read as "missing field"; a
+/// field that is absent still is.
+#[test]
+fn a_composite_extract_item_names_the_field_and_the_type_it_refuses() {
+    let rule = |extract: &str| {
+        format!(
+            "id: t.comp\ndescription: x\nseverity: error\nmatch: {{ format: yaml }}\n\
+             check:\n  extract: '{extract}'\n  message: m\n  nested:\n    id: t.inner\n    \
+             description: y\n    severity: error\n    match: {{ format: yaml }}\n    check:\n      \
+             schema: {{ type: string }}\n"
+        )
+    };
+    let cases = [
+        (
+            "[{value: .x, format: 1, anchor: \"/x\"}]",
+            "field `format` must be a string, got a number",
+        ),
+        (
+            "[{value: .x, format: null, anchor: \"/x\"}]",
+            "field `format` must be a string, got null",
+        ),
+        (
+            "[{value: .x, format: \"yaml\", anchor: .n}]",
+            "field `anchor` must be a string, got a number",
+        ),
+        (
+            "[{value: .x, format: \"yaml\", anchor: [1]}]",
+            "field `anchor` must be a string, got an array",
+        ),
+        (
+            "[{value: .b, format: \"yaml\", anchor: \"/x\"}]",
+            "field `value` must be a string, got a number",
+        ),
+        (
+            "[{value: true, format: \"yaml\", anchor: \"/x\"}]",
+            "field `value` must be a string, got a bool",
+        ),
+        (
+            "[{value: {a: 1}, format: \"yaml\", anchor: \"/x\"}]",
+            "field `value` must be a string, got an object",
+        ),
+        ("[{value: .x, format: \"yaml\"}]", "missing field `anchor`"),
+        (
+            "[{format: \"yaml\", anchor: \"/x\"}]",
+            "missing field `value`",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (extract, message) in cases {
+        let dir = dir_with(&[
+            ("rule.yml", &rule(extract)),
+            ("c.yaml", "x: hi\nn: .nan\nb: 18446744073709551617\n"),
+        ]);
+        let expected = (4, vec![format!("composite extract item {message}")]);
+        let actual = messages_in(dir.path(), &["check", "--rule", "rule.yml", "c.yaml"]);
+        if actual != expected {
+            wrong.push(format!(
+                "{extract}\n  expected {expected:?}\n  actual   {actual:?}"
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} case(s) differ:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}

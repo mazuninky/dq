@@ -149,3 +149,31 @@ fn parse_unterminated_open_delim_falls_back_to_empty_header_and_full_body() {
         "body must equal the whole file in the unterminated-fallback path",
     );
 }
+
+#[test]
+fn every_frontmatter_kind_writes_a_float_in_its_shortest_form() {
+    // The JSON and TOML writers printed `1e300` as 301 digits and `-1e-300`
+    // as `-0.` and 299 zeros and a 1; the YAML writer has its own
+    // spelling. A whole float keeps its `.0` in each.
+    let cases = [
+        (
+            "{\n  \"x\": 1e300,\n  \"w\": [3.0, -1e-300]\n}\n\n# Body\n",
+            "{\n  \"x\": 1e300,\n  \"w\": [\n    3.0,\n    -1e-300\n  ]\n}\n\n# Body\n",
+        ),
+        (
+            "+++\nx = 1e300\nw = [3.0, -1e-300]\n+++\n# Body\n",
+            "+++\nx = 1e300\nw = [\n    3.0,\n    -1e-300,\n]\n+++\n# Body\n",
+        ),
+        (
+            "---\nx: 1e300\nw: [3.0, -1e-300]\n---\n# Body\n",
+            "---\nx: 1.0e+300\nw:\n- 3.0\n- -1.0e-300\n---\n# Body\n",
+        ),
+    ];
+    for (input, expected) in cases {
+        let mut out = Vec::new();
+        frontmatter()
+            .write(&parse_md(input), &mut out)
+            .expect("frontmatter writes");
+        assert_eq!(String::from_utf8(out).expect("UTF-8"), expected, "{input}");
+    }
+}

@@ -794,6 +794,55 @@ mod plugins_enabled {
         }
 
         #[test]
+        fn host_state_spells_numbers_inside_containers_as_at_the_root() {
+            // A NaN or an infinity inside an array or a map is the string
+            // spelling too — the JSON writer refuses a non-finite number, so
+            // one left in place would empty the whole payload — and floats
+            // keep their shortest spelling at any depth.
+            use bindings::dq::plugin::ir::Host as _;
+            use bindings::dq::plugin::jq::Host as _;
+            use dq_core::FormatTag;
+            use dq_core::ProvenanceMap;
+            let inner = Value::Map(
+                [
+                    ("i".to_owned(), Value::Float(f64::INFINITY)),
+                    ("s".to_owned(), Value::Float(5e-324)),
+                ]
+                .into_iter()
+                .collect(),
+            );
+            let value = Value::Map(
+                [(
+                    "a".to_owned(),
+                    Value::Array(vec![
+                        Value::Float(f64::NAN),
+                        Value::BigFloat("-.inf".into()),
+                        Value::Float(1e-7),
+                        Value::Float(-0.0),
+                        Value::Array(vec![Value::Float(1.5e20)]),
+                        inner,
+                    ]),
+                )]
+                .into_iter()
+                .collect(),
+            );
+            let prov = ProvenanceMap::new();
+            let ir = Ir::new(&value, &prov, FormatTag::Yaml);
+            let mut state = HostState::new(&ir);
+            let text = |bytes: Vec<u8>| String::from_utf8(bytes).expect("utf-8");
+            let a = r#"[".nan","-.inf",1e-7,-0.0,[1.5e20],{"i":".inf","s":5e-324}]"#;
+            assert_eq!(text(state.get_root()), format!(r#"{{"a":{a}}}"#));
+            assert_eq!(state.get_at("/a".into()).map(text).as_deref(), Some(a));
+            assert_eq!(
+                state.get_at("/a/5".into()).map(text).as_deref(),
+                Some(r#"{"i":".inf","s":5e-324}"#)
+            );
+            let handle = state.compile(".".into()).expect("compiles");
+            let got = state.eval(handle, "/a".into()).expect("eval");
+            assert_eq!(got.into_iter().map(text).collect::<Vec<_>>(), [a]);
+        }
+
+        #[test]
         fn host_state_iterate_yields_object_keys() {
             use dq_core::FormatTag;
             use dq_core::ProvenanceMap;
