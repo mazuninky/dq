@@ -67,7 +67,9 @@
 //! declared by an `xmlns:p` on the element or an ancestor (`xml` always
 //! is), `xmlns` names only declarations, `xmlns:xml` binds only its fixed
 //! URI, no other declaration binds the `xml` or `xmlns` namespace URI, and
-//! `xmlns:p=""` (undeclaring, XML namespaces 1.1 only) is refused. The
+//! `xmlns:p=""` (undeclaring) is refused unless the declaration says
+//! `version="1.1"`: Namespaces in XML 1.1 allow it, and the prefix is then
+//! undeclared within the element. The
 //! reader refuses the same, as a parse error: an undeclared prefix on an
 //! element (`<a:b/>`) or an attribute (`<r a:x="1"/>`), and a declaration
 //! the writer would refuse.
@@ -205,8 +207,9 @@ struct Frame {
     /// text (or vice-versa). Used to detect mixed content.
     saw_element: bool,
     saw_mixed: bool,
-    /// The namespace prefixes this element's `xmlns:p` attributes declare.
-    prefixes: Vec<String>,
+    /// The namespace prefixes this element's `xmlns:p` attributes declare
+    /// (`true`) or, in XML 1.1, undeclare with `xmlns:p=""` (`false`).
+    prefixes: Vec<(String, bool)>,
 }
 
 impl Frame {
@@ -283,6 +286,8 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
     let mut top_pi: Vec<String> = Vec::new();
     let mut top_comments: Vec<String> = Vec::new();
     let mut stack: Vec<Frame> = Vec::new();
+    // Namespaces in XML 1.1 hold for an XML 1.1 document only.
+    let mut xml11 = false;
 
     loop {
         match reader.read_event() {
@@ -311,6 +316,7 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                 }
                 let mut decl_map: IndexMap<String, Value> = IndexMap::new();
                 if let Ok(v) = decl.version() {
+                    xml11 = v == "1.1";
                     decl_map.insert("version".to_owned(), Value::String(v.into_owned()));
                 }
                 if let Some(Ok(enc)) = decl.encoding() {
@@ -339,7 +345,7 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
             }
             Ok(Event::Start(start)) => {
                 let mut frame = build_start_frame(&start)?;
-                check_namespaces(&stack, &mut frame).map_err(|message| {
+                check_namespaces(&stack, &mut frame, xml11).map_err(|message| {
                     let pos = reader.buffer_position() as usize;
                     parse_error_at(text, pos, message)
                 })?;
@@ -353,7 +359,7 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
             }
             Ok(Event::Empty(start)) => {
                 let mut frame = build_start_frame(&start)?;
-                check_namespaces(&stack, &mut frame).map_err(|message| {
+                check_namespaces(&stack, &mut frame, xml11).map_err(|message| {
                     let pos = reader.buffer_position() as usize;
                     parse_error_at(text, pos, message)
                 })?;
@@ -807,29 +813,34 @@ fn parse_error_at(text: &str, pos: usize, message: String) -> Error {
     }
 }
 
-/// Record on `frame` the prefixes its attributes declare, and refuse what
-/// the writer refuses ([`Scope`]): a declaration Namespaces in XML 1.0
-/// forbids, and an element or attribute name whose prefix no `xmlns:p` on
-/// the element or an ancestor (`stack`) declares — `xml` always is. Read,
-/// such a file could not be written back.
-fn check_namespaces(stack: &[Frame], frame: &mut Frame) -> std::result::Result<(), String> {
+/// Record on `frame` the prefixes its attributes declare or undeclare,
+/// and refuse what the writer refuses ([`Scope`]): a declaration
+/// Namespaces in XML forbids (1.1 when `xml11`, else 1.0), and an element
+/// or attribute name whose prefix is not in scope — no `xmlns:p` on the
+/// element or an ancestor (`stack`) declares it, or the nearest one
+/// undeclares it; `xml` always is. Read, such a file could not be written
+/// back.
+fn check_namespaces(
+    stack: &[Frame],
+    frame: &mut Frame,
+    xml11: bool,
+) -> std::result::Result<(), String> {
     let mut prefixes = Vec::new();
     for (name, value) in &frame.attrs {
         let Value::String(uri) = value else {
             continue;
         };
-        if let Some(prefix) = declared_prefix(name, uri, &frame.tag)? {
-            prefixes.push(prefix.to_owned());
+        if let Some((prefix, bound)) = declared_prefix(name, uri, &frame.tag, xml11)? {
+            prefixes.push((prefix.to_owned(), bound));
         }
     }
     frame.prefixes = prefixes;
     let declares = |prefix: &str| {
         prefix == "xml"
-            || frame
-                .prefixes
-                .iter()
-                .chain(stack.iter().flat_map(|f| &f.prefixes))
-                .any(|p| p == prefix)
+            || std::iter::once(&*frame)
+                .chain(stack.iter().rev())
+                .find_map(|f| f.prefixes.iter().find(|(p, _)| p == prefix))
+                .is_some_and(|(_, bound)| *bound)
     };
     if let Some(message) = undeclared_prefix(&frame.tag, None, declares) {
         return Err(message);
@@ -1126,7 +1137,12 @@ fn render_xml(top: &Value) -> Result<Vec<u8>> {
         root_body,
         0,
         &mut unencodable,
-        &Scope::default(),
+        &Scope {
+            xml11: decl
+                .as_ref()
+                .is_some_and(|decl| decl.written && decl.version == "1.1"),
+            ..Scope::default()
+        },
     )?;
 
     if let Some((c, place)) = unencodable.first {
@@ -1360,21 +1376,21 @@ const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
 const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
 
 /// The namespace prefixes in scope while writing an element: the ones its
-/// own `xmlns:p` attributes declare on top of its ancestors'. `xml` is
-/// always in scope.
+/// own `xmlns:p` attributes declare (`true`) or, in XML 1.1, undeclare
+/// (`false`) on top of its ancestors'. `xml` is always in scope.
 #[derive(Default)]
 struct Scope<'a> {
     parent: Option<&'a Scope<'a>>,
-    prefixes: Vec<&'a str>,
+    prefixes: Vec<(&'a str, bool)>,
+    /// Whether the document is XML 1.1, whose namespaces may undeclare a
+    /// prefix.
+    xml11: bool,
 }
 
 impl<'a> Scope<'a> {
     /// The scope inside `<tag>`: `parent` plus the prefixes its attributes
-    /// declare. A declaration Namespaces in XML 1.0 forbids is refused:
-    /// `xmlns:xmlns`, `xmlns:xml` bound anywhere but [`XML_NAMESPACE`],
-    /// another prefix (or the default) bound to that or to
-    /// [`XMLNS_NAMESPACE`], and an empty `xmlns:p` (1.0 cannot undeclare a
-    /// prefix).
+    /// declare or undeclare. A declaration [`declared_prefix`] refuses is
+    /// refused.
     fn declared_on(
         parent: &'a Scope<'a>,
         tag: &str,
@@ -1382,20 +1398,29 @@ impl<'a> Scope<'a> {
     ) -> Result<Self> {
         let mut prefixes = Vec::new();
         for (name, uri) in attributes {
-            if let Some(prefix) = declared_prefix(name, uri, tag).map_err(write_refusal)? {
-                prefixes.push(prefix);
+            if let Some(binding) =
+                declared_prefix(name, uri, tag, parent.xml11).map_err(write_refusal)?
+            {
+                prefixes.push(binding);
             }
         }
         Ok(Self {
             parent: Some(parent),
             prefixes,
+            xml11: parent.xml11,
         })
     }
 
+    /// Whether `prefix` is in scope: `xml`, or a prefix the nearest
+    /// `xmlns:prefix` declares rather than undeclares.
     fn declares(&self, prefix: &str) -> bool {
-        prefix == "xml"
-            || self.prefixes.contains(&prefix)
-            || self.parent.is_some_and(|parent| parent.declares(prefix))
+        if prefix == "xml" {
+            return true;
+        }
+        match self.prefixes.iter().find(|(p, _)| *p == prefix) {
+            Some((_, bound)) => *bound,
+            None => self.parent.is_some_and(|parent| parent.declares(prefix)),
+        }
     }
 
     /// Refuse an element name (`on` is `None`) or an attribute name on
@@ -1417,17 +1442,20 @@ fn write_refusal(message: String) -> Error {
     }
 }
 
-/// The prefix the attribute `name="uri"` on `<tag>` declares: `p` for
-/// `xmlns:p`, `None` for the default `xmlns` and any other attribute. A
-/// declaration Namespaces in XML 1.0 forbids is an `Err` naming it:
-/// `xmlns:xmlns`, `xmlns:xml` bound anywhere but [`XML_NAMESPACE`],
-/// another prefix (or the default) bound to that or to [`XMLNS_NAMESPACE`],
-/// and an empty `xmlns:p` (1.0 cannot undeclare a prefix).
+/// The prefix the attribute `name="uri"` on `<tag>` declares, `(p, true)`
+/// for `xmlns:p`, or undeclares, `(p, false)` for `xmlns:p=""` in an XML
+/// 1.1 document (`xml11`, Namespaces in XML 1.1); `None` for the default
+/// `xmlns` and any other attribute. A declaration Namespaces in XML forbids
+/// is an `Err` naming it: `xmlns:xmlns`, `xmlns:xml` bound anywhere but
+/// [`XML_NAMESPACE`], another prefix (or the default) bound to that or to
+/// [`XMLNS_NAMESPACE`], and an empty `xmlns:p` outside XML 1.1 (Namespaces
+/// in XML 1.0 cannot undeclare a prefix).
 fn declared_prefix<'n>(
     name: &'n str,
     uri: &str,
     tag: &str,
-) -> std::result::Result<Option<&'n str>, String> {
+    xml11: bool,
+) -> std::result::Result<Option<(&'n str, bool)>, String> {
     let prefix = match name.strip_prefix("xmlns") {
         Some("") => None,
         Some(rest) => match rest.strip_prefix(':') {
@@ -1450,10 +1478,11 @@ fn declared_prefix<'n>(
         _ if uri == XMLNS_NAMESPACE => Err(format!(
             "'{name}' on <{tag}> binds {XMLNS_NAMESPACE}, which nothing may",
         )),
+        Some(prefix) if uri.is_empty() && xml11 => Ok(Some((prefix, false))),
         Some(_) if uri.is_empty() => Err(format!(
             "'{name}' on <{tag}> is empty: XML namespaces 1.0 cannot undeclare a prefix",
         )),
-        prefix => Ok(prefix),
+        prefix => Ok(prefix.map(|prefix| (prefix, true))),
     }
 }
 
@@ -2587,6 +2616,21 @@ mod tests {
         assert!(err.to_string().contains("no 'xmlns:q' declares"), "{err}");
         assert!(root.check_prefix("p:x", None).is_err());
         assert!(root.check_prefix("xmlns:a", None).is_err());
+        // XML 1.1 may undeclare a prefix; inside, it is out of scope.
+        let root11 = Scope {
+            xml11: true,
+            ..Scope::default()
+        };
+        let decls11 = [("xmlns:p", "u".to_owned())];
+        let outer11 = Scope::declared_on(&root11, "r", &decls11).expect("declares p");
+        let undo = [("xmlns:p", String::new())];
+        let inner11 = Scope::declared_on(&outer11, "k", &undo).expect("1.1 undeclares p");
+        let below = Scope::declared_on(&inner11, "j", &[]).expect("nothing declared");
+        assert!(outer11.check_prefix("p:x", None).is_ok());
+        assert!(inner11.check_prefix("p:x", None).is_err());
+        assert!(below.check_prefix("p:x", None).is_err());
+        let redo = Scope::declared_on(&below, "i", &decls11).expect("declares p again");
+        assert!(redo.check_prefix("p:x", None).is_ok());
         for (name, uri) in [
             ("xmlns:xmlns", "u"),
             ("xmlns:xml", "u"),
@@ -2611,10 +2655,23 @@ mod tests {
             "<p:r xmlns:p='u'><k><p:k/></k></p:r>",
             "<r xmlns='u' xmlns:xml='http://www.w3.org/XML/1998/namespace'/>",
             "<r xml:space='preserve'/>",
+            // XML 1.1 may undeclare a prefix, and declare it again below.
+            "<?xml version='1.1'?><r xmlns:p='u'><k xmlns:p=''><j xmlns:p='v'><p:i/></j></k></r>",
         ] {
             let value = parse_xml(xml.as_bytes()).expect(xml);
             render_xml(&value).expect(xml);
         }
+        // Undeclared, the prefix is out of scope — down to the next
+        // declaration.
+        let xml = "<?xml version='1.1'?><r xmlns:p='u'><k xmlns:p=''><j><p:i/></j></k></r>";
+        let Err(Error::Parse { message, .. }) = parse_xml(xml.as_bytes()) else {
+            panic!("{xml} must be a parse error");
+        };
+        assert_eq!(
+            message,
+            "XML parse error: element <p:i> uses the prefix 'p', which no 'xmlns:p' declares in \
+             scope"
+        );
         for (xml, message) in [
             (
                 "<a:b/>",

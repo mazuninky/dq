@@ -944,3 +944,76 @@ fn utf8_under_a_utf16_label_is_written_back_as_utf8() {
     let written = std::fs::read(dir.path().join("in_place.xml")).expect("read in_place.xml");
     assert_eq!(String::from_utf8_lossy(&written), net);
 }
+
+/// `xmlns:p=""` undeclares a prefix under Namespaces in XML 1.1, which
+/// holds for an XML 1.1 document only: with `version="1.1"` the reader and
+/// the writer take it, and the prefix is out of scope inside the element
+/// until declared again; with 1.0, or no declaration, both refuse it.
+/// Before, the reader took it in either version and the writer refused it
+/// in both.
+#[test]
+fn undeclaring_a_prefix_needs_xml_1_1() {
+    let doc = |version: &str, inner: &str| {
+        format!(
+            "<?xml version=\"{version}\"?><r xmlns:p=\"u\"><k xmlns:p=\"\">{inner}</k><p:k/></r>"
+        )
+    };
+    let v11 = doc("1.1", "");
+    let v11_redeclared = doc("1.1", "<j xmlns:p=\"v\"><p:i/></j>");
+    let v11_out = doc("1.1", "<j><p:i/></j>");
+    let v10 = doc("1.0", "");
+    let tree = |version: &str| {
+        format!(
+            "\"#xml\": {{version: \"{version}\"}}\nr:\n- \"@attrs\": {{\"xmlns:p\": u}}\n  k:\n  - \
+             \"@attrs\": {{\"xmlns:p\": \"\"}}\n"
+        )
+    };
+    let (yaml11, yaml10) = (tree("1.1"), tree("1.0"));
+    let yaml11_out = format!("{yaml11}    \"p:i\": [{{}}]\n");
+    let dir = dir_with(&[
+        ("v11.xml", v11.as_bytes()),
+        ("v11_redeclared.xml", v11_redeclared.as_bytes()),
+        ("v11_out.xml", v11_out.as_bytes()),
+        ("v10.xml", v10.as_bytes()),
+        ("v11.yaml", yaml11.as_bytes()),
+        ("v10.yaml", yaml10.as_bytes()),
+        ("v11_out.yaml", yaml11_out.as_bytes()),
+        ("bare.yaml", b"r:\n- \"@attrs\": {\"xmlns:p\": \"\"}\n"),
+    ]);
+    let empty_10 = "'xmlns:p' on <k> is empty: XML namespaces 1.0 cannot undeclare a prefix";
+    let undeclared = "element <p:i> uses the prefix 'p', which no 'xmlns:p' declares in scope";
+    assert_cases(
+        &dir,
+        &[
+            (
+                convert("v11.xml", "xml"),
+                ok("<?xml version=\"1.1\"?><r xmlns:p=\"u\">\n  <k xmlns:p=\"\"/>\n  <p:k/>\n</r>"),
+            ),
+            (
+                convert("v11_redeclared.xml", "xml"),
+                ok(
+                    "<?xml version=\"1.1\"?><r xmlns:p=\"u\">\n  <k xmlns:p=\"\">\n    <j \
+                    xmlns:p=\"v\">\n      <p:i/>\n    </j>\n  </k>\n  <p:k/>\n</r>",
+                ),
+            ),
+            (
+                convert("v11_out.xml", "json"),
+                unreadable("v11_out.xml", &format!("XML parse error: {undeclared}")),
+            ),
+            (
+                convert("v10.xml", "json"),
+                unreadable("v10.xml", &format!("XML parse error: {empty_10}")),
+            ),
+            (
+                convert("v11.yaml", "xml"),
+                ok("<?xml version=\"1.1\"?><r xmlns:p=\"u\">\n  <k xmlns:p=\"\"/>\n</r>"),
+            ),
+            (convert("v10.yaml", "xml"), refused(empty_10)),
+            (convert("v11_out.yaml", "xml"), refused(undeclared)),
+            (
+                convert("bare.yaml", "xml"),
+                refused("'xmlns:p' on <r> is empty: XML namespaces 1.0 cannot undeclare a prefix"),
+            ),
+        ],
+    );
+}
