@@ -223,6 +223,47 @@ mod tests {
         assert!(ToonReporter.report_value(&exact, &mut Vec::new()).is_ok());
     }
 
+    fn toon(value: &serde_json::Value) -> String {
+        let mut buf: Vec<u8> = Vec::new();
+        ToonReporter.report(value, &mut buf).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    /// A string or a key holding the private-use characters the tie
+    /// respelling marks floats with is written as it is, next to a float on
+    /// a 17th-digit tie and without one; the float still reads back as
+    /// itself.
+    #[test]
+    fn a_string_holding_a_marker_character_is_written_intact() {
+        let tie = 1_658_206_780_088_562.2_f64;
+        let marker = "\u{E000}0\u{E001}";
+        assert_eq!(
+            toon(&serde_json::json!({"s": "a\u{E000}b\u{E001}c", "t": [1.5, marker]})),
+            format!("s: a\u{E000}b\u{E001}c\nt[2]: 1.5,{marker}\n")
+        );
+        for (value, first) in [
+            (
+                serde_json::json!({"s": marker, "v": tie}),
+                format!("s: {marker}"),
+            ),
+            (
+                serde_json::json!({marker: "k", "v": tie}),
+                format!("\"{marker}\": k"),
+            ),
+        ] {
+            let out = toon(&value);
+            let lines: Vec<&str> = out.lines().collect();
+            assert_eq!(lines.len(), 2, "{out:?}");
+            assert_eq!(lines[0], first, "{out:?}");
+            let v = lines[1].strip_prefix("v: ").expect("a v line");
+            assert_eq!(
+                v.parse::<f64>().map(f64::to_bits),
+                Ok(tie.to_bits()),
+                "{out:?}"
+            );
+        }
+    }
+
     #[test]
     fn encodes_toon_spec_v4_empty_arrays_and_quoting() {
         let mut buf: Vec<u8> = Vec::new();

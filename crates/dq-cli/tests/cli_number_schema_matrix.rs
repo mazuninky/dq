@@ -1338,3 +1338,35 @@ fn a_limit_is_quoted_in_a_message_as_the_rule_spells_it() {
         ),
     ]);
 }
+
+/// `dq lint` quotes a limit as the rule file spells it too, in every
+/// document of a rule stream under `.dq/rules/`. Before, `0.00000000001`
+/// came out as `1e-11` and `2.50` as `2.5`.
+#[test]
+fn lint_quotes_a_limit_as_each_rule_of_a_stream_spells_it() {
+    let stream = "id: t.a\ndescription: x\nseverity: error\nmatch: { format: yaml }\n\
+                  check:\n  schema: { properties: { w: { maximum: 0.00000000001 } } }\n---\n\
+                  id: t.b\ndescription: x\nseverity: error\nmatch: { format: yaml }\n\
+                  check:\n  schema: { properties: { x: { multipleOf: 0.00000000001 }, \
+                  y: { maximum: 2.50 } } }\n";
+    let dir = dir_with(&[
+        (".dq/rules/limits.yml", stream),
+        ("doc.yaml", "w: 1\nx: 0.000000000015\ny: 3\n"),
+        ("ok.yaml", "w: 0.00000000001\nx: 0.00000000002\ny: 2.5\n"),
+    ]);
+    assert_eq!(
+        messages_in(dir.path(), &["lint", "ok.yaml"]),
+        (0, Vec::new())
+    );
+    assert_eq!(
+        messages_in(dir.path(), &["lint", "doc.yaml"]),
+        (
+            4,
+            vec![
+                "/properties/w/maximum: 1 is greater than the maximum of 0.00000000001".to_owned(),
+                "/properties/x/multipleOf: 1.5e-11 is not a multiple of 0.00000000001".to_owned(),
+                "/properties/y/maximum: 3 is greater than the maximum of 2.50".to_owned(),
+            ]
+        )
+    );
+}
