@@ -29,7 +29,9 @@ use indexmap::IndexSet;
 use walkdir::WalkDir;
 
 use crate::cli::{Cli, DocSelector};
-use crate::commands::io_helpers::{checked_index, load_document_for_lint, pick_format};
+use crate::commands::io_helpers::{
+    checked_index, load_document_for_lint, pick_format, skip_out_of_range,
+};
 use crate::commands::plugin_loader::{self, LoadedPlugins};
 use crate::error::{InvalidInput, LintFail, LintWarnStrict};
 use crate::output::Reporter;
@@ -131,6 +133,7 @@ pub(crate) fn run_with_rulesets(
     };
 
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
+    let several = expanded.len() > 1;
     for file in &expanded {
         let fmt = pick_format(file, input_format)?;
         let format_name = fmt.name().to_owned();
@@ -144,8 +147,18 @@ pub(crate) fn run_with_rulesets(
         // of its own — `match.filter`, `check`, `loc.*`, composite
         // `extract` and plugins all see one document, as they would in a
         // file of its own. `--doc N` keeps only document N.
+        // Over several files, one without document N is skipped with a
+        // note on stderr; a single file without it is exit 2.
         let only = match cli.doc {
-            Some(DocSelector::Index(index)) => Some(checked_index(&doc, index, file)?),
+            Some(DocSelector::Index(index)) => {
+                match skip_out_of_range(checked_index(&doc, index, file), several)? {
+                    Ok(index) => Some(index),
+                    Err(reason) => {
+                        tracing::warn!("skipped {file}: {reason}");
+                        continue;
+                    }
+                }
+            }
             Some(DocSelector::All) | None => None,
         };
         match doc.stream_documents() {

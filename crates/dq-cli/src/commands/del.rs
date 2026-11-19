@@ -31,7 +31,7 @@ use std::io::Write;
 use camino::Utf8Path;
 use dq_core::{Document, Pointer};
 
-use super::io_helpers::{pick_format, pointer_in_document, read_bytes};
+use super::io_helpers::{pick_format, pointer_in_document, read_bytes, skip_out_of_range};
 use crate::bulk::{self, FileOp, FileOpResult};
 use crate::cli::{Cli, DelArgs, DocSelector};
 
@@ -81,15 +81,15 @@ pub fn run(
     // Parse the pointer ONCE — every file uses the same pointer.
     let pointer = Pointer::parse(&args.pointer).map_err(anyhow::Error::new)?;
 
+    let files = bulk::expand_glob(&args.file)?;
     let op = DelFileOp {
         cli,
         input_format,
         use_color,
         pointer: &pointer,
         doc_index,
+        several: files.len() > 1,
     };
-
-    let files = bulk::expand_glob(&args.file)?;
     bulk::run_per_file(files, &op, cli, out)
 }
 
@@ -102,6 +102,8 @@ struct DelFileOp<'a> {
     pointer: &'a Pointer,
     /// `--doc N`: `pointer` is relative to document `N` of a stream.
     doc_index: Option<usize>,
+    /// The run covers several files: one without document `N` is skipped.
+    several: bool,
 }
 
 impl<'a> FileOp for DelFileOp<'a> {
@@ -127,7 +129,13 @@ impl<'a> FileOp for DelFileOp<'a> {
         };
 
         let mut document = parse_to_document(format, &parse_input, path)?;
-        let pointer = pointer_in_document(&document, self.doc_index, self.pointer, path)?;
+        let pointer = match skip_out_of_range(
+            pointer_in_document(&document, self.doc_index, self.pointer, path),
+            self.several,
+        )? {
+            Ok(pointer) => pointer,
+            Err(reason) => return Ok(FileOpResult::Skipped(reason)),
+        };
         document.del_at(&pointer).map_err(anyhow::Error::new)?;
 
         let mut final_bytes = document.original_bytes().to_vec();

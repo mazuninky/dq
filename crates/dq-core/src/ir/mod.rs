@@ -401,8 +401,8 @@ impl<'a> Ir<'a> {
     /// IR views one document of a stream ([`Ir::with_origin`]), where it is
     /// the start of the document's first line that holds a spanned value
     /// (spans cover scalars and empty containers, so for `b:\n  c: 2` that
-    /// is the `c: 2` line), so the finding still lands in the document it
-    /// is about.
+    /// is the `c: 2` line) — or its `---` line, for an empty document — so
+    /// the finding still lands in the document it is about.
     #[must_use]
     pub fn origin_line_col(&self) -> (u32, u32) {
         match self.origin {
@@ -507,9 +507,9 @@ pub struct StreamDocument<'a> {
     provenance: ProvenanceMap,
     format: FormatTag,
     bytes: &'a [u8],
-    /// Start of the first line holding a node of this document; `None`
-    /// when the document has no spans (an empty document, a read-only
-    /// parse).
+    /// Start of the first line holding a node of this document, or of its
+    /// `---` line when no node lies inside it (an empty document); `None`
+    /// for a read-only parse.
     origin: Option<usize>,
 }
 
@@ -542,11 +542,20 @@ impl<'a> StreamDocument<'a> {
 
 /// Split a stream's `documents` and its `/{doc_idx}/...`-keyed
 /// `provenance` into one [`StreamDocument`] per document.
+///
+/// `bounds`, when known, is each document's byte range in `bytes` — from
+/// the start of its `---` line (its first line, for an implicit document)
+/// to where the next document begins. A document's origin is the first
+/// line holding one of its spans, but only when that line lies inside the
+/// document: the empty node of an empty document is spanned at the next
+/// event — the next `---`, or the end of the file — so such a document
+/// starts at its own `---` line instead.
 pub(crate) fn split_stream<'a>(
     documents: &'a [Value],
     provenance: &ProvenanceMap,
     format: FormatTag,
     bytes: &'a [u8],
+    bounds: Option<&[std::ops::Range<usize>]>,
 ) -> Vec<StreamDocument<'a>> {
     let mut parts: Vec<StreamDocument<'a>> = documents
         .iter()
@@ -591,6 +600,13 @@ pub(crate) fn split_stream<'a>(
             Provenance::Synthetic { reason } => Provenance::Synthetic { reason: *reason },
         };
         part.provenance.insert(rebased_key, rebased);
+    }
+    if let Some(bounds) = bounds {
+        for (part, bound) in parts.iter_mut().zip(bounds) {
+            if !part.origin.is_some_and(|origin| bound.contains(&origin)) {
+                part.origin = Some(bound.start);
+            }
+        }
     }
     parts
 }

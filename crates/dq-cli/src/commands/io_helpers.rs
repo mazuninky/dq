@@ -213,6 +213,25 @@ pub(crate) fn checked_index(
     }
 }
 
+/// Turn a [`DocOutOfRange`] from `result` into a reason to skip the file
+/// when the run covers several files.
+///
+/// Over several files (`several`), a file without the document `--doc N`
+/// names is not an error: `Ok(Err(reason))` says why to skip it, and the
+/// run goes on with the next file. Over exactly one file — and for every
+/// other error — `result` is returned as it is: a single file lacking
+/// document N is exit 2, as for every single-file command.
+pub(crate) fn skip_out_of_range<T>(
+    result: anyhow::Result<T>,
+    several: bool,
+) -> anyhow::Result<Result<T, String>> {
+    match result {
+        Ok(value) => Ok(Ok(value)),
+        Err(err) if several && err.is::<DocOutOfRange>() => Ok(Err(err.to_string())),
+        Err(err) => Err(err),
+    }
+}
+
 /// Resolve `--doc` against `doc`, returning the [`Value`] a read command
 /// works on.
 ///

@@ -230,7 +230,7 @@ check:
 
 ## Multi-document YAML streams
 
-A YAML file with several `---`-separated documents (a Kubernetes manifest bundle, say) is a stream. `lint`, `check` and `fix` treat each document as a file of its own: rules match, check, locate and fix one document at a time, and diagnostics carry the line in the file. `dq fix` writes every document back, `---` separators included.
+A YAML file with several `---`-separated documents (a Kubernetes manifest bundle, say) is a stream. `lint`, `check` and `fix` treat each document as a file of its own: rules match, check, locate and fix one document at a time, and diagnostics carry the line in the file. `dq fix` writes every document back, `---` separators included; a `fix.jq` re-emits only the document it fixes (dropping that document's comments) and leaves the others byte for byte.
 
 `--doc N|all` picks the document a command works on; a file that is not a stream is document 0:
 
@@ -244,7 +244,7 @@ dq --doc 1 lint bundle.yaml                       # lint the second document onl
 dq --doc 1 convert bundle.yaml -F json            # convert one document
 ```
 
-Read commands (`get`, `exists`, `keys`, `values`, `len`, `type`, `paths`, `select`, `query`) read document 0 unless told otherwise. `set --jq` without `--doc` sees the stream as an array of documents and must return one. `--doc all` is refused by `set` and `del`, any `--doc` by `convert -i` and by commands that work on the whole file (`fmt`, `validate`, `diff`, `patch`, `merge`, …): a usage error, exit 2. An index past the last document is exit 2 as well.
+Read commands (`get`, `exists`, `keys`, `values`, `len`, `type`, `paths`, `select`, `query`) read document 0 unless told otherwise. `set --jq` without `--doc` sees the stream as an array of documents and must return one. `--doc all` is refused by `set` and `del`, any `--doc` by `convert -i` and by commands that work on the whole file (`fmt`, `validate`, `diff`, `patch`, `merge`, …): a usage error, exit 2. An index past the last document is exit 2 as well; over several files (a glob, a directory, a list), a file without that document is skipped with a note on stderr and the run goes on.
 
 ## Global write flags & exit codes
 

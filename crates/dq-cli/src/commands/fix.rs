@@ -56,7 +56,9 @@ use indexmap::IndexSet;
 
 use crate::bulk::{self, FileOp, FileOpResult};
 use crate::cli::{Cli, DocSelector, FixArgs};
-use crate::commands::io_helpers::{checked_index, load_document_for_lint, pick_format, read_bytes};
+use crate::commands::io_helpers::{
+    checked_index, load_document_for_lint, pick_format, read_bytes, skip_out_of_range,
+};
 use crate::commands::lint_core::expand_lint_inputs;
 use crate::commands::plugin_loader::{self, LoadedPlugins};
 use crate::error::InvalidInput;
@@ -156,6 +158,7 @@ pub fn run(
         use_color,
         fixer,
         plugins,
+        several: expanded.len() > 1,
     };
 
     bulk::run_per_file(expanded, &op, cli, out)
@@ -173,6 +176,9 @@ struct FixFileOp<'a> {
     /// workers via the outer `Arc`. `None` when the flag is absent or the
     /// directory contains no `*.wasm` files.
     plugins: Option<Arc<LoadedPlugins>>,
+    /// The run covers several files: one without document `--doc N` is
+    /// skipped.
+    several: bool,
 }
 
 impl<'a> FileOp for FixFileOp<'a> {
@@ -189,7 +195,12 @@ impl<'a> FileOp for FixFileOp<'a> {
         // written back with every document; `--doc N` fixes document N
         // alone.
         let only = match self.cli.doc {
-            Some(DocSelector::Index(index)) => Some(checked_index(&document, index, path)?),
+            Some(DocSelector::Index(index)) => {
+                match skip_out_of_range(checked_index(&document, index, path), self.several)? {
+                    Ok(index) => Some(index),
+                    Err(reason) => return Ok(FileOpResult::Skipped(reason)),
+                }
+            }
             Some(DocSelector::All) | None => None,
         };
 
@@ -270,11 +281,12 @@ impl<'a> FileOp for FixFileOp<'a> {
         // - Only `fix.ops` (rule-engine) and/or plugin EditScripts ran →
         //   `document.original_bytes()` is the canonical post-fix byte
         //   buffer; comments are preserved.
-        // - Any `fix.jq` ran → the document was replaced with a
-        //   value-only one (no spans, no `original_bytes`); re-emit
-        //   through the format writer, same trade-off as
-        //   `dq set --jq`.
-        let final_bytes = if outcome.legacy_jq_applied {
+        // - A `fix.jq` ran and left a value-only document (no spans, no
+        //   `original_bytes`) → re-emit through the format writer, same
+        //   trade-off as `dq set --jq`. In a YAML stream a `fix.jq`
+        //   normally rewrites only its own document inside
+        //   `original_bytes`, which then stay canonical.
+        let final_bytes = if outcome.legacy_jq_applied && document.original_bytes().is_empty() {
             let mut buf = Vec::new();
             format
                 .write_with_options(&document, &mut buf, &self.cli.write_options())

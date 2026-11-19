@@ -1017,10 +1017,12 @@ fn bulk_fix_counts_a_stream_as_one_file() {
     );
 }
 
-/// `--doc 1` over a glob: the streams are edited, the single-document file
-/// has no document 1 and is the one failure (exit 7), left untouched.
+/// `--doc 1` over a glob: the streams are edited; the single-document
+/// file has no document 1, so it is skipped with a note on stderr and
+/// left untouched, and the run goes on (exit 0) — no
+/// `--continue-on-error` needed.
 #[test]
-fn bulk_set_doc_fails_the_file_without_that_document() {
+fn bulk_set_doc_skips_the_file_without_that_document() {
     let scratch = Scratch::new();
     scratch.write("bk/a.yaml", STREAM);
     scratch.write("bk/b.yaml", SINGLE);
@@ -1029,7 +1031,6 @@ fn bulk_set_doc_fails_the_file_without_that_document() {
         .dq()
         .args([
             "-i",
-            "--continue-on-error",
             "--doc",
             "1",
             "set",
@@ -1039,15 +1040,14 @@ fn bulk_set_doc_fails_the_file_without_that_document() {
         ])
         .output()
         .expect("spawn dq");
-    assert_eq!(output.status.code(), Some(7));
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8");
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
     let stdout = String::from_utf8(output.stdout).expect("UTF-8");
+    assert_eq!(stdout, "Modified: 2, Skipped: 1, Failed: 0\n");
     assert!(
-        stdout.starts_with("Modified: 2, Skipped: 0, Failed: 1\n"),
-        "{stdout}"
-    );
-    assert!(
-        stdout.contains("bk/b.yaml: --doc 1 is out of range: bk/b.yaml holds 1 document(s)"),
-        "{stdout}"
+        stderr
+            .contains("skipped bk/b.yaml: --doc 1 is out of range: bk/b.yaml holds 1 document(s)"),
+        "{stderr}"
     );
     let edited = STREAM.replace("{name: b}", "{name: z}");
     assert_eq!(scratch.read("bk/a.yaml"), edited);
@@ -1192,4 +1192,211 @@ fn a_plugin_lints_every_document_of_a_stream() {
             diag("example.demo-lint", 5, 1)
         ]
     );
+}
+
+/// Fires on every document without a `name` key — an empty document
+/// (`null`) included.
+const NO_NAME_RULE: &str = r#"
+id: test.no-name
+description: every document has a name
+severity: warn
+match:
+  format: yaml
+check:
+  jq: 'select(has("name") | not)'
+  message: "no name"
+"#;
+
+/// An empty document reports at its own `---` line (line 1 for an implicit
+/// first document) — never past the end of the file, never on the
+/// separator of the document after it.
+#[test]
+fn an_empty_document_reports_at_its_own_marker_line() {
+    let scratch = Scratch::new();
+    scratch.write("no-name.yml", NO_NAME_RULE);
+    let cases: [(&str, &[u64]); 4] = [
+        ("name: a\n---\n", &[2]),
+        ("---\n---\n", &[1, 2]),
+        ("name: a\n--- # c\n# tail\n", &[2]),
+        ("name: a\n---\n---\nname: c\n", &[2]),
+    ];
+    for (source, lines) in cases {
+        scratch.write("e.yaml", source);
+        let (code, found) = scratch.diagnostics(&["lint", "--rules", "no-name.yml", "e.yaml"]);
+        assert_eq!(code, 0, "{source:?}");
+        let expected: Vec<_> = lines
+            .iter()
+            .map(|&line| diag("test.no-name", line, 1))
+            .collect();
+        assert_eq!(found, expected, "{source:?}");
+    }
+}
+
+/// A `fix.jq` in one document re-emits that document only: every other
+/// document keeps its bytes — `---` lines and comments included — and a
+/// `fix.ops` in a later document still applies in the same run.
+#[test]
+fn fix_jq_in_one_document_keeps_every_other_byte_and_later_ops_apply() {
+    let scratch = Scratch::new();
+    scratch.write(
+        "jq.yml",
+        r#"
+id: test.jq-name
+description: documents with x get a name
+severity: warn
+match: {format: yaml}
+check:
+  jq: 'select(type == "object" and has("x") and .name != "fixed")'
+  message: no name
+fix:
+  jq: '.name = "fixed"'
+"#,
+    );
+    scratch.write(
+        "ops.yml",
+        r#"
+id: test.ops-name
+description: z becomes zz
+severity: warn
+match: {format: yaml}
+check:
+  jq: 'select(type == "object" and .name == "z")'
+  message: z
+fix:
+  ops: 'if .name == "z" then [{"op":"replace","path":"/name","value":"zz"}] else [] end'
+"#,
+    );
+    scratch.write(
+        "m.yaml",
+        "# head\nname: a # keep\n--- # one\nx: 1 # c\n---\n- 1\n---\nname: z # tail\n",
+    );
+    scratch
+        .run(&[
+            "-i", "fix", "--rules", "jq.yml", "--rules", "ops.yml", "m.yaml",
+        ])
+        .expect("fix -i");
+    assert_eq!(
+        scratch.read("m.yaml"),
+        "# head\nname: a # keep\n--- # one\nx: 1\nname: fixed\n---\n- 1\n---\nname: zz # tail\n"
+    );
+}
+
+/// A `fix.ops` script that replaces or removes the whole document is the
+/// same error in a single file and in a stream: exit 3, naming the rule
+/// and the document, the file untouched.
+#[test]
+fn fix_ops_on_a_whole_document_is_one_error_in_a_file_and_in_a_stream() {
+    let scratch = Scratch::new();
+    for (op, value) in [("replace", r#","value":{"ok":true}"#), ("remove", "")] {
+        scratch.write(
+            "whole.yml",
+            &format!(
+                r#"
+id: test.whole
+description: whole-document fix
+severity: warn
+match: {{format: yaml}}
+check:
+  jq: 'select(.bad == true)'
+  message: bad
+fix:
+  ops: '[{{"op":"{op}","path":""{value}}}]'
+"#
+            ),
+        );
+        for (file, source, document) in [
+            ("single.yaml", "bad: true\n", "the document"),
+            (
+                "stream.yaml",
+                "ok: 1\n---\nbad: true\n",
+                "document 1 of the stream",
+            ),
+        ] {
+            scratch.write(file, source);
+            let (code, stderr) = scratch
+                .run(&["-i", "fix", "--rules", "whole.yml", file])
+                .expect_err("a whole-document fix.ops is refused");
+            assert_eq!(code, 3, "{op} {file}: {stderr}");
+            assert!(
+                stderr.starts_with(&format!(
+                    "rule test.whole fix failed: fix.ops would {op} {document} as a whole"
+                )),
+                "{op} {file}: {stderr}"
+            );
+            assert_eq!(scratch.read(file), source, "{op} {file}: untouched");
+        }
+    }
+}
+
+/// `--doc N` over several files: lint and fix skip a file without
+/// document N with a note on stderr and go on with the rest.
+#[test]
+fn bulk_lint_and_fix_doc_skip_the_file_without_that_document() {
+    let scratch = Scratch::new();
+    scratch.write("bk/a.yaml", STREAM);
+    scratch.write("bk/b.yaml", SINGLE);
+    scratch.write("bk/c.yaml", STREAM);
+
+    let output = scratch
+        .dq()
+        .args(["-F", "json", "--doc", "1", "lint", "--rules", "rule.yml"])
+        .args(["bk/a.yaml", "bk/b.yaml", "bk/c.yaml"])
+        .output()
+        .expect("spawn dq");
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8");
+    assert_eq!(output.status.code(), Some(4), "{stderr}");
+    assert!(
+        stderr.contains("skipped bk/b.yaml: --doc 1 is out of range"),
+        "{stderr}"
+    );
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    let paths: Vec<_> = body["diagnostics"]
+        .as_array()
+        .expect("diagnostics")
+        .iter()
+        .map(|d| d["path"].as_str().expect("path").to_owned())
+        .collect();
+    assert_eq!(paths, vec!["bk/a.yaml", "bk/c.yaml"]);
+
+    let output = scratch
+        .dq()
+        .args(["-i", "--doc", "1", "fix", "--rules", "rule.yml"])
+        .args(["bk/a.yaml", "bk/b.yaml", "bk/c.yaml"])
+        .output()
+        .expect("spawn dq");
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8");
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8"),
+        "Modified: 2, Skipped: 1, Failed: 0\n"
+    );
+    let fixed = STREAM.replace("{name: b}", "{name: fixed}");
+    assert_eq!(scratch.read("bk/a.yaml"), fixed);
+    assert_eq!(scratch.read("bk/b.yaml"), SINGLE);
+    assert_eq!(scratch.read("bk/c.yaml"), fixed);
+
+    // One file lacking document 1 stays an exit-2 error.
+    let (code, _) = scratch
+        .run(&["--doc", "1", "lint", "--rules", "rule.yml", "bk/b.yaml"])
+        .unwrap_err();
+    assert_eq!(code, 2);
+}
+
+/// `set --jq` returning an empty array for a whole stream would write a
+/// file with no document: refused (exit 6), the file untouched. With
+/// `--doc N` an empty array is that document's value.
+#[test]
+fn set_jq_empty_array_over_a_stream_is_refused() {
+    let scratch = Scratch::new();
+    let (code, stderr) = scratch
+        .run(&["-i", "set", "s.yaml", "--jq", "[]"])
+        .unwrap_err();
+    assert_eq!(code, 6);
+    assert!(stderr.contains("--jq returned an empty array"), "{stderr}");
+    assert_eq!(scratch.read("s.yaml"), STREAM);
+
+    let out = scratch
+        .run(&["--doc", "0", "set", "s.yaml", "--jq", "[]"])
+        .expect("a per-document value");
+    assert!(out.starts_with("[]\n---\n"), "{out}");
 }

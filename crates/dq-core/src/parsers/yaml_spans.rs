@@ -184,6 +184,83 @@ pub fn parse_yaml_stream_with_spans(bytes: &[u8]) -> Result<Document> {
     Ok(doc)
 }
 
+/// Where one document of a YAML stream sits in its source bytes, as
+/// [`document_extents`] finds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DocumentExtent {
+    /// Start of the line the document begins on: the line of its `---`
+    /// marker, or — for an implicit document — of its first content.
+    pub(crate) line_start: usize,
+    /// The document's body: from just after the marker line (from just
+    /// after `---` when content shares that line) to where the next
+    /// document's marker, an explicit `...`, or the end of the source
+    /// begins. Comments in between belong to the body.
+    pub(crate) body: Range<usize>,
+    /// Whether text replacing `body` must start with a line break: the
+    /// body begins on the marker line (`--- {a: 1}`), or the marker is the
+    /// last line and has no newline.
+    pub(crate) needs_line_break: bool,
+}
+
+/// One [`DocumentExtent`] per document of the YAML source `bytes`, in
+/// stream order; `None` when `bytes` do not parse (the callers only ask
+/// about sources that already did).
+///
+/// The document spans the span builder records cannot say this: a
+/// document's empty node (`---` followed by nothing) is spanned at the
+/// *next* event — the next `---`, or the end of the source — and a
+/// non-empty container carries no span at all.
+pub(crate) fn document_extents(bytes: &[u8]) -> Option<Vec<DocumentExtent>> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let char_to_byte = build_char_to_byte_map(text);
+    let line_start_of = |at: usize| {
+        bytes[..at]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |newline| newline + 1)
+    };
+    let mut extents: Vec<DocumentExtent> = Vec::new();
+    let mut parser = YamlParser::new_from_str(text);
+    while let Some(item) = parser.next_event() {
+        let (event, span) = item.ok()?;
+        match event {
+            Event::DocumentStart(explicit) => {
+                let range = span_to_range(span, &char_to_byte);
+                let line_start = line_start_of(range.start);
+                let (body_start, needs_line_break) = if explicit {
+                    let line_end = bytes[range.end..]
+                        .iter()
+                        .position(|&b| b == b'\n')
+                        .map(|offset| range.end + offset);
+                    let rest = &bytes[range.end..line_end.unwrap_or(bytes.len())];
+                    let rest = rest.trim_ascii_start();
+                    let only_a_comment = rest.is_empty() || rest.starts_with(b"#");
+                    match line_end {
+                        Some(line_end) if only_a_comment => (line_end + 1, false),
+                        None if only_a_comment => (bytes.len(), true),
+                        _ => (range.end, true),
+                    }
+                } else {
+                    (range.start, false)
+                };
+                extents.push(DocumentExtent {
+                    line_start,
+                    body: body_start..body_start,
+                    needs_line_break,
+                });
+            }
+            Event::DocumentEnd => {
+                let end = char_index_to_byte(&char_to_byte, span.start.index());
+                if let Some(extent) = extents.last_mut() {
+                    extent.body.end = end.max(extent.body.start);
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(extents)
+}
+
 /// The write-aware [`Document`] for a [`SpanParse`] of `bytes`.
 fn span_document(parsed: SpanParse, bytes: &[u8]) -> Document {
     let provenance = build_provenance_with_inline_offsets(&parsed.spans, &parsed.block_scalars);
@@ -3450,5 +3527,49 @@ mod tests {
         // map `b` has no span of its own) — not to line 1 of the file.
         assert_eq!(ir.origin_line_col().0, 5);
         assert_eq!(parts[0].as_ir().origin_line_col(), (1, 1));
+    }
+
+    #[test]
+    fn an_empty_document_starts_at_its_own_marker_line() {
+        // (source, the fallback line of each document)
+        let cases: [(&[u8], &[u32]); 5] = [
+            (b"name: a\n---\n", &[1, 2]),
+            (b"---\n---\n", &[1, 2]),
+            (b"name: a\n--- # c\n# tail\n", &[1, 2]),
+            (b"name: a\n---\n---\nname: c\n", &[1, 2, 4]),
+            (b"name: a\n---", &[1, 2]),
+        ];
+        for (bytes, lines) in cases {
+            let doc = parse_yaml_stream_with_spans(bytes).unwrap();
+            let found: Vec<u32> = doc
+                .stream_documents()
+                .expect("a stream")
+                .iter()
+                .map(|part| part.as_ir().origin_line_col().0)
+                .collect();
+            assert_eq!(found, lines, "{:?}", String::from_utf8_lossy(bytes));
+        }
+    }
+
+    #[test]
+    fn document_extents_locate_marker_lines_and_bodies() {
+        let bytes = b"# h\na: 1\n--- # c\nb: 2\n--- {c: 3}\n...\n";
+        let extents = document_extents(bytes).expect("parses");
+        let body = |extent: &DocumentExtent| &bytes[extent.body.clone()];
+        assert_eq!(extents.len(), 3);
+        assert_eq!(
+            (extents[0].line_start, body(&extents[0])),
+            (4, &b"a: 1\n"[..])
+        );
+        assert_eq!(
+            (extents[1].line_start, body(&extents[1])),
+            (9, &b"b: 2\n"[..])
+        );
+        assert!(!extents[1].needs_line_break);
+        assert_eq!(
+            (extents[2].line_start, body(&extents[2])),
+            (22, &b" {c: 3}\n"[..])
+        );
+        assert!(extents[2].needs_line_break, "content on the marker line");
     }
 }

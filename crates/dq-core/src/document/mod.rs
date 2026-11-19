@@ -22,6 +22,7 @@
 //! (single only) and [`Document::values`] (multi only).
 
 pub mod spans;
+mod stream;
 
 use std::fmt;
 use std::str::FromStr;
@@ -640,11 +641,26 @@ impl Document {
     #[must_use]
     pub fn stream_documents(&self) -> Option<Vec<crate::StreamDocument<'_>>> {
         let documents = self.values()?;
+        // Where each document sits in the bytes, so a document's fallback
+        // position stays inside it — an empty document has no span of its
+        // own inside it.
+        let bounds: Option<Vec<std::ops::Range<usize>>> = (self.format == FormatTag::Yaml
+            && !self.original_bytes.is_empty())
+        .then(|| crate::parsers::yaml_spans::document_extents(&self.original_bytes))
+        .flatten()
+        .filter(|extents| extents.len() == documents.len())
+        .map(|extents| {
+            extents
+                .into_iter()
+                .map(|extent| extent.line_start..extent.body.end)
+                .collect()
+        });
         Some(crate::ir::split_stream(
             documents,
             &self.provenance,
             self.format,
             &self.original_bytes,
+            bounds.as_deref(),
         ))
     }
 

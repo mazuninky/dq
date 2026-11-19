@@ -42,6 +42,7 @@ use indexmap::IndexMap;
 
 use super::io_helpers::{
     checked_index, load_document_with_path, pick_format, pointer_in_document, read_bytes,
+    skip_out_of_range,
 };
 use super::query::jq_compile_to_parse;
 use crate::bulk::{self, FileOp, FileOpResult};
@@ -150,17 +151,17 @@ pub fn run(
     // return `Path { MissingKey }` if it doesn't exist, so mkdir-p (the
     // Bug #1 fix in `Document::set_at`) does NOT silently create new keys
     // when the user explicitly asked to keep the document shape unchanged.
+    let files = bulk::expand_glob(&args.file)?;
     let op = SetFileOp {
         cli,
         input_format,
         use_color,
         pointer: &pointer,
         doc_index,
+        several: files.len() > 1,
         value: &value,
         no_create: args.no_create,
     };
-
-    let files = bulk::expand_glob(&args.file)?;
     bulk::run_per_file(files, &op, cli, out)
 }
 
@@ -174,6 +175,8 @@ struct SetFileOp<'a> {
     pointer: &'a Pointer,
     /// `--doc N`: `pointer` is relative to document `N` of a stream.
     doc_index: Option<usize>,
+    /// The run covers several files: one without document `N` is skipped.
+    several: bool,
     value: &'a Value,
     /// When `true`, fail (exit 2) instead of creating missing keys via
     /// the mkdir-p path in `Document::set_at`. Mirrors `--no-create` on
@@ -214,7 +217,13 @@ impl<'a> FileOp for SetFileOp<'a> {
         //    via `Toml::parse`; JSONL is read-only, so `set_at` will return
         //    `WriteUnavailable` and the exit-code mapper picks 7).
         let mut document = parse_to_document(format, &parse_input, path)?;
-        let pointer = pointer_in_document(&document, self.doc_index, self.pointer, path)?;
+        let pointer = match skip_out_of_range(
+            pointer_in_document(&document, self.doc_index, self.pointer, path),
+            self.several,
+        )? {
+            Ok(pointer) => pointer,
+            Err(reason) => return Ok(FileOpResult::Skipped(reason)),
+        };
 
         // 5. Apply the write. Cloning the value is unavoidable because
         //    `set_at` consumes a `Value` (the engine takes ownership of the
@@ -276,6 +285,8 @@ struct JqFileOp<'a> {
     input_format: Option<&'a str>,
     /// `--doc N`: the filter transforms document `N` of a stream alone.
     doc_index: Option<usize>,
+    /// The run covers several files: one without document `N` is skipped.
+    several: bool,
     use_color: bool,
     engine: Arc<dq_transform::JqEngine>,
 }
@@ -303,7 +314,12 @@ impl<'a> FileOp for JqFileOp<'a> {
         // `--doc N` hands the filter one document of a stream; without it
         // a stream reaches the filter as the array of its documents.
         let target = match self.doc_index {
-            Some(index) => Some(checked_index(&document, index, path)?),
+            Some(index) => {
+                match skip_out_of_range(checked_index(&document, index, path), self.several)? {
+                    Ok(index) => Some(index),
+                    Err(reason) => return Ok(FileOpResult::Skipped(reason)),
+                }
+            }
             None => None,
         };
         let input = match (target, document.values()) {
@@ -374,12 +390,13 @@ impl<'a> FileOp for JqFileOp<'a> {
 /// with its `---` instead of one document holding a sequence: with
 /// `--doc N` (`target`) the output replaces document `N` alone; without it
 /// the filter saw the array of the documents and must return such an
-/// array, each item becoming a document.
+/// array — a non-empty one, each item becoming a document.
 ///
 /// # Errors
 ///
 /// [`InvalidInput`] (exit 6) when a filter over a whole stream returns
-/// anything but an array.
+/// anything but an array, or an empty one — that would write a file with
+/// no document at all. With `--doc N` any value is that document's.
 fn rebuild_document(
     document: &Document,
     target: Option<usize>,
@@ -394,6 +411,12 @@ fn rebuild_document(
             let mut documents = values.to_vec();
             documents[index] = output;
             Ok(Document::multi_value_only(documents, document.format()))
+        }
+        (None, Value::Array(documents)) if documents.is_empty() => {
+            Err(anyhow::Error::new(InvalidInput::new(format!(
+                "{path} is a stream of {} documents: --jq returned an empty array, which would leave the file with no document; pass --doc N to transform one document",
+                values.len(),
+            ))))
         }
         (None, Value::Array(documents)) => {
             Ok(Document::multi_value_only(documents, document.format()))
@@ -445,15 +468,15 @@ fn run_jq_transform(
     let engine = dq_transform::JqEngine::compile(expression)
         .map_err(|e| anyhow::Error::new(jq_compile_to_parse(e, &args.file, expression)))?;
 
+    let files = bulk::expand_glob(&args.file)?;
     let op = JqFileOp {
         cli,
         input_format,
         doc_index,
+        several: files.len() > 1,
         use_color,
         engine: Arc::new(engine),
     };
-
-    let files = bulk::expand_glob(&args.file)?;
     bulk::run_per_file(files, &op, cli, out)
 }
 

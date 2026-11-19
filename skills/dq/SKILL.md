@@ -111,7 +111,7 @@ dq --doc 1 set bundle.yaml /spec/replicas 3 -i    # pointer relative to document
 dq lint bundle.yaml                               # every document linted on its own
 ```
 
-`lint` / `check` / `fix` evaluate each document separately; `fix` keeps every document and `---`. `--doc` on a command that cannot honour it (`fmt`, `validate`, `diff`, `patch`, `merge`, `convert -i`, `--doc all` with `set` / `del`) is a usage error, exit 2; so is an index past the last document.
+`lint` / `check` / `fix` evaluate each document separately; `fix` keeps every document and `---`. `--doc` on a command that cannot honour it (`fmt`, `validate`, `diff`, `patch`, `merge`, `convert -i`, `--doc all` with `set` / `del`) is a usage error, exit 2; so is an index past the last document of a single file (over several files such a file is skipped with a stderr note).
 
 ## Write — in-place with round-trip preservation
 

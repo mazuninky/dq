@@ -41,9 +41,10 @@ pub enum FileOpResult {
     },
     /// File is byte-identical to its prospective output (idempotent run).
     Unchanged,
-    /// File was skipped for a non-error reason (e.g., path filter); the
-    /// string is shown to the user. Reserved for future use; M3 doesn't
-    /// produce `Skipped`.
+    /// File was skipped for a non-error reason — in a bulk run, a file
+    /// without the document `--doc N` names. The driver counts it under
+    /// `Skipped` and notes the reason on stderr (a `tracing::warn!`
+    /// line), keeping stdout for the files' output.
     Skipped(String),
 }
 
@@ -290,7 +291,7 @@ pub fn run_per_file(
             }
             Ok(FileOpResult::Skipped(reason)) => {
                 skipped += 1;
-                writeln!(buffer, "Skipped: {path} ({reason})")?;
+                tracing::warn!("skipped {path}: {reason}");
             }
             Err(e) => {
                 if cli.continue_on_error && is_bulk {

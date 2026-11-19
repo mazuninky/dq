@@ -18,11 +18,23 @@
 //! A YAML stream parsed by [`dq_core::parse_yaml_stream_with_spans`] is
 //! fixed one document at a time ([`Fixer::apply_to`] narrows it to one):
 //! for each document, every rule runs against that document's value as
-//! if it were a file of its own. A `fix.ops` script is rebased under the
-//! document's `/N` with [`EditScript::under`] before it is applied, so
-//! the textual edit lands in that document and every `---` survives; a
-//! `fix.jq` output replaces that document alone and the result stays a
-//! stream ([`Document::multi_value_only`]).
+//! if it were a file of its own.
+//!
+//! - A `fix.ops` script is rebased under the document's `/N` with
+//!   [`EditScript::under`] and applied as a textual edit, so the rest of
+//!   the file — other documents, comments, every `---` — keeps its bytes.
+//!   A script that adds, replaces or removes the document itself (path
+//!   `""`) is a [`ExecError::FixApply`], in a stream and in a single
+//!   document alike: whole-document edits are not textual edits yet.
+//! - A `fix.jq` output is written into the file with
+//!   [`Document::reemit_stream_document`]: that document's body is
+//!   re-emitted through the YAML writer (its comments are dropped), its
+//!   `---` line and every other document keep their bytes, and the
+//!   stream stays write-aware, so `fix.ops` rules after it — in any
+//!   document — still apply. Only when that re-emit is refused does the
+//!   whole stream fall back to a value-only
+//!   [`Document::multi_value_only`] that the CLI writes through the
+//!   format's writer, dropping every comment.
 //!
 //! ## OPS branch (Phase 4)
 //!
@@ -57,19 +69,20 @@
 //!
 //! ## JQ branch (legacy M10, deprecated)
 //!
-//! Whole-document jq transformation. The output replaces the document
-//! tree (via [`Document::value_only`]), which **drops the original
-//! bytes and the span map** — subsequent `fix.ops` rules on the same
-//! file will see a read-only document and surface
-//! [`dq_core::Error::WriteUnavailable`] from
-//! [`EditScript::apply`]. The fixer catches that and logs a warn-level
-//! skip rather than aborting the whole run.
+//! Whole-document jq transformation. Outside a YAML stream the output
+//! replaces the document tree (via [`Document::value_only`]), which
+//! **drops the original bytes and the span map** — subsequent `fix.ops`
+//! rules on the same file will see a read-only document and surface
+//! [`dq_core::Error::WriteUnavailable`] from [`EditScript::apply`]. The
+//! fixer catches that and logs a warn-level skip rather than aborting
+//! the whole run. In a write-aware stream only the fixed document is
+//! re-emitted and the stream stays write-aware (see above).
 //!
 //! `FixOutcome::legacy_jq_applied` is `true` when at least one rule on
-//! the current file took the jq branch; the CLI's `dq fix` handler
-//! consumes that flag to decide whether to re-emit the document via
-//! `Format::write_with_options` (legacy path) or to take
-//! `doc.original_bytes()` directly (OPS-only path, comments preserved).
+//! the current file took the jq branch. The CLI's `dq fix` handler
+//! re-emits the document via `Format::write_with_options` when that
+//! flag is set *and* the document has no `original_bytes` left; otherwise
+//! `doc.original_bytes()` is the canonical post-fix file.
 
 use std::sync::Arc;
 
@@ -97,11 +110,11 @@ pub struct FixOutcome {
     /// of a stream, like `applied_rules`.
     pub skipped_non_idempotent: Vec<String>,
     /// `true` if any rule on this run took the legacy `fix.jq` path.
-    /// The CLI handler consumes this to decide whether the post-fix
-    /// `Document::original_bytes()` is canonical (only `fix.ops` ran)
-    /// or whether the document needs to be re-emitted through
-    /// `Format::write_with_options` (any `fix.jq` ran, dropping spans
-    /// and `original_bytes`).
+    /// The CLI handler re-emits the document through
+    /// `Format::write_with_options` when this is set and the document is
+    /// left without `original_bytes` (a `fix.jq` outside a YAML stream,
+    /// or one whose single-document re-emit was refused); otherwise
+    /// `Document::original_bytes()` is canonical.
     pub legacy_jq_applied: bool,
 }
 
@@ -332,6 +345,7 @@ fn apply_ops_branch(
     if script.is_noop() {
         return Ok(());
     }
+    refuse_whole_document_ops(&script, slot, &rule.rule.id)?;
     // The script addresses the document's root as `""`; in a stream that
     // document is `/N`.
     let script = match slot {
@@ -381,15 +395,13 @@ fn apply_ops_branch(
     // already has `x: 1`) pass as silently-skipped instead of being
     // recorded on `skipped_non_idempotent`.
     let Some(value_after) = slot_value(&working, slot) else {
-        // The script removed the document it was written for: there is
-        // nothing to re-evaluate it against, so it cannot be shown to be
-        // idempotent.
-        tracing::warn!(
-            rule_id = %rule.rule.id,
-            "fix.ops removed the document it fixes; skipping",
-        );
-        audit.skipped_non_idempotent.push(rule.rule.id.clone());
-        return Ok(());
+        // Not reachable through a script `refuse_whole_document_ops`
+        // let through — every path lies below the document — but a
+        // document that vanished must not pass as fixed.
+        return Err(ExecError::FixApply {
+            rule_id: rule.rule.id.clone(),
+            message: format!("fix.ops left no {}", document_name(slot)),
+        });
     };
     let ops_value2 = run_ops_output(engine, value_after, &rule.rule.id)?;
     let script2: EditScript = match serde_json::from_value::<EditScript>(ops_value2) {
@@ -426,6 +438,48 @@ fn apply_ops_branch(
     *doc = working;
     audit.applied_rules.push(rule.rule.id.clone());
     Ok(())
+}
+
+/// Refuse a `fix.ops` script with an op on the document itself (path
+/// `""`): `add` / `replace` of the whole document, or its `remove`.
+///
+/// A textual edit splices a value into its parent, and a document has
+/// none, so `set_at` / `del_at` cannot make such an edit — in a single
+/// document it failed as an unaddressable root, and in a stream it would
+/// become an edit of `/N` that the stream's writer refuses. One error for
+/// both, naming the rule, the document and why, so the finding is never
+/// left in place behind an exit 0. When whole-document replacement
+/// becomes a textual edit, this check is what to lift.
+///
+/// # Errors
+///
+/// [`ExecError::FixApply`] (exit 3) for the first such op.
+fn refuse_whole_document_ops(script: &EditScript, slot: Slot, rule_id: &str) -> Result<()> {
+    let whole = script.ops().iter().find_map(|op| match op {
+        dq_core::EditOp::Add { path, .. } if path.segments().is_empty() => Some("add"),
+        dq_core::EditOp::Replace { path, .. } if path.segments().is_empty() => Some("replace"),
+        dq_core::EditOp::Remove { path } if path.segments().is_empty() => Some("remove"),
+        _ => None,
+    });
+    match whole {
+        None => Ok(()),
+        Some(op) => Err(ExecError::FixApply {
+            rule_id: rule_id.to_owned(),
+            message: format!(
+                "fix.ops would {op} {} as a whole (path \"\"): fix.ops edits values inside \
+                 a document and cannot {op} a whole document yet",
+                document_name(slot)
+            ),
+        }),
+    }
+}
+
+/// `the document`, or `document N of the stream`, for messages.
+fn document_name(slot: Slot) -> String {
+    match slot {
+        None => "the document".to_owned(),
+        Some(index) => format!("document {index} of the stream"),
+    }
 }
 
 /// JQ branch (legacy M10) of `Fixer::apply`. Returns `Ok(true)` when
@@ -476,15 +530,34 @@ fn apply_jq_branch(
         "applying legacy fix.jq path",
     );
 
-    // Replace the document with a value-only one. **NB**: this drops
-    // `original_bytes` and the span map. Subsequent `fix.ops` rules
+    // In a write-aware stream only this document is re-emitted through
+    // the writer; every other document keeps its bytes, and the stream
+    // stays write-aware for the rules after this one.
+    if let Some(index) = slot
+        && !doc.original_bytes().is_empty()
+    {
+        let mut working = doc.clone();
+        match working.reemit_stream_document(index, new_value.clone()) {
+            Ok(()) => {
+                *doc = working;
+                audit.applied_rules.push(rule.rule.id.clone());
+                return Ok(true);
+            }
+            Err(err) => tracing::warn!(
+                rule_id = %rule.rule.id,
+                document = index,
+                error = %err,
+                "fix.jq: cannot re-emit this document alone; re-emitting the whole stream",
+            ),
+        }
+    }
+
+    // Otherwise replace the document with a value-only one. **NB**: this
+    // drops `original_bytes` and the span map. Subsequent `fix.ops` rules
     // on the same file will surface `WriteUnavailable` from
     // `EditScript::apply`; that is caught and downgraded to a warn in
-    // `apply_ops_branch`.
-    //
-    // In a stream the result replaces its own document only, and the
-    // document stays a stream, so the format writer emits every document
-    // with its `---` again instead of one document holding a sequence.
+    // `apply_ops_branch`. A stream stays a stream — the format writer
+    // emits every document with its `---` — with this document replaced.
     *doc = match (slot, doc.values()) {
         (Some(index), Some(documents)) => {
             let mut documents = documents.to_vec();
@@ -1568,5 +1641,85 @@ fix:
             .map(|d| d.to_serde_json()["name"].clone())
             .collect();
         assert_eq!(names, vec![json!("fixed"), json!("s"), json!("fixed")]);
+    }
+
+    #[test]
+    fn fixer_jq_in_a_stream_keeps_other_documents_and_later_ops_apply() {
+        let rules = format!(
+            "{}\n---\n{}",
+            r#"
+id: test.jq-x
+description: documents with x get a name
+severity: warn
+match: {format: yaml}
+check:
+  jq: 'select(type == "object" and has("x") and .name != "fixed")'
+  message: no name
+fix:
+  jq: '.name = "fixed"'
+"#,
+            r#"
+id: test.ops-z
+description: z becomes zz
+severity: warn
+match: {format: yaml}
+check:
+  jq: 'select(type == "object" and .name == "z")'
+  message: z
+fix:
+  ops: 'if .name == "z" then [{"op":"replace","path":"/name","value":"zz"}] else [] end'
+"#
+        );
+        let fixer = Fixer::new(&evaluator_from_yaml(&rules));
+        let mut doc =
+            dq_core::parse_yaml_stream_with_spans(b"x: 1 # c\n---\nname: z # keep\n").unwrap();
+        let out = fixer
+            .apply(Utf8Path::new("s.yaml"), &mut doc, "yaml")
+            .expect("fix");
+        assert!(out.legacy_jq_applied);
+        assert_eq!(out.applied_rules, vec!["test.jq-x", "test.ops-z"]);
+        assert_eq!(
+            String::from_utf8(doc.original_bytes().to_vec()).unwrap(),
+            "x: 1\nname: fixed\n---\nname: zz # keep\n",
+            "the stream stays write-aware after the fix.jq"
+        );
+    }
+
+    #[test]
+    fn fixer_ops_on_the_whole_document_is_fix_apply_in_a_file_and_a_stream() {
+        for (op, value) in [("replace", r#","value":{"ok":true}"#), ("remove", "")] {
+            let rule = format!(
+                r#"
+id: test.whole
+description: whole-document fix
+severity: warn
+match: {{format: yaml}}
+check:
+  jq: 'select(.bad == true)'
+  message: bad
+fix:
+  ops: '[{{"op":"{op}","path":""{value}}}]'
+"#
+            );
+            let fixer = Fixer::new(&evaluator_from_yaml(&rule));
+            for (source, document) in [
+                (&b"bad: true\n"[..], "the document"),
+                (&b"ok: 1\n---\nbad: true\n"[..], "document 1 of the stream"),
+            ] {
+                let mut doc = dq_core::parse_yaml_stream_with_spans(source).unwrap();
+                let err = fixer
+                    .apply(Utf8Path::new("f.yaml"), &mut doc, "yaml")
+                    .expect_err("refused");
+                let ExecError::FixApply { rule_id, message } = err else {
+                    panic!("expected FixApply, got {err:?}");
+                };
+                assert_eq!(rule_id, "test.whole");
+                assert!(
+                    message.starts_with(&format!("fix.ops would {op} {document} as a whole")),
+                    "{message}"
+                );
+                assert_eq!(doc.original_bytes(), source, "untouched");
+            }
+        }
     }
 }
