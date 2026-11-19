@@ -1478,3 +1478,112 @@ fn text_of_unicode_spaces_that_are_no_xml_whitespace_is_kept() {
         ],
     );
 }
+
+/// XML 1.1 allows the C0 controls but NUL, and takes them and the C1
+/// controls but NEL (its `RestrictedChar`) only as character references.
+/// In a `version="1.1"` document the writer writes each as one, in text
+/// and in attributes, and the reader reads the references back; a
+/// comment, a PI or CDATA has no references, so one there is refused. XML
+/// 1.0 is as before: C1 controls raw, C0 controls refused. Before, a 1.1
+/// document wrote U+007F–U+009F raw — not well-formed 1.1 — and refused
+/// every C0 control as "a character XML 1.0 does not allow".
+#[test]
+fn xml_1_1_writes_its_restricted_characters_as_references() {
+    let v11 = "{\"#xml\": {\"version\": \"1.1\"}, \"r\": [";
+    let v10 = "{\"#xml\": {\"version\": \"1.0\"}, \"r\": [";
+    let text = "{\"@attrs\": {\"a\": \"\\u0001\\u007f\\u0084\\u0085\\u0086\\u009f\\u00a0\"}, \
+                \"#text\": \"t\\u0001\\u0008\\u000b\\u000c\\u000e\\u001f\\u007f\\u0080\\u009f\\u00a0\"}]}";
+    let files: Vec<(String, String)> = vec![
+        ("v11.json".into(), format!("{v11}{text}")),
+        (
+            "v10.json".into(),
+            format!(
+                "{v10}{{\"@attrs\": {{\"a\": \"\\u007f\\u009f\"}}, \"#text\": \"\\u0080\"}}]}}"
+            ),
+        ),
+        (
+            "v10_c0.json".into(),
+            format!("{v10}{{\"#text\": \"\\u0001\"}}]}}"),
+        ),
+        (
+            "v11_nul.json".into(),
+            format!("{v11}{{\"#text\": \"\\u0000\"}}]}}"),
+        ),
+        (
+            "v11_comment.json".into(),
+            format!("{v11}{{\"#comments\": [\"a\\u007fb\"]}}]}}"),
+        ),
+        (
+            "v11_pi.json".into(),
+            format!("{v11}{{\"#pi\": [\"t \\u0001\"]}}]}}"),
+        ),
+        (
+            "v11_cdata.json".into(),
+            format!("{v11}{{\"#cdata\": [\"\\u0090\"]}}]}}"),
+        ),
+        (
+            "v11_top.json".into(),
+            "{\"#xml\": {\"version\": \"1.1\"}, \"#comments\": [\"\\u0002\"], \"r\": [{}]}".into(),
+        ),
+    ];
+    let borrowed: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(name, body)| (name.as_str(), body.as_bytes()))
+        .collect();
+    let dir = dir_with(&borrowed);
+    let written_11 = "<?xml version=\"1.1\"?><r a=\"&#1;&#127;&#x84;&#x85;&#x86;&#x9F;\u{a0}\">\
+                      t&#1;&#8;&#11;&#12;&#14;&#31;&#127;&#x80;&#x9F;\u{a0}</r>";
+    let raw_but = "allows only as a character reference, and a comment, a processing \
+                   instruction or CDATA holds none";
+    assert_cases(
+        &dir,
+        &[
+            (convert("v11.json", "xml"), ok(written_11)),
+            (
+                convert("v10.json", "xml"),
+                ok("<?xml version=\"1.0\"?><r a=\"\u{7f}\u{9f}\">\u{80}</r>"),
+            ),
+            (
+                convert("v10_c0.json", "xml"),
+                refused("'#text' of <r> holds U+0001, a character XML 1.0 does not allow"),
+            ),
+            (
+                convert("v11_nul.json", "xml"),
+                refused("'#text' of <r> holds U+0000, a character XML 1.1 does not allow"),
+            ),
+            (
+                convert("v11_comment.json", "xml"),
+                refused(&format!(
+                    "'#comments' of <r> holds U+007F, which XML 1.1 {raw_but}"
+                )),
+            ),
+            (
+                convert("v11_pi.json", "xml"),
+                refused(&format!(
+                    "'#pi' of <r> holds U+0001, which XML 1.1 {raw_but}"
+                )),
+            ),
+            (
+                convert("v11_cdata.json", "xml"),
+                refused(&format!(
+                    "'#cdata' of <r> holds U+0090, which XML 1.1 {raw_but}"
+                )),
+            ),
+            (
+                convert("v11_top.json", "xml"),
+                refused(&format!(
+                    "'#comments' at the top level holds U+0002, which XML 1.1 {raw_but}"
+                )),
+            ),
+        ],
+    );
+    // What is written reads back as the tree it was written from.
+    std::fs::write(dir.path().join("back.xml"), written_11).expect("write");
+    // (YAML: a JSON file converted to JSON is passed through as it is.)
+    let (_, first, _) = run(&dir, &convert("v11.json", "yaml"));
+    let (code, second, stderr) = run(&dir, &convert("back.xml", "yaml"));
+    assert_eq!(
+        (code, String::from_utf8_lossy(&second), stderr.as_str()),
+        (0, String::from_utf8_lossy(&first), "")
+    );
+}

@@ -266,7 +266,12 @@ folded into `#text` with a warning. Whitespace is XML's: space, tab, CR
 and LF. Text of nothing else is indentation on read, and is written as
 character references (`&#32;`) so it reads back as text; U+3000 and other
 Unicode spaces are text. NEL and LS (U+0085, U+2028) are always written as
-references, as XML 1.1 reads them raw as line ends.
+references, as XML 1.1 reads them raw as line ends. In a `version="1.1"` document the
+writer also writes XML 1.1's restricted characters — the C0 controls but
+tab, LF and CR, and the C1 controls U+007F–U+0084 and U+0086–U+009F — as
+references in text and attribute values, and refuses one in a comment, a
+PI or CDATA, which hold no references. XML 1.0 has no C0 controls but
+tab, LF and CR, so the writer refuses them, and writes C1 controls raw.
 
 Encodings. A file is decoded per its byte order mark, else per the
 declaration's `encoding`, else as UTF-8. Labels are the WHATWG Encoding

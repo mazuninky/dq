@@ -1176,14 +1176,17 @@ fn render_xml(top: &Value) -> Result<Vec<u8>> {
 
     // 2. Top-level processing instructions and comments (kept above root).
     const TOP: &str = "at the top level";
+    let xml11 = decl
+        .as_ref()
+        .is_some_and(|decl| decl.written && decl.version == "1.1");
     let mut unencodable = Unencodable::new(&output);
-    for s in item_texts(KEY_PI, TOP, top.get(KEY_PI))? {
+    for s in item_texts(KEY_PI, TOP, top.get(KEY_PI), xml11)? {
         unencodable.note(&s, || TOP.to_owned());
         writer
             .write_event(Event::PI(BytesPI::new(s.as_str())))
             .map_err(map_write_err)?;
     }
-    for s in item_texts(KEY_COMMENTS, TOP, top.get(KEY_COMMENTS))? {
+    for s in item_texts(KEY_COMMENTS, TOP, top.get(KEY_COMMENTS), xml11)? {
         unencodable.note(&s, || TOP.to_owned());
         writer
             .write_event(Event::Comment(comment_event(&s)))
@@ -1249,9 +1252,7 @@ fn render_xml(top: &Value) -> Result<Vec<u8>> {
         0,
         &mut unencodable,
         &Scope {
-            xml11: decl
-                .as_ref()
-                .is_some_and(|decl| decl.written && decl.version == "1.1"),
+            xml11,
             ..Scope::default()
         },
     )?;
@@ -1694,7 +1695,12 @@ fn write_element(
                 })?,
             };
             check_name(k, &format!("an attribute (on <{tag}>)"))?;
-            check_chars(&format!("attribute '{k}' on <{tag}>"), &v)?;
+            check_chars(
+                &format!("attribute '{k}' on <{tag}>"),
+                &v,
+                scope.xml11,
+                Spelled::Escaped,
+            )?;
             unencodable.note(k, place);
             unencodable.note(&v, place);
             attributes.push((k.as_str(), v));
@@ -1708,7 +1714,7 @@ fn write_element(
         }
         start.push_attribute(Attribute {
             key: QName(k),
-            value: escape_attr(v).into_owned().into(),
+            value: escape_attr(v, scope.xml11).into_owned().into(),
         });
     }
 
@@ -1726,16 +1732,22 @@ fn write_element(
         })?),
     };
     if let Some(text) = &text {
-        check_chars(&format!("'{KEY_TEXT}' of <{tag}>"), text)?;
+        check_chars(
+            &format!("'{KEY_TEXT}' of <{tag}>"),
+            text,
+            scope.xml11,
+            Spelled::Escaped,
+        )?;
         unencodable.note(text, place);
     }
 
     // Determine if the element has any body content. If not, emit as
     // self-closing `<tag/>`.
     let owner = format!("of <{tag}>");
-    let comments = item_texts(KEY_COMMENTS, &owner, body.get(KEY_COMMENTS))?;
-    let pis = item_texts(KEY_PI, &owner, body.get(KEY_PI))?;
-    let cdata = item_texts(KEY_CDATA, &owner, body.get(KEY_CDATA))?;
+    let xml11 = scope.xml11;
+    let comments = item_texts(KEY_COMMENTS, &owner, body.get(KEY_COMMENTS), xml11)?;
+    let pis = item_texts(KEY_PI, &owner, body.get(KEY_PI), xml11)?;
+    let cdata = item_texts(KEY_CDATA, &owner, body.get(KEY_CDATA), xml11)?;
     for s in comments.iter().chain(&pis).chain(&cdata) {
         unencodable.note(s, place);
     }
@@ -1808,7 +1820,7 @@ fn write_element(
     }
     if let Some(s) = &text {
         writer
-            .write_event(Event::Text(text_event(s)))
+            .write_event(Event::Text(text_event(s, xml11)))
             .map_err(map_write_err)?;
     }
     for s in &cdata {
@@ -1905,7 +1917,7 @@ fn scalar_text(v: &Value) -> Option<String> {
 /// A container, as the entry or as an item, is refused: it has no text.
 ///
 /// `owner` completes the message: `of <tag>` or `at the top level`.
-fn item_texts(key: &str, owner: &str, entry: Option<&Value>) -> Result<Vec<String>> {
+fn item_texts(key: &str, owner: &str, entry: Option<&Value>, xml11: bool) -> Result<Vec<String>> {
     let items = match entry {
         None | Some(Value::Null) => return Ok(Vec::new()),
         Some(Value::Array(items)) => items.as_slice(),
@@ -1923,7 +1935,7 @@ fn item_texts(key: &str, owner: &str, entry: Option<&Value>) -> Result<Vec<Strin
                 what_it_is(item),
             ),
         })?;
-        check_item(key, owner, &text)?;
+        check_item(key, owner, &text, xml11)?;
         texts.push(text);
     }
     Ok(texts)
@@ -1935,8 +1947,8 @@ fn item_texts(key: &str, owner: &str, entry: Option<&Value>) -> Result<Vec<Strin
 /// target (up to the first whitespace) that is not an NCName (an XML name
 /// without a colon) or is `xml` in any case, or `?>` inside. CDATA has no such limit: `]]>` is split
 /// across adjacent sections when written.
-fn check_item(key: &str, owner: &str, text: &str) -> Result<()> {
-    check_chars(&format!("'{key}' {owner}"), text)?;
+fn check_item(key: &str, owner: &str, text: &str, xml11: bool) -> Result<()> {
+    check_chars(&format!("'{key}' {owner}"), text, xml11, Spelled::Raw)?;
     let refuse = |message: String| {
         Err(Error::Format {
             format: "xml",
@@ -2035,25 +2047,64 @@ fn is_xml_name(name: &str) -> bool {
         })
 }
 
-/// Refuse `text` if it holds a character outside XML 1.0's `Char`: a C0
-/// control other than tab, LF and CR, or U+FFFE / U+FFFF. XML has no escape
-/// for them — a character reference to one is not well-formed either.
-/// `what` names the place (`'#text' of <r>`).
-fn check_chars(what: &str, text: &str) -> Result<()> {
-    let allowed = |c: char| {
+/// How a place writes a character: escaped, so a character reference
+/// can stand for it (text, an attribute value), or raw (a comment, a PI,
+/// CDATA).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Spelled {
+    Escaped,
+    Raw,
+}
+
+/// Refuse `text` if it holds a character the document's XML version does
+/// not allow where it goes. XML 1.0's `Char` leaves out the C0 controls but
+/// tab, LF and CR, and U+FFFE / U+FFFF; XML has no escape for them — a
+/// character reference to one is not well-formed either. XML 1.1's `Char`
+/// takes every C0 control but NUL, and takes them and the C1 controls but
+/// NEL (its `RestrictedChar`, [`is_restricted_11`]) only as character
+/// references, which a comment, a PI or CDATA cannot hold. `what` names the
+/// place (`'#text' of <r>`).
+fn check_chars(what: &str, text: &str, xml11: bool, spelled: Spelled) -> Result<()> {
+    let char_10 = |c: char| {
         matches!(c,
             '\t' | '\n' | '\r' | '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..)
     };
-    match text.chars().find(|&c| !allowed(c)) {
-        None => Ok(()),
-        Some(c) => Err(Error::Format {
+    let char_11 =
+        |c: char| matches!(c, '\u{1}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..);
+    let refuse = |c: char, why: &str| {
+        Err(Error::Format {
             format: "xml",
-            message: format!(
-                "XML write: {what} holds U+{:04X}, a character XML 1.0 does not allow",
-                u32::from(c),
-            ),
-        }),
+            message: format!("XML write: {what} holds U+{:04X}, {why}", u32::from(c)),
+        })
+    };
+    if !xml11 {
+        return match text.chars().find(|&c| !char_10(c)) {
+            None => Ok(()),
+            Some(c) => refuse(c, "a character XML 1.0 does not allow"),
+        };
     }
+    for c in text.chars() {
+        if !char_11(c) {
+            return refuse(c, "a character XML 1.1 does not allow");
+        }
+        if spelled == Spelled::Raw && is_restricted_11(c) {
+            return refuse(
+                c,
+                "which XML 1.1 allows only as a character reference, and a comment, a \
+                 processing instruction or CDATA holds none",
+            );
+        }
+    }
+    Ok(())
+}
+
+/// XML 1.1's `RestrictedChar`: the C0 controls but tab, LF and CR, and the
+/// C1 controls but NEL, which a document holds only as character
+/// references.
+fn is_restricted_11(c: char) -> bool {
+    matches!(c,
+        '\u{1}'..='\u{8}' | '\u{B}' | '\u{C}' | '\u{E}'..='\u{1F}' | '\u{7F}'..='\u{84}'
+        | '\u{86}'..='\u{9F}')
 }
 
 /// The fields of an `<?xml …?>` declaration, and the UTF-16 BOM to begin
@@ -2257,15 +2308,13 @@ fn is_xml_whitespace(s: &str) -> bool {
 /// the reader drops whitespace-only text written as it is — it is
 /// indentation — but keeps what references spell. Other Unicode spaces
 /// (U+3000) are text to XML and are written as they are.
-fn escape_text(raw: &str) -> Cow<'_, str> {
+fn escape_text(raw: &str, xml11: bool) -> Cow<'_, str> {
     if !raw.is_empty() && is_xml_whitespace(raw) {
         return Cow::Owned(raw.chars().map(char_reference).collect());
     }
     escape_with(raw, |c| match c {
-        '\r' => Some("&#13;"),
-        '\u{85}' => Some("&#x85;"),
-        '\u{2028}' => Some("&#x2028;"),
-        _ => None,
+        '\r' | '\u{85}' | '\u{2028}' => true,
+        c => xml11 && is_restricted_11(c),
     })
 }
 
@@ -2273,14 +2322,10 @@ fn escape_text(raw: &str) -> Cow<'_, str> {
 /// tab as `&#10;` / `&#9;`. Attribute-value normalization reads a raw tab,
 /// LF or CR back as a space — and in XML 1.1 a raw NEL or LS — the
 /// references read back as themselves.
-fn escape_attr(raw: &str) -> Cow<'_, str> {
+fn escape_attr(raw: &str, xml11: bool) -> Cow<'_, str> {
     escape_with(raw, |c| match c {
-        '\r' => Some("&#13;"),
-        '\n' => Some("&#10;"),
-        '\t' => Some("&#9;"),
-        '\u{85}' => Some("&#x85;"),
-        '\u{2028}' => Some("&#x2028;"),
-        _ => None,
+        '\r' | '\n' | '\t' | '\u{85}' | '\u{2028}' => true,
+        c => xml11 && is_restricted_11(c),
     })
 }
 
@@ -2294,24 +2339,26 @@ fn char_reference(c: char) -> String {
     }
 }
 
-/// Replace the five markup characters and whatever `extra` maps.
-fn escape_with(raw: &str, extra: impl Fn(char) -> Option<&'static str>) -> Cow<'_, str> {
-    let escaped = |c: char| match c {
+/// Replace the five markup characters by their entities, and every
+/// character `referenced` picks by its [`char_reference`].
+fn escape_with(raw: &str, referenced: impl Fn(char) -> bool) -> Cow<'_, str> {
+    let entity = |c: char| match c {
         '<' => Some("&lt;"),
         '>' => Some("&gt;"),
         '&' => Some("&amp;"),
         '\'' => Some("&apos;"),
         '"' => Some("&quot;"),
-        other => extra(other),
+        _ => None,
     };
-    let Some(first) = raw.find(|c| escaped(c).is_some()) else {
+    let Some(first) = raw.find(|c| entity(c).is_some() || referenced(c)) else {
         return Cow::Borrowed(raw);
     };
     let mut out = String::with_capacity(raw.len() + 8);
     out.push_str(&raw[..first]);
     for c in raw[first..].chars() {
-        match escaped(c) {
+        match entity(c) {
             Some(entity) => out.push_str(entity),
+            None if referenced(c) => out.push_str(&char_reference(c)),
             None => out.push(c),
         }
     }
@@ -2319,8 +2366,8 @@ fn escape_with(raw: &str, extra: impl Fn(char) -> Option<&'static str>) -> Cow<'
 }
 
 /// `BytesText` for a text body, escaped with [`escape_text`].
-fn text_event(s: &str) -> BytesText<'_> {
-    BytesText::from_escaped(escape_text(s))
+fn text_event(s: &str, xml11: bool) -> BytesText<'_> {
+    BytesText::from_escaped(escape_text(s, xml11))
 }
 
 /// `BytesText` for a comment body, written as it is: XML has no escapes in
@@ -2480,16 +2527,16 @@ mod tests {
     #[test]
     fn items_xml_cannot_hold_are_refused_and_cdata_split() {
         let owner = "of <r>";
-        assert!(check_item(KEY_COMMENTS, owner, "a < b & c -x").is_ok());
-        assert!(check_item(KEY_COMMENTS, owner, "a--b").is_err());
-        assert!(check_item(KEY_COMMENTS, owner, "a-").is_err());
-        assert!(check_item(KEY_PI, owner, "xml-stylesheet href='a'").is_ok());
-        assert!(check_item(KEY_PI, owner, "t\tdata ? >").is_ok());
+        assert!(check_item(KEY_COMMENTS, owner, "a < b & c -x", false).is_ok());
+        assert!(check_item(KEY_COMMENTS, owner, "a--b", false).is_err());
+        assert!(check_item(KEY_COMMENTS, owner, "a-", false).is_err());
+        assert!(check_item(KEY_PI, owner, "xml-stylesheet href='a'", false).is_ok());
+        assert!(check_item(KEY_PI, owner, "t\tdata ? >", false).is_ok());
         for pi in ["xml v", "XML", "1t", "", " t", "t a?>"] {
-            assert!(check_item(KEY_PI, owner, pi).is_err(), "{pi:?}");
+            assert!(check_item(KEY_PI, owner, pi, false).is_err(), "{pi:?}");
         }
-        assert!(check_item(KEY_CDATA, owner, "a]]>b").is_ok());
-        let err = check_item(KEY_CDATA, owner, "\u{FFFE}").expect_err("refused");
+        assert!(check_item(KEY_CDATA, owner, "a]]>b", false).is_ok());
+        let err = check_item(KEY_CDATA, owner, "\u{FFFE}", false).expect_err("refused");
         assert!(err.to_string().contains("holds U+FFFE"), "{err}");
 
         let mut body = IndexMap::new();
@@ -2794,18 +2841,33 @@ mod tests {
 
     #[test]
     fn whitespace_xml_would_normalise_is_escaped() {
-        assert_eq!(escape_text("a\tb\nc\rd<"), "a\tb\nc&#13;d&lt;");
+        assert_eq!(escape_text("a\tb\nc\rd<", false), "a\tb\nc&#13;d&lt;");
         // All whitespace: every character a reference.
-        assert_eq!(escape_text("\t \n\r"), "&#9;&#32;&#10;&#13;");
-        assert_eq!(escape_text("\u{85}\u{2028}"), "&#x85;&#x2028;");
+        assert_eq!(escape_text("\t \n\r", false), "&#9;&#32;&#10;&#13;");
+        assert_eq!(escape_text("\u{85}\u{2028}", false), "&#x85;&#x2028;");
         // Line ends in XML 1.1, wherever they stand; U+3000 is text.
-        assert_eq!(escape_text("a\u{85}b\u{2028} "), "a&#x85;b&#x2028; ");
-        assert!(matches!(escape_text("\u{3000}"), Cow::Borrowed("\u{3000}")));
+        assert_eq!(escape_text("a\u{85}b\u{2028} ", false), "a&#x85;b&#x2028; ");
+        assert!(matches!(
+            escape_text("\u{3000}", false),
+            Cow::Borrowed("\u{3000}")
+        ));
         assert!(is_xml_whitespace(" \t\r\n") && !is_xml_whitespace("\u{3000}"));
-        assert_eq!(escape_attr("a\u{85}b\u{2028}"), "a&#x85;b&#x2028;");
-        assert_eq!(escape_text(""), "");
-        assert_eq!(escape_attr("a\tb\nc\rd\""), "a&#9;b&#10;c&#13;d&quot;");
-        assert!(matches!(escape_attr("plain"), Cow::Borrowed(_)));
+        assert_eq!(escape_attr("a\u{85}b\u{2028}", false), "a&#x85;b&#x2028;");
+        assert_eq!(escape_text("", false), "");
+        assert_eq!(
+            escape_attr("a\tb\nc\rd\"", false),
+            "a&#9;b&#10;c&#13;d&quot;"
+        );
+        // XML 1.1 references its restricted characters; 1.0 writes C1 raw.
+        assert_eq!(
+            escape_text("\u{1}\u{7F}\u{85}\u{9F}\u{A0}", true),
+            "&#1;&#127;&#x85;&#x9F;\u{A0}"
+        );
+        assert_eq!(escape_attr("\u{B}\u{86}", true), "&#11;&#x86;");
+        assert_eq!(escape_text("\u{7F}\u{9F}", false), "\u{7F}\u{9F}");
+        assert!(check_item(KEY_CDATA, "of <r>", "\u{7F}", true).is_err());
+        assert!(check_item(KEY_CDATA, "of <r>", "\u{7F}", false).is_ok());
+        assert!(matches!(escape_attr("plain", false), Cow::Borrowed(_)));
     }
 
     #[test]
