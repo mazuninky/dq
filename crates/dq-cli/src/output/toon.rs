@@ -22,11 +22,12 @@ impl Reporter for ToonReporter {
     fn report(&self, value: &serde_json::Value, w: &mut dyn Write) -> anyhow::Result<()> {
         ensure_toon_numbers(value)?;
         let mut respelled = Vec::new();
-        let marked = mark_tie_floats(value, &mut respelled);
+        let marks = FloatMarks::for_document(value);
+        let marked = marks.mark_tie_floats(value, &mut respelled);
         let mut encoded = toon_format::encode_default(marked.as_ref())
             .map_err(|e| anyhow::anyhow!("toon encode failed: {e}"))?;
-        for (at, spelling) in respelled.iter().enumerate() {
-            encoded = encoded.replacen(&float_marker(at), spelling, 1);
+        if !respelled.is_empty() {
+            encoded = marks.unmark(&encoded, &respelled);
         }
         w.write_all(encoded.as_bytes())?;
         if !encoded.ends_with('\n') {
@@ -44,71 +45,138 @@ impl Reporter for ToonReporter {
     }
 }
 
-/// The placeholder [`mark_tie_floats`] puts in place of the `at`-th float
-/// it respells: private-use characters, which TOON writes bare.
-fn float_marker(at: usize) -> String {
-    format!("\u{E000}{at}\u{E001}")
+/// Opens a float marker: U+E000, a private-use character TOON writes bare.
+const MARK_OPEN: char = '\u{E000}';
+/// Closes a float marker: U+E001.
+const MARK_CLOSE: char = '\u{E001}';
+
+/// The placeholders that stand for floats in the text `toon_format`
+/// writes, until [`FloatMarks::unmark`] puts each float's spelling there.
+///
+/// A marker is a run of [`MARK_OPEN`] one longer than the longest run in
+/// any string or key of the document, the float's index, and
+/// [`MARK_CLOSE`]. No string or key holds such a run, and none of the
+/// marker's characters is one TOON writes between values (`,`, `:`, a
+/// space, a quote, a line break), so the run is found in the written text
+/// only where a marker stands — whatever the strings hold.
+struct FloatMarks {
+    run: String,
 }
 
-/// `value` with each float that `toon_format` would spell otherwise than
-/// [`dq_core::plain_float`] replaced by a [`float_marker`] string, its
-/// spelling pushed to `respelled`. `toon_format` writes a non-whole float
-/// with Rust's `Display`, which breaks a tie in the 17th digit to the odd
-/// digit (`1658206780088562.3`), while every other dq writer picks the
-/// even one (`…562.2`). Borrowed when there is none — or when some string
-/// already holds a private-use marker character, which is left as it is.
-fn mark_tie_floats<'v>(
-    value: &'v serde_json::Value,
-    respelled: &mut Vec<String>,
-) -> std::borrow::Cow<'v, serde_json::Value> {
-    fn respelling(n: &serde_json::Number) -> Option<String> {
-        if n.as_i64().is_some() || n.as_u64().is_some() {
-            return None;
+impl FloatMarks {
+    fn for_document(value: &serde_json::Value) -> Self {
+        fn longest_run(s: &str) -> usize {
+            s.split(|c| c != MARK_OPEN)
+                .map(|run| run.chars().count())
+                .max()
+                .unwrap_or(0)
         }
-        let f = n.as_f64().filter(|f| f.is_finite())?;
-        // `toon_format` writes a whole float in `i64` range, [-2^63, 2^63),
-        // as that integer.
-        const TWO_TO_63: f64 = 9_223_372_036_854_775_808.0;
-        let in_i64 = f.fract() == 0.0 && (-TWO_TO_63..TWO_TO_63).contains(&f);
-        let plain = dq_core::plain_float(f);
-        (!in_i64 && plain != f.to_string()).then_some(plain)
-    }
-    fn has_tie(value: &serde_json::Value) -> bool {
-        match value {
-            serde_json::Value::Number(n) => respelling(n).is_some(),
-            serde_json::Value::Array(items) => items.iter().any(has_tie),
-            serde_json::Value::Object(map) => map.values().any(has_tie),
-            _ => false,
+        fn longest(value: &serde_json::Value) -> usize {
+            match value {
+                serde_json::Value::String(s) => longest_run(s),
+                serde_json::Value::Array(items) => items.iter().map(longest).max().unwrap_or(0),
+                serde_json::Value::Object(map) => map
+                    .iter()
+                    .map(|(k, v)| longest_run(k).max(longest(v)))
+                    .max()
+                    .unwrap_or(0),
+                _ => 0,
+            }
+        }
+        Self {
+            run: MARK_OPEN.to_string().repeat(longest(value) + 1),
         }
     }
-    fn holds_marker(value: &serde_json::Value) -> bool {
-        let marks = |s: &str| s.contains(['\u{E000}', '\u{E001}']);
-        match value {
-            serde_json::Value::String(s) => marks(s),
-            serde_json::Value::Array(items) => items.iter().any(holds_marker),
-            serde_json::Value::Object(map) => map.iter().any(|(k, v)| marks(k) || holds_marker(v)),
-            _ => false,
-        }
+
+    /// The marker for the `at`-th float respelled.
+    fn marker(&self, at: usize) -> String {
+        format!("{}{at}{MARK_CLOSE}", self.run)
     }
-    fn mark(value: &mut serde_json::Value, respelled: &mut Vec<String>) {
-        match value {
-            serde_json::Value::Number(n) => {
-                if let Some(plain) = respelling(n) {
-                    *value = serde_json::Value::String(float_marker(respelled.len()));
-                    respelled.push(plain);
+
+    /// `value` with each float that `toon_format` would spell otherwise
+    /// than [`dq_core::plain_float`] replaced by a marker string, its
+    /// spelling pushed to `respelled`. `toon_format` writes a non-whole
+    /// float with Rust's `Display`, which breaks a tie in the 17th digit to
+    /// the odd digit (`1658206780088562.3`), while every other dq writer
+    /// picks the even one (`…562.2`). Borrowed when there is none.
+    fn mark_tie_floats<'v>(
+        &self,
+        value: &'v serde_json::Value,
+        respelled: &mut Vec<String>,
+    ) -> std::borrow::Cow<'v, serde_json::Value> {
+        fn respelling(n: &serde_json::Number) -> Option<String> {
+            if n.as_i64().is_some() || n.as_u64().is_some() {
+                return None;
+            }
+            let f = n.as_f64().filter(|f| f.is_finite())?;
+            // `toon_format` writes a whole float in `i64` range, [-2^63, 2^63),
+            // as that integer.
+            const TWO_TO_63: f64 = 9_223_372_036_854_775_808.0;
+            let in_i64 = f.fract() == 0.0 && (-TWO_TO_63..TWO_TO_63).contains(&f);
+            let plain = dq_core::plain_float(f);
+            (!in_i64 && plain != f.to_string()).then_some(plain)
+        }
+        fn has_tie(value: &serde_json::Value) -> bool {
+            match value {
+                serde_json::Value::Number(n) => respelling(n).is_some(),
+                serde_json::Value::Array(items) => items.iter().any(has_tie),
+                serde_json::Value::Object(map) => map.values().any(has_tie),
+                _ => false,
+            }
+        }
+        fn mark(marks: &FloatMarks, value: &mut serde_json::Value, respelled: &mut Vec<String>) {
+            match value {
+                serde_json::Value::Number(n) => {
+                    if let Some(plain) = respelling(n) {
+                        *value = serde_json::Value::String(marks.marker(respelled.len()));
+                        respelled.push(plain);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    items.iter_mut().for_each(|v| mark(marks, v, respelled));
+                }
+                serde_json::Value::Object(map) => {
+                    map.values_mut().for_each(|v| mark(marks, v, respelled));
+                }
+                _ => {}
+            }
+        }
+        if !has_tie(value) {
+            return std::borrow::Cow::Borrowed(value);
+        }
+        let mut owned = value.clone();
+        mark(self, &mut owned, respelled);
+        std::borrow::Cow::Owned(owned)
+    }
+
+    /// `encoded` with every marker replaced by the spelling `respelled`
+    /// holds at its index, in one pass.
+    fn unmark(&self, encoded: &str, respelled: &[String]) -> String {
+        let mut out = String::with_capacity(encoded.len());
+        let mut rest = encoded;
+        while let Some(start) = rest.find(&self.run) {
+            out.push_str(&rest[..start]);
+            let after = &rest[start + self.run.len()..];
+            let spelled = after.split_once(MARK_CLOSE).and_then(|(at, tail)| {
+                let spelling = respelled.get(at.parse::<usize>().ok()?)?;
+                Some((spelling, tail))
+            });
+            match spelled {
+                Some((spelling, tail)) => {
+                    out.push_str(spelling);
+                    rest = tail;
+                }
+                // Not a marker after all: no string holds the run, so this
+                // does not happen; keep the text as it is.
+                None => {
+                    out.push_str(&self.run);
+                    rest = after;
                 }
             }
-            serde_json::Value::Array(items) => items.iter_mut().for_each(|v| mark(v, respelled)),
-            serde_json::Value::Object(map) => map.values_mut().for_each(|v| mark(v, respelled)),
-            _ => {}
         }
+        out.push_str(rest);
+        out
     }
-    if !has_tie(value) || holds_marker(value) {
-        return std::borrow::Cow::Borrowed(value);
-    }
-    let mut owned = value.clone();
-    mark(&mut owned, respelled);
-    std::borrow::Cow::Owned(owned)
 }
 
 /// Fail on the first number of `value` that `toon_format` would not write
@@ -230,38 +298,62 @@ mod tests {
     }
 
     /// A string or a key holding the private-use characters the tie
-    /// respelling marks floats with is written as it is, next to a float on
-    /// a 17th-digit tie and without one; the float still reads back as
-    /// itself.
+    /// respelling marks floats with — one of them, a whole marker, or a
+    /// run of them — is written as it is, and the float on a 17th-digit tie
+    /// next to it is still spelled as every dq writer spells it, `…562.2`,
+    /// not `toon_format`'s `…562.3`. Before, any such character turned the
+    /// respelling off for the whole document.
     #[test]
-    fn a_string_holding_a_marker_character_is_written_intact() {
+    fn a_tie_float_is_spelled_the_same_whatever_the_strings_hold() {
         let tie = 1_658_206_780_088_562.2_f64;
         let marker = "\u{E000}0\u{E001}";
+        let run = "\u{E000}\u{E000}\u{E000}1\u{E001}";
         assert_eq!(
             toon(&serde_json::json!({"s": "a\u{E000}b\u{E001}c", "t": [1.5, marker]})),
             format!("s: a\u{E000}b\u{E001}c\nt[2]: 1.5,{marker}\n")
         );
         for (value, first) in [
             (
+                serde_json::json!({"s": "\u{E000}", "v": tie}),
+                "s: \u{E000}".to_owned(),
+            ),
+            (
                 serde_json::json!({"s": marker, "v": tie}),
                 format!("s: {marker}"),
             ),
+            (serde_json::json!({"s": run, "v": tie}), format!("s: {run}")),
             (
                 serde_json::json!({marker: "k", "v": tie}),
                 format!("\"{marker}\": k"),
             ),
         ] {
-            let out = toon(&value);
-            let lines: Vec<&str> = out.lines().collect();
-            assert_eq!(lines.len(), 2, "{out:?}");
-            assert_eq!(lines[0], first, "{out:?}");
-            let v = lines[1].strip_prefix("v: ").expect("a v line");
             assert_eq!(
-                v.parse::<f64>().map(f64::to_bits),
-                Ok(tie.to_bits()),
-                "{out:?}"
+                toon(&value),
+                format!("{first}\nv: 1658206780088562.2\n"),
+                "{value}"
             );
         }
+        // Several ties among marker-shaped strings, each in its place.
+        assert_eq!(
+            toon(&serde_json::json!({"a": [tie, run, -tie, marker, tie]})),
+            format!(
+                "a[5]: 1658206780088562.2,{run},-1658206780088562.2,{marker},1658206780088562.2\n"
+            )
+        );
+    }
+
+    #[test]
+    fn a_marker_run_is_one_longer_than_any_in_the_document() {
+        let marks =
+            FloatMarks::for_document(&serde_json::json!({"k\u{E000}\u{E000}": ["\u{E000}"]}));
+        assert_eq!(marks.marker(7), "\u{E000}\u{E000}\u{E000}7\u{E001}");
+        let marks = FloatMarks::for_document(&serde_json::json!([1, true]));
+        assert_eq!(marks.marker(0), "\u{E000}0\u{E001}");
+        // A run that is no marker of this document is kept.
+        assert_eq!(
+            marks.unmark("x\u{E000}9\u{E001} \u{E000}0\u{E001}", &["2.5".to_owned()]),
+            "x\u{E000}9\u{E001} 2.5"
+        );
     }
 
     #[test]

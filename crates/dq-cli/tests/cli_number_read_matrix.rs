@@ -589,6 +589,43 @@ fn toml_and_textual_edits_spell_a_float_without_a_digit_run() {
 
 const SOME_FLOATS_YAML: &str = "a: 1e300\nb: -1e-300\nc: 1.5e20\nd: 123.25\ne: 3.0\nf: 1e-7\n";
 
+/// A float on a 17th-digit tie is written by TOON, in its plain decimals,
+/// as every other writer spells it, `…562.2`, not `toon_format`'s odd
+/// `…562.3` — next to a string or a key holding the private-use characters
+/// the respelling marks floats with too. Before, any such character turned
+/// the respelling off for the whole document.
+#[test]
+fn toon_spells_a_tie_float_the_same_whatever_the_strings_hold() {
+    let dir = dir_with(&[
+        ("plain.json", "{\"v\": 1658206780088562.2}"),
+        (
+            "marked.json",
+            "{\"s\": \"\u{E000}\", \"v\": 1658206780088562.2}",
+        ),
+        (
+            "key.json",
+            "{\"\u{E000}0\u{E001}\": 1, \"v\": [1658206780088562.2]}",
+        ),
+    ]);
+    assert_cases(
+        &dir,
+        &[
+            (
+                vec!["get", "plain.json", "", "-F", "toon"],
+                ok("v: 1658206780088562.2\n"),
+            ),
+            (
+                vec!["get", "marked.json", "", "-F", "toon"],
+                ok("s: \u{E000}\nv: 1658206780088562.2\n"),
+            ),
+            (
+                vec!["get", "key.json", "", "-F", "toon"],
+                ok("\"\u{E000}0\u{E001}\": 1\nv[1]: 1658206780088562.2\n"),
+            ),
+        ],
+    );
+}
+
 /// The console printed serde_json's `1e+300`, `-F yaml` `1.0e+300`; the
 /// line-oriented writers and XML printed 301 digits (and `3` for `3.0`).
 /// Now the console spells a float as the YAML writer does, every other
