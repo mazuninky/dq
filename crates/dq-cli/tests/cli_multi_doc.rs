@@ -1468,6 +1468,70 @@ fn fix_jq_keeps_trailing_comments_and_marker_properties() {
     }
 }
 
+/// Turns the document holding `toscalar` into the int 5.
+const JQ_SCALAR_RULE: &str = r#"
+id: test.jq-scalar
+description: documents with toscalar become 5
+severity: warn
+match: {format: yaml}
+check:
+  jq: 'select(type == "object" and has("toscalar"))'
+  message: not a scalar
+fix:
+  jq: '5'
+"#;
+
+/// A tag on the `---` line survives a `fix.jq` only while it fits the new
+/// value: an application tag over the same node kind, the non-specific
+/// `!` over a plain string — a map tagged `!foo` or `!` that becomes an
+/// int loses the tag. The blank line after a clip or strip block scalar
+/// is kept; after a keep (`|+`) scalar it is the scalar's and goes.
+#[test]
+fn fix_jq_drops_a_misfit_tag_and_keeps_blank_lines_after_block_scalars() {
+    let scratch = Scratch::new();
+    scratch.write("scalar.yml", JQ_SCALAR_RULE);
+    scratch.write("jq.yml", JQ_NAME_RULE);
+    let cases = [
+        (
+            "scalar.yml",
+            "a: 1\n--- !foo\ntoscalar: 1\n---\nb: 2\n",
+            "a: 1\n---\n5\n---\nb: 2\n",
+        ),
+        (
+            "scalar.yml",
+            "a: 1\n--- !\ntoscalar: 1\n---\nb: 2\n",
+            "a: 1\n---\n5\n---\nb: 2\n",
+        ),
+        (
+            "jq.yml",
+            "a: 1\n--- !foo\nx: 1\n---\nb: 2\n",
+            "a: 1\n--- !foo\nx: 1\nname: fixed\n---\nb: 2\n",
+        ),
+        (
+            "jq.yml",
+            "a: 1\n---\nx: 1\nk: |\n  y\n\n# c\n---\nb: 2\n",
+            "a: 1\n---\nx: 1\nk: |\n  y\nname: fixed\n\n# c\n---\nb: 2\n",
+        ),
+        (
+            "jq.yml",
+            "a: 1\n---\nx: 1\nk: >-\n  y\n  z\n\n# c\n",
+            "a: 1\n---\nx: 1\nk: y z\nname: fixed\n\n# c\n",
+        ),
+        (
+            "jq.yml",
+            "a: 1\n---\nx: 1\nk: |+\n  y\n\n# c\n",
+            "a: 1\n---\nx: 1\nk: |+\n  y\n\nname: fixed\n# c\n",
+        ),
+    ];
+    for (rule, before, after) in cases {
+        scratch.write("m.yaml", before);
+        scratch
+            .run(&["-i", "fix", "--rules", rule, "m.yaml"])
+            .expect("fix -i");
+        assert_eq!(scratch.read("m.yaml"), after, "{before:?}");
+    }
+}
+
 /// `set --jq` returning an empty array for a whole stream would write a
 /// file with no document: refused (exit 6), the file untouched. With
 /// `--doc N` an empty array is that document's value.

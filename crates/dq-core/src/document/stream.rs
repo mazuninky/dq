@@ -17,8 +17,9 @@ impl Document {
     /// all — stay byte for byte. Comments among the rewritten document's
     /// content are dropped, as any writer re-emit drops them. Node
     /// properties on the marker line (`--- !!map`, `--- &anchor`) are kept
-    /// when the rewritten document still reads back as `value` under them,
-    /// and dropped otherwise. The rewritten content breaks lines the way
+    /// when the tag still fits `value` (see `tags_fit`) and the rewritten
+    /// document reads back as `value` under them, and dropped otherwise.
+    /// The rewritten content breaks lines the way
     /// the file does around it: `\r\n` in a CRLF file, `\n` otherwise.
     /// The result is parsed again and must read back as the requested
     /// stream, so the document stays write-aware: later textual edits
@@ -46,7 +47,7 @@ impl Document {
         let Some(slot) = expected.get_mut(index) else {
             return Err(unavailable(&format!("the stream has no document {index}")));
         };
-        *slot = value;
+        let previous = std::mem::replace(slot, value);
         let extents = document_extents(&self.original_bytes)
             .filter(|extents| extents.len() == expected.len())
             .ok_or_else(|| unavailable("the stream's documents could not be located"))?;
@@ -67,7 +68,9 @@ impl Document {
         if let Some(after_properties) = extent.after_properties.filter(|&(end, _)| {
             tags_fit(
                 &self.original_bytes[extent.body.start..end],
+                &previous,
                 &expected[index],
+                &emitted,
             )
         }) {
             attempts.push((after_properties, extent.content_end));
@@ -115,32 +118,58 @@ impl Document {
     }
 }
 
-/// Whether every YAML core-schema tag (`!!map`, `!<tag:yaml.org,2002:seq>`)
-/// among the node properties `properties` names the kind of `value`.
+/// Whether the tag among the node properties `properties` (the marker
+/// line's `!tag` / `&anchor`, then any comment) still fits the document
+/// once its value `previous` becomes `value`, written as `emitted`.
+///
 /// The read-back cannot tell: dq reads a document's value without its
 /// tag, so `--- !!map` over a sequence reads back fine while other YAML
-/// readers reject it. Other tags are left to the read-back.
-fn tags_fit(properties: &[u8], value: &Value) -> bool {
-    properties.split(u8::is_ascii_whitespace).all(|token| {
-        let core = token.strip_prefix(b"!!").or_else(|| {
-            token
-                .strip_prefix(b"!<tag:yaml.org,2002:")
-                .and_then(|rest| rest.strip_suffix(b">"))
-        });
-        let Some(kind) = core else {
-            return true;
-        };
-        matches!(
-            (kind, value),
-            (b"map", Value::Map(_))
-                | (b"seq", Value::Array(_))
-                | (b"str", Value::String(_))
-                | (b"int", Value::Int(_) | Value::BigInt(_))
-                | (b"float", Value::Float(_) | Value::BigFloat(_))
-                | (b"bool", Value::Bool(_))
-                | (b"null", Value::Null)
-        )
-    })
+/// readers reject it. So:
+///
+/// - a YAML core-schema tag (`!!map`, `!<tag:yaml.org,2002:seq>`) fits a
+///   value of the kind it names;
+/// - the non-specific `!` fits only a string written as a plain scalar
+///   (`! 5` is the string `"5"`, which dq would read as an int);
+/// - any other tag — an application's `!foo` — fits only a value of the
+///   same node kind as `previous`: mapping, sequence or scalar.
+///
+/// Without a tag the properties always fit.
+fn tags_fit(properties: &[u8], previous: &Value, value: &Value, emitted: &[u8]) -> bool {
+    let node_kind = |value: &Value| match value {
+        Value::Map(_) => 0,
+        Value::Array(_) => 1,
+        _ => 2,
+    };
+    properties
+        .split(u8::is_ascii_whitespace)
+        .filter(|token| !token.is_empty())
+        .take_while(|token| !token.starts_with(b"#"))
+        .filter(|token| token.starts_with(b"!"))
+        .all(|tag| {
+            let core = tag.strip_prefix(b"!!").or_else(|| {
+                tag.strip_prefix(b"!<tag:yaml.org,2002:")
+                    .and_then(|rest| rest.strip_suffix(b">"))
+            });
+            if let Some(kind) = core {
+                return matches!(
+                    (kind, value),
+                    (b"map", Value::Map(_))
+                        | (b"seq", Value::Array(_))
+                        | (b"str", Value::String(_))
+                        | (b"int", Value::Int(_) | Value::BigInt(_))
+                        | (b"float", Value::Float(_) | Value::BigFloat(_))
+                        | (b"bool", Value::Bool(_))
+                        | (b"null", Value::Null)
+                );
+            }
+            if tag == b"!" {
+                let plain = emitted
+                    .first()
+                    .is_some_and(|b| !matches!(b, b'\'' | b'"' | b'|' | b'>'));
+                return matches!(value, Value::String(_)) && plain;
+            }
+            node_kind(previous) == node_kind(value)
+        })
 }
 
 /// `bytes` parsed as a stream, when it reads back as the documents
@@ -279,6 +308,38 @@ mod tests {
         doc.reemit_stream_document(0, Value::Array(vec![Value::Bool(true)]))
             .expect("sequence");
         assert_eq!(text(&doc), "---\n- true\n---\nb: 2\n");
+    }
+
+    #[test]
+    fn keeps_an_application_tag_only_over_the_same_node_kind() {
+        let src = "a: 1\n--- !foo\ntoscalar: 1\n---\nb: 2\n";
+        let mut doc = stream(src);
+        doc.reemit_stream_document(1, Value::Int(5)).expect("int");
+        assert_eq!(text(&doc), "a: 1\n---\n5\n---\nb: 2\n");
+        let mut doc = stream(src);
+        doc.reemit_stream_document(1, map("name", "fixed"))
+            .expect("map");
+        assert_eq!(text(&doc), "a: 1\n--- !foo\nname: fixed\n---\nb: 2\n");
+        let mut doc = stream("a: 1\n--- !foo 3\n---\nb: 2\n");
+        doc.reemit_stream_document(1, Value::Int(5))
+            .expect("scalar");
+        assert_eq!(text(&doc), "a: 1\n--- !foo\n5\n---\nb: 2\n");
+    }
+
+    #[test]
+    fn keeps_the_non_specific_tag_only_over_a_plain_string() {
+        let src = "a: 1\n--- !\ntoscalar: 1\n---\nb: 2\n";
+        let mut doc = stream(src);
+        doc.reemit_stream_document(1, Value::Int(5)).expect("int");
+        assert_eq!(text(&doc), "a: 1\n---\n5\n---\nb: 2\n");
+        let mut doc = stream(src);
+        doc.reemit_stream_document(1, Value::String("5".to_owned()))
+            .expect("quoted string");
+        assert_eq!(text(&doc), "a: 1\n---\n'5'\n---\nb: 2\n");
+        let mut doc = stream(src);
+        doc.reemit_stream_document(1, Value::String("hi".to_owned()))
+            .expect("plain string");
+        assert_eq!(text(&doc), "a: 1\n--- !\nhi\n---\nb: 2\n");
     }
 
     #[test]

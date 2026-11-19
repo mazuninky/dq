@@ -246,6 +246,10 @@ pub(crate) fn document_extents(bytes: &[u8]) -> Option<Vec<DocumentExtent>> {
                     after_properties,
                 });
             }
+            Event::Scalar(value, ScalarStyle::Literal | ScalarStyle::Folded, ..) => {
+                let range = span_to_range(span, &char_to_byte);
+                content.push(block_scalar_content(bytes, range, &value));
+            }
             Event::Scalar(..) | Event::Alias(_) => {
                 content.push(span_to_range(span, &char_to_byte));
             }
@@ -315,6 +319,27 @@ fn marker_line_body(bytes: &[u8], marker_end: usize) -> (usize, bool, Option<(us
         }
     });
     (marker_end, true, after_properties)
+}
+
+/// The part of a block scalar's span `range` that is its content: a
+/// clip (`|`, `>`) or strip (`|-`, `>-`) scalar's span runs over the blank
+/// lines after it, which are not part of its `value`, so the span ends
+/// after its last non-blank line. A keep (`|+`, `>+`) scalar's trailing
+/// blank lines are in its value — two or more final line breaks — and
+/// stay content.
+fn block_scalar_content(bytes: &[u8], range: Range<usize>, value: &str) -> Range<usize> {
+    if value.ends_with("\n\n") {
+        return range;
+    }
+    let span = &bytes[range.clone()];
+    let Some(last) = span.iter().rposition(|b| !b.is_ascii_whitespace()) else {
+        return range;
+    };
+    let end = span[last..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(range.end, |newline| range.start + last + newline + 1);
+    range.start..end
 }
 
 /// End of the last content line of `body`, whose scalars and aliases are
@@ -3670,7 +3695,7 @@ mod tests {
 
     #[test]
     fn document_extents_end_content_before_trailing_comments() {
-        let cases: [(&[u8], &[&[u8]]); 6] = [
+        let cases: [(&[u8], &[&[u8]]); 10] = [
             (
                 b"a: 1\n---\nfixme: 1 # k\n\n# next\n---\nb: 2\n# tail\n",
                 &[b"a: 1\n", b"fixme: 1 # k\n", b"b: 2\n"],
@@ -3690,6 +3715,18 @@ mod tests {
                 &[b"a:\n  k: |\n    x\n", b"b: 2\n"],
             ),
             (b"a: [1,\n  2\n]\n# c\n...\n", &[b"a: [1,\n  2\n]\n"]),
+            // Clip and strip: the blank lines after the scalar are not
+            // content; keep: they are.
+            (
+                b"k: |\n  x\n\n# c\n---\nb: 2\n",
+                &[b"k: |\n  x\n", b"b: 2\n"],
+            ),
+            (b"k: >-\n  x\n  y\n\n# c\n", &[b"k: >-\n  x\n  y\n"]),
+            (b"k: |\r\n  x\r\n\r\n# c\r\n", &[b"k: |\r\n  x\r\n"]),
+            (
+                b"k: |+\n  x\n\n# c\n---\nb: 2\n",
+                &[b"k: |+\n  x\n\n", b"b: 2\n"],
+            ),
         ];
         for (bytes, contents) in cases {
             let extents = document_extents(bytes).expect("parses");
