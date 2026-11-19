@@ -547,52 +547,30 @@ fn noted_spelling(
 /// `at` is where `node` sits in the source and `literal_at` gives the
 /// source text of the value at a place. The text is noted only when it is
 /// a JSON number of the limit's value: other text (`+5`, `.5`) keeps the
-/// number's own spelling. Data (`const`, `enum`, `default`, `examples`)
-/// gets no member: there `maximum` is no keyword, and a member would
+/// number's own spelling. Only a schema gets a member ([`walk_schemas_mut`]):
+/// in data (`const`, `enum`) `maximum` is no keyword, and a member would
 /// change the value.
 pub(crate) fn note_limit_spellings(
     node: &mut serde_json::Value,
     at: &mut dq_core::Pointer,
     literal_at: &dyn Fn(&dq_core::Pointer) -> Option<String>,
 ) {
-    match node {
-        serde_json::Value::Object(schema) => {
-            let mut noted = serde_json::Map::new();
-            for (keyword, value) in schema.iter_mut() {
-                at.push_segment(dq_core::Segment::Key(keyword.clone()));
-                match keyword.as_str() {
-                    k if LIMIT_KEYWORDS.contains(&k) => {
-                        if let Some(text) = source_spelling(value, &literal_at(at)) {
-                            noted.insert(k.to_owned(), serde_json::Value::String(text));
-                        }
-                    }
-                    k if DATA_KEYWORDS.contains(&k) => {}
-                    k if SCHEMA_MAPS.contains(&k) => {
-                        if let Some(map) = value.as_object_mut() {
-                            for (name, schema) in map.iter_mut() {
-                                at.push_segment(dq_core::Segment::Key(name.clone()));
-                                note_limit_spellings(schema, at, literal_at);
-                                at.pop_segment();
-                            }
-                        }
-                    }
-                    _ => note_limit_spellings(value, at, literal_at),
-                }
-                at.pop_segment();
-            }
-            if !noted.is_empty() {
-                schema.insert(SPELLINGS.to_owned(), serde_json::Value::Object(noted));
+    walk_schemas_mut(node, at, &mut |schema, at| {
+        let mut noted = serde_json::Map::new();
+        for keyword in LIMIT_KEYWORDS {
+            let Some(limit) = schema.get(keyword) else {
+                continue;
+            };
+            let mut place = at.clone();
+            place.push_segment(dq_core::Segment::Key(keyword.to_owned()));
+            if let Some(text) = source_spelling(limit, &literal_at(&place)) {
+                noted.insert(keyword.to_owned(), serde_json::Value::String(text));
             }
         }
-        serde_json::Value::Array(items) => {
-            for (index, item) in items.iter_mut().enumerate() {
-                at.push_segment(dq_core::Segment::Index(index));
-                note_limit_spellings(item, at, literal_at);
-                at.pop_segment();
-            }
+        if !noted.is_empty() {
+            schema.insert(SPELLINGS.to_owned(), serde_json::Value::Object(noted));
         }
-        _ => {}
-    }
+    });
 }
 
 /// `text`, the source text of the limit `value`, when it is a JSON number
@@ -625,11 +603,43 @@ pub(crate) fn stand_in_tiny_divisors(schema: &serde_json::Value) -> Cow<'_, serd
     Cow::Owned(owned)
 }
 
-/// Keywords whose value is data, not a schema: no `multipleOf` inside is
-/// one.
-const DATA_KEYWORDS: [&str; 4] = ["const", "enum", "default", "examples"];
+/// The prefix of every member dq adds to a schema ([`TINY_DIVISOR`],
+/// [`SPELLINGS`]), and of a non-finite float's [`marker`].
+const DQ_MEMBER: &str = "\u{0}dq.";
 
-/// Keywords whose value maps names to schemas: a member named
+/// What a keyword's value is in a JSON Schema 2020-12 schema.
+#[derive(Clone, Copy)]
+enum Place {
+    /// A schema: `not`, `items`, `additionalProperties`, …
+    Schema,
+    /// An array of schemas: `allOf`, `prefixItems`, …
+    Schemas,
+    /// A map of names to schemas: `properties`, `$defs`, …
+    SchemaMap,
+    /// Anything else: a limit, data (`const`, `enum`, `default`), an
+    /// annotation, or a keyword 2020-12 does not have.
+    Data,
+}
+
+/// The keywords whose value is a schema.
+const SCHEMA_KEYWORDS: [&str; 11] = [
+    "items",
+    "contains",
+    "additionalProperties",
+    "propertyNames",
+    "if",
+    "then",
+    "else",
+    "not",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+    "contentSchema",
+];
+
+/// The keywords whose value is an array of schemas.
+const SCHEMA_LISTS: [&str; 4] = ["prefixItems", "allOf", "anyOf", "oneOf"];
+
+/// The keywords whose value maps names to schemas: a member named
 /// `multipleOf` there is a schema.
 const SCHEMA_MAPS: [&str; 5] = [
     "properties",
@@ -638,6 +648,85 @@ const SCHEMA_MAPS: [&str; 5] = [
     "definitions",
     "dependentSchemas",
 ];
+
+/// What the value of `keyword` is in a schema.
+fn place_of(keyword: &str) -> Place {
+    if SCHEMA_KEYWORDS.contains(&keyword) {
+        Place::Schema
+    } else if SCHEMA_LISTS.contains(&keyword) {
+        Place::Schemas
+    } else if SCHEMA_MAPS.contains(&keyword) {
+        Place::SchemaMap
+    } else {
+        Place::Data
+    }
+}
+
+/// Call `visit` on `node`, when it is a schema object, and on every schema
+/// object in it, each with where it sits (`at` is where `node` does).
+///
+/// Only a value of the shape its keyword takes is walked — an object for
+/// `not`, an array for `allOf` — so a member dq adds never lands in a value
+/// the meta-schema refuses, whose error would print it.
+fn walk_schemas_mut(
+    node: &mut serde_json::Value,
+    at: &mut dq_core::Pointer,
+    visit: &mut dyn FnMut(&mut serde_json::Map<String, serde_json::Value>, &dq_core::Pointer),
+) {
+    let serde_json::Value::Object(schema) = node else {
+        return;
+    };
+    visit(schema, at);
+    for (keyword, value) in schema.iter_mut() {
+        let place = place_of(keyword);
+        if matches!(place, Place::Data) {
+            continue;
+        }
+        at.push_segment(dq_core::Segment::Key(keyword.clone()));
+        match (place, value) {
+            (Place::Schema, value) => walk_schemas_mut(value, at, visit),
+            (Place::Schemas, serde_json::Value::Array(items)) => {
+                for (index, item) in items.iter_mut().enumerate() {
+                    at.push_segment(dq_core::Segment::Index(index));
+                    walk_schemas_mut(item, at, visit);
+                    at.pop_segment();
+                }
+            }
+            (Place::SchemaMap, serde_json::Value::Object(map)) => {
+                for (name, item) in map.iter_mut() {
+                    at.push_segment(dq_core::Segment::Key(name.clone()));
+                    walk_schemas_mut(item, at, visit);
+                    at.pop_segment();
+                }
+            }
+            _ => {}
+        }
+        at.pop_segment();
+    }
+}
+
+/// Whether `node` or a schema in it ([`walk_schemas_mut`]) passes `test`.
+fn any_schema(
+    node: &serde_json::Value,
+    test: &dyn Fn(&serde_json::Map<String, serde_json::Value>) -> bool,
+) -> bool {
+    let serde_json::Value::Object(schema) = node else {
+        return false;
+    };
+    test(schema)
+        || schema
+            .iter()
+            .any(|(keyword, value)| match (place_of(keyword), value) {
+                (Place::Schema, value) => any_schema(value, test),
+                (Place::Schemas, serde_json::Value::Array(items)) => {
+                    items.iter().any(|item| any_schema(item, test))
+                }
+                (Place::SchemaMap, serde_json::Value::Object(map)) => {
+                    map.values().any(|item| any_schema(item, test))
+                }
+                _ => false,
+            })
+}
 
 /// Whether `divisor` is a positive number that its nearest `f64` reads as
 /// zero or less.
@@ -651,102 +740,121 @@ fn is_tiny_divisor(divisor: &serde_json::Value) -> bool {
 
 /// Whether some schema in `node` has a tiny `multipleOf`.
 fn has_tiny_divisor(node: &serde_json::Value) -> bool {
-    match node {
-        serde_json::Value::Object(schema) => {
-            schema
-                .iter()
-                .any(|(keyword, value)| match keyword.as_str() {
-                    "multipleOf" => is_tiny_divisor(value),
-                    k if DATA_KEYWORDS.contains(&k) => false,
-                    k if SCHEMA_MAPS.contains(&k) => value
-                        .as_object()
-                        .is_some_and(|map| map.values().any(has_tiny_divisor)),
-                    _ => has_tiny_divisor(value),
-                })
-        }
-        serde_json::Value::Array(items) => items.iter().any(has_tiny_divisor),
-        _ => false,
-    }
+    any_schema(node, &|schema| {
+        schema.get("multipleOf").is_some_and(is_tiny_divisor)
+    })
 }
 
 /// [`stand_in_tiny_divisors`] in place.
 fn replace_tiny_divisors(node: &mut serde_json::Value) {
-    match node {
-        serde_json::Value::Object(schema) => {
-            let mut literal = None;
-            for (keyword, value) in schema.iter_mut() {
-                match keyword.as_str() {
-                    "multipleOf" if is_tiny_divisor(value) => {
-                        literal = Some(value.to_string());
-                        *value = serde_json::Value::from(1);
+    walk_schemas_mut(node, &mut dq_core::Pointer::default(), &mut |schema, _| {
+        let literal = match schema.get_mut("multipleOf") {
+            Some(divisor) if is_tiny_divisor(divisor) => {
+                let literal = divisor.to_string();
+                *divisor = serde_json::Value::from(1);
+                literal
+            }
+            _ => return,
+        };
+        schema.insert(TINY_DIVISOR.to_owned(), serde_json::Value::String(literal));
+    });
+}
+
+/// `schema` as a message prints it (`not`), in serde_json's compact JSON
+/// but for what dq holds in it: a limit is spelled as its source text
+/// ([`SPELLINGS`]), a tiny divisor as written ([`TINY_DIVISOR`]), a NaN or
+/// an infinity as `.nan` / `.inf` / `-.inf`, and no member dq adds is
+/// printed.
+fn render_schema(schema: &serde_json::Value) -> String {
+    let mut out = String::new();
+    render(schema, Place::Schema, &mut out);
+    out
+}
+
+/// [`render_schema`] for `node`, which is a `place`.
+fn render(node: &serde_json::Value, place: Place, out: &mut String) {
+    match (place, node) {
+        (Place::Schema, serde_json::Value::Object(schema)) => {
+            out.push('{');
+            let members = schema.iter().filter(|(k, _)| !k.starts_with(DQ_MEMBER));
+            for (index, (keyword, value)) in members.enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                render_key(keyword, out);
+                match value {
+                    serde_json::Value::Number(number)
+                        if LIMIT_KEYWORDS.contains(&keyword.as_str()) =>
+                    {
+                        let text = noted_spelling(schema, keyword)
+                            .or_else(|| {
+                                (keyword == "multipleOf")
+                                    .then(|| schema.get(TINY_DIVISOR)?.as_str().map(str::to_owned))
+                                    .flatten()
+                            })
+                            .unwrap_or_else(|| number.to_string());
+                        out.push_str(&text);
                     }
-                    k if DATA_KEYWORDS.contains(&k) => {}
-                    k if SCHEMA_MAPS.contains(&k) => {
-                        if let Some(map) = value.as_object_mut() {
-                            map.values_mut().for_each(replace_tiny_divisors);
-                        }
-                    }
-                    _ => replace_tiny_divisors(value),
+                    value => render(value, place_of(keyword), out),
                 }
             }
-            if let Some(literal) = literal {
-                schema.insert(TINY_DIVISOR.to_owned(), serde_json::Value::String(literal));
-            }
+            out.push('}');
         }
-        serde_json::Value::Array(items) => items.iter_mut().for_each(replace_tiny_divisors),
-        _ => {}
+        (Place::Schemas, serde_json::Value::Array(items)) => {
+            render_array(items, Place::Schema, out);
+        }
+        (Place::SchemaMap, serde_json::Value::Object(map)) => {
+            render_object(map, Place::Schema, out);
+        }
+        (_, serde_json::Value::Array(items)) => render_array(items, Place::Data, out),
+        (_, serde_json::Value::Object(map)) => render_object(map, Place::Data, out),
+        (_, serde_json::Value::String(s)) => match unmarker(s) {
+            Some(spelling) => out.push_str(spelling),
+            None => out.push_str(&serde_json::Value::String(s.clone()).to_string()),
+        },
+        (_, scalar) => out.push_str(&scalar.to_string()),
     }
 }
 
-/// `schema` with every [`stand_in_tiny_divisors`] stand-in turned back
-/// into the divisor as written, and every [`SPELLINGS`] member dropped, for
-/// a message that prints a schema (`not`). Borrowed when there is none.
-fn restore_tiny_divisors(schema: &serde_json::Value) -> Cow<'_, serde_json::Value> {
-    fn walk(node: &mut serde_json::Value) {
-        match node {
-            serde_json::Value::Object(schema) => {
-                let literal = schema
-                    .get(TINY_DIVISOR)
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|literal| serde_json::from_str::<serde_json::Value>(literal).ok());
-                if let Some(literal) = literal {
-                    schema.shift_remove(TINY_DIVISOR);
-                    schema.insert("multipleOf".to_owned(), literal);
-                }
-                schema.shift_remove(SPELLINGS);
-                for (keyword, value) in schema.iter_mut() {
-                    match keyword.as_str() {
-                        k if DATA_KEYWORDS.contains(&k) => {}
-                        k if SCHEMA_MAPS.contains(&k) => {
-                            if let Some(map) = value.as_object_mut() {
-                                map.values_mut().for_each(walk);
-                            }
-                        }
-                        _ => walk(value),
-                    }
-                }
-            }
-            serde_json::Value::Array(items) => items.iter_mut().for_each(walk),
-            _ => {}
+/// [`render`] for an array whose items are each a `place`.
+fn render_array(items: &[serde_json::Value], place: Place, out: &mut String) {
+    out.push('[');
+    for (index, item) in items.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
         }
+        render(item, place, out);
     }
-    // Both members dq adds begin `\u{0}dq.`.
-    if !serde_json::to_string(schema).is_ok_and(|text| text.contains("\\u0000dq.")) {
-        return Cow::Borrowed(schema);
+    out.push(']');
+}
+
+/// [`render`] for an object whose values are each a `place`.
+fn render_object(map: &serde_json::Map<String, serde_json::Value>, place: Place, out: &mut String) {
+    out.push('{');
+    for (index, (key, value)) in map.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        render_key(key, out);
+        render(value, place, out);
     }
-    let mut owned = schema.clone();
-    walk(&mut owned);
-    Cow::Owned(owned)
+    out.push('}');
+}
+
+/// `key` as JSON writes an object key, and the colon after it.
+fn render_key(key: &str, out: &mut String) {
+    out.push_str(&serde_json::Value::String(key.to_owned()).to_string());
+    out.push(':');
 }
 
 /// The text of a validation error as dq reports it: a schema the message
-/// prints (`not`) with its tiny divisors as written, and every non-finite
-/// float [`restore`]d.
+/// prints (`not`) as [`render_schema`] does, and every non-finite float
+/// [`restore`]d.
 pub(crate) fn error_text(error: &jsonschema::ValidationError<'_>) -> String {
     let text = match error.kind() {
         jsonschema::error::ValidationErrorKind::Not { schema } => format!(
             "{} is not allowed for {}",
-            restore_tiny_divisors(schema),
+            render_schema(schema),
             error.instance()
         ),
         _ => error.to_string(),
@@ -1405,11 +1513,46 @@ mod tests {
                 r#"{"maximum":1e+2} was expected"#,
             ]
         );
-        assert!(
-            !restore_tiny_divisors(&schema)
-                .to_string()
-                .contains("dq.spelling")
+        assert_eq!(
+            render_schema(&schema),
+            r#"{"maximum":1e2,"minimum":5,"multipleOf":2.5E0,"const":{"maximum":1e+2},"properties":{"maximum":{"minimum":1E1}},"prefixItems":[{"exclusiveMinimum":1E-1},{"maximum":1e-1}]}"#
         );
+    }
+
+    #[test]
+    fn a_printed_schema_shows_only_what_the_rule_wrote() {
+        let mut schema = serde_json::json!({
+            "not": {"multipleOf": 1, "enum": [marker(".inf"), "a"], "x-data": {"k": marker("-.inf")}},
+            "allOf": [{"maximum": 3}],
+            "$defs": {"d": {"minimum": 0}},
+            "const": {"\u{0}dq.member": 1}
+        });
+        schema["not"][TINY_DIVISOR] = serde_json::json!("1e-400");
+        schema["allOf"][0][SPELLINGS] = serde_json::json!({"maximum": "3.0e0"});
+        schema["$defs"]["d"][SPELLINGS] = serde_json::json!({"minimum": "0E0"});
+        assert_eq!(
+            render_schema(&schema),
+            "{\"not\":{\"multipleOf\":1e-400,\"enum\":[.inf,\"a\"],\"x-data\":{\"k\":-.inf}},\
+             \"allOf\":[{\"maximum\":3.0e0}],\"$defs\":{\"d\":{\"minimum\":0E0}},\
+             \"const\":{\"\\u0000dq.member\":1}}"
+        );
+    }
+
+    #[test]
+    fn a_note_goes_only_where_the_keyword_takes_a_schema() {
+        // `not` holding an array, `allOf` an object, `type` an object: the
+        // meta-schema refuses each, and its error prints the value.
+        let text = r#"{"not": [{"maximum": 1e2}], "allOf": {"a": {"maximum": 1e2}},
+            "type": {"maximum": 1e2}}"#;
+        let mut schema: serde_json::Value = serde_json::from_str(text).expect("schema");
+        let before = schema.clone();
+        let doc = dq_core::parse_json_with_spans(text.as_bytes()).expect("spans");
+        let literal_at = |at: &dq_core::Pointer| {
+            let span = doc.span_at(at)?;
+            text.get(span.value_range.clone()).map(str::to_owned)
+        };
+        note_limit_spellings(&mut schema, &mut dq_core::Pointer::default(), &literal_at);
+        assert_eq!(schema, before);
     }
 
     #[test]

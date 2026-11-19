@@ -1382,8 +1382,8 @@ fn lint_quotes_a_limit_as_each_rule_of_a_stream_spells_it() {
 }
 
 /// A `schema_file` limit is quoted as the file spells it too, through a
-/// `$ref` as well. The spelling travels next to the keyword, never into
-/// data (`const`) or into a schema a message prints (`not`). Before, an
+/// `$ref` and in a schema a message prints (`not`) as well. The spelling
+/// travels next to the keyword, never into data (`const`). Before, an
 /// exponent came out as serde_json reads it, `1e2` as `1e+2`.
 #[test]
 fn a_schema_file_limit_is_quoted_as_the_file_spells_it() {
@@ -1434,10 +1434,72 @@ f: 101
                 "/properties/b/multipleOf: 1 is not a multiple of 2.50",
                 "/properties/c/exclusiveMaximum: 1 is greater than or equal to the maximum of 1E-1",
                 "/properties/d/$ref/minimum: 4 is less than the minimum of 5e0",
-                "/properties/f/not: {\"maximum\":1e+2} is not allowed for 5",
+                "/properties/f/not: {\"maximum\":1e2} is not allowed for 5",
             ]
             .map(str::to_owned)
             .to_vec()
         )
+    );
+}
+
+/// The text dq keeps inside a schema — a limit's spelling, a tiny
+/// divisor's literal and its stand-in, a NaN or an infinity's marker —
+/// never reaches output: a schema a message prints (`not`) reads as the
+/// rule wrote it, in every report format, in `dq test`, in `-vv` tracing,
+/// and in a compile error. Before, a `not` message printed `1e+2` for
+/// `1e2`, and a tiny divisor under a keyword that takes no schema (`type`)
+/// put its stand-in into the compile error:
+/// `{"multipleOf":1,"\u0000dq.multipleOf":"1e-400"} is not valid …`.
+#[test]
+fn no_text_dq_keeps_in_a_schema_reaches_output() {
+    let rule = "id: t.not\ndescription: x\nseverity: error\nmatch: { format: yaml }\n\
+                check:\n  schema: { properties: { x: { not: { maximum: 1e2, \
+                multipleOf: 1e-400, enum: [.inf, 5], properties: { m: { minimum: 1E1 } } } } } }\n";
+    let cases = "tests:\n  - name: shows the message\n    input: |\n      x: 5\n    \
+                 expected:\n      violations: []\n";
+    let broken = "id: t.bad\ndescription: x\nseverity: error\nmatch: { format: yaml }\n\
+                  check:\n  schema: { properties: { x: { type: { maximum: 1e2, \
+                  multipleOf: 1e-400 } } } }\n";
+    let dir = dir_with(&[
+        ("r/not.yml", rule),
+        ("r/not.test.yml", cases),
+        ("bad.yml", broken),
+        (".dq/rules/not.yml", rule),
+        ("doc.yaml", "x: 5\n"),
+    ]);
+    let message = "/properties/x/not: {\"maximum\":1e2,\"multipleOf\":1e-400,\"enum\":[.inf,5],\
+                   \"properties\":{\"m\":{\"minimum\":1E1}}} is not allowed for 5";
+    assert_eq!(
+        messages_in(dir.path(), &["check", "--rule", "r/not.yml", "doc.yaml"]),
+        (4, vec![message.to_owned()])
+    );
+    let runs: [&[&str]; 9] = [
+        &["check", "--rule", "r/not.yml", "doc.yaml"],
+        &["-F", "yaml", "check", "--rule", "r/not.yml", "doc.yaml"],
+        &["-F", "jsonl", "lint", "doc.yaml"],
+        &["-F", "toon", "lint", "doc.yaml"],
+        &["-vv", "lint", "doc.yaml"],
+        &["test", "r"],
+        &["-F", "json", "explain", "t.not"],
+        &["-F", "json", "rules", "list"],
+        &["-vv", "check", "--rule", "bad.yml", "doc.yaml"],
+    ];
+    for args in runs {
+        let (code, stdout, stderr) = run_in(dir.path(), args);
+        let output = format!("{stdout}{stderr}");
+        for leak in ["\u{0}", "\\u0000", "dq.spelling", "dq.multipleOf", "dq.inf"] {
+            assert!(
+                !output.contains(leak),
+                "{args:?} exit {code} prints {leak:?}: {output}"
+            );
+        }
+    }
+    let (code, _, stderr) = run_in(dir.path(), &["check", "--rule", "bad.yml", "doc.yaml"]);
+    assert_eq!(code, 3, "{stderr}");
+    assert!(
+        stderr.contains(
+            "{\"maximum\":1e+2,\"multipleOf\":1e-400} is not valid under any of the schemas"
+        ),
+        "{stderr}"
     );
 }
