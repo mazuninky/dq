@@ -2371,3 +2371,900 @@ fn patch_add_before_a_compact_first_item_inserts() {
         },
     ]);
 }
+
+// ---- patch: moves, scalars and stream documents, further ----------------
+
+/// `patch` ops of one kind, on `path`, with `value`.
+fn op(kind: &str, path: &str, value: &str) -> String {
+    format!(r#"[{{"op":"{kind}","path":"{path}","value":{value}}}]"#)
+}
+
+/// A `move` or `copy` from `from` to `path`.
+fn mv(kind: &str, from: &str, path: &str) -> String {
+    format!(r#"[{{"op":"{kind}","from":"{from}","path":"{path}"}}]"#)
+}
+
+/// The root is the parent of every path: a move of `""` into one of them
+/// is a move into its own child (RFC 6902 §4.4), named as such.
+#[test]
+fn patch_move_of_the_root_into_a_child_is_refused() {
+    let stderr = refused(
+        "f.yaml",
+        "a: {x: 1}\n",
+        &["-i", "patch", "f.yaml", &mv("move", "", "/a/y")],
+        2,
+    );
+    assert!(
+        stderr.contains("cannot move '' to '/a/y'")
+            && stderr.contains("into one of its own children"),
+        "stderr: {stderr}"
+    );
+}
+
+/// A child is under its parent's pointer and a `/`: `/a/xz` shares the
+/// prefix `/a/x` and is its sibling, so a move there lands.
+#[test]
+fn patch_move_to_a_sibling_sharing_a_prefix_lands() {
+    check(&[
+        Case {
+            name: "f.yaml",
+            src: "a: {x: 1}\n",
+            args: &["patch", "f.yaml", &mv("move", "/a/x", "/a/xz")],
+            want: "a: {xz: 1}\n",
+            reads: json!({"a": {"xz": 1}}),
+        },
+        Case {
+            name: "f.yaml",
+            src: "ab: 1\na: {}\n",
+            args: &["patch", "f.yaml", &mv("move", "/ab", "/a/b")],
+            want: "a: {b: 1}\n",
+            reads: json!({"a": {"b": 1}}),
+        },
+        Case {
+            name: "f.yaml",
+            src: "a: {x: 1}\nc: 2\n",
+            args: &["patch", "f.yaml", &mv("move", "/a", "/ab")],
+            want: "c: 2\nab:\n  x: 1\n",
+            reads: json!({"c": 2, "ab": {"x": 1}}),
+        },
+    ]);
+}
+
+/// `add` under a scalar has no object or array to add into: exit 2.
+#[test]
+fn patch_add_under_a_scalar_is_not_found() {
+    for (name, src) in [("f.yaml", "a: 1\n"), ("f.json", "{\"a\": 1}\n")] {
+        let stderr = refused(
+            name,
+            src,
+            &["-i", "patch", name, &op("add", "/a/b", "2")],
+            2,
+        );
+        assert!(stderr.contains("'/a/b' not found"), "stderr: {stderr}");
+    }
+}
+
+/// `copy`, `test` and `add` take `/N` as a document of the stream, as
+/// `remove` and `replace` do; ops after a `remove` that leaves one
+/// document see a stream of one, which `add /1` and `add /-` extend.
+#[test]
+fn patch_copy_test_and_add_address_stream_documents() {
+    let stream = "a: 1\n---\nb: 2\n";
+    check(&[
+        Case {
+            name: "s.yaml",
+            src: stream,
+            args: &["patch", "s.yaml", &mv("copy", "/0", "/1")],
+            want: "a: 1\n---\na: 1\n---\nb: 2\n",
+            reads: json!([{"a": 1}, {"a": 1}, {"b": 2}]),
+        },
+        Case {
+            name: "s.yaml",
+            src: stream,
+            args: &[
+                "patch",
+                "s.yaml",
+                r#"[{"op":"test","path":"/1","value":{"b":2}},{"op":"add","path":"/1/c","value":3}]"#,
+            ],
+            want: "a: 1\n---\nb: 2\nc: 3\n",
+            reads: json!([{"a": 1}, {"b": 2, "c": 3}]),
+        },
+        Case {
+            name: "s.yaml",
+            src: stream,
+            args: &[
+                "patch",
+                "s.yaml",
+                r#"[{"op":"remove","path":"/1"},{"op":"add","path":"/1","value":{"x":1}}]"#,
+            ],
+            want: "a: 1\n---\nx: 1\n",
+            reads: json!([{"a": 1}, {"x": 1}]),
+        },
+        Case {
+            name: "s.yaml",
+            src: stream,
+            args: &[
+                "patch",
+                "s.yaml",
+                r#"[{"op":"remove","path":"/0"},{"op":"add","path":"/-","value":{"x":1}}]"#,
+            ],
+            want: "---\nb: 2\n---\nx: 1\n",
+            reads: json!([{"b": 2}, {"x": 1}]),
+        },
+        Case {
+            name: "s.yaml",
+            src: stream,
+            args: &["patch", "s.yaml", &mv("move", "/1", "/0")],
+            want: "b: 2\n---\na: 1\n",
+            reads: json!([{"b": 2}, {"a": 1}]),
+        },
+    ]);
+    let stderr = refused(
+        "s.yaml",
+        stream,
+        &["-i", "patch", "s.yaml", &op("test", "/1", r#"{"b":3}"#)],
+        1,
+    );
+    assert!(stderr.contains("test op failed at /1"), "stderr: {stderr}");
+}
+
+// ---- array inserts: refusals and separators ---------------------------
+
+/// An array of tables holds only tables, and TOML has no null: such an
+/// insert is refused (exit 7), the file untouched, at an index or `-`.
+#[test]
+fn patch_add_into_a_toml_array_refuses_what_it_cannot_hold() {
+    for (src, ops, says) in [
+        (
+            "[[t]]\nx = 1\n",
+            op("add", "/t/0", "5"),
+            "cannot insert '/t/0': an array of tables holds only tables",
+        ),
+        (
+            "[[t]]\nx = 1\n",
+            op("add", "/t/-", "[1]"),
+            "cannot insert '/t/1': an array of tables holds only tables",
+        ),
+        (
+            "a = [1, 2]\n",
+            op("add", "/a/0", "null"),
+            "cannot set '/a/0'",
+        ),
+        (
+            "a = [1, 2]\n",
+            op("add", "/a/-", "null"),
+            "cannot set '/a/2'",
+        ),
+    ] {
+        let stderr = refused("f.toml", src, &["-i", "patch", "f.toml", &ops], 7);
+        assert!(stderr.contains(says), "{ops}: {stderr}");
+    }
+}
+
+/// In a multi-line array the new item gets its own line and comma; a
+/// comment after an item's comma stays with that item; an append after a
+/// last item without a trailing comma puts the comma after the item and
+/// the new one before its comment. Arrays of one item and of none too.
+#[test]
+fn patch_add_into_an_array_keeps_the_separators_and_comments() {
+    let (zero, one, end) = (
+        op("add", "/a/0", "9"),
+        op("add", "/a/1", "9"),
+        op("add", "/a/-", "9"),
+    );
+    let mut cases = Vec::new();
+    for (name, open, close) in [("f.toml", "a = [", "]"), ("f.yaml", "a: [", "]")] {
+        cases.push((
+            name,
+            format!("{open}\n  1, # one\n  2, # two\n{close}\n"),
+            one.as_str(),
+            format!("{open}\n  1, # one\n  9,\n  2, # two\n{close}\n"),
+            json!({"a": [1, 9, 2]}),
+        ));
+        cases.push((
+            name,
+            format!("{open}\n  1, # one\n  2 # two\n{close}\n"),
+            end.as_str(),
+            format!("{open}\n  1, # one\n  2, 9 # two\n{close}\n"),
+            json!({"a": [1, 2, 9]}),
+        ));
+        cases.push((
+            name,
+            format!("{open}\n  1, # one\n  2 # two\n{close}\n"),
+            zero.as_str(),
+            format!("{open}\n  9,\n  1, # one\n  2 # two\n{close}\n"),
+            json!({"a": [9, 1, 2]}),
+        ));
+        cases.push((
+            name,
+            format!("{open}1{close}\n"),
+            zero.as_str(),
+            format!("{open}9, 1{close}\n"),
+            json!({"a": [9, 1]}),
+        ));
+        cases.push((
+            name,
+            format!("{open}1{close}\n"),
+            one.as_str(),
+            format!("{open}1, 9{close}\n"),
+            json!({"a": [1, 9]}),
+        ));
+        cases.push((
+            name,
+            format!("{open}{close}\n"),
+            zero.as_str(),
+            format!("{open}9{close}\n"),
+            json!({"a": [9]}),
+        ));
+    }
+    cases.push((
+        "f.yaml",
+        "a: [1 # c\n]\n".to_owned(),
+        end.as_str(),
+        "a: [1, 9 # c\n]\n".to_owned(),
+        json!({"a": [1, 9]}),
+    ));
+    cases.push((
+        "f.yaml",
+        "a:\n  - 1\n".to_owned(),
+        zero.as_str(),
+        "a:\n  - 9\n  - 1\n".to_owned(),
+        json!({"a": [9, 1]}),
+    ));
+    for (name, src, ops, want, reads) in cases {
+        let got = edit(name, &src, &["patch", name, ops]);
+        assert_eq!(got, want, "{ops} on {src:?}");
+        assert_eq!(read(name, &got), reads, "{got:?}");
+    }
+}
+
+/// RFC 6902 §4.1: `add` at an index of a root array inserts; `set` at
+/// one replaces.
+#[test]
+fn patch_add_at_an_index_of_a_root_array_inserts_and_set_replaces() {
+    check(&[
+        Case {
+            name: "f.json",
+            src: "[1,2]\n",
+            args: &["patch", "f.json", &op("add", "/0", "9")],
+            want: "[9,1,2]\n",
+            reads: json!([9, 1, 2]),
+        },
+        Case {
+            name: "f.yaml",
+            src: "[1,2]\n",
+            args: &["patch", "f.yaml", &op("add", "/0", "9")],
+            want: "[9,1,2]\n",
+            reads: json!([9, 1, 2]),
+        },
+        Case {
+            name: "f.json",
+            src: "[1,2]\n",
+            args: &["set", "f.json", "/0", "9"],
+            want: "[9,2]\n",
+            reads: json!([9, 2]),
+        },
+    ]);
+}
+
+// ---- stream inserts, further ------------------------------------------
+
+/// A document inserted into a stream: at 0 before an implicit first
+/// document (after the file's head comment), after a `...` line, with
+/// `\r\n` and lone `\r` line breaks, after a byte order mark (which stays
+/// the first byte), and appended after a last document ended by `...` or
+/// followed by comment lines (which stay last).
+#[test]
+fn patch_add_of_a_stream_document_in_every_layout() {
+    let (zero, one, end) = (
+        op("add", "/0", r#"{"x":1}"#),
+        op("add", "/1", r#"{"x":1}"#),
+        op("add", "/-", r#"{"x":1}"#),
+    );
+    let three = json!([{"x": 1}, {"a": 1}, {"b": 2}]);
+    let middle = json!([{"a": 1}, {"x": 1}, {"b": 2}]);
+    let last = json!([{"a": 1}, {"b": 2}, {"x": 1}]);
+    check(&[
+        Case {
+            name: "s.yaml",
+            src: "# c\na: 1\n---\nb: 2\n",
+            args: &["patch", "s.yaml", &zero],
+            want: "# c\nx: 1\n---\na: 1\n---\nb: 2\n",
+            reads: three.clone(),
+        },
+        Case {
+            name: "s.yaml",
+            src: "---\na: 1\n---\nb: 2\n",
+            args: &["patch", "s.yaml", &zero],
+            want: "---\nx: 1\n---\na: 1\n---\nb: 2\n",
+            reads: three.clone(),
+        },
+        Case {
+            name: "s.yaml",
+            src: "a: 1\n...\n---\nb: 2\n",
+            args: &["patch", "s.yaml", &one],
+            want: "a: 1\n...\n---\nx: 1\n---\nb: 2\n",
+            reads: middle.clone(),
+        },
+        Case {
+            name: "s.yaml",
+            src: "a: 1\r\n---\r\nb: 2\r\n",
+            args: &["patch", "s.yaml", &zero],
+            want: "x: 1\r\n---\r\na: 1\r\n---\r\nb: 2\r\n",
+            reads: three.clone(),
+        },
+        Case {
+            name: "s.yaml",
+            src: "a: 1\r\n---\r\nb: 2\r\n",
+            args: &["patch", "s.yaml", &end],
+            want: "a: 1\r\n---\r\nb: 2\r\n---\r\nx: 1\r\n",
+            reads: last.clone(),
+        },
+        Case {
+            name: "s.yaml",
+            src: "a: 1\r---\rb: 2\r",
+            args: &["patch", "s.yaml", &one],
+            want: "a: 1\r---\rx: 1\r---\rb: 2\r",
+            reads: middle.clone(),
+        },
+        Case {
+            name: "s.yaml",
+            src: "\u{feff}a: 1\n---\nb: 2\n",
+            args: &["patch", "s.yaml", &zero],
+            want: "\u{feff}x: 1\n---\na: 1\n---\nb: 2\n",
+            reads: three.clone(),
+        },
+        Case {
+            name: "s.yaml",
+            src: "\u{feff}a: 1\n---\nb: 2\n",
+            args: &["patch", "s.yaml", &one],
+            want: "\u{feff}a: 1\n---\nx: 1\n---\nb: 2\n",
+            reads: middle.clone(),
+        },
+        Case {
+            name: "s.yaml",
+            src: "a: 1\n---\nb: 2\n...\n",
+            args: &["patch", "s.yaml", &end],
+            want: "a: 1\n---\nb: 2\n...\n---\nx: 1\n",
+            reads: last.clone(),
+        },
+        Case {
+            name: "s.yaml",
+            src: "a: 1\n---\nb: 2\n# trailing\n",
+            args: &["patch", "s.yaml", &end],
+            want: "a: 1\n---\nb: 2\n---\nx: 1\n# trailing\n",
+            reads: last.clone(),
+        },
+        Case {
+            name: "s.yaml",
+            src: "a: 1\n---\nb: 2\n# trailing\n",
+            args: &["patch", "s.yaml", &one],
+            want: "a: 1\n---\nx: 1\n---\nb: 2\n# trailing\n",
+            reads: middle,
+        },
+    ]);
+}
+
+/// `%YAML` and `%TAG` together, with comment lines among them and before
+/// `---`, stay with their document; a `copy` or `move` to `/0` inserts
+/// the same way.
+#[test]
+fn patch_insert_before_directives_keeps_them_all_with_their_document() {
+    let tagged = "%TAG !e! tag:e.com,2000:\n---\na: !e!x 1\n---\nb: 2\n";
+    check(&[
+        Case {
+            name: "s.yaml",
+            src: "%YAML 1.2\n%TAG !e! tag:e.com,2000:\n---\na: !e!x 1\n---\nb: 2\n",
+            args: &["patch", "s.yaml", &op("add", "/0", r#"{"x":1}"#)],
+            want: "---\nx: 1\n...\n%YAML 1.2\n%TAG !e! tag:e.com,2000:\n---\na: !e!x 1\n---\nb: 2\n",
+            reads: json!([{"x": 1}, {"a": 1}, {"b": 2}]),
+        },
+        Case {
+            name: "s.yaml",
+            src: "%YAML 1.2\n# between\n%TAG !e! tag:e.com,2000:\n# again\n---\na: !e!x 1\n---\nb: 2\n",
+            args: &["patch", "s.yaml", &op("add", "/0", r#"{"x":1}"#)],
+            want: "---\nx: 1\n...\n%YAML 1.2\n# between\n%TAG !e! tag:e.com,2000:\n# again\n---\na: !e!x 1\n---\nb: 2\n",
+            reads: json!([{"x": 1}, {"a": 1}, {"b": 2}]),
+        },
+        Case {
+            name: "s.yaml",
+            src: tagged,
+            args: &["patch", "s.yaml", &mv("copy", "/1", "/0")],
+            want: "---\nb: 2\n...\n%TAG !e! tag:e.com,2000:\n---\na: !e!x 1\n---\nb: 2\n",
+            reads: json!([{"b": 2}, {"a": 1}, {"b": 2}]),
+        },
+        Case {
+            name: "s.yaml",
+            src: tagged,
+            args: &["patch", "s.yaml", &mv("move", "/1", "/0")],
+            want: "---\nb: 2\n...\n%TAG !e! tag:e.com,2000:\n---\na: !e!x 1\n",
+            reads: json!([{"b": 2}, {"a": 1}]),
+        },
+    ]);
+}
+
+// ---- inserts and aliases, further -------------------------------------
+
+/// An insert into an anchored array shows through every alias of it,
+/// nested anchors too; under a nested alias it is refused, naming the
+/// anchored node. A `move` within an anchored array reorders it for all.
+#[test]
+fn patch_insert_through_nested_and_repeated_aliases() {
+    check(&[
+        Case {
+            name: "f.yaml",
+            src: "a: &q [1]\nb: *q\nc: {k: *q}\n",
+            args: &["patch", "f.yaml", &op("add", "/a/0", "9")],
+            want: "a: &q [9, 1]\nb: *q\nc: {k: *q}\n",
+            reads: json!({"a": [9, 1], "b": [9, 1], "c": {"k": [9, 1]}}),
+        },
+        Case {
+            name: "f.yaml",
+            src: "x: &r\n  a: &s [1]\n  b: *s\ny: *r\n",
+            args: &["patch", "f.yaml", &op("add", "/x/a/0", "9")],
+            want: "x: &r\n  a: &s [9, 1]\n  b: *s\ny: *r\n",
+            reads: json!({
+                "x": {"a": [9, 1], "b": [9, 1]},
+                "y": {"a": [9, 1], "b": [9, 1]},
+            }),
+        },
+        Case {
+            name: "f.yaml",
+            src: "a: &q [1, 2]\nb: *q\n",
+            args: &["patch", "f.yaml", &mv("move", "/a/1", "/a/0")],
+            want: "a: &q [2, 1]\nb: *q\n",
+            reads: json!({"a": [2, 1], "b": [2, 1]}),
+        },
+        Case {
+            name: "f.yaml",
+            src: "a: &q [1, 2]\nb: *q\n",
+            args: &["patch", "f.yaml", &mv("move", "/a/0", "/a/-")],
+            want: "a: &q [2, 1]\nb: *q\n",
+            reads: json!({"a": [2, 1], "b": [2, 1]}),
+        },
+        Case {
+            name: "f.yaml",
+            src: "a: &q\n  - 1\n  - 2\nb: *q\n",
+            args: &["patch", "f.yaml", &mv("move", "/a/1", "/a/0")],
+            want: "a: &q\n  - 2\n  - 1\nb: *q\n",
+            reads: json!({"a": [2, 1], "b": [2, 1]}),
+        },
+    ]);
+    let stderr = refused(
+        "f.yaml",
+        "x: &r\n  a: &s [1]\n  b: *s\ny: *r\n",
+        &["-i", "patch", "f.yaml", &op("add", "/x/b/0", "9")],
+        7,
+    );
+    assert!(
+        stderr
+            .contains("cannot insert '/x/b/0': it lies under the alias on line 3, a copy of /x/a"),
+        "stderr: {stderr}"
+    );
+}
+
+/// A `*` in a string is no alias: inserts into arrays holding one, in
+/// every format, go as into any other array.
+#[test]
+fn patch_insert_next_to_a_star_in_a_string_is_a_plain_insert() {
+    let ops = op("add", "/a/0", r#""*x""#);
+    let reads = json!({"a": ["*x", "*q", 1]});
+    check(&[
+        Case {
+            name: "f.json",
+            src: "{\"a\": [\"*q\", 1]}\n",
+            args: &["patch", "f.json", &ops],
+            want: "{\"a\": [\"*x\", \"*q\", 1]}\n",
+            reads: reads.clone(),
+        },
+        Case {
+            name: "f.toml",
+            src: "a = [\"*q\", 1]\n",
+            args: &["patch", "f.toml", &ops],
+            want: "a = [\"*x\", \"*q\", 1]\n",
+            reads: reads.clone(),
+        },
+        Case {
+            name: "f.yaml",
+            src: "a: [\"*q\", 1]\n",
+            args: &["patch", "f.yaml", &ops],
+            want: "a: [\"*x\", \"*q\", 1]\n",
+            reads,
+        },
+        Case {
+            name: "f.yaml",
+            src: "a: [1]\nb: \"*a\"\n",
+            args: &["patch", "f.yaml", &op("add", "/a/0", "9")],
+            want: "a: [9, 1]\nb: \"*a\"\n",
+            reads: json!({"a": [9, 1], "b": "*a"}),
+        },
+    ]);
+}
+
+// ---- inserts before a compact first item, further -----------------------
+
+/// Before a compact first item: deeper nesting, an item with a tag or an
+/// anchor (its alias still reads the old item), a tab before a comment
+/// or inside a string, multibyte text in keys and values, and a sequence
+/// at the column of its key. Each reads back as the insert asked.
+#[test]
+fn patch_add_before_a_compact_first_item_in_every_shape() {
+    check(&[
+        Case {
+            name: "f.yaml",
+            src: "- - - 1\n    - 2\n",
+            args: &["patch", "f.yaml", &op("add", "/0/0/0", "9")],
+            want: "- - - 9\n    - 1\n    - 2\n",
+            reads: json!([[[9, 1, 2]]]),
+        },
+        Case {
+            name: "f.yaml",
+            src: "- - - 1\n    - 2\n",
+            args: &["patch", "f.yaml", &op("add", "/0/0", "9")],
+            want: "- - 9\n  - - 1\n    - 2\n",
+            reads: json!([[9, [1, 2]]]),
+        },
+        Case {
+            name: "f.yaml",
+            src: "- - !t 1\n  - 2\n",
+            args: &["patch", "f.yaml", &op("add", "/0/0", "9")],
+            want: "- - 9\n  - !t 1\n  - 2\n",
+            reads: json!([[9, 1, 2]]),
+        },
+        Case {
+            name: "f.yaml",
+            src: "- - &a 1\n  - *a\n",
+            args: &["patch", "f.yaml", &op("add", "/0/0", "9")],
+            want: "- - 9\n  - &a 1\n  - *a\n",
+            reads: json!([[9, 1, 1]]),
+        },
+        Case {
+            name: "f.yaml",
+            src: "- - 1\t# c\n  - 2\n",
+            args: &["patch", "f.yaml", &op("add", "/0/0", "9")],
+            want: "- - 9\n  - 1\t# c\n  - 2\n",
+            reads: json!([[9, 1, 2]]),
+        },
+        Case {
+            name: "f.yaml",
+            src: "- - \"a\tb\"\n  - 2\n",
+            args: &["patch", "f.yaml", &op("add", "/0/0", "9")],
+            want: "- - 9\n  - \"a\tb\"\n  - 2\n",
+            reads: json!([[9, "a\tb", 2]]),
+        },
+        Case {
+            name: "f.yaml",
+            src: "- - é1\n  - 2\n",
+            args: &["patch", "f.yaml", &op("add", "/0/0", r#""ü""#)],
+            want: "- - ü\n  - é1\n  - 2\n",
+            reads: json!([["ü", "é1", 2]]),
+        },
+        Case {
+            name: "f.yaml",
+            src: "ключ:\n  - - k: 1\n      j: 2\n",
+            args: &["patch", "f.yaml", &op("add", "/ключ/0/0", r#""ж""#)],
+            want: "ключ:\n  - - ж\n    - k: 1\n      j: 2\n",
+            reads: json!({"ключ": [["ж", {"k": 1, "j": 2}]]}),
+        },
+        Case {
+            name: "f.yaml",
+            src: "- - k: é\n    j: ü\n",
+            args: &["patch", "f.yaml", &op("add", "/0/0", r#"{"ж":"я"}"#)],
+            want: "- - {ж: я}\n  - k: é\n    j: ü\n",
+            reads: json!([[{"ж": "я"}, {"k": "é", "j": "ü"}]]),
+        },
+        Case {
+            name: "f.yaml",
+            src: "k:\n- - 1\n  - 2\n",
+            args: &["patch", "f.yaml", &op("add", "/k/0/0", "9")],
+            want: "k:\n- - 9\n  - 1\n  - 2\n",
+            reads: json!({"k": [[9, 1, 2]]}),
+        },
+    ]);
+}
+
+/// A compact first item that is a block scalar cannot move to the next
+/// line by a textual edit: the insert is refused, the file untouched.
+#[test]
+fn patch_add_before_a_compact_block_scalar_is_refused() {
+    let stderr = refused(
+        "f.yaml",
+        "- - |\n    text\n  - 2\n",
+        &["-i", "patch", "f.yaml", &op("add", "/0/0", "9")],
+        7,
+    );
+    assert!(stderr.contains("cannot insert '/0/0'"), "stderr: {stderr}");
+}
+
+// ---- merge into a root that is no mapping, further ----------------------
+
+/// RFC 7396 §2 on roots of every kind: a scalar or array root gives way
+/// to a mapping patch without its nulls, nested ones under a value that
+/// is no mapping too; an empty or comment-only file takes the patch.
+#[test]
+fn merge_replaces_a_root_or_value_that_is_no_mapping() {
+    check(&[
+        Case {
+            name: "f.yaml",
+            src: "5\n",
+            args: &["merge", "f.yaml", r#"{"a": 1, "b": null}"#],
+            want: "{a: 1}\n",
+            reads: json!({"a": 1}),
+        },
+        Case {
+            name: "f.yaml",
+            src: "",
+            args: &["merge", "f.yaml", r#"{"a": 1, "b": null}"#],
+            want: "a: 1\n",
+            reads: json!({"a": 1}),
+        },
+        Case {
+            name: "f.yaml",
+            src: "# only\n",
+            args: &["merge", "f.yaml", r#"{"a": 1}"#],
+            want: "# only\na: 1\n",
+            reads: json!({"a": 1}),
+        },
+        Case {
+            name: "f.json",
+            src: "[1, 2]\n",
+            args: &["merge", "f.json", r#"{"a": {"b": null, "c": 1}}"#],
+            want: "{\"a\":{\"c\":1}}\n",
+            reads: json!({"a": {"c": 1}}),
+        },
+        Case {
+            name: "f.json",
+            src: "\"s\"\n",
+            args: &["merge", "f.json", r#"{"a": 1}"#],
+            want: "{\"a\":1}\n",
+            reads: json!({"a": 1}),
+        },
+        Case {
+            name: "f.yaml",
+            src: "a: [1]\n",
+            args: &["merge", "f.yaml", r#"{"a": {"x": {"y": null, "z": 1}}}"#],
+            want: "a: {x: {z: 1}}\n",
+            reads: json!({"a": {"x": {"z": 1}}}),
+        },
+        Case {
+            name: "f.yaml",
+            src: "a: 5\n",
+            args: &["merge", "f.yaml", r#"{"a": {"x": null}}"#],
+            want: "a: {}\n",
+            reads: json!({"a": {}}),
+        },
+    ]);
+}
+
+/// A TOML root is a table: a merge patch that is none would replace it
+/// with something TOML cannot hold, and is refused (exit 7).
+#[test]
+fn merge_of_a_patch_that_is_no_mapping_into_toml_is_refused() {
+    for patch in ["[1, 2]", "5", "null"] {
+        let stderr = refused("f.toml", "a = 1\n", &["-i", "merge", "f.toml", patch], 7);
+        assert!(
+            stderr.contains("a TOML document is a table"),
+            "{patch}: {stderr}"
+        );
+    }
+}
+
+// ---- JSON with a byte order mark, further ------------------------------
+
+/// The mark stays through `patch` (an insert too) and `merge` (a root
+/// replaced too), and both lines of a `--diff` carry it.
+#[test]
+fn json_byte_order_mark_stays_through_patch_merge_and_diff() {
+    check(&[
+        Case {
+            name: "f.json",
+            src: "\u{feff}{\"a\": 1}\n",
+            args: &["patch", "f.json", &op("add", "/b", "2")],
+            want: "\u{feff}{\"a\": 1, \"b\": 2}\n",
+            reads: json!({"a": 1, "b": 2}),
+        },
+        Case {
+            name: "f.json",
+            src: "\u{feff}{\"a\": [1]}\n",
+            args: &["patch", "f.json", &op("add", "/a/0", "2")],
+            want: "\u{feff}{\"a\": [2, 1]}\n",
+            reads: json!({"a": [2, 1]}),
+        },
+        Case {
+            name: "f.json",
+            src: "\u{feff}{\"a\": 1}\n",
+            args: &["merge", "f.json", r#"{"b": 2}"#],
+            want: "\u{feff}{\"a\": 1, \"b\": 2}\n",
+            reads: json!({"a": 1, "b": 2}),
+        },
+        Case {
+            name: "f.json",
+            src: "\u{feff}[1]\n",
+            args: &["merge", "f.json", r#"{"b": 2}"#],
+            want: "\u{feff}{\"b\":2}\n",
+            reads: json!({"b": 2}),
+        },
+    ]);
+    let src = "\u{feff}{\"a\": 1}\n";
+    let diff =
+        "--- a/f.json\n+++ b/f.json\n@@ -1 +1 @@\n-\u{feff}{\"a\": 1}\n+\u{feff}{\"a\": 2}\n";
+    for args in [
+        vec!["set", "f.json", "/a", "2", "--diff"],
+        vec![
+            "patch",
+            "f.json",
+            r#"[{"op":"replace","path":"/a","value":2}]"#,
+            "--diff",
+        ],
+    ] {
+        let out = run("f.json", src, &args);
+        assert_eq!(
+            (out.code, out.stdout.as_str(), out.stderr.as_str()),
+            (0, diff, ""),
+            "{args:?}"
+        );
+        assert_eq!(out.file, src, "{args:?}: --diff leaves the file");
+    }
+}
+
+/// A rewrite through the JSON writer drops the mark, as YAML's does; a
+/// `fmt` that has nothing to change leaves the file, mark and all.
+#[test]
+fn json_byte_order_mark_is_dropped_by_a_writer_rewrite() {
+    for (name, src, args, want) in [
+        (
+            "f.json",
+            "\u{feff}{\"a\": 1}\n",
+            &["set", "f.json", "--jq", ".a = 2"][..],
+            "{\n  \"a\": 2\n}",
+        ),
+        (
+            "f.json",
+            "\u{feff}{\"a\":1}\n",
+            &["fmt", "--indent", "2", "f.json"][..],
+            "{\n  \"a\": 1\n}",
+        ),
+        (
+            "f.json",
+            "\u{feff}{\"b\":1,\"a\":2}\n",
+            &["fmt", "--sort-keys", "f.json"][..],
+            "{\n  \"a\": 2,\n  \"b\": 1\n}",
+        ),
+        (
+            "f.json",
+            "\u{feff}{\"a\":1}\n",
+            &["fmt", "f.json"][..],
+            "\u{feff}{\"a\":1}\n",
+        ),
+        (
+            "f.yaml",
+            "\u{feff}a: 1\n",
+            &["set", "f.yaml", "--jq", ".a = 2"][..],
+            "a: 2\n",
+        ),
+        (
+            "f.yaml",
+            "\u{feff}a:   1\n",
+            &["fmt", "f.yaml"][..],
+            "a: 1\n",
+        ),
+    ] {
+        assert_eq!(edit(name, src, args), want, "{args:?} on {src:?}");
+    }
+}
+
+/// A file of a byte order mark and no JSON text is a parse error (exit 3).
+#[test]
+fn json_of_only_a_byte_order_mark_is_a_parse_error() {
+    for src in ["\u{feff}", "\u{feff}\n"] {
+        let stderr = refused("f.json", src, &["get", "f.json", ""], 3);
+        assert!(
+            stderr.contains("parse error in f.json"),
+            "{src:?}: {stderr}"
+        );
+        refused("f.json", src, &["-i", "set", "f.json", "/a", "1"], 3);
+    }
+}
+
+/// `convert` output has no mark: `-i` into another format writes the new
+/// file without it and removes the old one; a same-format TOML or YAML
+/// convert to stdout drops it too.
+#[test]
+fn convert_drops_the_byte_order_mark() {
+    let dir = TempDir::new().expect("tempdir");
+    std::fs::write(dir.path().join("g.json"), "\u{feff}{\"a\": 1}\n").expect("write fixture");
+    let out = dq(dir.path())
+        .args(["-i", "-F", "yaml", "convert", "g.json"])
+        .output()
+        .expect("spawn dq");
+    assert_eq!(
+        (
+            out.status.code(),
+            out.stdout.as_slice(),
+            out.stderr.as_slice()
+        ),
+        (Some(0), &b""[..], &b""[..])
+    );
+    assert!(
+        !dir.path().join("g.json").exists(),
+        "the source is replaced"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("g.yaml")).expect("g.yaml written"),
+        b"a: 1\n"
+    );
+    for (name, src, format, want) in [
+        ("f.toml", "\u{feff}a = 1\n", "toml", "a = 1\n"),
+        ("f.yaml", "\u{feff}a: 1\n", "yaml", "a: 1\n"),
+        ("f.json", "\u{feff}{\"a\": 1}\n", "toml", "a = 1\n"),
+    ] {
+        let out = run(name, src, &["-F", format, "convert", name]);
+        assert_eq!(
+            (out.code, out.stdout.as_str(), out.stderr.as_str()),
+            (0, want, ""),
+            "{name} -F {format}"
+        );
+    }
+}
+
+// ---- fix.jq on a file of one document, further --------------------------
+
+/// The re-emit of a file's only document keeps an anchor or a tag on its
+/// `---` line while the new root is of the kind they fit; a scalar root
+/// is re-emitted under `---`, with the directives, the comment lines
+/// around it and the `...` kept. A tag that no longer fits goes.
+#[test]
+fn fix_jq_reemit_of_a_single_document_with_an_anchored_or_scalar_root() {
+    let rule = |check: &str, fix: &str| {
+        format!(
+            "id: test.jq\ndescription: d\nseverity: warn\nmatch: {{format: yaml}}\n\
+             check:\n  jq: '{check}'\n  message: m\nfix:\n  jq: '{fix}'\n"
+        )
+    };
+    let tidy = rule("select(.bad == true)", "del(.bad) | .ok = true");
+    let five_to_six = rule("select(. == 5)", "6");
+    let to_five = rule("select(.bad == true)", "5");
+    let to_map = rule("select(. == \"5\")", "{a: 1}");
+    for (rule, src, want, reads) in [
+        (
+            &tidy,
+            "--- &r\nbad: true\nx: 1\n",
+            "--- &r\nx: 1\nok: true\n",
+            json!({"x": 1, "ok": true}),
+        ),
+        (
+            &tidy,
+            "# lead\n--- &r\nbad: true\nx: 1\n# tail\n",
+            "# lead\n--- &r\nx: 1\nok: true\n# tail\n",
+            json!({"x": 1, "ok": true}),
+        ),
+        (
+            &tidy,
+            "--- !!map\nbad: true\nx: 1\n",
+            "--- !!map\nx: 1\nok: true\n",
+            json!({"x": 1, "ok": true}),
+        ),
+        (&five_to_six, "5\n", "6\n", json!(6)),
+        (&five_to_six, "--- 5\n", "---\n6\n", json!(6)),
+        (
+            &five_to_six,
+            "# lead\n---\n5 # c\n# tail\n",
+            "# lead\n---\n6\n# tail\n",
+            json!(6),
+        ),
+        (
+            &five_to_six,
+            "%YAML 1.2\n--- 5\n...\n",
+            "%YAML 1.2\n---\n6\n...\n",
+            json!(6),
+        ),
+        (&to_five, "--- &r\nbad: true\n", "--- &r\n5\n", json!(5)),
+        (&to_five, "--- !!map\nbad: true\n", "---\n5\n", json!(5)),
+        (&to_map, "--- !!str 5\n", "---\na: 1\n", json!({"a": 1})),
+    ] {
+        let out = fix(rule, src);
+        assert_eq!((out.code, out.stderr.as_str()), (0, ""), "{src:?}");
+        assert_eq!(out.file, want, "{src:?}");
+        assert_eq!(read("s.yaml", &out.file), reads, "{:?}", out.file);
+    }
+}
