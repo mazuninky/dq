@@ -294,8 +294,10 @@ gets a BOM, little-endian unless `bom` says otherwise; `UTF-16LE` and
 
 The reader refuses, with exit 3, naming in the message where the name at
 fault begins (`XML parse error at line 2, column 4: element <a:b> uses the
-prefix 'a', …`), as `dq validate` does in its `line` / `col` fields; an
-encoding error has no position:
+prefix 'a', …`), or the declaration's `encoding` label (line 1, column 31
+in `<?xml version="1.0" encoding="UTF-32"?>`, a BOM not counted), as
+`dq validate` does in its `line` / `col` fields. Bytes the encoding
+cannot read name their byte index instead:
 
 - an encoding dq does not know (`UTF-32`) or cannot read (`ISO-2022-KR`),
   and an `encoding` that is not an encoding name;

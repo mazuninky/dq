@@ -1808,22 +1808,23 @@ fn xml_refuses_a_bom_its_declaration_contradicts_and_keeps_a_utf8_bom() {
         ),
         ("attrs_null.yaml", b"r:\n- \"@attrs\": null\n"),
     ]);
+    // Each placed at its label, past the BOM.
     let unreadable = |file: &str, message: &str| format!("parse error in {file}: {message}\n");
     let u16_latin_err = unreadable(
         "u16_latin.xml",
-        "the file begins with a UTF-16LE byte order mark but declares encoding \"ISO-8859-1\"",
+        "XML parse error at line 1, column 31: the file begins with a UTF-16LE byte order mark but declares encoding \"ISO-8859-1\"",
     );
     let u16_be_le_err = unreadable(
         "u16_be_le.xml",
-        "the file begins with a UTF-16BE byte order mark but declares encoding \"UTF-16LE\"",
+        "XML parse error at line 1, column 31: the file begins with a UTF-16BE byte order mark but declares encoding \"UTF-16LE\"",
     );
     let spaced_err = unreadable(
         "spaced.xml",
-        "the XML declaration's encoding \" ISO-8859-1 \" is not an encoding name",
+        "XML parse error at line 1, column 31: the XML declaration's encoding \" ISO-8859-1 \" is not an encoding name",
     );
     let u8_latin_err = unreadable(
         "u8_latin.xml",
-        "the file begins with a UTF-8 byte order mark but declares encoding \"ISO-8859-1\"",
+        "XML parse error at line 1, column 31: the file begins with a UTF-8 byte order mark but declares encoding \"ISO-8859-1\"",
     );
     let u8_latin_refused = "xml format error: XML write: '#xml' field 'bom' is UTF-8 but the \
                             declared encoding is \"ISO-8859-1\"\n";

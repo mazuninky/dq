@@ -814,8 +814,10 @@ fn utf16_without_a_bom_keeps_its_byte_order_and_refuses_a_contradiction() {
         let label = encoding.trim_start_matches(" encoding=");
         cases.push((
             convert(file, "json"),
-            unreadable(
+            unreadable_at(
                 file,
+                1,
+                31,
                 &format!(
                     "the file begins in {order} with no byte order mark but declares encoding \
                      {label}"
@@ -863,8 +865,10 @@ fn the_reader_refuses_what_the_writer_would() {
         )
     };
     let label = |file: &str, label: &str, why: &str| {
-        unreadable(
+        unreadable_at(
             file,
+            1,
+            31,
             &format!("the XML declaration's encoding \"{label}\" is one dq {why}"),
         )
     };
@@ -1342,6 +1346,10 @@ fn an_undeclared_prefix_is_reported_with_its_line_and_column() {
     let dir = dir_with(&[
         ("start.xml", b"<r>\n  <a:b>t</a:b>\n</r>\n"),
         ("empty.xml", b"<r>\n\n <k a:x=\"1\"/>\n</r>\n"),
+        (
+            "label.xml",
+            b"<?xml version=\"1.0\"\n encoding=\"UTF-32\"?><r/>",
+        ),
     ]);
     let report = |file: &str, line: u32, col: u32, message: &str, snippet: &str| {
         (
@@ -1377,6 +1385,16 @@ fn an_undeclared_prefix_is_reported_with_its_line_and_column() {
                     "<r>\\n\\n <k a:x=\"1\"/>\\n</r>\\n",
                 ),
             ),
+            (
+                vec!["validate", "label.xml"],
+                report(
+                    "label.xml",
+                    2,
+                    12,
+                    "the XML declaration's encoding \"UTF-32\" is one dq does not know",
+                    "on=\"1.0\"\\n encoding=\"UTF-32\"?>",
+                ),
+            ),
         ],
     );
 }
@@ -1398,8 +1416,10 @@ fn replacement_labels_and_bad_iso_2022_jp_are_refused_on_read() {
         ),
     ]);
     let cannot = |file: &str, label: &str| {
-        unreadable(
+        unreadable_at(
             file,
+            1,
+            31,
             &format!("the XML declaration's encoding \"{label}\" is one dq cannot read"),
         )
     };

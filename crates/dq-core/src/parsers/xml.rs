@@ -620,55 +620,34 @@ fn decode_input(bytes: &[u8]) -> Result<(Cow<'_, str>, Option<Bom>, Option<Bom>)
         snippet: String::new(),
         message,
     };
-    let check_label = |label: &str| {
-        if !is_enc_name(label) {
-            return Err(invalid(format!(
-                "the XML declaration's encoding {label:?} is not an encoding name"
-            )));
-        }
-        match Charset::for_label(label) {
-            None => {
-                return Err(invalid(format!(
-                    "the XML declaration's encoding {label:?} is one dq does not know"
-                )));
-            }
-            Some(Charset::Whatwg(encoding)) if encoding == REPLACEMENT => {
-                return Err(invalid(format!(
-                    "the XML declaration's encoding {label:?} is one dq cannot read"
-                )));
-            }
-            Some(_) => {}
-        }
-        match (bom, detected, Charset::for_label(label)) {
-            (Some(bom), _, Some(charset)) if !bom.admits(charset, label) => Err(invalid(format!(
-                "the file begins with a {} byte order mark but declares encoding {label:?}",
-                bom.label(),
-            ))),
-            (_, Some(order), Some(charset)) if !order.admits(charset, label) => {
-                Err(invalid(format!(
-                    "the file begins in {} with no byte order mark but declares encoding {label:?}",
-                    order.label(),
-                )))
-            }
-            _ => Ok(()),
-        }
+    // A refusal of the label, placed at it: `head` is the text it stands
+    // in, from the start of the file (past a BOM) to the declaration's end.
+    let check_label = |head: &[u8], label: &str| {
+        let message = label_refusal(label, bom, detected);
+        message.map_or(Ok(()), |message| {
+            let pos = (label.as_ptr() as usize).saturating_sub(head.as_ptr() as usize);
+            let head = std::str::from_utf8(head).unwrap_or_default();
+            Err(parse_error_at(head, pos, message))
+        })
     };
     if let Some(encoding) = utf16 {
         let text = quick_xml::encoding::decode(body, encoding)
             .map_err(|_| invalid(format!("invalid {} in XML input", encoding.name())))?;
         let label = declared_label(text.as_bytes());
-        if let Some(label) = label {
-            check_label(label)?;
+        if let Some((label, head)) = label {
+            check_label(head, label)?;
         }
+        let label = label.map(|(label, _)| label);
         // `UTF-16LE` / `UTF-16BE` keep the byte order themselves.
         let detected = detected.filter(|_| !label.is_some_and(names_utf16_byte_order));
         return Ok((text, bom, detected));
     }
     // Every 8-bit encoding read here spells the declaration in ASCII.
     let label = declared_label(body);
-    if let Some(label) = label {
-        check_label(label)?;
+    if let Some((label, head)) = label {
+        check_label(head, label)?;
     }
+    let label = label.map(|(label, _)| label);
     // A UTF-16 label over 8-bit bytes reads as UTF-8, by the bytes, and
     // says so in `detected`. ISO-2022-JP is not ASCII-compatible to
     // encoding_rs, but it starts in ASCII, so its declaration reads as
@@ -810,7 +789,7 @@ impl Charset {
 /// The `encoding` value of an XML declaration at the very start of `bytes`,
 /// read as ASCII — every encoding this applies to spells the declaration
 /// the same. `None` without a declaration or without an `encoding`.
-fn declared_label(bytes: &[u8]) -> Option<&str> {
+fn declared_label(bytes: &[u8]) -> Option<(&str, &[u8])> {
     let rest = bytes.strip_prefix(b"<?xml")?;
     if !rest.first().is_some_and(u8::is_ascii_whitespace) {
         return None;
@@ -820,7 +799,38 @@ fn declared_label(bytes: &[u8]) -> Option<&str> {
     let value = decl.split_once("encoding")?.1.trim_start();
     let value = value.strip_prefix('=')?.trim_start();
     let quote = value.chars().next().filter(|c| matches!(c, '"' | '\''))?;
-    value[1..].split(quote).next()
+    let label = value[1..].split(quote).next()?;
+    Some((label, &bytes[..b"<?xml".len() + end + b"?>".len()]))
+}
+
+/// Why the reader refuses `label`, the declaration's `encoding`, in a file
+/// that begins with `bom`, or in the UTF-16 byte order `detected` with no
+/// BOM: not an encoding name, one dq does not know or cannot read, or one
+/// the BOM or the byte order contradicts. `None` when it reads.
+fn label_refusal(label: &str, bom: Option<Bom>, detected: Option<Bom>) -> Option<String> {
+    if !is_enc_name(label) {
+        return Some(format!(
+            "the XML declaration's encoding {label:?} is not an encoding name"
+        ));
+    }
+    let charset = Charset::for_label(label);
+    match (charset, bom, detected) {
+        (None, ..) => Some(format!(
+            "the XML declaration's encoding {label:?} is one dq does not know"
+        )),
+        (Some(Charset::Whatwg(encoding)), ..) if encoding == REPLACEMENT => Some(format!(
+            "the XML declaration's encoding {label:?} is one dq cannot read"
+        )),
+        (Some(charset), Some(bom), _) if !bom.admits(charset, label) => Some(format!(
+            "the file begins with a {} byte order mark but declares encoding {label:?}",
+            bom.label(),
+        )),
+        (Some(charset), _, Some(order)) if !order.admits(charset, label) => Some(format!(
+            "the file begins in {} with no byte order mark but declares encoding {label:?}",
+            order.label(),
+        )),
+        _ => None,
+    }
 }
 
 /// Build a [`Frame`] from a `<tag attr="...">` event.
@@ -2655,8 +2665,8 @@ mod tests {
             assert_eq!(
                 message,
                 format!(
-                    "the file begins in {order} with no byte order mark but declares encoding \
-                     \"{label}\""
+                    "XML parse error: the file begins in {order} with no byte order mark but \
+                     declares encoding \"{label}\""
                 )
             );
         }
@@ -2688,12 +2698,15 @@ mod tests {
             };
             assert_eq!(
                 message,
-                format!("the XML declaration's encoding \"{label}\" is one dq {why}")
+                format!(
+                    "XML parse error: the XML declaration's encoding \"{label}\" is one dq {why}"
+                )
             );
         }
+        let decl = b"<?xml version='1.0' encoding = \"x\"?><r/>";
         assert_eq!(
-            declared_label(b"<?xml version='1.0' encoding = \"x\"?>"),
-            Some("x")
+            declared_label(decl),
+            Some(("x", &decl[..decl.len() - "<r/>".len()]))
         );
         assert_eq!(
             declared_label(b"<?xml version='1.0'?><r encoding='x'/>"),
@@ -2830,12 +2843,19 @@ mod tests {
         // An entity, at its `&`; a malformed attribute, at its tag.
         assert_eq!(place("<r>\n x&bogus;</r>"), (2, 3));
         assert_eq!(place("<r>\n<k a=\"1\" a=\"2\"/></r>"), (2, 1));
-        // No text yet to place an encoding in: no position, none claimed.
-        let (line, _, message) = at("<?xml version=\"1.0\" encoding=\"UTF-32\"?><r/>");
-        assert_eq!(line, 0);
+        // A refused encoding, at its label — past a BOM, on the line the
+        // label stands on.
+        let (line, col, message) = at("<?xml version=\"1.0\" encoding=\"UTF-32\"?><r/>");
+        assert_eq!((line, col), (1, 31));
         assert!(
-            message.starts_with("the XML declaration's encoding"),
+            message.starts_with(
+                "XML parse error at line 1, column 31: the XML declaration's encoding"
+            ),
             "{message}"
+        );
+        assert_eq!(
+            place("\u{FEFF}<?xml version=\"1.0\"\n  encoding='ISO-8859-1'?><r/>"),
+            (2, 13)
         );
     }
 
