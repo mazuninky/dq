@@ -267,7 +267,8 @@ fn utf16_reads_by_its_declaration_without_a_bom() {
             (
                 convert("le.xml", "json"),
                 ok(json(
-                    "  \"#xml\": {\n    \"version\": \"1.0\",\n    \"encoding\": \"UTF-16\"\n  },\n",
+                    "  \"#xml\": {\n    \"version\": \"1.0\",\n    \"encoding\": \"UTF-16\",\n    \
+                     \"detected\": \"UTF-16LE\"\n  },\n",
                 )),
             ),
             (
@@ -691,4 +692,111 @@ fn whitespace_only_text_is_written_as_character_references() {
             "{file}"
         );
     }
+}
+
+/// UTF-16 with no byte order mark, told by its leading `<?`, is written
+/// back in its own byte order with no BOM, the declaration or none, and
+/// `#xml.detected` keeps the order — unless the declaration names it. A
+/// declaration the UTF-16 contradicts is a parse error, exit 3, as it is
+/// after a BOM. Before, the files without an `encoding` came back as UTF-8,
+/// the `UTF-16` one as little-endian with a BOM, and every contradiction
+/// read.
+#[test]
+fn utf16_without_a_bom_keeps_its_byte_order_and_refuses_a_contradiction() {
+    let decl = |encoding: &str| format!("<?xml version=\"1.0\"{encoding}?><r>\u{e9}</r>");
+    let le = utf16(&decl(""), false);
+    let be = utf16(&decl(""), true);
+    let be_generic = utf16(&decl(" encoding=\"UTF-16\""), true);
+    let le_named = utf16(&decl(" encoding=\"UTF-16LE\""), false);
+    let pi = utf16("<?pi x?><r/>", true);
+    let contradicted = [
+        ("latin.xml", " encoding=\"ISO-8859-1\"", false, "UTF-16LE"),
+        ("utf8.xml", " encoding=\"UTF-8\"", true, "UTF-16BE"),
+        ("be_named.xml", " encoding=\"UTF-16BE\"", false, "UTF-16LE"),
+        ("le_named.xml", " encoding=\"UTF-16LE\"", true, "UTF-16BE"),
+    ]
+    .map(|(file, encoding, big_endian, order)| {
+        (file, utf16(&decl(encoding), big_endian), encoding, order)
+    });
+    let mut files: Vec<(&str, &[u8])> = vec![
+        ("le.xml", &le),
+        ("be.xml", &be),
+        ("be_generic.xml", &be_generic),
+        ("le_named_ok.xml", &le_named),
+        ("pi.xml", &pi),
+        (
+            "both.yaml",
+            b"\"#xml\": {bom: UTF-16LE, detected: UTF-16LE}\nr:\n- {}\n",
+        ),
+        ("bare.yaml", b"\"#xml\": {detected: UTF-16BE}\nr:\n- {}\n"),
+        ("wrong.yaml", b"\"#xml\": {detected: UTF-8}\nr:\n- {}\n"),
+    ];
+    files.extend(
+        contradicted
+            .iter()
+            .map(|(file, bytes, ..)| (*file, bytes.as_slice())),
+    );
+    let dir = dir_with(&files);
+    let json = |fields: &str| {
+        format!(
+            "{{\n  \"#xml\": {{\n{fields}\n  }},\n  \"r\": [\n    {{\n      \"#text\": \"\u{e9}\"\n    }}\n  ]\n}}\n"
+        )
+    };
+    let mut cases = vec![
+        (
+            convert("le.xml", "json"),
+            ok(json(
+                "    \"version\": \"1.0\",\n    \"detected\": \"UTF-16LE\"",
+            )),
+        ),
+        (convert("le.xml", "xml"), ok(le.clone())),
+        (
+            convert("be.xml", "json"),
+            ok(json(
+                "    \"version\": \"1.0\",\n    \"detected\": \"UTF-16BE\"",
+            )),
+        ),
+        (convert("be.xml", "xml"), ok(be.clone())),
+        (convert("be_generic.xml", "xml"), ok(be_generic.clone())),
+        (
+            convert("le_named_ok.xml", "json"),
+            ok(json(
+                "    \"version\": \"1.0\",\n    \"encoding\": \"UTF-16LE\"",
+            )),
+        ),
+        (convert("le_named_ok.xml", "xml"), ok(le_named.clone())),
+        (convert("pi.xml", "xml"), ok(pi.clone())),
+        (
+            convert("both.yaml", "xml"),
+            refused(
+                "'#xml' has both 'bom' and 'detected', but a file begins with a byte order mark \
+                 or does not",
+            ),
+        ),
+        (
+            convert("bare.yaml", "xml"),
+            refused(
+                "'#xml' field 'detected' asks for UTF-16 with no byte order mark, which a reader \
+                 can tell only in a file that begins with `<?`: add a declaration or a 'bom'",
+            ),
+        ),
+        (
+            convert("wrong.yaml", "xml"),
+            refused("'#xml' field 'detected' must be UTF-16LE or UTF-16BE (got \"UTF-8\")"),
+        ),
+    ];
+    for (file, _, encoding, order) in &contradicted {
+        let label = encoding.trim_start_matches(" encoding=");
+        cases.push((
+            convert(file, "json"),
+            unreadable(
+                file,
+                &format!(
+                    "the file begins in {order} with no byte order mark but declares encoding \
+                     {label}"
+                ),
+            ),
+        ));
+    }
+    assert_cases(&dir, &cases);
 }

@@ -832,7 +832,7 @@ fn xml_writes_the_declaration_fields_and_refuses_what_a_document_cannot_hold() {
                     1,
                     "",
                     "xml format error: XML write: '#xml' has no field 'foo' \
-                     (only version, encoding, standalone, bom)\n",
+                     (only version, encoding, standalone, bom, detected)\n",
                 ),
             ),
             (
