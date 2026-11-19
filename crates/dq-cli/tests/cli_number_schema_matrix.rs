@@ -1503,3 +1503,316 @@ fn no_text_dq_keeps_in_a_schema_reaches_output() {
         "{stderr}"
     );
 }
+
+/// A rule `t.<id>` whose check is `schema`.
+fn schema_rule(id: &str, schema: &str) -> String {
+    format!(
+        "id: t.{id}\ndescription: x\nseverity: error\nmatch: {{ format: yaml }}\n\
+         check:\n  schema: {schema}\n"
+    )
+}
+
+/// A limit is quoted as the rule spells it under every keyword that takes
+/// a schema — `patternProperties`, `dependentSchemas`, `prefixItems`, a
+/// `$defs` entry a `$ref` reaches — and a `not` prints each of them as
+/// written. Before (acce170, bbe4e4c), each came out as serde_json reads
+/// it: `1e+2`, `1e+1`, `5e+0`.
+#[test]
+fn a_limit_under_every_keyword_that_takes_a_schema_is_quoted_as_written() {
+    let dir = dir_with(&[
+        (
+            "pp.yml",
+            &schema_rule(
+                "pp",
+                "{ patternProperties: { \"^p\": { exclusiveMinimum: 1e2 } } }",
+            ),
+        ),
+        (
+            "ds.yml",
+            &schema_rule(
+                "ds",
+                "{ dependentSchemas: { a: { properties: { b: { minimum: 1E1 } } } } }",
+            ),
+        ),
+        (
+            "pi.yml",
+            &schema_rule("pi", "{ prefixItems: [ { exclusiveMinimum: 1e2 } ] }"),
+        ),
+        (
+            "df.yml",
+            &schema_rule(
+                "df",
+                "{ $defs: { m: { minimum: 5e0 } }, properties: { d: { $ref: \"#/$defs/m\" } } }",
+            ),
+        ),
+        (
+            "nt.yml",
+            &schema_rule(
+                "nt",
+                "{ properties: { x: { not: { patternProperties: { \"^p\": { minimum: 1e2 } }, \
+                 prefixItems: [ { maximum: 1E1 } ], dependentSchemas: { a: { minimum: 25e-1 } } } } } }",
+            ),
+        ),
+        ("pp_bad.yaml", "p1: 100\n"),
+        ("pp_ok.yaml", "p1: 101\nq: 1\n"),
+        ("ds_bad.yaml", "a: 1\nb: 5\n"),
+        ("ds_ok.yaml", "b: 5\n"),
+        ("pi_bad.yaml", "- 100\n"),
+        ("pi_ok.yaml", "- 101\n- 1\n"),
+        ("df_bad.yaml", "d: 4\n"),
+        ("df_ok.yaml", "d: 5\n"),
+        ("nt_bad.yaml", "x: {p: 200, a: 3}\n"),
+        ("nt_ok.yaml", "x: {p: 1}\n"),
+    ]);
+    let not = "/properties/x/not: {\"patternProperties\":{\"^p\":{\"minimum\":1e2}},\
+               \"prefixItems\":[{\"maximum\":1E1}],\"dependentSchemas\":{\"a\":{\"minimum\":25e-1}}} \
+               is not allowed for {\"p\":200,\"a\":3}";
+    for (rule, bad, message) in [
+        (
+            "pp",
+            "pp_bad.yaml",
+            "/patternProperties/^p/exclusiveMinimum: 100 is less than or equal to the minimum of 1e2",
+        ),
+        (
+            "ds",
+            "ds_bad.yaml",
+            "/dependentSchemas/a/properties/b/minimum: 5 is less than the minimum of 1E1",
+        ),
+        (
+            "pi",
+            "pi_bad.yaml",
+            "/prefixItems/0/exclusiveMinimum: 100 is less than or equal to the minimum of 1e2",
+        ),
+        (
+            "df",
+            "df_bad.yaml",
+            "/properties/d/$ref/minimum: 4 is less than the minimum of 5e0",
+        ),
+        ("nt", "nt_bad.yaml", not),
+    ] {
+        let rule_file = format!("{rule}.yml");
+        assert_eq!(
+            messages_in(dir.path(), &["check", "--rule", &rule_file, bad]),
+            (4, vec![message.to_owned()]),
+            "{rule} on {bad}"
+        );
+        let good = format!("{rule}_ok.yaml");
+        assert_eq!(
+            messages_in(dir.path(), &["check", "--rule", &rule_file, &good]),
+            (0, Vec::new()),
+            "{rule} on {good}"
+        );
+    }
+}
+
+/// A `not` prints the data it holds (`const`, `enum`) as data: a big
+/// integer digit for digit, an exponent as serde_json spells a number,
+/// a map under `enum` with no limit spelling noted into it. Only a limit
+/// keyword of a schema gets its source text. Guard: this held before
+/// acce170 too.
+#[test]
+fn a_not_prints_the_data_it_holds_as_data() {
+    let dir = dir_with(&[
+        (
+            "r.yml",
+            &schema_rule(
+                "nc",
+                "{ properties: { x: { not: { const: 1e2 } }, \
+                 y: { not: { enum: [18446744073709551617, 1e2, {maximum: 1e2}] } } } }",
+            ),
+        ),
+        ("bad.yaml", "x: 1e2\ny: 18446744073709551617\n"),
+        ("ok.yaml", "x: 99\ny: 18446744073709551616\n"),
+    ]);
+    assert_eq!(
+        messages_in(dir.path(), &["check", "--rule", "r.yml", "bad.yaml"]),
+        (
+            4,
+            vec![
+                "/properties/x/not: {\"const\":1e+2} is not allowed for 100.0".to_owned(),
+                "/properties/y/not: {\"enum\":[18446744073709551617,1e+2,{\"maximum\":1e+2}]} \
+                 is not allowed for 18446744073709551617"
+                    .to_owned(),
+            ]
+        )
+    );
+    assert_eq!(
+        messages_in(dir.path(), &["check", "--rule", "r.yml", "ok.yaml"]),
+        (0, Vec::new())
+    );
+}
+
+/// A property, and a document key, named as dq's own spelling note
+/// (`"\u0000dq.spelling"`) is an ordinary name: it is checked, its limit
+/// quoted as written, and a `not` prints it.
+#[test]
+fn a_property_named_like_dqs_spelling_note_is_an_ordinary_name() {
+    let dir = dir_with(&[
+        (
+            "r.yml",
+            &schema_rule(
+                "nul",
+                "{ properties: { \"\\0dq.spelling\": { maximum: 1e2 } } }",
+            ),
+        ),
+        (
+            "n.yml",
+            &schema_rule(
+                "nn",
+                "{ properties: { x: { not: { properties: { \"\\0dq.spelling\": { maximum: 1e2 } } } } } }",
+            ),
+        ),
+        ("bad.yaml", "\"\\0dq.spelling\": 101\n"),
+        ("ok.yaml", "\"\\0dq.spelling\": 100\n"),
+        ("n_bad.yaml", "x: {\"\\0dq.spelling\": 5}\n"),
+        ("n_ok.yaml", "x: {\"\\0dq.spelling\": 500}\n"),
+    ]);
+    assert_eq!(
+        messages_in(dir.path(), &["check", "--rule", "r.yml", "bad.yaml"]),
+        (
+            4,
+            vec![
+                "/properties/\u{0}dq.spelling/maximum: 101 is greater than the maximum of 1e2"
+                    .to_owned()
+            ]
+        )
+    );
+    assert_eq!(
+        messages_in(dir.path(), &["check", "--rule", "r.yml", "ok.yaml"]),
+        (0, Vec::new())
+    );
+    assert_eq!(
+        messages_in(dir.path(), &["check", "--rule", "n.yml", "n_bad.yaml"]),
+        (
+            4,
+            vec![
+                "/properties/x/not: {\"properties\":{\"\\u0000dq.spelling\":{\"maximum\":1e2}}} \
+                 is not allowed for {\"\\u0000dq.spelling\":5}"
+                    .to_owned()
+            ]
+        )
+    );
+    assert_eq!(
+        messages_in(dir.path(), &["check", "--rule", "n.yml", "n_ok.yaml"]),
+        (0, Vec::new())
+    );
+}
+
+/// The schema of an `extract` + `nested` rule quotes its limits as
+/// written too, in a bound's message and in a `not`. Before (acce170,
+/// bbe4e4c): `1e+2`, `{"minimum":1e+3}`.
+#[test]
+fn a_nested_rule_quotes_its_limit_as_written() {
+    let rule = "id: t.outer\ndescription: x\nseverity: error\nmatch: { format: yaml }\n\
+                check:\n  extract: '[{value: .inner, format: \"json\", anchor: \"/inner\"}]'\n  \
+                message: inner\n  nested:\n    id: t.inner\n    description: y\n    \
+                severity: error\n    match: { format: json }\n    check:\n      \
+                schema: { properties: { n: { maximum: 1e2, not: { minimum: 1E3 } } } }\n";
+    let dir = dir_with(&[
+        ("c.yml", rule),
+        ("a.yaml", "inner: '{\"n\": 101}'\n"),
+        ("b.yaml", "inner: '{\"n\": 5000}'\n"),
+        ("ok.yaml", "inner: '{\"n\": 100}'\n"),
+    ]);
+    assert_eq!(
+        messages_in(dir.path(), &["check", "--rule", "c.yml", "a.yaml"]),
+        (
+            4,
+            vec!["inner: /properties/n/maximum: 101 is greater than the maximum of 1e2".to_owned()]
+        )
+    );
+    assert_eq!(
+        messages_in(dir.path(), &["check", "--rule", "c.yml", "b.yaml"]),
+        (
+            4,
+            [
+                "inner: /properties/n/not: {\"minimum\":1E3} is not allowed for 5000",
+                "inner: /properties/n/maximum: 5000 is greater than the maximum of 1e2",
+            ]
+            .map(str::to_owned)
+            .to_vec()
+        )
+    );
+    assert_eq!(
+        messages_in(dir.path(), &["check", "--rule", "c.yml", "ok.yaml"]),
+        (0, Vec::new())
+    );
+}
+
+/// `dq test` matches a fixture's `message_contains` against the limit as
+/// the rule writes it: `1e2` passes, serde_json's `1e+2` no longer does.
+/// Before (acce170), it was the other way round.
+#[test]
+fn dq_test_matches_a_limit_as_the_rule_writes_it() {
+    let rule = schema_rule("lim", "{ properties: { x: { maximum: 1e2 } } }");
+    let cases = |spelled: &str| {
+        format!(
+            "tests:\n  - name: quotes the limit\n    input: |\n      x: 101\n    expected:\n      \
+             violations:\n        - rule: t.lim\n          \
+             message_contains: \"greater than the maximum of {spelled}\"\n  \
+             - name: within the limit\n    input: |\n      x: 100\n    expected:\n      \
+             violations: []\n"
+        )
+    };
+    let dir = dir_with(&[
+        ("as_written/lim.yml", &rule),
+        ("as_written/lim.test.yml", &cases("1e2")),
+        ("serde/lim.yml", &rule),
+        ("serde/lim.test.yml", &cases("1e+2")),
+    ]);
+    let (code, stdout, stderr) = run_in(dir.path(), &["test", "as_written"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(stdout.contains("summary: 2 passed, 0 failed"), "{stdout}");
+    let (code, stdout, stderr) = run_in(dir.path(), &["test", "serde"]);
+    assert_eq!(code, 4, "{stdout}{stderr}");
+    assert!(
+        stdout.contains(
+            "extra: rule=t.lim message=\"/properties/x/maximum: 101 is greater than the \
+             maximum of 1e2\" line=1"
+        ),
+        "{stdout}"
+    );
+    assert!(stdout.contains("summary: 1 passed, 1 failed"), "{stdout}");
+}
+
+/// A project rule under `.dq/rules/` with a `schema_file` quotes its
+/// limits as the file spells them, `dq lint` end to end, in a bound and in
+/// a `not`. Before (acce170, bbe4e4c): `1e+2`, `{"multipleOf":7e+0}`.
+#[test]
+fn a_project_rule_quotes_its_schema_file_limit_as_written() {
+    let dir = dir_with(&[
+        (
+            ".dq/rules/file.yml",
+            "id: t.file\ndescription: x\nseverity: error\nmatch: { format: yaml }\n\
+             check:\n  schema_file: s.json\n",
+        ),
+        (
+            ".dq/rules/s.json",
+            r#"{"properties": {"x": {"exclusiveMaximum": 1E2, "not": {"multipleOf": 7e0}}}}"#,
+        ),
+        ("bound.yaml", "x: 100\n"),
+        ("not.yaml", "x: 14\n"),
+        ("ok.yaml", "x: 5\n"),
+    ]);
+    assert_eq!(
+        messages_in(dir.path(), &["lint", "bound.yaml"]),
+        (
+            4,
+            vec![
+                "/properties/x/exclusiveMaximum: 100 is greater than or equal to the maximum of 1E2"
+                    .to_owned()
+            ]
+        )
+    );
+    assert_eq!(
+        messages_in(dir.path(), &["lint", "not.yaml"]),
+        (
+            4,
+            vec!["/properties/x/not: {\"multipleOf\":7e0} is not allowed for 14".to_owned()]
+        )
+    );
+    assert_eq!(
+        messages_in(dir.path(), &["lint", "ok.yaml"]),
+        (0, Vec::new())
+    );
+}
