@@ -1154,3 +1154,107 @@ fn diff_sees_one_number_in_two_spellings_of_a_huge_exponent() {
     ]);
     assert_eq!(stdout_of(&dir, &["diff", "a.json", "b.json"]), "[]\n");
 }
+
+/// A tagged big number keys a block map wherever the map sits: in a
+/// sequence item, two levels down, after `?`, with the tag on a line of
+/// its own.
+#[test]
+fn a_tagged_big_key_reads_in_any_block_position() {
+    let big_int = "1234567890123456789012345678901234567890";
+    let dir = dir_with(&[
+        ("item.yaml", "x:\n  - !!float 1e400: a\n    b: 1\n"),
+        (
+            "deep.yaml",
+            &format!("x:\n  y:\n    !!int {big_int}: a\n    b: 1\n"),
+        ),
+        ("explicit.yaml", "? !!float 1e400\n: a\nb: 1\n"),
+        ("own_line.yaml", "!!float\n1e400: a\nb: 1\n"),
+    ]);
+    assert_eq!(
+        stdout_of(&dir, &["-q", "-F", "json", "convert", "item.yaml"]),
+        "{\n  \"x\": [\n    {\n      \"1e400\": \"a\",\n      \"b\": 1\n    }\n  ]\n}\n"
+    );
+    assert_eq!(stdout_of(&dir, &["get", "item.yaml", "/x/0/b"]), "1\n");
+    assert_eq!(
+        stdout_of(&dir, &["keys", "deep.yaml", "/x/y"]),
+        format!("{big_int}\nb\n")
+    );
+    assert_eq!(stdout_of(&dir, &["get", "deep.yaml", "/x/y/b"]), "1\n");
+    for file in ["explicit.yaml", "own_line.yaml"] {
+        assert_eq!(stdout_of(&dir, &["keys", file, ""]), "1e400\nb\n", "{file}");
+    }
+}
+
+/// A key that repeats an earlier one in another spelling is reported with
+/// the earlier key as it was written, at the line of the repeat.
+#[test]
+fn a_repeated_number_key_is_named_as_first_written() {
+    for (first, again) in [
+        ("0.10", "0.1"),
+        ("0.10000000000000001", "0.1"),
+        ("1.0e3", "1000.0"),
+        ("+1", "1"),
+        ("0x10", "16"),
+        ("0o20", "16"),
+    ] {
+        let src = format!("{first}: a\n{again}: b\n");
+        let dir = dir_with(&[("k.yaml", &src)]);
+        for args in [&["get", "k.yaml", ""][..], &["set", "k.yaml", "/z", "1"]] {
+            let (code, stdout, stderr) = failure_of(&dir, args);
+            assert_eq!((code, stdout.as_str()), (Some(3), ""), "{src:?} {args:?}");
+            assert_eq!(
+                stderr,
+                format!(
+                    "parse error in k.yaml: duplicate entry with key {first} at line 2 column 1\n"
+                ),
+                "{src:?} {args:?}"
+            );
+        }
+    }
+}
+
+/// An alias used as a key, with nothing to collide with, is its anchor's
+/// key as written.
+#[test]
+fn an_alias_key_is_its_anchors_literal() {
+    let dir = dir_with(&[("a.yaml", "k: &x +1e400\n*x : v\n")]);
+    assert_eq!(stdout_of(&dir, &["keys", "a.yaml", ""]), "k\n+1e400\n");
+    assert_eq!(
+        stdout_of(&dir, &["-q", "-F", "json", "convert", "a.yaml"]),
+        "{\n  \"k\": 1e400,\n  \"+1e400\": \"v\"\n}\n"
+    );
+}
+
+/// Huge exponents compare by value for negative exponents, negative
+/// numbers and YAML too; a different value is still a change.
+#[test]
+fn diff_compares_huge_exponents_by_value_in_every_sign() {
+    let p31 = format!("1{}", "0".repeat(30));
+    let n30 = "9".repeat(30);
+    for (a, b) in [
+        (format!("1e-{p31}"), format!("0.1e-{n30}")),
+        (format!("-1e{p31}"), format!("-10e{n30}")),
+    ] {
+        let dir = dir_with(&[
+            ("a.json", &format!("{{\"a\": {a}}}")),
+            ("b.json", &format!("{{\"a\": {b}}}")),
+        ]);
+        assert_eq!(
+            stdout_of(&dir, &["diff", "a.json", "b.json"]),
+            "[]\n",
+            "{a} {b}"
+        );
+    }
+    let dir = dir_with(&[
+        ("a.yaml", &format!("x: 1e{p31}\n")),
+        ("b.yaml", &format!("x: 10e{n30}\n")),
+        ("c.yaml", &format!("x: 2e{p31}\n")),
+    ]);
+    assert_eq!(stdout_of(&dir, &["diff", "a.yaml", "b.yaml"]), "[]\n");
+    assert_eq!(
+        stdout_of(&dir, &["diff", "a.yaml", "c.yaml"]),
+        format!(
+            "[\n  {{\n    \"op\": \"replace\",\n    \"path\": \"/x\",\n    \"value\": 2e+{p31}\n  }}\n]\n"
+        )
+    );
+}
