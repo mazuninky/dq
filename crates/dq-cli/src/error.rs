@@ -176,7 +176,7 @@ pub struct WrongType {
     pub pointer: String,
     /// The node's type, as `dq type` names it.
     pub found: &'static str,
-    /// The types the command reads: `"object or array"`.
+    /// The types the command reads: `"an object or an array"`.
     pub expected: &'static str,
 }
 
