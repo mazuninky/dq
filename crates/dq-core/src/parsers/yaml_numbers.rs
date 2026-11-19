@@ -134,8 +134,10 @@ pub(super) fn read_exact(bytes: &[u8]) -> Result<Vec<Value>> {
 
 /// `text` with the tag of every `!!float` / `!!int` scalar serde_norway
 /// refuses and [`exact_value`] reads (`!!float 1e400`, a `!!int` past
-/// `u128`) blanked out — spaces, so every position stays — for
-/// serde_norway to read it untagged; the events of `text` give the value.
+/// `u128`) made a local tag of the same length (`!xxxxxx`), which
+/// serde_norway reads as untagged; the events of `text` give the value.
+/// Every node keeps its column, so a tagged block-map key stays a key:
+/// spaces in the tag's place would move the key right of its siblings.
 /// `None` when there is none, or saphyr-parser fails on `text`.
 fn untag_numbers(text: &str) -> Option<String> {
     let mut starts = Vec::new();
@@ -163,7 +165,8 @@ fn untag_numbers(text: &str) -> Option<String> {
     let mut out = text.as_bytes().to_vec();
     for at in offsets {
         let tag = tag_range(&out, at)?;
-        out[tag].fill(b' ');
+        out[tag.start] = b'!';
+        out[tag.start + 1..tag.end].fill(b'x');
     }
     String::from_utf8(out).ok()
 }
@@ -509,7 +512,9 @@ impl<'t> Walk<'t> {
     /// The map of `entries`, failing on a key that repeats an earlier one.
     fn mapping(&mut self, entries: Vec<Entry>, path: &Path<'_>) -> Step<Value> {
         let mut out: IndexMap<String, Value> = IndexMap::with_capacity(entries.len());
-        let mut kinds: Vec<KeyKind> = Vec::with_capacity(entries.len());
+        // How each key is named in a message: a number as written
+        // (`0.10`, not the `0.1` it reads as), any other as `out` holds it.
+        let mut names: Vec<(KeyKind, Option<String>)> = Vec::with_capacity(entries.len());
         let mut floats: HashMap<FloatKey, usize> = HashMap::new();
         for entry in entries {
             let Entry {
@@ -573,11 +578,9 @@ impl<'t> Walk<'t> {
                 .or_else(|| id.as_ref().and_then(|id| floats.get(id).copied()));
             if let Some(first) = first {
                 let (first_key, _) = out.get_index(first).ok_or(Stop::Disagree)?;
-                return Err(repeated(
-                    path,
-                    &kinds[first].duplicate_message(first_key),
-                    &span,
-                ));
+                let (first_kind, written) = &names[first];
+                let name = written.as_deref().unwrap_or(first_key);
+                return Err(repeated(path, &first_kind.duplicate_message(name), &span));
             }
             let value = match key_text.as_deref() {
                 Some(text) => self.node(
@@ -592,7 +595,10 @@ impl<'t> Walk<'t> {
             if let Some(id) = id {
                 floats.insert(id, out.len());
             }
-            kinds.push(kind);
+            let written = key_text
+                .filter(|_| kind == KeyKind::Number)
+                .map(|text| text.to_string());
+            names.push((kind, written));
             out.insert(key, value);
         }
         if !matches!(self.next()?.0, Event::MappingEnd) {
@@ -756,6 +762,78 @@ mod tests {
             error("1e400: a\n0.1: b\n0.10: c\n"),
             "duplicate entry with key 0.1 at line 3 column 1"
         );
+    }
+
+    #[test]
+    fn a_tagged_big_number_reads_wherever_its_tag_starts_a_node() {
+        let big = "1234567890123456789012345678901234567890";
+        let f = Value::BigFloat("1e400".into());
+        for (text, want) in [
+            (
+                "!!float 1e400: a\nb: 1\n".to_owned(),
+                map(&[("1e400", Value::String("a".into())), ("b", Value::Int(1))]),
+            ),
+            (
+                "x:\n  !!float 1e400: a\n  b: 1\n".to_owned(),
+                map(&[(
+                    "x",
+                    map(&[("1e400", Value::String("a".into())), ("b", Value::Int(1))]),
+                )]),
+            ),
+            (
+                format!("!!int {big}: a\nb: 1\n"),
+                map(&[(big, Value::String("a".into())), ("b", Value::Int(1))]),
+            ),
+            (
+                "&k !!float 1e400: a\nb: *k\n".to_owned(),
+                map(&[("1e400", Value::String("a".into())), ("b", f.clone())]),
+            ),
+            (
+                "- !!float 1e400\n- !<tag:yaml.org,2002:float> 1e401\n".to_owned(),
+                Value::Array(vec![f.clone(), Value::BigFloat("1e401".into())]),
+            ),
+            (
+                "? !!float 1e400\n: a\nb: 1\n".to_owned(),
+                map(&[("1e400", Value::String("a".into())), ("b", Value::Int(1))]),
+            ),
+            (
+                "a: !!float\n  1e400\nb: !!int\n  1234567890123456789012345678901234567890\n"
+                    .to_owned(),
+                map(&[("a", f.clone()), ("b", Value::BigInt(big.into()))]),
+            ),
+        ] {
+            assert_eq!(read(&text), want, "{text}");
+        }
+        // A plain scalar over two lines folds to a text with a space: no
+        // number, refused as serde_norway refuses it.
+        assert!(
+            error("b: !!int\n  12345678901234567890\n  123456789012345678901\n")
+                .contains("expected an integer")
+        );
+    }
+
+    #[test]
+    fn a_repeated_number_key_is_named_as_first_written() {
+        for (text, message) in [
+            (
+                "0.10: a\n0.1: b\n",
+                "duplicate entry with key 0.10 at line 2 column 1",
+            ),
+            (
+                "0.10000000000000001: a\n0.1: b\n",
+                "duplicate entry with key 0.10000000000000001 at line 2 column 1",
+            ),
+            (
+                "x:\n  1.0e3: a\n  1000.0: b\n",
+                "x: duplicate entry with key 1.0e3 at line 3 column 3",
+            ),
+            (
+                "+1: a\n1: b\n",
+                "duplicate entry with key +1 at line 2 column 1",
+            ),
+        ] {
+            assert_eq!(error(text), message, "{text}");
+        }
     }
 
     #[test]

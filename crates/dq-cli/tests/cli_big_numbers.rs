@@ -1101,3 +1101,16 @@ fn toon_names_a_yaml_big_number_as_written() {
         "a: 1\n"
     );
 }
+
+#[test]
+fn a_float_tagged_big_key_reads_in_a_block_map() {
+    let dir = dir_with(&[
+        ("k.yaml", "!!float 1e400: a\nb: 1\n"),
+        ("n.yaml", "x:\n  !!float 1e400: a\n  b: 1\n"),
+    ]);
+    assert_eq!(
+        stdout_of(&dir, &["-q", "-F", "json", "convert", "k.yaml"]),
+        "{\n  \"1e400\": \"a\",\n  \"b\": 1\n}\n"
+    );
+    assert_eq!(stdout_of(&dir, &["get", "n.yaml", "/x/b"]), "1\n");
+}
