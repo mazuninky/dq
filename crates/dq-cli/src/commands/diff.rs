@@ -70,8 +70,8 @@ pub fn run(
         // `preserve_order`) and unified-diff the textual forms. JSON is the
         // lowest-common-denominator stable representation that both YAML and
         // TOML inputs can be normalised through.
-        let a_json = serde_json::to_string_pretty(&doc_a.value().to_serde_json())?;
-        let b_json = serde_json::to_string_pretty(&doc_b.value().to_serde_json())?;
+        let a_json = pretty_json(&doc_a.value().to_serde_json())?;
+        let b_json = pretty_json(&doc_b.value().to_serde_json())?;
         let label = format!("{} -> {}", args.a, args.b);
         let unified = crate::diff::render_unified(&a_json, &b_json, &label, !cli.no_color);
         out.write_all(unified.as_bytes())?;
@@ -93,12 +93,24 @@ pub fn run(
     // JSON-pretty — closer to the user's intent than the "console reporter"
     // shape. Other formats route through the supplied reporter unchanged.
     if cli.format == OutputFormat::Console {
-        serde_json::to_writer_pretty(&mut *out, &json)?;
-        out.write_all(b"\n")?;
+        crate::output::JsonReporter.report(&json, out)?;
         return Ok(());
     }
     reporter.report(&json, out)?;
     Ok(())
+}
+
+/// `value` as the JSON reporter prints it — floats in their shortest
+/// round-trip spelling, as every JSON output spells them — without the
+/// trailing newline.
+fn pretty_json(value: &serde_json::Value) -> anyhow::Result<String> {
+    let mut buf = Vec::new();
+    crate::output::JsonReporter.report(value, &mut buf)?;
+    let mut text = String::from_utf8(buf)?;
+    if text.ends_with('\n') {
+        text.pop();
+    }
+    Ok(text)
 }
 
 /// The RFC 6902 wire shape of `ops`, each `value` with its number exact.

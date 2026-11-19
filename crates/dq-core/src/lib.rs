@@ -14,7 +14,9 @@ pub mod textual_edit;
 pub mod transform;
 pub mod write_options;
 
-pub use document::{Document, FormatTag, FrontmatterKind, FrontmatterPayload, Value};
+pub use document::{
+    Document, FormatTag, FrontmatterKind, FrontmatterPayload, Value, shortest_float,
+};
 pub use edit_ops::{EditOp, EditScript};
 pub use enumerate::enumerate_pointers;
 pub use error::{Error, PathErrorKind};

@@ -11,9 +11,13 @@ use super::Reporter;
 pub struct JsonReporter;
 
 impl Reporter for JsonReporter {
+    /// Writes through `dq-core`'s JSON writer too, in the layout
+    /// `serde_json`'s pretty printer has, so a float is spelled one way on
+    /// every JSON output: the shortest round-trip form, `1e300` (serde_json
+    /// writes `1e+300`).
     fn report(&self, value: &serde_json::Value, w: &mut dyn Write) -> anyhow::Result<()> {
-        serde_json::to_writer_pretty(&mut *w, value)?;
-        w.write_all(b"\n")?;
+        let core = super::from_serde_value(value);
+        dq_core::parsers::Json.write(&dq_core::Document::single(core), w)?;
         Ok(())
     }
 

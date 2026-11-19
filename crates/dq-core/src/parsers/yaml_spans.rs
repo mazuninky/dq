@@ -3006,13 +3006,15 @@ fn render_float(f: f64) -> Vec<u8> {
             b".inf".to_vec()
         }
     } else {
-        // `1.0_f64.to_string()` returns `"1"` — that loses the float-ness in
-        // YAML round-trip. Force a fractional component when it's missing.
-        let s = f.to_string();
-        if s.contains('.') || s.contains('e') || s.contains('E') {
-            s.into_bytes()
+        // As the YAML emitter spells it: the shortest round-trip digits, a
+        // whole float with its `.0`, an exponent past the plain-decimal
+        // range in the YAML 1.1 shape (`1e300` -> `1.0e+300`, not 301
+        // digits).
+        let s = crate::document::shortest_float(f);
+        if s.contains('e') {
+            super::yaml_emit::yaml11_float(&s).unwrap_or(s).into_bytes()
         } else {
-            format!("{s}.0").into_bytes()
+            s.into_bytes()
         }
     }
 }

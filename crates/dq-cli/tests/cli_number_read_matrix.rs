@@ -511,3 +511,77 @@ fn hcl_keeps_integers_past_64_bits_exact() {
         ],
     );
 }
+
+const FLOATS_YAML: &str = "a: 1e300\nb: -1e-300\nc: 1.5e20\nd: 123.25\ne: 3.0\n\
+    f: 5e-324\ng: 1.7976931348623157e308\n";
+
+/// `convert -F json` printed `1e300` as 301 digits and `1e-300` as `0.`
+/// and 300 zeros; `query -F json` did too once it wrote through the same
+/// writer. Every JSON output spells a float shortest, as ryu lays it out.
+#[test]
+fn json_output_spells_a_float_in_its_shortest_round_trip_form() {
+    let dir = dir_with(&[("f.yaml", FLOATS_YAML)]);
+    let query = ".a, .b, .c, .d, .e, .f, .g";
+    assert_cases(
+        &dir,
+        &[
+            (
+                vec!["query", query, "f.yaml", "-F", "json"],
+                ok(
+                    "[\n  1e300,\n  -1e-300,\n  1.5e20,\n  123.25,\n  3.0,\n  5e-324,\n  \
+                    1.7976931348623157e308\n]\n",
+                ),
+            ),
+            (
+                vec!["query", query, "f.yaml", "-F", "jsonl"],
+                ok("1e300\n-1e-300\n1.5e20\n123.25\n3.0\n5e-324\n1.7976931348623157e308\n"),
+            ),
+            (
+                vec!["-q", "convert", "f.yaml", "-F", "json"],
+                ok(
+                    "{\n  \"a\": 1e300,\n  \"b\": -1e-300,\n  \"c\": 1.5e20,\n  \
+                    \"d\": 123.25,\n  \"e\": 3.0,\n  \"f\": 5e-324,\n  \
+                    \"g\": 1.7976931348623157e308\n}\n",
+                ),
+            ),
+            (
+                vec!["convert", "f.yaml", "-F", "jsonl"],
+                ok(
+                    "{\"a\":1e300,\"b\":-1e-300,\"c\":1.5e20,\"d\":123.25,\"e\":3.0,\
+                    \"f\":5e-324,\"g\":1.7976931348623157e308}\n",
+                ),
+            ),
+        ],
+    );
+}
+
+/// The TOML writer and the YAML / TOML / JSON textual edit printed the
+/// same digit runs (`a = 1000…000.0`).
+#[test]
+fn toml_and_textual_edits_spell_a_float_without_a_digit_run() {
+    let dir = dir_with(&[
+        ("f.yaml", FLOATS_YAML),
+        ("s.yaml", "a: 1 # kept\n"),
+        ("s.toml", "a = 1 # kept\n"),
+        ("s.json", "{\"a\": 1}\n"),
+    ]);
+    assert_cases(
+        &dir,
+        &[
+            (
+                vec!["-q", "convert", "f.yaml", "-F", "toml"],
+                ok("a = 1e300\nb = -1e-300\nc = 1.5e20\nd = 123.25\ne = 3.0\n\
+                    f = 5e-324\ng = 1.7976931348623157e308\n"),
+            ),
+            (
+                vec!["set", "s.yaml", "/a", "1e300"],
+                ok("a: 1.0e+300 # kept\n"),
+            ),
+            (
+                vec!["set", "s.toml", "/a", "1.5e20"],
+                ok("a = 1.5e20 # kept\n"),
+            ),
+            (vec!["set", "s.json", "/a", "1e-7"], ok("{\"a\": 1e-7}\n")),
+        ],
+    );
+}

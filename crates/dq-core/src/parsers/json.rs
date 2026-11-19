@@ -1019,13 +1019,10 @@ fn write_value_with(
             if !n.is_finite() {
                 return Err(non_finite_error());
             }
-            // Use the shortest-round-trip representation. If the value is
-            // integral, append `.0` to keep it parseable as float.
-            let mut s = n.to_string();
-            if !s.contains('.') && !s.contains('e') && !s.contains('E') {
-                s.push_str(".0");
-            }
-            write_io(w, s.as_bytes())?;
+            // The shortest round-trip spelling, an exponent past the
+            // plain-decimal range (`1e300`, not 301 digits); a whole float
+            // keeps its `.0`.
+            write_io(w, crate::document::shortest_float(*n).as_bytes())?;
         }
         Value::String(s) => {
             write_io(w, b"\"")?;

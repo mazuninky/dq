@@ -554,6 +554,74 @@ fn holds(normal: &Normal<'_>, f: f64) -> bool {
     DecimalParts::parse(spelled.as_str()).is_some_and(|parts| Normal::of(&parts).same(normal))
 }
 
+/// The shortest spelling of a finite `f64` that reads back as the same
+/// `f64`, laid out as ryu's `format64` lays it out — the spelling
+/// serde_json wrote before it moved to zmij, and the one serde_norway
+/// (dq's YAML emitter) still writes:
+///
+/// - plain decimal while the value lies in `[1e-5, 1e16)`, a whole float
+///   keeping `.0` so it stays recognisably a float: `3.0`, `123.25`,
+///   `0.0001`, `1000000000000000.0`;
+/// - an exponent otherwise, with no `+` and no `.0` on a one-digit
+///   mantissa: `1e16`, `1.5e20`, `1e-7`, `1e300`, `5e-324`,
+///   `1.7976931348623157e308`;
+/// - `0.0` and `-0.0` for the zeros.
+///
+/// The digits are serde_json's (zmij's): the shortest that round-trip,
+/// a tie between two of them going to the even one as ryu does — Rust's
+/// own `{:e}` takes the odd one up (`1658206780088562.3` for the `f64`
+/// halfway between it and `1658206780088562.2`). NaN and the infinities
+/// have no spelling here: they come back as Rust's `Display` (`NaN`,
+/// `inf`, `-inf`), which each format's writer refuses or respells before
+/// it gets this far.
+#[must_use]
+pub fn shortest_float(f: f64) -> String {
+    let Some((digits, kk)) = shortest_digits(f) else {
+        return f.to_string();
+    };
+    let sign = if f.is_sign_negative() { "-" } else { "" };
+    if digits.is_empty() {
+        return format!("{sign}0.0");
+    }
+    let len = i32::try_from(digits.len()).unwrap_or(i32::MAX);
+    let zeros = |n: i32| "0".repeat(usize::try_from(n).unwrap_or(0));
+    let split = usize::try_from(kk).unwrap_or(0);
+    let exponent = kk - 1;
+    if kk >= len && kk <= 16 {
+        // 1234e7 -> 12340000000.0
+        format!("{sign}{digits}{}.0", zeros(kk - len))
+    } else if kk > 0 && kk <= 16 {
+        // 1234e-2 -> 12.34
+        format!("{sign}{}.{}", &digits[..split], &digits[split..])
+    } else if kk > -5 && kk <= 0 {
+        // 1234e-6 -> 0.001234
+        format!("{sign}0.{}{digits}", zeros(-kk))
+    } else if len == 1 {
+        // 1e30
+        format!("{sign}{digits}e{exponent}")
+    } else {
+        // 1234e30 -> 1.234e33
+        format!("{sign}{}.{}e{exponent}", &digits[..1], &digits[1..])
+    }
+}
+
+/// The significant digits serde_json spells a finite `f` with, and the
+/// power of ten `kk` just above it: `|f| = 0.digits × 10^kk`. Empty digits
+/// for a zero; `None` for NaN and the infinities.
+fn shortest_digits(f: f64) -> Option<(String, i32)> {
+    let text = serde_json::Number::from_f64(f.abs())?.to_string();
+    let (mantissa, exponent) = match text.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, exponent.parse::<i32>().ok()?),
+        None => (text.as_str(), 0),
+    };
+    let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let mut kk = i32::try_from(int.len()).ok()?.checked_add(exponent)?;
+    let all = format!("{int}{frac}");
+    let significant = all.trim_start_matches('0');
+    kk -= i32::try_from(all.len() - significant.len()).ok()?;
+    Some((significant.trim_end_matches('0').to_owned(), kk))
+}
+
 /// Whether a decimal literal may be a number another reader, which parses
 /// floats with Rust's `f64` parser and integers up to `u128` / `i128`,
 /// gets wrong: an integer of 39 digits or more, or a float literal no
@@ -610,6 +678,81 @@ impl fmt::Write for StackText {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shortest_float_spells_as_ryu_lays_it_out() {
+        for (f, spelled) in [
+            (1e300, "1e300"),
+            (-1e-300, "-1e-300"),
+            (1.5e20, "1.5e20"),
+            (123.25, "123.25"),
+            (3.0, "3.0"),
+            (5e-324, "5e-324"),
+            (f64::MAX, "1.7976931348623157e308"),
+            (1e-7, "1e-7"),
+            (1e16, "1e16"),
+            (1e15, "1000000000000000.0"),
+            (1234.5e13, "1.2345e16"),
+            (0.0001, "0.0001"),
+            (0.00001, "0.00001"),
+            (0.000001, "1e-6"),
+            (0.001234, "0.001234"),
+            (0.1, "0.1"),
+            (-2.5, "-2.5"),
+            (0.0, "0.0"),
+            (-0.0, "-0.0"),
+            // Halfway between two 17-digit spellings: the even one, as
+            // ryu and serde_json pick (Rust's `{:e}` writes `...623e15`).
+            (1.6582067800885623e15, "1658206780088562.2"),
+        ] {
+            assert_eq!(shortest_float(f), spelled, "{f:e}");
+        }
+    }
+
+    /// Read back as the same bits, with no more digits than it takes.
+    #[test]
+    fn shortest_float_round_trips_with_the_shortest_digits() {
+        // Significant digits of a decimal spelling: no sign, point, exponent
+        // or leading / trailing zeros.
+        let significant = |s: &str| {
+            let mantissa = s.split(['e', 'E']).next().unwrap_or(s);
+            mantissa
+                .replace(['-', '.'], "")
+                .trim_start_matches('0')
+                .trim_end_matches('0')
+                .to_owned()
+        };
+        let mut bits: u64 = 0x9e37_79b9_7f4a_7c15;
+        for _ in 0..20_000 {
+            // xorshift64: cheap, deterministic coverage of every exponent.
+            bits ^= bits << 13;
+            bits ^= bits >> 7;
+            bits ^= bits << 17;
+            let f = f64::from_bits(bits);
+            if !f.is_finite() {
+                continue;
+            }
+            let spelled = shortest_float(f);
+            assert_eq!(
+                spelled.parse::<f64>().map(f64::to_bits),
+                Ok(f.to_bits()),
+                "{spelled}"
+            );
+            // As short as Rust's own shortest digits, which come from
+            // another implementation (Grisu with a Dragon fallback).
+            assert_eq!(
+                significant(&spelled).len(),
+                significant(&format!("{f:e}")).len(),
+                "{f:e}: {spelled}"
+            );
+        }
+    }
+
+    #[test]
+    fn shortest_float_leaves_nan_and_the_infinities_to_display() {
+        assert_eq!(shortest_float(f64::NAN), "NaN");
+        assert_eq!(shortest_float(f64::NEG_INFINITY), "-inf");
+    }
 
     #[test]
     fn a_float_holds_its_correctly_rounded_spellings_only() {
