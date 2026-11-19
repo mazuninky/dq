@@ -211,6 +211,9 @@ impl RuleSet {
 /// The YAML reader sees the same documents as `serde_norway`; should the
 /// two ever disagree on how many there are, or where a schema sits, the
 /// rule keeps the schema `serde_norway` read.
+///
+/// A number keeps the rule's spelling too (`0.00000000001`, `2.50`), so a
+/// message prints a limit as the rule writes it: see [`Literals`].
 fn exact_schemas(yaml: &str, rules: &mut [Rule]) {
     if !rules.iter().any(has_inline_schema) {
         return;
@@ -236,8 +239,67 @@ fn exact_schemas(yaml: &str, rules: &mut [Rule]) {
         );
         return;
     }
-    for (rule, document) in rules.iter_mut().zip(documents) {
-        exact_schema(rule, document);
+    let spans = dq_core::parse_yaml_with_spans(yaml.as_bytes()).ok();
+    let literals = spans.as_ref().map(|doc| Literals { yaml, doc });
+    for (index, (rule, document)) in rules.iter_mut().zip(documents).enumerate() {
+        // The span parse keys a stream's documents `/N/...`, a lone one `/...`.
+        let mut at = dq_core::Pointer::default();
+        if documents.len() > 1 {
+            at.push_segment(dq_core::Segment::Index(index));
+        }
+        exact_schema(rule, document, literals.as_ref(), &mut at);
+    }
+}
+
+/// The text of every number in a rule file, by where it sits.
+struct Literals<'a> {
+    yaml: &'a str,
+    /// The rule file as the span parse reads it.
+    doc: &'a dq_core::Document,
+}
+
+impl Literals<'_> {
+    /// `json`, a schema read from the rule file at `at`, with every number
+    /// spelled as the file spells it — when that text is a JSON number of
+    /// the same value. Any other text (`+5`, `.5`, `0x10`) keeps the
+    /// number's own spelling.
+    fn respell(&self, json: &mut serde_json::Value, at: &mut dq_core::Pointer) {
+        match json {
+            serde_json::Value::Number(number) => {
+                let Some(text) = self
+                    .doc
+                    .span_at(at)
+                    .and_then(|span| self.yaml.get(span.value_range.clone()))
+                else {
+                    return;
+                };
+                let Ok(literal) = text.parse::<serde_json::Number>() else {
+                    return;
+                };
+                let read =
+                    dq_core::Value::from_serde_json(&serde_json::Value::Number(literal.clone()));
+                let held =
+                    dq_core::Value::from_serde_json(&serde_json::Value::Number(number.clone()));
+                if read.same_number(&held) {
+                    *number = literal;
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (index, item) in items.iter_mut().enumerate() {
+                    at.push_segment(dq_core::Segment::Index(index));
+                    self.respell(item, at);
+                    at.pop_segment();
+                }
+            }
+            serde_json::Value::Object(members) => {
+                for (key, member) in members.iter_mut() {
+                    at.push_segment(dq_core::Segment::Key(key.clone()));
+                    self.respell(member, at);
+                    at.pop_segment();
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -250,24 +312,39 @@ fn has_inline_schema(rule: &Rule) -> bool {
     }
 }
 
-/// [`exact_schemas`] for one rule and the YAML reader's value of it.
-fn exact_schema(rule: &mut Rule, document: &dq_core::Value) {
+/// [`exact_schemas`] for one rule, the YAML reader's value of it, and
+/// where that value sits in the rule file.
+fn exact_schema(
+    rule: &mut Rule,
+    document: &dq_core::Value,
+    literals: Option<&Literals<'_>>,
+    at: &mut dq_core::Pointer,
+) {
     let Some(check) = member(document, "check") else {
         return;
     };
+    at.push_segment(dq_core::Segment::Key("check".to_owned()));
     match &mut rule.check {
         Check::Schema { schema, .. } => {
             if let Some(exact) = member(check, "schema") {
                 *schema = crate::schema_value::schema_json(exact);
+                if let Some(literals) = literals {
+                    at.push_segment(dq_core::Segment::Key("schema".to_owned()));
+                    literals.respell(schema, at);
+                    at.pop_segment();
+                }
             }
         }
         Check::Composite { nested, .. } => {
             if let Some(nested_document) = member(check, "nested") {
-                exact_schema(nested, nested_document);
+                at.push_segment(dq_core::Segment::Key("nested".to_owned()));
+                exact_schema(nested, nested_document, literals, at);
+                at.pop_segment();
             }
         }
         _ => {}
     }
+    at.pop_segment();
 }
 
 /// The member `key` of a map value.
@@ -398,11 +475,12 @@ mod tests {
             "{RULE_A}---\n\
              id: n.one\ndescription: x\nseverity: error\nmatch: {{ format: yaml }}\n\
              check:\n  schema: {{ const: 18446744073709551616, maximum: 1e400, \
-             minimum: 0.10000000000000000001, enum: [.inf] }}\n---\n\
+             minimum: 0.10000000000000000001, enum: [.inf], multipleOf: 2.50 }}\n---\n\
              id: n.two\ndescription: x\nseverity: error\nmatch: {{ format: yaml }}\n\
              check:\n  extract: '[]'\n  message: m\n  nested:\n    id: n.inner\n    \
              description: x\n    severity: error\n    match: {{ format: json }}\n    \
-             check:\n      schema: {{ const: 340282366920938463463374607431768211456 }}\n"
+             check:\n      schema: {{ const: 340282366920938463463374607431768211456, \
+             items: [{{ maximum: 0.00000000001 }}, {{ minimum: +5 }}] }}\n"
         );
         let set = RuleSet::from_str(&stream, RuleSource::Inline).expect("parse rule stream");
         let Check::Schema { schema, .. } = &set.rules[1].check else {
@@ -410,7 +488,7 @@ mod tests {
         };
         assert_eq!(
             schema.to_string(),
-            r#"{"const":18446744073709551616,"maximum":1e+400,"minimum":0.10000000000000000001,"enum":["\u0000dq.inf\u0000"]}"#
+            r#"{"const":18446744073709551616,"maximum":1e+400,"minimum":0.10000000000000000001,"enum":["\u0000dq.inf\u0000"],"multipleOf":2.50}"#
         );
         let Check::Composite { nested, .. } = &set.rules[2].check else {
             panic!("expected a composite check: {:?}", set.rules[2].check);
@@ -420,7 +498,7 @@ mod tests {
         };
         assert_eq!(
             schema.to_string(),
-            r#"{"const":340282366920938463463374607431768211456}"#
+            r#"{"const":340282366920938463463374607431768211456,"items":[{"maximum":0.00000000001},{"minimum":5}]}"#
         );
     }
 

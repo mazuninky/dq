@@ -1298,3 +1298,43 @@ fn a_float_on_a_17th_digit_tie_compares_by_its_even_spelling() {
         ),
     ]);
 }
+
+/// A limit in a message is spelled as the rule writes it — the rule's
+/// numbers are held exactly, so `1e-11` for `0.00000000001` would misquote
+/// the rule. An exponent comes out as serde_json reads it (`1e2` as
+/// `1e+2`, as a `schema_file` gives it); text that is no JSON number
+/// (`+5`) keeps the number's own spelling. Before, every limit came out in
+/// its shortest spelling.
+#[test]
+fn a_limit_is_quoted_in_a_message_as_the_rule_spells_it() {
+    use Some as Fails;
+    assert_schema_cases(&[
+        (
+            "{multipleOf: 0.00000000001}",
+            "0.000000000015",
+            Fails("/properties/x/multipleOf: 1.5e-11 is not a multiple of 0.00000000001"),
+        ),
+        (
+            "{multipleOf: 2.50}",
+            "1",
+            Fails("/properties/x/multipleOf: 1 is not a multiple of 2.50"),
+        ),
+        (
+            "{maximum: 0.00000000001}",
+            "1",
+            Fails("/properties/x/maximum: 1 is greater than the maximum of 0.00000000001"),
+        ),
+        (
+            "{exclusiveMinimum: 1e2}",
+            "100",
+            Fails(
+                "/properties/x/exclusiveMinimum: 100 is less than or equal to the minimum of 1e+2",
+            ),
+        ),
+        (
+            "{minimum: +5}",
+            "1",
+            Fails("/properties/x/minimum: 1 is less than the minimum of 5"),
+        ),
+    ]);
+}
