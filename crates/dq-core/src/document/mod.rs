@@ -225,6 +225,10 @@ pub struct Document {
     /// `Document` to ignore the cache; the eager path keeps the existing
     /// derives intact for a fixed parse-time hashmap iteration.
     provenance: ProvenanceMap,
+    /// Whether a write-aware parser built this document, so the textual
+    /// edits apply to it. Not the same as having bytes: an empty YAML file
+    /// parsed write-aware has neither bytes nor spans.
+    write_aware: bool,
 }
 
 /// The not-a-number or infinite float a number literal spells in YAML
@@ -495,6 +499,7 @@ impl Document {
             multi_doc: false,
             frontmatter_payload: None,
             provenance: ProvenanceMap::new(),
+            write_aware: false,
         }
     }
 
@@ -516,6 +521,7 @@ impl Document {
             multi_doc: true,
             frontmatter_payload: None,
             provenance: ProvenanceMap::new(),
+            write_aware: false,
         }
     }
 
@@ -541,6 +547,7 @@ impl Document {
             multi_doc: false,
             frontmatter_payload: None,
             provenance,
+            write_aware: true,
         }
     }
 
@@ -577,6 +584,7 @@ impl Document {
             multi_doc: false,
             frontmatter_payload: None,
             provenance,
+            write_aware: true,
         }
     }
 
@@ -604,6 +612,7 @@ impl Document {
             multi_doc: false,
             frontmatter_payload: None,
             provenance,
+            write_aware: false,
         }
     }
 
@@ -620,6 +629,7 @@ impl Document {
             multi_doc: false,
             frontmatter_payload: Some(FrontmatterPayload { kind, body }),
             provenance: ProvenanceMap::new(),
+            write_aware: false,
         }
     }
 
@@ -727,6 +737,14 @@ impl Document {
     /// neither, so they behave the same either way.
     pub(crate) fn mark_stream(&mut self) {
         self.multi_doc = matches!(self.value, Value::Array(_));
+    }
+
+    /// Whether a write-aware parser built this document, so
+    /// [`Document::set_at`] and [`Document::del_at`] can edit its text. An
+    /// empty file parsed write-aware is write-aware with no bytes.
+    #[must_use]
+    pub fn is_write_aware(&self) -> bool {
+        self.write_aware
     }
 
     /// Borrow the original source bytes, if this document was parsed by a
@@ -865,7 +883,7 @@ impl Document {
     ///   check.
     pub fn set_at(&mut self, pointer: &Pointer, value: Value) -> Result<()> {
         self.with_lf_line_breaks("set", pointer, |doc| {
-            if doc.format == FormatTag::Yaml && !doc.original_bytes.is_empty() {
+            if doc.format == FormatTag::Yaml && doc.write_aware {
                 // A whole document: one of a stream whose content is a
                 // collection, or a file's only document, which has no
                 // bytes of its own to replace; the YAML writer writes it
@@ -895,6 +913,18 @@ impl Document {
                         });
                     }
                     return doc.reemit_yaml_root(value);
+                }
+                // A key of an empty document — an empty file, comments
+                // alone, a bare `---`: the document becomes a mapping
+                // holding it, written whole.
+                if let Some((index, rest)) = doc.empty_document_path(pointer) {
+                    let mut fresh = Value::Map(IndexMap::new());
+                    if set_value_at(&mut fresh, &rest, value.clone()).is_ok() {
+                        return match index {
+                            Some(index) => doc.reemit_stream_document(index, fresh),
+                            None => doc.reemit_yaml_root(fresh),
+                        };
+                    }
                 }
             }
             let before = doc.clone();
@@ -963,13 +993,53 @@ impl Document {
     /// The index of the document of a write-aware YAML stream `pointer`
     /// names (`/1`), `None` for any other pointer or document.
     fn stream_document_index(&self, pointer: &Pointer) -> Option<usize> {
-        if self.format != FormatTag::Yaml || self.original_bytes.is_empty() {
+        match pointer.segments() {
+            [segment] => self.stream_document_at(segment),
+            _ => None,
+        }
+    }
+
+    /// Where `pointer` names a key below a write-aware YAML document with
+    /// no content (not even `~`): the document — `None`
+    /// for a file's only document, `Some(index)` for one of a stream — and
+    /// the pointer within it. `None` for any other pointer or document.
+    fn empty_document_path(&self, pointer: &Pointer) -> Option<(Option<usize>, Pointer)> {
+        if self.format != FormatTag::Yaml || !self.write_aware {
+            return None;
+        }
+        let (index, rest) = if self.multi_doc {
+            let (first, rest) = pointer.segments().split_first()?;
+            let index = self.stream_document_at(first)?;
+            (Some(index), rest)
+        } else {
+            (None, pointer.segments())
+        };
+        let document = match index {
+            Some(index) => self.values()?.get(index)?,
+            None => &self.value,
+        };
+        if !matches!(rest.first(), Some(Segment::Key(_))) || *document != Value::Null {
+            return None;
+        }
+        // No content and no node properties (`--- !!str`); the spans
+        // cannot tell, since an empty node is spanned at the next token.
+        let extents = crate::parsers::yaml_spans::document_extents(&self.original_bytes)?;
+        let empty = match extents.get(index.unwrap_or(0)) {
+            Some(extent) => {
+                extent.content_end == extent.body.start && extent.after_properties.is_none()
+            }
+            None => extents.is_empty(),
+        };
+        empty.then(|| (index, Pointer::new(rest.to_vec())))
+    }
+
+    /// The index of the document of a write-aware YAML stream `segment`
+    /// names, `None` when it names none.
+    fn stream_document_at(&self, segment: &Segment) -> Option<usize> {
+        if self.format != FormatTag::Yaml || !self.write_aware {
             return None;
         }
         let documents = self.values()?;
-        let [segment] = pointer.segments() else {
-            return None;
-        };
         let index = match segment {
             Segment::Index(index) => *index,
             Segment::Key(key) => key
@@ -1020,21 +1090,11 @@ impl Document {
         let bytes = &self.original_bytes;
         let content_start = bom_end(bytes);
         let (range, inserted) = if self.format == FormatTag::Toml {
-            if !matches!(value, Value::Map(_)) {
+            if let Some(reason) = toml_root_refusal(&value) {
                 return Err(Error::EditRejected {
                     action: "set",
                     pointer: String::new(),
-                    reason: format!(
-                        "{TOML_ROOT_TABLE}, not {}",
-                        match value {
-                            Value::Null => "null",
-                            Value::Bool(_) => "a boolean",
-                            Value::Int(_) | Value::BigInt(_) => "an integer",
-                            Value::Float(_) | Value::BigFloat(_) => "a float",
-                            Value::String(_) => "a string",
-                            Value::Array(_) | Value::Map(_) => "an array",
-                        }
-                    ),
+                    reason,
                 });
             }
             let mut emitted = Vec::new();
@@ -1088,15 +1148,10 @@ impl Document {
         value: Value,
         layout: &LayoutCache,
     ) -> Result<()> {
-        // "Read-only" really means "no source bytes captured" — read-only
-        // parsers go through `value_only` / `multi_value_only` and leave
-        // `original_bytes` empty. A document with bytes but an empty
-        // SpanMap (e.g. `{"a":{}}` whose only key is itself an empty
-        // container) is still write-aware; its mkdir-p path will fail
-        // through to `Error::Path { MissingKey }` further down, but the
-        // top-level capability check should not falsely block it. An empty
-        // file parsed write-aware has no bytes but a span for its root.
-        if self.original_bytes.is_empty() && self.spans.is_empty() {
+        // Read-only parsers go through `value_only` / `multi_value_only`;
+        // neither bytes nor spans tell, since an empty YAML file parsed
+        // write-aware has none of either.
+        if !self.write_aware {
             return Err(Error::WriteUnavailable {
                 reason: format!(
                     "{} document was loaded read-only; reload via a write-aware parser to enable set",
@@ -1551,7 +1606,9 @@ impl Document {
         // Compute the actual splice point + final bytes, format-aware so
         // we don't smear `\n`s or forget a `,` separator.
         let (splice_at, splice_bytes) = match flow_layout {
-            Some(layout) => flow_sibling_splice(&fragment, &sibling_span, layout),
+            Some(layout) => {
+                flow_sibling_splice(&fragment, &sibling_span, layout, &self.original_bytes)
+            }
             None => {
                 format_specific_splice(self.format, &fragment, &sibling_span, &self.original_bytes)
             }
@@ -2511,12 +2568,8 @@ impl Document {
 
     /// [`Document::del_at`] without the read-back check.
     fn del_at_unchecked(&mut self, pointer: &Pointer, cache: &LayoutCache) -> Result<()> {
-        // "Read-only" is signalled by empty `original_bytes` (`value_only`
-        // constructor); an all-container document with zero leaf scalars
-        // has an empty SpanMap but populated bytes — its del would
-        // legitimately fall through to MissingKey, not WriteUnavailable. An
-        // empty file parsed write-aware has a span for its root.
-        if self.original_bytes.is_empty() && self.spans.is_empty() {
+        // Read-only parsers go through `value_only` / `multi_value_only`.
+        if !self.write_aware {
             return Err(Error::WriteUnavailable {
                 reason: format!(
                     "{} document was loaded read-only; reload via a write-aware parser to enable del",
@@ -2568,6 +2621,24 @@ impl Document {
             None
         };
         let in_map = matches!(parent_ptr.resolve(&self.value), Ok(Value::Map(_)));
+        // The one key of a mapping written in a flow sequence without
+        // braces (`[a: 1]`, `[? a]`): the mapping is left as `{}`.
+        let parent_canonical = parent_ptr.as_canonical();
+        if let Some(layout) = layout.as_ref()
+            && layout
+                .containers
+                .get(&parent_canonical)
+                .is_some_and(|parent| parent.implicit_pair)
+            && let Some(pair) = layout.flow_entries.get(&parent_canonical).cloned()
+        {
+            if let Some(err) = self.anchor_removal_refused(cache, &pair, "delete", &canonical) {
+                return Err(err);
+            }
+            self.original_bytes.splice(pair, b"{}".iter().copied());
+            delete_value_at(&mut self.value, pointer)?;
+            // The read-back check takes the spans of the edited bytes.
+            return Ok(());
+        }
         // What takes the place of the removed bytes: `{}` / `[]` for the
         // only entry of a compact collection.
         let mut inserted: Vec<u8> = Vec::new();
@@ -2613,9 +2684,13 @@ impl Document {
                 _ => entry,
             });
             entry.or_else(|| {
-                collection.flow_value.as_ref().and_then(|value| {
-                    flow_entry_removal(&self.original_bytes, value, in_map, self.format)
-                })
+                let value = collection.flow_value.as_ref()?;
+                match layout.as_ref()?.flow_entries.get(&canonical) {
+                    Some(entry) => {
+                        flow_entry_removal_from(&self.original_bytes, entry.start, value)
+                    }
+                    None => flow_entry_removal(&self.original_bytes, value, in_map, self.format),
+                }
             })
         });
         // JSON records no span for a non-empty collection.
@@ -2764,12 +2839,23 @@ impl Document {
                 in_flow
                     .then(|| {
                         yaml_flow_entry.clone().or_else(|| {
-                            flow_entry_removal(
-                                &self.original_bytes,
-                                &span.value_range,
-                                in_map,
-                                self.format,
-                            )
+                            let value = &span.value_range;
+                            match layout
+                                .as_ref()
+                                .and_then(|layout| layout.flow_entries.get(&canonical))
+                            {
+                                Some(entry) => flow_entry_removal_from(
+                                    &self.original_bytes,
+                                    entry.start,
+                                    value,
+                                ),
+                                None => flow_entry_removal(
+                                    &self.original_bytes,
+                                    value,
+                                    in_map,
+                                    self.format,
+                                ),
+                            }
                         })
                     })
                     .flatten()
@@ -3154,6 +3240,21 @@ fn flow_entry_removal(
     map_entry: bool,
     format: FormatTag,
 ) -> Option<std::ops::Range<usize>> {
+    let start = flow_entry_start(bytes, value, map_entry, format)?;
+    flow_entry_removal_from(bytes, start, value)
+}
+
+/// Where the entry of a flow collection whose value is at `value` begins,
+/// read back from the value: its key with any YAML node properties and
+/// `?`, or the value's own node properties. A YAML edit takes it from the
+/// layout when it can (`EditLayout::flow_entries`): reading back cannot
+/// always tell a bracket of a collection key from one in a quoted scalar.
+fn flow_entry_start(
+    bytes: &[u8],
+    value: &std::ops::Range<usize>,
+    map_entry: bool,
+    format: FormatTag,
+) -> Option<usize> {
     let yaml = format == FormatTag::Yaml;
     let mut start = value.start;
     if yaml {
@@ -3184,6 +3285,15 @@ fn flow_entry_removal(
             }
         }
     }
+    Some(start)
+}
+
+/// [`flow_entry_removal`] for the entry that begins at `start`.
+fn flow_entry_removal_from(
+    bytes: &[u8],
+    start: usize,
+    value: &std::ops::Range<usize>,
+) -> Option<std::ops::Range<usize>> {
     let after = skip_blanks(bytes, value.end);
     let before = skip_blanks_back(bytes, start);
     let preceding = before.checked_sub(1).map(|i| bytes[i]);
@@ -3265,10 +3375,22 @@ fn yaml_flow_entry_removal(
         _ => return None,
     };
     let Some(previous) = at.checked_sub(1).map(|i| &siblings[i]) else {
-        // The only entry: the collection is left empty.
+        // The only entry: the collection is left empty, with the comments
+        // before and after the entry.
+        let open = brackets.start + 1;
+        let start = if bytes[open..entry.start].contains(&b'#') {
+            entry.start
+        } else {
+            open
+        };
+        let end = if bytes[end..close].contains(&b'#') {
+            end
+        } else {
+            close
+        };
         return (matches!(bytes.get(brackets.start), Some(b'{' | b'['))
             && matches!(bytes.get(close), Some(b'}' | b']')))
-        .then_some(brackets.start + 1..close);
+        .then_some(start..end);
     };
     let comma = skip_blanks_and_comments(bytes, previous.end);
     if bytes.get(comma) != Some(&b',') {
@@ -3280,8 +3402,11 @@ fn yaml_flow_entry_removal(
         return Some(entry.start..end);
     }
     // The blanks before the comma go too (`{a: 1 , b: 2}`), a comment
-    // there stays.
-    let start = if bytes[previous.end..comma]
+    // there stays, and so does a blank after a tag that ends the entry
+    // before (`[!!str , 1]`): dq's readers take `!!str]` for one tag.
+    let start = if ends_in_a_tag(&bytes[previous.clone()]) && comma > previous.end {
+        previous.end + 1
+    } else if bytes[previous.end..comma]
         .iter()
         .all(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
     {
@@ -3289,7 +3414,7 @@ fn yaml_flow_entry_removal(
     } else {
         comma
     };
-    Some(start..end)
+    Some(start.min(comma)..end)
 }
 
 /// Start of the key that ends at `end` in a flow mapping: a quoted key, a
@@ -3373,11 +3498,12 @@ fn yaml_flow_collection_start(bytes: &[u8], end: usize) -> Option<usize> {
 }
 
 /// Whether the YAML flow collection opening at `open` closes exactly at
-/// `end`: brackets counted outside quoted scalars and comments. A quote
+/// `end`: brackets matched by kind outside quoted scalars and comments. A quote
 /// starts a scalar only where a node can start — after `[` `{` `,`, or a
 /// `?` / `:` indicator — not inside a plain scalar (`it's`).
 fn yaml_flow_closes_at(bytes: &[u8], open: usize, end: usize) -> bool {
-    let mut depth = 0usize;
+    // The open brackets, innermost last: a `]` closes only a `[`.
+    let mut open_brackets: Vec<u8> = Vec::new();
     let mut node_next = true;
     let mut i = open;
     while i < end {
@@ -3385,12 +3511,15 @@ fn yaml_flow_closes_at(bytes: &[u8], open: usize, end: usize) -> bool {
         i += 1;
         match b {
             b'[' | b'{' => {
-                depth += 1;
+                open_brackets.push(b);
                 node_next = true;
             }
             b']' | b'}' => {
-                depth -= 1;
-                if depth == 0 {
+                let opener = if b == b']' { b'[' } else { b'{' };
+                if open_brackets.pop() != Some(opener) {
+                    return false;
+                }
+                if open_brackets.is_empty() {
                     return i == end;
                 }
                 node_next = false;
@@ -4214,6 +4343,21 @@ const TOML_BIG_NUMBER: &str = "TOML cannot represent arbitrary-precision number"
 /// Why a TOML `set` of the root to a value that is no table is refused.
 const TOML_ROOT_TABLE: &str = "a TOML document is a table, so its root is one";
 
+/// Why `value` cannot be the root of a TOML document — the textual `set`
+/// of the root and the TOML writer both refuse it so; `None` for a table.
+pub(crate) fn toml_root_refusal(value: &Value) -> Option<String> {
+    let kind = match value {
+        Value::Map(_) => return None,
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Int(_) | Value::BigInt(_) => "an integer",
+        Value::Float(_) | Value::BigFloat(_) => "a float",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+    };
+    Some(format!("{TOML_ROOT_TABLE}, not {kind}"))
+}
+
 /// The way around an edit the read-back check refuses.
 const JQ_REWRITE_HINT: &str =
     "`dq set --jq` rewrites the whole file through its writer instead, dropping comments";
@@ -4231,11 +4375,14 @@ enum FlowLayout {
 /// `(splice_at, splice_bytes)` putting the entry the insertion renderer
 /// wrote as `fragment` right after the flow `sibling`, behind a comma. The
 /// renderers write a block entry (a line break, indentation, a trailing
-/// line break): only its `key: value` / `key = value` text is kept.
+/// line break): only its `key: value` / `key = value` text is kept. A
+/// sibling ending in a tag (`n: !!null`) gets a blank before the comma:
+/// YAML 1.1 readers take `!!null,` for one tag.
 fn flow_sibling_splice(
     fragment: &[u8],
     sibling: &ValueSpan,
     layout: FlowLayout,
+    bytes: &[u8],
 ) -> (usize, Vec<u8>) {
     let start = fragment
         .iter()
@@ -4246,7 +4393,13 @@ fn flow_sibling_splice(
         .rposition(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
         .map_or(start, |last| last + 1);
     let entry = &fragment[start..end.max(start)];
-    let mut out = Vec::with_capacity(entry.len() + 2);
+    let mut out = Vec::with_capacity(entry.len() + 3);
+    if bytes
+        .get(..sibling.value_range.end)
+        .is_some_and(ends_in_a_tag)
+    {
+        out.push(b' ');
+    }
     match layout {
         FlowLayout::SameLine => out.extend_from_slice(b", "),
         FlowLayout::OwnLine { column, crlf } => {
@@ -4256,6 +4409,15 @@ fn flow_sibling_splice(
     }
     out.extend_from_slice(entry);
     (sibling.value_range.end, out)
+}
+
+/// Whether the last blank-separated token of `text` is a tag (`!!str`).
+fn ends_in_a_tag(text: &[u8]) -> bool {
+    let token = text
+        .iter()
+        .rposition(u8::is_ascii_whitespace)
+        .map_or(0, |blank| blank + 1);
+    text.get(token) == Some(&b'!')
 }
 
 /// `pos`, or — when it is not at the start of a line — just past the line
@@ -6056,6 +6218,10 @@ mod tests {
                 "{k: ']', it's: '['}",
             ),
             (FormatTag::Yaml, "{b: 2, [\"a\\\"[\"]: 1}", "[\"a\\\"[\"]"),
+            // A `{` / `[` inside a quoted scalar of the key opens nothing,
+            // even where a bracket of the other kind closes after it.
+            (FormatTag::Yaml, "{b: 2, ['{', b]: 1}", "['{', b]"),
+            (FormatTag::Yaml, "{b: 2, {x: '['}: 1}", "{x: '['}"),
             (
                 FormatTag::Toml,
                 "{b = 2, x . \"y z\" . w = 1}",

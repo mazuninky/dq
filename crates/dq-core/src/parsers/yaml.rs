@@ -122,10 +122,14 @@ impl Format for Yaml {
 /// A plain scalar under a tag of no schema dq knows — a `%TAG` handle
 /// bound to another prefix (`!!str` after `%TAG !! tag:example.com,2000:`),
 /// a verbatim `!<tag:example.com,2000:x>` — reads as untagged, as one under
-/// a local tag (`!foo`) does ([`super::yaml_numbers::untag_foreign`]).
+/// a local tag (`!foo`) does ([`super::yaml_numbers::untag_foreign`]). An
+/// empty `!!null` node reads as null
+/// ([`super::yaml_numbers::untag_empty_nulls`]).
 fn read_documents(bytes: &[u8]) -> Result<Vec<Value>> {
     let untagged = super::yaml_numbers::untag_foreign(bytes);
     let bytes = untagged.as_deref().map_or(bytes, str::as_bytes);
+    let nulls = super::yaml_numbers::untag_empty_nulls(bytes);
+    let bytes = nulls.as_deref().map_or(bytes, str::as_bytes);
     if !super::yaml_numbers::may_lose_numbers(bytes) {
         match read_nodes(bytes, true) {
             Ok(nodes) => return Ok(nodes.into_iter().map(node_to_value).collect()),

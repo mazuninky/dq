@@ -1162,6 +1162,10 @@ pub(crate) struct ContainerLayout {
     /// collection or one in a block parent, past its closing bracket in a
     /// flow parent.
     pub(crate) end: usize,
+    /// `true` for a single-pair mapping written in a flow sequence without
+    /// braces (`[a: 1]`, `[? a]`): its bytes are its entry in
+    /// [`EditLayout::flow_entries`], and it has no brackets to keep.
+    pub(crate) implicit_pair: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1569,6 +1573,25 @@ impl<'src> State<'src> {
                         let is_empty_node = style == ScalarStyle::Plain && value.is_empty();
                         self.legacy_scalar_span(span, style, is_empty_node, n_properties, ordinal)
                     };
+                    // An empty item of a flow sequence has properties
+                    // (`[!!str , 1]`); saphyr spans it at the token after
+                    // it. A value set there replaces them.
+                    let flow_item = matches!(
+                        self.stack.last(),
+                        Some(Frame::Sequence {
+                            style: ContextStyle::Flow,
+                            ..
+                        })
+                    ) && style == ScalarStyle::Plain
+                        && value.is_empty()
+                        && n_properties > 0;
+                    if flow_item && let Some(start) = flow_entry_start {
+                        let end = empty_node_end(self.bytes, start, value_range.start.max(start));
+                        value_range = end..end;
+                        if let Some(layout) = self.layout.as_mut() {
+                            layout.empty_values.insert(pointer.clone(), start..end);
+                        }
+                    }
                     if let Some(key) = flow_key {
                         // saphyr spans an empty flow value at the token
                         // after it (`}`); it is empty where a value goes.
@@ -1705,12 +1728,15 @@ impl<'src> State<'src> {
     /// included — or, in a sequence, the item's node at `item_start`. Call
     /// it before [`State::entry_anchor`], which takes the pending key.
     fn flow_entry_start(&self, item_start: usize) -> Option<usize> {
+        let in_flow = self.flow_depth > 0;
         match self.stack.last()? {
+            // A mapping in a flow collection is a flow mapping, braces or
+            // not (`[a: 1]`).
             Frame::Mapping {
-                style: ContextStyle::Flow,
+                style,
                 pending_key_range,
                 ..
-            } => {
+            } if *style == ContextStyle::Flow || in_flow => {
                 let key = pending_key_range.as_ref()?;
                 let mut before = key.start;
                 while before > 0 && matches!(self.bytes[before - 1], b' ' | b'\t' | b'\n' | b'\r') {
@@ -2021,6 +2047,9 @@ impl<'src> State<'src> {
         };
         let style = frame.style();
         let in_flow_parent = self.flow_depth > usize::from(style == ContextStyle::Flow);
+        let implicit_pair = style == ContextStyle::Block
+            && self.flow_depth > 0
+            && matches!(frame, Frame::Mapping { .. });
         let (entry, props_end, content_end, first_entry, start_byte, flow_entry_start) = match frame
         {
             Frame::Mapping {
@@ -2055,13 +2084,31 @@ impl<'src> State<'src> {
             let container = parent.container_mut();
             container.content_end = container.content_end.max(end);
         }
-        if self.layout.is_some() {
+        // A mapping in a flow collection without braces (`[a: 1]`): its
+        // event ends at the token after it, its entry with its value's.
+        if let Some(layout) = self.layout.as_ref() {
             let pointer = if self.path.is_empty() {
                 String::new()
             } else {
                 format!("/{}", self.path.join("/"))
             };
-            self.note_flow_entry(&pointer, flow_entry_start, end_byte);
+            let entry_end = if implicit_pair {
+                let prefix = format!("{pointer}/");
+                layout
+                    .flow_entries
+                    .iter()
+                    .filter(|(child, _)| {
+                        child
+                            .strip_prefix(&prefix)
+                            .is_some_and(|tail| !tail.contains('/'))
+                    })
+                    .map(|(_, range)| range.end)
+                    .max()
+                    .unwrap_or(end_byte)
+            } else {
+                end_byte
+            };
+            self.note_flow_entry(&pointer, flow_entry_start, entry_end);
         }
         if let Some(layout) = self.layout.as_mut().map(|layout| &mut layout.containers) {
             let top_level = self.stack.len() == 1;
@@ -2089,6 +2136,7 @@ impl<'src> State<'src> {
                     flow_value: (style == ContextStyle::Flow && in_flow_parent)
                         .then_some(start_byte..end_byte),
                     brackets: (style == ContextStyle::Flow).then_some(start_byte..end_byte),
+                    implicit_pair,
                 },
             );
         }
@@ -2801,7 +2849,11 @@ fn render_double_quoted_if(s: &str, quote: bool) -> Vec<u8> {
 /// Whether `s` written plain inside a flow collection would not read
 /// back as the string `s`.
 fn needs_quoting_in_flow(s: &str) -> bool {
-    needs_quoting_for_plain(s) || needs_flow_quoting(s) || s.contains(['[', '{'])
+    // A `:` that ends it would be read as the value indicator.
+    needs_quoting_for_plain(s)
+        || needs_flow_quoting(s)
+        || s.contains(['[', '{'])
+        || s.ends_with(':')
 }
 
 /// `value` as an entry of a flow collection: a scalar plain where it
@@ -2814,9 +2866,9 @@ fn render_flow_item(value: &Value) -> Vec<u8> {
     }
 }
 
-/// A collection in flow style, JSON-shaped with spaces after the
-/// separators — `{"x": [1, {"y": null}]}` — which YAML reads as the same
-/// tree. Floats JSON cannot spell (`.nan`, `.inf`) use YAML's form.
+/// A collection in YAML flow style with spaces after the separators —
+/// `{x: [1, {y: null}]}` — each key and string plain where it reads back
+/// as itself, else double-quoted (`{"y": "1", "a, b": "on"}`).
 fn render_flow(value: &Value) -> Vec<u8> {
     let mut out = Vec::new();
     push_flow(&mut out, value);
@@ -2841,13 +2893,15 @@ fn push_flow(out: &mut Vec<u8>, value: &Value) {
                 if i > 0 {
                     out.extend_from_slice(b", ");
                 }
-                out.extend_from_slice(&render_double_quoted(key));
+                out.extend_from_slice(&render_double_quoted_if(key, needs_quoting_in_flow(key)));
                 out.extend_from_slice(b": ");
                 push_flow(out, item);
             }
             out.push(b'}');
         }
-        Value::String(s) => out.extend_from_slice(&render_double_quoted(s)),
+        Value::String(s) => {
+            out.extend_from_slice(&render_double_quoted_if(s, needs_quoting_in_flow(s)));
+        }
         scalar => out.extend_from_slice(&render_scalar_inline(scalar)),
     }
 }

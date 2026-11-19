@@ -483,7 +483,7 @@ fn set_over_a_block_collection_replaces_it_after_its_key() {
         (
             "a:\n  x: 1 # one\n  y: [1, 2]\nb: 2\n",
             &["/a", "{\"q\": 1}"],
-            "a: {\"q\": 1}\nb: 2\n",
+            "a: {q: 1}\nb: 2\n",
             serde_json::json!({"a": {"q": 1}, "b": 2}),
         ),
         (
@@ -859,7 +859,7 @@ fn set_over_a_block_collection_takes_the_comment_lines_inside_it() {
             "a:\n  # note\n  b: 1\n  c: 2\nd: 3\n",
             "set",
             &["/a", "{\"z\":3}"],
-            "a: {\"z\": 3}\nd: 3\n",
+            "a: {z: 3}\nd: 3\n",
             serde_json::json!({"a": {"z": 3}, "d": 3}),
         ),
         // After its last entry, as deep as its entries: inside it.
@@ -1411,4 +1411,22 @@ fn a_tag_on_the_document_start_line() {
             serde_json::json!([{"a": 1}, 5]),
         ),
     ]);
+}
+
+#[test]
+fn set_in_an_empty_file_writes_the_first_key() {
+    for (src, args, want) in [
+        ("", &["/a", "1"][..], "a: 1\n"),
+        ("", &["", "{\"a\": 1}"][..], "a: 1\n"),
+        (
+            "# only a comment\n",
+            &["/a", "1"][..],
+            "# only a comment\na: 1\n",
+        ),
+        ("---\n", &["/a", "1"][..], "---\na: 1\n"),
+    ] {
+        let out = in_place(src, "set", args);
+        assert_eq!(out, want, "set {args:?} on {src:?}");
+        assert_eq!(read_back(&out), serde_json::json!({"a": 1}));
+    }
 }

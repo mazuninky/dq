@@ -1,7 +1,9 @@
 //! Sanity tests for edits dq used to refuse: implicit-null entries of YAML
 //! flow mappings, a byte order mark, lone-`\r` line breaks, a `%TAG`
 //! rebinding of `!!`, flow-mapping deletes next to collection keys, a
-//! document of a stream as a whole, and the root of a file.
+//! document of a stream as a whole, the root of a file, an empty file or
+//! document, an empty `!!null`, and mappings of flow sequences written
+//! without braces.
 
 use dq_core::{Document, Error, Pointer, Value, by_name, parse_yaml_stream_with_spans};
 use pretty_assertions::assert_eq;
@@ -216,5 +218,127 @@ fn del_of_the_root_says_why_it_cannot() {
     assert!(
         err.to_string().starts_with("cannot delete the root ''"),
         "{err}"
+    );
+}
+
+#[test]
+fn a_key_of_an_empty_document_makes_it_a_mapping() {
+    assert_eq!(set("yaml", "", "/a", "1"), "a: 1\n");
+    assert_eq!(set("yaml", "", "/a/b", "1"), "a:\n  b: 1\n");
+    assert_eq!(set("yaml", "", "", r#"{"b": 2}"#), "b: 2\n");
+    assert_eq!(set("yaml", "# c\n", "/a", "1"), "# c\na: 1\n");
+    assert_eq!(set("yaml", "---\n", "/a", "1"), "---\na: 1\n");
+    assert_eq!(set("yaml", "--- # c\n", "/a", "1"), "--- # c\na: 1\n");
+    assert_eq!(set("yaml", "\u{feff}", "/a", "1"), "\u{feff}a: 1\n");
+    assert_eq!(
+        set("yaml", "a: 1\n--- # x\n# y\n---\nb: 2\n", "/1/a", "1"),
+        "a: 1\n--- # x\na: 1\n# y\n---\nb: 2\n"
+    );
+    assert_eq!(set("toml", "", "/a", "1"), "a = 1\n");
+    // `~` is a node: no key goes below it.
+    let mut null = doc("yaml", "~\n");
+    assert!(matches!(
+        null.set_at(&ptr("/a"), Value::Int(1)),
+        Err(Error::Path { .. })
+    ));
+    // JSON has no empty document.
+    assert!(dq_core::parse_json_with_spans(b"").is_err());
+}
+
+#[test]
+fn an_empty_document_is_write_aware() {
+    let empty = doc("yaml", "");
+    assert!(empty.is_write_aware());
+    assert!(!Document::value_only(Value::Null, dq_core::FormatTag::Yaml).is_write_aware());
+    let mut empty = doc("yaml", "");
+    assert!(matches!(empty.del_at(&ptr("/a")), Err(Error::Path { .. })));
+}
+
+#[test]
+fn an_empty_null_node_reads_as_null_and_edits() {
+    let read = |src: &str| doc("yaml", src).value().clone();
+    assert_eq!(read("{n: !!null }\n"), json(r#"{"n": null}"#));
+    assert_eq!(read("n: !!null\nb: 2\n"), json(r#"{"n": null, "b": 2}"#));
+    assert_eq!(read("n: !!null ''\n"), json(r#"{"n": null}"#));
+    assert_eq!(read("[!!null , 1]\n"), json("[null, 1]"));
+    assert_eq!(set("yaml", "{n: !!null }\n", "/n", "1"), "{n: 1 }\n");
+    assert_eq!(del("yaml", "{n: !!null, b: 2}\n", "/n"), "{b: 2}\n");
+    // `!!null,` is one tag to a YAML 1.1 reader: a blank goes between.
+    assert_eq!(
+        set("yaml", "{n: !!null }\n", "/new", "1"),
+        "{n: !!null , new: 1 }\n"
+    );
+}
+
+#[test]
+fn an_empty_tagged_item_of_a_flow_sequence_takes_a_value_and_goes() {
+    assert_eq!(set("yaml", "[!!str , 1]\n", "/0", "2"), "[2 , 1]\n");
+    assert_eq!(del("yaml", "[!!str , 1]\n", "/0"), "[1]\n");
+    assert_eq!(set("yaml", "[1, !!null ]\n", "/1", "2"), "[1, 2 ]\n");
+    assert_eq!(del("yaml", "{n: [!!str ]}\n", "/n/0"), "{n: []}\n");
+    // A tag right before `]` or `}` would not read back.
+    assert_eq!(del("yaml", "[!!str , 1]\n", "/1"), "[!!str ]\n");
+    assert_eq!(del("yaml", "{n: !!str , b: 1}\n", "/b"), "{n: !!str }\n");
+}
+
+#[test]
+fn a_mapping_of_a_flow_sequence_without_braces_is_left_empty() {
+    assert_eq!(del("yaml", "z: [? a]\n", "/z/0/a"), "z: [{}]\n");
+    assert_eq!(del("yaml", "z: [? a]\n", "/z/0"), "z: []\n");
+    assert_eq!(del("yaml", "[x, a: 1, y]\n", "/1/a"), "[x, {}, y]\n");
+    assert_eq!(del("yaml", "[x, a: 1, y]\n", "/1"), "[x, y]\n");
+    assert_eq!(del("yaml", "[? a : 1, b]\n", "/0/a"), "[{}, b]\n");
+    assert_eq!(del("yaml", "{z: [a: [1, 2]]}\n", "/z/0/a"), "{z: [{}]}\n");
+}
+
+#[test]
+fn the_only_flow_entry_goes_and_its_comments_stay() {
+    assert_eq!(del("yaml", "[1 # c\n]\n", "/0"), "[ # c\n]\n");
+    assert_eq!(del("yaml", "{a: 1 # c\n}\n", "/a"), "{ # c\n}\n");
+    assert_eq!(del("yaml", "[ # c\n 1]\n", "/0"), "[ # c\n ]\n");
+    assert_eq!(del("yaml", "[1, # c\n]\n", "/0"), "[ # c\n]\n");
+    assert_eq!(del("yaml", "[ 1 ]\n", "/0"), "[]\n");
+}
+
+#[test]
+fn a_flow_mapping_with_collection_keys_takes_new_keys_and_values() {
+    let src = "{x: 1, ['{', b]: 2}\n";
+    assert_eq!(
+        set("yaml", src, "/y", "5"),
+        "{x: 1, ['{', b]: 2, \"y\": 5}\n"
+    );
+    assert_eq!(set("yaml", src, "/['{', b]", "5"), "{x: 1, ['{', b]: 5}\n");
+    assert_eq!(del("yaml", src, "/['{', b]"), "{x: 1}\n");
+    assert_eq!(del("yaml", src, "/x"), "{['{', b]: 2}\n");
+    let src = "{b: 2, {x: ']'}: 1}\n";
+    assert_eq!(set("yaml", src, "/c", "3"), "{b: 2, {x: ']'}: 1, c: 3}\n");
+    assert_eq!(set("yaml", src, "/b", "5"), "{b: 5, {x: ']'}: 1}\n");
+    assert_eq!(del("yaml", src, "/b"), "{{x: ']'}: 1}\n");
+    assert_eq!(
+        set("yaml", "x: {b: 2, {'[': ']'}: 1}\n", "/x/c", "3"),
+        "x: {b: 2, {'[': ']'}: 1, c: 3}\n"
+    );
+}
+
+#[test]
+fn a_collection_is_written_in_yaml_flow_style() {
+    assert_eq!(set("yaml", "{}\n", "", r#"{"b": 2}"#), "{b: 2}\n");
+    assert_eq!(
+        set(
+            "yaml",
+            "a: 1\n",
+            "/a",
+            r#"{"b": [1, "x y", "1", "on", "a: b", "a:", "", null, {"c d": true}]}"#
+        ),
+        "a: {b: [1, x y, \"1\", \"on\", \"a: b\", \"a:\", \"\", null, {c d: true}]}\n"
+    );
+    assert_eq!(
+        set(
+            "yaml",
+            "{a: 1}\n",
+            "/b",
+            r##"{"x": ["#c", "a #b", "- x"]}"##
+        ),
+        "{a: 1, b: {x: [\"#c\", \"a #b\", \"- x\"]}}\n"
     );
 }

@@ -37,7 +37,7 @@ impl Document {
         let unavailable = |reason: &str| Error::WriteUnavailable {
             reason: reason.to_owned(),
         };
-        if self.format != FormatTag::Yaml || self.original_bytes.is_empty() {
+        if self.format != FormatTag::Yaml || !self.write_aware {
             return Err(unavailable("not a write-aware YAML stream"));
         }
         let expected = self
@@ -62,7 +62,7 @@ impl Document {
     /// As [`Document::reemit_stream_document`], for a file that is not one
     /// write-aware YAML document.
     pub(crate) fn reemit_yaml_root(&mut self, value: Value) -> Result<()> {
-        if self.format != FormatTag::Yaml || self.original_bytes.is_empty() || self.multi_doc {
+        if self.format != FormatTag::Yaml || !self.write_aware || self.multi_doc {
             return Err(Error::WriteUnavailable {
                 reason: "not a write-aware YAML document".to_owned(),
             });
@@ -152,7 +152,7 @@ impl Document {
         let unavailable = |reason: &str| Error::WriteUnavailable {
             reason: reason.to_owned(),
         };
-        if self.format != FormatTag::Yaml || self.original_bytes.is_empty() {
+        if self.format != FormatTag::Yaml || !self.write_aware {
             return Err(unavailable("not a write-aware YAML stream"));
         }
         let mut expected = self
@@ -291,7 +291,8 @@ fn end_of_file_extent(bytes: &[u8]) -> DocumentExtent {
     DocumentExtent {
         line_start: end,
         body: end..end,
-        needs_line_break: !bytes.is_empty() && !bytes.ends_with(b"\n"),
+        // A byte order mark alone is no line to end.
+        needs_line_break: bytes.len() > super::bom_end(bytes) && !bytes.ends_with(b"\n"),
         content_end: end,
         after_properties: None,
     }

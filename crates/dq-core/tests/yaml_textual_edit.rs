@@ -350,7 +350,7 @@ fn set_of_a_collection_over_a_scalar_writes_it_in_flow_style() {
     let nested = Value::from_serde_json(&serde_json::json!({"nested": 1, "l": ["x"]}));
     assert_eq!(
         set("a: 3\nb: 4\n", "/a", nested.clone()),
-        "a: {\"nested\": 1, \"l\": [\"x\"]}\nb: 4\n"
+        "a: {nested: 1, l: [x]}\nb: 4\n"
     );
     let mut doc = doc("a: 3\nb: 4\n");
     doc.set_at(&ptr("/a"), nested.clone()).expect("set_at /a");
@@ -362,11 +362,11 @@ fn set_of_a_new_key_writes_nested_collections_in_flow_style() {
     let json = |v| Value::from_serde_json(&v);
     assert_eq!(
         set("a: 1\n", "/b", json(serde_json::json!([{"x": 1}]))),
-        "a: 1\nb:\n  - {\"x\": 1}\n"
+        "a: 1\nb:\n  - {x: 1}\n"
     );
     assert_eq!(
         set("a: 1\n", "/b", json(serde_json::json!({"c": {"d": 1}}))),
-        "a: 1\nb:\n  c: {\"d\": 1}\n"
+        "a: 1\nb:\n  c: {d: 1}\n"
     );
     assert_eq!(
         set(
@@ -374,7 +374,7 @@ fn set_of_a_new_key_writes_nested_collections_in_flow_style() {
             "/l/0/resources",
             json(serde_json::json!({"limits": {"cpu": "1"}}))
         ),
-        "l:\n  - containerPort: 80\n    resources:\n      limits: {\"cpu\": \"1\"}\n"
+        "l:\n  - containerPort: 80\n    resources:\n      limits: {cpu: \"1\"}\n"
     );
 }
 
@@ -387,7 +387,7 @@ fn set_of_a_new_key_in_a_flow_mapping_stays_on_its_line() {
     );
     assert_eq!(
         set("a: {}\n", "/a/z", json(serde_json::json!({"q": [1]}))),
-        "a: {z: {\"q\": [1]}}\n"
+        "a: {z: {q: [1]}}\n"
     );
     assert_eq!(
         set("a: {x: 1}\n", "/a/z", Value::String("a, b".into())),

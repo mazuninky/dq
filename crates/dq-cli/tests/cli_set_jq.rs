@@ -352,3 +352,22 @@ fn set_jq_drops_yaml_comments_on_re_emit_documented_behaviour() {
         "the new value must land on disk, got:\n{on_disk}",
     );
 }
+
+#[test]
+fn set_jq_to_a_toml_root_that_is_no_table_says_why_and_exits_one() {
+    let mut tmp = NamedTempFile::with_suffix(".toml").expect("tempfile");
+    tmp.write_all(b"a = 1\n").expect("write tempfile");
+    let tmp = tmp.into_temp_path();
+    let path = tmp.to_str().unwrap();
+    let cli = Cli::try_parse_from(["dq", "-i", "set", path, "--jq", "5", "--no-color"]).unwrap();
+    let mut out: Vec<u8> = Vec::new();
+    let mut err: Vec<u8> = Vec::new();
+    let e = dq::run(&cli, false, &mut out, &mut err).expect_err("an integer is no TOML root");
+    assert!(
+        e.to_string()
+            .contains("a TOML document is a table, so its root is one, not an integer"),
+        "{e}"
+    );
+    assert_eq!(exit_code::exit_code_for_error(&e), exit_code::GENERIC);
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "a = 1\n");
+}

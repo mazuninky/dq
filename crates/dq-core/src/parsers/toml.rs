@@ -144,6 +144,12 @@ impl Format for Toml {
         // does not carry formatting metadata, but the input doesn't
         // either, so there's nothing to preserve.
         let v = doc.value();
+        if let Some(message) = crate::document::toml_root_refusal(v) {
+            return Err(Error::Format {
+                format: "toml",
+                message,
+            });
+        }
         let toml_value = value_to_toml(v)?;
         let s = toml::to_string_pretty(&toml_value).map_err(|e| Error::Format {
             format: "toml",
@@ -183,6 +189,12 @@ impl Format for Toml {
         // and the round-trip through `toml::to_string_pretty` produces a
         // canonical TOML document with no comments preserved (which is the
         // expected tradeoff: `--sort-keys` is a re-emit knob, not a splice).
+        if let Some(message) = crate::document::toml_root_refusal(doc.value()) {
+            return Err(Error::Format {
+                format: "toml",
+                message,
+            });
+        }
         let canon = canonicalize_keys(doc.value());
         let toml_value = value_to_toml(&canon)?;
         let s = toml::to_string_pretty(&toml_value).map_err(|e| Error::Format {
@@ -1275,6 +1287,29 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         Toml.write(&doc, &mut buf).expect("write");
         assert_eq!(buf, bytes);
+    }
+
+    #[test]
+    fn write_refuses_a_root_that_is_no_table() {
+        for (value, kind) in [
+            (Value::Int(5), "an integer"),
+            (Value::Null, "null"),
+            (Value::Array(vec![Value::Int(1)]), "an array"),
+        ] {
+            let doc = Document::single(value);
+            let mut buf: Vec<u8> = Vec::new();
+            let err = Toml.write(&doc, &mut buf).expect_err("no table");
+            assert!(
+                matches!(&err, Error::Format { message, .. }
+                    if message == &format!("a TOML document is a table, so its root is one, not {kind}")),
+                "{err}"
+            );
+            let sorted = WriteOptions {
+                sort_keys: true,
+                ..WriteOptions::default()
+            };
+            assert!(Toml.write_with_options(&doc, &mut buf, &sorted).is_err());
+        }
     }
 
     #[test]

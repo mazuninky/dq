@@ -160,7 +160,7 @@ fn set_over_a_yaml_flow_collection_replaces_its_brackets() {
             "/a/x",
             json(serde_json::json!({"q": 1}))
         ),
-        "a: {x: {\"q\": 1}}\n"
+        "a: {x: {q: 1}}\n"
     );
 }
 

@@ -189,6 +189,57 @@ pub(super) fn untag_foreign(bytes: &[u8]) -> Option<String> {
     stand_in_tags(text, &starts)
 }
 
+/// `bytes` with every empty `!!null` node — no content (`{n: !!null }`,
+/// `- !!null`) or an empty quoted scalar (`!!null ""`), both null to YAML's
+/// core schema — read as the null it is: its tag made a local tag of the
+/// same length (`!xxxxx`), which serde_norway reads as untagged, and an
+/// empty quoted scalar made a `~` and a blank. serde_norway refuses an
+/// empty `!!null` ("expected null"). Every node keeps its position.
+///
+/// `None` when there is none, or when `bytes` is no UTF-8 or saphyr-parser
+/// fails on it.
+pub(super) fn untag_empty_nulls(bytes: &[u8]) -> Option<String> {
+    if !bytes.windows(4).any(|w| w == b"null") || !bytes.contains(&b'!') {
+        return None;
+    }
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut starts = Vec::new();
+    let mut quoted = Vec::new();
+    let mut events = YamlParser::new_from_str(text);
+    while let Some(item) = events.next_event() {
+        let (event, span) = item.ok()?;
+        if let Event::Scalar(literal, style, _, Some(tag)) = &event
+            && literal.is_empty()
+            && core_suffix(tag) == Some("null")
+        {
+            starts.push(span.start.index());
+            quoted.push(matches!(
+                style,
+                ScalarStyle::SingleQuoted | ScalarStyle::DoubleQuoted
+            ));
+        }
+    }
+    let untagged = stand_in_tags(text, &starts)?;
+    if !quoted.contains(&true) {
+        return Some(untagged);
+    }
+    let mut out = untagged.into_bytes();
+    for (at, _) in byte_offsets(text, &starts)
+        .into_iter()
+        .zip(quoted)
+        .filter(|(_, quoted)| *quoted)
+    {
+        let tag = tag_range(&out, at)?;
+        let quote = (tag.end..out.len()).find(|&i| !out[i].is_ascii_whitespace())?;
+        if !matches!(&out[quote..], [b'"', b'"', ..] | [b'\'', b'\'', ..]) {
+            return None;
+        }
+        out[quote] = b'~';
+        out[quote + 1] = b' ';
+    }
+    String::from_utf8(out).ok()
+}
+
 /// Whether `tag` is a global tag outside the core schema, which
 /// serde_norway types as a string.
 fn foreign(tag: &Tag) -> bool {
@@ -204,7 +255,18 @@ fn stand_in_tags(text: &str, starts: &[usize]) -> Option<String> {
     if starts.is_empty() {
         return None;
     }
-    // Char indices to byte offsets, in one pass: the events come in order.
+    let mut out = text.as_bytes().to_vec();
+    for at in byte_offsets(text, starts) {
+        let tag = tag_range(&out, at)?;
+        out[tag.start] = b'!';
+        out[tag.start + 1..tag.end].fill(b'x');
+    }
+    String::from_utf8(out).ok()
+}
+
+/// The byte offsets in `text` of the char indices `starts`, in order (the
+/// events come in order, so one pass does).
+fn byte_offsets(text: &str, starts: &[usize]) -> Vec<usize> {
     let mut offsets = Vec::with_capacity(starts.len());
     let mut wanted = starts.iter().peekable();
     for (char_at, (byte_at, _)) in text.char_indices().enumerate() {
@@ -212,13 +274,7 @@ fn stand_in_tags(text: &str, starts: &[usize]) -> Option<String> {
             offsets.push(byte_at);
         }
     }
-    let mut out = text.as_bytes().to_vec();
-    for at in offsets {
-        let tag = tag_range(&out, at)?;
-        out[tag.start] = b'!';
-        out[tag.start + 1..tag.end].fill(b'x');
-    }
-    String::from_utf8(out).ok()
+    offsets
 }
 
 /// The bytes of the tag among the node properties (`&anchor`, `!tag`) that
@@ -263,15 +319,20 @@ enum Typing {
 
 /// The typing a core-schema tag gives, `None` for a local tag or another one.
 fn core_typing(tag: &Tag) -> Option<Typing> {
-    const CORE: &str = "tag:yaml.org,2002:";
-    let suffix = match tag.handle.as_str() {
-        CORE => tag.suffix.as_str(),
-        "" => tag.suffix.strip_prefix(CORE)?,
-        _ => return None,
-    };
-    match suffix {
+    match core_suffix(tag)? {
         "float" => Some(Typing::Float),
         "int" => Some(Typing::Int),
+        _ => None,
+    }
+}
+
+/// The name of a YAML core-schema tag (`null` for `!!null` or
+/// `!<tag:yaml.org,2002:null>`), `None` for any other tag.
+fn core_suffix(tag: &Tag) -> Option<&str> {
+    const CORE: &str = "tag:yaml.org,2002:";
+    match tag.handle.as_str() {
+        CORE => Some(tag.suffix.as_str()),
+        "" => tag.suffix.strip_prefix(CORE),
         _ => None,
     }
 }
@@ -826,6 +887,22 @@ mod tests {
         ] {
             assert!(!may_lose_numbers(no.as_bytes()), "{no}");
         }
+    }
+
+    #[test]
+    fn untag_empty_nulls_reads_an_empty_null_node_as_null() {
+        assert_eq!(read("{n: !!null }\n"), map(&[("n", Value::Null)]));
+        assert_eq!(read("n: !!null ''\n"), map(&[("n", Value::Null)]));
+        assert_eq!(
+            read("- !!null\n- 1\n"),
+            Value::Array(vec![Value::Null, Value::Int(1)])
+        );
+        assert_eq!(untag_empty_nulls(b"n: !!null x\n"), None);
+        assert_eq!(untag_empty_nulls(b"n: null\n"), None);
+        // Content is no null: the reader's own error stays.
+        assert!(crate::parsers::Yaml.parse(b"n: !!null x\n").is_err());
+        // A tag right before `}`: no reader of dq (nor libyaml) scans it.
+        assert!(crate::parsers::Yaml.parse(b"{n: !!str}\n").is_err());
     }
 
     #[test]
