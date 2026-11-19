@@ -16,7 +16,10 @@
 use std::io::Write;
 
 use camino::Utf8PathBuf;
-use hcl::{Block, BlockLabel, Body, Expression, Number, Structure, Value as HclValue};
+use hcl::edit::structure::{
+    Block as EditBlock, BlockLabel as EditLabel, Body as EditBody, Structure as EditStructure,
+};
+use hcl::{Expression, Number, Value as HclValue};
 use indexmap::IndexMap;
 
 use crate::Result;
@@ -46,12 +49,12 @@ impl Format for Hcl {
             snippet: String::new(),
             message: format!("invalid UTF-8 in HCL input: {e}"),
         })?;
-        let body: Body = text
+        // One parse, with `hcl-edit`, which keeps every number literal;
+        // `hcl::parse` is the same parse turned into `hcl-rs` types.
+        let body: EditBody = text
             .parse()
-            .map_err(|e: hcl::Error| map_hcl_parse_error(e))?;
-        check_body_keys(&body)?;
-        let mut value = body_to_value(&body);
-        restore_exact_numbers(text, &mut value);
+            .map_err(|e: hcl::edit::parser::Error| map_hcl_parse_error(e.into()))?;
+        let value = body_to_value(&body)?;
         Ok(Document::value_only(value, FormatTag::Hcl))
     }
 
@@ -72,31 +75,43 @@ impl Format for Hcl {
     }
 }
 
-/// Convert an `hcl::Body` (top-level or nested block body) into our `Value`.
+/// Convert a body (top-level or nested block body), as `hcl-edit` reads it,
+/// into our `Value`.
 ///
-/// Each [`Attribute`] in the body becomes a `key → value` entry in the result
-/// map. Each [`Block`] is grouped under its identifier; if the block has
-/// labels, one level of nesting is added per label (per the
-/// `HCL backend block parses to nested map` spec scenario).
+/// Each attribute in the body becomes a `key → value` entry in the result
+/// map: its expression is turned into `hcl-rs` types as `hcl::parse` would
+/// (`From<hcl_edit::expr::Expression>`), then into a `Value`, and every
+/// number literal that `hcl-rs` misreads is put back
+/// ([`restore_in_expression`]). Each block is grouped under its identifier;
+/// if the block has labels, one level of nesting is added per label (per
+/// the `HCL backend block parses to nested map` spec scenario).
 ///
 /// Multiple blocks sharing the same identifier+label path get their bodies
 /// merged into the same map (e.g. two `provider "aws" {}` blocks become a
-/// single `{ "provider": { "aws": { ... } } }`); a future milestone may
-/// surface duplicates explicitly. For M5 this matches the typical
-/// Terraform-style usage where labels are unique per identifier.
-fn body_to_value(body: &Body) -> Value {
+/// single `{ "provider": { "aws": { ... } } }`), the last attribute winning
+/// with the number its own literal holds; a future milestone may surface
+/// duplicates explicitly. For M5 this matches the typical Terraform-style
+/// usage where labels are unique per identifier.
+///
+/// # Errors
+///
+/// [`Error::Parse`] from [`check_expression_keys`].
+fn body_to_value(body: &EditBody) -> Result<Value> {
     let mut out: IndexMap<String, Value> = IndexMap::new();
     for structure in body.iter() {
         match structure {
-            Structure::Attribute(attr) => {
+            EditStructure::Attribute(attr) => {
                 let key = attr.key.as_str().to_owned();
-                let val = expression_to_value(&attr.expr);
+                let expr = Expression::from(attr.value.clone());
+                check_expression_keys(&expr)?;
+                let mut val = hcl_value_to_value(HclValue::from(expr));
+                restore_in_expression(&attr.value, &mut val);
                 out.insert(key, val);
             }
-            Structure::Block(block) => insert_block(&mut out, block),
+            EditStructure::Block(block) => insert_block(&mut out, block)?,
         }
     }
-    Value::Map(out)
+    Ok(Value::Map(out))
 }
 
 /// Fail on an object whose keys repeat once they are the strings a
@@ -107,13 +122,6 @@ fn body_to_value(body: &Body) -> Value {
 /// # Errors
 ///
 /// [`Error::Parse`] naming the repeated key; `hcl-rs` gives no position.
-fn check_body_keys(body: &Body) -> Result<()> {
-    body.iter().try_for_each(|structure| match structure {
-        Structure::Attribute(attr) => check_expression_keys(&attr.expr),
-        Structure::Block(block) => check_body_keys(&block.body),
-    })
-}
-
 fn check_expression_keys(expr: &Expression) -> Result<()> {
     match expr {
         Expression::Array(items) => items.iter().try_for_each(check_expression_keys),
@@ -147,21 +155,21 @@ fn check_expression_keys(expr: &Expression) -> Result<()> {
 /// `block_type "a" "b" {}` becomes `parent[block_type] → Map[a] → Map[b] →
 /// body_value`. Existing maps at any depth are reused so multi-block sources
 /// merge cleanly.
-fn insert_block(parent: &mut IndexMap<String, Value>, block: &Block) {
-    let body_value = body_to_value(&block.body);
-    let identifier = block.identifier.as_str().to_owned();
+fn insert_block(parent: &mut IndexMap<String, Value>, block: &EditBlock) -> Result<()> {
+    let body_value = body_to_value(&block.body)?;
+    let identifier = block.ident.as_str().to_owned();
     if block.labels.is_empty() {
         // Bare block (no labels): merge into existing entry if present, else
         // insert directly.
         merge_into(parent, identifier, body_value);
-        return;
+        return Ok(());
     }
     let labels: Vec<String> = block
         .labels
         .iter()
         .map(|l| match l {
-            BlockLabel::Identifier(id) => id.as_str().to_owned(),
-            BlockLabel::String(s) => s.clone(),
+            EditLabel::Ident(id) => id.as_str().to_owned(),
+            EditLabel::String(s) => s.as_str().to_owned(),
         })
         .collect();
     // Walk into `parent[identifier]`, creating intermediate maps as needed.
@@ -186,13 +194,14 @@ fn insert_block(parent: &mut IndexMap<String, Value>, block: &Block) {
         };
         if is_last {
             merge_into(map, label.clone(), body_value);
-            return;
+            return Ok(());
         }
         let next = map
             .entry(label.clone())
             .or_insert_with(|| Value::Map(IndexMap::new()));
         cursor = next;
     }
+    Ok(())
 }
 
 /// Merge `incoming` into `parent[key]`. If `parent[key]` already holds a Map
@@ -220,17 +229,6 @@ fn merge_into(parent: &mut IndexMap<String, Value>, key: String, incoming: Value
     parent.insert(key, incoming);
 }
 
-/// Convert an HCL expression into our `Value`.
-///
-/// Uses the existing `From<Expression> for HclValue` impl from `hcl-rs` then
-/// maps `HclValue → Value`. Template-expression nodes (heredocs, `${...}`
-/// strings, etc.) are stringified through `HclValue::String` by that impl —
-/// our parser inherits that behaviour.
-fn expression_to_value(expr: &Expression) -> Value {
-    let hcl_v: HclValue = expr.clone().into();
-    hcl_value_to_value(hcl_v)
-}
-
 fn hcl_value_to_value(v: HclValue) -> Value {
     match v {
         HclValue::Null => Value::Null,
@@ -248,65 +246,13 @@ fn hcl_value_to_value(v: HclValue) -> Value {
     }
 }
 
-/// Put back the exact value of every number literal that `hcl-rs` read
-/// as the `f64` nearest it: an integer past 64 bits
-/// (`18446744073709551617`, `-9223372036854775809`) or a decimal with more
-/// digits than an `f64` holds — and the float-ness of a whole float
-/// literal (`3.0`, `1e16`), which `hcl-rs` reads as an integer. `hcl-rs`
-/// keeps no literal; `hcl-edit`, which it parses with, does, so `text` is
-/// parsed once more with it and walked alongside `value`.
-///
-/// Blocks that repeat merge into one map, the last block's attribute
-/// winning ([`merge_into`]); so the walk goes from the last structure to
-/// the first and puts back each attribute's number only the first time it
-/// meets that attribute — the literal the value was read from. An earlier
-/// literal that reads as the same `f64` (`0.10000000000000000001` before
-/// `0.1`) would otherwise put back the wrong number.
-fn restore_exact_numbers(text: &str, value: &mut Value) {
-    let (Ok(body), Value::Map(map)) = (text.parse::<hcl::edit::structure::Body>(), value) else {
-        return;
-    };
-    restore_in_body(&body, map, &mut std::collections::HashSet::new());
-}
-
-/// `restored` holds the address of each attribute value already put back.
-fn restore_in_body(
-    body: &hcl::edit::structure::Body,
-    map: &mut IndexMap<String, Value>,
-    restored: &mut std::collections::HashSet<usize>,
-) {
-    use hcl::edit::structure::{BlockLabel as EditLabel, Structure as EditStructure};
-    let structures: Vec<_> = body.iter().collect();
-    for structure in structures.into_iter().rev() {
-        match structure {
-            EditStructure::Attribute(attr) => {
-                if let Some(value) = map.get_mut(attr.key.as_str())
-                    && restored.insert(std::ptr::from_ref::<Value>(value) as usize)
-                {
-                    restore_in_expression(&attr.value, value);
-                }
-            }
-            // Where `insert_block` put the block's body.
-            EditStructure::Block(block) => {
-                let mut cursor = map.get_mut(block.ident.as_str());
-                for label in &block.labels {
-                    let label = match label {
-                        EditLabel::Ident(ident) => ident.as_str(),
-                        EditLabel::String(s) => s.as_str(),
-                    };
-                    cursor = match cursor {
-                        Some(Value::Map(inner)) => inner.get_mut(label),
-                        _ => None,
-                    };
-                }
-                if let Some(Value::Map(inner)) = cursor {
-                    restore_in_body(&block.body, inner, restored);
-                }
-            }
-        }
-    }
-}
-
+/// Put back the exact value of every number literal in `expr` that
+/// `hcl-rs` read, into `value`, as the `f64` nearest it: an integer past
+/// 64 bits (`18446744073709551617`, `-9223372036854775809`) or a decimal
+/// with more digits than an `f64` holds — and the float-ness of a whole
+/// float literal (`3.0`, `1e16`), which `hcl-rs` reads as an integer.
+/// `hcl-rs` keeps no literal; `hcl-edit`, which `value` was read with,
+/// does.
 fn restore_in_expression(expr: &hcl::edit::expr::Expression, value: &mut Value) {
     use hcl::edit::expr::Expression as EditExpression;
     match (expr, value) {
@@ -314,11 +260,24 @@ fn restore_in_expression(expr: &hcl::edit::expr::Expression, value: &mut Value) 
             let Some(repr) = number.as_repr() else {
                 return;
             };
+            // An integer literal that fits `i64` is what `hcl-rs` read.
+            if matches!(value, Value::Int(_))
+                && repr
+                    .strip_prefix('-')
+                    .unwrap_or(repr)
+                    .bytes()
+                    .all(|b| b.is_ascii_digit())
+            {
+                return;
+            }
             // `- 5` is a number too.
-            let literal: String = repr.chars().filter(|c| !c.is_whitespace()).collect();
-            // Only the number `hcl-rs` read from this very literal: an
-            // attribute and a block of one name may have put another one
-            // there. It reads a whole float (`3.0`, `-0.0`) as an integer.
+            let literal: std::borrow::Cow<'_, str> = if repr.contains(char::is_whitespace) {
+                repr.chars().filter(|c| !c.is_whitespace()).collect()
+            } else {
+                std::borrow::Cow::Borrowed(repr)
+            };
+            // Only the number `hcl-rs` read from this very literal, which
+            // reads a whole float (`3.0`, `-0.0`) as an integer.
             let Ok(parsed) = literal.parse::<f64>() else {
                 return;
             };
