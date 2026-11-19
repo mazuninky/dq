@@ -729,7 +729,7 @@ fn utf16_without_a_bom_keeps_its_byte_order_and_refuses_a_contradiction() {
             b"\"#xml\": {bom: UTF-16LE, detected: UTF-16LE}\nr:\n- {}\n",
         ),
         ("bare.yaml", b"\"#xml\": {detected: UTF-16BE}\nr:\n- {}\n"),
-        ("wrong.yaml", b"\"#xml\": {detected: UTF-8}\nr:\n- {}\n"),
+        ("wrong.yaml", b"\"#xml\": {detected: UTF-32}\nr:\n- {}\n"),
     ];
     files.extend(
         contradicted
@@ -782,7 +782,7 @@ fn utf16_without_a_bom_keeps_its_byte_order_and_refuses_a_contradiction() {
         ),
         (
             convert("wrong.yaml", "xml"),
-            refused("'#xml' field 'detected' must be UTF-16LE or UTF-16BE (got \"UTF-8\")"),
+            refused("'#xml' field 'detected' must be UTF-8, UTF-16LE or UTF-16BE (got \"UTF-32\")"),
         ),
     ];
     for (file, _, encoding, order) in &contradicted {
@@ -884,4 +884,63 @@ fn the_reader_refuses_what_the_writer_would() {
             ),
         ],
     );
+}
+
+/// A file in 8-bit bytes that declares UTF-16 — .NET's `XmlSerializer`
+/// over a `StringWriter` writes `encoding="utf-16"` into a file saved as
+/// UTF-8 — reads by its bytes and keeps `#xml.detected: UTF-8`. `-F xml`
+/// and `fmt -i` give its bytes back: UTF-8, no BOM, the label as it was.
+/// The writer takes `detected: UTF-8` only under a UTF-16 label. Before,
+/// the file was rewritten as UTF-16 with a BOM.
+#[test]
+fn utf8_under_a_utf16_label_is_written_back_as_utf8() {
+    let net = "<?xml version=\"1.0\" encoding=\"utf-16\"?><r>\u{e9}</r>";
+    let dir = dir_with(&[
+        ("net.xml", net.as_bytes()),
+        ("in_place.xml", net.as_bytes()),
+        (
+            "label.yaml",
+            b"\"#xml\": {encoding: UTF-16BE, detected: UTF-8}\nr:\n- {}\n",
+        ),
+        ("no_label.yaml", b"\"#xml\": {detected: UTF-8}\nr:\n- {}\n"),
+        (
+            "utf8.yaml",
+            b"\"#xml\": {encoding: UTF-8, detected: UTF-8}\nr:\n- {}\n",
+        ),
+    ]);
+    assert_cases(
+        &dir,
+        &[
+            (
+                convert("net.xml", "json"),
+                ok(
+                    "{\n  \"#xml\": {\n    \"version\": \"1.0\",\n    \"encoding\": \"utf-16\",\n    \
+                    \"detected\": \"UTF-8\"\n  },\n  \"r\": [\n    {\n      \"#text\": \"\u{e9}\"\n    \
+                    }\n  ]\n}\n",
+                ),
+            ),
+            (convert("net.xml", "xml"), ok(net)),
+            (vec!["fmt", "in_place.xml", "-i"], ok("")),
+            (
+                convert("label.yaml", "xml"),
+                ok("<?xml version=\"1.0\" encoding=\"UTF-16BE\"?><r/>"),
+            ),
+            (
+                convert("no_label.yaml", "xml"),
+                refused(
+                    "'#xml' field 'detected' is UTF-8, which only a UTF-16 label needs, but there \
+                     is no declared encoding",
+                ),
+            ),
+            (
+                convert("utf8.yaml", "xml"),
+                refused(
+                    "'#xml' field 'detected' is UTF-8, which only a UTF-16 label needs, but the \
+                     declared encoding is \"UTF-8\"",
+                ),
+            ),
+        ],
+    );
+    let written = std::fs::read(dir.path().join("in_place.xml")).expect("read in_place.xml");
+    assert_eq!(String::from_utf8_lossy(&written), net);
 }

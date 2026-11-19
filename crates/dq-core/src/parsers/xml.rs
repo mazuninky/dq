@@ -16,6 +16,7 @@
 //! | `<?xml version="1.0" encoding="..."?>` | `Map { "version", "encoding", "standalone" }` under top-level `"#xml"` |
 //! | Byte order mark                        | `"bom": "UTF-8"` / `"UTF-16LE"` / `"UTF-16BE"` in `"#xml"` (only `bom` there: no declaration) |
 //! | UTF-16 with no byte order mark         | `"detected": "UTF-16LE"` / `"UTF-16BE"` in `"#xml"`, unless the declaration names the byte order |
+//! | 8-bit bytes under a UTF-16 label       | `"detected": "UTF-8"` in `"#xml"`                                   |
 //! | Namespace prefix on tag (`foo:tag`)    | retained verbatim in the tag name (`"foo:tag"`)                   |
 //! | `xmlns:foo` attribute                  | retained verbatim in `@attrs`                                     |
 //!
@@ -83,9 +84,13 @@
 //! refuses a label dq does
 //! not know, a character the encoding cannot hold, and a `bom` the label
 //! contradicts. A UTF-16 file with no BOM — told by its leading `<?` — is
-//! kept as `detected` and written back in its byte order with no BOM; the
+//! kept as `detected` and written back in its byte order with no BOM. A
+//! file in 8-bit bytes that declares UTF-16 (.NET's `XmlSerializer` over a
+//! `StringWriter` writes `encoding="utf-16"` into UTF-8) reads as UTF-8 and
+//! is kept as `detected: UTF-8`, written back as UTF-8 under its label. The
 //! writer refuses `detected` together with `bom`, one the label
-//! contradicts, and one whose output would not begin with `<?`. Labels are
+//! contradicts (`UTF-8` only under a UTF-16 label), and one whose output
+//! would not begin with `<?`. Labels are
 //! encoding_rs's (the WHATWG Encoding
 //! Standard) except two, which follow IANA and the XML spec as other XML
 //! parsers do: `US-ASCII` (`ASCII`, …) is strict 7-bit — a byte from 0x80
@@ -508,7 +513,8 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
 /// A UTF-16 file with no BOM, which begins `<?` in 16-bit units, has its
 /// byte order kept the same way as the `#xml` field `detected`, unless the
 /// declaration names it (`UTF-16LE`); the writer writes UTF-16 in that
-/// order, with no BOM.
+/// order, with no BOM. A file in 8-bit bytes under a UTF-16 label is kept
+/// as `detected: UTF-8`, and written back as UTF-8.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Bom {
     Utf8,
@@ -633,16 +639,16 @@ fn decode_input(bytes: &[u8]) -> Result<(Cow<'_, str>, Option<Bom>, Option<Bom>)
     if let Some(label) = label {
         check_label(label)?;
     }
-    // A UTF-16 label over 8-bit bytes reads as UTF-8. ISO-2022-JP is not
-    // ASCII-compatible to encoding_rs, but it starts in ASCII, so its
-    // declaration reads as written.
-    let charset = label
-        .filter(|_| bom.is_none())
-        .and_then(Charset::for_label)
-        .filter(|charset| match charset {
-            Charset::Whatwg(encoding) => *encoding != UTF_16LE && *encoding != UTF_16BE,
-            Charset::Ascii | Charset::Latin1 => true,
-        })
+    // A UTF-16 label over 8-bit bytes reads as UTF-8, by the bytes, and
+    // says so in `detected`. ISO-2022-JP is not ASCII-compatible to
+    // encoding_rs, but it starts in ASCII, so its declaration reads as
+    // written.
+    let declared = label.filter(|_| bom.is_none()).and_then(Charset::for_label);
+    let detected = declared
+        .filter(|charset| charset.is_utf16())
+        .map(|_| Bom::Utf8);
+    let charset = declared
+        .filter(|charset| !charset.is_utf16())
         .unwrap_or(Charset::Whatwg(UTF_8));
     let text = match charset {
         Charset::Ascii => {
@@ -665,7 +671,7 @@ fn decode_input(bytes: &[u8]) -> Result<(Cow<'_, str>, Option<Bom>, Option<Bom>)
         Charset::Whatwg(encoding) => quick_xml::encoding::decode(body, encoding)
             .map_err(|_| invalid(format!("invalid {} in XML input", encoding.name())))?,
     };
-    Ok((text, bom, None))
+    Ok((text, bom, detected))
 }
 
 /// The character set an `encoding` label names. US-ASCII and ISO-8859-1
@@ -678,6 +684,14 @@ enum Charset {
     Ascii,
     Latin1,
     Whatwg(&'static Encoding),
+}
+
+impl Charset {
+    /// Whether this is UTF-16 in either byte order (`UTF-16`, `UTF-16LE`,
+    /// `unicode`, `ucs-2`, …).
+    fn is_utf16(self) -> bool {
+        matches!(self, Self::Whatwg(encoding) if encoding == UTF_16LE || encoding == UTF_16BE)
+    }
 }
 
 /// IANA names and aliases of US-ASCII, lower case.
@@ -1150,9 +1164,11 @@ impl Output {
     /// order `bom` names, little-endian by default; `UTF-16LE` / `UTF-16BE`
     /// fix the byte order and begin with a BOM only if `bom` says so.
     /// `detected` — a file read with no BOM — writes UTF-16 in its byte
-    /// order with no BOM, as the file was. Refused: a label dq does not know
-    /// or cannot encode to, a `bom` or `detected` that contradicts the
-    /// label, and both of them at once.
+    /// order with no BOM, as the file was; `detected: UTF-8` under a UTF-16
+    /// label writes UTF-8, as a file that declared UTF-16 in 8-bit bytes
+    /// was. Refused: a label dq does not know or cannot encode to, a `bom`
+    /// or `detected` that contradicts the label (`UTF-8` with no UTF-16
+    /// label), and both of them at once.
     fn for_declaration(decl: Option<&Declaration>) -> Result<Self> {
         let (label, bom, detected) = decl.map_or((None, None, None), |d| {
             (d.encoding.as_deref(), d.bom, d.detected)
@@ -1168,6 +1184,21 @@ impl Output {
                 "has both '{KEY_BOM}' and '{KEY_DETECTED}', but a file begins with a byte order \
                  mark or does not"
             ));
+        }
+        if detected == Some(Bom::Utf8) {
+            return match label {
+                Some(label) if Charset::for_label(label).is_some_and(Charset::is_utf16) => {
+                    Ok(Self::Utf8 { bom: false })
+                }
+                Some(label) => refuse(format!(
+                    "field '{KEY_DETECTED}' is UTF-8, which only a UTF-16 label needs, but the \
+                     declared encoding is {label:?}"
+                )),
+                None => refuse(format!(
+                    "field '{KEY_DETECTED}' is UTF-8, which only a UTF-16 label needs, but there \
+                     is no declared encoding"
+                )),
+            };
         }
         let Some(label) = label else {
             return Ok(match (bom, detected) {
@@ -1877,13 +1908,16 @@ fn check_chars(what: &str, text: &str) -> Result<()> {
 /// The fields of an `<?xml …?>` declaration, and the UTF-16 BOM to begin
 /// with. `written` is false for a `#xml` that holds only `bom` /
 /// `detected`: a file that began with a BOM, or in UTF-16 without one, and
-/// had no declaration.
+/// had no declaration. `detected` is the encoding a file with no BOM was
+/// read in when its declaration does not say it: UTF-16 in a byte order,
+/// or UTF-8 under a UTF-16 label.
 struct Declaration {
     version: String,
     encoding: Option<String>,
     standalone: Option<String>,
     bom: Option<Bom>,
-    /// The UTF-16 byte order a file with no BOM was read in.
+    /// The encoding a file with no BOM was read in, where its declaration
+    /// does not say it.
     detected: Option<Bom>,
     written: bool,
 }
@@ -1939,11 +1973,16 @@ fn declaration(entry: Option<&Value>) -> Result<Option<Declaration>> {
         if k == KEY_DETECTED {
             fields.detected = match v {
                 Value::Null => None,
+                Value::String(s) if s == "UTF-8" => Some(Bom::Utf8),
                 Value::String(s) if s == "UTF-16LE" => Some(Bom::Utf16Le),
                 Value::String(s) if s == "UTF-16BE" => Some(Bom::Utf16Be),
                 other => {
                     let got = scalar_text(other).unwrap_or_else(|| other.type_name().to_owned());
-                    return Err(decl_field_error(k, "must be UTF-16LE or UTF-16BE", &got));
+                    return Err(decl_field_error(
+                        k,
+                        "must be UTF-8, UTF-16LE or UTF-16BE",
+                        &got,
+                    ));
                 }
             };
             continue;
@@ -2380,11 +2419,18 @@ mod tests {
             );
         }
 
-        // A UTF-16 label over 8-bit bytes reads as UTF-8; ISO-2022-JP reads
-        // as itself.
-        let xml = "<?xml version=\"1.0\" encoding='UTF-16'?><r>\u{e9}</r>";
-        let (text, ..) = decode_input(xml.as_bytes()).expect("decodes");
-        assert_eq!(text, xml);
+        // A UTF-16 label over 8-bit bytes reads as UTF-8 and says so;
+        // ISO-2022-JP reads as itself.
+        for label in ["UTF-16", "utf-16le", "unicode"] {
+            let xml = format!("<?xml version=\"1.0\" encoding='{label}'?><r>\u{e9}</r>");
+            let (text, bom, detected) = decode_input(xml.as_bytes()).expect("decodes");
+            assert_eq!(
+                (text.as_ref(), bom, detected),
+                (xml.as_str(), None, Some(Bom::Utf8))
+            );
+        }
+        let xml = "<?xml version=\"1.0\" encoding='UTF-8'?><r/>";
+        assert_eq!(decode_input(xml.as_bytes()).expect("decodes").2, None);
         let jis = b"<?xml version='1.0' encoding='ISO-2022-JP'?><r>\x1b$B$\x22\x1b(B</r>";
         let (text, ..) = decode_input(jis).expect("decodes");
         assert!(text.ends_with("<r>\u{3042}</r>"), "{text}");
@@ -2459,7 +2505,17 @@ mod tests {
             assert_eq!(utf16(detected(encoding, Bom::Utf16Be)), (true, false));
             assert_eq!(utf16(detected(encoding, Bom::Utf16Le)), (false, false));
         }
+        // UTF-8 under a UTF-16 label is written as UTF-8, with no BOM.
+        for label in ["UTF-16", "utf-16be"] {
+            assert!(matches!(
+                Output::for_declaration(Some(&detected(Some(label), Bom::Utf8))),
+                Ok(Output::Utf8 { bom: false })
+            ));
+        }
         for (case, decl) in [
+            detected(Some("UTF-8"), Bom::Utf8),
+            detected(Some("ISO-8859-1"), Bom::Utf8),
+            detected(None, Bom::Utf8),
             detected(Some("UTF-8"), Bom::Utf16Le),
             detected(Some("UTF-16BE"), Bom::Utf16Le),
             Declaration {
