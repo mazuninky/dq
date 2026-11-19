@@ -706,6 +706,23 @@ fn smoke_convert_hcl_to_json_emits_valid_json() {
 }
 
 #[test]
+fn smoke_hcl_syntax_error_names_its_line_and_column() {
+    // An HCL syntax error exits 3, and its message carries the line and
+    // column the parser stopped at.
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(dir.path().join("bad.tf"), "a = 1\nb = {\n").expect("write bad.tf");
+    dq().current_dir(dir.path())
+        .args(["--no-color", "-q", "convert", "bad.tf", "-F", "json"])
+        .assert()
+        .code(3)
+        .stdout("")
+        .stderr(
+            "parse error in bad.tf:  --> HCL parse error in line 2, column 1\n  |\n2 | b = {\n  \
+             | ^---\n  |\n  = unexpected token\n",
+        );
+}
+
+#[test]
 fn smoke_fmt_frontmatter_in_place_preserves_body_bytes() {
     // M5 contract: `dq fmt hugo_post.md -i` re-emits the document; the
     // BODY portion must be byte-identical to the source even if the header

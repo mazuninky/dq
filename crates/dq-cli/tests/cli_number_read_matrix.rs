@@ -1604,6 +1604,57 @@ fn hcl_keeps_big_integers_and_whole_floats_inside_blocks() {
     );
 }
 
+/// Blocks repeated with the same type keep the last block's number, also
+/// when the earlier literal reads as the same `f64` as the later one: the
+/// later `0.1` wins over `0.10000000000000000001`, and the later long
+/// literal wins, exact, over `0.1`. Before, the first block's literal was
+/// put back over the last block's number.
+#[test]
+fn hcl_repeated_blocks_keep_the_last_blocks_number() {
+    let long = "0.10000000000000000001";
+    let blocks =
+        |first: &str, last: &str| format!("x {{\n  a = {first}\n}}\nx {{\n  a = {last}\n}}\n");
+    let dir = dir_with(&[
+        ("short_last.tf", &blocks(long, "0.1")),
+        ("long_last.tf", &blocks("0.1", long)),
+    ]);
+    assert_cases(
+        &dir,
+        &[
+            (
+                vec!["convert", "short_last.tf", "-F", "json"],
+                ok("{\n  \"x\": {\n    \"a\": 0.1\n  }\n}\n"),
+            ),
+            (
+                vec!["convert", "long_last.tf", "-F", "json"],
+                ok("{\n  \"x\": {\n    \"a\": 0.10000000000000000001\n  }\n}\n"),
+            ),
+            (vec!["type", "short_last.tf", "/x/a"], ok("float\n")),
+        ],
+    );
+}
+
+/// HCL number literals read as they are spelled: `- 5`, with a space, is
+/// the integer -5, and a parenthesised whole float, `(3.0)` or `(- 2.0)`,
+/// stays a float, as `-0.0` does.
+#[test]
+fn hcl_reads_spaced_and_parenthesised_literals_as_spelled() {
+    let dir = dir_with(&[("n.tf", "n = - 5\np = (3.0)\nq = (- 2.0)\nz = -0.0\n")]);
+    assert_cases(
+        &dir,
+        &[
+            (
+                vec!["convert", "n.tf", "-F", "json"],
+                ok("{\n  \"n\": -5,\n  \"p\": 3.0,\n  \"q\": -2.0,\n  \"z\": -0.0\n}\n"),
+            ),
+            (vec!["type", "n.tf", "/n"], ok("int\n")),
+            (vec!["type", "n.tf", "/p"], ok("float\n")),
+            (vec!["type", "n.tf", "/q"], ok("float\n")),
+            (vec!["type", "n.tf", "/z"], ok("float\n")),
+        ],
+    );
+}
+
 /// A byte order mark and the declared encoding must agree (XML 1.0
 /// §4.3.3), and `encoding` must be an encoding name: the reader refuses
 /// both (exit 3) as the writer does. A UTF-8 BOM is kept as `#xml.bom` and

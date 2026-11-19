@@ -165,3 +165,68 @@ backend "s3" {
         "round-trip must preserve the value tree exactly",
     );
 }
+
+/// Write `doc` as HCL, panicking with the writer's message on failure.
+fn write_hcl(doc: &Document) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    hcl()
+        .write(doc, &mut buf)
+        .unwrap_or_else(|e| panic!("hcl write failed: {e}"));
+    String::from_utf8(buf).expect("hcl writer must produce utf-8")
+}
+
+/// `{key: value}`.
+fn map1(key: &str, value: Value) -> Value {
+    Value::Map([(key.to_owned(), value)].into_iter().collect())
+}
+
+#[test]
+fn fifty_nested_blocks_write_and_read_back() {
+    let depth = 50;
+    let source = format!("{}x = 1\n{}", "a {\n".repeat(depth), "}\n".repeat(depth));
+    let doc = parse_hcl(&source);
+    let expected = (0..depth).fold(map1("x", Value::Int(1)), |inner, _| map1("a", inner));
+    assert_eq!(doc.value(), &expected);
+    let written = write_hcl(&doc);
+    assert!(written.starts_with("a = {\n  \"a\" = {\n"), "{written}");
+    assert_eq!(parse_hcl(&written).value(), &expected);
+}
+
+#[test]
+fn fifty_nested_arrays_and_objects_write_and_read_back() {
+    let expected = map1(
+        "v",
+        (0..50).fold(Value::Int(1), |inner, level| {
+            if level % 2 == 0 {
+                Value::Array(vec![inner, Value::Bool(true)])
+            } else {
+                map1("k", inner)
+            }
+        }),
+    );
+    let doc = Document::value_only(expected.clone(), dq_core::FormatTag::Hcl);
+    assert_eq!(parse_hcl(&write_hcl(&doc)).value(), &expected);
+}
+
+#[test]
+fn empty_arrays_and_objects_inside_arrays_write_and_read_back() {
+    let empty_array = || Value::Array(Vec::new());
+    let empty_map = || Value::Map(Default::default());
+    let expected = map1(
+        "a",
+        Value::Array(vec![
+            empty_array(),
+            empty_map(),
+            Value::Array(vec![empty_array()]),
+            Value::Array(vec![empty_map()]),
+            map1("k", empty_array()),
+        ]),
+    );
+    let doc = Document::value_only(expected.clone(), dq_core::FormatTag::Hcl);
+    let written = write_hcl(&doc);
+    assert_eq!(
+        written,
+        "a = [\n  [],\n  {},\n  [\n    []\n  ],\n  [\n    {}\n  ],\n  {\n    \"k\" = []\n  }\n]\n"
+    );
+    assert_eq!(parse_hcl(&written).value(), &expected);
+}

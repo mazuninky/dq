@@ -529,6 +529,59 @@ fn toml_hcl_and_toon_output_refuse_a_number_they_cannot_hold() {
     );
 }
 
+/// HCL output names the first value it cannot write, in document order
+/// and whatever its depth, and a big number before a key that is no HCL
+/// identifier, wherever that key sits; of two such keys, the first. A
+/// document that is no map is no HCL body.
+#[test]
+fn hcl_output_names_the_first_value_it_cannot_write() {
+    let dir = dir_with(&[
+        (
+            "float_first.json",
+            "{\"a\": 1e400, \"b\": 18446744073709551617}",
+        ),
+        (
+            "int_first.json",
+            "{\"b\": 18446744073709551617, \"a\": 1e400}",
+        ),
+        (
+            "deep_first.json",
+            "{\"x\": [1, {\"y\": 1e400}], \"z\": 18446744073709551617}",
+        ),
+        ("key_first.json", "{\"a b\": 1, \"x\": {\"y\": 1e400}}"),
+        ("two_keys.json", "{\"a b\": 1, \"c d\": 2}"),
+        ("array.json", "[1, 2]"),
+        ("scalar.json", "\"s\""),
+    ]);
+    let refused = |literal: &str| {
+        format!("hcl format error: HCL cannot represent arbitrary-precision number {literal}\n")
+    };
+    for (file, stderr) in [
+        ("float_first.json", refused("1e+400")),
+        ("int_first.json", refused("18446744073709551617")),
+        ("deep_first.json", refused("1e+400")),
+        ("key_first.json", refused("1e+400")),
+        (
+            "two_keys.json",
+            "hcl format error: failed to serialize HCL: invalid identifier `a b`\n".to_owned(),
+        ),
+    ] {
+        assert_eq!(
+            failure_of(&dir, &["-q", "-F", "hcl", "convert", file]),
+            (Some(1), String::new(), stderr),
+            "{file}"
+        );
+    }
+    for file in ["array.json", "scalar.json"] {
+        let (code, stdout, stderr) = failure_of(&dir, &["-q", "-F", "hcl", "convert", file]);
+        assert_eq!((code, stdout.as_str()), (Some(1), ""), "{file}");
+        assert!(
+            stderr.starts_with("hcl format error: failed to serialize HCL: "),
+            "{file}: {stderr}"
+        );
+    }
+}
+
 /// `convert -i` writes the converted file and removes the source; a
 /// refused number leaves the source as it was and writes nothing.
 #[test]
@@ -810,9 +863,10 @@ fn hcl_object_keys_a_and_quoted_a_are_a_parse_error() {
     let dir = dir_with(&[
         ("a.hcl", "x = { a = 1, \"a\" = 2 }\n"),
         ("b.hcl", "x = { \"a\" = 1, a = 2 }\n"),
+        ("block.hcl", "b {\n  o = { a = 1, \"a\" = 2 }\n}\n"),
         ("ok.hcl", "x = { a = 1, \"a b\" = 2 }\n"),
     ]);
-    for file in ["a.hcl", "b.hcl"] {
+    for file in ["a.hcl", "b.hcl", "block.hcl"] {
         let (code, stdout, stderr) = failure_of(&dir, &["-F", "json", "convert", file]);
         assert_eq!(code, Some(3), "{file}");
         assert_eq!(stdout, "", "{file}");
