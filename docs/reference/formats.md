@@ -284,7 +284,10 @@ gets a BOM, little-endian unless `bom` says otherwise; `UTF-16LE` and
   The writer takes `detected: UTF-8` only under a UTF-16 label (exit 1
   otherwise).
 
-The reader refuses, with exit 3:
+The reader refuses, with exit 3, naming in the message where the name at
+fault begins (`XML parse error at line 2, column 4: element <a:b> uses the
+prefix 'a', …`), as `dq validate` does in its `line` / `col` fields; an
+encoding error has no position:
 
 - an encoding dq does not know (`UTF-32`) or cannot read (`ISO-2022-KR`),
   and an `encoding` that is not an encoding name;

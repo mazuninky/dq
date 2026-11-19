@@ -69,6 +69,15 @@ fn unreadable(file: &str, message: &str) -> Outcome {
     (3, Vec::new(), format!("parse error in {file}: {message}\n"))
 }
 
+/// The XML reader's refusal of `file` at `line` and `col`, where the name
+/// at fault begins: exit 3 and `message` on stderr, placed.
+fn unreadable_at(file: &str, line: u32, col: u32, message: &str) -> Outcome {
+    unreadable(
+        file,
+        &format!("XML parse error at line {line}, column {col}: {message}"),
+    )
+}
+
 /// Run every `(args, outcome)` case in `dir` and fail once, listing every
 /// case whose outcome differs.
 fn assert_cases(dir: &TempDir, cases: &[(Vec<&str>, Outcome)]) {
@@ -843,12 +852,13 @@ fn the_reader_refuses_what_the_writer_would() {
         ("x_foo.xml", x_foo.as_bytes()),
         ("kr.xml", kr.as_bytes()),
     ]);
-    let prefix = |file: &str, what: &str, prefix: &str| {
-        unreadable(
+    let prefix = |file: &str, col: u32, what: &str, prefix: &str| {
+        unreadable_at(
             file,
+            1,
+            col,
             &format!(
-                "XML parse error: {what} uses the prefix '{prefix}', which no 'xmlns:{prefix}' \
-                 declares in scope"
+                "{what} uses the prefix '{prefix}', which no 'xmlns:{prefix}' declares in scope"
             ),
         )
     };
@@ -863,15 +873,15 @@ fn the_reader_refuses_what_the_writer_would() {
         &[
             (
                 convert("element.xml", "json"),
-                prefix("element.xml", "element <a:b>", "a"),
+                prefix("element.xml", 2, "element <a:b>", "a"),
             ),
             (
                 convert("attribute.xml", "json"),
-                prefix("attribute.xml", "attribute 'a:x' on <r>", "a"),
+                prefix("attribute.xml", 4, "attribute 'a:x' on <r>", "a"),
             ),
             (
                 convert("sibling.xml", "json"),
-                prefix("sibling.xml", "element <p:k>", "p"),
+                prefix("sibling.xml", 21, "element <p:k>", "p"),
             ),
             (
                 convert("declared.xml", "xml"),
@@ -1014,11 +1024,11 @@ fn undeclaring_a_prefix_needs_xml_1_1() {
             ),
             (
                 convert("v11_out.xml", "json"),
-                unreadable("v11_out.xml", &format!("XML parse error: {undeclared}")),
+                unreadable_at("v11_out.xml", 1, 55, undeclared),
             ),
             (
                 convert("v10.xml", "json"),
-                unreadable("v10.xml", &format!("XML parse error: {empty_10}")),
+                unreadable_at("v10.xml", 1, 40, empty_10),
             ),
             (
                 convert("v11.yaml", "xml"),
@@ -1224,8 +1234,9 @@ fn the_reader_refuses_every_declaration_the_writer_does() {
         ),
     ];
     let dir = dir_with(&files.each_ref().map(|(name, src)| (*name, src.as_bytes())));
+    // Every file is one line; the column is where the name at fault begins.
     let refused_on_read =
-        |file: &str, message: &str| unreadable(file, &format!("XML parse error: {message}"));
+        |file: &str, col: u32, message: &str| unreadable_at(file, 1, col, message);
     let undeclared = "uses the prefix 'p', which no 'xmlns:p' declares in scope";
     assert_cases(
         &dir,
@@ -1234,6 +1245,7 @@ fn the_reader_refuses_every_declaration_the_writer_does() {
                 convert("xmlns.xml", "json"),
                 refused_on_read(
                     "xmlns.xml",
+                    4,
                     "'xmlns:xmlns' on <r> cannot be declared: the xmlns prefix is reserved",
                 ),
             ),
@@ -1241,6 +1253,7 @@ fn the_reader_refuses_every_declaration_the_writer_does() {
                 convert("xml.xml", "json"),
                 refused_on_read(
                     "xml.xml",
+                    4,
                     "'xmlns:xml' on <r> must bind http://www.w3.org/XML/1998/namespace (got \
                      \"urn:x\")",
                 ),
@@ -1249,6 +1262,7 @@ fn the_reader_refuses_every_declaration_the_writer_does() {
                 convert("xml_uri.xml", "json"),
                 refused_on_read(
                     "xml_uri.xml",
+                    4,
                     "'xmlns:p' on <r> binds http://www.w3.org/XML/1998/namespace, which only the \
                      xml prefix may",
                 ),
@@ -1257,6 +1271,7 @@ fn the_reader_refuses_every_declaration_the_writer_does() {
                 convert("xmlns_uri.xml", "json"),
                 refused_on_read(
                     "xmlns_uri.xml",
+                    4,
                     "'xmlns:p' on <r> binds http://www.w3.org/2000/xmlns/, which nothing may",
                 ),
             ),
@@ -1264,6 +1279,7 @@ fn the_reader_refuses_every_declaration_the_writer_does() {
                 convert("element.xml", "json"),
                 refused_on_read(
                     "element.xml",
+                    2,
                     "'xmlns' cannot name an element: the xmlns prefix is reserved for namespace \
                      declarations",
                 ),
@@ -1272,6 +1288,7 @@ fn the_reader_refuses_every_declaration_the_writer_does() {
                 convert("prefixed.xml", "json"),
                 refused_on_read(
                     "prefixed.xml",
+                    5,
                     "'xmlns:k' cannot name an element: the xmlns prefix is reserved for namespace \
                      declarations",
                 ),
@@ -1280,17 +1297,19 @@ fn the_reader_refuses_every_declaration_the_writer_does() {
                 convert("empty.xml", "json"),
                 refused_on_read(
                     "empty.xml",
+                    4,
                     "'xmlns:p' on <r> is empty: XML namespaces 1.0 cannot undeclare a prefix",
                 ),
             ),
             (
                 convert("self.xml", "json"),
-                refused_on_read("self.xml", &format!("element <p:k> {undeclared}")),
+                refused_on_read("self.xml", 38, &format!("element <p:k> {undeclared}")),
             ),
             (
                 convert("self_attr.xml", "json"),
                 refused_on_read(
                     "self_attr.xml",
+                    51,
                     &format!("attribute 'p:a' on <k> {undeclared}"),
                 ),
             ),
@@ -1310,7 +1329,8 @@ fn the_reader_refuses_every_declaration_the_writer_does() {
 }
 
 /// `dq validate` reports on stderr where the reader met an undeclared
-/// prefix: the line of the tag and the column just past its end.
+/// prefix: the line and column where the name at fault begins, in the
+/// fields and in the message.
 #[test]
 fn an_undeclared_prefix_is_reported_with_its_line_and_column() {
     let dir = dir_with(&[
@@ -1322,8 +1342,8 @@ fn an_undeclared_prefix_is_reported_with_its_line_and_column() {
             4,
             Vec::new(),
             format!(
-                "kind: parse\nfile: {file}\nline: {line}\ncol: {col}\nmessage: XML parse error: \
-                 {message}\nsnippet: {snippet}\n"
+                "kind: parse\nfile: {file}\nline: {line}\ncol: {col}\nmessage: XML parse error \
+                 at line {line}, column {col}: {message}\nsnippet: {snippet}\n"
             ),
         )
     };
@@ -1335,7 +1355,7 @@ fn an_undeclared_prefix_is_reported_with_its_line_and_column() {
                 report(
                     "start.xml",
                     2,
-                    8,
+                    4,
                     "element <a:b> uses the prefix 'a', which no 'xmlns:a' declares in scope",
                     "<r>\\n  <a:b>t</a:b>\\n</r>\\n",
                 ),
@@ -1345,7 +1365,7 @@ fn an_undeclared_prefix_is_reported_with_its_line_and_column() {
                 report(
                     "empty.xml",
                     3,
-                    14,
+                    5,
                     "attribute 'a:x' on <k> uses the prefix 'a', which no 'xmlns:a' declares in \
                      scope",
                     "<r>\\n\\n <k a:x=\"1\"/>\\n</r>\\n",

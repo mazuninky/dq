@@ -165,7 +165,7 @@ impl Format for Xml {
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<Document> {
-        let value = parse_xml(bytes)?;
+        let value = parse_xml(bytes).map_err(with_position)?;
         Ok(Document::value_only(value, FormatTag::Xml))
     }
 
@@ -290,14 +290,19 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
     let mut stack: Vec<Frame> = Vec::new();
     // Namespaces in XML 1.1 hold for an XML 1.1 document only.
     let mut xml11 = false;
+    // Where the second root element begins, to report it there.
+    let mut roots = 0_usize;
+    let mut extra_root = None;
 
     loop {
+        // Where the next event begins: its `<` (or `&`), or the first
+        // character of a text.
+        let event_start = reader.buffer_position() as usize;
         match reader.read_event() {
             Err(e) => {
-                // `buffer_position` returns the byte offset of the cursor at
-                // the time of the error — that's the closest we can get to a
-                // (line, col) without rebuilding line breaks ourselves.
-                let pos = reader.buffer_position() as usize;
+                // The start of the markup the error is in (its `<`), where
+                // `buffer_position` would be wherever reading stopped.
+                let pos = reader.error_position() as usize;
                 let (line, col) = byte_pos_to_line_col(text, pos);
                 return Err(Error::Parse {
                     file: None,
@@ -346,11 +351,18 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                 push_comment(&mut stack, &mut top_comments, txt);
             }
             Ok(Event::Start(start)) => {
-                let mut frame = build_start_frame(&start)?;
-                check_namespaces(&stack, &mut frame, xml11).map_err(|message| {
-                    let pos = reader.buffer_position() as usize;
+                let mut frame =
+                    build_start_frame(&start).map_err(|e| place(e, text, event_start))?;
+                check_namespaces(&stack, &mut frame, xml11).map_err(|(message, attr)| {
+                    let pos = name_offset(text, &start, event_start, attr.as_deref());
                     parse_error_at(text, pos, message)
                 })?;
+                if stack.is_empty() {
+                    roots += 1;
+                    if roots == 2 {
+                        extra_root = Some(event_start);
+                    }
+                }
                 if let Some(parent) = stack.last_mut() {
                     parent.saw_element = true;
                     if parent.has_text {
@@ -360,11 +372,18 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                 stack.push(frame);
             }
             Ok(Event::Empty(start)) => {
-                let mut frame = build_start_frame(&start)?;
-                check_namespaces(&stack, &mut frame, xml11).map_err(|message| {
-                    let pos = reader.buffer_position() as usize;
+                let mut frame =
+                    build_start_frame(&start).map_err(|e| place(e, text, event_start))?;
+                check_namespaces(&stack, &mut frame, xml11).map_err(|(message, attr)| {
+                    let pos = name_offset(text, &start, event_start, attr.as_deref());
                     parse_error_at(text, pos, message)
                 })?;
+                if stack.is_empty() {
+                    roots += 1;
+                    if roots == 2 {
+                        extra_root = Some(event_start);
+                    }
+                }
                 if let Some(parent) = stack.last_mut() {
                     parent.saw_element = true;
                     if parent.has_text {
@@ -378,7 +397,7 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
             }
             Ok(Event::End(end)) => {
                 let Some(frame) = stack.pop() else {
-                    let pos = reader.buffer_position() as usize;
+                    let pos = event_start;
                     let (line, col) = byte_pos_to_line_col(text, pos);
                     return Err(Error::Parse {
                         file: None,
@@ -394,7 +413,7 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                 };
                 let end_name = end.name().as_ref().to_owned();
                 if end_name != frame.tag {
-                    let pos = reader.buffer_position() as usize;
+                    let pos = event_start;
                     let (line, col) = byte_pos_to_line_col(text, pos);
                     return Err(Error::Parse {
                         file: None,
@@ -446,7 +465,7 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                 // the reference here and append to the current frame's text so
                 // the parsed `Value` matches the pre-0.38 behaviour (entities
                 // are folded into the surrounding text body).
-                let s = resolve_general_ref(&r, text, reader.buffer_position() as usize)?;
+                let s = resolve_general_ref(&r, text, event_start)?;
                 if let Some(frame) = stack.last_mut() {
                     if frame.saw_element {
                         frame.saw_mixed = true;
@@ -481,7 +500,7 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
     // (`#xml`, `#pi`, `#comments`) are not "elements" and don't count.
     let root_count: usize = top_children.values().map(Vec::len).sum();
     if root_count != 1 {
-        let pos = reader.buffer_position() as usize;
+        let pos = extra_root.unwrap_or_else(|| reader.buffer_position() as usize);
         let (line, col) = byte_pos_to_line_col(text, pos);
         return Err(Error::Parse {
             file: None,
@@ -489,7 +508,10 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
             col,
             span: pos..pos,
             snippet: snippet_for_pos(text, pos),
-            message: format!("XML must have exactly one root element; found {root_count}",),
+            message: format!(
+                "XML parse error: a document must have exactly one root element; found \
+                 {root_count}",
+            ),
         });
     }
     for (name, group) in top_children {
@@ -803,6 +825,79 @@ fn declared_label(bytes: &[u8]) -> Option<&str> {
 
 /// Build a [`Frame`] from a `<tag attr="...">` event.
 /// A parse error at byte `pos` of `text`, `XML parse error: ` + `message`.
+/// Where in `text` the name at fault in the start tag `start` (which
+/// begins at `event_start`, its `<`) begins: the attribute `attr`, else the
+/// element's name, just past the `<`. The reader borrows its events from
+/// `text`, so an attribute's key is a slice of it; should it not be, the
+/// element's name stands in.
+fn name_offset(
+    text: &str,
+    start: &BytesStart<'_>,
+    event_start: usize,
+    attr: Option<&str>,
+) -> usize {
+    let tag_name = event_start + 1;
+    let Some(attr) = attr else {
+        return tag_name;
+    };
+    let base = text.as_ptr() as usize;
+    start
+        .attributes()
+        .flatten()
+        .find(|a| a.key.as_ref() == attr)
+        .and_then(|a| (a.key.as_ref().as_ptr() as usize).checked_sub(base))
+        .filter(|&offset| offset < text.len())
+        .unwrap_or(tag_name)
+}
+
+/// `e` placed at `pos` in `text` when it was raised with no position
+/// (line 0) — a malformed attribute, found while the start tag at `pos` is
+/// taken apart.
+fn place(e: Error, text: &str, pos: usize) -> Error {
+    match e {
+        Error::Parse {
+            line: 0, message, ..
+        } => {
+            let message = message
+                .strip_prefix("XML parse error: ")
+                .map_or(message.clone(), str::to_owned);
+            parse_error_at(text, pos, message)
+        }
+        other => other,
+    }
+}
+
+/// `e` with its line and column in the message too, `XML parse error at
+/// line 2, column 4: …`, as the HCL and YAML readers put theirs — the
+/// message is all `convert` or `get` print. An error with no position
+/// (line 0: the encoding, told before there is text to count lines in)
+/// is left as it is.
+fn with_position(e: Error) -> Error {
+    match e {
+        Error::Parse {
+            file,
+            line,
+            col,
+            span,
+            snippet,
+            message,
+        } if line > 0 => {
+            let rest = message
+                .strip_prefix("XML parse error: ")
+                .unwrap_or(&message);
+            Error::Parse {
+                message: format!("XML parse error at line {line}, column {col}: {rest}"),
+                file,
+                line,
+                col,
+                span,
+                snippet,
+            }
+        }
+        other => other,
+    }
+}
+
 fn parse_error_at(text: &str, pos: usize, message: String) -> Error {
     let (line, col) = byte_pos_to_line_col(text, pos);
     Error::Parse {
@@ -822,17 +917,21 @@ fn parse_error_at(text: &str, pos: usize, message: String) -> Error {
 /// element or an ancestor (`stack`) declares it, or the nearest one
 /// undeclares it; `xml` always is. Read, such a file could not be written
 /// back.
+///
+/// The error names the attribute at fault, `None` for the element's name.
 fn check_namespaces(
     stack: &[Frame],
     frame: &mut Frame,
     xml11: bool,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<(), (String, Option<String>)> {
     let mut prefixes = Vec::new();
     for (name, value) in &frame.attrs {
         let Value::String(uri) = value else {
             continue;
         };
-        if let Some((prefix, bound)) = declared_prefix(name, uri, &frame.tag, xml11)? {
+        if let Some((prefix, bound)) = declared_prefix(name, uri, &frame.tag, xml11)
+            .map_err(|message| (message, Some(name.clone())))?
+        {
             prefixes.push((prefix.to_owned(), bound));
         }
     }
@@ -845,13 +944,13 @@ fn check_namespaces(
                 .is_some_and(|(_, bound)| *bound)
     };
     if let Some(message) = undeclared_prefix(&frame.tag, None, declares) {
-        return Err(message);
+        return Err((message, None));
     }
     for name in frame.attrs.keys() {
         if !is_namespace_declaration(name)
             && let Some(message) = undeclared_prefix(name, Some(&frame.tag), declares)
         {
-            return Err(message);
+            return Err((message, Some(name.clone())));
         }
     }
     Ok(())
@@ -2606,6 +2705,42 @@ mod tests {
         unencodable.note("caf\u{e9}", || "in <r>".to_owned());
         assert_eq!(unencodable.first, Some(('\u{e9}', "in <r>".to_owned())));
         assert!(ascii.encode("\u{e9}".into()).is_err());
+    }
+
+    #[test]
+    fn a_parse_error_names_where_the_name_at_fault_begins() {
+        let at = |xml: &str| match Xml.parse(xml.as_bytes()) {
+            Err(Error::Parse {
+                line, col, message, ..
+            }) => (line, col, message),
+            other => panic!("{xml}: expected a parse error, got {other:?}"),
+        };
+        // An attribute whose name stands earlier inside a quoted value.
+        let (line, col, message) = at("<r>\n  <k b=\" a:x=1\" a:x=\"2\"/>\n</r>");
+        assert_eq!((line, col), (2, 17));
+        assert!(
+            message.starts_with("XML parse error at line 2, column 17: attribute 'a:x' on <k>"),
+            "{message}"
+        );
+        let place = |xml: &str| {
+            let (line, col, _) = at(xml);
+            (line, col)
+        };
+        // An element: its prefix, past the `<`.
+        assert_eq!(place("<r>\n<a:b/></r>"), (2, 2));
+        // A second root, where it begins; a closing tag that does not match.
+        assert_eq!(place("<r/>\n <s/>"), (2, 2));
+        assert_eq!(place("<r>\n <a></b></r>"), (2, 5));
+        // An entity, at its `&`; a malformed attribute, at its tag.
+        assert_eq!(place("<r>\n x&bogus;</r>"), (2, 3));
+        assert_eq!(place("<r>\n<k a=\"1\" a=\"2\"/></r>"), (2, 1));
+        // No text yet to place an encoding in: no position, none claimed.
+        let (line, _, message) = at("<?xml version=\"1.0\" encoding=\"UTF-32\"?><r/>");
+        assert_eq!(line, 0);
+        assert!(
+            message.starts_with("the XML declaration's encoding"),
+            "{message}"
+        );
     }
 
     #[test]
