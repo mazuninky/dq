@@ -47,14 +47,19 @@
 //! with content at the top level, outside the root.
 //!
 //! The writer never emits XML that is not well-formed, and never alters
-//! content to make it so. It refuses: an element or attribute name or a PI
-//! target that is not an XML `Name` (a PI target `xml` in any case too), a
-//! character XML 1.0 does not allow (a C0 control other than tab, LF, CR),
-//! a comment with `--` or a trailing `-`, a PI with `?>`, and declaration
-//! fields outside its grammar. A boolean `standalone` is `yes` / `no`.
-//! CDATA holding `]]>` is split across adjacent sections, which read back
-//! as separate `#cdata` items with the same text. Comments are written as
-//! they are: XML has no escapes inside a comment.
+//! content to make it so. It refuses: an element or attribute name that is
+//! not a namespace `QName` (one `prefix:` at most), a PI target that is not
+//! an `NCName` or is `xml` in any case, a character XML 1.0 does not allow
+//! (a C0 control other than tab, LF, CR), a comment with `--` or a trailing
+//! `-`, a PI with `?>`, declaration fields outside its grammar, and a
+//! declared encoding the UTF-8 bytes would contradict — anything but UTF-8,
+//! except an ASCII-compatible one (US-ASCII, ISO-8859-*, windows-125x) on
+//! an all-ASCII document. A boolean `standalone` is `yes` / `no`. CDATA
+//! holding `]]>` is split across adjacent sections, which read back as
+//! separate `#cdata` items with the same text. Comments are written as they
+//! are: XML has no escapes inside a comment. A CR in text and a tab, LF or
+//! CR in an attribute value are written as character references, so XML's
+//! end-of-line and attribute normalization give them back unchanged.
 //!
 //! ## Read-only edit operations
 //!
@@ -637,7 +642,8 @@ fn render_xml(top: &Value) -> Result<Vec<u8>> {
     }
 
     // 1. XML declaration.
-    if let Some(decl) = declaration(top.get(KEY_XML_DECL))? {
+    let decl = declaration(top.get(KEY_XML_DECL))?;
+    if let Some(decl) = &decl {
         writer
             .write_event(Event::Decl(BytesDecl::new(
                 &decl.version,
@@ -649,12 +655,15 @@ fn render_xml(top: &Value) -> Result<Vec<u8>> {
 
     // 2. Top-level processing instructions and comments (kept above root).
     const TOP: &str = "at the top level";
+    let mut non_ascii = FirstNonAscii::default();
     for s in item_texts(KEY_PI, TOP, top.get(KEY_PI))? {
+        non_ascii.note(&s, || TOP.to_owned());
         writer
             .write_event(Event::PI(BytesPI::new(s.as_str())))
             .map_err(map_write_err)?;
     }
     for s in item_texts(KEY_COMMENTS, TOP, top.get(KEY_COMMENTS))? {
+        non_ascii.note(&s, || TOP.to_owned());
         writer
             .write_event(Event::Comment(comment_event(&s)))
             .map_err(map_write_err)?;
@@ -705,9 +714,76 @@ fn render_xml(top: &Value) -> Result<Vec<u8>> {
             message: format!("XML write: root element '{root_tag}' must be a Map"),
         });
     };
-    write_element(&mut writer, root_tag, root_body, 0)?;
+    write_element(&mut writer, root_tag, root_body, 0, &mut non_ascii)?;
 
+    if let Some(encoding) = decl.as_ref().and_then(|d| d.encoding.as_deref()) {
+        check_declared_encoding(encoding, &non_ascii)?;
+    }
     Ok(writer.into_inner().into_inner())
+}
+
+/// The first non-ASCII character the writer emitted and where: `in <tag>`
+/// or `at the top level`.
+#[derive(Default)]
+struct FirstNonAscii(Option<(char, String)>);
+
+impl FirstNonAscii {
+    /// Remember the first non-ASCII character of `text`, unless one is
+    /// already remembered. `place` is built only when one is found.
+    fn note(&mut self, text: &str, place: impl FnOnce() -> String) {
+        if self.0.is_none()
+            && let Some(c) = text.chars().find(|c| !c.is_ascii())
+        {
+            self.0 = Some((c, place()));
+        }
+    }
+}
+
+/// dq writes UTF-8 whatever `#xml` declares, so a declared encoding must
+/// name UTF-8 — or name an ASCII-compatible encoding (US-ASCII,
+/// ISO-8859-*, windows-125x) of a document that is all ASCII, whose bytes
+/// are the same in either. Anything else would label the bytes wrongly.
+fn check_declared_encoding(encoding: &str, non_ascii: &FirstNonAscii) -> Result<()> {
+    let lower = encoding.to_ascii_lowercase();
+    if matches!(lower.as_str(), "utf-8" | "utf8") {
+        return Ok(());
+    }
+    let ascii_compatible = matches!(lower.as_str(), "us-ascii" | "ascii")
+        || lower.strip_prefix("iso-8859-").is_some_and(|n| {
+            matches!(
+                n,
+                "1" | "2"
+                    | "3"
+                    | "4"
+                    | "5"
+                    | "6"
+                    | "7"
+                    | "8"
+                    | "9"
+                    | "10"
+                    | "11"
+                    | "13"
+                    | "14"
+                    | "15"
+                    | "16"
+            )
+        })
+        || lower
+            .strip_prefix("windows-125")
+            .is_some_and(|n| matches!(n, "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8"));
+    let message = match &non_ascii.0 {
+        None if ascii_compatible => return Ok(()),
+        None => format!("'{KEY_XML_DECL}' declares encoding {encoding:?} but dq writes UTF-8"),
+        Some((c, place)) => format!(
+            "'{KEY_XML_DECL}' declares encoding {encoding:?} but dq writes UTF-8 and the document \
+             holds U+{:04X} {place}",
+            u32::from(*c),
+        ),
+    };
+    Err(Error::Format {
+        format: "xml",
+        message: format!("XML write: {message}"),
+    })
 }
 
 /// Indent width for pretty-printed XML output (2 spaces per level).
@@ -740,8 +816,11 @@ fn write_element(
     tag: &str,
     body: &IndexMap<String, Value>,
     indent_level: usize,
+    non_ascii: &mut FirstNonAscii,
 ) -> Result<()> {
     check_name(tag, "an element")?;
+    let place = || format!("in <{tag}>");
+    non_ascii.note(tag, place);
     let mut start = BytesStart::new(tag);
     match body.get(KEY_ATTRS) {
         None | Some(Value::Map(_)) => {}
@@ -770,9 +849,11 @@ fn write_element(
             };
             check_name(k, &format!("an attribute (on <{tag}>)"))?;
             check_chars(&format!("attribute '{k}' on <{tag}>"), &v)?;
+            non_ascii.note(k, place);
+            non_ascii.note(&v, place);
             start.push_attribute(Attribute {
                 key: QName(k.as_str()),
-                value: escape_xml(&v).into_owned().into(),
+                value: escape_attr(&v).into_owned().into(),
             });
         }
     }
@@ -792,6 +873,7 @@ fn write_element(
     };
     if let Some(text) = &text {
         check_chars(&format!("'{KEY_TEXT}' of <{tag}>"), text)?;
+        non_ascii.note(text, place);
     }
 
     // Determine if the element has any body content. If not, emit as
@@ -800,6 +882,9 @@ fn write_element(
     let comments = item_texts(KEY_COMMENTS, &owner, body.get(KEY_COMMENTS))?;
     let pis = item_texts(KEY_PI, &owner, body.get(KEY_PI))?;
     let cdata = item_texts(KEY_CDATA, &owner, body.get(KEY_CDATA))?;
+    for s in comments.iter().chain(&pis).chain(&cdata) {
+        non_ascii.note(s, place);
+    }
     let has_text = text.is_some();
     let has_cdata = !cdata.is_empty();
     let has_pi = !pis.is_empty();
@@ -885,12 +970,12 @@ fn write_element(
             }
             match child {
                 Value::Map(child_body) => {
-                    write_element(writer, k, child_body, child_indent)?;
+                    write_element(writer, k, child_body, child_indent, non_ascii)?;
                 }
                 Value::Null => {
                     // Empty child element.
                     let tmp = IndexMap::new();
-                    write_element(writer, k, &tmp, child_indent)?;
+                    write_element(writer, k, &tmp, child_indent, non_ascii)?;
                 }
                 // Scalar-shaped child: emitted as `<k>text</k>`. This shape
                 // arises when JSON input is converted to XML —
@@ -903,7 +988,7 @@ fn write_element(
                 | Value::BigFloat(_)) => {
                     let mut tmp = IndexMap::new();
                     tmp.insert(KEY_TEXT.to_owned(), scalar.clone());
-                    write_element(writer, k, &tmp, child_indent)?;
+                    write_element(writer, k, &tmp, child_indent, non_ascii)?;
                 }
                 Value::Array(_) => {
                     return Err(Error::Format {
@@ -982,8 +1067,8 @@ fn item_texts(key: &str, owner: &str, entry: Option<&Value>) -> Result<Vec<Strin
 /// Refuse an item that cannot be written as well-formed XML of its kind —
 /// never alter it. Every kind: a character XML 1.0 does not allow. A
 /// comment: `--` anywhere or `-` at the end. A processing instruction: a
-/// target (up to the first whitespace) that is not an XML name or is `xml`
-/// in any case, or `?>` inside. CDATA has no such limit: `]]>` is split
+/// target (up to the first whitespace) that is not an NCName (an XML name
+/// without a colon) or is `xml` in any case, or `?>` inside. CDATA has no such limit: `]]>` is split
 /// across adjacent sections when written.
 fn check_item(key: &str, owner: &str, text: &str) -> Result<()> {
     check_chars(&format!("'{key}' {owner}"), text)?;
@@ -1005,10 +1090,15 @@ fn check_item(key: &str, owner: &str, text: &str) -> Result<()> {
                 .split([' ', '\t', '\n', '\r'])
                 .next()
                 .unwrap_or_default();
-            if !is_xml_name(target) {
+            if !is_ncname(target) {
+                let hint = if target.contains(':') {
+                    ", a target holds no ':'"
+                } else {
+                    ""
+                };
                 refuse(format!(
                     "XML write: '{target}' is not a valid XML name for a processing-instruction \
-                     target ('{key}' {owner})",
+                     target ('{key}' {owner}{hint})",
                 ))
             } else if target.eq_ignore_ascii_case("xml") {
                 refuse(format!(
@@ -1028,22 +1118,40 @@ fn check_item(key: &str, owner: &str, text: &str) -> Result<()> {
     }
 }
 
-/// Refuse `name` unless it is an XML 1.0 `Name`; `what` says what it names
-/// (`an element`, `an attribute (on <r>)`). A colon is a name character, so
-/// a prefixed name (`svg:rect`, even `x:y:z`) passes: dq does not check
-/// namespaces.
+/// Refuse `name` unless it is a namespace-well-formed `QName`: an NCName,
+/// or two joined by one `:` (`svg:rect`, `xmlns:svg`). `what` says what it
+/// names (`an element`, `an attribute (on <r>)`). Whether a prefix is
+/// declared is not checked.
 fn check_name(name: &str, what: &str) -> Result<()> {
-    if is_xml_name(name) {
+    if is_qname(name) {
         return Ok(());
     }
+    let hint = if name.contains(':') {
+        " (a name holds at most one ':', between a prefix and a local name)"
+    } else {
+        ""
+    };
     Err(Error::Format {
         format: "xml",
-        message: format!("XML write: '{name}' is not a valid XML name for {what}"),
+        message: format!("XML write: '{name}' is not a valid XML name for {what}{hint}"),
     })
 }
 
+/// Namespaces in XML 1.0 `QName`: `NCName` or `NCName ':' NCName`.
+fn is_qname(name: &str) -> bool {
+    match name.split_once(':') {
+        None => is_ncname(name),
+        Some((prefix, local)) => is_ncname(prefix) && is_ncname(local),
+    }
+}
+
+/// Namespaces in XML 1.0 `NCName`: an XML `Name` without a colon.
+fn is_ncname(name: &str) -> bool {
+    !name.contains(':') && is_xml_name(name)
+}
+
 /// The XML 1.0 (fifth edition) `Name` production: a `NameStartChar`, then
-/// `NameChar`s.
+/// `NameChar`s. A colon is a `NameStartChar` here; [`is_ncname`] drops it.
 fn is_xml_name(name: &str) -> bool {
     let start = |c: char| {
         matches!(c,
@@ -1206,39 +1314,56 @@ fn non_empty_array(v: &Value) -> bool {
     matches!(v, Value::Array(items) if !items.is_empty())
 }
 
-/// Escape `raw` for text and attribute-value output.
-///
-/// Replaces exactly `<`, `>`, `&`, `'` and `"` — the set quick-xml's
-/// `escape` used up to 0.40, which is what `BytesText::new` and
-/// `Attribute::from((&str, &str))` applied on our write path. quick-xml
-/// 0.42 widened both: `BytesText::new` now also escapes `\r` as `&#13;`, and
-/// `Attribute::from` additionally escapes `\n` / `\t` as `&#10;` / `&#9;`.
-/// We pin the old set so `dq fmt` / `dq convert -F xml` output stays
-/// byte-identical across the dependency bump; adopting the wider escaping
-/// is a separate, user-visible writer change.
-fn escape_xml(raw: &str) -> Cow<'_, str> {
-    let needs_escape = |c: char| matches!(c, '<' | '>' | '&' | '\'' | '"');
-    let Some(first) = raw.find(needs_escape) else {
+/// Escape `raw` for a text body: `<`, `>`, `&`, `'` and `"` — the set
+/// quick-xml's `escape` used up to 0.40, kept so output stays byte-stable —
+/// and CR as `&#13;`. A raw CR in text reads back as LF (XML end-of-line
+/// handling); the reference reads back as CR.
+fn escape_text(raw: &str) -> Cow<'_, str> {
+    escape_with(raw, |c| match c {
+        '\r' => Some("&#13;"),
+        _ => None,
+    })
+}
+
+/// Escape `raw` for an attribute value: [`escape_text`]'s set plus LF and
+/// tab as `&#10;` / `&#9;`. Attribute-value normalization reads a raw tab,
+/// LF or CR back as a space; the references read back as themselves.
+fn escape_attr(raw: &str) -> Cow<'_, str> {
+    escape_with(raw, |c| match c {
+        '\r' => Some("&#13;"),
+        '\n' => Some("&#10;"),
+        '\t' => Some("&#9;"),
+        _ => None,
+    })
+}
+
+/// Replace the five markup characters and whatever `extra` maps.
+fn escape_with(raw: &str, extra: impl Fn(char) -> Option<&'static str>) -> Cow<'_, str> {
+    let escaped = |c: char| match c {
+        '<' => Some("&lt;"),
+        '>' => Some("&gt;"),
+        '&' => Some("&amp;"),
+        '\'' => Some("&apos;"),
+        '"' => Some("&quot;"),
+        other => extra(other),
+    };
+    let Some(first) = raw.find(|c| escaped(c).is_some()) else {
         return Cow::Borrowed(raw);
     };
     let mut out = String::with_capacity(raw.len() + 8);
     out.push_str(&raw[..first]);
     for c in raw[first..].chars() {
-        match c {
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '&' => out.push_str("&amp;"),
-            '\'' => out.push_str("&apos;"),
-            '"' => out.push_str("&quot;"),
-            other => out.push(other),
+        match escaped(c) {
+            Some(entity) => out.push_str(entity),
+            None => out.push(c),
         }
     }
     Cow::Owned(out)
 }
 
-/// `BytesText` for a text body, escaped with [`escape_xml`].
+/// `BytesText` for a text body, escaped with [`escape_text`].
 fn text_event(s: &str) -> BytesText<'_> {
-    BytesText::from_escaped(escape_xml(s))
+    BytesText::from_escaped(escape_text(s))
 }
 
 /// `BytesText` for a comment body, written as it is: XML has no escapes in
@@ -1356,12 +1481,17 @@ mod tests {
 
     #[test]
     fn xml_names_follow_the_name_production() {
-        for name in ["r", "_a", ":a", "x:y:z", "a-b.c1", "é", "a\u{B7}"] {
-            assert!(is_xml_name(name), "{name:?} is a name");
+        for name in [
+            "r", "_a", "svg:rect", "xmlns", "xmlns:p", "a-b.c1", "é", "a\u{B7}",
+        ] {
+            assert!(is_qname(name), "{name:?} is a QName");
         }
-        for name in ["", "1x", "-a", ".a", "a b", "a\tb", "a/b", "\u{B7}a"] {
-            assert!(!is_xml_name(name), "{name:?} is not a name");
+        for name in [
+            "", "1x", "-a", ".a", "a b", "a\tb", "a/b", "\u{B7}a", ":a", "a:", "x:y:z", "a:1",
+        ] {
+            assert!(!is_qname(name), "{name:?} is not a QName");
         }
+        assert!(is_xml_name("x:y:z") && !is_ncname("x:y") && is_ncname("t"));
     }
 
     #[test]
@@ -1406,6 +1536,44 @@ mod tests {
             })
             .collect();
         assert_eq!(text, "a]]>b]]>");
+    }
+
+    #[test]
+    fn a_declared_encoding_must_agree_with_utf8_bytes() {
+        let ascii = FirstNonAscii::default();
+        let mut accented = FirstNonAscii::default();
+        accented.note("café", || "in <r>".to_owned());
+        for enc in ["UTF-8", "utf8", "Utf-8"] {
+            assert!(check_declared_encoding(enc, &accented).is_ok(), "{enc}");
+        }
+        for enc in [
+            "US-ASCII",
+            "iso-8859-15",
+            "ISO-8859-1",
+            "windows-1250",
+            "Windows-1258",
+        ] {
+            assert!(check_declared_encoding(enc, &ascii).is_ok(), "{enc}");
+            assert!(check_declared_encoding(enc, &accented).is_err(), "{enc}");
+        }
+        for enc in [
+            "UTF-16",
+            "ISO-8859-12",
+            "ISO-8859-01",
+            "windows-1259",
+            "Shift_JIS",
+        ] {
+            assert!(check_declared_encoding(enc, &ascii).is_err(), "{enc}");
+        }
+        let err = check_declared_encoding("US-ASCII", &accented).expect_err("refused");
+        assert!(err.to_string().ends_with("holds U+00E9 in <r>"), "{err}");
+    }
+
+    #[test]
+    fn whitespace_xml_would_normalise_is_escaped() {
+        assert_eq!(escape_text("a\tb\nc\rd<"), "a\tb\nc&#13;d&lt;");
+        assert_eq!(escape_attr("a\tb\nc\rd\""), "a&#9;b&#10;c&#13;d&quot;");
+        assert!(matches!(escape_attr("plain"), Cow::Borrowed(_)));
     }
 
     #[test]

@@ -879,11 +879,11 @@ macro_rules! refused {
     };
 }
 
-/// Names and the declaration: an element name, an attribute name and a PI
-/// target must be XML names (a PI target not `xml`), and the `#xml` fields
-/// must fit the declaration grammar — a boolean `standalone` is `yes` / `no`.
-/// The writer refuses the rest instead of emitting XML that is not
-/// well-formed. A colon is a name character: `x:y:z` is written.
+/// Names and the declaration: an element or attribute name must be a
+/// namespace QName (one `prefix:` at most; `xmlns:p` passes), a PI target an
+/// NCName other than `xml`, and the `#xml` fields must fit the declaration
+/// grammar — a boolean `standalone` is `yes` / `no`. The writer refuses the
+/// rest instead of emitting XML that is not well-formed.
 #[test]
 fn xml_refuses_names_and_declaration_fields_xml_does_not_allow() {
     let dir = dir_with(&[
@@ -895,6 +895,13 @@ fn xml_refuses_names_and_declaration_fields_xml_does_not_allow() {
         ("ver.yaml", "\"#xml\": {version: abc}\nr:\n- {}\n"),
         ("enc.yaml", "\"#xml\": {encoding: \"a b\"}\nr:\n- {}\n"),
         ("colons.yaml", "\"x:y:z\":\n- {}\n"),
+        ("lead_colon.yaml", "\":a\":\n- {}\n"),
+        ("trail_colon.yaml", "r:\n- \"@attrs\": {\"a:\": 1}\n"),
+        (
+            "prefixed.yaml",
+            "\"svg:r\":\n- \"@attrs\": {\"xmlns:svg\": u, xmlns: d, \"svg:w\": 1}\n",
+        ),
+        ("pi_colon.yaml", "r:\n- \"#pi\": [\"a:b c\"]\n"),
         ("space.yaml", "\"a b\":\n- {}\n"),
         ("digit.yaml", "r:\n- \"1x\": [{}]\n"),
         ("empty.yaml", "\"\":\n- {}\n"),
@@ -920,7 +927,38 @@ fn xml_refuses_names_and_declaration_fields_xml_does_not_allow() {
             "enc.yaml",
             refused!("'#xml' field 'encoding' is not an encoding name (got \"a b\")"),
         ),
-        ("colons.yaml", ok("<x:y:z/>")),
+        (
+            "colons.yaml",
+            refused!(
+                "'x:y:z' is not a valid XML name for an element (a name holds at most one ':', \
+                 between a prefix and a local name)"
+            ),
+        ),
+        (
+            "lead_colon.yaml",
+            refused!(
+                "':a' is not a valid XML name for an element (a name holds at most one ':', \
+                 between a prefix and a local name)"
+            ),
+        ),
+        (
+            "trail_colon.yaml",
+            refused!(
+                "'a:' is not a valid XML name for an attribute (on <r>) (a name holds at most \
+                 one ':', between a prefix and a local name)"
+            ),
+        ),
+        (
+            "prefixed.yaml",
+            ok("<svg:r xmlns:svg=\"u\" xmlns=\"d\" svg:w=\"1\"/>"),
+        ),
+        (
+            "pi_colon.yaml",
+            refused!(
+                "'a:b' is not a valid XML name for a processing-instruction target \
+                 ('#pi' of <r>, a target holds no ':')"
+            ),
+        ),
         (
             "space.yaml",
             refused!("'a b' is not a valid XML name for an element"),
@@ -1018,6 +1056,89 @@ fn xml_refuses_content_xml_cannot_hold_and_round_trips_a_read_tree() {
             refused!("'#cdata' of <r> holds U+001F, a character XML 1.0 does not allow"),
         ),
         ("rt.xml", (0, round_trip, "")),
+    ];
+    assert_cases(
+        &dir,
+        &cases.map(|(file, outcome)| (vec!["-q", "convert", file, "-F", "xml"], outcome)),
+    );
+}
+
+/// dq writes UTF-8, so `#xml` may declare UTF-8 in any spelling, or an
+/// ASCII-compatible encoding when the whole document is ASCII; any other
+/// declaration is refused, naming the first non-ASCII character and where it
+/// is. A CR in text and a tab / LF / CR in an attribute value are written as
+/// character references, so they read back unchanged — and a file holding
+/// those references writes back byte for byte.
+#[test]
+fn xml_declares_only_an_encoding_its_utf8_bytes_satisfy_and_keeps_whitespace() {
+    let refs = "<r a=\"x&#10;y&#9;z&#13;w\">p&#13;q\ns</r>";
+    let latin = "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><r>cafe</r>";
+    let dir = dir_with(&[
+        (
+            "utf8.yaml",
+            "\"#xml\": {encoding: utf8}\nr:\n- \"#text\": é\n",
+        ),
+        (
+            "latin_ascii.yaml",
+            "\"#xml\": {encoding: ISO-8859-1}\nr:\n- \"#text\": cafe\n",
+        ),
+        (
+            "latin.yaml",
+            "\"#xml\": {encoding: ISO-8859-1}\nr:\n- \"#text\": café\n",
+        ),
+        (
+            "windows.yaml",
+            "\"#xml\": {encoding: windows-1252}\n\"#comments\": [ü]\nr:\n- {}\n",
+        ),
+        (
+            "ascii.yaml",
+            "\"#xml\": {encoding: US-ASCII}\nr:\n- k: [{\"@attrs\": {a: π}}]\n",
+        ),
+        ("utf16.yaml", "\"#xml\": {encoding: UTF-16}\nr:\n- {}\n"),
+        (
+            "ws.yaml",
+            "r:\n- \"@attrs\": {a: \"x\\ny\\tz\\rw\"}\n  \"#text\": \"p\\rq\\ns\"\n",
+        ),
+        ("refs.xml", refs),
+        ("latin.xml", latin),
+    ]);
+    let cases = [
+        (
+            "utf8.yaml",
+            ok("<?xml version=\"1.0\" encoding=\"utf8\"?><r>é</r>"),
+        ),
+        (
+            "latin_ascii.yaml",
+            ok("<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><r>cafe</r>"),
+        ),
+        (
+            "latin.yaml",
+            refused!(
+                "'#xml' declares encoding \"ISO-8859-1\" but dq writes UTF-8 and the document \
+                 holds U+00E9 in <r>"
+            ),
+        ),
+        (
+            "windows.yaml",
+            refused!(
+                "'#xml' declares encoding \"windows-1252\" but dq writes UTF-8 and the document \
+                 holds U+00FC at the top level"
+            ),
+        ),
+        (
+            "ascii.yaml",
+            refused!(
+                "'#xml' declares encoding \"US-ASCII\" but dq writes UTF-8 and the document \
+                 holds U+03C0 in <k>"
+            ),
+        ),
+        (
+            "utf16.yaml",
+            refused!("'#xml' declares encoding \"UTF-16\" but dq writes UTF-8"),
+        ),
+        ("ws.yaml", ok(refs)),
+        ("refs.xml", ok(refs)),
+        ("latin.xml", ok(latin)),
     ];
     assert_cases(
         &dir,
