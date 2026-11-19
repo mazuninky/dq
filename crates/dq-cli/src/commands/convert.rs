@@ -588,8 +588,16 @@ fn render_to_format(
             )));
         }
     }
+    // A same-format render copies the source bytes, byte order mark
+    // included; converted output never carries one.
+    if buf.starts_with(UTF8_BOM) {
+        buf.drain(..UTF8_BOM.len());
+    }
     Ok(buf)
 }
+
+/// The UTF-8 byte order mark a source file may open with.
+const UTF8_BOM: &[u8] = "\u{feff}".as_bytes();
 
 /// Build a fresh Frontmatter [`Document`] that wraps `input_doc`'s value as
 /// the YAML header with an empty body. Used when `convert -F frontmatter` is

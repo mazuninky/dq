@@ -27,6 +27,12 @@ pub enum PathErrorKind {
         /// What we actually found.
         found: &'static str,
     },
+    /// An RFC 6902 `move` into one of the children of the value it moves:
+    /// its `from` is a proper prefix of its `path` (RFC 6902 §4.4).
+    IntoItsOwnChild {
+        /// The `from` of the move, in canonical form.
+        from: String,
+    },
 }
 
 /// All errors `dq-core` may produce.
@@ -187,6 +193,10 @@ fn path_message(pointer: &str, matched_prefix: &str, kind: &PathErrorKind) -> St
         } => format!(
             "cannot set the root '{pointer}' of a stream of documents: set one document \
              as /N, or pass --doc N"
+        ),
+        PathErrorKind::IntoItsOwnChild { from } => format!(
+            "cannot move '{from}' to '{pointer}': a value cannot move into one of its own \
+             children"
         ),
         _ => format!("path '{pointer}' not found (matched up to '{matched_prefix}')"),
     }

@@ -61,7 +61,7 @@ impl Document {
     ///
     /// As [`Document::reemit_stream_document`], for a file that is not one
     /// write-aware YAML document.
-    pub(crate) fn reemit_yaml_root(&mut self, value: Value) -> Result<()> {
+    pub fn reemit_yaml_root(&mut self, value: Value) -> Result<()> {
         if self.format != FormatTag::Yaml || !self.write_aware || self.multi_doc {
             return Err(Error::WriteUnavailable {
                 reason: "not a write-aware YAML document".to_owned(),

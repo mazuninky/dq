@@ -87,6 +87,8 @@ enum PathKindView {
         expected: &'static str,
         found: &'static str,
     },
+    #[serde(rename = "IntoItsOwnChild")]
+    IntoItsOwnChild { from: String },
 }
 
 impl From<&PathErrorKind> for PathKindView {
@@ -97,6 +99,7 @@ impl From<&PathErrorKind> for PathKindView {
             PathErrorKind::TypeMismatch { expected, found } => {
                 Self::TypeMismatch { expected, found }
             }
+            PathErrorKind::IntoItsOwnChild { from } => Self::IntoItsOwnChild { from: from.clone() },
         }
     }
 }

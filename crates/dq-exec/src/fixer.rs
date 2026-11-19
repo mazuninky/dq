@@ -594,23 +594,31 @@ fn apply_jq_branch(
 
     // In a write-aware stream only this document is re-emitted through
     // the writer; every other document keeps its bytes, and the stream
-    // stays write-aware for the rules after this one.
-    if let Some(index) = slot
-        && !doc.original_bytes().is_empty()
-    {
+    // stays write-aware for the rules after this one. A write-aware YAML
+    // file of one document is re-emitted the same way: its directives,
+    // `---` and the comment lines around the content stay.
+    if !doc.original_bytes().is_empty() {
         let mut working = doc.clone();
-        match working.reemit_stream_document(index, new_value.clone()) {
-            Ok(()) => {
+        let reemitted = match slot {
+            Some(index) => Some(working.reemit_stream_document(index, new_value.clone())),
+            None if doc.format() == dq_core::FormatTag::Yaml && doc.is_write_aware() => {
+                Some(working.reemit_yaml_root(new_value.clone()))
+            }
+            None => None,
+        };
+        match reemitted {
+            Some(Ok(())) => {
                 *doc = working;
                 audit.applied_rules.push(rule.rule.id.clone());
                 return Ok(true);
             }
-            Err(err) => tracing::warn!(
+            Some(Err(err)) => tracing::warn!(
                 rule_id = %rule.rule.id,
-                document = index,
+                document = %document_name(slot),
                 error = %err,
-                "fix.jq: cannot re-emit this document alone; re-emitting the whole stream",
+                "fix.jq: cannot re-emit this document alone; re-emitting the whole file",
             ),
+            None => {}
         }
     }
 

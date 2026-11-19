@@ -1876,3 +1876,181 @@ fn patch_move_lands_only_where_the_parent_survives_the_removal() {
         reads: json!({"a": {"y": 1}, "b": 2}),
     }]);
 }
+
+// ---- patch and merge on a stream, moves into a child ------------------
+
+#[test]
+fn patch_move_into_its_own_child_is_refused() {
+    for ops in [
+        r#"[{"op":"move","from":"/a","path":"/a/y"}]"#,
+        r#"[{"op":"move","from":"/a/x","path":"/a/x/z"}]"#,
+    ] {
+        refused(
+            "f.yaml",
+            "a: {x: {y: 1}}\nb: 2\n",
+            &["-i", "patch", "f.yaml", ops],
+            2,
+        );
+    }
+}
+
+/// The refusal names both paths of the move.
+#[test]
+fn patch_move_into_its_own_child_names_both_paths() {
+    let stderr = refused(
+        "f.yaml",
+        "a: {x: 1}\nb: 2\n",
+        &[
+            "patch",
+            "f.yaml",
+            r#"[{"op":"move","from":"/a","path":"/a/y"}]"#,
+        ],
+        2,
+    );
+    assert!(
+        stderr.contains("cannot move '/a' to '/a/y'"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn patch_on_a_whole_stream_document_does_what_set_and_del_do() {
+    check(&[
+        Case {
+            name: "s.yaml",
+            src: "a: 1\n---\nb: 2\n",
+            args: &["patch", "s.yaml", r#"[{"op":"remove","path":"/1"}]"#],
+            want: "a: 1\n",
+            reads: json!({"a": 1}),
+        },
+        Case {
+            name: "s.yaml",
+            src: "a: 1\n---\nb: 2\n",
+            args: &[
+                "patch",
+                "s.yaml",
+                r#"[{"op":"replace","path":"/1","value":{"x":1}}]"#,
+            ],
+            want: "a: 1\n---\nx: 1\n",
+            reads: json!([{"a": 1}, {"x": 1}]),
+        },
+    ]);
+}
+
+/// Once a patch has removed all but one document of a stream, that one
+/// is still `/0` to the ops after it; `/1` is past the end.
+#[test]
+fn patch_still_addresses_the_last_document_left_as_0() {
+    check(&[Case {
+        name: "s.yaml",
+        src: "a: 1\n---\nb: 2\n",
+        args: &[
+            "patch",
+            "s.yaml",
+            r#"[{"op":"remove","path":"/1"},{"op":"replace","path":"/0/a","value":5}]"#,
+        ],
+        want: "a: 5\n",
+        reads: json!({"a": 5}),
+    }]);
+    refused(
+        "s.yaml",
+        "a: 1\n---\nb: 2\n",
+        &[
+            "patch",
+            "s.yaml",
+            r#"[{"op":"move","from":"/0","path":"/1"}]"#,
+        ],
+        2,
+    );
+}
+
+/// A merge patch applies to one document: a stream is refused (exit 6).
+#[test]
+fn merge_into_a_stream_is_refused() {
+    let stderr = refused(
+        "s.yaml",
+        "a: 1\n---\nb: 2\n",
+        &["merge", "s.yaml", r#"{"c": 3}"#],
+        6,
+    );
+    assert!(stderr.contains("is a stream of 2"), "stderr: {stderr}");
+}
+
+// ---- fix.jq on a file of one document ----------------------------------
+
+/// A `fix.jq` re-emit of a file's only document keeps its directives,
+/// `---`, the lead-in lines and the comment lines after the content.
+#[test]
+fn fix_jq_reemit_of_a_single_document_keeps_what_is_around_it() {
+    let rule = "
+id: test.jq
+description: re-emit the document
+severity: warn
+match: {format: yaml}
+check:
+  jq: 'select(.bad == true)'
+  message: bad
+fix:
+  jq: 'del(.bad) | .ok = true'
+";
+    for (src, want) in [
+        (
+            "---\n# lead\n\nbad: true\nx: 1\n",
+            "---\n# lead\n\nx: 1\nok: true\n",
+        ),
+        (
+            "%YAML 1.2\n---\n# lead\nbad: true # gone\nx: 1\n# tail\n",
+            "%YAML 1.2\n---\n# lead\nx: 1\nok: true\n# tail\n",
+        ),
+        ("bad: true\r\nx: 1\r\n", "x: 1\r\nok: true\r\n"),
+    ] {
+        let out = fix(rule, src);
+        assert_eq!((out.code, out.stderr.as_str()), (0, ""), "{src:?}");
+        assert_eq!(out.file, want, "{src:?}");
+        assert_eq!(read("s.yaml", &out.file), json!({"x": 1, "ok": true}));
+    }
+}
+
+// ---- JSON with a byte order mark --------------------------------------
+
+/// RFC 8259 §8.1: a byte order mark before the JSON text is read past;
+/// textual edits keep it, `convert` output has none.
+#[test]
+fn json_with_a_byte_order_mark_is_read_and_edited_keeping_it() {
+    check(&[
+        Case {
+            name: "f.json",
+            src: "\u{feff}{\"a\": 1}\n",
+            args: &["set", "f.json", "/a", "2"],
+            want: "\u{feff}{\"a\": 2}\n",
+            reads: json!({"a": 2}),
+        },
+        Case {
+            name: "f.json",
+            src: "\u{feff}{\"a\": 1, \"b\": 2}\n",
+            args: &["del", "f.json", "/b"],
+            want: "\u{feff}{\"a\": 1}\n",
+            reads: json!({"a": 1}),
+        },
+    ]);
+    let out = run("f.json", "\u{feff}{\"a\": 1}\n", &["get", "f.json", "/a"]);
+    assert_eq!(
+        (out.code, out.stdout.as_str()),
+        (0, "1\n"),
+        "{}",
+        out.stderr
+    );
+    for target in ["json", "yaml"] {
+        let out = run(
+            "f.json",
+            "\u{feff}{\"a\": 1}\n",
+            &["-q", "-F", target, "convert", "f.json"],
+        );
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        assert!(
+            !out.stdout.starts_with('\u{feff}'),
+            "-F {target}: {:?}",
+            out.stdout
+        );
+    }
+}

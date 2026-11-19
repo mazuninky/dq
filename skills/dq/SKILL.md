@@ -113,7 +113,7 @@ dq del bundle.yaml /1 -i                          # remove document 1 with its -
 dq lint bundle.yaml                               # every document linted on its own
 ```
 
-`lint` / `check` / `fix` evaluate each document separately; `fix` keeps every document and `---` (a `fix.ops` `remove ""` drops its own document). `set FILE '' VALUE` on a file that is no stream replaces the whole document (TOML: only by a table); `del FILE ''` is exit 2. `--doc` on a command that cannot honour it (`fmt`, `validate`, `diff`, `patch`, `merge`, `convert -i`, `--doc all` with `set` / `del`) is a usage error, exit 2; so is an index past the last document of a single file (over several files such a file is skipped with a stderr note; exit 2 again when no file holds it).
+`lint` / `check` / `fix` evaluate each document separately; `fix` keeps every document and `---` (a `fix.ops` `remove ""` drops its own document). `set FILE '' VALUE` on a file that is no stream replaces the whole document (TOML: only by a table); `del FILE ''` is exit 2. `patch` takes stream documents as `/N` like `set` / `del`; `merge` on a stream is exit 6. `--doc` on a command that cannot honour it (`fmt`, `validate`, `diff`, `patch`, `merge`, `convert -i`, `--doc all` with `set` / `del`) is a usage error, exit 2; so is an index past the last document of a single file (over several files such a file is skipped with a stderr note; exit 2 again when no file holds it).
 
 ## Write — in-place with round-trip preservation
 

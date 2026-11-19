@@ -43,7 +43,7 @@ use serde_json::value::Number as JsonNumber;
 use crate::Result;
 use crate::WriteOptions;
 use crate::document::spans::{SpanContext, SpanMap, ValueSpan};
-use crate::document::{Document, FormatTag, Value};
+use crate::document::{Document, FormatTag, Value, bom_end};
 use crate::error::Error;
 use crate::format::Format;
 use crate::textual_edit::{InsertionRenderer, ScalarRenderer};
@@ -69,7 +69,7 @@ impl Format for Json {
         // contract (it rejects JSONC before serde_json would reject the
         // comment as unexpected token), giving a clearer diagnostic.
         let spans = build_span_map(bytes)?;
-        let json: JsonValue = serde_json::from_slice(bytes).map_err(|e| {
+        let json: JsonValue = serde_json::from_slice(&bytes[bom_end(bytes)..]).map_err(|e| {
             let line = e.line() as u32;
             let col = e.column() as u32;
             let (span, snippet) = compute_parse_anchor(bytes, e.line());
@@ -176,7 +176,7 @@ impl Format for Json {
 ///   comments, or fails strict JSON parsing.
 pub fn parse_with_spans(bytes: &[u8]) -> Result<(Value, SpanMap)> {
     let spans = build_span_map(bytes)?;
-    let json: JsonValue = serde_json::from_slice(bytes).map_err(|e| {
+    let json: JsonValue = serde_json::from_slice(&bytes[bom_end(bytes)..]).map_err(|e| {
         let line = e.line() as u32;
         let col = e.column() as u32;
         let (span, snippet) = compute_parse_anchor(bytes, e.line());
@@ -262,6 +262,8 @@ fn scan(bytes: &[u8], containers: bool) -> Result<(SpanMap, Option<ContainerRang
     }
     let lines = LineIndex::new(bytes);
     let mut scanner = Scanner::new(bytes, lines);
+    // RFC 8259 §8.1: a byte order mark may open the text; it is no value.
+    scanner.pos = bom_end(bytes);
     scanner.containers = containers.then(HashMap::new);
     let mut spans = SpanMap::new();
     scanner.skip_ws_and_check_jsonc()?;
@@ -1267,6 +1269,16 @@ mod tests {
 
     fn parse(s: &str) -> Document {
         Json.parse(s.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn a_byte_order_mark_before_the_text_is_read_past() {
+        let src = "\u{feff}{\"a\": [1]}\n";
+        let doc = parse(src);
+        assert_eq!(doc.value().to_serde_json(), serde_json::json!({"a": [1]}));
+        let spanned = parse_json_with_spans(src.as_bytes()).unwrap();
+        assert_eq!(spanned.value(), doc.value());
+        assert_eq!(write(&doc), src, "the bytes are written as they came");
     }
 
     fn write(doc: &Document) -> String {

@@ -9,7 +9,8 @@
 //! 1. Resolve the format (extension or `-F`).
 //! 2. Read the original bytes.
 //! 3. Run the template guard (mirrors `commands::set` / `commands::patch`).
-//! 4. Parse to a write-aware [`Document`].
+//! 4. Parse to a write-aware [`Document`]; a YAML stream of documents is
+//!    refused (exit 6): a merge patch applies to one document.
 //! 5. Apply the pre-resolved merge patch via [`dq_core::apply_merge`] —
 //!    atomic rollback on any failure is the engine's responsibility.
 //! 6. Restore template placeholders if the substitution pass ran.
@@ -105,6 +106,15 @@ impl<'a> FileOp for MergeFileOp<'a> {
         };
 
         let mut document = parse_to_document(format, &parse_input, path)?;
+        // RFC 7396 merges into one document; a stream is several, and
+        // `--doc` is refused here.
+        if let Some(documents) = document.values() {
+            return Err(anyhow::Error::new(InvalidInput::new(format!(
+                "`dq merge` merges into one document, and {path} is a stream of {}: \
+                 change one of them with `dq patch` (paths /N/...) or `dq set /N`",
+                documents.len()
+            ))));
+        }
 
         // Apply the merge patch atomically — on any failure, the engine
         // leaves `document` untouched (clone-on-apply).
@@ -154,7 +164,8 @@ fn parse_to_document(
 ) -> anyhow::Result<Document> {
     let path_label = Utf8PathBuf::from(file);
     let doc_result: dq_core::Result<Document> = match format.name() {
-        "yaml" => dq_core::parse_yaml_with_spans(parse_input),
+        // Stream-aware, so a stream of documents is told from one document.
+        "yaml" => dq_core::parse_yaml_stream_with_spans(parse_input),
         "json" => dq_core::parse_json_with_spans(parse_input),
         _ => format.parse(parse_input),
     };

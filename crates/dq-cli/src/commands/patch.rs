@@ -160,7 +160,8 @@ fn parse_to_document(
 ) -> anyhow::Result<Document> {
     let path_label = Utf8PathBuf::from(file);
     let doc_result: dq_core::Result<Document> = match format.name() {
-        "yaml" => dq_core::parse_yaml_with_spans(parse_input),
+        // Stream-aware, like `set` and `del`: `/N` is a whole document.
+        "yaml" => dq_core::parse_yaml_stream_with_spans(parse_input),
         "json" => dq_core::parse_json_with_spans(parse_input),
         _ => format.parse(parse_input),
     };
