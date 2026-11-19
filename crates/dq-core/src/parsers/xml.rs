@@ -66,14 +66,18 @@
 //! declared by an `xmlns:p` on the element or an ancestor (`xml` always
 //! is), `xmlns` names only declarations, `xmlns:xml` binds only its fixed
 //! URI, no other declaration binds the `xml` or `xmlns` namespace URI, and
-//! `xmlns:p=""` (undeclaring, XML namespaces 1.1 only) is refused.
+//! `xmlns:p=""` (undeclaring, XML namespaces 1.1 only) is refused. The
+//! reader refuses the same, as a parse error: an undeclared prefix on an
+//! element (`<a:b/>`) or an attribute (`<r a:x="1"/>`), and a declaration
+//! the writer would refuse.
 //!
 //! ## Encodings
 //!
 //! The reader decodes a file per its byte order mark, else per the
-//! declaration's `encoding` when that encoding keeps ASCII as ASCII
-//! (US-ASCII, ISO-8859-1, windows-1252, Shift_JIS, …), else as UTF-8; an
-//! unknown label reads as UTF-8. The writer encodes its output in the
+//! declaration's `encoding` when that declaration reads in ASCII
+//! (US-ASCII, ISO-8859-1, windows-1252, Shift_JIS, ISO-2022-JP, …), else
+//! as UTF-8; it refuses a label dq does not know (`UTF-32`) or cannot read
+//! (`ISO-2022-KR`), as the writer does. The writer encodes its output in the
 //! encoding `#xml` declares (UTF-8 without one), beginning with the BOM
 //! `bom` names — UTF-16 always has one, little-endian by default — and
 //! refuses a label dq does
@@ -196,6 +200,8 @@ struct Frame {
     /// text (or vice-versa). Used to detect mixed content.
     saw_element: bool,
     saw_mixed: bool,
+    /// The namespace prefixes this element's `xmlns:p` attributes declare.
+    prefixes: Vec<String>,
 }
 
 impl Frame {
@@ -211,6 +217,7 @@ impl Frame {
             comments: Vec::new(),
             saw_element: false,
             saw_mixed: false,
+            prefixes: Vec::new(),
         }
     }
 
@@ -326,7 +333,11 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                 push_comment(&mut stack, &mut top_comments, txt);
             }
             Ok(Event::Start(start)) => {
-                let frame = build_start_frame(&start)?;
+                let mut frame = build_start_frame(&start)?;
+                check_namespaces(&stack, &mut frame).map_err(|message| {
+                    let pos = reader.buffer_position() as usize;
+                    parse_error_at(text, pos, message)
+                })?;
                 if let Some(parent) = stack.last_mut() {
                     parent.saw_element = true;
                     if parent.has_text {
@@ -336,7 +347,11 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                 stack.push(frame);
             }
             Ok(Event::Empty(start)) => {
-                let frame = build_start_frame(&start)?;
+                let mut frame = build_start_frame(&start)?;
+                check_namespaces(&stack, &mut frame).map_err(|message| {
+                    let pos = reader.buffer_position() as usize;
+                    parse_error_at(text, pos, message)
+                })?;
                 if let Some(parent) = stack.last_mut() {
                     parent.saw_element = true;
                     if parent.has_text {
@@ -539,12 +554,14 @@ fn names_utf16_byte_order(label: &str) -> bool {
 /// no BOM whose declaration names no byte order — the byte order it was
 /// read in ([`Bom::Utf16Le`] / [`Bom::Utf16Be`]). The encoding is the
 /// BOM's, else UTF-16 when the file starts `<?` in 16-bit units, else the
-/// one the declaration names if that encoding keeps ASCII as ASCII
-/// (US-ASCII, ISO-8859-1, windows-1252, Shift_JIS, …), else UTF-8. A label
-/// dq does not know, or a UTF-16 label over 8-bit bytes, reads as UTF-8,
-/// as it did before dq decoded other encodings. A parse error: an
-/// `encoding` that is not an encoding name (` ISO-8859-1 `), and one dq
-/// knows that the BOM, or the UTF-16 the file begins in, contradicts.
+/// one the declaration names if its declaration reads in ASCII (US-ASCII,
+/// ISO-8859-1, windows-1252, Shift_JIS, ISO-2022-JP, …), else UTF-8. A
+/// UTF-16 label over 8-bit bytes reads as UTF-8. A parse error: an
+/// `encoding` that is not an encoding name (` ISO-8859-1 `), one dq does
+/// not know (`UTF-32`, `x-foo`) or cannot read (`ISO-2022-KR`, which
+/// encoding_rs decodes to nothing but U+FFFD), and one the BOM, or the
+/// UTF-16 the file begins in, contradicts. The writer refuses the same
+/// labels.
 fn decode_input(bytes: &[u8]) -> Result<(Cow<'_, str>, Option<Bom>, Option<Bom>)> {
     use quick_xml::encoding::{DetectedEncoding, detect_encoding};
     let (bom, detected, body, utf16) = match detect_encoding(bytes) {
@@ -572,6 +589,19 @@ fn decode_input(bytes: &[u8]) -> Result<(Cow<'_, str>, Option<Bom>, Option<Bom>)
             return Err(invalid(format!(
                 "the XML declaration's encoding {label:?} is not an encoding name"
             )));
+        }
+        match Charset::for_label(label) {
+            None => {
+                return Err(invalid(format!(
+                    "the XML declaration's encoding {label:?} is one dq does not know"
+                )));
+            }
+            Some(Charset::Whatwg(encoding)) if encoding == REPLACEMENT => {
+                return Err(invalid(format!(
+                    "the XML declaration's encoding {label:?} is one dq cannot read"
+                )));
+            }
+            Some(_) => {}
         }
         match (bom, detected, Charset::for_label(label)) {
             (Some(bom), _, Some(charset)) if !bom.admits(charset, label) => Err(invalid(format!(
@@ -603,11 +633,14 @@ fn decode_input(bytes: &[u8]) -> Result<(Cow<'_, str>, Option<Bom>, Option<Bom>)
     if let Some(label) = label {
         check_label(label)?;
     }
+    // A UTF-16 label over 8-bit bytes reads as UTF-8. ISO-2022-JP is not
+    // ASCII-compatible to encoding_rs, but it starts in ASCII, so its
+    // declaration reads as written.
     let charset = label
         .filter(|_| bom.is_none())
         .and_then(Charset::for_label)
         .filter(|charset| match charset {
-            Charset::Whatwg(encoding) => encoding.is_ascii_compatible(),
+            Charset::Whatwg(encoding) => *encoding != UTF_16LE && *encoding != UTF_16BE,
             Charset::Ascii | Charset::Latin1 => true,
         })
         .unwrap_or(Charset::Whatwg(UTF_8));
@@ -747,6 +780,56 @@ fn declared_label(bytes: &[u8]) -> Option<&str> {
 }
 
 /// Build a [`Frame`] from a `<tag attr="...">` event.
+/// A parse error at byte `pos` of `text`, `XML parse error: ` + `message`.
+fn parse_error_at(text: &str, pos: usize, message: String) -> Error {
+    let (line, col) = byte_pos_to_line_col(text, pos);
+    Error::Parse {
+        file: None,
+        line,
+        col,
+        span: pos..pos,
+        snippet: snippet_for_pos(text, pos),
+        message: format!("XML parse error: {message}"),
+    }
+}
+
+/// Record on `frame` the prefixes its attributes declare, and refuse what
+/// the writer refuses ([`Scope`]): a declaration Namespaces in XML 1.0
+/// forbids, and an element or attribute name whose prefix no `xmlns:p` on
+/// the element or an ancestor (`stack`) declares — `xml` always is. Read,
+/// such a file could not be written back.
+fn check_namespaces(stack: &[Frame], frame: &mut Frame) -> std::result::Result<(), String> {
+    let mut prefixes = Vec::new();
+    for (name, value) in &frame.attrs {
+        let Value::String(uri) = value else {
+            continue;
+        };
+        if let Some(prefix) = declared_prefix(name, uri, &frame.tag)? {
+            prefixes.push(prefix.to_owned());
+        }
+    }
+    frame.prefixes = prefixes;
+    let declares = |prefix: &str| {
+        prefix == "xml"
+            || frame
+                .prefixes
+                .iter()
+                .chain(stack.iter().flat_map(|f| &f.prefixes))
+                .any(|p| p == prefix)
+    };
+    if let Some(message) = undeclared_prefix(&frame.tag, None, declares) {
+        return Err(message);
+    }
+    for name in frame.attrs.keys() {
+        if !is_namespace_declaration(name)
+            && let Some(message) = undeclared_prefix(name, Some(&frame.tag), declares)
+        {
+            return Err(message);
+        }
+    }
+    Ok(())
+}
+
 fn build_start_frame(start: &BytesStart<'_>) -> Result<Frame> {
     let tag = start.name().as_ref().to_owned();
     let mut frame = Frame::new(tag);
@@ -1266,49 +1349,10 @@ impl<'a> Scope<'a> {
         tag: &str,
         attributes: &'a [(&'a str, String)],
     ) -> Result<Self> {
-        let refuse = |message: String| Error::Format {
-            format: "xml",
-            message: format!("XML write: {message}"),
-        };
         let mut prefixes = Vec::new();
         for (name, uri) in attributes {
-            let prefix = match name.strip_prefix("xmlns") {
-                Some("") => None,
-                Some(rest) => match rest.strip_prefix(':') {
-                    Some(prefix) => Some(prefix),
-                    None => continue,
-                },
-                None => continue,
-            };
-            match prefix {
-                Some("xmlns") => {
-                    return Err(refuse(format!(
-                        "'{name}' on <{tag}> cannot be declared: the xmlns prefix is reserved",
-                    )));
-                }
-                Some("xml") if uri != XML_NAMESPACE => {
-                    return Err(refuse(format!(
-                        "'{name}' on <{tag}> must bind {XML_NAMESPACE} (got {uri:?})",
-                    )));
-                }
-                Some("xml") => {}
-                _ if uri == XML_NAMESPACE => {
-                    return Err(refuse(format!(
-                        "'{name}' on <{tag}> binds {XML_NAMESPACE}, which only the xml prefix may",
-                    )));
-                }
-                _ if uri == XMLNS_NAMESPACE => {
-                    return Err(refuse(format!(
-                        "'{name}' on <{tag}> binds {XMLNS_NAMESPACE}, which nothing may",
-                    )));
-                }
-                Some(_) if uri.is_empty() => {
-                    return Err(refuse(format!(
-                        "'{name}' on <{tag}> is empty: XML namespaces 1.0 cannot undeclare a prefix",
-                    )));
-                }
-                Some(prefix) => prefixes.push(prefix),
-                None => {}
+            if let Some(prefix) = declared_prefix(name, uri, tag).map_err(write_refusal)? {
+                prefixes.push(prefix);
             }
         }
         Ok(Self {
@@ -1327,32 +1371,85 @@ impl<'a> Scope<'a> {
     /// `<on>` whose prefix is not in scope, and an element named with the
     /// reserved `xmlns` prefix or `xmlns` itself.
     fn check_prefix(&self, name: &str, on: Option<&str>) -> Result<()> {
-        let refuse = |message: String| {
-            Err(Error::Format {
-                format: "xml",
-                message: format!("XML write: {message}"),
-            })
-        };
-        let prefix = name.split_once(':').map(|(prefix, _)| prefix);
-        if on.is_none() && (name == "xmlns" || prefix == Some("xmlns")) {
-            return refuse(format!(
-                "'{name}' cannot name an element: the xmlns prefix is reserved for namespace \
-                 declarations",
-            ));
-        }
-        match prefix {
-            Some(prefix) if !self.declares(prefix) => {
-                let what = match on {
-                    None => format!("element <{name}>"),
-                    Some(tag) => format!("attribute '{name}' on <{tag}>"),
-                };
-                refuse(format!(
-                    "{what} uses the prefix '{prefix}', which no 'xmlns:{prefix}' declares in scope",
-                ))
-            }
-            _ => Ok(()),
+        match undeclared_prefix(name, on, |prefix| self.declares(prefix)) {
+            Some(message) => Err(write_refusal(message)),
+            None => Ok(()),
         }
     }
+}
+
+/// The writer's refusal: `Error::Format` with `XML write: ` + `message`.
+fn write_refusal(message: String) -> Error {
+    Error::Format {
+        format: "xml",
+        message: format!("XML write: {message}"),
+    }
+}
+
+/// The prefix the attribute `name="uri"` on `<tag>` declares: `p` for
+/// `xmlns:p`, `None` for the default `xmlns` and any other attribute. A
+/// declaration Namespaces in XML 1.0 forbids is an `Err` naming it:
+/// `xmlns:xmlns`, `xmlns:xml` bound anywhere but [`XML_NAMESPACE`],
+/// another prefix (or the default) bound to that or to [`XMLNS_NAMESPACE`],
+/// and an empty `xmlns:p` (1.0 cannot undeclare a prefix).
+fn declared_prefix<'n>(
+    name: &'n str,
+    uri: &str,
+    tag: &str,
+) -> std::result::Result<Option<&'n str>, String> {
+    let prefix = match name.strip_prefix("xmlns") {
+        Some("") => None,
+        Some(rest) => match rest.strip_prefix(':') {
+            Some(prefix) => Some(prefix),
+            None => return Ok(None),
+        },
+        None => return Ok(None),
+    };
+    match prefix {
+        Some("xmlns") => Err(format!(
+            "'{name}' on <{tag}> cannot be declared: the xmlns prefix is reserved",
+        )),
+        Some("xml") if uri != XML_NAMESPACE => Err(format!(
+            "'{name}' on <{tag}> must bind {XML_NAMESPACE} (got {uri:?})",
+        )),
+        Some("xml") => Ok(None),
+        _ if uri == XML_NAMESPACE => Err(format!(
+            "'{name}' on <{tag}> binds {XML_NAMESPACE}, which only the xml prefix may",
+        )),
+        _ if uri == XMLNS_NAMESPACE => Err(format!(
+            "'{name}' on <{tag}> binds {XMLNS_NAMESPACE}, which nothing may",
+        )),
+        Some(_) if uri.is_empty() => Err(format!(
+            "'{name}' on <{tag}> is empty: XML namespaces 1.0 cannot undeclare a prefix",
+        )),
+        prefix => Ok(prefix),
+    }
+}
+
+/// Why an element name (`on` is `None`) or an attribute name on `<on>`
+/// cannot stand where `declares` says which prefixes are in scope: its
+/// prefix is not, or it names an element with the reserved `xmlns` prefix
+/// or `xmlns` itself. `None` when it can.
+fn undeclared_prefix(
+    name: &str,
+    on: Option<&str>,
+    declares: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let prefix = name.split_once(':').map(|(prefix, _)| prefix);
+    if on.is_none() && (name == "xmlns" || prefix == Some("xmlns")) {
+        return Some(format!(
+            "'{name}' cannot name an element: the xmlns prefix is reserved for namespace \
+             declarations",
+        ));
+    }
+    let prefix = prefix.filter(|prefix| !declares(prefix))?;
+    let what = match on {
+        None => format!("element <{name}>"),
+        Some(tag) => format!("attribute '{name}' on <{tag}>"),
+    };
+    Some(format!(
+        "{what} uses the prefix '{prefix}', which no 'xmlns:{prefix}' declares in scope",
+    ))
 }
 
 /// `xmlns` or `xmlns:p`: an attribute that declares a namespace rather
@@ -2283,11 +2380,28 @@ mod tests {
             );
         }
 
-        // A UTF-16 label over 8-bit bytes, and an unknown label, read as UTF-8.
-        for label in ["UTF-16", "no-such"] {
-            let xml = format!("<?xml version=\"1.0\" encoding='{label}'?><r>\u{e9}</r>");
-            let (text, ..) = decode_input(xml.as_bytes()).expect("decodes");
-            assert_eq!(text, xml);
+        // A UTF-16 label over 8-bit bytes reads as UTF-8; ISO-2022-JP reads
+        // as itself.
+        let xml = "<?xml version=\"1.0\" encoding='UTF-16'?><r>\u{e9}</r>";
+        let (text, ..) = decode_input(xml.as_bytes()).expect("decodes");
+        assert_eq!(text, xml);
+        let jis = b"<?xml version='1.0' encoding='ISO-2022-JP'?><r>\x1b$B$\x22\x1b(B</r>";
+        let (text, ..) = decode_input(jis).expect("decodes");
+        assert!(text.ends_with("<r>\u{3042}</r>"), "{text}");
+        // A label dq does not know, or cannot read, is a parse error.
+        for (label, why) in [
+            ("no-such", "does not know"),
+            ("UTF-32", "does not know"),
+            ("ISO-2022-KR", "cannot read"),
+        ] {
+            let xml = format!("<?xml version=\"1.0\" encoding='{label}'?><r/>");
+            let Err(Error::Parse { message, .. }) = decode_input(xml.as_bytes()) else {
+                panic!("{label} must be a parse error");
+            };
+            assert_eq!(
+                message,
+                format!("the XML declaration's encoding \"{label}\" is one dq {why}")
+            );
         }
         assert_eq!(
             declared_label(b"<?xml version='1.0' encoding = \"x\"?>"),
@@ -2432,6 +2546,47 @@ mod tests {
         }
         let decls = [("xmlns:xml", XML_NAMESPACE.to_owned())];
         assert!(Scope::declared_on(&root, "r", &decls).is_ok());
+    }
+
+    #[test]
+    fn the_reader_refuses_a_prefix_the_writer_would() {
+        for xml in [
+            "<r xmlns:p='u'><p:k xml:lang='en' p:x='1'/></r>",
+            "<p:r xmlns:p='u'><k><p:k/></k></p:r>",
+            "<r xmlns='u' xmlns:xml='http://www.w3.org/XML/1998/namespace'/>",
+            "<r xml:space='preserve'/>",
+        ] {
+            let value = parse_xml(xml.as_bytes()).expect(xml);
+            render_xml(&value).expect(xml);
+        }
+        for (xml, message) in [
+            (
+                "<a:b/>",
+                "element <a:b> uses the prefix 'a', which no 'xmlns:a' declares in scope",
+            ),
+            (
+                "<r a:x='1'/>",
+                "attribute 'a:x' on <r> uses the prefix 'a', which no 'xmlns:a' declares in scope",
+            ),
+            (
+                "<r><k xmlns:p='u'/><p:k/></r>",
+                "element <p:k> uses the prefix 'p', which no 'xmlns:p' declares in scope",
+            ),
+            (
+                "<xmlns:k/>",
+                "'xmlns:k' cannot name an element: the xmlns prefix is reserved for namespace \
+                 declarations",
+            ),
+            (
+                "<r xmlns:p=''/>",
+                "'xmlns:p' on <r> is empty: XML namespaces 1.0 cannot undeclare a prefix",
+            ),
+        ] {
+            let Err(Error::Parse { message: got, .. }) = parse_xml(xml.as_bytes()) else {
+                panic!("{xml} must be a parse error");
+            };
+            assert_eq!(got, format!("XML parse error: {message}"), "{xml}");
+        }
     }
 
     #[test]

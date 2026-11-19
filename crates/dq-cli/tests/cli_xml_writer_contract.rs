@@ -800,3 +800,88 @@ fn utf16_without_a_bom_keeps_its_byte_order_and_refuses_a_contradiction() {
     }
     assert_cases(&dir, &cases);
 }
+
+/// The reader refuses what the writer would, exit 3, naming it: an
+/// undeclared prefix on an element or an attribute, an encoding dq does not
+/// know (`UTF-32`, `x-foo`) or cannot read (`ISO-2022-KR`). `xmlns:` and
+/// `xml:` — declared or not — keep working, and ISO-2022-JP, which the
+/// writer writes, now reads as itself. Before, every refused file read, and
+/// could not be written back; ISO-2022-JP read as UTF-8, escapes and all.
+#[test]
+fn the_reader_refuses_what_the_writer_would() {
+    let declared = "<r xmlns:a=\"u\"><a:b a:x=\"1\" xml:lang=\"en\"/></r>";
+    let jis = b"<?xml version=\"1.0\" encoding=\"ISO-2022-JP\"?><r>\x1b$B$\"\x1b(B</r>";
+    let encoding = |label: &str| format!("<?xml version=\"1.0\" encoding=\"{label}\"?><r/>");
+    let (utf32, x_foo, kr) = (
+        encoding("UTF-32"),
+        encoding("x-foo"),
+        encoding("ISO-2022-KR"),
+    );
+    let dir = dir_with(&[
+        ("element.xml", b"<a:b/>"),
+        ("attribute.xml", b"<r a:x=\"1\"/>"),
+        ("sibling.xml", b"<r><k xmlns:p=\"u\"/><p:k/></r>"),
+        ("declared.xml", declared.as_bytes()),
+        ("jis.xml", jis),
+        ("utf32.xml", utf32.as_bytes()),
+        ("x_foo.xml", x_foo.as_bytes()),
+        ("kr.xml", kr.as_bytes()),
+    ]);
+    let prefix = |file: &str, what: &str, prefix: &str| {
+        unreadable(
+            file,
+            &format!(
+                "XML parse error: {what} uses the prefix '{prefix}', which no 'xmlns:{prefix}' \
+                 declares in scope"
+            ),
+        )
+    };
+    let label = |file: &str, label: &str, why: &str| {
+        unreadable(
+            file,
+            &format!("the XML declaration's encoding \"{label}\" is one dq {why}"),
+        )
+    };
+    assert_cases(
+        &dir,
+        &[
+            (
+                convert("element.xml", "json"),
+                prefix("element.xml", "element <a:b>", "a"),
+            ),
+            (
+                convert("attribute.xml", "json"),
+                prefix("attribute.xml", "attribute 'a:x' on <r>", "a"),
+            ),
+            (
+                convert("sibling.xml", "json"),
+                prefix("sibling.xml", "element <p:k>", "p"),
+            ),
+            (
+                convert("declared.xml", "xml"),
+                ok("<r xmlns:a=\"u\">\n  <a:b a:x=\"1\" xml:lang=\"en\"/>\n</r>"),
+            ),
+            (
+                convert("jis.xml", "json"),
+                ok(
+                    "{\n  \"#xml\": {\n    \"version\": \"1.0\",\n    \"encoding\": \
+                     \"ISO-2022-JP\"\n  },\n  \"r\": [\n    {\n      \"#text\": \"\u{3042}\"\n    \
+                     }\n  ]\n}\n",
+                ),
+            ),
+            (convert("jis.xml", "xml"), ok(jis.to_vec())),
+            (
+                convert("utf32.xml", "json"),
+                label("utf32.xml", "UTF-32", "does not know"),
+            ),
+            (
+                convert("x_foo.xml", "json"),
+                label("x_foo.xml", "x-foo", "does not know"),
+            ),
+            (
+                convert("kr.xml", "json"),
+                label("kr.xml", "ISO-2022-KR", "cannot read"),
+            ),
+        ],
+    );
+}
