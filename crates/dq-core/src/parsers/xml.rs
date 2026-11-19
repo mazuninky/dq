@@ -61,6 +61,12 @@
 //! CR in an attribute value are written as character references, so XML's
 //! end-of-line and attribute normalization give them back unchanged.
 //!
+//! Names are checked against Namespaces in XML 1.0 too: a prefix must be
+//! declared by an `xmlns:p` on the element or an ancestor (`xml` always
+//! is), `xmlns` names only declarations, `xmlns:xml` binds only its fixed
+//! URI, no other declaration binds the `xml` or `xmlns` namespace URI, and
+//! `xmlns:p=""` (undeclaring, XML namespaces 1.1 only) is refused.
+//!
 //! ## Read-only edit operations
 //!
 //! `XmlFormat` does **not** register a textual-edit `ScalarRenderer` /
@@ -714,7 +720,14 @@ fn render_xml(top: &Value) -> Result<Vec<u8>> {
             message: format!("XML write: root element '{root_tag}' must be a Map"),
         });
     };
-    write_element(&mut writer, root_tag, root_body, 0, &mut non_ascii)?;
+    write_element(
+        &mut writer,
+        root_tag,
+        root_body,
+        0,
+        &mut non_ascii,
+        &Scope::default(),
+    )?;
 
     if let Some(encoding) = decl.as_ref().and_then(|d| d.encoding.as_deref()) {
         check_declared_encoding(encoding, &non_ascii)?;
@@ -737,6 +750,127 @@ impl FirstNonAscii {
             self.0 = Some((c, place()));
         }
     }
+}
+
+/// The namespace URI the `xml` prefix is bound to, always and only.
+const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
+/// The namespace URI of the `xmlns` prefix, which no declaration may bind.
+const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
+
+/// The namespace prefixes in scope while writing an element: the ones its
+/// own `xmlns:p` attributes declare on top of its ancestors'. `xml` is
+/// always in scope.
+#[derive(Default)]
+struct Scope<'a> {
+    parent: Option<&'a Scope<'a>>,
+    prefixes: Vec<&'a str>,
+}
+
+impl<'a> Scope<'a> {
+    /// The scope inside `<tag>`: `parent` plus the prefixes its attributes
+    /// declare. A declaration Namespaces in XML 1.0 forbids is refused:
+    /// `xmlns:xmlns`, `xmlns:xml` bound anywhere but [`XML_NAMESPACE`],
+    /// another prefix (or the default) bound to that or to
+    /// [`XMLNS_NAMESPACE`], and an empty `xmlns:p` (1.0 cannot undeclare a
+    /// prefix).
+    fn declared_on(
+        parent: &'a Scope<'a>,
+        tag: &str,
+        attributes: &'a [(&'a str, String)],
+    ) -> Result<Self> {
+        let refuse = |message: String| Error::Format {
+            format: "xml",
+            message: format!("XML write: {message}"),
+        };
+        let mut prefixes = Vec::new();
+        for (name, uri) in attributes {
+            let prefix = match name.strip_prefix("xmlns") {
+                Some("") => None,
+                Some(rest) => match rest.strip_prefix(':') {
+                    Some(prefix) => Some(prefix),
+                    None => continue,
+                },
+                None => continue,
+            };
+            match prefix {
+                Some("xmlns") => {
+                    return Err(refuse(format!(
+                        "'{name}' on <{tag}> cannot be declared: the xmlns prefix is reserved",
+                    )));
+                }
+                Some("xml") if uri != XML_NAMESPACE => {
+                    return Err(refuse(format!(
+                        "'{name}' on <{tag}> must bind {XML_NAMESPACE} (got {uri:?})",
+                    )));
+                }
+                Some("xml") => {}
+                _ if uri == XML_NAMESPACE => {
+                    return Err(refuse(format!(
+                        "'{name}' on <{tag}> binds {XML_NAMESPACE}, which only the xml prefix may",
+                    )));
+                }
+                _ if uri == XMLNS_NAMESPACE => {
+                    return Err(refuse(format!(
+                        "'{name}' on <{tag}> binds {XMLNS_NAMESPACE}, which nothing may",
+                    )));
+                }
+                Some(_) if uri.is_empty() => {
+                    return Err(refuse(format!(
+                        "'{name}' on <{tag}> is empty: XML namespaces 1.0 cannot undeclare a prefix",
+                    )));
+                }
+                Some(prefix) => prefixes.push(prefix),
+                None => {}
+            }
+        }
+        Ok(Self {
+            parent: Some(parent),
+            prefixes,
+        })
+    }
+
+    fn declares(&self, prefix: &str) -> bool {
+        prefix == "xml"
+            || self.prefixes.contains(&prefix)
+            || self.parent.is_some_and(|parent| parent.declares(prefix))
+    }
+
+    /// Refuse an element name (`on` is `None`) or an attribute name on
+    /// `<on>` whose prefix is not in scope, and an element named with the
+    /// reserved `xmlns` prefix or `xmlns` itself.
+    fn check_prefix(&self, name: &str, on: Option<&str>) -> Result<()> {
+        let refuse = |message: String| {
+            Err(Error::Format {
+                format: "xml",
+                message: format!("XML write: {message}"),
+            })
+        };
+        let prefix = name.split_once(':').map(|(prefix, _)| prefix);
+        if on.is_none() && (name == "xmlns" || prefix == Some("xmlns")) {
+            return refuse(format!(
+                "'{name}' cannot name an element: the xmlns prefix is reserved for namespace \
+                 declarations",
+            ));
+        }
+        match prefix {
+            Some(prefix) if !self.declares(prefix) => {
+                let what = match on {
+                    None => format!("element <{name}>"),
+                    Some(tag) => format!("attribute '{name}' on <{tag}>"),
+                };
+                refuse(format!(
+                    "{what} uses the prefix '{prefix}', which no 'xmlns:{prefix}' declares in scope",
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// `xmlns` or `xmlns:p`: an attribute that declares a namespace rather
+/// than one that is in one.
+fn is_namespace_declaration(name: &str) -> bool {
+    name == "xmlns" || name.starts_with("xmlns:")
 }
 
 /// dq writes UTF-8 whatever `#xml` declares, so a declared encoding must
@@ -817,6 +951,7 @@ fn write_element(
     body: &IndexMap<String, Value>,
     indent_level: usize,
     non_ascii: &mut FirstNonAscii,
+    scope: &Scope<'_>,
 ) -> Result<()> {
     check_name(tag, "an element")?;
     let place = || format!("in <{tag}>");
@@ -834,6 +969,7 @@ fn write_element(
             });
         }
     }
+    let mut attributes = Vec::new();
     if let Some(Value::Map(attrs)) = body.get(KEY_ATTRS) {
         for (k, v) in attrs {
             let v = match v {
@@ -851,11 +987,19 @@ fn write_element(
             check_chars(&format!("attribute '{k}' on <{tag}>"), &v)?;
             non_ascii.note(k, place);
             non_ascii.note(&v, place);
-            start.push_attribute(Attribute {
-                key: QName(k.as_str()),
-                value: escape_attr(&v).into_owned().into(),
-            });
+            attributes.push((k.as_str(), v));
         }
+    }
+    let scope = Scope::declared_on(scope, tag, &attributes)?;
+    scope.check_prefix(tag, None)?;
+    for (k, v) in &attributes {
+        if !is_namespace_declaration(k) {
+            scope.check_prefix(k, Some(tag))?;
+        }
+        start.push_attribute(Attribute {
+            key: QName(k),
+            value: escape_attr(v).into_owned().into(),
+        });
     }
 
     // The text of a scalar `#text`: a number or a boolean as it is
@@ -970,12 +1114,12 @@ fn write_element(
             }
             match child {
                 Value::Map(child_body) => {
-                    write_element(writer, k, child_body, child_indent, non_ascii)?;
+                    write_element(writer, k, child_body, child_indent, non_ascii, &scope)?;
                 }
                 Value::Null => {
                     // Empty child element.
                     let tmp = IndexMap::new();
-                    write_element(writer, k, &tmp, child_indent, non_ascii)?;
+                    write_element(writer, k, &tmp, child_indent, non_ascii, &scope)?;
                 }
                 // Scalar-shaped child: emitted as `<k>text</k>`. This shape
                 // arises when JSON input is converted to XML —
@@ -988,7 +1132,7 @@ fn write_element(
                 | Value::BigFloat(_)) => {
                     let mut tmp = IndexMap::new();
                     tmp.insert(KEY_TEXT.to_owned(), scalar.clone());
-                    write_element(writer, k, &tmp, child_indent, non_ascii)?;
+                    write_element(writer, k, &tmp, child_indent, non_ascii, &scope)?;
                 }
                 Value::Array(_) => {
                     return Err(Error::Format {
@@ -1574,6 +1718,38 @@ mod tests {
         assert_eq!(escape_text("a\tb\nc\rd<"), "a\tb\nc&#13;d&lt;");
         assert_eq!(escape_attr("a\tb\nc\rd\""), "a&#9;b&#10;c&#13;d&quot;");
         assert!(matches!(escape_attr("plain"), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn prefixes_must_be_declared_in_scope() {
+        let root = Scope::default();
+        let decls = [("xmlns:p", "u".to_owned()), ("xmlns", String::new())];
+        let outer = Scope::declared_on(&root, "r", &decls).expect("valid declarations");
+        let inner = Scope::declared_on(&outer, "k", &[]).expect("nothing declared");
+        assert!(inner.check_prefix("p:x", None).is_ok());
+        assert!(inner.check_prefix("xml:lang", Some("k")).is_ok());
+        assert!(inner.check_prefix("plain", None).is_ok());
+        let err = inner
+            .check_prefix("q:x", Some("k"))
+            .expect_err("undeclared");
+        assert!(err.to_string().contains("no 'xmlns:q' declares"), "{err}");
+        assert!(root.check_prefix("p:x", None).is_err());
+        assert!(root.check_prefix("xmlns:a", None).is_err());
+        for (name, uri) in [
+            ("xmlns:xmlns", "u"),
+            ("xmlns:xml", "u"),
+            ("xmlns:p", XML_NAMESPACE),
+            ("xmlns", XMLNS_NAMESPACE),
+            ("xmlns:p", ""),
+        ] {
+            let decls = [(name, uri.to_owned())];
+            assert!(
+                Scope::declared_on(&root, "r", &decls).is_err(),
+                "{name}={uri}"
+            );
+        }
+        let decls = [("xmlns:xml", XML_NAMESPACE.to_owned())];
+        assert!(Scope::declared_on(&root, "r", &decls).is_ok());
     }
 
     #[test]

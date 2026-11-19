@@ -1145,3 +1145,97 @@ fn xml_declares_only_an_encoding_its_utf8_bytes_satisfy_and_keeps_whitespace() {
         &cases.map(|(file, outcome)| (vec!["-q", "convert", file, "-F", "xml"], outcome)),
     );
 }
+
+/// Namespace well-formedness: a prefix on an element or attribute name must
+/// be declared by an `xmlns:p` on that element or an ancestor (`xml` always
+/// is), `xmlns` names only declarations, `xmlns:xml` binds only its fixed
+/// URI, nothing else binds the `xml` / `xmlns` URIs, and a 1.0 prefix cannot
+/// be undeclared. The writer refuses the rest.
+#[test]
+fn xml_refuses_names_outside_the_namespaces_in_scope() {
+    let dir = dir_with(&[
+        (
+            "ok.yaml",
+            "r:\n- \"@attrs\": {\"xmlns:p\": u}\n  \"p:k\": [{\"@attrs\": {\"p:a\": 1, \"xml:lang\": en}}]\n",
+        ),
+        ("element.yaml", "\"svg:r\":\n- {}\n"),
+        ("attribute.yaml", "r:\n- \"@attrs\": {\"p:a\": 1}\n"),
+        (
+            "sibling.yaml",
+            "r:\n- k: [{\"@attrs\": {\"xmlns:p\": u}}]\n  \"p:x\": [{}]\n",
+        ),
+        ("xmlns_element.yaml", "\"xmlns:a\":\n- {}\n"),
+        (
+            "xmlns_xmlns.yaml",
+            "r:\n- \"@attrs\": {\"xmlns:xmlns\": u}\n",
+        ),
+        ("xml_rebound.yaml", "r:\n- \"@attrs\": {\"xmlns:xml\": u}\n"),
+        (
+            "xml_uri.yaml",
+            "r:\n- \"@attrs\": {\"xmlns:p\": \"http://www.w3.org/XML/1998/namespace\"}\n",
+        ),
+        (
+            "xmlns_uri.yaml",
+            "r:\n- \"@attrs\": {xmlns: \"http://www.w3.org/2000/xmlns/\"}\n",
+        ),
+        ("undeclare.yaml", "r:\n- \"@attrs\": {\"xmlns:p\": \"\"}\n"),
+    ]);
+    let cases = [
+        (
+            "ok.yaml",
+            ok("<r xmlns:p=\"u\">\n  <p:k p:a=\"1\" xml:lang=\"en\"/>\n</r>"),
+        ),
+        (
+            "element.yaml",
+            refused!(
+                "element <svg:r> uses the prefix 'svg', which no 'xmlns:svg' declares in scope"
+            ),
+        ),
+        (
+            "attribute.yaml",
+            refused!(
+                "attribute 'p:a' on <r> uses the prefix 'p', which no 'xmlns:p' declares in scope"
+            ),
+        ),
+        (
+            "sibling.yaml",
+            refused!("element <p:x> uses the prefix 'p', which no 'xmlns:p' declares in scope"),
+        ),
+        (
+            "xmlns_element.yaml",
+            refused!(
+                "'xmlns:a' cannot name an element: the xmlns prefix is reserved for namespace \
+                 declarations"
+            ),
+        ),
+        (
+            "xmlns_xmlns.yaml",
+            refused!("'xmlns:xmlns' on <r> cannot be declared: the xmlns prefix is reserved"),
+        ),
+        (
+            "xml_rebound.yaml",
+            refused!(
+                "'xmlns:xml' on <r> must bind http://www.w3.org/XML/1998/namespace (got \"u\")"
+            ),
+        ),
+        (
+            "xml_uri.yaml",
+            refused!(
+                "'xmlns:p' on <r> binds http://www.w3.org/XML/1998/namespace, which only the xml \
+                 prefix may"
+            ),
+        ),
+        (
+            "xmlns_uri.yaml",
+            refused!("'xmlns' on <r> binds http://www.w3.org/2000/xmlns/, which nothing may"),
+        ),
+        (
+            "undeclare.yaml",
+            refused!("'xmlns:p' on <r> is empty: XML namespaces 1.0 cannot undeclare a prefix"),
+        ),
+    ];
+    assert_cases(
+        &dir,
+        &cases.map(|(file, outcome)| (vec!["-q", "convert", file, "-F", "xml"], outcome)),
+    );
+}
