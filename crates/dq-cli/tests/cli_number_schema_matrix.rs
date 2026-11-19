@@ -1257,3 +1257,22 @@ fn a_composite_extract_item_names_the_field_and_the_type_it_refuses() {
         wrong.join("\n")
     );
 }
+
+#[test]
+fn a_divisor_below_f64_is_spelled_as_written_where_a_message_prints_the_schema() {
+    use Some as Fails;
+    assert_schema_cases(&[
+        (
+            "{not: {multipleOf: 1e-400}}",
+            "2e-400",
+            Fails("/properties/x/not: {\"multipleOf\":1e-400} is not allowed for 2e-400"),
+        ),
+        (
+            "{not: {properties: {m: {multipleOf: 3e-400}}}}",
+            "{m: 6e-400}",
+            Fails(
+                "/properties/x/not: {\"properties\":{\"m\":{\"multipleOf\":3e-400}}} is not allowed for {\"m\":6e-400}",
+            ),
+        ),
+    ]);
+}

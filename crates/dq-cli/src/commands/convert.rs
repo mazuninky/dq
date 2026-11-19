@@ -591,8 +591,10 @@ fn render_to_format(
         }
     }
     // A same-format render copies the source bytes, byte order mark
-    // included; converted output never carries one.
-    if buf.starts_with(UTF8_BOM) {
+    // included; converted output never carries one. XML is the exception:
+    // its tree carries the BOM as `#xml.bom`, and the writer begins with it
+    // only when that asks.
+    if !matches!(output_format, OutputFormat::Xml) && buf.starts_with(UTF8_BOM) {
         buf.drain(..UTF8_BOM.len());
     }
     Ok(buf)

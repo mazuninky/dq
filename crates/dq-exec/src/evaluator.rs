@@ -717,7 +717,7 @@ fn run_schema_check(
         // dedup so duplicates at different `schema_path` locations
         // collapse, while distinct violations at the same path
         // (different `error_text`) are preserved.
-        let error_text = crate::schema_value::restore(&error.to_string()).into_owned();
+        let error_text = crate::schema_value::error_text(&error);
         let dedup_key = (
             rule.rule.id.clone(),
             pointer_str.to_owned(),

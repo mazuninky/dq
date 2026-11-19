@@ -598,6 +598,60 @@ fn replace_tiny_divisors(node: &mut serde_json::Value) {
     }
 }
 
+/// `schema` with every [`stand_in_tiny_divisors`] stand-in turned back
+/// into the divisor as written, for a message that prints a schema (`not`).
+/// Borrowed when there is none.
+fn restore_tiny_divisors(schema: &serde_json::Value) -> Cow<'_, serde_json::Value> {
+    fn walk(node: &mut serde_json::Value) {
+        match node {
+            serde_json::Value::Object(schema) => {
+                let literal = schema
+                    .get(TINY_DIVISOR)
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|literal| serde_json::from_str::<serde_json::Value>(literal).ok());
+                if let Some(literal) = literal {
+                    schema.shift_remove(TINY_DIVISOR);
+                    schema.insert("multipleOf".to_owned(), literal);
+                }
+                for (keyword, value) in schema.iter_mut() {
+                    match keyword.as_str() {
+                        k if DATA_KEYWORDS.contains(&k) => {}
+                        k if SCHEMA_MAPS.contains(&k) => {
+                            if let Some(map) = value.as_object_mut() {
+                                map.values_mut().for_each(walk);
+                            }
+                        }
+                        _ => walk(value),
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(walk),
+            _ => {}
+        }
+    }
+    if !serde_json::to_string(schema).is_ok_and(|text| text.contains("\\u0000dq.multipleOf")) {
+        return Cow::Borrowed(schema);
+    }
+    let mut owned = schema.clone();
+    walk(&mut owned);
+    Cow::Owned(owned)
+}
+
+/// The text of a validation error as dq reports it: a schema the message
+/// prints (`not`) with its tiny divisors as written, and every non-finite
+/// float [`restore`]d.
+pub(crate) fn error_text(error: &jsonschema::ValidationError<'_>) -> String {
+    let text = match error.kind() {
+        jsonschema::error::ValidationErrorKind::Not { schema } => format!(
+            "{} is not allowed for {}",
+            restore_tiny_divisors(schema),
+            error.instance()
+        ),
+        _ => error.to_string(),
+    };
+    restore(&text).into_owned()
+}
+
 /// The keywords [`options`] puts in place of jsonschema's own.
 const OVERRIDDEN: [&str; 7] = [
     "const",
@@ -1034,6 +1088,26 @@ mod tests {
         options()
             .build(&stand_in_tiny_divisors(&schema))
             .expect("schema compiles")
+    }
+
+    #[test]
+    fn a_not_message_prints_a_tiny_divisor_as_written() {
+        let not = rule_validator(r#"{"not": {"minimum": 0, "multipleOf": 1e-400}}"#);
+        let tiny = big("2e-400");
+        let error = not.iter_errors(DqNode(&tiny)).next().expect("error");
+        assert_eq!(
+            error_text(&error),
+            r#"{"minimum":0,"multipleOf":1e-400} is not allowed for 2e-400"#
+        );
+        let plain = rule_validator(r#"{"not": {"multipleOf": 2}}"#);
+        let error = plain
+            .iter_errors(DqNode(&Value::Int(4)))
+            .next()
+            .expect("error");
+        assert_eq!(
+            error_text(&error),
+            r#"{"multipleOf":2} is not allowed for 4"#
+        );
     }
 
     #[test]

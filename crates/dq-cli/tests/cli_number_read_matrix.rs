@@ -1603,3 +1603,77 @@ fn hcl_keeps_big_integers_and_whole_floats_inside_blocks() {
         ],
     );
 }
+
+/// A byte order mark and the declared encoding must agree (XML 1.0
+/// §4.3.3), and `encoding` must be an encoding name: the reader refuses
+/// both (exit 3) as the writer does. A UTF-8 BOM is kept as `#xml.bom` and
+/// written back; `bom: UTF-8` needs a UTF-8 declaration or none. A null
+/// `@attrs` is no attributes, as every other null is no content.
+#[test]
+fn xml_refuses_a_bom_its_declaration_contradicts_and_keeps_a_utf8_bom() {
+    let utf16_le = |text: &str| utf16(text, false);
+    let u16_latin = utf16_le("<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><r/>");
+    let mut u16_be_le = vec![0xFE, 0xFF];
+    u16_be_le.extend(
+        "<?xml version=\"1.0\" encoding=\"UTF-16LE\"?><r/>"
+            .encode_utf16()
+            .flat_map(u16::to_be_bytes),
+    );
+    let utf8_bom = |text: &str| [b"\xEF\xBB\xBF".as_slice(), text.as_bytes()].concat();
+    let u8_latin = utf8_bom("<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><r>é</r>");
+    let u8_decl = utf8_bom("<?xml version=\"1.0\" encoding=\"UTF-8\"?><r>é</r>");
+    let u8_bare = utf8_bom("<r>é</r>");
+    let dir = dir_with_bytes(&[
+        ("u16_latin.xml", &u16_latin),
+        ("u16_be_le.xml", &u16_be_le),
+        (
+            "spaced.xml",
+            b"<?xml version=\"1.0\" encoding=\" ISO-8859-1 \"?><r/>",
+        ),
+        ("u8_latin.xml", &u8_latin),
+        ("u8_decl.xml", &u8_decl),
+        ("u8_bare.xml", &u8_bare),
+        ("u8.yaml", b"\"#xml\": {bom: UTF-8}\nr:\n- {}\n"),
+        (
+            "u8_latin.yaml",
+            b"\"#xml\": {encoding: ISO-8859-1, bom: UTF-8}\nr:\n- {}\n",
+        ),
+        ("attrs_null.yaml", b"r:\n- \"@attrs\": null\n"),
+    ]);
+    let unreadable = |file: &str, message: &str| format!("parse error in {file}: {message}\n");
+    let u16_latin_err = unreadable(
+        "u16_latin.xml",
+        "the file begins with a UTF-16LE byte order mark but declares encoding \"ISO-8859-1\"",
+    );
+    let u16_be_le_err = unreadable(
+        "u16_be_le.xml",
+        "the file begins with a UTF-16BE byte order mark but declares encoding \"UTF-16LE\"",
+    );
+    let spaced_err = unreadable(
+        "spaced.xml",
+        "the XML declaration's encoding \" ISO-8859-1 \" is not an encoding name",
+    );
+    let u8_latin_err = unreadable(
+        "u8_latin.xml",
+        "the file begins with a UTF-8 byte order mark but declares encoding \"ISO-8859-1\"",
+    );
+    let u8_latin_refused = "xml format error: XML write: '#xml' field 'bom' is UTF-8 but the \
+                            declared encoding is \"ISO-8859-1\"\n";
+    let u8_json = "{\n  \"#xml\": {\n    \"bom\": \"UTF-8\"\n  },\n  \"r\": [\n    {\n      \
+                   \"#text\": \"é\"\n    }\n  ]\n}\n";
+    assert_byte_cases(
+        &dir,
+        &[
+            ("u16_latin.xml", "json", 3, b"", &u16_latin_err),
+            ("u16_be_le.xml", "json", 3, b"", &u16_be_le_err),
+            ("spaced.xml", "json", 3, b"", &spaced_err),
+            ("u8_latin.xml", "json", 3, b"", &u8_latin_err),
+            ("u8_decl.xml", "xml", 0, &u8_decl, ""),
+            ("u8_bare.xml", "xml", 0, &u8_bare, ""),
+            ("u8_bare.xml", "json", 0, u8_json.as_bytes(), ""),
+            ("u8.yaml", "xml", 0, b"\xEF\xBB\xBF<r/>", ""),
+            ("u8_latin.yaml", "xml", 1, b"", u8_latin_refused),
+            ("attrs_null.yaml", "xml", 0, b"<r/>", ""),
+        ],
+    );
+}

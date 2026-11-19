@@ -354,13 +354,20 @@ fn write_top_level_non_map_is_format_error() {
 // quick-xml 0.40 build.
 
 #[test]
-fn parse_utf8_bom_is_skipped_and_dropped_on_write() {
+fn parse_utf8_bom_is_kept_as_xml_bom_and_written_back() {
     let with_bom = parse(b"\xEF\xBB\xBF<a b=\"1\">x</a>");
     let without_bom = parse(b"<a b=\"1\">x</a>");
-    assert_eq!(with_bom.value(), without_bom.value());
+    let (Value::Map(with), Value::Map(without)) = (with_bom.value(), without_bom.value()) else {
+        panic!("expected map roots");
+    };
+    let Some(Value::Map(decl)) = with.get("#xml") else {
+        panic!("expected #xml holding the BOM, got {with:?}");
+    };
+    assert_eq!(decl.get("bom"), Some(&Value::String("UTF-8".into())));
+    assert_eq!(with.get("a"), without.get("a"));
     let mut buf: Vec<u8> = Vec::new();
     xml().write(&with_bom, &mut buf).expect("write");
-    assert_eq!(buf, b"<a b=\"1\">x</a>");
+    assert_eq!(buf, b"\xEF\xBB\xBF<a b=\"1\">x</a>");
 }
 
 #[test]

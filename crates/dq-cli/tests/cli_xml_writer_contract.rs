@@ -237,7 +237,8 @@ fn null_content_is_left_out() {
 
 /// UTF-16 with no byte order mark reads by its declaration, and UTF-16BE
 /// declared so writes back byte for byte; a big-endian BOM alone is enough
-/// and is kept as `#xml.bom`. A UTF-8 BOM reads as UTF-8. Before, each of
+/// and is kept as `#xml.bom`. A UTF-8 BOM reads as UTF-8 and is kept as
+/// `#xml.bom` too. Before, each of
 /// the UTF-16 files was a parse error.
 #[test]
 fn utf16_reads_by_its_declaration_without_a_bom() {
@@ -281,7 +282,10 @@ fn utf16_reads_by_its_declaration_without_a_bom() {
                 ok(json("  \"#xml\": {\n    \"bom\": \"UTF-16BE\"\n  },\n")),
             ),
             (convert("be_bom.xml", "xml"), ok(be_bom.clone())),
-            (convert("utf8_bom.xml", "json"), ok(json(""))),
+            (
+                convert("utf8_bom.xml", "json"),
+                ok(json("  \"#xml\": {\n    \"bom\": \"UTF-8\"\n  },\n")),
+            ),
         ],
     );
 }
