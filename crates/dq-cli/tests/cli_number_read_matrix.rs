@@ -866,3 +866,161 @@ fn xml_writes_the_declaration_fields_and_refuses_what_a_document_cannot_hold() {
         ],
     );
 }
+
+/// `(1, "", "xml format error: XML write: <message>\n")`: the XML writer's
+/// refusal.
+macro_rules! refused {
+    ($message:literal) => {
+        (
+            1,
+            "",
+            concat!("xml format error: XML write: ", $message, "\n"),
+        )
+    };
+}
+
+/// Names and the declaration: an element name, an attribute name and a PI
+/// target must be XML names (a PI target not `xml`), and the `#xml` fields
+/// must fit the declaration grammar — a boolean `standalone` is `yes` / `no`.
+/// The writer refuses the rest instead of emitting XML that is not
+/// well-formed. A colon is a name character: `x:y:z` is written.
+#[test]
+fn xml_refuses_names_and_declaration_fields_xml_does_not_allow() {
+    let dir = dir_with(&[
+        (
+            "sa_bool.yaml",
+            "\"#xml\": {version: \"1.0\", standalone: true}\nr:\n- {}\n",
+        ),
+        ("sa_str.yaml", "\"#xml\": {standalone: maybe}\nr:\n- {}\n"),
+        ("ver.yaml", "\"#xml\": {version: abc}\nr:\n- {}\n"),
+        ("enc.yaml", "\"#xml\": {encoding: \"a b\"}\nr:\n- {}\n"),
+        ("colons.yaml", "\"x:y:z\":\n- {}\n"),
+        ("space.yaml", "\"a b\":\n- {}\n"),
+        ("digit.yaml", "r:\n- \"1x\": [{}]\n"),
+        ("empty.yaml", "\"\":\n- {}\n"),
+        ("attr.yaml", "r:\n- \"@attrs\": {\"a b\": 1}\n"),
+        ("pi_num.yaml", "r:\n- \"#pi\": [42]\n"),
+        ("pi_empty.yaml", "r:\n- \"#pi\": [\"\"]\n"),
+        ("pi_xml.yaml", "\"#pi\": [\"XmL v\"]\nr:\n- {}\n"),
+    ]);
+    let cases = [
+        (
+            "sa_bool.yaml",
+            ok("<?xml version=\"1.0\" standalone=\"yes\"?><r/>"),
+        ),
+        (
+            "sa_str.yaml",
+            refused!("'#xml' field 'standalone' must be yes or no (got \"maybe\")"),
+        ),
+        (
+            "ver.yaml",
+            refused!("'#xml' field 'version' must be 1. and digits (got \"abc\")"),
+        ),
+        (
+            "enc.yaml",
+            refused!("'#xml' field 'encoding' is not an encoding name (got \"a b\")"),
+        ),
+        ("colons.yaml", ok("<x:y:z/>")),
+        (
+            "space.yaml",
+            refused!("'a b' is not a valid XML name for an element"),
+        ),
+        (
+            "digit.yaml",
+            refused!("'1x' is not a valid XML name for an element"),
+        ),
+        (
+            "empty.yaml",
+            refused!("'' is not a valid XML name for an element"),
+        ),
+        (
+            "attr.yaml",
+            refused!("'a b' is not a valid XML name for an attribute (on <r>)"),
+        ),
+        (
+            "pi_num.yaml",
+            refused!(
+                "'42' is not a valid XML name for a processing-instruction target ('#pi' of <r>)"
+            ),
+        ),
+        (
+            "pi_empty.yaml",
+            refused!(
+                "'' is not a valid XML name for a processing-instruction target ('#pi' of <r>)"
+            ),
+        ),
+        (
+            "pi_xml.yaml",
+            refused!(
+                "'XmL' cannot be a processing-instruction target, XML reserves it for the \
+                 declaration ('#pi' at the top level)"
+            ),
+        ),
+    ];
+    assert_cases(
+        &dir,
+        &cases.map(|(file, outcome)| (vec!["-q", "convert", file, "-F", "xml"], outcome)),
+    );
+}
+
+/// Content: a comment is written as it is (XML has no escapes in one) and
+/// refused with `--` or a trailing `-`; a PI with `?>` is refused; CDATA
+/// with `]]>` is split across adjacent sections; a C0 control other than
+/// tab / LF / CR in text or an attribute is refused. An XML file in dq's
+/// layout writes back byte for byte.
+#[test]
+fn xml_refuses_content_xml_cannot_hold_and_round_trips_a_read_tree() {
+    let round_trip = "<?xml version=\"1.0\" standalone=\"yes\"?><!--top & <x>--><r a=\"1\">\n  \
+                      <!--c < d-->\n  <?pi x?><![CDATA[d]]]]><![CDATA[>e]]>\n  <k>v</k>\n</r>";
+    let dir = dir_with(&[
+        ("comment.yaml", "r:\n- \"#comments\": [\"a < b & c\"]\n"),
+        ("dashes.yaml", "r:\n- \"#comments\": [\"a--b\"]\n"),
+        ("dash_end.yaml", "\"#comments\": [\"a-\"]\nr:\n- {}\n"),
+        ("pi_close.yaml", "r:\n- \"#pi\": [\"t a?>b\"]\n"),
+        ("cdata.yaml", "r:\n- \"#cdata\": [\"x]]>y\"]\n"),
+        ("ctl_text.yaml", "r:\n- \"#text\": \"a\\x01b\"\n"),
+        ("ctl_attr.yaml", "r:\n- \"@attrs\": {a: \"\\a\"}\n"),
+        ("ctl_cdata.yaml", "r:\n- \"#cdata\": [\"\\x1f\"]\n"),
+        ("rt.xml", round_trip),
+    ]);
+    let cases = [
+        ("comment.yaml", ok("<r><!--a < b & c--></r>")),
+        (
+            "dashes.yaml",
+            refused!(
+                "a comment in '#comments' of <r> contains '--', which XML does not allow in a comment"
+            ),
+        ),
+        (
+            "dash_end.yaml",
+            refused!(
+                "a comment in '#comments' at the top level ends in '-', which XML does not allow \
+                 in a comment"
+            ),
+        ),
+        (
+            "pi_close.yaml",
+            refused!(
+                "a processing instruction in '#pi' of <r> contains '?>', which would end it early"
+            ),
+        ),
+        ("cdata.yaml", ok("<r><![CDATA[x]]]]><![CDATA[>y]]></r>")),
+        (
+            "ctl_text.yaml",
+            refused!("'#text' of <r> holds U+0001, a character XML 1.0 does not allow"),
+        ),
+        (
+            "ctl_attr.yaml",
+            refused!("attribute 'a' on <r> holds U+0007, a character XML 1.0 does not allow"),
+        ),
+        (
+            "ctl_cdata.yaml",
+            refused!("'#cdata' of <r> holds U+001F, a character XML 1.0 does not allow"),
+        ),
+        ("rt.xml", (0, round_trip, "")),
+    ];
+    assert_cases(
+        &dir,
+        &cases.map(|(file, outcome)| (vec!["-q", "convert", file, "-F", "xml"], outcome)),
+    );
+}

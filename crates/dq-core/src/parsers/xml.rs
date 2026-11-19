@@ -46,6 +46,16 @@
 //! `standalone`, a second root element, and `@attrs` / `#text` / `#cdata`
 //! with content at the top level, outside the root.
 //!
+//! The writer never emits XML that is not well-formed, and never alters
+//! content to make it so. It refuses: an element or attribute name or a PI
+//! target that is not an XML `Name` (a PI target `xml` in any case too), a
+//! character XML 1.0 does not allow (a C0 control other than tab, LF, CR),
+//! a comment with `--` or a trailing `-`, a PI with `?>`, and declaration
+//! fields outside its grammar. A boolean `standalone` is `yes` / `no`.
+//! CDATA holding `]]>` is split across adjacent sections, which read back
+//! as separate `#cdata` items with the same text. Comments are written as
+//! they are: XML has no escapes inside a comment.
+//!
 //! ## Read-only edit operations
 //!
 //! `XmlFormat` does **not** register a textual-edit `ScalarRenderer` /
@@ -646,7 +656,7 @@ fn render_xml(top: &Value) -> Result<Vec<u8>> {
     }
     for s in item_texts(KEY_COMMENTS, TOP, top.get(KEY_COMMENTS))? {
         writer
-            .write_event(Event::Comment(text_event(&s)))
+            .write_event(Event::Comment(comment_event(&s)))
             .map_err(map_write_err)?;
     }
 
@@ -731,6 +741,7 @@ fn write_element(
     body: &IndexMap<String, Value>,
     indent_level: usize,
 ) -> Result<()> {
+    check_name(tag, "an element")?;
     let mut start = BytesStart::new(tag);
     match body.get(KEY_ATTRS) {
         None | Some(Value::Map(_)) => {}
@@ -757,6 +768,8 @@ fn write_element(
                     ),
                 })?,
             };
+            check_name(k, &format!("an attribute (on <{tag}>)"))?;
+            check_chars(&format!("attribute '{k}' on <{tag}>"), &v)?;
             start.push_attribute(Attribute {
                 key: QName(k.as_str()),
                 value: escape_xml(&v).into_owned().into(),
@@ -777,6 +790,9 @@ fn write_element(
             ),
         })?),
     };
+    if let Some(text) = &text {
+        check_chars(&format!("'{KEY_TEXT}' of <{tag}>"), text)?;
+    }
 
     // Determine if the element has any body content. If not, emit as
     // self-closing `<tag/>`.
@@ -825,7 +841,7 @@ fn write_element(
             write_indent_break(writer, child_indent)?;
         }
         writer
-            .write_event(Event::Comment(text_event(s)))
+            .write_event(Event::Comment(comment_event(s)))
             .map_err(map_write_err)?;
     }
     for s in &pis {
@@ -842,9 +858,13 @@ fn write_element(
             .map_err(map_write_err)?;
     }
     for s in &cdata {
-        writer
-            .write_event(Event::CData(BytesCData::new(s.as_str())))
-            .map_err(map_write_err)?;
+        // `]]>` would end the section early: quick-xml splits it across
+        // adjacent sections (`]]]]><![CDATA[>`), the same text on re-read.
+        for section in BytesCData::escaped(s) {
+            writer
+                .write_event(Event::CData(section))
+                .map_err(map_write_err)?;
+        }
     }
 
     for (k, v) in body {
@@ -953,9 +973,114 @@ fn item_texts(key: &str, owner: &str, entry: Option<&Value>) -> Result<Vec<Strin
                 item.type_name(),
             ),
         })?;
+        check_item(key, owner, &text)?;
         texts.push(text);
     }
     Ok(texts)
+}
+
+/// Refuse an item that cannot be written as well-formed XML of its kind —
+/// never alter it. Every kind: a character XML 1.0 does not allow. A
+/// comment: `--` anywhere or `-` at the end. A processing instruction: a
+/// target (up to the first whitespace) that is not an XML name or is `xml`
+/// in any case, or `?>` inside. CDATA has no such limit: `]]>` is split
+/// across adjacent sections when written.
+fn check_item(key: &str, owner: &str, text: &str) -> Result<()> {
+    check_chars(&format!("'{key}' {owner}"), text)?;
+    let refuse = |message: String| {
+        Err(Error::Format {
+            format: "xml",
+            message,
+        })
+    };
+    match key {
+        KEY_COMMENTS if text.contains("--") => refuse(format!(
+            "XML write: a comment in '{key}' {owner} contains '--', which XML does not allow in a comment",
+        )),
+        KEY_COMMENTS if text.ends_with('-') => refuse(format!(
+            "XML write: a comment in '{key}' {owner} ends in '-', which XML does not allow in a comment",
+        )),
+        KEY_PI => {
+            let target = text
+                .split([' ', '\t', '\n', '\r'])
+                .next()
+                .unwrap_or_default();
+            if !is_xml_name(target) {
+                refuse(format!(
+                    "XML write: '{target}' is not a valid XML name for a processing-instruction \
+                     target ('{key}' {owner})",
+                ))
+            } else if target.eq_ignore_ascii_case("xml") {
+                refuse(format!(
+                    "XML write: '{target}' cannot be a processing-instruction target, XML reserves \
+                     it for the declaration ('{key}' {owner})",
+                ))
+            } else if text.contains("?>") {
+                refuse(format!(
+                    "XML write: a processing instruction in '{key}' {owner} contains '?>', which \
+                     would end it early",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Refuse `name` unless it is an XML 1.0 `Name`; `what` says what it names
+/// (`an element`, `an attribute (on <r>)`). A colon is a name character, so
+/// a prefixed name (`svg:rect`, even `x:y:z`) passes: dq does not check
+/// namespaces.
+fn check_name(name: &str, what: &str) -> Result<()> {
+    if is_xml_name(name) {
+        return Ok(());
+    }
+    Err(Error::Format {
+        format: "xml",
+        message: format!("XML write: '{name}' is not a valid XML name for {what}"),
+    })
+}
+
+/// The XML 1.0 (fifth edition) `Name` production: a `NameStartChar`, then
+/// `NameChar`s.
+fn is_xml_name(name: &str) -> bool {
+    let start = |c: char| {
+        matches!(c,
+            ':' | 'A'..='Z' | '_' | 'a'..='z'
+            | '\u{C0}'..='\u{D6}' | '\u{D8}'..='\u{F6}' | '\u{F8}'..='\u{2FF}'
+            | '\u{370}'..='\u{37D}' | '\u{37F}'..='\u{1FFF}' | '\u{200C}'..='\u{200D}'
+            | '\u{2070}'..='\u{218F}' | '\u{2C00}'..='\u{2FEF}' | '\u{3001}'..='\u{D7FF}'
+            | '\u{F900}'..='\u{FDCF}' | '\u{FDF0}'..='\u{FFFD}' | '\u{10000}'..='\u{EFFFF}')
+    };
+    let mut chars = name.chars();
+    chars.next().is_some_and(start)
+        && chars.all(|c| {
+            start(c)
+                || matches!(c,
+                    '-' | '.' | '0'..='9' | '\u{B7}' | '\u{300}'..='\u{36F}' | '\u{203F}'..='\u{2040}')
+        })
+}
+
+/// Refuse `text` if it holds a character outside XML 1.0's `Char`: a C0
+/// control other than tab, LF and CR, or U+FFFE / U+FFFF. XML has no escape
+/// for them — a character reference to one is not well-formed either.
+/// `what` names the place (`'#text' of <r>`).
+fn check_chars(what: &str, text: &str) -> Result<()> {
+    let allowed = |c: char| {
+        matches!(c,
+            '\t' | '\n' | '\r' | '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..)
+    };
+    match text.chars().find(|&c| !allowed(c)) {
+        None => Ok(()),
+        Some(c) => Err(Error::Format {
+            format: "xml",
+            message: format!(
+                "XML write: {what} holds U+{:04X}, a character XML 1.0 does not allow",
+                u32::from(c),
+            ),
+        }),
+    }
 }
 
 /// The fields of an `<?xml …?>` declaration.
@@ -968,8 +1093,11 @@ struct Declaration {
 /// The declaration a top-level `#xml` entry asks for: `None` without one
 /// (absent or null). Each field is written as its [`scalar_text`] — a YAML
 /// `version: 1.1` is a float and stays `1.1` — and a missing or null
-/// `version` is `1.0`. A non-map entry, a key other than `version` /
-/// `encoding` / `standalone`, and a container as a field are refused.
+/// `version` is `1.0`; a boolean `standalone` is `yes` / `no`. A non-map
+/// entry, a key other than `version` / `encoding` / `standalone`, a
+/// container as a field, and a field the declaration grammar does not allow
+/// (`version` not `1.` and digits, `encoding` not an encoding name,
+/// `standalone` not `yes` / `no`) are refused.
 fn declaration(entry: Option<&Value>) -> Result<Option<Declaration>> {
     let decl = match entry {
         None | Some(Value::Null) => return Ok(None),
@@ -1013,12 +1141,48 @@ fn declaration(entry: Option<&Value>) -> Result<Option<Declaration>> {
                 v.type_name(),
             ),
         })?;
+        let text = match (k.as_str(), v) {
+            // `standalone` takes `yes` / `no` only; a boolean is the same
+            // answer.
+            ("standalone", Value::Bool(b)) => if *b { "yes" } else { "no" }.to_owned(),
+            ("standalone", _) if text != "yes" && text != "no" => {
+                return Err(decl_field_error(k, "must be yes or no", &text));
+            }
+            ("version", _) if !is_version_num(&text) => {
+                return Err(decl_field_error(k, "must be 1. and digits", &text));
+            }
+            ("encoding", _) if !is_enc_name(&text) => {
+                return Err(decl_field_error(k, "is not an encoding name", &text));
+            }
+            _ => text,
+        };
         match slot {
             Some(slot) => *slot = Some(text),
             None => fields.version = text,
         }
     }
     Ok(Some(fields))
+}
+
+fn decl_field_error(field: &str, rule: &str, got: &str) -> Error {
+    Error::Format {
+        format: "xml",
+        message: format!("XML write: '{KEY_XML_DECL}' field '{field}' {rule} (got {got:?})"),
+    }
+}
+
+/// XML 1.0 `VersionNum`: `1.` and one or more digits.
+fn is_version_num(s: &str) -> bool {
+    s.strip_prefix("1.")
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// XML 1.0 `EncName`: a Latin letter, then Latin letters, digits, `.`, `_`
+/// and `-`.
+fn is_enc_name(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    bytes.next().is_some_and(|b| b.is_ascii_alphabetic())
+        && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 /// A top-level value that carries nothing: a null or an empty container.
@@ -1042,7 +1206,7 @@ fn non_empty_array(v: &Value) -> bool {
     matches!(v, Value::Array(items) if !items.is_empty())
 }
 
-/// Escape `raw` for text, comment and attribute-value output.
+/// Escape `raw` for text and attribute-value output.
 ///
 /// Replaces exactly `<`, `>`, `&`, `'` and `"` — the set quick-xml's
 /// `escape` used up to 0.40, which is what `BytesText::new` and
@@ -1072,9 +1236,17 @@ fn escape_xml(raw: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// `BytesText` for a text or comment body, escaped with [`escape_xml`].
+/// `BytesText` for a text body, escaped with [`escape_xml`].
 fn text_event(s: &str) -> BytesText<'_> {
     BytesText::from_escaped(escape_xml(s))
+}
+
+/// `BytesText` for a comment body, written as it is: XML has no escapes in
+/// a comment — `&lt;` there is four characters — and the reader takes a
+/// comment's text as written, so escaping would change it on every round
+/// trip. [`check_item`] has refused what a comment cannot hold.
+fn comment_event(s: &str) -> BytesText<'_> {
+    BytesText::from_escaped(s)
 }
 
 fn map_write_err(e: std::io::Error) -> Error {
@@ -1180,6 +1352,60 @@ mod tests {
         assert!(err.to_string().contains("has no field 'doctype'"), "{err}");
         let err = render_xml(&doc(Value::Int(1))).expect_err("refused");
         assert!(err.to_string().contains("(got int)"), "{err}");
+    }
+
+    #[test]
+    fn xml_names_follow_the_name_production() {
+        for name in ["r", "_a", ":a", "x:y:z", "a-b.c1", "é", "a\u{B7}"] {
+            assert!(is_xml_name(name), "{name:?} is a name");
+        }
+        for name in ["", "1x", "-a", ".a", "a b", "a\tb", "a/b", "\u{B7}a"] {
+            assert!(!is_xml_name(name), "{name:?} is not a name");
+        }
+    }
+
+    #[test]
+    fn declaration_grammar_accepts_only_its_own_values() {
+        assert!(is_version_num("1.0") && is_version_num("1.10"));
+        assert!(!is_version_num("1.") && !is_version_num("2.0") && !is_version_num("1.0a"));
+        assert!(is_enc_name("UTF-8") && is_enc_name("iso_8859.1"));
+        assert!(!is_enc_name("") && !is_enc_name("8bit") && !is_enc_name("a b"));
+    }
+
+    #[test]
+    fn items_xml_cannot_hold_are_refused_and_cdata_split() {
+        let owner = "of <r>";
+        assert!(check_item(KEY_COMMENTS, owner, "a < b & c -x").is_ok());
+        assert!(check_item(KEY_COMMENTS, owner, "a--b").is_err());
+        assert!(check_item(KEY_COMMENTS, owner, "a-").is_err());
+        assert!(check_item(KEY_PI, owner, "xml-stylesheet href='a'").is_ok());
+        assert!(check_item(KEY_PI, owner, "t\tdata ? >").is_ok());
+        for pi in ["xml v", "XML", "1t", "", " t", "t a?>"] {
+            assert!(check_item(KEY_PI, owner, pi).is_err(), "{pi:?}");
+        }
+        assert!(check_item(KEY_CDATA, owner, "a]]>b").is_ok());
+        let err = check_item(KEY_CDATA, owner, "\u{FFFE}").expect_err("refused");
+        assert!(err.to_string().contains("holds U+FFFE"), "{err}");
+
+        let mut body = IndexMap::new();
+        body.insert(KEY_CDATA.to_owned(), Value::String("a]]>b]]>".to_owned()));
+        let mut top = IndexMap::new();
+        top.insert("r".to_owned(), Value::Array(vec![Value::Map(body)]));
+        let xml = render(&Value::Map(top));
+        assert_eq!(xml, "<r><![CDATA[a]]]]><![CDATA[>b]]]]><![CDATA[>]]></r>");
+        let back = parse(&xml);
+        let body = root_element_body(&back, "r");
+        let Some(Value::Array(sections)) = body.get(KEY_CDATA) else {
+            panic!("#cdata")
+        };
+        let text: String = sections
+            .iter()
+            .map(|s| match s {
+                Value::String(s) => s.as_str(),
+                _ => panic!("string section"),
+            })
+            .collect();
+        assert_eq!(text, "a]]>b]]>");
     }
 
     #[test]
