@@ -49,6 +49,7 @@ impl Format for Hcl {
         let body: Body = text
             .parse()
             .map_err(|e: hcl::Error| map_hcl_parse_error(e))?;
+        check_body_keys(&body)?;
         let value = body_to_value(&body);
         Ok(Document::value_only(value, FormatTag::Hcl))
     }
@@ -96,6 +97,49 @@ fn body_to_value(body: &Body) -> Value {
         }
     }
     Value::Map(out)
+}
+
+/// Fail on an object whose keys repeat once they are the strings a
+/// [`Value::Map`] holds: `hcl-rs` rejects `{ a = 1, a = 2 }`, but `a` and
+/// `"a"` (or `1` and `"1"`) are two keys to it and one to the map, where
+/// the last would silently win.
+///
+/// # Errors
+///
+/// [`Error::Parse`] naming the repeated key; `hcl-rs` gives no position.
+fn check_body_keys(body: &Body) -> Result<()> {
+    body.iter().try_for_each(|structure| match structure {
+        Structure::Attribute(attr) => check_expression_keys(&attr.expr),
+        Structure::Block(block) => check_body_keys(&block.body),
+    })
+}
+
+fn check_expression_keys(expr: &Expression) -> Result<()> {
+    match expr {
+        Expression::Array(items) => items.iter().try_for_each(check_expression_keys),
+        Expression::Parenthesis(inner) => check_expression_keys(inner),
+        Expression::Object(object) => {
+            let mut seen = std::collections::HashSet::with_capacity(object.len());
+            for (key, value) in object.iter() {
+                let key = key.to_string();
+                if !seen.insert(key.clone()) {
+                    return Err(Error::Parse {
+                        file: None,
+                        line: 0,
+                        col: 0,
+                        span: 0..0,
+                        snippet: String::new(),
+                        message: format!(
+                            "invalid object item; expected unique object key; found redefined object key {key:?}"
+                        ),
+                    });
+                }
+                check_expression_keys(value)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Insert a block into `parent` honouring the labels-as-keys nesting rule.
@@ -304,6 +348,22 @@ fn map_hcl_parse_error(e: hcl::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_fails_on_object_keys_that_repeat_as_strings() {
+        for text in [
+            "x = { a = 1, \"a\" = 2 }\n",
+            "x = [{ 1 = 1, \"1\" = 2 }]\n",
+            "b {\n  x = ({ k = 1, \"k\" = 2 })\n}\n",
+        ] {
+            let err = Hcl.parse(text.as_bytes()).expect_err(text);
+            let Error::Parse { message, .. } = err else {
+                panic!("{err:?}")
+            };
+            assert!(message.contains("found redefined object key"), "{message}");
+        }
+        assert!(Hcl.parse(b"x = { a = 1, \"b\" = 2 }\n").is_ok());
+    }
 
     #[test]
     fn parse_simple_attribute() {

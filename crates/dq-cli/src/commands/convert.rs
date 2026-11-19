@@ -534,16 +534,18 @@ fn render_to_format(
                 .map_err(anyhow::Error::new)?;
         }
         OutputFormat::Toon => {
-            // toon-format only accepts `serde::Serialize` types; route via
-            // serde_json::Value as the lowest-common-denominator
-            // representation.
-            let v = if let Some(values) = doc.values() {
-                serde_json::Value::Array(values.iter().map(dq_core::Value::to_serde_json).collect())
-            } else {
-                doc.value().to_serde_json()
+            // The reporter checks the numbers on dq's value, so a refusal
+            // names a number as dq holds it, then writes through
+            // serde_json::Value — toon-format only accepts `serde::Serialize`.
+            let stream;
+            let v = match doc.values() {
+                Some(values) => {
+                    stream = dq_core::Value::Array(values.to_vec());
+                    &stream
+                }
+                None => doc.value(),
             };
-            let reporter = ToonReporter;
-            reporter.report(&v, &mut buf)?;
+            ToonReporter.report_value(v, &mut buf)?;
         }
         OutputFormat::Console => {
             // Console is the default; for `convert` it produces a "what

@@ -21,6 +21,7 @@
 //! and [`Document::multi`], and the read-side accessors [`Document::value`]
 //! (single only) and [`Document::values`] (multi only).
 
+mod number;
 pub mod spans;
 mod stream;
 
@@ -36,6 +37,7 @@ use crate::ir::{Ir, Provenance, ProvenanceMap};
 use crate::pointer::{Pointer, Segment};
 use crate::textual_edit::{insertion_renderer_for_format, renderer_for_format};
 
+pub(crate) use number::{DecimalParts, decimal_identity, float_literal_value, may_exceed_f64};
 pub use spans::{SpanContext, SpanMap, SpanRecomputeDelta, ValueSpan, apply_delta};
 
 /// A single value node within a parsed document.
@@ -270,15 +272,31 @@ impl Value {
         }
     }
 
+    /// The first number literal this value is or holds that no `f64` or
+    /// `i64` holds ([`Value::BigInt`], a finite [`Value::BigFloat`]), as
+    /// dq holds it; `None` when there is none.
+    fn big_number(&self) -> Option<&str> {
+        match self {
+            Self::Array(items) => items.iter().find_map(Self::big_number),
+            Self::Map(map) => map.values().find_map(Self::big_number),
+            Self::BigFloat(s) if non_finite_literal(s).is_some() => None,
+            Self::BigInt(s) | Self::BigFloat(s) => Some(s),
+            _ => None,
+        }
+    }
+
     /// Whether `self` and `other` hold the same data.
     ///
     /// Unlike `==`, a NaN equals a NaN, a non-finite float equals the
     /// literal spelling it (`Float(NaN)` and `BigFloat(".nan")`), and
     /// `-0.0` differs from `0.0` (finite floats compare by bits), and a
     /// big-number literal equals another spelling of the same decimal
-    /// (`BigFloat("1e400")` and `BigFloat("1.0e+400")`) — never a number of
-    /// another value, so `0.1000000000000000000000000001` differs from
-    /// `Float(0.1)`; map key order is ignored, as `==` ignores it.
+    /// (`BigFloat("1e400")` and `BigFloat("1.0e+400")`, exponents of any
+    /// size) and a float the literal is one of
+    /// ([`Value::from_number_literal`]: `BigFloat("0.10")` and
+    /// `Float(0.1)`) — never a number of another value, so
+    /// `0.1000000000000000000000000001` differs from `Float(0.1)`; map key
+    /// order is ignored, as `==` ignores it.
     #[must_use]
     pub fn same_data(&self, other: &Self) -> bool {
         match (self, other) {
@@ -298,12 +316,18 @@ impl Value {
                     // is a change.
                     (None, None) => match (a, b) {
                         (Self::Float(a), Self::Float(b)) => a.to_bits() == b.to_bits(),
-                        // A literal by its decimal value: `1e400` is `1.0e+400`,
-                        // and a float the decimal its shortest spelling is.
+                        // A literal by its decimal value: `1e400` is `1.0e+400`;
+                        // a literal is a float when the float holds it
+                        // ([`Value::from_number_literal`]: `0.10` is `0.1`).
                         (Self::BigInt(a), Self::BigInt(b))
-                        | (Self::BigFloat(a), Self::BigFloat(b)) => a == b || same_decimal(a, b),
+                        | (Self::BigFloat(a), Self::BigFloat(b)) => {
+                            a == b || number::same_decimal(a, b)
+                        }
                         (Self::Float(f), Self::BigFloat(s))
-                        | (Self::BigFloat(s), Self::Float(f)) => same_decimal(s, &format!("{f:e}")),
+                        | (Self::BigFloat(s), Self::Float(f)) => matches!(
+                            number::float_literal_value(s),
+                            Some(Self::Float(g)) if g.to_bits() == f.to_bits()
+                        ),
                         _ => a == b,
                     },
                 }
@@ -321,38 +345,30 @@ impl Value {
         (big(self) || big(other)) && self.same_data(other)
     }
 
-    /// The number a decimal literal spells, with its exact value:
+    /// The number a decimal literal spells, with its exact value — the one
+    /// rule every reader and the jq bridge use:
     ///
     /// - an integer that fits `i64` is an [`Value::Int`], any other a
     ///   [`Value::BigInt`];
     /// - a literal with a fraction or an exponent is a [`Value::Float`] when
-    ///   the nearest `f64` is the same decimal (`1.10`, `1e3`), else a
-    ///   [`Value::BigFloat`] — more digits than an `f64` holds
-    ///   (`0.1000000000000000000000000001`), or past its range (`1e400`,
-    ///   `1e-400`).
+    ///   it parses to a finite `f64`, has at most 17 significant digits, and
+    ///   is that `f64` correctly rounded to its own number of digits
+    ///   (`format!("{:.*e}", n - 1, f)` spells the same decimal): `1.10`,
+    ///   `1e3`, `0.10000000000000001` (`%.17g` output), `4.9e-324`. Any
+    ///   other is a [`Value::BigFloat`]: more digits than an `f64` holds
+    ///   (`0.1000000000000000000000000001`), a 17-digit decimal another
+    ///   one rounds the `f64` to (`0.10000000000000004`), or a value past
+    ///   its range (`1e400`, `1e-400`).
     ///
     /// A big literal is kept as JSON spells it: without a leading `+` or
     /// leading zeros, with a digit on both sides of a `.` (`+.5e400` is
-    /// `0.5e400`), so every writer can copy it. `None` for anything not
-    /// shaped `[-+]digits[.digits][(e|E)[-+]digits]` (a `.` may lead or end
-    /// the mantissa, not both): hex, `.inf`, `1_000`, words.
+    /// `0.5e400`), the exponent as written, so every writer can copy it.
+    /// `None` for anything not shaped `[-+]digits[.digits][(e|E)[-+]digits]`
+    /// (a `.` may lead or end the mantissa, not both): hex, `.inf`,
+    /// `1_000`, words.
     #[must_use]
     pub fn from_number_literal(literal: &str) -> Option<Self> {
-        let parts = DecimalParts::parse(literal)?;
-        if let Ok(i) = literal.parse::<i64>() {
-            return Some(Self::Int(i));
-        }
-        if parts.frac.is_none() && parts.exponent.is_none() {
-            return Some(Self::BigInt(parts.json_spelling()));
-        }
-        let f = literal.parse::<f64>().ok()?;
-        Some(
-            if f.is_finite() && same_decimal(literal, &format!("{f:e}")) {
-                Self::Float(f)
-            } else {
-                Self::BigFloat(parts.json_spelling())
-            },
-        )
+        number::number_value(literal)
     }
 
     /// Stable type name used by the `type` command and error messages.
@@ -395,6 +411,15 @@ impl Value {
             Self::Float(f) => serde_json::Number::from_f64(*f)
                 .map(serde_json::Value::Number)
                 .unwrap_or_else(|| serde_json::Value::String(f.to_string())),
+            // A float spelled as an integer (`!!float 18446744073709551617`)
+            // gets a `.0`, so JSON reads it back as a float.
+            Self::BigFloat(s) if DecimalParts::parse(s).is_some_and(|p| p.is_integer()) => {
+                let float = format!("{s}.0");
+                serde_json::Number::from_str(&float).map_or_else(
+                    |_| serde_json::Value::String(s.clone()),
+                    serde_json::Value::Number,
+                )
+            }
             Self::BigInt(s) | Self::BigFloat(s) => match serde_json::Number::from_str(s) {
                 Ok(n) => serde_json::Value::Number(n),
                 Err(_) => serde_json::Value::String(s.clone()),
@@ -451,103 +476,6 @@ impl Value {
 fn serde_json_number_to_value(n: &serde_json::Number) -> Value {
     let literal = n.to_string();
     Value::from_number_literal(&literal).unwrap_or(Value::BigFloat(literal))
-}
-
-/// The parts of a decimal number literal: sign, integer digits, fraction
-/// digits after a `.`, and the exponent after an `e` / `E`.
-struct DecimalParts<'a> {
-    negative: bool,
-    int: &'a str,
-    frac: Option<&'a str>,
-    /// The exponent with its `e` / `E`: `e+400`.
-    exponent: Option<&'a str>,
-}
-
-impl<'a> DecimalParts<'a> {
-    /// `None` unless `literal` is `[-+]digits[.digits][(e|E)[-+]digits]`
-    /// with a digit somewhere in the mantissa.
-    fn parse(literal: &'a str) -> Option<Self> {
-        let (negative, rest) = match literal.as_bytes().first()? {
-            b'-' => (true, &literal[1..]),
-            b'+' => (false, &literal[1..]),
-            _ => (false, literal),
-        };
-        let (mantissa, exponent) = match rest.find(['e', 'E']) {
-            Some(at) => (&rest[..at], Some(&rest[at..])),
-            None => (rest, None),
-        };
-        let (int, frac) = match mantissa.split_once('.') {
-            Some((int, frac)) => (int, Some(frac)),
-            None => (mantissa, None),
-        };
-        let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
-        if !digits(int) || !frac.is_none_or(digits) || int.len() + frac.map_or(0, str::len) == 0 {
-            return None;
-        }
-        if let Some(exponent) = exponent {
-            let exponent = &exponent[1..];
-            let unsigned = exponent.strip_prefix(['-', '+']).unwrap_or(exponent);
-            if unsigned.is_empty() || !digits(unsigned) {
-                return None;
-            }
-        }
-        Some(Self {
-            negative,
-            int,
-            frac,
-            exponent,
-        })
-    }
-
-    /// The literal as JSON writes it: no `+`, no leading zeros, a digit on
-    /// both sides of a `.`.
-    fn json_spelling(&self) -> String {
-        let int = self.int.trim_start_matches('0');
-        let mut out = String::from(if self.negative { "-" } else { "" });
-        out.push_str(if int.is_empty() { "0" } else { int });
-        if let Some(frac) = self.frac {
-            out.push('.');
-            out.push_str(if frac.is_empty() { "0" } else { frac });
-        }
-        if let Some(exponent) = self.exponent {
-            out.push_str(exponent);
-        }
-        out
-    }
-}
-
-/// Whether two decimal literals spell the same number: sign, digits and
-/// exponent are compared after dropping leading and trailing zeros, so
-/// `1.10` equals `1.1` and `1e3` equals `1000`. `false` when either is not
-/// a plain decimal literal.
-fn same_decimal(a: &str, b: &str) -> bool {
-    match (normalized_decimal(a), normalized_decimal(b)) {
-        (Some(a), Some(b)) => a == b,
-        _ => false,
-    }
-}
-
-/// `literal` as `(negative, significant digits, exponent of the last
-/// digit)`: `-0.0120e2` (-1.2) is `(true, "12", -1)`. Zero has no digits
-/// and no sign, so `-0` equals `0` here — a [`Value::Float`] pair is
-/// compared by bits instead.
-fn normalized_decimal(literal: &str) -> Option<(bool, String, i64)> {
-    let parts = DecimalParts::parse(literal)?;
-    let exponent = match parts.exponent {
-        Some(exponent) => exponent[1..].parse::<i64>().ok()?,
-        None => 0,
-    };
-    let frac = parts.frac.unwrap_or("");
-    let frac_len = i64::try_from(frac.len()).ok()?;
-    let digits = format!("{}{frac}", parts.int);
-    let significant = digits.trim_start_matches('0');
-    let trimmed = significant.trim_end_matches('0');
-    if trimmed.is_empty() {
-        return Some((false, String::new(), 0));
-    }
-    let trailing = i64::try_from(significant.len() - trimmed.len()).ok()?;
-    let exponent = exponent.checked_sub(frac_len)?.checked_add(trailing)?;
-    Some((parts.negative, trimmed.to_owned(), exponent))
 }
 
 impl Document {
@@ -1001,6 +929,15 @@ impl Document {
                 action: "set",
                 pointer: canonical,
                 reason: JSON_NON_FINITE.to_owned(),
+            });
+        }
+        if self.format == FormatTag::Toml
+            && let Some(number) = value.big_number()
+        {
+            return Err(Error::EditRejected {
+                action: "set",
+                pointer: canonical,
+                reason: format!("{TOML_BIG_NUMBER} {number}"),
             });
         }
         if self.format == FormatTag::Yaml
@@ -2146,7 +2083,10 @@ impl Document {
                     action,
                     pointer,
                     reason,
-                } if !reason.contains(JQ_REWRITE_HINT) && reason != JSON_NON_FINITE => {
+                } if !reason.contains(JQ_REWRITE_HINT)
+                    && reason != JSON_NON_FINITE
+                    && !reason.starts_with(TOML_BIG_NUMBER) =>
+                {
                     Error::EditRejected {
                         action,
                         pointer,
@@ -3831,6 +3771,10 @@ type LayoutCache = std::cell::OnceCell<Option<crate::parsers::yaml_spans::EditLa
 /// Why a JSON `set` of NaN or Infinity is refused — by the JSON writer
 /// too, so with no way around it.
 const JSON_NON_FINITE: &str = "JSON has no NaN or Infinity";
+
+/// Why a TOML `set` of a number past `i64` / `f64` is refused — by the
+/// TOML writer too, so with no way around it. The number follows.
+const TOML_BIG_NUMBER: &str = "TOML cannot represent arbitrary-precision number";
 
 /// The way around an edit the read-back check refuses.
 const JQ_REWRITE_HINT: &str =

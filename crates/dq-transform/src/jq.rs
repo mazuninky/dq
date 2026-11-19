@@ -449,77 +449,21 @@ mod imp {
         }
     }
 
-    /// The [`dq_core::Value`] a decimal literal is.
-    ///
-    /// - An `i64` literal is an `Int`; any other integer literal a `BigInt`.
-    /// - A float literal is a `Float` when the nearest `f64` has the same
-    ///   decimal value ([`same_decimal`]: `1.10` and `1e3` qualify), else
-    ///   it stays a `BigFloat` carrying the literal — a 30-digit `π`, or
-    ///   `1e400`, which no `f64` holds.
-    /// - A word jq parses as a float (`NaN`, `inf`) becomes that float.
+    /// The [`dq_core::Value`] a decimal literal is: as a reader reads it
+    /// ([`dq_core::Value::from_number_literal`] — an `i64` is an `Int`, a
+    /// longer integer a `BigInt`, a float literal an `f64` holds a `Float`,
+    /// any other a `BigFloat` carrying it: a 30-digit `π`, `1e400`), and a
+    /// word jq parses as a float (`NaN`, `inf`) that float.
     fn dec_to_value(literal: &str) -> Result<dq_core::Value, JqError> {
-        if let Ok(i) = literal.parse::<i64>() {
-            return Ok(dq_core::Value::Int(i));
+        if let Some(value) = dq_core::Value::from_number_literal(literal) {
+            return Ok(value);
         }
-        let Ok(f) = literal.parse::<f64>() else {
-            return Err(JqError::Conversion {
+        match literal.parse::<f64>() {
+            Ok(f) if !literal.bytes().any(|b| b.is_ascii_digit()) => Ok(dq_core::Value::Float(f)),
+            _ => Err(JqError::Conversion {
                 message: format!("jaq_json::Num::Dec({literal}) is not a number"),
-            });
-        };
-        if !literal.bytes().any(|b| b.is_ascii_digit()) {
-            return Ok(dq_core::Value::Float(f));
+            }),
         }
-        if !literal.contains(['.', 'e', 'E']) {
-            return Ok(dq_core::Value::BigInt(literal.to_owned()));
-        }
-        Ok(
-            if f.is_finite() && same_decimal(literal, &format!("{f:e}")) {
-                dq_core::Value::Float(f)
-            } else {
-                dq_core::Value::BigFloat(literal.to_owned())
-            },
-        )
-    }
-
-    /// Whether two decimal literals spell the same number: sign, digits
-    /// and exponent are compared after dropping leading and trailing
-    /// zeros, so `1.10` equals `1.1` and `1e3` equals `1000`. `false` when
-    /// either is not a plain decimal literal.
-    fn same_decimal(a: &str, b: &str) -> bool {
-        match (normalized_decimal(a), normalized_decimal(b)) {
-            (Some(a), Some(b)) => a == b,
-            _ => false,
-        }
-    }
-
-    /// `literal` as `(negative, significant digits, exponent of the last
-    /// digit)`: `-0.0120e2` (-1.2) is `(true, "12", -1)`. Zero has no digits.
-    fn normalized_decimal(literal: &str) -> Option<(bool, String, i64)> {
-        let (negative, rest) = match literal.as_bytes().first()? {
-            b'-' => (true, &literal[1..]),
-            b'+' => (false, &literal[1..]),
-            _ => (false, literal),
-        };
-        let (mantissa, exponent) = match rest.find(['e', 'E']) {
-            Some(at) => (&rest[..at], rest[at + 1..].parse::<i64>().ok()?),
-            None => (rest, 0),
-        };
-        let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-        if (int.is_empty() && frac.is_empty())
-            || !int.bytes().chain(frac.bytes()).all(|b| b.is_ascii_digit())
-        {
-            return None;
-        }
-        let frac_len = i64::try_from(frac.len()).ok()?;
-        let digits = format!("{int}{frac}");
-        let significant = digits.trim_start_matches('0');
-        let trimmed = significant.trim_end_matches('0');
-        let trailing = i64::try_from(significant.len() - trimmed.len()).ok()?;
-        let exponent = exponent.checked_sub(frac_len)?.checked_add(trailing)?;
-        if trimmed.is_empty() {
-            return Some((negative, String::new(), 0));
-        }
-        Some((negative, trimmed.to_owned(), exponent))
     }
 
     /// JSON has no byte-string type, and neither has [`dq_core::Value`].
@@ -913,6 +857,8 @@ mod imp {
                 );
             }
             for (spelled, f) in [
+                ("0.10000000000000001", 0.1),
+                ("37.774929499999999", 37.7749295),
                 ("1.10", 1.1),
                 ("1e3", 1000.0),
                 ("-0.0", -0.0),
@@ -931,22 +877,6 @@ mod imp {
                 dec_to_value("not-a-number").map_err(|e| e.kind_name()),
                 Err("conversion")
             );
-        }
-
-        #[test]
-        fn normalized_decimal_drops_zeros_and_folds_the_exponent() {
-            assert_eq!(
-                normalized_decimal("-0.0120e2"),
-                Some((true, "12".into(), -1))
-            );
-            assert_eq!(normalized_decimal("1000"), Some((false, "1".into(), 3)));
-            assert_eq!(normalized_decimal("1e3"), normalized_decimal("1000"));
-            assert_eq!(normalized_decimal("1.10"), normalized_decimal("1.1"));
-            assert_eq!(normalized_decimal("0.0"), Some((false, String::new(), 0)));
-            assert_eq!(normalized_decimal("-0e0"), Some((true, String::new(), 0)));
-            for bad in ["", "-", ".", "1e", "NaN", "1_0", "1.2.3"] {
-                assert_eq!(normalized_decimal(bad), None, "{bad:?}");
-            }
         }
 
         #[test]

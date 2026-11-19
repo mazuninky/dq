@@ -6,17 +6,22 @@
 //! range (`1e400`) — a `Value::BigFloat(literal)`. serde_norway's
 //! `Value` holds neither, so the tree is read into this module's own
 //! [`Node`], which takes the `u128` / `i128` integers serde_norway hands
-//! over, and [`super::yaml_numbers`] restores the literals it rounds to an
-//! `f64` or reads as a string. M1 is read-only — comment preservation,
-//! anchor names, and quote style arrive in M2 with the event-API rewrite.
+//! over; a file holding a literal serde_norway rounds to an `f64` or
+//! reads as a string is read again by [`super::yaml_numbers`], which keeps
+//! it. A mapping key equal to an earlier one — by value, or once both are
+//! the strings a [`Value::Map`] holds (`1` and `"1"`) — fails the file.
+//! M1 is read-only — comment preservation, anchor names, and quote style
+//! arrive in M2 with the event-API rewrite.
 
 use std::collections::HashSet;
 use std::fmt;
+use std::hash::BuildHasher as _;
 use std::io::Write;
 
 use indexmap::IndexMap;
-use serde::Deserialize;
-use serde::de::{self, EnumAccess, MapAccess, SeqAccess, VariantAccess, Visitor};
+use serde::de::{
+    self, DeserializeSeed as _, EnumAccess, MapAccess, SeqAccess, VariantAccess, Visitor,
+};
 use serde_norway::Value as YamlValue;
 
 use crate::Result;
@@ -44,14 +49,7 @@ impl Format for Yaml {
         // leading one as part of the first line, and a second top-level key
         // then fails with "did not find expected <document start>".
         let bytes = bytes.strip_prefix("\u{feff}".as_bytes()).unwrap_or(bytes);
-        let mut documents: Vec<Value> = Vec::new();
-        for de_result in serde_norway::Deserializer::from_slice(bytes) {
-            let yaml = Node::deserialize(de_result).map_err(map_yaml_err)?;
-            documents.push(node_to_value(yaml));
-        }
-        if super::yaml_numbers::may_lose_numbers(bytes) {
-            super::yaml_numbers::restore_exact_numbers(bytes, &mut documents);
-        }
+        let mut documents = read_documents(bytes)?;
         match documents.len() {
             0 => Ok(Document::value_only(
                 Value::Null,
@@ -114,12 +112,28 @@ impl Format for Yaml {
     }
 }
 
+/// The value of each document of `bytes`: as serde_norway reads it when
+/// no literal can need more than it keeps, else as
+/// [`super::yaml_numbers::read_exact`] reads it — also for a key that
+/// repeats an earlier one, which that reader names where it repeats, and
+/// for a `!!float` / `!!int` number serde_norway refuses.
+fn read_documents(bytes: &[u8]) -> Result<Vec<Value>> {
+    if !super::yaml_numbers::may_lose_numbers(bytes) {
+        match read_nodes(bytes, true) {
+            Ok(nodes) => return Ok(nodes.into_iter().map(node_to_value).collect()),
+            Err(err) if is_duplicate_key(&err) || is_tagged_number(&err) => {}
+            Err(err) => return Err(map_yaml_err(err)),
+        }
+    }
+    super::yaml_numbers::read_exact(bytes)
+}
+
 fn write_one(v: &Value, w: &mut dyn Write) -> Result<()> {
     let s = super::yaml_emit::to_yaml_string(v).map_err(map_yaml_err)?;
     write_io(w, s.as_bytes())
 }
 
-fn map_yaml_err(e: serde_norway::Error) -> Error {
+pub(super) fn map_yaml_err(e: serde_norway::Error) -> Error {
     let location = e.location();
     Error::Parse {
         file: None,
@@ -131,11 +145,37 @@ fn map_yaml_err(e: serde_norway::Error) -> Error {
     }
 }
 
+/// Read every document of `bytes` into [`Node`]s. `check_keys` fails on a
+/// mapping key that may repeat one before it ([`NodeVisitor`]).
+pub(super) fn read_nodes(
+    bytes: &[u8],
+    check_keys: bool,
+) -> std::result::Result<Vec<Node>, serde_norway::Error> {
+    serde_norway::Deserializer::from_slice(bytes)
+        .map(|document| NodeSeed { check_keys }.deserialize(document))
+        .collect()
+}
+
+/// Whether serde_norway failed on a mapping key equal to one before it —
+/// as [`NodeVisitor`] tells it, or by its own check.
+pub(super) fn is_duplicate_key(err: &serde_norway::Error) -> bool {
+    err.to_string().contains("duplicate entry")
+}
+
+/// Whether serde_norway refused a `!!float` / `!!int` scalar — maybe a
+/// number past the `f64` range or past `u128`, which it has no type for.
+pub(super) fn is_tagged_number(err: &serde_norway::Error) -> bool {
+    let message = err.to_string();
+    message.contains("invalid value: string")
+        && (message.contains("expected a float") || message.contains("expected an integer"))
+}
+
 /// A YAML node as serde_norway reads it — [`YamlValue`]'s shape, plus the
 /// integers past `u64` / `i64` that `YamlValue` has no room for (its
-/// visitor fails on them with "invalid type: integer as u128").
+/// visitor fails on them with "invalid type: integer as u128"), with each
+/// mapping key stringified as [`Value::Map`] holds it.
 #[derive(Debug)]
-enum Node {
+pub(super) enum Node {
     Null,
     Bool(bool),
     Number(serde_norway::Number),
@@ -143,8 +183,44 @@ enum Node {
     BigInt(String),
     String(String),
     Sequence(Vec<Node>),
-    Mapping(Vec<(Node, Node)>),
+    Mapping(Vec<Entry>),
     Tagged(String, Box<Node>),
+}
+
+/// A mapping entry of a [`Node`].
+#[derive(Debug)]
+pub(super) struct Entry {
+    /// The key as the [`Value::Map`] key.
+    pub(super) key: String,
+    pub(super) kind: KeyKind,
+    /// The key node, `None` for a string key (`key` is the string).
+    pub(super) key_node: Option<Node>,
+    pub(super) value: Node,
+}
+
+/// What a mapping key is, for the message naming it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum KeyKind {
+    Null,
+    Bool,
+    String,
+    Number,
+    /// A collection or a tagged node.
+    Other,
+}
+
+impl KeyKind {
+    /// serde_norway's message for a key equal to an earlier one, `key`
+    /// being the earlier one as [`Entry::key`] holds it.
+    pub(super) fn duplicate_message(self, key: &str) -> String {
+        match self {
+            Self::Null => "duplicate entry with null key".to_owned(),
+            Self::Bool => format!("duplicate entry with key `{key}`"),
+            Self::String => format!("duplicate entry with key {key:?}"),
+            Self::Number => format!("duplicate entry with key {key}"),
+            Self::Other => "duplicate entry in YAML map".to_owned(),
+        }
+    }
 }
 
 impl Node {
@@ -166,7 +242,13 @@ impl Node {
             Self::Mapping(entries) => YamlValue::Mapping(
                 entries
                     .iter()
-                    .map(|(k, v)| Some((k.to_yaml_value()?, v.to_yaml_value()?)))
+                    .map(|entry| {
+                        let key = match &entry.key_node {
+                            Some(key) => key.to_yaml_value()?,
+                            None => YamlValue::String(entry.key.clone()),
+                        };
+                        Some((key, entry.value.to_yaml_value()?))
+                    })
                     .collect::<Option<_>>()?,
             ),
             Self::Tagged(tag, value) => {
@@ -177,18 +259,60 @@ impl Node {
             }
         })
     }
+
+    /// The key a [`Value::Map`] holds for this key node, and its kind: a
+    /// string as it is, a number as serde_norway prints it, `null` as the
+    /// empty key; a collection or a tagged key as its debug text.
+    fn stringify_key(&self) -> (String, KeyKind) {
+        match self {
+            Self::String(s) => (s.clone(), KeyKind::String),
+            Self::BigInt(s) => (s.clone(), KeyKind::Number),
+            Self::Bool(b) => (b.to_string(), KeyKind::Bool),
+            Self::Number(n) => (n.to_string(), KeyKind::Number),
+            Self::Null => (String::new(), KeyKind::Null),
+            // Composite keys are rare in real configs; M1 surfaces them as
+            // their textual form rather than failing.
+            other => (
+                match other.to_yaml_value() {
+                    Some(plain) => format!("{plain:?}"),
+                    None => format!("{other:?}"),
+                },
+                KeyKind::Other,
+            ),
+        }
+    }
 }
 
-impl<'de> Deserialize<'de> for Node {
+/// Deserializes a [`Node`] with [`NodeVisitor`].
+#[derive(Clone, Copy)]
+struct NodeSeed {
+    check_keys: bool,
+}
+
+impl<'de> de::DeserializeSeed<'de> for NodeSeed {
+    type Value = Node;
+
     fn deserialize<D: de::Deserializer<'de>>(
+        self,
         deserializer: D,
-    ) -> std::result::Result<Self, D::Error> {
-        deserializer.deserialize_any(NodeVisitor)
+    ) -> std::result::Result<Node, D::Error> {
+        deserializer.deserialize_any(NodeVisitor {
+            check_keys: self.check_keys,
+        })
     }
 }
 
 /// [`YamlValue`]'s visitor, with `visit_u128` / `visit_i128`.
-struct NodeVisitor;
+///
+/// With `check_keys`, a mapping fails on a key that may repeat an earlier
+/// one: the same value, or the same [`Value::Map`] key after
+/// stringification (`1` and `"1"`, `~` and `""`). The check compares
+/// hashes, so it may fail on two keys that differ; the exact check —
+/// [`super::yaml_numbers::read_exact`] — decides, and names the key where
+/// it repeats.
+struct NodeVisitor {
+    check_keys: bool,
+}
 
 impl<'de> Visitor<'de> for NodeVisitor {
     type Value = Node;
@@ -243,43 +367,59 @@ impl<'de> Visitor<'de> for NodeVisitor {
         self,
         deserializer: D,
     ) -> std::result::Result<Node, D::Error> {
-        Node::deserialize(deserializer)
+        NodeSeed {
+            check_keys: self.check_keys,
+        }
+        .deserialize(deserializer)
     }
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut data: A) -> std::result::Result<Node, A::Error> {
+        let seed = NodeSeed {
+            check_keys: self.check_keys,
+        };
         let mut items = Vec::new();
-        while let Some(item) = data.next_element::<Node>()? {
+        while let Some(item) = data.next_element_seed(seed)? {
             items.push(item);
         }
         Ok(Node::Sequence(items))
     }
 
-    /// Fails on a key seen before in the mapping, as `YamlValue`'s
-    /// `Mapping` does, with its message.
     fn visit_map<A: MapAccess<'de>>(self, mut data: A) -> std::result::Result<Node, A::Error> {
+        let seed = NodeSeed {
+            check_keys: self.check_keys,
+        };
         let mut entries = Vec::new();
-        // A key holding a big integer is never equal to one without.
-        let mut seen: HashSet<YamlValue> = HashSet::new();
-        let mut seen_big: HashSet<String> = HashSet::new();
-        while let Some(key) = data.next_key::<Node>()? {
-            let duplicate = match key.to_yaml_value() {
-                Some(plain) => {
-                    let message = duplicate_key_message(&plain);
-                    (!seen.insert(plain)).then_some(message)
+        let hasher = std::collections::hash_map::RandomState::new();
+        let mut seen: HashSet<u64> = HashSet::new();
+        while let Some(key) = data.next_key_seed(seed)? {
+            let (text, kind) = key.stringify_key();
+            if self.check_keys {
+                let mut repeats = !seen.insert(hasher.hash_one(("text", &text)));
+                // Equal values that print apart: `-0.0` and `0.0`, and
+                // collections holding them.
+                if let Node::Number(n) = &key
+                    && let Some(f) = n.as_f64()
+                    && n.is_f64()
+                {
+                    let bits = if f == 0.0 { 0 } else { f.to_bits() };
+                    repeats |= !seen.insert(hasher.hash_one(("float", bits)));
+                } else if kind == KeyKind::Other
+                    && let Some(plain) = key.to_yaml_value()
+                {
+                    repeats |= !seen.insert(hasher.hash_one(("value", plain)));
                 }
-                None => {
-                    let message = match &key {
-                        Node::BigInt(s) => format!("duplicate entry with key {s}"),
-                        _ => "duplicate entry in YAML map".to_owned(),
-                    };
-                    (!seen_big.insert(format!("{key:?}"))).then_some(message)
+                if repeats {
+                    return Err(de::Error::custom(kind.duplicate_message(&text)));
                 }
-            };
-            if let Some(message) = duplicate {
-                return Err(de::Error::custom(message));
             }
-            let value = data.next_value::<Node>()?;
-            entries.push((key, value));
+            let value = data.next_value_seed(seed)?;
+            let key_node = (kind != KeyKind::String).then_some(key);
+            entries.push(Entry {
+                key: text,
+                kind,
+                key_node,
+                value,
+            });
         }
         Ok(Node::Mapping(entries))
     }
@@ -289,37 +429,28 @@ impl<'de> Visitor<'de> for NodeVisitor {
         if tag.is_empty() {
             return Err(de::Error::custom("empty YAML tag is not allowed"));
         }
-        let value = contents.newtype_variant::<Node>()?;
+        let value = contents.newtype_variant_seed(NodeSeed {
+            check_keys: self.check_keys,
+        })?;
         Ok(Node::Tagged(tag, Box::new(value)))
     }
 }
 
-/// serde_norway's message for a duplicate mapping key.
-fn duplicate_key_message(key: &YamlValue) -> String {
-    match key {
-        YamlValue::Null => "duplicate entry with null key".to_owned(),
-        YamlValue::Bool(b) => format!("duplicate entry with key `{b}`"),
-        YamlValue::Number(n) => format!("duplicate entry with key {n}"),
-        YamlValue::String(s) => format!("duplicate entry with key {s:?}"),
-        YamlValue::Sequence(_) | YamlValue::Mapping(_) | YamlValue::Tagged(_) => {
-            "duplicate entry in YAML map".to_owned()
-        }
-    }
-}
-
-fn node_to_value(node: Node) -> Value {
+/// The [`Value`] of a node serde_norway read: numbers as
+/// [`number_value`] makes them, tags dropped.
+pub(super) fn node_to_value(node: Node) -> Value {
     match node {
         Node::Null => Value::Null,
         Node::Bool(b) => Value::Bool(b),
-        Node::Number(n) => yaml_number_to_value(&n),
+        Node::Number(n) => number_value(&n),
         Node::BigInt(s) => Value::BigInt(s),
         Node::String(s) => Value::String(s),
         Node::Sequence(items) => Value::Array(items.into_iter().map(node_to_value).collect()),
         Node::Mapping(entries) => {
+            // The keys are apart: `read_nodes` checked them.
             let mut out = IndexMap::with_capacity(entries.len());
-            for (k, val) in entries {
-                let key_str = stringify_key(k);
-                out.insert(key_str, node_to_value(val));
+            for entry in entries {
+                out.insert(entry.key, node_to_value(entry.value));
             }
             Value::Map(out)
         }
@@ -330,26 +461,11 @@ fn node_to_value(node: Node) -> Value {
     }
 }
 
-fn stringify_key(k: Node) -> String {
-    match k {
-        Node::String(s) | Node::BigInt(s) => s,
-        Node::Bool(b) => b.to_string(),
-        Node::Number(n) => n.to_string(),
-        Node::Null => String::new(),
-        // Composite keys (sequence/mapping/tagged) are rare in real configs;
-        // M1 surfaces them as their textual form rather than failing.
-        other => match other.to_yaml_value() {
-            Some(plain) => format!("{plain:?}"),
-            None => format!("{other:?}"),
-        },
-    }
-}
-
-/// The [`Value`] of a number serde_norway read: an `f64` it rounded a long
-/// literal to stays that `f64` here — [`super::yaml_numbers`] puts the
-/// literal back. A NaN or an infinity keeps serde_norway's spelling
-/// (`.nan`, `-.inf`) as a [`Value::BigFloat`].
-fn yaml_number_to_value(n: &serde_norway::Number) -> Value {
+/// The [`Value`] of a number serde_norway read: an `f64` it parsed a
+/// literal to stays that `f64` here — [`super::yaml_numbers`] reads the
+/// literals no `f64` holds exactly. A NaN or an infinity keeps
+/// serde_norway's spelling (`.nan`, `-.inf`) as a [`Value::BigFloat`].
+fn number_value(n: &serde_norway::Number) -> Value {
     if let Some(i) = n.as_i64() {
         return Value::Int(i);
     }
@@ -428,42 +544,89 @@ mod tests {
     }
 
     #[test]
-    fn parse_fails_on_a_duplicate_key_as_serde_norway_does() {
-        for (text, message) in [
-            ("a: 1\na: 2\n", "duplicate entry with key \"a\""),
-            ("1: 1\n1: 2\n", "duplicate entry with key 1"),
+    fn parse_fails_on_a_duplicate_key_at_the_repeated_key() {
+        // Worded as serde_norway words it, naming the first key, at the
+        // second one.
+        for (text, message, line, col) in [
+            (
+                "a: 1\na: 2\n",
+                "duplicate entry with key \"a\" at line 2 column 1",
+                2,
+                1,
+            ),
+            (
+                "1: 1\n1: 2\n",
+                "duplicate entry with key 1 at line 2 column 1",
+                2,
+                1,
+            ),
             (
                 "18446744073709551616: 1\n18446744073709551616: 2\n",
-                "duplicate entry with key 18446744073709551616",
+                "duplicate entry with key 18446744073709551616 at line 2 column 1",
+                2,
+                1,
+            ),
+            (
+                "18446744073709551616: 1\n'18446744073709551616': 2\n",
+                "duplicate entry with key 18446744073709551616 at line 2 column 1",
+                2,
+                1,
+            ),
+            (
+                "x:\n  - {~: 1, null: 2}\n",
+                "x[0]: duplicate entry with null key at line 2 column 12",
+                2,
+                12,
+            ),
+            (
+                "[1]: 1\n[1]: 2\n",
+                "duplicate entry in YAML map at line 2 column 1",
+                2,
+                1,
+            ),
+            (
+                "y: {true: 1, 'true': 2}\n",
+                "y: duplicate entry with key `true` at line 1 column 14",
+                1,
+                14,
             ),
         ] {
             let err = Yaml.parse(text.as_bytes()).unwrap_err();
-            let Error::Parse { message: got, .. } = err else {
+            let Error::Parse {
+                message: got,
+                line: got_line,
+                col: got_col,
+                ..
+            } = err
+            else {
                 panic!("{err:?}")
             };
-            assert!(got.starts_with(message), "{got}");
+            assert_eq!(
+                (got.as_str(), got_line, got_col),
+                (message, line, col),
+                "{text}"
+            );
         }
-        // Word for word, position included.
-        for text in [
-            "a: 1\na: 2\n",
-            "x:\n  - {~: 1, null: 2}\n",
-            "[1]: 1\n[1]: 2\n",
-            "a: [1, !x {}]\n",
-        ] {
-            let ours = Yaml
-                .parse(text.as_bytes())
-                .map(|_| ())
-                .map_err(|e| e.to_string());
-            let theirs = serde_norway::from_str::<YamlValue>(text)
-                .map(|_| ())
-                .map_err(|e| map_yaml_err(e).to_string());
-            assert_eq!(ours, theirs, "{text}");
-        }
-        // A big-integer key and the same digits quoted are two keys.
-        assert!(
-            Yaml.parse(b"18446744073709551616: 1\n'18446744073709551616': 2\n")
-                .is_ok()
-        );
+        // Any other error is serde_norway's, word for word.
+        let text = "a: [1, !x {}]\nb: !!int x\n";
+        let ours = Yaml
+            .parse(text.as_bytes())
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        let theirs = serde_norway::from_str::<YamlValue>(text)
+            .map(|_| ())
+            .map_err(|e| map_yaml_err(e).to_string());
+        assert_eq!(ours, theirs);
+    }
+
+    #[test]
+    fn parse_tells_keys_apart_that_hash_alike_only() {
+        // `0.1` and `"0.1"` print alike; `0.10` is the same `f64`.
+        assert!(Yaml.parse(b"0.1: a\n'0.1': b\n").is_err());
+        assert!(Yaml.parse(b"0.1: a\n0.10: b\n").is_err());
+        let doc = parse("a: 1\nb: 2\n'1': 3\n2.5: 4\n");
+        let Value::Map(m) = doc.value() else { panic!() };
+        assert_eq!(m.len(), 4);
     }
 
     #[test]

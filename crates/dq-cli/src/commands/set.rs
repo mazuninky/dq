@@ -575,6 +575,11 @@ fn parse_inline_value(s: &str, force_string: bool) -> Value {
         return Value::String(s.to_owned());
     }
     match serde_json::from_str::<serde_json::Value>(trimmed) {
+        // A number keeps its literal as written: serde_json respells an
+        // exponent (`1e400` as `1e+400`).
+        Ok(serde_json::Value::Number(_)) => {
+            Value::from_number_literal(trimmed).unwrap_or_else(|| Value::String(s.to_owned()))
+        }
         Ok(json) => Value::from_serde_json(&json),
         Err(_) => Value::String(s.to_owned()),
     }
@@ -1076,6 +1081,22 @@ mod tests {
             Value::Int(42) => {}
             other => panic!("expected Int(42), got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_inline_value_keeps_a_number_literal_as_written() {
+        assert_eq!(
+            parse_inline_value("1e400", false),
+            Value::BigFloat("1e400".into())
+        );
+        assert_eq!(
+            parse_inline_value("0.10000000000000001", false),
+            Value::Float(0.1)
+        );
+        assert_eq!(
+            parse_inline_value("-.5", false),
+            Value::String("-.5".into())
+        );
     }
 
     #[test]

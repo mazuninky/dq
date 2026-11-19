@@ -2638,9 +2638,6 @@ fn render_null(original_style: ScalarStyle) -> Vec<u8> {
     }
 }
 
-/// Render an `f64`. NaN/Inf are emitted as YAML's `.nan` / `.inf` (with sign),
-/// finite values use the standard `Display` form which already matches what
-/// YAML accepts as a `Float` token.
 /// A big-float literal as a float to every YAML reader: with a `.` and a
 /// signed exponent (`1e400` → `1.0e+400`), which a YAML 1.1 reader (PyYAML)
 /// needs; any other literal (`.nan`) as it is.
@@ -2650,6 +2647,9 @@ fn render_big_float(literal: &str) -> Vec<u8> {
         .into_bytes()
 }
 
+/// Render an `f64`. NaN/Inf are emitted as YAML's `.nan` / `.inf` (with sign),
+/// finite values use the standard `Display` form which already matches what
+/// YAML accepts as a `Float` token.
 fn render_float(f: f64) -> Vec<u8> {
     if f.is_nan() {
         b".nan".to_vec()

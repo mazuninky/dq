@@ -993,6 +993,12 @@ fn write_value_with(
                 return Err(non_finite_error());
             }
             write_io(w, s.as_bytes())?;
+            // A float spelled as an integer (`!!float 18446744073709551617`)
+            // stays a float to a JSON reader.
+            if matches!(v, Value::BigFloat(_)) && s.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+            {
+                write_io(w, b".0")?;
+            }
         }
         Value::Float(n) => {
             // NaN and ±Infinity are not valid JSON (RFC 8259 § 6) — fail

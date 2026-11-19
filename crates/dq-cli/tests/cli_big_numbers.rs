@@ -162,11 +162,10 @@ fn get_query_and_convert_print_each_big_number_exact() {
     }
 }
 
-/// The scan that decides whether a YAML file needs its numbers re-read
-/// looks for 16 digits in a run or a 3-digit exponent: below that every
-/// literal fits an `f64` as written, at it some do and some do not.
+/// A YAML float is an `f64` when it is the correct rounding of one at its
+/// own precision (at most 17 significant digits), else its literal.
 #[test]
-fn a_yaml_float_is_kept_exact_from_16_digits_or_a_3_digit_exponent() {
+fn a_yaml_float_is_kept_exact_when_no_f64_rounds_to_it() {
     let src = "\
 # a long id in a comment: 12345678901234567890
 d15: 0.123456789012345
@@ -187,11 +186,12 @@ ver: 1.2.3.4.5.6.7.8.9.0.1.2.3.4.5.6
         ("/d16fit", "1.234567890123457"),
         ("/e2", "1.5e+99"),
         ("/e3fit", "1e+308"),
+        // The smallest subnormal rounds to `4.9e-324` at two digits.
+        ("/sub", "5e-324"),
         // Do not: the literal (the nearest `f64` is 9999999999999.998,
-        // infinity, 5e-324 and 0.0).
+        // infinity and 0.0).
         ("/d16lost", "9999999999999.999"),
         ("/e3past", "1.8e+308"),
-        ("/sub", "4.9e-324"),
         ("/under", "1e-400"),
     ] {
         assert_eq!(
@@ -277,8 +277,9 @@ lz: 000{U64_PLUS_ONE}
 }
 
 /// A duplicate key past `u64` fails as any duplicate does, in
-/// serde_norway's words; two spellings of one big float are two keys (dq
-/// keys are strings).
+/// serde_norway's words, at the repeated key; so do two spellings of one
+/// big float, compared by their exact value, and a number key repeated as
+/// a string — dq keys are strings.
 #[test]
 fn a_duplicate_big_key_fails_like_any_duplicate_key() {
     let dir = dir_with(&[
@@ -289,6 +290,8 @@ fn a_duplicate_big_key_fails_like_any_duplicate_key() {
         ("small.yaml", "x:\n  1: a\n  1: b\n"),
         ("same.yaml", "1e400: a\n1e400: b\n"),
         ("spellings.yaml", "1e400: a\n1.0e+400: b\n"),
+        ("quoted.yaml", "1e400: a\n'1e400': b\n"),
+        ("apart.yaml", "1e400: a\n1e401: b\n"),
     ]);
     for (file, key) in [("big.yaml", U64_PLUS_ONE), ("small.yaml", "1")] {
         let (code, stdout, stderr) = failure_of(&dir, &["get", file, "/x"]);
@@ -297,19 +300,21 @@ fn a_duplicate_big_key_fails_like_any_duplicate_key() {
         assert_eq!(
             stderr,
             format!(
-                "parse error in {file}: x: duplicate entry with key {key} at line 2 column 3\n"
+                "parse error in {file}: x: duplicate entry with key {key} at line 3 column 3\n"
             )
         );
     }
-    let (code, _, stderr) = failure_of(&dir, &["get", "same.yaml", "/"]);
-    assert_eq!(code, Some(3));
+    for file in ["same.yaml", "spellings.yaml", "quoted.yaml"] {
+        let (code, _, stderr) = failure_of(&dir, &["get", file, "/"]);
+        assert_eq!(code, Some(3), "{file}");
+        assert_eq!(
+            stderr,
+            format!("parse error in {file}: duplicate entry with key 1e400 at line 2 column 1\n")
+        );
+    }
     assert_eq!(
-        stderr,
-        "parse error in same.yaml: duplicate entry with key \"1e400\"\n"
-    );
-    assert_eq!(
-        stdout_of(&dir, &["-F", "json", "-q", "convert", "spellings.yaml"]),
-        "{\n  \"1e400\": \"a\",\n  \"1.0e+400\": \"b\"\n}\n"
+        stdout_of(&dir, &["-F", "json", "-q", "convert", "apart.yaml"]),
+        "{\n  \"1e400\": \"a\",\n  \"1e401\": \"b\"\n}\n"
     );
 }
 

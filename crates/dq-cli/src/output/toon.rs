@@ -29,6 +29,39 @@ impl Reporter for ToonReporter {
         }
         Ok(())
     }
+
+    /// As [`ToonReporter::report`], refusing a number no `i64`, `u64` or
+    /// `f64` holds by the literal dq holds — the one the TOML and HCL
+    /// writers name too.
+    fn report_value(&self, value: &dq_core::Value, w: &mut dyn Write) -> anyhow::Result<()> {
+        ensure_toon_value(value)?;
+        self.report(&value.to_serde_json(), w)
+    }
+}
+
+/// Fail on the first number of `value` that `toon_format` would not write
+/// as the number it is, naming it as `value` spells it.
+///
+/// # Errors
+///
+/// [`dq_core::Error::Format`] naming the number.
+fn ensure_toon_value(value: &dq_core::Value) -> Result<(), dq_core::Error> {
+    use dq_core::Value;
+    match value {
+        Value::BigInt(s) if s.parse::<u64>().is_ok() => Ok(()),
+        Value::BigFloat(_) if value.non_finite_float().is_some() => Ok(()),
+        Value::BigInt(s) | Value::BigFloat(s) => Err(toon_refuses(s)),
+        Value::Array(items) => items.iter().try_for_each(ensure_toon_value),
+        Value::Map(map) => map.values().try_for_each(ensure_toon_value),
+        Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::String(_) => Ok(()),
+    }
+}
+
+fn toon_refuses(literal: &str) -> dq_core::Error {
+    dq_core::Error::Format {
+        format: "toon",
+        message: format!("TOON cannot represent arbitrary-precision number {literal}"),
+    }
 }
 
 /// Fail on the first number of `value` that `toon_format` would not write
@@ -49,10 +82,7 @@ fn ensure_toon_numbers(value: &serde_json::Value) -> Result<(), dq_core::Error> 
             if exact {
                 Ok(())
             } else {
-                Err(dq_core::Error::Format {
-                    format: "toon",
-                    message: format!("TOON cannot represent arbitrary-precision number {literal}"),
-                })
+                Err(toon_refuses(&literal))
             }
         }
         serde_json::Value::Array(items) => items.iter().try_for_each(ensure_toon_numbers),
@@ -101,6 +131,24 @@ mod tests {
         }
         let exact = serde_json::json!({"u": 18446744073709551615_u64, "f": 1.5, "i": -3});
         assert!(ToonReporter.report(&exact, &mut Vec::new()).is_ok());
+    }
+
+    #[test]
+    fn report_value_names_the_number_as_dq_holds_it() {
+        for literal in ["1e400", "1E+400", "0.1000000000000000000000000001"] {
+            let value = dq_core::Value::Array(vec![dq_core::Value::BigFloat(literal.into())]);
+            let err = ToonReporter
+                .report_value(&value, &mut Vec::new())
+                .expect_err(literal);
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "toon format error: TOON cannot represent arbitrary-precision number {literal}"
+                )
+            );
+        }
+        let exact = dq_core::Value::BigInt("18446744073709551615".into());
+        assert!(ToonReporter.report_value(&exact, &mut Vec::new()).is_ok());
     }
 
     #[test]
