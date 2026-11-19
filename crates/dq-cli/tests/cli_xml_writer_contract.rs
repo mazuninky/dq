@@ -1607,3 +1607,146 @@ fn xml_1_1_writes_its_restricted_characters_as_references() {
         (0, String::from_utf8_lossy(&first), "")
     );
 }
+
+/// The reader refuses a document that is not well-formed for the
+/// characters it holds, exit 3, at the character or the reference at
+/// fault, in text, attributes and markup alike, as libxml2 does:
+/// - raw, a character neither version allows (NUL, U+FFFE), a C0 control
+///   but tab, LF and CR in XML 1.0, and in XML 1.1 a `RestrictedChar`,
+///   which 1.1 takes only as a reference;
+/// - a character reference to NUL, a surrogate, U+FFFE or U+FFFF, and in
+///   XML 1.0 to a C0 control but tab, LF and CR.
+///
+/// What each version allows reads: C1 controls raw in 1.0, NEL raw and
+/// references to C0 controls in 1.1. Before, every one of these read, but
+/// NUL and surrogate references, which were refused in quick-xml's words.
+#[test]
+fn the_reader_refuses_characters_the_version_does_not_allow() {
+    let v11 = "<?xml version=\"1.1\"?>";
+    let files: Vec<(&str, String)> = vec![
+        ("raw_c0.xml", "<r>a\u{1}b</r>".into()),
+        ("raw_comment.xml", "<!--a\u{1}--><r/>".into()),
+        ("raw_fffe.xml", "<r>\u{FFFE}</r>".into()),
+        ("raw_nul.xml", "<r a=\"\u{0}\"/>".into()),
+        ("raw_c1_11.xml", format!("{v11}<r>a\u{80}b</r>")),
+        ("raw_c0_11.xml", format!("{v11}\n<r a=\"\u{2}\"/>")),
+        ("ref_c0.xml", "<r>&#x1;</r>".into()),
+        ("ref_c0_attr.xml", "<r a=\"&#x1;\"/>".into()),
+        ("ref_fffe.xml", "<r>&#65534;</r>".into()),
+        ("ref_nul.xml", "<r>&#0;</r>".into()),
+        ("ref_surrogate.xml", "<r>\n&#xD800;</r>".into()),
+        ("ref_surrogate_attr.xml", "<r a=\"x&#xD800;\"/>".into()),
+        ("ref_ffff_11.xml", format!("{v11}<r>&#xFFFF;</r>")),
+        ("ok_c1_10.xml", "<r>\u{80}</r>".into()),
+        ("ok_nel_11.xml", format!("{v11}<r>a\u{85}b</r>")),
+        (
+            "ok_ref_11.xml",
+            format!("{v11}<r a=\"&#x1;\">&#1;&#x7F;</r>"),
+        ),
+    ];
+    let borrowed: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(name, body)| (*name, body.as_bytes()))
+        .collect();
+    let dir = dir_with(&borrowed);
+    let not_10 = |c: &str| format!("the document holds {c}, a character XML 1.0 does not allow");
+    let raw_11 = |c: &str| {
+        format!("the document holds {c}, which XML 1.1 allows only as a character reference")
+    };
+    let reference = |r: &str, c: &str, version: &str| {
+        format!(
+            "the character reference '{r}' refers to {c}, a character XML {version} does not allow"
+        )
+    };
+    assert_cases(
+        &dir,
+        &[
+            (
+                convert("raw_c0.xml", "json"),
+                unreadable_at("raw_c0.xml", 1, 5, &not_10("U+0001")),
+            ),
+            (
+                convert("raw_comment.xml", "json"),
+                unreadable_at("raw_comment.xml", 1, 6, &not_10("U+0001")),
+            ),
+            (
+                convert("raw_fffe.xml", "json"),
+                unreadable_at("raw_fffe.xml", 1, 4, &not_10("U+FFFE")),
+            ),
+            (
+                convert("raw_nul.xml", "json"),
+                unreadable_at("raw_nul.xml", 1, 7, &not_10("U+0000")),
+            ),
+            (
+                convert("raw_c1_11.xml", "json"),
+                unreadable_at("raw_c1_11.xml", 1, 26, &raw_11("U+0080")),
+            ),
+            (
+                convert("raw_c0_11.xml", "json"),
+                unreadable_at("raw_c0_11.xml", 2, 7, &raw_11("U+0002")),
+            ),
+            (
+                convert("ref_c0.xml", "json"),
+                unreadable_at("ref_c0.xml", 1, 4, &reference("&#x1;", "U+0001", "1.0")),
+            ),
+            (
+                convert("ref_c0_attr.xml", "json"),
+                unreadable_at(
+                    "ref_c0_attr.xml",
+                    1,
+                    7,
+                    &reference("&#x1;", "U+0001", "1.0"),
+                ),
+            ),
+            (
+                convert("ref_fffe.xml", "json"),
+                unreadable_at(
+                    "ref_fffe.xml",
+                    1,
+                    4,
+                    &reference("&#65534;", "U+FFFE", "1.0"),
+                ),
+            ),
+            (
+                convert("ref_nul.xml", "json"),
+                unreadable_at("ref_nul.xml", 1, 4, &reference("&#0;", "U+0000", "1.0")),
+            ),
+            (
+                convert("ref_surrogate.xml", "json"),
+                unreadable_at(
+                    "ref_surrogate.xml",
+                    2,
+                    1,
+                    &reference("&#xD800;", "U+D800", "1.0"),
+                ),
+            ),
+            (
+                convert("ref_surrogate_attr.xml", "json"),
+                unreadable_at(
+                    "ref_surrogate_attr.xml",
+                    1,
+                    8,
+                    &reference("&#xD800;", "U+D800", "1.0"),
+                ),
+            ),
+            (
+                convert("ref_ffff_11.xml", "json"),
+                unreadable_at(
+                    "ref_ffff_11.xml",
+                    1,
+                    25,
+                    &reference("&#xFFFF;", "U+FFFF", "1.1"),
+                ),
+            ),
+            (convert("ok_c1_10.xml", "xml"), ok("<r>\u{80}</r>")),
+            (
+                convert("ok_nel_11.xml", "xml"),
+                ok(format!("{v11}<r>a&#x85;b</r>")),
+            ),
+            (
+                convert("ok_ref_11.xml", "xml"),
+                ok(format!("{v11}<r a=\"&#1;\">&#1;&#127;</r>")),
+            ),
+        ],
+    );
+}

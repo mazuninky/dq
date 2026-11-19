@@ -276,6 +276,11 @@ impl Frame {
 fn parse_xml(bytes: &[u8]) -> Result<Value> {
     let (text, bom, detected) = decode_input(bytes)?;
     let text: &str = &text;
+    // The characters a document may hold depend on its version, which
+    // its declaration, ahead of every other character, gives.
+    let chars_11 = declared_pseudo_attribute(text.as_bytes(), "version")
+        .is_some_and(|(version, _)| version == "1.1");
+    check_raw_chars(text, chars_11)?;
     let mut reader = Reader::from_str(text);
     let cfg = reader.config_mut();
     // We deliberately preserve text whitespace verbatim — XML config-doc
@@ -351,6 +356,7 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                 push_comment(&mut stack, &mut top_comments, txt);
             }
             Ok(Event::Start(start)) => {
+                check_attribute_references(text, &start, chars_11)?;
                 let mut frame =
                     build_start_frame(&start).map_err(|e| place(e, text, event_start))?;
                 check_namespaces(&stack, &mut frame, xml11).map_err(|(message, attr)| {
@@ -372,6 +378,7 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                 stack.push(frame);
             }
             Ok(Event::Empty(start)) => {
+                check_attribute_references(text, &start, chars_11)?;
                 let mut frame =
                     build_start_frame(&start).map_err(|e| place(e, text, event_start))?;
                 check_namespaces(&stack, &mut frame, xml11).map_err(|(message, attr)| {
@@ -465,7 +472,7 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                 // the reference here and append to the current frame's text so
                 // the parsed `Value` matches the pre-0.38 behaviour (entities
                 // are folded into the surrounding text body).
-                let s = resolve_general_ref(&r, text, event_start)?;
+                let s = resolve_general_ref(&r, text, event_start, chars_11)?;
                 if let Some(frame) = stack.last_mut() {
                     if frame.saw_element {
                         frame.saw_mixed = true;
@@ -790,13 +797,19 @@ impl Charset {
 /// read as ASCII — every encoding this applies to spells the declaration
 /// the same. `None` without a declaration or without an `encoding`.
 fn declared_label(bytes: &[u8]) -> Option<(&str, &[u8])> {
+    declared_pseudo_attribute(bytes, "encoding")
+}
+
+/// The value of the pseudo-attribute `name` (`version`, `encoding`) in the
+/// XML declaration `bytes` begin with, if any, and the declaration.
+fn declared_pseudo_attribute<'b>(bytes: &'b [u8], name: &str) -> Option<(&'b str, &'b [u8])> {
     let rest = bytes.strip_prefix(b"<?xml")?;
     if !rest.first().is_some_and(u8::is_ascii_whitespace) {
         return None;
     }
     let end = rest.windows(2).position(|pair| pair == b"?>")?;
     let decl = std::str::from_utf8(&rest[..end]).ok()?;
-    let value = decl.split_once("encoding")?.1.trim_start();
+    let value = decl.split_once(name)?.1.trim_start();
     let value = value.strip_prefix('=')?.trim_start();
     let quote = value.chars().next().filter(|c| matches!(c, '"' | '\''))?;
     let label = value[1..].split(quote).next()?;
@@ -1016,6 +1029,87 @@ fn decode_attr(attr: &Attribute<'_>) -> Result<String> {
         })
 }
 
+/// Refuse a character `text`, a document of XML 1.1 when `xml11` (else
+/// 1.0), holds that is not well-formed there, at the character: one
+/// neither version allows (NUL, U+FFFE, U+FFFF), a C0 control but tab, LF
+/// and CR in 1.0, and in 1.1 a `RestrictedChar` ([`is_restricted_11`]),
+/// which 1.1 takes only as a character reference. C1 controls are
+/// characters in 1.0; NEL is a line end in 1.1.
+fn check_raw_chars(text: &str, xml11: bool) -> Result<()> {
+    let refusal = |c: char| match c {
+        '\u{0}' | '\u{FFFE}' | '\u{FFFF}' => Some(if xml11 { "1.1" } else { "1.0" }),
+        '\t' | '\n' | '\r' => None,
+        '\u{1}'..='\u{1F}' if !xml11 => Some("1.0"),
+        _ => None,
+    };
+    for (pos, c) in text.char_indices() {
+        let message = match refusal(c) {
+            Some(version) => format!(
+                "the document holds U+{:04X}, a character XML {version} does not allow",
+                u32::from(c)
+            ),
+            None if xml11 && is_restricted_11(c) => format!(
+                "the document holds U+{:04X}, which XML 1.1 allows only as a character \
+                 reference",
+                u32::from(c)
+            ),
+            None => continue,
+        };
+        return Err(parse_error_at(text, pos, message));
+    }
+    Ok(())
+}
+
+/// Why the reference `&name;` is not well-formed in XML 1.1 when `xml11`
+/// (else 1.0): a character reference to NUL, a surrogate, U+FFFE or
+/// U+FFFF, or in 1.0 to a C0 control but tab, LF and CR. `None` for any
+/// other reference — an entity, or a malformed number, which the reader
+/// refuses in its own words.
+fn reference_refusal(name: &str, xml11: bool) -> Option<String> {
+    let number = name.strip_prefix('#')?;
+    let (digits, radix) = match number.strip_prefix('x') {
+        Some(hex) => (hex, 16),
+        None => (number, 10),
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+        return None;
+    }
+    let code = u32::from_str_radix(digits, radix).ok()?;
+    let allowed = match code {
+        0 | 0xD800..=0xDFFF | 0xFFFE | 0xFFFF => false,
+        0x9 | 0xA | 0xD => true,
+        0x1..=0x1F => xml11,
+        _ => true,
+    };
+    let version = if xml11 { "1.1" } else { "1.0" };
+    (!allowed).then(|| {
+        format!(
+            "the character reference '&{name};' refers to U+{code:04X}, a character XML \
+             {version} does not allow"
+        )
+    })
+}
+
+/// Refuse a character reference in an attribute value of `start` that
+/// [`reference_refusal`] refuses, at its `&`. The reader borrows the
+/// value from `text`.
+fn check_attribute_references(text: &str, start: &BytesStart<'_>, xml11: bool) -> Result<()> {
+    let base = text.as_ptr() as usize;
+    for attr in start.attributes().flatten() {
+        let value: &str = &attr.value;
+        let at = (value.as_ptr() as usize).saturating_sub(base);
+        for (index, _) in value.match_indices('&') {
+            let Some(end) = value[index..].find(';') else {
+                continue;
+            };
+            if let Some(message) = reference_refusal(&value[index + 1..index + end], xml11) {
+                return Err(parse_error_at(text, at + index, message));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Resolve an `Event::GeneralRef(&entity;)` payload into its textual
 /// replacement.
 ///
@@ -1023,7 +1117,7 @@ fn decode_attr(attr: &Attribute<'_>) -> Result<String> {
 /// `apos`) plus numeric character references (`&#48;` / `&#x30;`). Anything
 /// else is an undeclared entity — without a DTD we cannot resolve it, so we
 /// surface a `Error::Parse` rather than silently swallowing the reference.
-fn resolve_general_ref(r: &BytesRef<'_>, text: &str, pos: usize) -> Result<String> {
+fn resolve_general_ref(r: &BytesRef<'_>, text: &str, pos: usize, xml11: bool) -> Result<String> {
     let make_parse_err = |msg: String| {
         let (line, col) = byte_pos_to_line_col(text, pos);
         Error::Parse {
@@ -1038,6 +1132,9 @@ fn resolve_general_ref(r: &BytesRef<'_>, text: &str, pos: usize) -> Result<Strin
     // quick-xml 0.42: `BytesRef` derefs to the entity name as `str`; the
     // fallible `decode()` step (UTF-8 only, so it never failed for us) is gone.
     let name: &str = r;
+    if let Some(message) = reference_refusal(name, xml11) {
+        return Err(parse_error_at(text, pos, message));
+    }
     if r.is_char_ref() {
         // Numeric character reference — `&#48;` or `&#x30;`.
         let ch = r.resolve_char_ref().map_err(|e| {
@@ -2437,6 +2534,33 @@ mod tests {
             err.to_string().contains("must be a scalar (got an array)"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn a_reference_or_character_a_version_does_not_allow_is_refused() {
+        for (name, xml11, refused) in [
+            ("#x1", false, true),
+            ("#x1", true, false),
+            ("#9", false, false),
+            ("#0", true, true),
+            ("#xD800", true, true),
+            ("#65535", true, true),
+            ("#x7F", false, false),
+            ("amp", false, false),
+            ("#x", false, false),
+            ("#-1", false, false),
+        ] {
+            assert_eq!(
+                reference_refusal(name, xml11).is_some(),
+                refused,
+                "{name} {xml11}"
+            );
+        }
+        assert!(check_raw_chars("<r>\u{80}\u{85}</r>", false).is_ok());
+        assert!(check_raw_chars("<r>\u{85}\u{2028}</r>", true).is_ok());
+        assert!(check_raw_chars("<r>\u{80}</r>", true).is_err());
+        assert!(check_raw_chars("<r>\u{1}</r>", false).is_err());
+        assert!(check_raw_chars("<r>\t\r\n</r>", true).is_ok());
     }
 
     #[test]

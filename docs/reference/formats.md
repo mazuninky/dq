@@ -307,6 +307,12 @@ cannot read name their byte index instead:
   an attribute (`<r a:x="1"/>`);
 - `xmlns:p=""` unless the declaration says `version="1.1"`. Namespaces in
   XML 1.1 allow it, and the prefix is then undeclared inside that element.
+- a character the version does not allow, raw or as a character
+  reference, wherever it stands (text, attribute values, comments, PIs,
+  CDATA): NUL, a surrogate, U+FFFE or U+FFFF in either version, a C0
+  control but tab, LF and CR in XML 1.0, and in XML 1.1 a restricted
+  character standing raw — 1.1 takes the C0 controls and U+007F–U+0084,
+  U+0086–U+009F only as references. C1 controls are characters in 1.0.
 
 The writer refuses the same, and a character the declared encoding cannot
 hold, with exit 1, leaving an `-i` file as it was. It refuses a value of the
