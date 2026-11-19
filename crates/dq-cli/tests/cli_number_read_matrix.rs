@@ -878,7 +878,7 @@ fn xml_writes_the_declaration_fields_and_refuses_what_a_document_cannot_hold() {
                     1,
                     "",
                     "xml format error: XML write: '#xml' field 'version' must be a scalar \
-                     (got array)\n",
+                     (got an array)\n",
                 ),
             ),
             (

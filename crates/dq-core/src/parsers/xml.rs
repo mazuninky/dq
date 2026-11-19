@@ -2090,11 +2090,10 @@ fn declaration(entry: Option<&Value>) -> Result<Option<Declaration>> {
                 Value::String(s) if s == "UTF-16LE" => Some(Bom::Utf16Le),
                 Value::String(s) if s == "UTF-16BE" => Some(Bom::Utf16Be),
                 other => {
-                    let got = scalar_text(other).unwrap_or_else(|| other.type_name().to_owned());
                     return Err(decl_field_error(
                         k,
                         "must be UTF-8, UTF-16LE or UTF-16BE",
-                        &got,
+                        other,
                     ));
                 }
             };
@@ -2107,11 +2106,10 @@ fn declaration(entry: Option<&Value>) -> Result<Option<Declaration>> {
                 Value::String(s) if s == "UTF-16LE" => Some(Bom::Utf16Le),
                 Value::String(s) if s == "UTF-16BE" => Some(Bom::Utf16Be),
                 other => {
-                    let got = scalar_text(other).unwrap_or_else(|| other.type_name().to_owned());
                     return Err(decl_field_error(
                         k,
                         "must be UTF-8, UTF-16LE or UTF-16BE",
-                        &got,
+                        other,
                     ));
                 }
             };
@@ -2134,25 +2132,19 @@ fn declaration(entry: Option<&Value>) -> Result<Option<Declaration>> {
         if matches!(v, Value::Null) {
             continue;
         }
-        let text = scalar_text(v).ok_or_else(|| Error::Format {
-            format: "xml",
-            message: format!(
-                "XML write: '{KEY_XML_DECL}' field '{k}' must be a scalar (got {})",
-                v.type_name(),
-            ),
-        })?;
+        let text = scalar_text(v).ok_or_else(|| decl_field_error(k, "must be a scalar", v))?;
         let text = match (k.as_str(), v) {
             // `standalone` takes `yes` / `no` only; a boolean is the same
             // answer.
             ("standalone", Value::Bool(b)) => if *b { "yes" } else { "no" }.to_owned(),
             ("standalone", _) if text != "yes" && text != "no" => {
-                return Err(decl_field_error(k, "must be yes or no", &text));
+                return Err(decl_field_error(k, "must be yes or no", v));
             }
             ("version", _) if !is_version_num(&text) => {
-                return Err(decl_field_error(k, "must be 1. and digits", &text));
+                return Err(decl_field_error(k, "must be 1. and digits", v));
             }
             ("encoding", _) if !is_enc_name(&text) => {
-                return Err(decl_field_error(k, "is not an encoding name", &text));
+                return Err(decl_field_error(k, "is not an encoding name", v));
             }
             _ => text,
         };
@@ -2164,10 +2156,28 @@ fn declaration(entry: Option<&Value>) -> Result<Option<Declaration>> {
     Ok(Some(fields))
 }
 
-fn decl_field_error(field: &str, rule: &str, got: &str) -> Error {
+fn decl_field_error(field: &str, rule: &str, got: &Value) -> Error {
     Error::Format {
         format: "xml",
-        message: format!("XML write: '{KEY_XML_DECL}' field '{field}' {rule} (got {got:?})"),
+        message: format!(
+            "XML write: '{KEY_XML_DECL}' field '{field}' {rule} (got {})",
+            what_it_is(got)
+        ),
+    }
+}
+
+/// `value` as a message names what it got: a string quoted (`"UTF-32"`),
+/// a number or a boolean by its kind and its text (`a number 5`,
+/// `a boolean true`), anything else by its kind (`a map`, `an array`,
+/// `null`) — so that a map never reads as the string `"object"`.
+fn what_it_is(value: &Value) -> String {
+    match value {
+        Value::String(s) => format!("{s:?}"),
+        Value::Int(_) | Value::BigInt(_) | Value::Float(_) | Value::BigFloat(_) => {
+            format!("a number {}", scalar_text(value).unwrap_or_default())
+        }
+        Value::Bool(b) => format!("a boolean {b}"),
+        Value::Null | Value::Array(_) | Value::Map(_) => value.kind_with_article().to_owned(),
     }
 }
 

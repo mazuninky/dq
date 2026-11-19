@@ -1114,7 +1114,9 @@ fn detected_survives_set_fmt_and_a_bulk_run() {
 }
 
 /// `detected` is one of three names or null: a number, a boolean, a map or
-/// an array is refused naming what it got, a null is no field at all, and
+/// an array is refused naming what it got — a string quoted, anything else
+/// by its kind, so a map does not read as the string `"object"` — a null is
+/// no field at all, and
 /// `detected: UTF-8` under a label that is not UTF-16 is refused as it is
 /// under `UTF-8`.
 #[test]
@@ -1125,6 +1127,8 @@ fn detected_is_one_of_three_names_or_null() {
         ("bool.yaml", tree("true")),
         ("map.yaml", tree("{a: 1}")),
         ("array.yaml", tree("[UTF-8]")),
+        ("object.yaml", tree("object")),
+        ("float.yaml", tree("1.5")),
         ("null.yaml", tree("null")),
         (
             "latin.yaml",
@@ -1134,16 +1138,18 @@ fn detected_is_one_of_three_names_or_null() {
     let dir = dir_with(&files.each_ref().map(|(name, src)| (*name, src.as_bytes())));
     let not_a_name = |got: &str| {
         refused(&format!(
-            "'#xml' field 'detected' must be UTF-8, UTF-16LE or UTF-16BE (got \"{got}\")"
+            "'#xml' field 'detected' must be UTF-8, UTF-16LE or UTF-16BE (got {got})"
         ))
     };
     assert_cases(
         &dir,
         &[
-            (convert("number.yaml", "xml"), not_a_name("5")),
-            (convert("bool.yaml", "xml"), not_a_name("true")),
-            (convert("map.yaml", "xml"), not_a_name("object")),
-            (convert("array.yaml", "xml"), not_a_name("array")),
+            (convert("number.yaml", "xml"), not_a_name("a number 5")),
+            (convert("bool.yaml", "xml"), not_a_name("a boolean true")),
+            (convert("map.yaml", "xml"), not_a_name("a map")),
+            (convert("array.yaml", "xml"), not_a_name("an array")),
+            (convert("object.yaml", "xml"), not_a_name("\"object\"")),
+            (convert("float.yaml", "xml"), not_a_name("a number 1.5")),
             (convert("null.yaml", "xml"), ok("<r/>")),
             (
                 convert("latin.yaml", "xml"),
