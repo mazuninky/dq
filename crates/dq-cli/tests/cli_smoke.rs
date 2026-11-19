@@ -1054,3 +1054,19 @@ fn smoke_set_jq_diff_renders_unified_diff_for_replicas_bump() {
     let after = std::fs::read_to_string(&path).unwrap();
     assert_eq!(after, original, "--diff must NOT modify the fixture");
 }
+
+/// BUG (uncommitted): the console escapes a control character in a string
+/// and then writes every other byte of that string as a char of its own,
+/// so a non-ASCII character next to it comes out as Latin-1 mojibake:
+/// `é\u0001` prints `Ã©\x01`, though `é` alone prints `é`.
+#[test]
+#[ignore = "red until item 2 of docs/plans/after-deps-update-fixes.md lands; drop with the fix"]
+fn console_keeps_non_ascii_next_to_an_escaped_control_character() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(dir.path().join("m.json"), r#"{"a": "é\u0001", "b": "é"}"#).expect("write");
+    dq().current_dir(dir.path())
+        .args(["--no-color", "query", ".", "m.json"])
+        .assert()
+        .success()
+        .stdout("{a: é\\x01, b: é}\n");
+}

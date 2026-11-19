@@ -329,17 +329,22 @@ fn exact_schema(
     };
     at.push_segment(dq_core::Segment::Key("check".to_owned()));
     match &mut rule.check {
-        Check::Schema { schema, .. } => {
+        Check::Schema { schema, notes, .. } => {
             if let Some(exact) = member(check, "schema") {
-                *schema = crate::schema_value::schema_json(exact);
+                let mut noted = crate::rule::SchemaNotes::default();
+                *schema = crate::schema_value::schema_json(exact, &mut noted);
                 if let Some(literals) = literals {
                     at.push_segment(dq_core::Segment::Key("schema".to_owned()));
                     literals.respell(schema, at);
-                    crate::schema_value::note_limit_spellings(schema, at, &|place| {
-                        literals.text_at(place)
-                    });
+                    crate::schema_value::note_limit_spellings(
+                        schema,
+                        at,
+                        &|place| literals.text_at(place),
+                        &mut noted,
+                    );
                     at.pop_segment();
                 }
+                *notes = noted;
             }
         }
         Check::Composite { nested, .. } => {
@@ -490,23 +495,28 @@ mod tests {
              items: [{{ maximum: 0.00000000001 }}, {{ minimum: +5 }}] }}\n"
         );
         let set = RuleSet::from_str(&stream, RuleSource::Inline).expect("parse rule stream");
-        let Check::Schema { schema, .. } = &set.rules[1].check else {
+        let Check::Schema { schema, notes, .. } = &set.rules[1].check else {
             panic!("expected a schema check: {:?}", set.rules[1].check);
         };
         assert_eq!(
             schema.to_string(),
-            r#"{"const":18446744073709551616,"maximum":1e+400,"minimum":0.10000000000000000001,"enum":["\u0000dq.inf\u0000"],"multipleOf":2.50,"\u0000dq.spelling":{"maximum":"1e400"}}"#
+            r#"{"const":18446744073709551616,"maximum":1e+400,"minimum":0.10000000000000000001,"enum":[".inf"],"multipleOf":2.50}"#
         );
+        // What the JSON cannot hold is noted beside it, by place.
+        assert_eq!(notes.spelling_at("/maximum"), Some("1e400"));
+        assert_eq!(notes.non_finite_at("/enum/0"), Some(".inf"));
+        assert_eq!(notes.spelling_at("/minimum"), None);
         let Check::Composite { nested, .. } = &set.rules[2].check else {
             panic!("expected a composite check: {:?}", set.rules[2].check);
         };
-        let Check::Schema { schema, .. } = &nested.check else {
+        let Check::Schema { schema, notes, .. } = &nested.check else {
             panic!("expected a nested schema check: {:?}", nested.check);
         };
         assert_eq!(
             schema.to_string(),
             r#"{"const":340282366920938463463374607431768211456,"items":[{"maximum":0.00000000001},{"minimum":5}]}"#
         );
+        assert!(notes.is_empty());
     }
 
     #[test]

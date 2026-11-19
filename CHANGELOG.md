@@ -346,6 +346,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A JSON Schema member named like one of dq's internal notes is the
+  user's own data. It used to be read as dq's note and could change a
+  message: `maximum: 5` with a forged spelling note printed `greater than
+  the maximum of garbage`.
 - A YAML file with a UTF-8 BOM parses and can be edited, the BOM kept on
   write. With one key, `set /key` used to fail with `path '/key' not
   found`; with more, parsing failed with "did not find expected

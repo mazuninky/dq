@@ -34,6 +34,7 @@ use jsonschema::Uri;
 
 use crate::error::{ExecError, Result};
 use crate::ruleset::RuleSource;
+use crate::schema_value::SchemaNotes;
 
 /// One compiled schema check, cached on the per-rule
 /// [`crate::evaluator::CompiledRule`].
@@ -63,16 +64,18 @@ pub(crate) struct CompiledSchemaCheck {
 pub(crate) fn compile_inline(
     rule_id: &str,
     schema_json: &serde_json::Value,
+    notes: &SchemaNotes,
     message_prefix: Option<String>,
 ) -> Result<CompiledSchemaCheck> {
-    compile_json(rule_id, schema_json, message_prefix)
+    compile_json(rule_id, schema_json, notes, message_prefix)
 }
 
-/// Compile an already-JSON-shaped schema. Shared by inline and
-/// embedded paths.
+/// Compile an already-JSON-shaped schema and what its JSON cannot hold
+/// (`notes`). Shared by inline and embedded paths.
 fn compile_json(
     rule_id: &str,
     schema_json: &serde_json::Value,
+    notes: &SchemaNotes,
     message_prefix: Option<String>,
 ) -> Result<CompiledSchemaCheck> {
     // Per spec scenario "HTTP $ref rejected at compile-time", an external
@@ -82,9 +85,11 @@ fn compile_json(
         return Err(external_ref_error(rule_id, uri));
     }
     // Offline: see `schema_value::options`.
-    // A `multipleOf` the meta-schema would read as 0 gets a stand-in.
+    // The notes go in band, under dq's tag, in the copy the validator
+    // compiles; a `multipleOf` the meta-schema would read as 0 gets a
+    // stand-in there.
     let built = crate::schema_value::options()
-        .build(&crate::schema_value::stand_in_tiny_divisors(schema_json));
+        .build(&crate::schema_value::compiled_json(schema_json, notes));
     // A `$schema` naming a meta-schema the validator does not bundle is
     // an external reference too. jsonschema ≤ 0.34 tried to retrieve it
     // while building the registry and failed the compile; 0.61 with an
@@ -546,13 +551,13 @@ pub(crate) fn compile_from_file(
         path: path.clone(),
         source: err,
     })?;
-    let mut schema_json: serde_json::Value =
+    let schema_json: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|err| ExecError::SchemaCompile {
             rule_id: rule_id.to_owned(),
             message: format!("could not parse {path} as JSON: {err}"),
         })?;
-    note_source_spellings(&bytes, &mut schema_json);
-    compile_json(rule_id, &schema_json, message_prefix)
+    let notes = source_spellings(&bytes, &schema_json);
+    compile_json(rule_id, &schema_json, &notes, message_prefix)
 }
 
 /// Compile a schema sourced from a `&'static str` (the embedded
@@ -567,26 +572,27 @@ pub(crate) fn compile_from_embedded(
     schema_text: &str,
     message_prefix: Option<String>,
 ) -> Result<CompiledSchemaCheck> {
-    let mut schema_json: serde_json::Value =
+    let schema_json: serde_json::Value =
         serde_json::from_str(schema_text).map_err(|err| ExecError::SchemaCompile {
             rule_id: rule_id.to_owned(),
             message: format!("could not parse embedded schema as JSON: {err}"),
         })?;
-    note_source_spellings(schema_text.as_bytes(), &mut schema_json);
-    compile_json(rule_id, &schema_json, message_prefix)
+    let notes = source_spellings(schema_text.as_bytes(), &schema_json);
+    compile_json(rule_id, &schema_json, &notes, message_prefix)
 }
 
-/// Note in `schema`, read from the JSON `text`, every limit's source text
+/// The source text of every limit in `schema`, read from the JSON `text`
 /// (see [`crate::schema_value::note_limit_spellings`]), so a message
 /// quotes `1e2` as the file writes it rather than serde_json's `1e+2`.
 /// Should dq's JSON span parse refuse `text`, which serde_json read, the
 /// limits keep serde_json's spelling.
-fn note_source_spellings(text: &[u8], schema: &mut serde_json::Value) {
+fn source_spellings(text: &[u8], schema: &serde_json::Value) -> SchemaNotes {
+    let mut notes = SchemaNotes::default();
     let doc = match dq_core::parse_json_with_spans(text) {
         Ok(doc) => doc,
         Err(err) => {
             tracing::debug!(error = %err, "schema limits keep serde_json's spelling");
-            return;
+            return notes;
         }
     };
     let literal_at = |at: &dq_core::Pointer| {
@@ -596,9 +602,11 @@ fn note_source_spellings(text: &[u8], schema: &mut serde_json::Value) {
     };
     crate::schema_value::note_limit_spellings(
         schema,
-        &mut dq_core::Pointer::default(),
+        &dq_core::Pointer::default(),
         &literal_at,
+        &mut notes,
     );
+    notes
 }
 
 /// Resolve a relative schema-file path against the rule's directory.
@@ -700,8 +708,13 @@ properties:
 "#,
         )
         .expect("yaml parse");
-        let compiled =
-            compile_inline("test.rule", &yaml, Some("prefix: ".to_owned())).expect("compile ok");
+        let compiled = compile_inline(
+            "test.rule",
+            &yaml,
+            &SchemaNotes::default(),
+            Some("prefix: ".to_owned()),
+        )
+        .expect("compile ok");
         assert_eq!(compiled.message_prefix.as_deref(), Some("prefix: "));
         let valid = serde_json::json!({"name": "x"});
         let invalid = serde_json::json!({});
@@ -721,7 +734,7 @@ $ref: "https://json-schema.org/draft/2020-12/schema"
 "#,
         )
         .expect("yaml parse");
-        let result = compile_inline("test.bad", &yaml, None);
+        let result = compile_inline("test.bad", &yaml, &SchemaNotes::default(), None);
         match result {
             Err(ExecError::SchemaCompile { rule_id, .. }) => {
                 assert_eq!(rule_id, "test.bad");
@@ -735,7 +748,7 @@ $ref: "https://json-schema.org/draft/2020-12/schema"
     fn compile_error_message(schema: serde_json::Value) -> String {
         let yaml: serde_json::Value =
             serde_norway::from_str(&schema.to_string()).expect("json is valid yaml");
-        match compile_inline("test.bad", &yaml, None) {
+        match compile_inline("test.bad", &yaml, &SchemaNotes::default(), None) {
             Err(ExecError::SchemaCompile { rule_id, message }) => {
                 assert_eq!(rule_id, "test.bad");
                 message
@@ -807,7 +820,7 @@ $ref: "https://json-schema.org/draft/2020-12/schema"
             let yaml: serde_json::Value =
                 serde_norway::from_str(&schema.to_string()).expect("json is valid yaml");
             assert!(
-                compile_inline("test.ok", &yaml, None).is_ok(),
+                compile_inline("test.ok", &yaml, &SchemaNotes::default(), None).is_ok(),
                 "{schema} should compile"
             );
         }
@@ -823,7 +836,7 @@ $ref: "https://json-schema.org/draft/2020-12/schema"
             let yaml: serde_json::Value =
                 serde_norway::from_str(&schema.to_string()).expect("json is valid yaml");
             assert!(
-                compile_inline("test.ok", &yaml, None).is_ok(),
+                compile_inline("test.ok", &yaml, &SchemaNotes::default(), None).is_ok(),
                 "{schema} should compile"
             );
         }
@@ -840,7 +853,8 @@ $defs:
 "##,
         )
         .expect("yaml parse");
-        let compiled = compile_inline("test.rule", &yaml, None).expect("internal $ref compiles");
+        let compiled = compile_inline("test.rule", &yaml, &SchemaNotes::default(), None)
+            .expect("internal $ref compiles");
         assert!(holds(&compiled, &serde_json::json!({"code": "AA"})));
         assert!(!holds(&compiled, &serde_json::json!({"code": "CC"})));
     }
@@ -972,7 +986,7 @@ $defs:
     fn assert_compiles(schema: &serde_json::Value) {
         let yaml: serde_json::Value =
             serde_norway::from_str(&schema.to_string()).expect("json is valid yaml");
-        if let Err(err) = compile_inline("test.ok", &yaml, None) {
+        if let Err(err) = compile_inline("test.ok", &yaml, &SchemaNotes::default(), None) {
             panic!("{schema} should compile, got {err:?}");
         }
     }
@@ -1393,7 +1407,8 @@ $defs:
         // And the schema still validates as 2020-12.
         let yaml: serde_json::Value =
             serde_norway::from_str(r#"{"$schema": "", "type": "integer"}"#).expect("yaml");
-        let compiled = compile_inline("test.ok", &yaml, None).expect("compiles");
+        let compiled =
+            compile_inline("test.ok", &yaml, &SchemaNotes::default(), None).expect("compiles");
         assert!(holds(&compiled, &serde_json::json!(1)));
         assert!(!holds(&compiled, &serde_json::json!({"a": 1})));
     }

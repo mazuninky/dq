@@ -44,21 +44,29 @@ the fix.
 
 ## In progress
 
-A last round on numbers, XML and YAML. It exists locally but is not
-committed yet.
+A last round on numbers, XML and YAML. Item 1 is committed; items 2–5 are
+open, in this order.
 
-1. **Schema notes are in band.** dq keeps its notes inside the schema JSON:
-   limit spellings (`"\u0000dq.spelling"`) and stand-ins for infinities and
-   divisors below the smallest float. A user schema member with the same
-   name is read as dq's note: `maximum: 5` plus a forged note prints
-   `greater than the maximum of garbage`. The fix moves the notes out of
-   band, into a table keyed by schema location and owned by the compiled
-   rule, and makes any stand-in that must stay in band impossible to forge.
+1. **Schema notes are in band.** Done 2026-11-19, not reviewed yet. dq kept
+   its notes inside the schema JSON: limit spellings (`"\u0000dq.spelling"`)
+   and stand-ins for infinities and divisors below the smallest float. A user
+   schema member with the same name was read as dq's note: `maximum: 5` plus
+   a forged note printed `greater than the maximum of garbage`. Now the
+   rule's schema holds only what the rule wrote, and the notes live in a
+   `SchemaNotes` table beside it (`Check::Schema.notes`), keyed by RFC 6901
+   place. A note still sits in band in one spot: the private copy the
+   validator compiles (`compiled_json`), behind a random per-process tag,
+   because jsonschema's own `Location` is not a reliable key behind `$ref`
+   and `$id`. Still to do for this item: tests for a forged member in an
+   `@std` embedded schema, inside a composite `nested:` rule and behind a
+   `$ref`, then the review.
 2. **Console escaping.** Console output mangles non-ASCII text next to an
    escaped control character (`é\u0001` prints as `Ã©\x01`), and so do
    `validate` snippets. `escape_control` in
    [console.rs](../../crates/dq-cli/src/output/console.rs) pushes bytes as
-   chars.
+   chars. The regression test is in place and `#[ignore]`d:
+   `console_keeps_non_ascii_next_to_an_escaped_control_character` in
+   `crates/dq-cli/tests/cli_smoke.rs`. Drop the `ignore` with the fix.
 3. **XML declaration order.** An XML declaration with its pseudo-attributes
    out of order (`standalone` before `encoding`) is accepted, while libxml2
    refuses it. Also to check: a missing `version`, an unknown or duplicate

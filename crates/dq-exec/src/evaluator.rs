@@ -479,8 +479,12 @@ fn compile_check(
                 message: message.clone(),
             })
         }
-        Check::Schema { schema, message } => {
-            let compiled = compile_inline(&rule.id, schema, message.clone())?;
+        Check::Schema {
+            schema,
+            message,
+            notes,
+        } => {
+            let compiled = compile_inline(&rule.id, schema, notes, message.clone())?;
             Ok(CompiledCheck::Schema(compiled))
         }
         Check::SchemaFile {

@@ -43,7 +43,7 @@ pub use error::{ExecError, Result};
 pub use evaluator::Evaluator;
 pub use fixer::{FixOutcome, Fixer};
 pub use loader::{LoaderArgs, RuleLoader};
-pub use rule::{Check, Rule, RuleCheck, RuleFix, RuleLoc, RuleMatch};
+pub use rule::{Check, Rule, RuleCheck, RuleFix, RuleLoc, RuleMatch, SchemaNotes};
 pub use ruleset::{RuleSet, RuleSource};
 pub use test_runner::{
     ExpectedOutcome, ExpectedViolation, RuleTestCase, RuleTestFile, RuleTester, TestOutcome,

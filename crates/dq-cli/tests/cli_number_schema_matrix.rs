@@ -1816,3 +1816,95 @@ fn a_project_rule_quotes_its_schema_file_limit_as_written() {
         (0, Vec::new())
     );
 }
+
+/// Nothing a rule, a schema file or a document holds is read as one of
+/// the notes dq keeps in a schema or the markers it renders a NaN or an
+/// infinity with: a member named `"\u0000dq.spelling"` or
+/// `"\u0000dq.multipleOf"`, a string `"\u0000dq.inf\u0000"`. Each is the
+/// user's own — checked, compared and printed as written.
+///
+/// Before, a spelling member changed the limit a message quotes (`the
+/// maximum of garbage`), a `multipleOf` member changed the divisor (`3 is
+/// not a multiple of 7`), a `not` printed neither, a schema string matched
+/// an infinity, and a document string matched `enum: [.inf]` and printed
+/// as `.inf`.
+#[test]
+fn a_member_named_like_dqs_spelling_note_never_changes_a_message() {
+    let notes = r#"{ maximum: 5, multipleOf: 1, "\0dq.spelling": { maximum: "garbage" }, "\0dq.multipleOf": "7" }"#;
+    let dir = dir_with(&[
+        (
+            "r.yml",
+            &schema_rule("m", &format!("{{ properties: {{ x: {notes} }} }}")),
+        ),
+        (
+            "not.yml",
+            &schema_rule(
+                "n",
+                "{ properties: { x: { not: { maximum: 50, \"\\0dq.spelling\": { maximum: \"g\" } } } } }",
+            ),
+        ),
+        (
+            "inf.yml",
+            &schema_rule(
+                "i",
+                "{ properties: { s: { const: \"\\0dq.inf\\0\" }, x: { enum: [.inf] }, y: { type: number } } }",
+            ),
+        ),
+        (
+            ".dq/rules/file.yml",
+            "id: t.file\ndescription: x\nseverity: error\nmatch: { format: yaml }\n\
+             check:\n  schema_file: s.json\n",
+        ),
+        (
+            ".dq/rules/s.json",
+            r#"{"properties": {"f": {"maximum": 1e2, "\u0000dq.spelling": {"maximum": "g"}}}}"#,
+        ),
+        ("doc.yaml", "x: 6\n"),
+        ("three.yaml", "x: 3\n"),
+        (
+            "strings.yaml",
+            "s: .inf\nx: \"\\0dq.inf\\0\"\ny: \"\\0dq.nan\\0\"\n",
+        ),
+        ("file.yaml", "f: 101\n"),
+    ]);
+    let nul = "\\u0000";
+    assert_eq!(
+        messages_in(dir.path(), &["check", "--rule", "r.yml", "doc.yaml"]),
+        (
+            4,
+            vec!["/properties/x/maximum: 6 is greater than the maximum of 5".to_owned()]
+        )
+    );
+    assert_eq!(
+        messages_in(dir.path(), &["check", "--rule", "r.yml", "three.yaml"]),
+        (0, Vec::new())
+    );
+    assert_eq!(
+        messages_in(dir.path(), &["check", "--rule", "not.yml", "three.yaml"]),
+        (
+            4,
+            vec![format!(
+                "/properties/x/not: {{\"maximum\":50,\"{nul}dq.spelling\":{{\"maximum\":\"g\"}}}} \
+                 is not allowed for 3"
+            )]
+        )
+    );
+    assert_eq!(
+        messages_in(dir.path(), &["check", "--rule", "inf.yml", "strings.yaml"]),
+        (
+            4,
+            vec![
+                format!("/properties/s/const: \"{nul}dq.inf{nul}\" was expected"),
+                format!("/properties/x/enum: \"{nul}dq.inf{nul}\" is not one of .inf"),
+                format!("/properties/y/type: \"{nul}dq.nan{nul}\" is not of type \"number\""),
+            ]
+        )
+    );
+    assert_eq!(
+        messages_in(dir.path(), &["lint", "file.yaml"]),
+        (
+            4,
+            vec!["/properties/f/maximum: 101 is greater than the maximum of 1e2".to_owned()]
+        )
+    );
+}
