@@ -10,7 +10,8 @@
 //! under a namespace the root declares, and an optional declaration. Text
 //! and attribute values carry what the writer must escape: `<`, `&`,
 //! quotes, tab, LF and CR (as character references, the way a file holds
-//! them), and non-ASCII characters.
+//! them), and non-ASCII characters; text that is all whitespace is held as
+//! character references, every character of it.
 
 use dq_core::{Document, Format};
 use proptest::prelude::*;
@@ -56,7 +57,11 @@ fn element_name() -> impl Strategy<Value = String> {
 
 /// Character data with every character the writer escapes or re-encodes.
 fn char_data() -> impl Strategy<Value = String> {
-    "[a-z0-9 <>&\"'\t\n\r#;=é☃\u{1F600}]{0,10}"
+    prop_oneof![
+        "[a-z0-9 <>&\"'\t\n\r#;=é☃\u{1F600}\u{85}\u{2028}]{0,10}",
+        // All whitespace, which a file can hold as text only in references.
+        "[ \t\n\r\u{85}\u{2028}]{1,4}",
+    ]
 }
 
 fn attributes() -> impl Strategy<Value = Vec<(String, String)>> {
@@ -157,6 +162,13 @@ fn render(element: &Element, root: bool, out: &mut String) {
     }
     match &element.content {
         Content::Empty => {}
+        // Written as it is, whitespace-only text is indentation, which the
+        // reader drops; a file holds such text as character references.
+        Content::Text(text) if text.trim().is_empty() => {
+            for c in text.chars() {
+                out.push_str(&format!("&#{};", u32::from(c)));
+            }
+        }
         Content::Text(text) => out.push_str(&escape(text, false)),
         Content::Cdata(text) => out.push_str(&format!("<![CDATA[{text}]]>")),
         Content::Children(children) => {

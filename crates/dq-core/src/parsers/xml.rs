@@ -1864,7 +1864,15 @@ fn non_empty_array(v: &Value) -> bool {
 /// quick-xml's `escape` used up to 0.40, kept so output stays byte-stable —
 /// and CR as `&#13;`. A raw CR in text reads back as LF (XML end-of-line
 /// handling); the reference reads back as CR.
+///
+/// Text that is all whitespace by [`str::trim`] (`"\t"`, `"\n"`,
+/// `"\u{85}"`) is written as character references, every character of
+/// it: the reader drops whitespace-only text written as it is — it is
+/// indentation — but keeps what references spell.
 fn escape_text(raw: &str) -> Cow<'_, str> {
+    if !raw.is_empty() && raw.trim().is_empty() {
+        return Cow::Owned(raw.chars().map(char_reference).collect());
+    }
     escape_with(raw, |c| match c {
         '\r' => Some("&#13;"),
         _ => None,
@@ -1881,6 +1889,16 @@ fn escape_attr(raw: &str) -> Cow<'_, str> {
         '\t' => Some("&#9;"),
         _ => None,
     })
+}
+
+/// `c` as a character reference: decimal for ASCII (`&#9;`), hexadecimal
+/// past it (`&#x2028;`).
+fn char_reference(c: char) -> String {
+    if c.is_ascii() {
+        format!("&#{};", u32::from(c))
+    } else {
+        format!("&#x{:X};", u32::from(c))
+    }
 }
 
 /// Replace the five markup characters and whatever `extra` maps.
@@ -2223,6 +2241,10 @@ mod tests {
     #[test]
     fn whitespace_xml_would_normalise_is_escaped() {
         assert_eq!(escape_text("a\tb\nc\rd<"), "a\tb\nc&#13;d&lt;");
+        // All whitespace: every character a reference.
+        assert_eq!(escape_text("\t \n\r"), "&#9;&#32;&#10;&#13;");
+        assert_eq!(escape_text("\u{85}\u{2028}"), "&#x85;&#x2028;");
+        assert_eq!(escape_text(""), "");
         assert_eq!(escape_attr("a\tb\nc\rd\""), "a&#9;b&#10;c&#13;d&quot;");
         assert!(matches!(escape_attr("plain"), Cow::Borrowed(_)));
     }

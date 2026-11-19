@@ -651,3 +651,44 @@ fn a_bulk_run_counts_each_refused_xml_write_as_failed() {
         [ASCII_XML.to_vec(), "<r>é</r>".as_bytes().to_vec()]
     );
 }
+
+/// Text that is all whitespace reads from character references (`&#9;`)
+/// and is written back as references, every character of it: written as
+/// it is, the reader took it for indentation and dropped it (`<d>\t</d>`
+/// read back as `{"d":[{}]}`).
+#[test]
+fn whitespace_only_text_is_written_as_character_references() {
+    let dir = dir_with(&[
+        ("tab.xml", b"<d>&#9;</d>"),
+        ("lf.xml", b"<d>&#10;</d>"),
+        ("nel.xml", b"<d>&#x85;</d>"),
+        ("cdata.xml", b"<a><![CDATA[]]>&#10;<![CDATA[x]]></a>"),
+        ("mixed.xml", b"<d>&#x2028;&#32;&#13;</d>"),
+    ]);
+    let cases = [
+        ("tab.xml", "<d>&#9;</d>"),
+        ("lf.xml", "<d>&#10;</d>"),
+        ("nel.xml", "<d>&#x85;</d>"),
+        ("cdata.xml", "<a>&#10;<![CDATA[]]><![CDATA[x]]></a>"),
+        ("mixed.xml", "<d>&#x2028;&#32;&#13;</d>"),
+    ];
+    assert_cases(
+        &dir,
+        &cases
+            .iter()
+            .map(|(file, written)| (convert(file, "xml"), ok(*written)))
+            .collect::<Vec<_>>(),
+    );
+    // What is written reads back as the tree it was written from.
+    for (file, written) in cases {
+        let back = format!("back-{file}");
+        std::fs::write(dir.path().join(&back), written).expect("write");
+        let (_, first, _) = run(&dir, &convert(file, "json"));
+        let (code, second, stderr) = run(&dir, &convert(&back, "json"));
+        assert_eq!(
+            (code, String::from_utf8_lossy(&second), stderr.as_str()),
+            (0, String::from_utf8_lossy(&first), ""),
+            "{file}"
+        );
+    }
+}
