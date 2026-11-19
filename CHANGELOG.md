@@ -168,6 +168,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`InvalidInput`). Breaking changes to the WIT schema and marshalling
   shapes are possible before `v1.0.0`. See `examples/plugin-rust/` for a
   working Rust reference plugin and the full build recipe.
+- A JSON Schema written in YAML may list `.inf` and `-.inf` in `enum`
+  and `const`.
 
 ### Changed
 
@@ -249,6 +251,89 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   gone.
 - `@std/dockerfile` rules run on Dockerfiles only. They used to run on any
   YAML file shaped like a list of instructions.
+- `--doc N|all` is honoured by `get`, `exists`, `keys`, `values`, `len`,
+  `type`, `paths`, `select`, `query`, `convert`, `set`, `del`, `lint`,
+  `check` and `fix`.
+  - `dq --doc 1 set bundle.yaml /metadata/name z` used to fail with
+    "path not found", exit 2; it now edits document 1. `/1/...` without
+    `--doc` still works.
+  - Over several files, a file without document N is skipped with a
+    note on stderr and counted under Skipped; the run used to abort at
+    that file with exit 2. When no file holds document N, the run exits
+    with 2 (`--doc 7 is out of range: none of the 3 files holds
+    document 7`) and writes nothing. It used to skip every file and
+    exit 0, so `dq --doc 7 lint 'g/*.yaml'` printed `diagnostics: []`.
+  - On a file of one document, `--doc N` with N > 0 used to be ignored
+    and is now out of range, exit 2: `dq --doc 1 get one.yaml /kind`
+    printed `Pod` and now prints `--doc 1 is out of range: one.yaml
+    holds 1 document(s) (--doc 0)`. `--doc all` wraps a single document
+    in an array of one, so `/0/...` addresses it as in a stream: with
+    `printf 'a: 1\nb: 2\n' > x.yaml`, `dq --doc all query 'length'
+    x.yaml` printed `2` and now prints `1`.
+  - An out-of-range `--doc` on a stream (`dq --doc 5 get bundle.yaml
+    /kind`) was exit 1 and is now exit 2. A value that is neither an
+    index nor `all` (`dq --doc x get f.yaml /a`) was exit 1 and is now
+    a usage error, exit 2.
+  - `--doc` on a command that cannot honour it used to be ignored and
+    is now a usage error, exit 2: ``error: `--doc 1` is not supported
+    by `dq fmt`: it re-emits the whole file``. This covers `fmt`,
+    `validate`, `diff`, `patch`, `merge`, `convert -i`, and `--doc all`
+    with `set` or `del`.
+- A plugin runs once per document of a YAML stream. Its diagnostics
+  without a position land at each document's first line.
+- YAML collections set into a flow context are written in YAML flow
+  style instead of JSON: `{}` with `set '' '{"b": 2}'` gave `{"b": 2}`
+  and now gives `{b: 2}`. Strings are quoted only when they need it
+  (`"1"`, `"on"`, `"a: b"`).
+- `dq patch --no-create` is documented as a no-op kept for symmetry
+  with `set`: `patch` follows RFC 6902 and never creates missing
+  parents. On `a: 1`,
+  `dq patch f.yaml '[{"op":"add","path":"/b/c","value":2}]'` exits 2
+  with "path '/b/c' not found" with or without the flag, as it always
+  did.
+- Some messages are clearer; the exit codes stay. `dq set` and `dq del`
+  on Markdown and other formats without textual edits say "markdown has
+  no textual edits: dq can read a markdown file but cannot set a value
+  in it" instead of "loaded read-only; reload via a write-aware
+  parser". An insert that cannot be written says "cannot insert
+  '/arr/1'" instead of "cannot set '/arr/1/k'". A `fix.ops`
+  `remove ""` that would take every document of a stream says "every
+  document of the stream would go".
+- `values` and `keys` work on arrays, and a node of the wrong type is
+  exit 1. `dq values f.yaml /list` used to fail with "path '/list' not
+  found" (exit 2) and now prints the items; `dq keys f.yaml /list`
+  prints `0`, `1`, …. `dq keys f.yaml /n` on a number fails with
+  `cannot list the keys of '/n': it is int, not an object or an array`
+  (exit 1), and so does `len` on a number, a bool or null.
+- `convert -F hcl` and `-F toon` refuse a number they cannot hold with
+  exit 1, naming it as dq read it (`hcl format error: HCL cannot
+  represent arbitrary-precision number 18446744073709551616`). HCL used
+  to write it as a string; TOON wrote `null` or a rounded value.
+  `dq set` of such a number in a TOML file says "TOML cannot represent
+  arbitrary-precision number <n>" (exit 7) instead of suggesting
+  `dq set --jq`.
+- Console output of `get`, `values`, `select` and `query` spells floats
+  the way `-F yaml` does: `get f.yaml /a` printed `1e+300` and now
+  prints `1.0e+300`, `1e400` printed `1e+400` and now `1.0e+400`, and
+  `1e-7` is now `1.0e-7`.
+- Plugins: `get-root`, `get-at` and `jq.eval` spell a float in its
+  shortest form and keep a big number exact, as dq holds it (`1e300`
+  was `1e+300`, `1e400` was `1e+400`). A NaN or an infinity is sent as
+  the string `".nan"`, `".inf"` or `"-.inf"`.
+- HCL output writes every float in its shortest spelling. Writing a
+  large HCL file is no longer superlinear: 100k blocks took 30 s and
+  now take 1.2 s.
+- An HCL file is read with a single `hcl-edit` parse that keeps every
+  number's literal, so `3.0` stays a float and big integers stay exact.
+  Reading Terraform-like files takes about 1.05x the time it did, and a
+  file made only of 17-digit floats about 1.27x.
+- JSON Schema numeric checks are faster on plain numbers: they compare
+  them without formatting them first.
+- The XML reader refuses a namespace prefix that no `xmlns:` declares
+  (`<a:b/>`) and an `encoding` it does not know or cannot read
+  (`UTF-32`, `ISO-2022-KR`) with exit 3, as the writer does.
+  ISO-2022-JP files now read correctly; they used to read as UTF-8 with
+  the escape bytes in the text.
 
 ### Deprecated
 
@@ -328,6 +413,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   exit 7.
 - YAML `del` of an explicit key with no value (`? k` + `? j`, `del /k`)
   removes only that key; it used to fail with exit 7.
+- A composite `extract` item whose `value`, `format` or `anchor` is not
+  a string says "field `value` must be a string, got a number"; it said
+  "missing field `value`".
+- `-F hcl` of an array or scalar root is refused in dq's own words
+  ("its root is a map, not an array") instead of a serde message. The
+  exit code is still 1.
+
+Numbers — NaN, infinities, big integers and long floats:
+
 - YAML `.nan` / `.inf` / `-.inf`: `convert -F json` fails, as it already
   did for TOML `nan`, since JSON has no such number; it used to print
   `.nan` into the JSON. `convert -F yaml` writes them as floats again (it
@@ -348,6 +442,74 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `set --jq` on a JSON file with a number beyond f64 (`1e400`) keeps the
   number; it used to write `{"$serde_json::private::Number": "1e+400"}`
   in its place.
+- A YAML integer past `u64` or below `i64::MIN` no longer fails every
+  command. On `a: 18446744073709551616`, `dq get f.yaml /a` printed
+  `invalid type: integer as u128` (exit 3); it now prints
+  `18446744073709551616`.
+- YAML and JSON numbers keep their exact value. An integer past i64,
+  or a float no f64 holds (more than 17 significant digits, or out of
+  f64's range like `1e400`), is read as written; it used to be rounded
+  or read as a string. On YAML, `convert -F json` turned
+  `c: 123456789012345678901234567890123456789012` into
+  `123456789012345680000000000000000000000000.0` and `b: 1e400` into
+  `"1e400"`. On JSON, `dq get f.json /b` turned
+  `0.1000000000000000000000000001` into `0.1`. Ordinary floats,
+  including 17-digit `%.17g` data such as `0.10000000000000001`, stay
+  plain floats.
+- YAML `!!float 1e400`, `!!float "1e400"` and `!!int` values past 128
+  bits are read as numbers instead of failing to parse.
+  `!!float 18446744073709551617` is written back as
+  `18446744073709551617.0`.
+- `dq set f.json /b 0.1000000000000000000000000002` wrote `0.1` and
+  exited 0. It now writes the full literal.
+- HCL keeps integers past 64 bits exact: `x = 18446744073709551617`
+  was read as `1.8446744073709552e+19`, and `dq get m.tf /x` now prints
+  `18446744073709551617`. When a block repeats, the exact number comes
+  from the last block in source order.
+- HCL whole floats stay floats. `dq convert f.yaml -F hcl` wrote
+  `e: 3.0` as `e = 3` and `1e16` as `h = 10000000000000000`; it now
+  writes `e = 3.0` and `h = 1e16`. dq read `e = 3.0` in a `.tf` file as
+  the integer `3`: `dq type w.tf /e` printed `int` and now prints
+  `float`, and `convert w.tf -F json` prints `"e": 3.0` (was `"e": 3`).
+- JSON output prints floats in their shortest round-trip form. With
+  `a: 1e300`, `dq -F json convert f.yaml` printed a 301-digit number,
+  and `1e-300` came out as `0.` and 300 zeros; they are now `1e300` and
+  `1e-300`. `1.5e20` is no longer `150000000000000000000.0`, and `3.0`
+  stays `3.0`. This covers `convert`; `query`, `get`, `values` and
+  `select` with `-F json` or `-F jsonl`, which now also spell `1e400`
+  one way; `set --jq`, `fmt`, JSON frontmatter and `diff`.
+- The TOML writer, and `set` on YAML and TOML, no longer write runs of
+  digits: `convert -F toml` gives `a = 1e300`,
+  `dq set s.toml /a 1.5e20` gives `a = 1.5e20`, and
+  `dq set s.yaml /a 1e300` gives `a: 1.0e+300`. `-F toon` still writes
+  plain decimals, as the TOON spec requires.
+- The .env, INI, CSV/TSV and XML writers no longer write floats as long
+  runs of digits. With `a: 1e300`, `dq convert v.yaml -F dot-env`
+  printed a 301-digit `a` and now prints `a=1e300`. `1.5e20` printed as
+  `150000000000000000000` and is now `1.5e20`; `3.0` printed as `3` and
+  is now `3.0`.
+- A float on a 17th-digit tie, such as `1658206780088562.2`, is spelled
+  with the even digit by every writer, TOON included; TOML wrote
+  `…562.3`. Schema checks compare it by that spelling, so
+  `maximum: 1658206780088562.25` no longer rejects
+  `1658206780088562.2`.
+- `dq patch` `test` ops and `dq diff` treat `1e400` and `1e+400` as the
+  same number. `diff` prints big numbers as numbers; it printed
+  `"0.1000000000000000000000000002"` as a string.
+- Read commands write NaN and infinity one way. `dq values n.toml ''`
+  printed `NaN` / `inf` and now prints `.nan` / `.inf`;
+  `dq select n.yaml '$.x' -F yaml` printed `- '.nan'` and now prints
+  `- .nan`.
+- In `select` filters a NaN or an infinity is a number, not the string
+  `".nan"`: `$[?@.n > 1]` matches `.inf` and never `.nan`, and
+  `$[?@.n == '.nan']` matches only the string. Filters still compare in
+  f64, so `.inf == .inf` is false and a filter literal past i64 is a
+  parse error; use `query` for exact numeric tests.
+- `isnan` works in `loc:`, in composite `extract:` and in the plugin
+  `jq.eval` import; it used to raise on the string `".nan"`.
+- `dq test` reads fixture inputs the way `dq check` reads files: a YAML
+  `x: .nan` was `null` in a fixture and is now a number, and JSON big
+  integers keep their digits.
 
 The YAML writer, used by `convert -F yaml`, by `set --jq` and `fix` on
 YAML files, and by `get` / `query -F yaml`:
@@ -359,16 +521,52 @@ YAML files, and by `get` / `query -F yaml`:
   and `on` as `true`. In a GitHub Actions workflow that `set --jq`
   rewrites, the `on:` key is now written `'on':`. A `<<` merge key over
   a map stays plain.
-- It writes an integer beyond i64, up to 18446744073709551615, as a
-  number; it used to write it as a quoted string. Larger integers stay
-  quoted, because dq cannot read them back as numbers.
+- It writes an integer beyond i64 as a plain number, however large
+  (`c: 123…`); it used to write it as a quoted string (`c: '123…'`).
 - It writes a float in exponent form with a dot and a signed exponent,
   `1.0e+16` and `1.5e+300`, which YAML 1.1 reads as a float. It used to
   write `1e16` and `1.5e300`, which PyYAML reads as strings. A float
   literal no f64 holds is written the same way (`1.0e+400`); it used to
-  be quoted, or written as `1e+400`. dq's YAML reader still reads such a
-  literal in a YAML file as a string, so `set --jq` on that file now
-  writes it quoted.
+  be quoted, or written as `1e+400`. dq and PyYAML read such an integer
+  or float back as a number.
+- It writes a string holding LS or PS (U+2028, U+2029) double-quoted,
+  with `\L` / `\P`, never raw in single quotes or a block scalar, so
+  YAML 1.1 and 1.2 readers read it alike. Textual-edit `set` writes
+  NEL, LS and PS escaped; it used to refuse such values.
+
+JSON Schema rules:
+
+- A NaN or an infinity is a number. `x: .nan` against `{type: number}`
+  failed with `".nan" is not of type "number"` and now passes. Against
+  `{maximum: 10}` it passed and now fails with `.nan has no order, so
+  it is not at most the maximum of 10`. `.inf` against `{maximum: 10}`
+  passed and now fails.
+- `integer`, `enum` and `const` compare big numbers by exact value:
+  `x: 1e400` against `{type: integer}` failed and now passes, and
+  `x: 1e-400` passed and now fails.
+- A big number in a YAML rule's schema no longer fails the rule:
+  `const: 18446744073709551616` gave `rule parse error … as u128`,
+  exit 3. `const`, `enum`, `minimum`, `maximum` and the exclusive
+  bounds hold exact values, and `maximum: 1e400` compiles.
+- Bounds compare exactly, in a `schema_file` JSON too:
+  `maximum: 18446744073709551616` let `18446744073709551617` pass
+  (exit 0); it now fails with `18446744073709551617 is greater than the
+  maximum of 18446744073709551616`, exit 4.
+- `multipleOf` compares exact values. `multipleOf: 1e400` accepted
+  every number, and now only `0` passes; `0.3` is a multiple of `0.1`,
+  and `1e400` of `2`. `multipleOf: 1e-400` compiles; it used to fail
+  with `1e-400 is less than or equal to the minimum of 0`, exit 3.
+  `multipleOf: 18446744073709551616` on `4` said `… multiple of
+  18446744073709552000`; the message now gives the exact divisor.
+- A message quotes a limit (`multipleOf`, `maximum`, …) as the rule or
+  schema file writes it: `0.00000000001`, not `1e-11`, and `1e2`, not
+  `1e+2`. A schema printed in a `not` message reads as the rule wrote
+  it too, with limits in their source text, `.inf`, and a `multipleOf`
+  divisor below the smallest float as written
+  (`{"multipleOf":1e-400}`).
+- `dq check --rule rule.yml` with a `schema_file:` resolves the schema
+  next to `rule.yml`; it used to fail with `io error reading : No such
+  file or directory` (exit 5).
 
 Textual edits — `set` and `del` on YAML, JSON and TOML:
 
@@ -424,6 +622,29 @@ Textual edits — `set` and `del` on YAML, JSON and TOML:
 - `set` of a new key in a YAML or TOML file with CRLF line breaks ends
   the lines it adds with CRLF, as JSON already did; it used to add LF
   lines to the file.
+- `set` with the root path `''` replaces the whole document in YAML,
+  JSON and TOML, keeping its leading comment lines; it used to fail
+  with exit 2. `# head` + `a: 1` with `set f.yaml '' '{"b":2}'` gives
+  `# head` + `b: 2`. A TOML root must be a table (exit 7 otherwise).
+  `dq del f.yaml ''` is still exit 2 and now says "cannot delete the
+  root ''" instead of "path '' not found".
+- `set` creates missing intermediate keys as mappings, as `--help`
+  says. On `a: 1`, `dq set f.yaml /b/c 2` failed with "path '/b/c' not
+  found", exit 2, and now gives `a: 1` + `b:` + `  c: 2`. JSON gives
+  `{"a": 1, "b": {"c":2}}`, and TOML gives `b.c = 2`, or a `[b]` header
+  in a file that uses headers. `--no-create` still exits 2. The help
+  now says "created as mappings"; it said "map/array nodes", though
+  arrays were never created.
+- Edits in a YAML file with a byte order mark before an indented root,
+  and in YAML or JSON files with lone-CR line breaks, failed with
+  exit 7. They now work, and new lines end the way the file's lines do:
+  `a: 1\rb: 2\r` with `set /c 3` gives `…c: 3\r`. Editing a YAML file
+  with lone-CR line breaks no longer takes quadratic time: on 10k lines
+  it took 28 s and now takes about as long as the same file with `\n`.
+- A TOML table that `set` creates gets a blank line before it also when
+  the next header has a comment line above it. A comment on a YAML
+  `---` line is kept when the document's tag is dropped:
+  `--- !!map # c` with `set '' [1]` gives `--- # c` + `- 1`.
 
 YAML:
 
@@ -484,6 +705,71 @@ YAML:
   leave the alias dangling, so the file no longer parsed. `lint --fix`
   skips such a fix with a warning. `set` over a collection that holds
   such an anchor fails the same way and names the alias's line.
+- Mapping keys that become the same key (`1` and `"1"`, `true` and
+  `"true"`, `~` and `""`, a big integer and the same digits quoted)
+  are a parse error (exit 3) that names the first key and points at the
+  repeated one. One key used to replace the other silently. Equal float
+  keys (`-0.0` and `0.0`) are duplicates as before, and two spellings
+  of one big number (`1e400`, `1.0e+400`) stay two keys. HCL object
+  keys `a` and `"a"` are a parse error too.
+- A key that is a sequence or a mapping is named by its compact flow
+  YAML (`[1, 2]`, `{k: v}`, `['on', 'a: b']`), without its tags; it
+  used to be Rust debug text (`Sequence [Number(1), Number(2)]`). A
+  collection key holding `!!float 1e400` reads (`[1e400]`) instead of
+  failing. Two keys that get the same name, or that YAML calls equal
+  (`{a: 1, b: 2}` and `{b: 2, a: 1}`), are a duplicate (exit 3). `set`
+  and `del` next to such a key, or on it (`set '/[1, 2]' x`), edit the
+  file in place and keep comments; they failed with "path not found".
+  The YAML writer writes the key back as a quoted string, and strings
+  starting with `?` or `:` inside such a key are quoted, so the key
+  name reads back as YAML. Deletes in a flow mapping with such keys are
+  no longer refused, and `del` of such a key inside a flow mapping
+  (`{[1]: a, z: 1}`) removes the entry in place.
+- A delete in a flow mapping leaves no blank before `,` or `}`:
+  `{a: 1 , b: 2}` with `del /b` gives `{a: 1}`. No extra blank follows
+  a flow scalar ending in a `!word`: `{a: x !y}` with `set /new 1`
+  gives `{a: x !y, new: 1}`, and `z: [a: ]` with `del /z/0/a` gives
+  `z: [{}]` (was `z: [{} ]`).
+- An implicit-null entry in a flow mapping can be set and deleted:
+  `z: {n}` with `set /z/n 1` failed with exit 7 and now gives
+  `z: {n: 1}`, and `del /z/n` gives `z: {}`.
+- `del` from a mapping without braces inside a flow sequence works:
+  `z: [? a]` with `del /z/0/a` failed with exit 7 and now gives
+  `z: [{}]`, and `[x, a: 1, y]` with `del /1/a` gives `[x, {}, y]`.
+- An empty tagged item of a flow sequence can be set and deleted:
+  `[!!str , 1]` with `set /0 2` failed with exit 7 and now gives
+  `[2 , 1]`.
+- `del` of the only entry of a flow collection keeps the comment next
+  to it: `[1 # c\n]` with `del /0` gave `[]` and now gives
+  `[ # c\n]`.
+- In a flow collection, an empty quoted `!!null` key reads as the null
+  key: `{!!null "":1}` reads as `{"": 1}` and `[!!null "":1]` as
+  `[{"": 1}]`, where both failed with exit 3, and so does
+  `{!!null "" :1}`, with a blank before the `:`. A flow key whose `:`
+  is on the next line, with no explicit `?`, is a parse error (exit 3)
+  instead of a wrong read.
+- An empty node tagged `!!null` reads as null: `{n: !!null }` failed
+  with exit 3 (`invalid value: string "", expected null`) and now reads
+  as `{"n": null}`; `set /n 1` gives `{n: 1 }`.
+- With `%TAG !! tag:example.com,2000:` and `a: !!str 1`,
+  `dq set t.yaml /a 2` failed with exit 7 and now gives `a: !!str 2`. A
+  plain scalar under a tag outside the core schema reads as untagged
+  (`1`), as it does under `!foo`.
+- `set` on an empty YAML file, or on one holding only comments or
+  `---`, writes the key; it used to fail with "loaded read-only"
+  (exit 7) or "path not found" (exit 2). On an empty file
+  `dq set f.yaml /a 1` gives `a: 1`, and on `# c` it gives `# c` +
+  `a: 1`. An empty document of a stream works too: `a: 1\n---\n` with
+  `set /1/a 1` gives `a: 1\n---\na: 1`.
+- Replacing a whole YAML document keeps the comment lines between
+  `---` and its content: `---\n# lead\nb: 2\n` with
+  `set '' '{"x": 1}'` gave `---\nx: 1\n` and now gives
+  `---\n# lead\nx: 1\n`. This holds for `set /N`, `fix.ops` and
+  `fix.jq` too.
+- A `fix.jq` on a YAML file of one document keeps its directives, the
+  `---` line and the comment lines around the content:
+  `---\n# lead\n\nbad: true\nx: 1\n` gives
+  `---\n# lead\n\nx: 1\nok: true\n`; it gave `x: 1\nok: true\n`.
 
 TOML:
 
@@ -519,6 +805,180 @@ TOML:
   used to fail with "not found". Inside an inline table, the last key
   under a dotted key that comes first leaves `{x = {}, b = 2}`; it used
   to lose the comma.
+- `del` of the last `[[array]]` item in a TOML file with CRLF line
+  breaks keeps CRLF: `[[arr]]\r\nx = 1\r\n` with `del /arr/0` gave
+  `arr = []\n` and now gives `arr = []\r\n`.
+- A TOML result that is not a table says why. `dq set f.toml --jq 5`
+  said "toml format error: unsupported i64 type" and now says "toml
+  format error: a TOML document is a table, so its root is one, not an
+  integer" (exit 1).
+
+JSON:
+
+- A JSON file that starts with a UTF-8 byte order mark is read; it
+  failed with exit 3. Edits and `-i` keep the mark, and `convert`
+  output has none.
+- `dq -F json convert` no longer prints a second blank line:
+  `{"a": 1}\n\n` is now `{"a": 1}\n`. `set --jq`, and `fmt --indent`
+  or `--sort-keys`, end a JSON file with a newline. A value moved or
+  inserted into `{}` inside one-line JSON stays on that line:
+  `{"a": {\n  "b": 1\n}}` is now `{"a": {"b": 1}}`.
+- A value set into a JSON file that is just `{}` stays on one line
+  (`{"x": {"y":1}}`), and `{\n}` no longer gets a blank line before the
+  new entry.
+
+YAML streams — files of several documents separated by `---`:
+
+- `dq lint`, `check` and `fix` evaluate each document of a stream on
+  its own. With a second Pod using `nginx:latest`, `dq lint
+  bundle.yaml` printed `diagnostics: []` and exited 0; it now reports
+  `k8s.no-latest-tag` at `bundle.yaml:9:38`, exit 4. A diagnostic with
+  no position of its own lands at its document's first line. An empty
+  document (`---` and nothing) reports at its own `---` line; it used
+  to be reported on the next document's separator or past the end of
+  the file.
+- `dq fix` on a stream keeps every document. `fix.ops` edits apply in
+  place, comments included. A `fix.jq` re-emits only its own
+  document's content: its `---` line (with any `!tag` / `&anchor` on
+  it, while they still fit the new value), the comment and blank lines
+  before the next `---`, and every other document keep their bytes,
+  and a rewritten document keeps the file's CRLF line ends. On
+  `# head\nname: a # keep\n---\nx: 1 # c\n…`, fixing only the second
+  document lost `# head` and `# keep`, and every later `fix.ops` was
+  skipped.
+- `dq set` and `dq del` work on a whole document of a stream. With
+  `printf 'a: 1\n---\nb: 2\n' > s.yaml`, `dq set s.yaml /1 '{"c":3}'`
+  failed with exit 7 and now gives `a: 1\n---\nc: 3\n`, and
+  `dq del s.yaml /1` failed with exit 2 ("path not found") and now
+  gives `a: 1\n`. `dq --doc 1 set s.yaml '' …` works the same way. A
+  `fix.ops` `replace ""` or `add ""` now applies, and `remove ""`
+  drops a stream document. In a stream the replace used to be skipped
+  with exit 0, leaving the finding, and the remove failed with "path
+  '/1' not found".
+- `dq del /N` also removes the document's `%YAML` / `%TAG` directives.
+  `del /1` on `%YAML 1.2\n---\na: 1\n...\n%YAML 1.2\n---\nb: 2` failed
+  with exit 7 and now gives `%YAML 1.2\n---\na: 1`.
+- `dq set FILE --jq` on a stream writes a stream:
+  `dq set bundle.yaml --jq '.[1].metadata.name = "z"'` printed one YAML
+  sequence and now prints both documents, separated by `---`. A filter
+  over a whole stream must return a non-empty array of documents:
+  `-i --jq '[]'` wrote an empty file and is now exit 6, with the file
+  untouched.
+
+`dq patch` and `dq merge`:
+
+- `patch` `add` into an array inserts, as RFC 6902 §4.1 says. On
+  `[1,2]`, `add /0 9` gives `[9,1,2]` (it gave `[9,2]`), and `/-` or
+  `/2` gives `[1,2,9]` (it failed with exit 2). `copy` and `move` into
+  an index insert too. Comments are kept in YAML, JSON and TOML,
+  arrays of tables included. `set` still replaces.
+- `add` into an anchored YAML array that an alias shares applies, and
+  the alias sees the new item as it does after `set`: `a: &q [1]` +
+  `b: *q` with `add /a/0 9` failed with exit 7 and now gives
+  `a: &q [9, 1]`. An insert under the alias (`/b/0`) is refused with
+  the same message as `set`.
+- `add` before the first item of a compact YAML sequence inserts and
+  keeps comments: `- - 1 # c` with `add /0/0 9` failed with exit 7 and
+  now gives `- - 9\n  - 1 # c`.
+- `patch` refuses a `move` into the value's own child (RFC 6902 §4.4)
+  with exit 2, naming both paths. Patch ops never create missing
+  parents, also after a move's removal.
+- `patch` addresses the documents of a YAML stream as `/N`, like `set`
+  and `del`. On `a: 1\n---\nb: 2\n`, `remove /1` gives `a: 1\n` (it
+  failed with exit 2) and `replace /1 {"x":1}` gives
+  `a: 1\n---\nx: 1\n` (it failed with exit 7).
+- `add /N` on a stream inserts a new document with its `---` line, and
+  `add /-` appends one; `add /1` used to replace document 1. Added
+  before a document with `%YAML` / `%TAG` directives, the new document
+  goes before them and ends with `...`, so the directives stay with
+  their document.
+- `merge` with a mapping patch on a root that is not a mapping replaces
+  the root with the patch minus its null members (RFC 7396 §2):
+  `- 1\n- 2\n` with `{"a":1,"b":null}` gives `a: 1\n`; it failed with
+  exit 2. Nested nulls under a key whose old value was not a mapping
+  are dropped; they used to be written.
+- `merge` on a YAML stream is refused with exit 6. It used to fail with
+  "not found" or merge into the wrong place.
+
+XML:
+
+- A `#text` that is a number or a boolean is written instead of lost:
+  `"#text": 1.5e20` gave `<x></x>` and now gives `<x>1.5e20</x>`, and
+  `true` gives `<t>true</t>`. An array or a map under `#text`, or an
+  `@attrs` that is not a map, was dropped silently and is now refused
+  with exit 1. `"@attrs": null` writes no attributes; it used to fail.
+- Non-string `#cdata`, `#comments` and `#pi` items and `#xml`
+  declaration fields are no longer dropped silently; a YAML
+  `version: 1.1` was written as `version="1.0"`. Scalars are written as
+  text. Containers, unknown `#xml` fields, a second root element and
+  top-level text are refused with exit 1.
+- Every writer refusal names the key and what it got: `(got a map)`,
+  `(got a number 5)`, `(got "hi")`. A child entry that is not a list
+  (`r: [{c: 5}]`) is refused instead of dropped silently.
+- Output is always well-formed. Names, PI targets, comments holding
+  `--`, PIs holding `?>`, control characters and declaration fields
+  that XML does not allow are refused with exit 1 and a message naming
+  the key; they used to be written. `standalone: true` is written as
+  `yes`. CDATA holding `]]>` is split across sections. Comments are no
+  longer escaped, so `<!-- a < b -->` round-trips unchanged; it came
+  back with `&lt;`.
+- Element and attribute names must be namespace QNames, and PI targets
+  may not contain a colon: `x:y:z`, `:a` and `a:` fail with exit 1
+  instead of being written.
+- The writer refuses a name whose prefix no `xmlns:` declares in scope,
+  `xmlns` as an element name, and the bindings XML Namespaces forbids
+  (`xmlns:xmlns`, `xmlns:xml` bound to another URI). `xmlns:p=""`
+  undeclares a prefix in a `version="1.1"` document, as Namespaces in
+  XML 1.1 allow; in XML 1.0 it is refused, with exit 3 on read and
+  exit 1 on write.
+- Whitespace survives XML's normalization. A CR in text, and a tab, LF
+  or CR in an attribute value, are written as `&#13;`, `&#9;` and
+  `&#10;`; they used to read back as an LF or a space. Text that is
+  only whitespace (`&#9;`, `&#10;`, `&#x85;`) is written as character
+  references; it read back as an empty element. Text made only of
+  Unicode spaces that are not XML whitespace (U+3000, U+2028, NEL) is
+  kept instead of dropped, and the writer references CR, NEL and LS so
+  they read back unchanged.
+- Line ends read as an LF in PIs and CDATA too (CRLF, CR). In a
+  `version="1.1"` document NEL, LS and CR NEL also read as an LF, or a
+  space in attribute values. The writer refuses a CR in a comment, PI
+  or CDATA, and NEL or LS there in a 1.1 document, with exit 1, since
+  they would read back as an LF.
+- In an XML 1.1 document the writer writes restricted control
+  characters as character references in text and attributes, and
+  refuses them in comments, PIs and CDATA. The reader refuses
+  characters the document's version does not allow, raw or as a
+  character reference, with exit 3 and the line and column: NUL,
+  surrogates, U+FFFE and U+FFFF; C0 controls other than tab, LF and CR
+  in 1.0; raw restricted characters in 1.1.
+- dq reads files in ISO-8859-1, windows-1252, Shift_JIS, UTF-16 (LE or
+  BE, with a BOM) and other encodings their declaration names; they
+  failed with "invalid UTF-8" (exit 3). Such a file writes back byte
+  for byte. `US-ASCII` is strict 7-bit, and `ISO-8859-1` is true
+  Latin-1 (IANA), not windows-1252. A byte order mark shows as
+  `#xml.bom`. A UTF-8 one, which used to be dropped, is kept as
+  `#xml.bom: UTF-8` and written back by `convert -F xml` and `fmt -i`,
+  so such files round-trip byte for byte.
+- UTF-16 without a BOM keeps its byte order on write
+  (`#xml.detected`), and a declaration that contradicts it is a parse
+  error (exit 3). A file in 8-bit bytes that declares
+  `encoding="utf-16"`, as .NET `XmlSerializer` over a `StringWriter`
+  writes it, reads as UTF-8, is kept as `#xml.detected: UTF-8` and is
+  written back as UTF-8 under its label, byte for byte. The writer
+  refuses `detected: UTF-8` under any other label.
+- A file whose byte order mark contradicts its declared encoding (a
+  UTF-16 or UTF-8 BOM declaring `ISO-8859-1`), or whose `encoding` is
+  not an encoding name (`" ISO-8859-1 "`), is a parse error (exit 3),
+  as XML 1.0 requires. It used to read fine and then fail to write
+  back, or be written in the wrong encoding.
+- `convert -F xml` encodes its output in the encoding `#xml` declares.
+  It refuses with exit 1 a character that encoding cannot hold (the
+  message names the character and where it is), an encoding dq does
+  not know, and a `bom` the declared encoding contradicts.
+- Parse errors name the line and column of the name at fault, the
+  attribute or the tag, in every command and not only in `validate`.
+  A refused `encoding` label names its line and column too, in
+  messages and in `dq validate`.
 
 ### Security
 

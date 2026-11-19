@@ -13,6 +13,13 @@ Status words: **done** (in the code, only bookkeeping left), **partly done**,
 
 Each has its own page with the design and the remaining steps.
 
+- **[Fix everything found on `fix/after-deps-update`](plans/after-deps-update-fixes.md)
+  — in progress.** Streams, big numbers, textual edits, non-finite numbers,
+  and the numbers/HCL/XML/YAML round are done. A last round on schema notes,
+  console escaping and XML declarations is in progress. After it come the
+  `@std` rules and the fixture runner, positions and schemas, formats and
+  reporters, and the README checked against the code, in that order.
+
 - **[Linear-cost pointers in recursive walks](plans/perf-pointer-recursive-walks.md)
   — done.** `Pointer::with_segment` copied the whole path on every call, so
   recursive walks paid O(depth²) per leaf (65 ns at depth 1, 115 µs at depth
@@ -133,6 +140,10 @@ against the binary on this branch:
   location without a separator.
 - **`--no-pager`** is accepted, but dq has no pager; implement one or drop the
   flag.
+- **Structural `set` on formats without textual edits**: `dq set f.xml /a 2`
+  is refused with exit 7 ("cannot set a value in it") for XML, HCL, INI,
+  dotenv and CSV. The README lists them as writable, and `set --jq '.a = 2'`
+  works on the same files.
 - **README drift**: `-F text` does not exist (`console`); `dq check
   k8s.no-latest-tag f.yaml` needs `--rule`; `dq query post.md '…'` has the
   arguments reversed; the `check --inline` and `.dq/rules/` examples lack the
