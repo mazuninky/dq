@@ -56,16 +56,14 @@ impl Format for Hcl {
     }
 
     fn write(&self, doc: &Document, w: &mut dyn Write) -> Result<()> {
-        // Re-emit through `hcl::to_string` on an `hcl::Value`. Comments are
-        // not preserved (M5 v1). The `hcl-rs` `Number` type cannot carry an
-        // arbitrary-precision literal: a big number past `u64` / `f64` is
-        // refused rather than written as another value.
-        let hcl_value = value_to_hcl_value(doc.value())?;
-        let serialized = hcl::to_string(&hcl_value).map_err(|e| Error::Format {
-            format: "hcl",
-            message: format!("failed to serialize HCL: {e}"),
-        })?;
-        let serialized = respell_whole_floats(serialized, doc.value());
+        // Comments are not preserved (M5 v1). The `hcl-rs` `Number` type
+        // cannot carry an arbitrary-precision literal: a big number past
+        // `u64` / `f64` is refused rather than written as another value.
+        let serialized = match doc.value() {
+            Value::Map(map) => write_body(map)?,
+            // Not a body: `hcl-rs` refuses it, with its own message.
+            other => hcl::to_string(&value_to_hcl_value(other)?).map_err(serialize_error)?,
+        };
         w.write_all(serialized.as_bytes())
             .map_err(|source| Error::Io {
                 path: Utf8PathBuf::from("<hcl-writer>"),
@@ -377,75 +375,107 @@ fn hcl_number_to_value(n: &Number) -> Value {
     Value::BigFloat(n.to_string())
 }
 
-/// `text`, which `hcl::to_string` wrote for `value`, with every whole
-/// float spelled as one again. `hcl-rs` keeps a whole `f64` that fits 64
-/// bits as an integer (`3.0` → `3`, `1e16` → `10000000000000000`), which
-/// reads back as an int; each such number is respelled
-/// [`shortest_float`](crate::document::shortest_float)'s way (`3.0`,
-/// `1e16`) by walking `text`, parsed with `hcl-edit`, alongside `value`.
-/// Every other byte stays as `hcl-rs` wrote it.
-fn respell_whole_floats(text: String, value: &Value) -> String {
-    let Value::Map(map) = value else {
-        return text;
+fn serialize_error(e: hcl::Error) -> Error {
+    Error::Format {
+        format: "hcl",
+        message: format!("failed to serialize HCL: {e}"),
+    }
+}
+
+/// `map` as an HCL body of attributes, laid out as `hcl::to_string` lays
+/// out an `hcl::Value` — two-space indents, one array item or object
+/// member per line, object keys quoted — with each float spelled by
+/// [`shortest_float`](crate::document::shortest_float) and strings and keys
+/// quoted by `hcl-rs` itself.
+///
+/// Written here rather than by `hcl-rs` because it writes a whole `f64`
+/// that fits 64 bits as an integer (`3.0` → `3`), which reads back as an
+/// int, and keeps objects in a map whose every insert scans the keys
+/// before it, which takes minutes for an object of 100,000 members.
+///
+/// # Errors
+///
+/// [`Error::Format`] naming the first big number HCL cannot hold, else the
+/// first key that is no HCL identifier.
+fn write_body(map: &IndexMap<String, Value>) -> Result<String> {
+    let mut out = String::new();
+    let mut bad_key = None;
+    for (key, value) in map {
+        match hcl::Identifier::new(key.as_str()) {
+            Ok(ident) => out.push_str(ident.as_str()),
+            Err(e) => {
+                bad_key.get_or_insert(e);
+            }
+        }
+        out.push_str(" = ");
+        write_expression(&mut out, value, 1)?;
+        out.push('\n');
+    }
+    match bad_key {
+        Some(e) => Err(serialize_error(e)),
+        None => Ok(out),
+    }
+}
+
+/// Append `value`, whose members go `depth` indents deep, to `out`.
+fn write_expression(out: &mut String, value: &Value, depth: usize) -> Result<()> {
+    let indent = |out: &mut String, depth: usize| {
+        for _ in 0..depth {
+            out.push_str("  ");
+        }
     };
-    if !map.values().any(has_whole_float) {
-        return text;
-    }
-    let Ok(mut body) = text.parse::<hcl::edit::structure::Body>() else {
-        return text;
-    };
-    for mut attr in body.attributes_mut() {
-        if let Some(value) = map.get(attr.get().key.as_str()) {
-            respell_whole_floats_in(attr.value_mut(), value);
+    match value {
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Int(i) => out.push_str(&i.to_string()),
+        Value::Float(f) if f.is_finite() => out.push_str(&crate::document::shortest_float(*f)),
+        Value::Float(_) => out.push_str("null"),
+        Value::BigInt(s) => match s.parse::<u64>() {
+            Ok(u) if u.to_string() == *s => out.push_str(s),
+            _ => return Err(big_number_error(s)),
+        },
+        Value::BigFloat(s) if crate::document::non_finite_literal(s).is_some() => {
+            out.push_str(&hcl_text(&hcl::Expression::String(s.clone()))?);
+        }
+        Value::BigFloat(s) => return Err(big_number_error(s)),
+        Value::String(s) => out.push_str(&hcl_text(&hcl::Expression::String(s.clone()))?),
+        Value::Array(items) if items.is_empty() => out.push_str("[]"),
+        Value::Array(items) => {
+            out.push('[');
+            for (at, item) in items.iter().enumerate() {
+                out.push_str(if at == 0 { "\n" } else { ",\n" });
+                indent(out, depth);
+                write_expression(out, item, depth + 1)?;
+            }
+            out.push('\n');
+            indent(out, depth - 1);
+            out.push(']');
+        }
+        Value::Map(map) if map.is_empty() => out.push_str("{}"),
+        Value::Map(map) => {
+            out.push('{');
+            for (key, member) in map {
+                out.push('\n');
+                indent(out, depth);
+                out.push_str(&hcl_text(&hcl::ObjectKey::from(key.as_str()))?);
+                out.push_str(" = ");
+                write_expression(out, member, depth + 1)?;
+            }
+            out.push('\n');
+            indent(out, depth - 1);
+            out.push('}');
         }
     }
-    body.to_string()
+    Ok(())
 }
 
-/// Whether `v` is or holds a finite float with no fraction.
-fn has_whole_float(v: &Value) -> bool {
-    match v {
-        Value::Float(f) => f.is_finite() && f.fract() == 0.0,
-        Value::Array(items) => items.iter().any(has_whole_float),
-        Value::Map(map) => map.values().any(has_whole_float),
-        Value::Null
-        | Value::Bool(_)
-        | Value::Int(_)
-        | Value::BigInt(_)
-        | Value::BigFloat(_)
-        | Value::String(_) => false,
-    }
+/// `value` as `hcl-rs` formats it.
+fn hcl_text<T: hcl::format::Format>(value: &T) -> Result<String> {
+    hcl::format::to_string(value).map_err(serialize_error)
 }
 
-fn respell_whole_floats_in(expr: &mut hcl::edit::expr::Expression, value: &Value) {
-    use hcl::edit::Decorate as _;
-    use hcl::edit::expr::Expression as EditExpression;
-    match (expr, value) {
-        // `-3` parses as a negation of `3`.
-        (expr @ (EditExpression::Number(_) | EditExpression::UnaryOp(_)), Value::Float(f))
-            if f.is_finite() && f.fract() == 0.0 =>
-        {
-            if let Ok(mut respelled) = crate::document::shortest_float(*f).parse::<EditExpression>()
-            {
-                *respelled.decor_mut() = expr.decor().clone();
-                *expr = respelled;
-            }
-        }
-        (EditExpression::Array(items), Value::Array(values)) if items.len() == values.len() => {
-            for (item, value) in items.iter_mut().zip(values) {
-                respell_whole_floats_in(item, value);
-            }
-        }
-        (EditExpression::Object(object), Value::Map(map)) if object.len() == map.len() => {
-            for ((_, member), value) in object.iter_mut().zip(map.values()) {
-                respell_whole_floats_in(member.expr_mut(), value);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Convert our `Value` back into `hcl::Value` for the write path.
+/// Convert our `Value` back into `hcl::Value`, for a value that is not a
+/// map — which `hcl-rs` refuses to write as a body.
 ///
 /// A [`Value::BigInt`] that fits `u64` becomes that number. Any other
 /// finite big number (`Value::BigInt` / `Value::BigFloat`) has no `hcl-rs`
@@ -665,6 +695,107 @@ mod tests {
         assert_eq!(text, "e = 3.0\nn = -3.0\nh = 1e16\ni = 4\n");
         let back = Hcl.parse(text.as_bytes()).expect("reads back");
         assert_eq!(back.value(), &value);
+    }
+
+    #[test]
+    fn write_lays_out_a_body_as_hcl_rs_does() {
+        // No floats: `hcl-rs` writes these as dq does.
+        let strings = [
+            "plain",
+            "",
+            "quote \" back \\ tab \t nl \n cr \r bell \u{7}",
+            "${var.x} templated \"raw\"",
+            "$${escaped} and %%{ also }",
+            "dollar ${ alone",
+            "\u{E000} private use, \u{fc}n\u{ef}code",
+        ];
+        let map = |members: Vec<(&str, Value)>| {
+            Value::Map(
+                members
+                    .into_iter()
+                    .map(|(k, v)| (k.to_owned(), v))
+                    .collect(),
+            )
+        };
+        let value = map(vec![
+            (
+                "s",
+                Value::Array(strings.iter().map(|s| Value::String((*s).into())).collect()),
+            ),
+            ("e", Value::Array(vec![])),
+            ("o", map(vec![])),
+            ("n", Value::Null),
+            ("b", Value::Bool(true)),
+            ("i", Value::Int(-7)),
+            ("u", Value::BigInt("18446744073709551615".into())),
+            ("nan", Value::BigFloat(".nan".into())),
+            (
+                "deep",
+                map(vec![
+                    (
+                        "a b",
+                        Value::Array(vec![Value::Array(vec![Value::Int(1)]), map(vec![])]),
+                    ),
+                    (
+                        "${k}",
+                        map(vec![(
+                            "x",
+                            Value::Array(vec![Value::Int(2), Value::Int(3)]),
+                        )]),
+                    ),
+                ]),
+            ),
+        ]);
+        let Value::Map(body) = &value else {
+            unreachable!()
+        };
+        let expected = hcl::to_string(&value_to_hcl_value(&value).unwrap()).unwrap();
+        assert_eq!(write_body(body).unwrap(), expected);
+    }
+
+    #[test]
+    fn write_spells_every_float_with_shortest_float() {
+        let value = Value::Map(
+            [
+                ("w".to_owned(), Value::Float(2.0)),
+                (
+                    "a".to_owned(),
+                    Value::Array(vec![
+                        Value::Float(1_658_206_780_088_562.2),
+                        Value::Map([("k".to_owned(), Value::Float(-0.5))].into_iter().collect()),
+                        Value::Float(f64::NAN),
+                    ]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let text = write(value).expect("writes");
+        assert_eq!(
+            text,
+            "w = 2.0\na = [\n  1658206780088562.2,\n  {\n    \"k\" = -0.5\n  },\n  null\n]\n"
+        );
+    }
+
+    #[test]
+    fn write_names_a_big_number_before_a_key_that_is_no_identifier() {
+        let value = Value::Map(
+            [
+                ("a b".to_owned(), Value::Int(1)),
+                ("x".to_owned(), Value::BigFloat("1e400".into())),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        assert_eq!(
+            write(value).unwrap_err().to_string(),
+            "hcl format error: HCL cannot represent arbitrary-precision number 1e400"
+        );
+        let value = Value::Map([("a b".to_owned(), Value::Int(1))].into_iter().collect());
+        assert_eq!(
+            write(value).unwrap_err().to_string(),
+            "hcl format error: failed to serialize HCL: invalid identifier `a b`"
+        );
     }
 
     #[test]
