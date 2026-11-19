@@ -448,3 +448,54 @@ fn line_and_paragraph_separators_are_written_escaped() {
         "r:\n- '@attrs':\n    a: \"x\\Ly\"\n  '#text': \"t\\Pv\"\n"
     );
 }
+
+/// `set --jq`, `fix`, and a YAML `get` / `query` write LS and PS escaped
+/// too. Before (1c5da56), each took them for line breaks: `a: 'l<LS>  m'`.
+#[test]
+fn every_yaml_output_writes_line_and_paragraph_separators_escaped() {
+    let dir = dir_with(&[
+        ("s.yaml", "a: x\nb: \"p\\Lq\\Pr\"\n"),
+        (
+            ".dq/rules/fx.yml",
+            "id: t.fx\ndescription: x\nseverity: error\nmatch: { format: yaml }\ncheck:\n  \
+             jq: \".a == \\\"x\\\"\"\n  message: a is x\nfix:\n  jq: \".a = \\\"l\\\\u2028m\\\"\"\n",
+        ),
+    ]);
+    assert_eq!(
+        stdout_of(
+            &dir,
+            &["set", "--jq", ".a = \"l\\u2028m\\u2029n\"", "s.yaml"]
+        ),
+        "a: \"l\\Lm\\Pn\"\nb: \"p\\Lq\\Pr\"\n"
+    );
+    assert_eq!(
+        stdout_of(&dir, &["fix", "s.yaml"]),
+        "a: \"l\\Lm\"\nb: \"p\\Lq\\Pr\"\n"
+    );
+    assert_eq!(
+        stdout_of(&dir, &["-F", "yaml", "get", "s.yaml", "/b"]),
+        "\"p\\Lq\\Pr\"\n"
+    );
+    assert_eq!(
+        stdout_of(&dir, &["-F", "yaml", "query", "{k: .b}", "s.yaml"]),
+        "- k: \"p\\Lq\\Pr\"\n"
+    );
+}
+
+/// A key past 128 bytes, which the writer puts behind `? `, is written
+/// escaped as a short one is. A key that was a collection is named by its
+/// flow text (`["a\Lb"]`) and written single-quoted, so it reads back as
+/// that text — a guard.
+#[test]
+fn a_long_key_or_a_collection_key_holding_a_separator() {
+    let long = format!("{}\u{2028}", "k".repeat(130));
+    let json = serde_json::json!({ long.as_str(): 1 }).to_string();
+    let dir = dir_with(&[("long.json", &json), ("ck.yaml", "? [\"a\\Lb\"]\n: 1\n")]);
+    let yaml = to_yaml(&dir, "long.json");
+    assert_eq!(yaml, format!("? \"{}\\L\"\n: 1\n", "k".repeat(130)));
+    assert_eq!(
+        read_back(&yaml),
+        serde_json::from_str::<serde_json::Value>(&json).expect("JSON")
+    );
+    assert_eq!(to_yaml(&dir, "ck.yaml"), "'[\"a\\Lb\"]': 1\n");
+}

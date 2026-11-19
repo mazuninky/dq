@@ -220,3 +220,54 @@ fn set_writes_line_and_paragraph_separators_escaped() {
     // A multi-line value over a single-quoted scalar, which would fold.
     assert_eq!(edit("b: 'y'\n", &["set", "/b", "p\nq"]), "b: \"p\\nq\"\n");
 }
+
+/// `set` of a JSON array or object holding LS or PS writes each string in
+/// it escaped, as a block sequence item and as a new block map value.
+/// Before (1c5da56), an item was written raw in a plain flow scalar,
+/// `- [l<LS>m]`, and the new map value was refused.
+#[test]
+fn set_of_a_collection_writes_its_line_and_paragraph_separators_escaped() {
+    let src = "c:\n- 1\n- 2\nd:\n  e: 1\n";
+    assert_eq!(
+        edit(src, &["set", "/c/0", "[\"l\\u2028m\"]"]),
+        "c:\n- [\"l\\Lm\"]\n- 2\nd:\n  e: 1\n"
+    );
+    assert_eq!(
+        edit(src, &["set", "/d/f", "{\"k\\u2029\": [\"v\\u2028\"]}"]),
+        "c:\n- 1\n- 2\nd:\n  e: 1\n  f:\n    \"k\\P\": [\"v\\L\"]\n"
+    );
+    assert_eq!(
+        edit(src, &["set", "/c/1", "[\"plain\", {\"k\": \"v\"}]"]),
+        "c:\n- 1\n- [plain, {k: v}]\nd:\n  e: 1\n"
+    );
+}
+
+/// A raw U+FEFF is written over a double-quoted scalar as it is, and over a
+/// single-quoted one double-quoted, as single quotes cannot keep it
+/// (before 1c5da56: `'a<BOM>b'`). A C1 control other than NEL has no
+/// escape in a textual edit: `set` refuses it, exit 7, file untouched,
+/// pointing at `set --jq`.
+#[test]
+fn set_of_a_bom_or_a_c1_control_over_a_quoted_scalar() {
+    let src = "a: x\nb: \"z\"\nc: 'y'\n";
+    assert_eq!(
+        edit(src, &["set", "/b", "a\u{feff}b"]),
+        "a: x\nb: \"a\u{feff}b\"\nc: 'y'\n"
+    );
+    assert_eq!(
+        edit(src, &["set", "/c", "a\u{feff}b"]),
+        "a: x\nb: \"z\"\nc: \"a\u{feff}b\"\n"
+    );
+    let file = write_yaml(src);
+    let path = file.to_str().expect("UTF-8 path");
+    for (pointer, value) in [("/b", "a\u{80}b"), ("/c", "a\u{9f}b")] {
+        dq().args(["--no-color", "set", "-i", path, pointer, value])
+            .assert()
+            .code(7)
+            .stdout("")
+            .stderr(predicates::str::contains(format!(
+                "cannot set '{pointer}': the edited document would not parse; `dq set --jq`"
+            )));
+        assert_eq!(std::fs::read_to_string(path).expect("read back"), src);
+    }
+}
