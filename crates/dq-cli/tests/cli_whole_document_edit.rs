@@ -1508,3 +1508,371 @@ fn del_of_the_last_toml_array_item_keeps_the_crlf_line_break() {
         reads: json!({"arr": []}),
     }]);
 }
+
+/// An `[[array]]` under a dotted name empties to `t.arr = []`, in the
+/// file's line breaks; a dotted or implicit table emptied by a delete
+/// keeps CRLF too.
+#[test]
+fn del_that_empties_a_toml_table_keeps_the_crlf_line_breaks() {
+    let case = |src, args, want, reads| Case {
+        name: "f.toml",
+        src,
+        args,
+        want,
+        reads,
+    };
+    check(&[
+        case(
+            "a = 1\r\n[[t.arr]]\r\nx = 1\r\n",
+            &["del", "f.toml", "/t/arr/0"],
+            "a = 1\r\nt.arr = []\r\n",
+            json!({"a": 1, "t": {"arr": []}}),
+        ),
+        case(
+            "a = 1\n[[t.arr]]\nx = 1\n",
+            &["del", "f.toml", "/t/arr/0"],
+            "a = 1\nt.arr = []\n",
+            json!({"a": 1, "t": {"arr": []}}),
+        ),
+        case(
+            "a = 1\r\nt.x = 1\r\n",
+            &["del", "f.toml", "/t/x"],
+            "a = 1\r\nt = {}\r\n",
+            json!({"a": 1, "t": {}}),
+        ),
+        case(
+            "a = 1\r\nt.u.x = 1\r\n",
+            &["del", "f.toml", "/t/u/x"],
+            "a = 1\r\nt.u = {}\r\n",
+            json!({"a": 1, "t": {"u": {}}}),
+        ),
+        case(
+            "a = 1\r\n[t.u]\r\nx = 1\r\n",
+            &["del", "f.toml", "/t/u/x"],
+            "a = 1\r\n[t.u]\r\n",
+            json!({"a": 1, "t": {"u": {}}}),
+        ),
+        case(
+            "a = 1\r\n[t.u]\r\nx = 1\r\n",
+            &["del", "f.toml", "/t/u"],
+            "a = 1\r\n[t]\r\n",
+            json!({"a": 1, "t": {}}),
+        ),
+    ]);
+}
+
+// ---- the lead-in through `dq fix` -------------------------------------
+
+/// A `fix.ops` `replace ""` keeps the comment and blank lines between a
+/// document's `---` line and its content, in a file and in one document
+/// of a CRLF stream.
+#[test]
+fn fix_ops_replace_keeps_the_lead_in_after_the_marker() {
+    let rule =
+        whole_rule(r#"if .bad then [{"op":"replace","path":"","value":{"ok":true}}] else [] end"#);
+    for (src, want, reads) in [
+        (
+            "---\n# lead\n\nbad: true\n",
+            "---\n# lead\n\nok: true\n",
+            json!({"ok": true}),
+        ),
+        (
+            "a: 1\r\n---\r\n# lead\r\n\r\nbad: true\r\n---\r\nc: 3\r\n",
+            "a: 1\r\n---\r\n# lead\r\n\r\nok: true\r\n---\r\nc: 3\r\n",
+            json!([{"a": 1}, {"ok": true}, {"c": 3}]),
+        ),
+    ] {
+        let out = fix(&rule, src);
+        assert_eq!((out.code, out.stderr.as_str()), (0, ""), "{src:?}");
+        assert_eq!(out.file, want, "{src:?}");
+        assert_eq!(read("s.yaml", &out.file), reads);
+    }
+}
+
+/// A `fix.jq` re-emit of one document of a stream keeps its lead-in
+/// lines, under a kept `--- !!map` too.
+#[test]
+fn fix_jq_reemit_of_a_stream_document_keeps_its_lead_in() {
+    let rule = "
+id: test.jq
+description: re-emit one document
+severity: warn
+match: {format: yaml}
+check:
+  jq: 'select(.bad == true)'
+  message: bad
+fix:
+  jq: 'del(.bad) | .ok = true'
+";
+    for (src, want, reads) in [
+        (
+            "a: 1\r\n---\r\n# lead\r\n\r\nbad: true\r\n---\r\nc: 3\r\n",
+            "a: 1\r\n---\r\n# lead\r\n\r\nok: true\r\n---\r\nc: 3\r\n",
+            json!([{"a": 1}, {"ok": true}, {"c": 3}]),
+        ),
+        (
+            "a: 1\n--- !!map\n  # lead\nbad: true\n",
+            "a: 1\n--- !!map\n  # lead\nok: true\n",
+            json!([{"a": 1}, {"ok": true}]),
+        ),
+    ] {
+        let out = fix(rule, src);
+        assert_eq!((out.code, out.stderr.as_str()), (0, ""), "{src:?}");
+        assert_eq!(out.file, want, "{src:?}");
+        assert_eq!(read("s.yaml", &out.file), reads);
+    }
+}
+
+// ---- chains of created mappings, further -------------------------------
+
+/// A chain whose leaf value is a collection: the collection is written
+/// where the chain ends, in each format's style.
+#[test]
+fn set_creates_a_chain_whose_leaf_is_a_collection() {
+    let value = "{\"x\": [1, 2]}";
+    let reads = || json!({"a": 1, "b": {"c": {"x": [1, 2]}}});
+    check(&[
+        Case {
+            name: "f.yaml",
+            src: "a: 1\n",
+            args: &["set", "f.yaml", "/b/c", value],
+            want: "a: 1\nb:\n  c: {x: [1, 2]}\n",
+            reads: reads(),
+        },
+        Case {
+            name: "f.yaml",
+            src: "{a: 1}\n",
+            args: &["set", "f.yaml", "/b/c", value],
+            want: "{a: 1, b: {c: {x: [1, 2]}}}\n",
+            reads: reads(),
+        },
+        Case {
+            name: "f.json",
+            src: "{\"a\": 1}\n",
+            args: &["set", "f.json", "/b/c", value],
+            want: "{\"a\": 1, \"b\": {\"c\":{\"x\":[1,2]}}}\n",
+            reads: reads(),
+        },
+        Case {
+            name: "f.toml",
+            src: "a = 1\n",
+            args: &["set", "f.toml", "/b/c", value],
+            want: "a = 1\nb.c = { x = [1, 2] }\n",
+            reads: reads(),
+        },
+        Case {
+            name: "f.toml",
+            src: "a = 1\n\n[t]\nx = 1\n",
+            args: &["set", "f.toml", "/b/c", value],
+            want: "a = 1\n\n[t]\nx = 1\n\n[b]\nc = { x = [1, 2] }\n",
+            reads: json!({"a": 1, "t": {"x": 1}, "b": {"c": {"x": [1, 2]}}}),
+        },
+    ]);
+}
+
+/// Under a table that exists only through a sub-table header (`[a.d]`)
+/// the chain is a dotted key under a new `[a]` header before it. In a
+/// file whose last section is an `[[array]]`, a new table goes after it,
+/// a sub-table of an earlier table before it, and a chain inside the
+/// array's item stays in that item.
+#[test]
+fn set_creates_a_toml_chain_under_an_implicit_table_and_around_an_array() {
+    let arr = "[t]\nx = 1\n\n[[arr]]\ny = 1\n";
+    check(&[
+        Case {
+            name: "f.toml",
+            src: "[a.d]\nx = 1\n",
+            args: &["set", "f.toml", "/a/q/r", "2"],
+            want: "[a]\nq.r = 2\n\n[a.d]\nx = 1\n",
+            reads: json!({"a": {"q": {"r": 2}, "d": {"x": 1}}}),
+        },
+        Case {
+            name: "f.toml",
+            src: arr,
+            args: &["set", "f.toml", "/b/c", "2"],
+            want: "[t]\nx = 1\n\n[[arr]]\ny = 1\n\n[b]\nc = 2\n",
+            reads: json!({"t": {"x": 1}, "arr": [{"y": 1}], "b": {"c": 2}}),
+        },
+        Case {
+            name: "f.toml",
+            src: arr,
+            args: &["set", "f.toml", "/t/q/r", "2"],
+            want: "[t]\nx = 1\n\n[t.q]\nr = 2\n\n[[arr]]\ny = 1\n",
+            reads: json!({"t": {"x": 1, "q": {"r": 2}}, "arr": [{"y": 1}]}),
+        },
+        Case {
+            name: "f.toml",
+            src: arr,
+            args: &["set", "f.toml", "/arr/0/q/r", "2"],
+            want: "[t]\nx = 1\n\n[[arr]]\ny = 1\nq.r = 2\n",
+            reads: json!({"t": {"x": 1}, "arr": [{"y": 1, "q": {"r": 2}}]}),
+        },
+        Case {
+            name: "f.toml",
+            src: "[t]\r\nx = 1\r\n\r\n[[arr]]\r\ny = 1\r\n",
+            args: &["set", "f.toml", "/t/q/r", "2"],
+            want: "[t]\r\nx = 1\r\n\r\n[t.q]\r\nr = 2\r\n\r\n[[arr]]\r\ny = 1\r\n",
+            reads: json!({"t": {"x": 1, "q": {"r": 2}}, "arr": [{"y": 1}]}),
+        },
+    ]);
+}
+
+/// A chain in one document of a stream through `--doc N`, and in files
+/// with a byte order mark or CRLF line breaks: the new lines break as the
+/// file's do, the mark stays.
+#[test]
+fn set_creates_a_chain_with_doc_n_and_in_bom_and_crlf_files() {
+    check(&[
+        Case {
+            name: "s.yaml",
+            src: "a: 1\n---\nb: 2\n",
+            args: &["--doc", "1", "set", "s.yaml", "/c/d", "3"],
+            want: "a: 1\n---\nb: 2\nc:\n  d: 3\n",
+            reads: json!([{"a": 1}, {"b": 2, "c": {"d": 3}}]),
+        },
+        Case {
+            name: "f.yaml",
+            src: "\u{feff}a: 1\n",
+            args: &["set", "f.yaml", "/b/c", "2"],
+            want: "\u{feff}a: 1\nb:\n  c: 2\n",
+            reads: json!({"a": 1, "b": {"c": 2}}),
+        },
+        Case {
+            name: "f.yaml",
+            src: "a: 1\r\n",
+            args: &["set", "f.yaml", "/b/c", "2"],
+            want: "a: 1\r\nb:\r\n  c: 2\r\n",
+            reads: json!({"a": 1, "b": {"c": 2}}),
+        },
+        Case {
+            name: "f.json",
+            src: "{\r\n  \"a\": 1\r\n}\r\n",
+            args: &["set", "f.json", "/b/c", "2"],
+            want: "{\r\n  \"a\": 1,\r\n  \"b\": {\"c\":2}\r\n}\r\n",
+            reads: json!({"a": 1, "b": {"c": 2}}),
+        },
+        Case {
+            name: "f.toml",
+            src: "a = 1\r\n",
+            args: &["set", "f.toml", "/b/c", "2"],
+            want: "a = 1\r\nb.c = 2\r\n",
+            reads: json!({"a": 1, "b": {"c": 2}}),
+        },
+        Case {
+            name: "f.toml",
+            src: "\u{feff}a = 1\n",
+            args: &["set", "f.toml", "/b/c", "2"],
+            want: "\u{feff}a = 1\nb.c = 2\n",
+            reads: json!({"a": 1, "b": {"c": 2}}),
+        },
+    ]);
+}
+
+/// `set --diff` shows the created chain and leaves the file.
+#[test]
+fn set_diff_shows_a_created_chain_and_leaves_the_file() {
+    let out = run(
+        "f.yaml",
+        "a: 1\n",
+        &["set", "--diff", "f.yaml", "/b/c", "2"],
+    );
+    assert_eq!(
+        (out.code, out.stdout.as_str(), out.stderr.as_str()),
+        (
+            0,
+            "--- a/f.yaml\n+++ b/f.yaml\n@@ -1 +1,3 @@\n a: 1\n+b:\n+  c: 2\n",
+            ""
+        )
+    );
+    assert_eq!(out.file, "a: 1\n");
+}
+
+/// A refused chain names the whole pointer and how far it resolved:
+/// under a scalar, through `-`, past the end of a sequence, and every
+/// chain with `--no-create`. Exit 2, the file untouched.
+#[test]
+fn a_refused_chain_names_the_whole_pointer() {
+    for (name, src) in [
+        ("f.yaml", "a: 1\nl: [1]\n"),
+        ("f.json", "{\"a\": 1, \"l\": [1]}\n"),
+        ("f.toml", "a = 1\nl = [1]\n"),
+    ] {
+        for (args, stderr) in [
+            (
+                &["-i", "set", name, "/a/c/d", "2"][..],
+                "path '/a/c/d' not found (matched up to '/a')\n  matched prefix: /a\n  \
+                 pointer: /a/c/d\n",
+            ),
+            (
+                &["-i", "set", name, "/b/-/c", "2"][..],
+                "path '/b/-/c' not found (matched up to '')\n  pointer: /b/-/c\n",
+            ),
+            (
+                &["-i", "set", name, "/l/-/c", "2"][..],
+                "path '/l/-/c' not found (matched up to '/l')\n  matched prefix: /l\n  \
+                 pointer: /l/-/c\n",
+            ),
+            (
+                &["-i", "set", name, "/l/1/c", "2"][..],
+                "path '/l/1/c' not found (matched up to '/l')\n  matched prefix: /l\n  \
+                 pointer: /l/1/c\n",
+            ),
+            (
+                &["-i", "set", "--no-create", name, "/b/c/d", "2"][..],
+                "path '/b/c/d' not found (matched up to '')\n  did_you_mean: a, l\n  \
+                 pointer: /b/c/d\n",
+            ),
+        ] {
+            assert_eq!(refused(name, src, args, 2), stderr, "dq {args:?}");
+        }
+    }
+}
+
+// ---- `dq patch` and parents -------------------------------------------
+
+/// A patch on a stream addresses its documents as `/N/…`; an `add` into
+/// a missing parent there is refused like anywhere (exit 2, its own
+/// path), and `--no-create` changes nothing.
+#[test]
+fn patch_on_a_stream_addresses_documents_and_creates_no_parent() {
+    let ops = r#"[{"op":"add","path":"/1/c","value":3},{"op":"replace","path":"/0/a","value":9}]"#;
+    for args in [
+        &["patch", "s.yaml", ops][..],
+        &["patch", "--no-create", "s.yaml", ops][..],
+    ] {
+        check(&[Case {
+            name: "s.yaml",
+            src: "a: 1\n---\nb: 2\n",
+            args,
+            want: "a: 9\n---\nb: 2\nc: 3\n",
+            reads: json!([{"a": 9}, {"b": 2, "c": 3}]),
+        }]);
+    }
+    let missing = r#"[{"op":"add","path":"/1/c/d","value":3}]"#;
+    assert_eq!(
+        refused(
+            "s.yaml",
+            "a: 1\n---\nb: 2\n",
+            &["-i", "patch", "s.yaml", missing],
+            2
+        ),
+        "path '/1/c/d' not found (matched up to '/1')\n  matched prefix: /1\n  pointer: /1/c/d\n"
+    );
+}
+
+/// A `move` whose target's parent stays after `from` is removed lands
+/// there.
+#[test]
+fn patch_move_lands_only_where_the_parent_survives_the_removal() {
+    check(&[Case {
+        name: "f.yaml",
+        src: "a: {x: 1}\nb: 2\n",
+        args: &[
+            "patch",
+            "f.yaml",
+            r#"[{"op":"move","from":"/a/x","path":"/a/y"}]"#,
+        ],
+        want: "a: {\"y\": 1}\nb: 2\n",
+        reads: json!({"a": {"y": 1}, "b": 2}),
+    }]);
+}
