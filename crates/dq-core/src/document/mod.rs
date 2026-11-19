@@ -37,7 +37,7 @@ use crate::ir::{Ir, Provenance, ProvenanceMap};
 use crate::pointer::{Pointer, Segment};
 use crate::textual_edit::{insertion_renderer_for_format, renderer_for_format};
 
-pub(crate) use number::{DecimalParts, decimal_identity, float_literal_value, may_exceed_f64};
+pub(crate) use number::{DecimalParts, float_literal_value, may_exceed_f64};
 pub use spans::{SpanContext, SpanMap, SpanRecomputeDelta, ValueSpan, apply_delta};
 
 /// A single value node within a parsed document.

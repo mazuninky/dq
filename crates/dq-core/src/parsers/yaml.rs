@@ -8,8 +8,9 @@
 //! [`Node`], which takes the `u128` / `i128` integers serde_norway hands
 //! over; a file holding a literal serde_norway rounds to an `f64` or
 //! reads as a string is read again by [`super::yaml_numbers`], which keeps
-//! it. A mapping key equal to an earlier one — by value, or once both are
-//! the strings a [`Value::Map`] holds (`1` and `"1"`) — fails the file.
+//! it. A mapping key that repeats an earlier one — by value, as
+//! serde_norway checks it, or once both are the strings a [`Value::Map`]
+//! holds (`1` and `"1"`) — fails the file.
 //! M1 is read-only — comment preservation, anchor names, and quote style
 //! arrive in M2 with the event-API rewrite.
 

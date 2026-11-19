@@ -227,27 +227,6 @@ pub(crate) fn same_decimal(a: &str, b: &str) -> bool {
     }
 }
 
-/// The decimal value of a literal as one text — equal for two literals
-/// exactly when [`same_decimal`] is: `1.10` and `11e-1` are `11e-1`, any
-/// zero is `0`. `None` when it is not a decimal literal.
-pub(crate) fn decimal_identity(literal: &str) -> Option<String> {
-    let parts = DecimalParts::parse(literal)?;
-    let normal = Normal::of(&parts);
-    if normal.len == 0 {
-        return Some("0".to_owned());
-    }
-    let mut out = String::from(if normal.negative { "-" } else { "" });
-    out.extend(normal.digits().map(char::from));
-    match &normal.exponent {
-        Exponent::Small(e) => out.push_str(&format!("e{e}")),
-        Exponent::Big(negative, digits) => {
-            out.push_str(if *negative { "e-" } else { "e" });
-            out.push_str(digits);
-        }
-    }
-    Some(out)
-}
-
 /// The value of a decimal literal: an `i64` integer is a [`Value::Int`],
 /// a longer one a [`Value::BigInt`], a literal with a fraction or an
 /// exponent as [`float_value`] decides. `None` for anything else.
@@ -433,18 +412,6 @@ mod tests {
         for bad in ["", "-", ".", "1e", "NaN", "1_0", "1.2.3"] {
             assert!(!same_decimal(bad, bad), "{bad:?}");
         }
-    }
-
-    #[test]
-    fn decimal_identity_is_equal_for_the_same_decimal() {
-        assert_eq!(decimal_identity("1.10"), decimal_identity("11e-1"));
-        assert_eq!(decimal_identity("-0.0").as_deref(), Some("0"));
-        assert_ne!(decimal_identity("1e400"), decimal_identity("1e401"));
-        assert_eq!(
-            decimal_identity("1e99999999999999999999999999999999"),
-            decimal_identity("10e99999999999999999999999999999998")
-        );
-        assert_eq!(decimal_identity("x"), None);
     }
 
     #[test]

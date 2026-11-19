@@ -15,8 +15,10 @@
 //! sequence in the events is the n-th in the tree; an alias repeats the
 //! value its anchor got. A scalar whose literal serde_norway read as
 //! another value gets the exact one, and the keys of each mapping are
-//! checked against each other there, with their exact values, so a repeat
-//! is named where it occurs. Wherever the two parsers disagree on the
+//! checked against each other there, so a repeat is named where it
+//! occurs: an `f64` key by value as serde_norway checks it (`-0.0` repeats
+//! `0.0`), any key by the [`Value::Map`] key it becomes (`1` and `"1"`, a
+//! big number and its quoted twin). Wherever the two parsers disagree on the
 //! shape, the file is read as serde_norway reads it.
 //!
 //! The events are walked as they come (only anchored values are kept), and
@@ -32,7 +34,7 @@ use super::yaml::{
     Entry, KeyKind, Node, is_tagged_number, map_yaml_err, node_to_value, read_nodes,
 };
 use crate::Result;
-use crate::document::{DecimalParts, Value, decimal_identity, float_literal_value, may_exceed_f64};
+use crate::document::{DecimalParts, Value, float_literal_value, may_exceed_f64};
 use crate::error::Error;
 
 /// Whether `bytes` hold a literal serde_norway may read as another number
@@ -84,9 +86,11 @@ pub(super) fn may_lose_numbers(bytes: &[u8]) -> bool {
 /// # Errors
 ///
 /// [`Error::Parse`] when serde_norway fails on `bytes` (a `!!float` /
-/// `!!int` number it has no type for aside), or for a mapping key equal to
-/// an earlier one — by value or as a [`Value::Map`] key (`1` and `"1"`) —
-/// at the repeated key's line and column.
+/// `!!int` number it has no type for aside), or for a mapping key that
+/// repeats an earlier one — an `f64` by value, any key as the
+/// [`Value::Map`] key it becomes (`1` and `"1"`) — at the repeated key's
+/// line and column. Two spellings of one big number (`1e400`, `1.0e+400`)
+/// are two keys.
 pub(super) fn read_exact(bytes: &[u8]) -> Result<Vec<Value>> {
     let as_serde_norway_reads = || {
         read_nodes(bytes, true)
@@ -326,25 +330,18 @@ enum Stop {
 
 type Step<T> = std::result::Result<T, Stop>;
 
-/// A number key's identity: equal for keys of the same value that print
-/// apart (`-0.0` and `0.0`, `1e400` and `1.0e+400`).
+/// The value of a key an `f64` holds, equal for keys serde_norway calls
+/// equal that print apart (`-0.0` and `0.0`, `0.1` and `0.10`). A key no
+/// `f64` holds (a [`Value::BigInt`] or [`Value::BigFloat`]) has none: it
+/// repeats another only when the two are the same [`Value::Map`] key — a
+/// repeat no reader before dq's saw, so no file that read fine fails now.
 #[derive(Debug, PartialEq, Eq, Hash)]
-enum NumberId {
-    Float(u64),
-    Decimal { float: bool, value: String },
-}
+struct FloatKey(u64);
 
-impl NumberId {
+impl FloatKey {
     fn of_value(value: &Value) -> Option<Self> {
         match value {
-            Value::Float(f) => Some(Self::Float(if *f == 0.0 { 0 } else { f.to_bits() })),
-            Value::BigFloat(s) => {
-                decimal_identity(s).map(|value| Self::Decimal { float: true, value })
-            }
-            Value::BigInt(s) => decimal_identity(s).map(|value| Self::Decimal {
-                float: false,
-                value,
-            }),
+            Value::Float(f) => Some(Self(if *f == 0.0 { 0 } else { f.to_bits() })),
             _ => None,
         }
     }
@@ -513,7 +510,7 @@ impl<'t> Walk<'t> {
     fn mapping(&mut self, entries: Vec<Entry>, path: &Path<'_>) -> Step<Value> {
         let mut out: IndexMap<String, Value> = IndexMap::with_capacity(entries.len());
         let mut kinds: Vec<KeyKind> = Vec::with_capacity(entries.len());
-        let mut numbers: HashMap<NumberId, usize> = HashMap::new();
+        let mut floats: HashMap<FloatKey, usize> = HashMap::new();
         for entry in entries {
             let Entry {
                 key,
@@ -533,11 +530,11 @@ impl<'t> Walk<'t> {
                         Some(exact) => (
                             literal.to_string(),
                             KeyKind::Number,
-                            NumberId::of_value(&exact),
+                            FloatKey::of_value(&exact),
                             exact,
                         ),
                         None => {
-                            let id = key_node.as_ref().and_then(NumberId::of_node);
+                            let id = key_node.as_ref().and_then(FloatKey::of_node);
                             let anchored = match key_node {
                                 Some(node) => node_to_value(node),
                                 None => Value::String(key.clone()),
@@ -556,11 +553,11 @@ impl<'t> Walk<'t> {
                         Value::BigInt(s) | Value::BigFloat(s) => (
                             s.clone(),
                             KeyKind::Number,
-                            NumberId::of_value(anchored),
+                            FloatKey::of_value(anchored),
                             None,
                         ),
                         anchored => {
-                            let id = NumberId::of_value(anchored);
+                            let id = FloatKey::of_value(anchored);
                             (key, kind, id, None)
                         }
                     }
@@ -573,7 +570,7 @@ impl<'t> Walk<'t> {
             };
             let first = out
                 .get_index_of(&key)
-                .or_else(|| id.as_ref().and_then(|id| numbers.get(id).copied()));
+                .or_else(|| id.as_ref().and_then(|id| floats.get(id).copied()));
             if let Some(first) = first {
                 let (first_key, _) = out.get_index(first).ok_or(Stop::Disagree)?;
                 return Err(repeated(
@@ -593,7 +590,7 @@ impl<'t> Walk<'t> {
                 None => self.node(value, &Path::Unknown { parent: path })?,
             };
             if let Some(id) = id {
-                numbers.insert(id, out.len());
+                floats.insert(id, out.len());
             }
             kinds.push(kind);
             out.insert(key, value);
@@ -724,8 +721,11 @@ mod tests {
     }
 
     #[test]
-    fn keys_keep_their_literal_and_repeat_by_exact_value() {
-        let text = "0.10000000000000000000001: a\n0.10000000000000000000002: b\n1e400: c\n";
+    fn big_keys_keep_their_literal_and_repeat_only_as_the_same_key() {
+        // Two spellings of one big number are two keys, as dq's keys are
+        // strings; so are a big key and an `f64` one it rounds to.
+        let text = "0.10000000000000000000001: a\n0.10000000000000000000002: b\n1e400: c\n\
+                    1.0e+400: d\n0.1: e\n+1e400: f\n";
         let Value::Map(m) = read(text) else { panic!() };
         let keys: Vec<&str> = m.keys().map(String::as_str).collect();
         assert_eq!(
@@ -733,7 +733,10 @@ mod tests {
             [
                 "0.10000000000000000000001",
                 "0.10000000000000000000002",
-                "1e400"
+                "1e400",
+                "1.0e+400",
+                "0.1",
+                "+1e400"
             ]
         );
         let big = "123456789012345678901234567890123456789012";
@@ -741,9 +744,52 @@ mod tests {
             error(&format!("x:\n  {big}: a\n  {big}: b\n")),
             format!("x: duplicate entry with key {big} at line 3 column 3")
         );
+        for text in ["1e400: a\n1e400: b\n", "1e400: a\n'1e400': b\n"] {
+            assert_eq!(
+                error(text),
+                "duplicate entry with key 1e400 at line 2 column 1",
+                "{text}"
+            );
+        }
+        // An `f64` key repeats as serde_norway says: by value.
         assert_eq!(
-            error("1e400: a\n1.0e+400: b\n"),
-            "duplicate entry with key 1e400 at line 2 column 1"
+            error("1e400: a\n0.1: b\n0.10: c\n"),
+            "duplicate entry with key 0.1 at line 3 column 1"
+        );
+    }
+
+    #[test]
+    fn a_plus_signed_big_literal_is_the_number_without_its_plus() {
+        let big = "1234567890123456789012345678901234567890123";
+        let text = format!(
+            "a: !!float +1e400\nb: +1e400\nc: +18446744073709551616\nd: !!int +{big}\n\
+             e: +0.1000000000000000000000000001\n"
+        );
+        let doc = crate::parsers::Yaml.parse(text.as_bytes()).unwrap();
+        assert_eq!(
+            doc.value(),
+            &map(&[
+                ("a", Value::BigFloat("1e400".into())),
+                ("b", Value::BigFloat("1e400".into())),
+                ("c", Value::BigInt("18446744073709551616".into())),
+                ("d", Value::BigInt(big.into())),
+                (
+                    "e",
+                    Value::BigFloat("0.1000000000000000000000000001".into())
+                ),
+            ])
+        );
+        let mut json = Vec::new();
+        crate::parsers::Json.write(&doc, &mut json).unwrap();
+        let json = String::from_utf8(json).unwrap();
+        assert!(!json.contains('+') || json.contains("e+"), "{json}");
+        assert!(json.contains("\"c\": 18446744073709551616"), "{json}");
+        let mut yaml = Vec::new();
+        crate::parsers::Yaml.write(&doc, &mut yaml).unwrap();
+        assert!(
+            String::from_utf8(yaml)
+                .unwrap()
+                .starts_with("a: 1.0e+400\nb: 1.0e+400\n")
         );
     }
 

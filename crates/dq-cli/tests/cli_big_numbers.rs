@@ -277,9 +277,9 @@ lz: 000{U64_PLUS_ONE}
 }
 
 /// A duplicate key past `u64` fails as any duplicate does, in
-/// serde_norway's words, at the repeated key; so do two spellings of one
-/// big float, compared by their exact value, and a number key repeated as
-/// a string — dq keys are strings.
+/// serde_norway's words, at the repeated key; so does a big key repeated
+/// as a string. Two spellings of one big float are two keys (dq keys are
+/// strings).
 #[test]
 fn a_duplicate_big_key_fails_like_any_duplicate_key() {
     let dir = dir_with(&[
@@ -304,7 +304,7 @@ fn a_duplicate_big_key_fails_like_any_duplicate_key() {
             )
         );
     }
-    for file in ["same.yaml", "spellings.yaml", "quoted.yaml"] {
+    for file in ["same.yaml", "quoted.yaml"] {
         let (code, _, stderr) = failure_of(&dir, &["get", file, "/"]);
         assert_eq!(code, Some(3), "{file}");
         assert_eq!(
@@ -312,6 +312,10 @@ fn a_duplicate_big_key_fails_like_any_duplicate_key() {
             format!("parse error in {file}: duplicate entry with key 1e400 at line 2 column 1\n")
         );
     }
+    assert_eq!(
+        stdout_of(&dir, &["-F", "json", "-q", "convert", "spellings.yaml"]),
+        "{\n  \"1e400\": \"a\",\n  \"1.0e+400\": \"b\"\n}\n"
+    );
     assert_eq!(
         stdout_of(&dir, &["-F", "json", "-q", "convert", "apart.yaml"]),
         "{\n  \"1e400\": \"a\",\n  \"1e401\": \"b\"\n}\n"
