@@ -137,10 +137,8 @@ fn set_diff_outputs_unified_diff() {
 #[test]
 fn set_no_create_rejects_missing_pointer() {
     // Spec: missing intermediate pointer with `--no-create` → `Error::Path`,
-    // which the exit-code mapper translates to NOT_FOUND (2). The M2 baseline
-    // also rejects non-existent pointers without `--no-create` because the
-    // mkdir-p path is not yet wired; this test pins the `--no-create` case
-    // so the future M3 work cannot accidentally regress the strict mode.
+    // which the exit-code mapper translates to NOT_FOUND (2). Without the
+    // flag the missing mappings are created; this test pins the strict mode.
     let tmp = write_yaml("a: 1\n");
     let path = tmp.to_str().unwrap();
     let cli =
@@ -204,8 +202,7 @@ fn set_inline_json_literal_int_heuristic() {
 fn set_at_file_value_from_path() {
     // `@<path>` shorthand: read the value from a file. The handler parses
     // the value source as a structured document and splices its top-level
-    // value into the target. We mutate an existing leaf (`/name`) so the
-    // M2 baseline's "no mkdir-p yet" restriction doesn't apply.
+    // value into the target. We mutate an existing leaf (`/name`).
     let target = write_yaml("name: old\n");
     let value_src = write_json(r#""loaded-from-file""#);
     let target_path = target.to_str().unwrap();

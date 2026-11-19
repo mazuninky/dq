@@ -37,6 +37,9 @@ use crate::error::InvalidInput;
 /// - [`dq_core::Error::TemplatedFile`] (exit 3) when a file contains Go
 ///   template syntax and neither `--allow-templates` nor
 ///   `--raw-template-strings` is set.
+/// - [`dq_core::Error::Path`] (exit 2) when `--no-create` is set and the
+///   parent of an `add` / `copy` / `move` target is missing; without the
+///   flag the missing mappings are created.
 /// - [`dq_core::Error::PatchTestFailed`] when an RFC 6902 `test` op
 ///   observes a mismatched value. The on-disk file is untouched (atomic
 ///   rollback in [`dq_core::apply_patch`]).
@@ -67,6 +70,7 @@ pub fn run(
 
     let op = PatchFileOp {
         ops: &ops,
+        no_create: args.no_create,
         input_format,
         cli,
         use_color,
@@ -80,6 +84,9 @@ pub fn run(
 /// rayon can spread `apply` across worker threads without cloning.
 struct PatchFileOp<'a> {
     ops: &'a [PatchOp],
+    /// `--no-create`: the parent of every `add` / `copy` / `move` target
+    /// must exist when the op runs.
+    no_create: bool,
     input_format: Option<&'a str>,
     cli: &'a Cli,
     use_color: bool,
@@ -111,7 +118,26 @@ impl<'a> FileOp for PatchFileOp<'a> {
 
         // Apply the patch atomically — on any failure (including a failing
         // `test`), the engine leaves `document` untouched (clone-on-apply).
-        dq_core::apply_patch(&mut document, self.ops).map_err(anyhow::Error::new)?;
+        if self.no_create {
+            // One op at a time, so each target's parent is looked up as
+            // the ops before it left the document; a failure drops it all.
+            for op in self.ops {
+                if let PatchOp::Add { path, .. }
+                | PatchOp::Copy { path, .. }
+                | PatchOp::Move { path, .. } = op
+                    && let Some((_, parent)) = path.segments().split_last()
+                    && document.is_write_aware()
+                {
+                    Pointer::new(parent.to_vec())
+                        .resolve(document.value())
+                        .map_err(anyhow::Error::new)?;
+                }
+                dq_core::apply_patch(&mut document, std::slice::from_ref(op))
+                    .map_err(anyhow::Error::new)?;
+            }
+        } else {
+            dq_core::apply_patch(&mut document, self.ops).map_err(anyhow::Error::new)?;
+        }
 
         // Compute final bytes, restoring template placeholders when the
         // substitution pass ran.

@@ -56,11 +56,10 @@ use crate::error::InvalidInput;
 /// - [`dq_core::Error::TemplatedFile`] (exit 3) when the file contains Go
 ///   template syntax and neither escape-hatch flag is set.
 /// - [`dq_core::Error::Path`] (exit 2) when the pointer addresses a missing
-///   node and one of the following holds: `--no-create` is set (blocks every
-///   mkdir-p variant); multiple intermediate keys are missing (multi-level
-///   mkdir-p is deferred); or the immediate parent is an empty container
-///   (`{}` / `[]`, also deferred). The single-level case — parent exists,
-///   one leaf key missing — is created automatically via [`Document::set_at`].
+///   node and `--no-create` is set, or the node it would hang from is no
+///   mapping (a scalar, or an array the pointer runs past). Otherwise the
+///   missing key is created with the mappings missing above it via
+///   [`Document::set_at`].
 /// - [`dq_core::Error::WriteIo`] / [`dq_core::Error::WriteUnavailable`]
 ///   (exit 7) on write failure.
 /// - [`crate::error::CheckPending`] (exit 1) when `--check` finds at least

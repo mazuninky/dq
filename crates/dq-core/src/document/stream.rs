@@ -12,8 +12,8 @@ impl Document {
     /// every other byte of the file.
     ///
     /// Only that document's content is rewritten: its `---` line (with any
-    /// comment on it), the comment and blank lines after its last content
-    /// line, and every other document — separators, comments, quoting and
+    /// comment on it), the comment and blank lines between that line and
+    /// the content and after its last content line, and every other document — separators, comments, quoting and
     /// all — stay byte for byte. Comments among the rewritten document's
     /// content are dropped, as any writer re-emit drops them. Node
     /// properties on the marker line (`--- !!map`, `--- &anchor`) are kept
@@ -105,8 +105,18 @@ impl Document {
         // line's node properties and the trailing comment lines; keep only
         // the comment lines; replace the whole body. The first that reads
         // back as `expected` wins.
+        // The comment and blank lines between the marker line and the
+        // content lead into the content and stay before the new one.
+        let bytes = &self.original_bytes;
+        let past_lead = |(start, needs_line_break): (usize, bool)| {
+            if needs_line_break {
+                (start, needs_line_break)
+            } else {
+                (past_lead_in(bytes, start, extent.content_end), false)
+            }
+        };
         let body = (extent.body.start, extent.needs_line_break);
-        let mut attempts = Vec::with_capacity(3);
+        let mut attempts = Vec::with_capacity(4);
         if let Some(after_properties) = extent.after_properties.filter(|&(end, _)| {
             tags_fit(
                 &self.original_bytes[extent.body.start..end],
@@ -115,9 +125,10 @@ impl Document {
                 &emitted,
             )
         }) {
-            attempts.push((after_properties, extent.content_end));
+            attempts.push((past_lead(after_properties), extent.content_end));
         }
-        attempts.push((body, extent.content_end));
+        attempts.push((past_lead(body), extent.content_end));
+        attempts.push((past_lead(body), extent.body.end));
         attempts.push((body, extent.body.end));
         attempts.dedup();
 
@@ -284,6 +295,24 @@ fn tags_fit(properties: &[u8], previous: &Value, value: &Value, emitted: &[u8]) 
         })
 }
 
+/// Past the comment and blank lines from the line start `start` on, up
+/// to `content_end` at most: where a document's content begins.
+fn past_lead_in(bytes: &[u8], start: usize, content_end: usize) -> usize {
+    let mut at = start;
+    while at < content_end {
+        let line_end = bytes[at..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(bytes.len(), |newline| at + newline + 1);
+        let line = bytes[at..line_end].trim_ascii();
+        if !(line.is_empty() || line.starts_with(b"#")) {
+            break;
+        }
+        at = line_end;
+    }
+    at.min(content_end)
+}
+
 /// The extent of a document after the last byte of `bytes`, for a file
 /// that holds no document yet (only comments).
 fn end_of_file_extent(bytes: &[u8]) -> DocumentExtent {
@@ -417,6 +446,20 @@ mod tests {
         doc.reemit_stream_document(0, map("a", "2"))
             .expect("marker line");
         assert_eq!(text(&doc), "---\r\na: '2'\r\n---\r\nb: 2\r\n");
+    }
+
+    #[test]
+    fn keeps_the_comment_lines_between_the_marker_and_the_content() {
+        let mut doc = stream("a: 1\n--- # m\n# lead\n\n  # two\nb: 2\n---\n# c\n---\nc: 3\n");
+        doc.reemit_stream_document(1, map("b", "x"))
+            .expect("lead-in");
+        doc.reemit_stream_document(2, map("e", "y")).expect("empty");
+        assert_eq!(
+            text(&doc),
+            "a: 1\n--- # m\n# lead\n\n  # two\nb: x\n---\ne: 'y'\n# c\n---\nc: 3\n"
+        );
+        assert_eq!(past_lead_in(b"# a\n\nb: 1\n", 0, 9), 5);
+        assert_eq!(past_lead_in(b"# a\n", 0, 0), 0);
     }
 
     #[test]

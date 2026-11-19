@@ -411,8 +411,8 @@ pub enum Command {
     Validate(ValidateArgs),
     /// Emit a structural diff between two documents.
     Diff(DiffArgs),
-    /// Set a value at a JSON Pointer. Intermediate map/array nodes are created
-    /// by default; `--no-create` rejects missing intermediates with exit 2.
+    /// Set a value at a JSON Pointer. Missing intermediate nodes are created
+    /// as mappings by default; `--no-create` rejects them with exit 2.
     Set(SetArgs),
     /// Remove the value at a JSON Pointer. Missing pointer is not silent —
     /// produces a structured Path error and exit 2.

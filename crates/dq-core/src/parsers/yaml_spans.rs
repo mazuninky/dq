@@ -1087,6 +1087,11 @@ pub(crate) struct EditLayout {
     /// nothing right after a blank (`{n: }`). Its range in
     /// [`EditLayout::empty_values`] is empty, where the value goes.
     pub(crate) flow_value_prefixes: HashMap<String, &'static [u8]>,
+    /// Every empty plain node with a tag inside a flow collection
+    /// (`{n: !!null }`, `[!!str , 1]`), by canonical pointer. YAML 1.1
+    /// readers take a flow indicator right after the tag for part of it
+    /// (`!!null,`), so an edit keeps a blank there.
+    pub(crate) bare_flow_tags: HashSet<String>,
     /// The bytes of every entry of a flow collection, keyed by the
     /// canonical pointer of its value: from its key (node properties and a
     /// `?` included) or its item's node through the end of its value.
@@ -1605,6 +1610,14 @@ impl<'src> State<'src> {
                             }
                             layout.empty_values.insert(pointer.clone(), empty.at);
                         }
+                    }
+                    if self.flow_depth > 0
+                        && style == ScalarStyle::Plain
+                        && value.is_empty()
+                        && tag.is_some()
+                        && let Some(layout) = self.layout.as_mut()
+                    {
+                        layout.bare_flow_tags.insert(pointer.clone());
                     }
                     let context = self.value_context();
                     let node_end = char_index_to_byte(self.char_to_byte, span.end.index());

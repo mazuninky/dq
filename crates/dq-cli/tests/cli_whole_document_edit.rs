@@ -3,8 +3,9 @@
 //! root of a YAML / JSON / TOML file (`''`), an empty or comment-only
 //! file. Also the edits dq used to refuse inside such files — lone-`\r`
 //! line breaks, a `%TAG` rebinding of `!!`, implicit-null entries and
-//! empty tagged nodes of YAML flow collections — and the YAML flow
-//! spelling of a collection `set` writes.
+//! empty tagged nodes of YAML flow collections — the YAML flow spelling
+//! of a collection `set` writes, and the mappings `set` creates on the way
+//! to a missing key.
 //!
 //! Every edit is checked twice: the bytes on disk, and the value dq reads
 //! back from them. Each refusal leaves the file as it was.
@@ -368,6 +369,62 @@ fn set_of_a_stream_document_diffs_and_leaves_the_file() {
         )
     );
     assert_eq!(out.file, src);
+}
+
+#[test]
+fn set_of_a_whole_document_keeps_the_comment_lines_after_its_marker() {
+    check(&[
+        Case {
+            name: "f.yaml",
+            src: "---\n# lead\nb: 2\n",
+            args: &["set", "f.yaml", "", "{\"x\": 1}"],
+            want: "---\n# lead\nx: 1\n",
+            reads: json!({"x": 1}),
+        },
+        Case {
+            name: "s.yaml",
+            src: "a: 1\n---\n# lead\nb: 2\n",
+            args: &["set", "s.yaml", "/1", "{\"x\": 1}"],
+            want: "a: 1\n---\n# lead\nx: 1\n",
+            reads: json!([{"a": 1}, {"x": 1}]),
+        },
+    ]);
+}
+
+/// Blank lines, indented comments and CRLF line breaks between the marker
+/// and the content stay too, under a kept `!!map` and after `--- # m`.
+#[test]
+fn set_of_a_whole_document_keeps_its_lead_in_lines_of_every_shape() {
+    check(&[
+        Case {
+            name: "s.yaml",
+            src: "a: 1\n---\n# lead\n\n  # two\nb: 2\n# tail\n",
+            args: &["set", "s.yaml", "/1", "{\"x\": 1}"],
+            want: "a: 1\n---\n# lead\n\n  # two\nx: 1\n# tail\n",
+            reads: json!([{"a": 1}, {"x": 1}]),
+        },
+        Case {
+            name: "f.yaml",
+            src: "--- !!map\n# lead\nb: 2\n",
+            args: &["set", "f.yaml", "", "{\"x\": 1}"],
+            want: "--- !!map\n# lead\nx: 1\n",
+            reads: json!({"x": 1}),
+        },
+        Case {
+            name: "f.yaml",
+            src: "--- # m\n# lead\n- 1\n",
+            args: &["set", "f.yaml", "", "[2]"],
+            want: "--- # m\n# lead\n- 2\n",
+            reads: json!([2]),
+        },
+        Case {
+            name: "f.yaml",
+            src: "---\r\n# lead\r\n\r\nb: 2\r\n",
+            args: &["set", "f.yaml", "", "{\"x\": 1}"],
+            want: "---\r\n# lead\r\n\r\nx: 1\r\n",
+            reads: json!({"x": 1}),
+        },
+    ]);
 }
 
 // ---- the root of a file -----------------------------------------------
@@ -1242,4 +1299,199 @@ fn pyyaml_reads_the_yaml_flow_spelling_back_as_the_same_strings() {
         let read: Value = serde_json::from_slice(&out.stdout).expect("JSON from python3");
         assert_eq!(read, json!({"a": value}), "{yaml}");
     }
+}
+
+#[test]
+fn a_scalar_whose_last_word_starts_with_a_bang_is_no_tag() {
+    check(&[
+        Case {
+            name: "f.yaml",
+            src: "{a: x !y}\n",
+            args: &["set", "f.yaml", "/new", "1"],
+            want: "{a: x !y, new: 1}\n",
+            reads: json!({"a": "x !y", "new": 1}),
+        },
+        Case {
+            name: "f.yaml",
+            src: "{a: 'x !y'}\n",
+            args: &["set", "f.yaml", "/new", "1"],
+            want: "{a: 'x !y', new: 1}\n",
+            reads: json!({"a": "x !y", "new": 1}),
+        },
+        Case {
+            name: "f.yaml",
+            src: "[x !y , 1]\n",
+            args: &["del", "f.yaml", "/1"],
+            want: "[x !y]\n",
+            reads: json!(["x !y"]),
+        },
+    ]);
+}
+
+/// The empty value of a brace-less pair goes with its blanks.
+#[test]
+fn del_in_a_brace_less_pair_leaves_no_blank_of_its_empty_value() {
+    check(&[
+        Case {
+            name: "f.yaml",
+            src: "z: [a: ]\n",
+            args: &["del", "f.yaml", "/z/0/a"],
+            want: "z: [{}]\n",
+            reads: json!({"z": [{}]}),
+        },
+        Case {
+            name: "f.yaml",
+            src: "z: [a: , b]\n",
+            args: &["del", "f.yaml", "/z/0/a"],
+            want: "z: [{}, b]\n",
+            reads: json!({"z": [{}, "b"]}),
+        },
+    ]);
+}
+
+// ---- mappings created on the way --------------------------------------
+
+/// `set` creates the mappings missing above the key it sets, in YAML,
+/// JSON and TOML, inside one document of a stream too. A numeric segment
+/// is a mapping key; comments stay.
+#[test]
+fn set_creates_the_missing_mappings_on_the_way() {
+    check(&[
+        Case {
+            name: "f.yaml",
+            src: "a: 1 # c\n",
+            args: &["set", "f.yaml", "/b/c", "2"],
+            want: "a: 1 # c\nb:\n  c: 2\n",
+            reads: json!({"a": 1, "b": {"c": 2}}),
+        },
+        Case {
+            name: "f.yaml",
+            src: "{a: 1}\n",
+            args: &["set", "f.yaml", "/b/c", "2"],
+            want: "{a: 1, b: {c: 2}}\n",
+            reads: json!({"a": 1, "b": {"c": 2}}),
+        },
+        Case {
+            name: "f.yaml",
+            src: "a: 1\n",
+            args: &["set", "f.yaml", "/b/0/c", "2"],
+            want: "a: 1\nb:\n  \"0\": {c: 2}\n",
+            reads: json!({"a": 1, "b": {"0": {"c": 2}}}),
+        },
+        Case {
+            name: "s.yaml",
+            src: "a: 1\n---\nb: 2\n",
+            args: &["set", "s.yaml", "/1/c/d", "3"],
+            want: "a: 1\n---\nb: 2\nc:\n  d: 3\n",
+            reads: json!([{"a": 1}, {"b": 2, "c": {"d": 3}}]),
+        },
+        Case {
+            name: "f.json",
+            src: "{\"a\": 1}\n",
+            args: &["set", "f.json", "/b/c", "2"],
+            want: "{\"a\": 1, \"b\": {\"c\":2}}\n",
+            reads: json!({"a": 1, "b": {"c": 2}}),
+        },
+    ]);
+}
+
+/// A TOML chain of tables is a dotted key in a file without headers or
+/// under a table with none, a `[header]` in a file that writes its
+/// tables under headers, and a nested inline table inside an inline one.
+#[test]
+fn set_creates_missing_toml_tables_in_the_style_of_the_file() {
+    check(&[
+        Case {
+            name: "f.toml",
+            src: "a = 1 # c\n",
+            args: &["set", "f.toml", "/b/c/d", "2"],
+            want: "a = 1 # c\nb.c.d = 2\n",
+            reads: json!({"a": 1, "b": {"c": {"d": 2}}}),
+        },
+        Case {
+            name: "f.toml",
+            src: "a = 1\n\n[t]\nx = 1\n",
+            args: &["set", "f.toml", "/b/c", "2"],
+            want: "a = 1\n\n[t]\nx = 1\n\n[b]\nc = 2\n",
+            reads: json!({"a": 1, "t": {"x": 1}, "b": {"c": 2}}),
+        },
+        Case {
+            name: "f.toml",
+            src: "a = 1\n\n[t]\nx = 1\n\n[u]\ny = 1\n",
+            args: &["set", "f.toml", "/t/y/z", "2"],
+            want: "a = 1\n\n[t]\nx = 1\n\n[t.y]\nz = 2\n\n[u]\ny = 1\n",
+            reads: json!({"a": 1, "t": {"x": 1, "y": {"z": 2}}, "u": {"y": 1}}),
+        },
+        Case {
+            name: "f.toml",
+            src: "t.x = 1\n",
+            args: &["set", "f.toml", "/t/y/z", "2"],
+            want: "t.x = 1\nt.y.z = 2\n",
+            reads: json!({"t": {"x": 1, "y": {"z": 2}}}),
+        },
+        Case {
+            name: "f.toml",
+            src: "t = { x = 1 }\n",
+            args: &["set", "f.toml", "/t/y/z", "2"],
+            want: "t = { x = 1, y = { z = 2 } }\n",
+            reads: json!({"t": {"x": 1, "y": {"z": 2}}}),
+        },
+        Case {
+            name: "f.toml",
+            src: "[[arr]]\nx = 1\n",
+            args: &["set", "f.toml", "/arr/0/y/z", "2"],
+            want: "[[arr]]\nx = 1\ny.z = 2\n",
+            reads: json!({"arr": [{"x": 1, "y": {"z": 2}}]}),
+        },
+        Case {
+            name: "f.toml",
+            src: "a = 1\r\n\r\n[t]\r\nx = 1\r\n",
+            args: &["set", "f.toml", "/b/c", "2"],
+            want: "a = 1\r\n\r\n[t]\r\nx = 1\r\n\r\n[b]\r\nc = 2\r\n",
+            reads: json!({"a": 1, "t": {"x": 1}, "b": {"c": 2}}),
+        },
+    ]);
+}
+
+/// `--no-create` refuses the chain (exit 2), and so does a scalar or the
+/// array-append marker on the way, `--no-create` or not.
+#[test]
+fn set_refuses_a_chain_with_no_create_or_under_a_scalar() {
+    for (name, src) in [
+        ("f.yaml", "a: 1\n"),
+        ("f.json", "{\"a\": 1}\n"),
+        ("f.toml", "a = 1\n"),
+    ] {
+        refused(name, src, &["set", "--no-create", name, "/b/c", "2"], 2);
+        refused(name, src, &["set", name, "/a/c/d", "2"], 2);
+        refused(name, src, &["set", name, "/b/-/c", "2"], 2);
+    }
+}
+
+/// `dq patch` creates the chain for `add`; `--no-create` makes the
+/// parent of each `add` target a must.
+#[test]
+fn patch_add_creates_the_chain_unless_no_create() {
+    let ops = r#"[{"op":"add","path":"/b/c","value":2}]"#;
+    check(&[Case {
+        name: "f.yaml",
+        src: "a: 1\n",
+        args: &["patch", "f.yaml", ops],
+        want: "a: 1\nb:\n  c: 2\n",
+        reads: json!({"a": 1, "b": {"c": 2}}),
+    }]);
+    refused(
+        "f.yaml",
+        "a: 1\n",
+        &["-i", "patch", "--no-create", "f.yaml", ops],
+        2,
+    );
+    let stepwise = r#"[{"op":"add","path":"/b","value":{}},{"op":"add","path":"/b/c","value":2}]"#;
+    check(&[Case {
+        name: "f.yaml",
+        src: "a: 1\n",
+        args: &["patch", "--no-create", "f.yaml", stepwise],
+        want: "a: 1\nb: {c: 2}\n",
+        reads: json!({"a": 1, "b": {"c": 2}}),
+    }]);
 }

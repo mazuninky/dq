@@ -39,9 +39,8 @@ use crate::pointer::{Pointer, Segment};
 pub enum PatchOp {
     /// `{"op":"add","path":"/a/b","value":...}` — insert or replace at `path`.
     ///
-    /// In M3's baseline insertion is limited to existing parent containers
-    /// (M2's `set_at` returns `MissingKey` for unknown pointers); full mkdir-p
-    /// insertion is a post-M3 follow-up.
+    /// Missing mappings on the way to `path` are created, as `set_at`
+    /// creates them (`dq patch --no-create` refuses them instead).
     Add {
         /// Target pointer.
         path: Pointer,

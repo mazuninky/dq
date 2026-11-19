@@ -855,9 +855,10 @@ impl Document {
     ///    record an empty-container span at the parent's pointer
     ///    specifically so this path can fire.
     ///
-    /// Multi-level mkdir-p chains (`/a/missing1/missing2/key` where every
-    /// `missingN` also needs creating) remain out of scope and fall
-    /// through to [`Error::Path`] with `kind = MissingKey`.
+    /// A chain of missing keys (`/a/missing1/missing2/key`) is created as
+    /// mappings, the first missing key holding the rest (see
+    /// `Document::try_mkdir_p`); the node it hangs from must be a mapping,
+    /// else [`Error::Path`] with `kind = MissingKey`.
     ///
     /// Formats whose [`Format::insertion_renderer`] returns `None` (XML,
     /// CSV, INI, .env, Dockerfile, ignore-list, markdown body) remain
@@ -878,7 +879,7 @@ impl Document {
     /// - [`Error::WriteUnavailable`] when the document was loaded
     ///   read-only (no spans or no renderer registered).
     /// - [`Error::Path`] when the pointer addresses a non-existent path
-    ///   that cannot be created via the single-level mkdir-p path.
+    ///   that cannot be created via the mkdir-p path.
     /// - [`Error::EditRejected`] when the edited bytes fail the read-back
     ///   check.
     pub fn set_at(&mut self, pointer: &Pointer, value: Value) -> Result<()> {
@@ -1353,13 +1354,174 @@ impl Document {
             // A non-empty collection records no span of its own.
             self.replace_collection(pointer, &canonical, value, layout, renderer)
         } else {
-            // mkdir-p path: try the single-level insertion fallback before
-            // surfacing `Error::Path { MissingKey }`. Multi-level chains
-            // and empty-parent inserts fall through to the structured Path
-            // error — the parsers do not yet record container-level spans
-            // we'd need to splice into an empty `{}` body.
-            self.try_single_level_mkdir_p(pointer, &canonical, value, layout)
+            // mkdir-p path: insert the missing key, with the mappings
+            // missing above it, before surfacing `Error::Path { MissingKey }`.
+            self.try_mkdir_p(pointer, &canonical, value, layout)
         }
+    }
+
+    /// Insert `value` at the missing `pointer` together with the mappings
+    /// missing on the way to it (`/b/c` in `a: 1`): the first missing key
+    /// goes in through [`Document::try_single_level_mkdir_p`] holding the
+    /// rest of the chain, as `set_value_at` builds it — every missing
+    /// segment is a mapping key, numeric ones included (`/b/0` makes
+    /// `{"b": {"0": …}}`); an array is never made. In TOML the chain is a
+    /// table: a `[header]` of its own in a file that writes its tables
+    /// under headers, when the table it hangs from is the root or has a
+    /// header itself; a dotted key (`b.c = 1`) otherwise, and a nested
+    /// inline table inside an inline one.
+    ///
+    /// # Errors
+    ///
+    /// As [`Document::try_single_level_mkdir_p`]; [`Error::Path`] for the
+    /// requested pointer when the node the chain hangs from is no mapping,
+    /// or a missing segment is the array-append marker `-`.
+    fn try_mkdir_p(
+        &mut self,
+        pointer: &Pointer,
+        canonical: &str,
+        value: Value,
+        layout: &LayoutCache,
+    ) -> Result<()> {
+        let segs = pointer.segments();
+        let existing = existing_prefix_len(&self.value, pointer);
+        if existing + 1 >= segs.len() {
+            return self.try_single_level_mkdir_p(pointer, canonical, value, layout, None);
+        }
+        let missing_key = |doc: &Self| Error::Path {
+            pointer: canonical.to_owned(),
+            matched_prefix: longest_existing_value_prefix(&doc.value, pointer),
+            kind: PathErrorKind::MissingKey,
+            did_you_mean: Vec::new(),
+        };
+        let parent = Pointer::new(segs[..existing].to_vec());
+        let keys: Option<Vec<String>> = segs[existing..]
+            .iter()
+            .map(|segment| match segment {
+                Segment::Key(key) if key != "-" => Some(key.clone()),
+                _ => None,
+            })
+            .collect();
+        let (Some(keys), Ok(Value::Map(_))) = (keys, parent.resolve(&self.value)) else {
+            return Err(missing_key(self));
+        };
+        let mut nested = Value::Map(IndexMap::new());
+        set_value_at(
+            &mut nested,
+            &Pointer::new(segs[existing + 1..].to_vec()),
+            value.clone(),
+        )?;
+        let first = Pointer::new(segs[..=existing].to_vec());
+        let result = if self.format == FormatTag::Toml {
+            match self.toml_header_mkdir_p(&parent, &keys, &value) {
+                Some(inserted) => inserted.and_then(|()| self.adopt_reparse("set", canonical)),
+                None => {
+                    let (leaf, chain) = keys.split_last().expect("two keys or more");
+                    let dotted = TomlDottedRenderer {
+                        chain,
+                        leaf,
+                        value: &value,
+                    };
+                    self.try_single_level_mkdir_p(
+                        &first,
+                        &first.as_canonical(),
+                        nested,
+                        layout,
+                        Some(&dotted),
+                    )
+                }
+            }
+        } else {
+            self.try_single_level_mkdir_p(&first, &first.as_canonical(), nested, layout, None)
+        };
+        // Errors name the pointer asked for, not its first missing key.
+        result.map_err(|err| match err {
+            Error::Path { .. } => missing_key(self),
+            Error::EditRejected { action, reason, .. } => Error::EditRejected {
+                action,
+                pointer: canonical.to_owned(),
+                reason,
+            },
+            err => err,
+        })
+    }
+
+    /// The `[header]` insertion of the TOML table chain `keys` (its last
+    /// key is the leaf `value`'s) under the existing table `parent`, when
+    /// the file writes its tables under headers and `parent` is the root
+    /// or a table with a header of its own (no array item on the way):
+    /// after the last section under `parent` — the end of the file for the
+    /// root. `None` when a dotted key fits the file better; `Some(Err)`
+    /// when the file does not parse.
+    fn toml_header_mkdir_p(
+        &mut self,
+        parent: &Pointer,
+        keys: &[String],
+        value: &Value,
+    ) -> Option<Result<()>> {
+        let bytes = &self.original_bytes;
+        let tables = crate::parsers::toml::toml_tables(bytes)?;
+        let canonical = parent.as_canonical();
+        let headers = tables
+            .header_line_ends
+            .keys()
+            .any(|pointer| !pointer.rsplit('/').next().is_some_and(is_index));
+        let named = parent
+            .segments()
+            .iter()
+            .all(|segment| matches!(segment, Segment::Key(key) if !is_index(key)));
+        if !headers
+            || !named
+            || !(parent.is_root() || tables.header_line_ends.contains_key(&canonical))
+        {
+            return None;
+        }
+        let prefix = format!("{canonical}/");
+        let at = tables
+            .sections
+            .iter()
+            .filter(|(pointer, _)| {
+                parent.is_root() || *pointer == canonical || pointer.starts_with(&prefix)
+            })
+            .map(|(_, section)| section.end)
+            .max()
+            .unwrap_or(bytes.len());
+        let (leaf, chain) = keys.split_last()?;
+        let path: Vec<String> = parent
+            .segments()
+            .iter()
+            .filter_map(|segment| match segment {
+                Segment::Key(key) => Some(key.as_str()),
+                Segment::Index(_) => None,
+            })
+            .chain(chain.iter().map(String::as_str))
+            .map(crate::parsers::toml::toml_key_token)
+            .collect();
+        let mut out = Vec::new();
+        if at > bom_end(bytes) && bytes[at - 1] != b'\n' {
+            out.push(b'\n');
+        }
+        // A blank line before the header when the file puts one there.
+        let blank_lines =
+            bytes.windows(3).any(|w| w == b"\n\n[") || bytes.windows(4).any(|w| w == b"\n\r\n[");
+        let after_blank = bytes[..at].ends_with(b"\n\n") || bytes[..at].ends_with(b"\n\r\n");
+        if blank_lines && at > bom_end(bytes) && !after_blank {
+            out.push(b'\n');
+        }
+        out.extend(format!("[{}]\n", path.join(".")).into_bytes());
+        out.extend(crate::textual_edit::InsertionRenderer::render_insertion(
+            &crate::parsers::toml::TomlInsertionRenderer,
+            leaf,
+            value,
+            1,
+            SpanContext::BlockMapValue,
+        ));
+        if blank_lines && at < bytes.len() {
+            out.push(b'\n');
+        }
+        let out = with_line_ending_at(bytes, at, out);
+        self.original_bytes.splice(at..at, out);
+        Some(Ok(()))
     }
 
     /// Try to insert `value` at `pointer` when the pointer's parent exists
@@ -1397,8 +1559,11 @@ impl Document {
     ///
     /// # Errors
     ///
+    /// `renderer` stands in for the format's [`InsertionRenderer`] (the
+    /// TOML dotted chain of [`Document::try_mkdir_p`]).
+    ///
     /// Returns `Error::Path { MissingKey }` whenever the single-level
-    /// path cannot be taken (multi-level missing chain, array parent,
+    /// path cannot be taken (missing parent, array parent,
     /// format without an `InsertionRenderer`, or empty parent whose
     /// container span was not recorded by the parser). The pointer and
     /// `matched_prefix` mirror the original baseline so callers see the
@@ -1409,6 +1574,7 @@ impl Document {
         canonical: &str,
         value: Value,
         layout: &LayoutCache,
+        renderer: Option<&dyn crate::textual_edit::InsertionRenderer>,
     ) -> Result<()> {
         // Bail-out helper — every unsupported shape funnels through here so
         // callers continue to see the structured Path diagnostic they
@@ -1420,7 +1586,9 @@ impl Document {
             did_you_mean: Vec::new(),
         };
 
-        let Some(insertion_renderer) = insertion_renderer_for_format(self.format) else {
+        let Some(insertion_renderer) =
+            renderer.or_else(|| insertion_renderer_for_format(self.format))
+        else {
             // Read-only formats keep the legacy `MissingKey` diagnostic so
             // callers can still distinguish "format does not support
             // mkdir-p" from "wrong path" via the `Format::insertion_renderer`
@@ -1429,10 +1597,9 @@ impl Document {
             return Err(missing_key());
         };
 
-        // Single-level only: the parent must resolve in the value tree
-        // and the missing segment must be the last one. Multi-level
-        // mkdir-p (where intermediate keys also need creating) is out of
-        // scope for this baseline — see set_at's doc comment.
+        // Single level: the parent must resolve in the value tree and the
+        // missing segment must be the last one; `try_mkdir_p` hands a
+        // longer chain here as its first missing key.
         let segs = pointer.segments();
         if segs.is_empty() {
             return Err(missing_key());
@@ -1606,8 +1773,11 @@ impl Document {
         // Compute the actual splice point + final bytes, format-aware so
         // we don't smear `\n`s or forget a `,` separator.
         let (splice_at, splice_bytes) = match flow_layout {
-            Some(layout) => {
-                flow_sibling_splice(&fragment, &sibling_span, layout, &self.original_bytes)
+            Some(flow) => {
+                let bare_tag = self
+                    .edit_layout(layout)
+                    .is_some_and(|layout| layout.bare_flow_tags.contains(&sibling_key));
+                flow_sibling_splice(&fragment, &sibling_span, flow, bare_tag)
             }
             None => {
                 format_specific_splice(self.format, &fragment, &sibling_span, &self.original_bytes)
@@ -2629,8 +2799,21 @@ impl Document {
                 .containers
                 .get(&parent_canonical)
                 .is_some_and(|parent| parent.implicit_pair)
-            && let Some(pair) = layout.flow_entries.get(&parent_canonical).cloned()
+            && let Some(mut pair) = layout.flow_entries.get(&parent_canonical).cloned()
         {
+            // The blanks of an empty value go with it (`[a: ]`).
+            let blanks = self.original_bytes[pair.end..]
+                .iter()
+                .take_while(|b| matches!(b, b' ' | b'\t'))
+                .count();
+            if self.original_bytes[..pair.end].ends_with(b":")
+                && matches!(
+                    self.original_bytes.get(pair.end + blanks),
+                    Some(b',' | b']')
+                )
+            {
+                pair.end += blanks;
+            }
             if let Some(err) = self.anchor_removal_refused(cache, &pair, "delete", &canonical) {
                 return Err(err);
             }
@@ -3338,7 +3521,7 @@ fn yaml_flow_entry_removal(
     let entry = layout.flow_entries.get(canonical)?.clone();
     let brackets = layout.containers.get(parent)?.brackets.clone()?;
     let prefix = format!("{parent}/");
-    let mut siblings: Vec<std::ops::Range<usize>> = layout
+    let mut siblings: Vec<(&str, std::ops::Range<usize>)> = layout
         .flow_entries
         .iter()
         .filter(|(pointer, _)| {
@@ -3346,13 +3529,15 @@ fn yaml_flow_entry_removal(
                 .strip_prefix(&prefix)
                 .is_some_and(|tail| !tail.contains('/'))
         })
-        .map(|(_, range)| range.clone())
+        .map(|(pointer, range)| (pointer.as_str(), range.clone()))
         .collect();
     if siblings.len() != children {
         return None;
     }
-    siblings.sort_by_key(|range| range.start);
-    let at = siblings.iter().position(|range| *range == entry)?;
+    siblings.sort_by_key(|(_, range)| range.start);
+    let at = siblings.iter().position(|(_, range)| *range == entry)?;
+    let (pointers, siblings): (Vec<&str>, Vec<std::ops::Range<usize>>) =
+        siblings.into_iter().unzip();
     // What follows the entry: its comma or the closing bracket.
     let after = skip_blanks_and_comments(bytes, entry.end);
     let close = brackets.end.checked_sub(1)?;
@@ -3402,9 +3587,9 @@ fn yaml_flow_entry_removal(
         return Some(entry.start..end);
     }
     // The blanks before the comma go too (`{a: 1 , b: 2}`), a comment
-    // there stays, and so does a blank after a tag that ends the entry
-    // before (`[!!str , 1]`): dq's readers take `!!str]` for one tag.
-    let start = if ends_in_a_tag(&bytes[previous.clone()]) && comma > previous.end {
+    // there stays, and so does a blank after the entry before when it is
+    // an empty node with a tag (`[!!str , 1]`): `!!str]` reads as one tag.
+    let start = if layout.bare_flow_tags.contains(pointers[at - 1]) && comma > previous.end {
         previous.end + 1
     } else if bytes[previous.end..comma]
         .iter()
@@ -4376,13 +4561,14 @@ enum FlowLayout {
 /// wrote as `fragment` right after the flow `sibling`, behind a comma. The
 /// renderers write a block entry (a line break, indentation, a trailing
 /// line break): only its `key: value` / `key = value` text is kept. A
-/// sibling ending in a tag (`n: !!null`) gets a blank before the comma:
-/// YAML 1.1 readers take `!!null,` for one tag.
+/// sibling that is an empty node with a tag (`n: !!null`, `bare_tag`)
+/// gets a blank before the comma: YAML 1.1 readers take `!!null,` for one
+/// tag.
 fn flow_sibling_splice(
     fragment: &[u8],
     sibling: &ValueSpan,
     layout: FlowLayout,
-    bytes: &[u8],
+    bare_tag: bool,
 ) -> (usize, Vec<u8>) {
     let start = fragment
         .iter()
@@ -4394,10 +4580,7 @@ fn flow_sibling_splice(
         .map_or(start, |last| last + 1);
     let entry = &fragment[start..end.max(start)];
     let mut out = Vec::with_capacity(entry.len() + 3);
-    if bytes
-        .get(..sibling.value_range.end)
-        .is_some_and(ends_in_a_tag)
-    {
+    if bare_tag {
         out.push(b' ');
     }
     match layout {
@@ -4409,15 +4592,6 @@ fn flow_sibling_splice(
     }
     out.extend_from_slice(entry);
     (sibling.value_range.end, out)
-}
-
-/// Whether the last blank-separated token of `text` is a tag (`!!str`).
-fn ends_in_a_tag(text: &[u8]) -> bool {
-    let token = text
-        .iter()
-        .rposition(u8::is_ascii_whitespace)
-        .map_or(0, |blank| blank + 1);
-    text.get(token) == Some(&b'!')
 }
 
 /// `pos`, or — when it is not at the start of a line — just past the line
@@ -4613,6 +4787,57 @@ fn toml_empty_parent_splice(
 /// write errors whose pointer descends through container keys. The Value
 /// tree has the truth and is the source the read-side [`Pointer::resolve`]
 /// already uses.
+/// How many leading segments of `pointer` resolve in `root`.
+fn existing_prefix_len(root: &Value, pointer: &Pointer) -> usize {
+    let segments = pointer.segments();
+    (0..=segments.len())
+        .rev()
+        .find(|&len| Pointer::new(segments[..len].to_vec()).resolve(root).is_ok())
+        .unwrap_or(0)
+}
+
+/// Whether the pointer segment `segment` is an array index.
+fn is_index(segment: &str) -> bool {
+    !segment.is_empty() && segment.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The TOML insertion of a chain of missing tables as a dotted key: a
+/// block entry `chain.leaf = value` (`b.c = 2`), whatever key and value
+/// the mkdir-p insertion asks for — the first missing key holding the
+/// rest; inside an inline table, that nested value as asked.
+struct TomlDottedRenderer<'a> {
+    chain: &'a [String],
+    leaf: &'a str,
+    value: &'a Value,
+}
+
+impl crate::textual_edit::InsertionRenderer for TomlDottedRenderer<'_> {
+    fn render_insertion(
+        &self,
+        key: &str,
+        value: &Value,
+        parent_indent: u32,
+        parent_context: SpanContext,
+    ) -> Vec<u8> {
+        let inner = crate::parsers::toml::TomlInsertionRenderer;
+        if matches!(
+            parent_context,
+            SpanContext::FlowMapValue | SpanContext::FlowSeqItem
+        ) {
+            return inner.render_insertion(key, value, parent_indent, parent_context);
+        }
+        let mut out = inner.render_insertion(self.leaf, self.value, parent_indent, parent_context);
+        let at = out.len() - out.trim_ascii_start().len();
+        let mut prefix = Vec::new();
+        for key in self.chain {
+            prefix.extend(crate::parsers::toml::toml_key_token(key).into_bytes());
+            prefix.push(b'.');
+        }
+        out.splice(at..at, prefix);
+        out
+    }
+}
+
 fn longest_existing_value_prefix(root: &Value, pointer: &Pointer) -> String {
     let mut current = root;
     let mut matched: Vec<Segment> = Vec::new();
@@ -5351,27 +5576,25 @@ mod tests {
     }
 
     #[test]
-    fn set_at_mkdir_p_fails_for_multi_level_missing_chain() {
-        // Single-level baseline only — `/a/missing1/missing2` is out of
-        // scope until container-level spans land. Verifies the structured
-        // `MissingKey` fallback so a future multi-level enhancement has a
-        // failing test to point at.
+    fn set_at_mkdir_p_creates_a_missing_chain_of_mappings() {
         let bytes = br#"{"a":{"b":1}}"#;
         let mut doc = crate::parsers::json::Json.parse(bytes).expect("parse JSON");
-        let pointer = Pointer::parse("/a/missing/leaf").unwrap();
-        let err = doc
-            .set_at(&pointer, Value::Int(42))
-            .expect_err("multi-level mkdir-p must fail in the single-level baseline");
-        assert!(
-            matches!(
-                err,
-                Error::Path {
-                    kind: PathErrorKind::MissingKey,
-                    ..
-                }
-            ),
-            "expected Path/MissingKey for multi-level mkdir-p, got: {err:?}",
+        doc.set_at(&Pointer::parse("/a/missing/leaf").unwrap(), Value::Int(42))
+            .expect("multi-level mkdir-p");
+        assert_eq!(
+            std::str::from_utf8(doc.original_bytes()).unwrap(),
+            r#"{"a":{"b":1, "missing": {"leaf":42}}}"#
         );
+        // Below a scalar, or with `-` on the way, nothing is made.
+        for pointer in ["/a/b/x/y", "/a/-/y"] {
+            let err = doc
+                .set_at(&Pointer::parse(pointer).unwrap(), Value::Int(1))
+                .expect_err(pointer);
+            assert!(
+                matches!(&err, Error::Path { pointer: at, kind: PathErrorKind::MissingKey, .. } if at == pointer),
+                "{err:?}"
+            );
+        }
     }
 
     #[test]
@@ -5736,9 +5959,10 @@ mod tests {
         // `{"spec":{"replicas":3}}` produced `matched up to ''` because the
         // parser SpanMap only records scalar leaves; walking the Value tree
         // (which records every container) is required to compute the prefix.
+        // A missing chain is created now; one under a scalar still fails.
         let mut doc = crate::parsers::parse_json_with_spans(b"{\"spec\":{\"replicas\":3}}")
             .expect("JSON parses");
-        let pointer = Pointer::parse("/spec/strategy/type").expect("pointer parses");
+        let pointer = Pointer::parse("/spec/replicas/strategy/type").expect("pointer parses");
         let result = doc.set_at(&pointer, Value::Int(42));
         match result {
             Err(Error::Path {
@@ -5747,9 +5971,9 @@ mod tests {
                 kind,
                 ..
             }) => {
-                assert_eq!(ptr, "/spec/strategy/type");
+                assert_eq!(ptr, "/spec/replicas/strategy/type");
                 assert_eq!(
-                    matched_prefix, "/spec",
+                    matched_prefix, "/spec/replicas",
                     "matched_prefix must follow the longest container chain present in the Value tree",
                 );
                 assert_eq!(kind, PathErrorKind::MissingKey);
