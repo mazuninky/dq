@@ -21,6 +21,7 @@
 //! and [`Document::multi`], and the read-side accessors [`Document::value`]
 //! (single only) and [`Document::values`] (multi only).
 
+mod insert;
 mod number;
 pub mod spans;
 mod stream;

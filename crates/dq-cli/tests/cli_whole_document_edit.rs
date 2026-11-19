@@ -1938,30 +1938,229 @@ fn patch_on_a_whole_stream_document_does_what_set_and_del_do() {
 }
 
 /// Once a patch has removed all but one document of a stream, that one
-/// is still `/0` to the ops after it; `/1` is past the end.
+/// is still `/0` to the ops after it; `add /1` appends a document after
+/// it, as into an array of one, and `/2` is past the end.
 #[test]
 fn patch_still_addresses_the_last_document_left_as_0() {
-    check(&[Case {
-        name: "s.yaml",
-        src: "a: 1\n---\nb: 2\n",
-        args: &[
-            "patch",
-            "s.yaml",
-            r#"[{"op":"remove","path":"/1"},{"op":"replace","path":"/0/a","value":5}]"#,
-        ],
-        want: "a: 5\n",
-        reads: json!({"a": 5}),
-    }]);
+    check(&[
+        Case {
+            name: "s.yaml",
+            src: "a: 1\n---\nb: 2\n",
+            args: &[
+                "patch",
+                "s.yaml",
+                r#"[{"op":"remove","path":"/1"},{"op":"replace","path":"/0/a","value":5}]"#,
+            ],
+            want: "a: 5\n",
+            reads: json!({"a": 5}),
+        },
+        Case {
+            name: "s.yaml",
+            src: "a: 1\n---\nb: 2\n",
+            args: &[
+                "patch",
+                "s.yaml",
+                r#"[{"op":"move","from":"/0","path":"/1"}]"#,
+            ],
+            want: "---\nb: 2\n---\na: 1\n",
+            reads: json!([{"b": 2}, {"a": 1}]),
+        },
+    ]);
     refused(
         "s.yaml",
         "a: 1\n---\nb: 2\n",
         &[
             "patch",
             "s.yaml",
-            r#"[{"op":"move","from":"/0","path":"/1"}]"#,
+            r#"[{"op":"remove","path":"/1"},{"op":"add","path":"/2","value":1}]"#,
         ],
         2,
     );
+}
+
+// ---- RFC 6902 add into an array, RFC 7396 merge into no mapping ---------
+
+/// `add` into an array inserts at an existing index, appends at its
+/// length or `-`, in every format, comments kept; `copy` and `move` into
+/// an index insert the same way.
+#[test]
+fn patch_add_into_an_array_inserts() {
+    let add = |path: &str| format!(r#"[{{"op":"add","path":"{path}","value":9}}]"#);
+    let (zero, two, end, one) = (add("/a/0"), add("/a/2"), add("/a/-"), add("/a/1"));
+    check(&[
+        Case {
+            name: "f.yaml",
+            src: "a:\n  - 1 # one\n  - 2\n",
+            args: &["patch", "f.yaml", &zero],
+            want: "a:\n  - 9\n  - 1 # one\n  - 2\n",
+            reads: json!({"a": [9, 1, 2]}),
+        },
+        Case {
+            name: "f.yaml",
+            src: "a:\n  - 1\n  - 2\n# tail\n",
+            args: &["patch", "f.yaml", &two],
+            want: "a:\n  - 1\n  - 2\n  - 9\n# tail\n",
+            reads: json!({"a": [1, 2, 9]}),
+        },
+        Case {
+            name: "f.yaml",
+            src: "a: [1, 2] # c\n",
+            args: &["patch", "f.yaml", &end],
+            want: "a: [1, 2, 9] # c\n",
+            reads: json!({"a": [1, 2, 9]}),
+        },
+        Case {
+            name: "f.json",
+            src: "{\"a\": [1, 2]}\n",
+            args: &["patch", "f.json", &one],
+            want: "{\"a\": [1, 9, 2]}\n",
+            reads: json!({"a": [1, 9, 2]}),
+        },
+        Case {
+            name: "f.toml",
+            src: "a = [\n  1, # one\n  2,\n]\n",
+            args: &["patch", "f.toml", &end],
+            want: "a = [\n  1, # one\n  2,\n  9,\n]\n",
+            reads: json!({"a": [1, 2, 9]}),
+        },
+        Case {
+            name: "f.yaml",
+            src: "a: [1, 2]\n",
+            args: &[
+                "patch",
+                "f.yaml",
+                r#"[{"op":"move","from":"/a/0","path":"/a/-"}]"#,
+            ],
+            want: "a: [2, 1]\n",
+            reads: json!({"a": [2, 1]}),
+        },
+        Case {
+            name: "f.yaml",
+            src: "a: [1, 2]\n",
+            args: &[
+                "patch",
+                "f.yaml",
+                r#"[{"op":"copy","from":"/a/1","path":"/a/0"}]"#,
+            ],
+            want: "a: [2, 1, 2]\n",
+            reads: json!({"a": [2, 1, 2]}),
+        },
+    ]);
+    refused(
+        "f.yaml",
+        "a: [1, 2]\n",
+        &["patch", "f.yaml", &add("/a/3")],
+        2,
+    );
+}
+
+/// A table goes into a TOML array of tables as a `[[header]]` section.
+#[test]
+fn patch_add_into_a_toml_array_of_tables_writes_a_section() {
+    check(&[Case {
+        name: "f.toml",
+        src: "[[t]]\nx = 1\n\n[b]\nc = 1\n",
+        args: &[
+            "patch",
+            "f.toml",
+            r#"[{"op":"add","path":"/t/-","value":{"y":2}}]"#,
+        ],
+        want: "[[t]]\nx = 1\n\n[[t]]\ny = 2\n\n[b]\nc = 1\n",
+        reads: json!({"t": [{"x": 1}, {"y": 2}], "b": {"c": 1}}),
+    }]);
+}
+
+/// `add /N` on a stream inserts a document with its `---`; `/-` appends.
+#[test]
+fn patch_add_of_a_stream_document_inserts_it() {
+    check(&[
+        Case {
+            name: "s.yaml",
+            src: "a: 1\n---\nb: 2\n",
+            args: &[
+                "patch",
+                "s.yaml",
+                r#"[{"op":"add","path":"/1","value":{"x":1}}]"#,
+            ],
+            want: "a: 1\n---\nx: 1\n---\nb: 2\n",
+            reads: json!([{"a": 1}, {"x": 1}, {"b": 2}]),
+        },
+        Case {
+            name: "s.yaml",
+            src: "a: 1\n---\nb: 2\n",
+            args: &[
+                "patch",
+                "s.yaml",
+                r#"[{"op":"add","path":"/0","value":{"x":1}}]"#,
+            ],
+            want: "x: 1\n---\na: 1\n---\nb: 2\n",
+            reads: json!([{"x": 1}, {"a": 1}, {"b": 2}]),
+        },
+        Case {
+            name: "s.yaml",
+            src: "a: 1\n---\nb: 2\n",
+            args: &[
+                "patch",
+                "s.yaml",
+                r#"[{"op":"add","path":"/-","value":{"x":1}}]"#,
+            ],
+            want: "a: 1\n---\nb: 2\n---\nx: 1\n",
+            reads: json!([{"a": 1}, {"b": 2}, {"x": 1}]),
+        },
+    ]);
+}
+
+/// `set` keeps replacing at an index.
+#[test]
+fn set_at_an_index_still_replaces() {
+    check(&[Case {
+        name: "f.yaml",
+        src: "- 1\n- 2\n",
+        args: &["set", "f.yaml", "/0", "9"],
+        want: "- 9\n- 2\n",
+        reads: json!([9, 2]),
+    }]);
+}
+
+/// RFC 7396 §2: a mapping patch merged into a root that is no mapping
+/// replaces it, without its null members; any other patch replaces the
+/// target as it is.
+#[test]
+fn merge_into_a_root_that_is_no_mapping_replaces_it() {
+    check(&[
+        Case {
+            name: "f.yaml",
+            src: "# head\n- 1\n- 2\n",
+            args: &[
+                "merge",
+                "f.yaml",
+                r#"{"a": 1, "b": null, "c": {"d": null, "e": 2}}"#,
+            ],
+            want: "# head\na: 1\nc:\n  e: 2\n",
+            reads: json!({"a": 1, "c": {"e": 2}}),
+        },
+        Case {
+            name: "f.json",
+            src: "[1, 2]\n",
+            args: &["merge", "f.json", r#"{"a": 1, "b": null}"#],
+            want: "{\"a\":1}\n",
+            reads: json!({"a": 1}),
+        },
+        Case {
+            name: "f.yaml",
+            src: "a: 1\n",
+            args: &["merge", "f.yaml", "[1, 2]"],
+            want: "- 1\n- 2\n",
+            reads: json!([1, 2]),
+        },
+        Case {
+            name: "f.yaml",
+            src: "a: 1\nb: [1]\n",
+            args: &["merge", "f.yaml", r#"{"b": {"x": null, "y": 1}}"#],
+            want: "a: 1\nb: {\"y\": 1}\n",
+            reads: json!({"a": 1, "b": {"y": 1}}),
+        },
+    ]);
 }
 
 /// A merge patch applies to one document: a stream is refused (exit 6).

@@ -148,6 +148,8 @@ dq patch deploy.yaml @ops.json -i      # JSON Patch — atomic; failed `test` op
 dq merge config.yaml @overrides.json -i # JSON Merge Patch — null removes
 ```
 
+`add` into an array inserts (`/0` before the first item, `/-` or the length appends; past it is exit 2), comments kept; `set` replaces at an index.
+
 ### jq-driven transforms (`set --jq`, `fix`)
 
 ```bash

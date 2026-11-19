@@ -216,6 +216,103 @@ impl Document {
         Ok(())
     }
 
+    /// Insert `value` as a new document of a write-aware YAML stream at
+    /// position `index`, written through the YAML writer with its `---`
+    /// line; the documents from `index` on move up one, and every byte of
+    /// them stays. `index` equal to the number of documents appends one.
+    /// A file of one document is a stream of one here: a document inserted
+    /// into it makes it a stream of two.
+    ///
+    /// The new document goes in after the content of the one before it
+    /// (after its `...` line when it ends with one), so the comment lines
+    /// that lead into the next document still do; first, it goes before
+    /// the first document's `---` line, or with a `---` line of its own
+    /// after it before an implicit first document.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::WriteUnavailable`] — not a write-aware YAML document, or
+    ///   its documents cannot be located.
+    /// - [`Error::Path`] with `kind = OutOfBounds` — `index` is past the
+    ///   number of documents.
+    /// - [`Error::EditRejected`] — the file would not read back as the
+    ///   stream with the new document; `self` is unchanged.
+    /// - The YAML writer's error when `value` cannot be written as YAML.
+    pub fn insert_stream_document(&mut self, index: usize, value: Value) -> Result<()> {
+        let unavailable = |reason: &str| Error::WriteUnavailable {
+            reason: reason.to_owned(),
+        };
+        if self.format != FormatTag::Yaml || !self.write_aware {
+            return Err(unavailable("not a write-aware YAML document"));
+        }
+        let mut expected = match self.values() {
+            Some(documents) => documents.to_vec(),
+            None => vec![self.value.clone()],
+        };
+        if index > expected.len() {
+            return Err(Error::Path {
+                pointer: format!("/{index}"),
+                matched_prefix: String::new(),
+                kind: crate::error::PathErrorKind::OutOfBounds,
+                did_you_mean: Vec::new(),
+            });
+        }
+        let extents = document_extents(&self.original_bytes)
+            .filter(|extents| extents.len() == expected.len())
+            .ok_or_else(|| unavailable("the stream's documents could not be located"))?;
+        let mut emitted = Vec::new();
+        crate::parsers::Yaml.write(
+            &Document::value_only(value.clone(), FormatTag::Yaml),
+            &mut emitted,
+        )?;
+        let bytes = &self.original_bytes;
+        let mut document = b"---\n".to_vec();
+        document.extend_from_slice(&emitted);
+        let at = match index.checked_sub(1) {
+            None => {
+                let first = &extents[0];
+                let marker = &bytes[first.line_start..];
+                let explicit =
+                    marker.starts_with(b"---") && marker.get(3).is_none_or(u8::is_ascii_whitespace);
+                if !explicit {
+                    // `---` opens the document that was implicit.
+                    document = emitted;
+                    document.extend_from_slice(b"---\n");
+                }
+                first.line_start.max(super::bom_end(bytes))
+            }
+            Some(before) => {
+                let next = extents
+                    .get(before + 1)
+                    .map_or(bytes.len(), |next| next.line_start);
+                let body_end = extents[before].body.end;
+                // Past the `...` line that ends the document before.
+                if body_end < next {
+                    bytes[body_end..next]
+                        .iter()
+                        .position(|&b| b == b'\n')
+                        .map_or(next, |newline| body_end + newline + 1)
+                } else {
+                    extents[before].content_end
+                }
+            }
+        };
+        // Mid-line, past content without a line break after it: the new
+        // document starts on a line of its own, and the line break it ends
+        // with is the one already there.
+        if at > super::bom_end(bytes) && !matches!(bytes[at - 1], b'\n' | b'\r') {
+            document.insert(0, b'\n');
+            if matches!(bytes.get(at), Some(b'\n' | b'\r')) {
+                document.pop();
+            }
+        }
+        let bytes = self.splice(at..at, false, &document);
+        expected.insert(index, value);
+        let reparsed = read_back(&bytes, &expected, true, &format!("/{index}"), "insert")?;
+        *self = reparsed;
+        Ok(())
+    }
+
     /// The original bytes with `range` replaced by `emitted` — the
     /// writer's `\n`-broken output, after a line break when
     /// `needs_line_break` — in the line ending of the file around it.

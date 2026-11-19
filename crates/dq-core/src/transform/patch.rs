@@ -39,6 +39,11 @@ use crate::pointer::{Pointer, Segment};
 pub enum PatchOp {
     /// `{"op":"add","path":"/a/b","value":...}` — insert or replace at `path`.
     ///
+    /// Into an array it inserts (RFC 6902 §4.1): at an existing index the
+    /// items from there on move up one; the array's length or `-` appends;
+    /// past the length is [`Error::Path`] with `kind = OutOfBounds`. In a
+    /// YAML stream `/N` inserts a document. A member of a mapping is set.
+    ///
     /// As RFC 6902 §4.1 asks, the parent of `path` must exist: a missing
     /// one is [`Error::Path`] with `kind = MissingKey` for `path`, and
     /// nothing is created on the way (unlike `Document::set_at`). `copy`
@@ -65,15 +70,15 @@ pub enum PatchOp {
         value: Value,
     },
     /// `{"op":"move","from":"/a","path":"/b"}` — read at `from`, delete at
-    /// `from`, set at `path`.
+    /// `from`, add at `path` as [`PatchOp::Add`] does.
     Move {
         /// Source pointer.
         from: Pointer,
         /// Destination pointer.
         path: Pointer,
     },
-    /// `{"op":"copy","from":"/a","path":"/b"}` — read at `from`, set at
-    /// `path`. The source is left in place.
+    /// `{"op":"copy","from":"/a","path":"/b"}` — read at `from`, add at
+    /// `path` as [`PatchOp::Add`] does. The source is left in place.
     Copy {
         /// Source pointer.
         from: Pointer,
@@ -350,10 +355,7 @@ fn not_into_itself(from: &Pointer, path: &Pointer) -> Result<()> {
 
 fn apply_one(doc: &mut Document, op: &PatchOp, stream: bool) -> Result<()> {
     match op {
-        PatchOp::Add { path, value } => at(doc, stream, path, |doc, path| {
-            parent_exists(doc, path)?;
-            doc.set_at(path, value.clone())
-        }),
+        PatchOp::Add { path, value } => add_at(doc, stream, path, value.clone()),
         PatchOp::Remove { path } => at(doc, stream, path, |doc, path| doc.del_at(path)),
         PatchOp::Replace { path, value } => at(doc, stream, path, |doc, path| {
             // RFC 6902 §4.3: target MUST exist. M2's `set_at` already returns
@@ -371,17 +373,11 @@ fn apply_one(doc: &mut Document, op: &PatchOp, stream: bool) -> Result<()> {
             not_into_itself(from, path)?;
             at(doc, stream, from, |doc, from| doc.del_at(from))?;
             // After the removal: `path`'s parent may be what moved away.
-            at(doc, stream, path, |doc, path| {
-                parent_exists(doc, path)?;
-                doc.set_at(path, v)
-            })
+            add_at(doc, stream, path, v)
         }
         PatchOp::Copy { from, path } => {
             let v = at(doc, stream, from, |doc, from| read_value_at(doc, from))?;
-            at(doc, stream, path, |doc, path| {
-                parent_exists(doc, path)?;
-                doc.set_at(path, v)
-            })
+            add_at(doc, stream, path, v)
         }
         PatchOp::Test { path, value } => at(doc, stream, path, |doc, path| {
             let actual = read_value_at(doc, path)?;
@@ -395,6 +391,47 @@ fn apply_one(doc: &mut Document, op: &PatchOp, stream: bool) -> Result<()> {
             Ok(())
         }),
     }
+}
+
+/// RFC 6902 §4.1 `add` of `value` at `path` — what `copy` and `move` do
+/// at their `path` too: into an array it inserts (`-` or the length
+/// appends), anywhere else it sets. The parent must exist.
+fn add_at(doc: &mut Document, stream: bool, path: &Pointer, value: Value) -> Result<()> {
+    // A stream the patch has taken down to one document: a new document
+    // goes before or after it.
+    if stream
+        && doc.values().is_none()
+        && let [segment] = path.segments()
+    {
+        let index = match segment {
+            Segment::Index(index) => Some(*index),
+            Segment::Key(key) if key == "-" => Some(1),
+            Segment::Key(key) => key.parse::<usize>().ok(),
+        };
+        return match index {
+            Some(index) if index <= 1 => doc.insert_stream_document(index, value),
+            _ => Err(Error::Path {
+                pointer: path.as_canonical(),
+                matched_prefix: String::new(),
+                kind: PathErrorKind::OutOfBounds,
+                did_you_mean: Vec::new(),
+            }),
+        };
+    }
+    at(doc, stream, path, |doc, path| {
+        parent_exists(doc, path)?;
+        let into_array = path.segments().split_last().is_some_and(|(_, parent)| {
+            matches!(
+                Pointer::new(parent.to_vec()).resolve(doc.value()),
+                Ok(Value::Array(_))
+            )
+        });
+        if into_array {
+            doc.insert_at(path, value)
+        } else {
+            doc.set_at(path, value)
+        }
+    })
 }
 
 /// Run `edit` on `doc` at `pointer`, as the patch addresses it.
@@ -745,6 +782,49 @@ mod tests {
         assert!(
             matches!(&err, Error::Path { pointer, kind: PathErrorKind::OutOfBounds, .. }
                 if pointer == "/1/b"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn apply_patch_add_copy_and_move_into_an_array_insert() {
+        let mut doc = crate::parse_yaml_with_spans(b"a: [1, 2]\n").unwrap();
+        let ops = [
+            PatchOp::Add {
+                path: Pointer::parse("/a/0").unwrap(),
+                value: Value::Int(0),
+            },
+            PatchOp::Add {
+                path: Pointer::parse("/a/-").unwrap(),
+                value: Value::Int(3),
+            },
+            PatchOp::Copy {
+                from: Pointer::parse("/a/1").unwrap(),
+                path: Pointer::parse("/a/4").unwrap(),
+            },
+            PatchOp::Move {
+                from: Pointer::parse("/a/0").unwrap(),
+                path: Pointer::parse("/a/1").unwrap(),
+            },
+        ];
+        apply_patch(&mut doc, &ops).unwrap();
+        assert_eq!(doc.original_bytes(), b"a: [1, 0, 2, 3, 1]\n");
+        let err = apply_patch(
+            &mut doc,
+            &[PatchOp::Add {
+                path: Pointer::parse("/a/6").unwrap(),
+                value: Value::Int(9),
+            }],
+        )
+        .expect_err("past the end");
+        assert!(
+            matches!(
+                &err,
+                Error::Path {
+                    kind: PathErrorKind::OutOfBounds,
+                    ..
+                }
+            ),
             "{err:?}"
         );
     }

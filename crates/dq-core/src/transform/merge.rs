@@ -24,8 +24,11 @@ use super::patch::read_value_at;
 /// Apply an RFC 7396 merge patch to `doc`.
 ///
 /// `patch` is an arbitrary [`Value`]: maps merge recursively, scalars and
-/// arrays replace, and `Null` removes the addressed key. The engine is
-/// clone-on-apply — the caller's `doc` is left untouched on error.
+/// arrays replace, and `Null` removes the addressed key. A target that is
+/// no map — the whole document too — merged with a map becomes that map
+/// without its `Null` members, at every depth (RFC 7396 §2: the target is
+/// taken as `{}`). The engine is clone-on-apply — the caller's `doc` is
+/// left untouched on error.
 ///
 /// # Errors
 ///
@@ -60,13 +63,15 @@ pub fn apply_merge(doc: &mut Document, patch: &Value) -> Result<()> {
 /// retain the pushed segment across the propagated error.
 fn merge_into(doc: &mut Document, base: &mut Pointer, patch: &Value) -> Result<()> {
     let Value::Map(patch_map) = patch else {
-        // Non-map patch replaces the addressed subtree wholesale. Root case
-        // (base.is_root()) won't be reached here in practice because callers
-        // always enter through `apply_merge` with the root pointer and an
-        // outer Map check, but we handle it for correctness should the engine
-        // ever be invoked with a non-Map patch at the top level.
+        // A patch that is no mapping replaces the target wholesale — the
+        // whole document at the root.
         return doc.set_at(base, patch.clone());
     };
+    // RFC 7396 §2: a target that is no mapping is merged as `{}` — it
+    // becomes the patch without its null members.
+    if !matches!(read_value_at(doc, base), Ok(Value::Map(_))) {
+        return doc.set_at(base, without_nulls(patch));
+    }
 
     for (k, v) in patch_map {
         base.push_segment(Segment::Key(k.clone()));
@@ -94,7 +99,7 @@ fn merge_into(doc: &mut Document, base: &mut Pointer, patch: &Value) -> Result<(
             if target_is_map && matches!(v, Value::Map(_)) {
                 merge_into(doc, base, v)
             } else {
-                doc.set_at(base, v.clone())
+                doc.set_at(base, without_nulls(v))
             }
         };
 
@@ -104,6 +109,20 @@ fn merge_into(doc: &mut Document, base: &mut Pointer, patch: &Value) -> Result<(
     Ok(())
 }
 
+/// `patch` merged into `{}` (RFC 7396 §2): a mapping without its null
+/// members, at every depth; any other value as it is.
+fn without_nulls(patch: &Value) -> Value {
+    match patch {
+        Value::Map(map) => Value::Map(
+            map.iter()
+                .filter(|(_, value)| !matches!(value, Value::Null))
+                .map(|(key, value)| (key.clone(), without_nulls(value)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,6 +130,20 @@ mod tests {
     use crate::format::Format;
     use indexmap::IndexMap;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn apply_merge_into_a_root_that_is_no_map_takes_the_patch_without_nulls() {
+        let mut doc = crate::parsers::parse_yaml_with_spans(b"- 1\n- 2\n").unwrap();
+        let mut inner = IndexMap::new();
+        inner.insert("d".to_owned(), Value::Null);
+        inner.insert("e".to_owned(), Value::Int(2));
+        let mut patch = IndexMap::new();
+        patch.insert("a".to_owned(), Value::Int(1));
+        patch.insert("b".to_owned(), Value::Null);
+        patch.insert("c".to_owned(), Value::Map(inner));
+        apply_merge(&mut doc, &Value::Map(patch)).unwrap();
+        assert_eq!(doc.original_bytes(), b"a: 1\nc:\n  e: 2\n");
+    }
 
     fn block_map_span(
         value_start: usize,
