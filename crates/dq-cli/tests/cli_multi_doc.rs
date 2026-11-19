@@ -1400,3 +1400,490 @@ fn set_jq_empty_array_over_a_stream_is_refused() {
         .expect("a per-document value");
     assert!(out.starts_with("[]\n---\n"), "{out}");
 }
+
+// ---------------------------------------------------------------------------
+// Empty documents, per-document `fix.jq` re-emit, whole-document `fix.ops`,
+// `--doc` over several files.
+// ---------------------------------------------------------------------------
+
+/// `dq --no-color <args>` in `scratch`: exit code, stdout, stderr — for the
+/// commands whose failure still prints to stdout (`--check`, bulk runs).
+fn capture(scratch: &Scratch, args: &[&str]) -> (i32, String, String) {
+    let output = scratch.dq().args(args).output().expect("spawn dq");
+    (
+        output.status.code().expect("exit code"),
+        String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+        String::from_utf8(output.stderr).expect("UTF-8 stderr"),
+    )
+}
+
+/// The `WARN skipped <file>: …` notes on stderr, without their timestamps.
+fn skipped_notes(stderr: &str) -> Vec<&str> {
+    stderr
+        .lines()
+        .filter_map(|line| line.find("skipped ").map(|at| &line[at..]))
+        .collect()
+}
+
+/// A BOM, CRLF line ends, a `%YAML` directive or an explicit `...` before
+/// or after an empty document: it still reports at its own `---` line.
+#[test]
+fn an_empty_document_reports_at_its_marker_line_after_a_bom_crlf_or_directive() {
+    let scratch = Scratch::new();
+    scratch.write("no-name.yml", NO_NAME_RULE);
+    let cases: [(&str, &[u64]); 8] = [
+        ("name: a\r\n---\r\n", &[2]),
+        ("name: a\r\n---\r\n---\r\nname: c\r\n", &[2]),
+        ("\u{feff}name: a\n---\n", &[2]),
+        ("\u{feff}---\n---\nname: b\n", &[1]),
+        ("%YAML 1.2\n---\nx: 1\n---\n", &[3, 4]),
+        ("%YAML 1.2\n---\n---\nname: c\n", &[2]),
+        ("name: a\n...\n---\n", &[3]),
+        ("name: a\n---\n...\n", &[2]),
+    ];
+    for (source, lines) in cases {
+        scratch.write("e.yaml", source);
+        let (code, found) = scratch.diagnostics(&["lint", "--rules", "no-name.yml", "e.yaml"]);
+        assert_eq!(code, 0, "{source:?}");
+        let expected: Vec<_> = lines
+            .iter()
+            .map(|&line| diag("test.no-name", line, 1))
+            .collect();
+        assert_eq!(found, expected, "{source:?}");
+    }
+}
+
+/// Through SARIF and JUnit an empty last document reports on its `---`
+/// line, never on a line past the end of the file — with or without a
+/// final newline.
+#[test]
+fn an_empty_last_document_stays_inside_the_file_in_sarif_and_junit() {
+    let scratch = Scratch::new();
+    scratch.write("no-name.yml", NO_NAME_RULE);
+    for source in ["name: a\n---\n", "name: a\n---"] {
+        scratch.write("e.yaml", source);
+        let (code, sarif, _) = capture(
+            &scratch,
+            &["-F", "sarif", "lint", "--rules", "no-name.yml", "e.yaml"],
+        );
+        assert_eq!(code, 0, "{source:?}");
+        let sarif: serde_json::Value = serde_json::from_str(&sarif).expect("SARIF JSON");
+        let results = sarif["runs"][0]["results"].as_array().expect("results");
+        assert_eq!(results.len(), 1, "{source:?}: {results:?}");
+        let region = &results[0]["locations"][0]["physicalLocation"]["region"];
+        assert_eq!(
+            (region["startLine"].as_u64(), region["startColumn"].as_u64()),
+            (Some(2), Some(1)),
+            "{source:?}"
+        );
+
+        let (code, junit, _) = capture(
+            &scratch,
+            &["-F", "junit", "lint", "--rules", "no-name.yml", "e.yaml"],
+        );
+        assert_eq!(code, 0, "{source:?}");
+        assert!(junit.contains(">e.yaml:2:1\n"), "{source:?}: {junit}");
+    }
+}
+
+/// Adds `name: fixed` to every document holding `x`, through a legacy
+/// `fix.jq` (a whole-document transform).
+const JQ_NAME_RULE: &str = r#"
+id: test.jq-name
+description: documents with x get a name
+severity: warn
+match: {format: yaml}
+check:
+  jq: 'select(type == "object" and has("x") and .name != "fixed")'
+  message: no name
+fix:
+  jq: '.name = "fixed"'
+"#;
+
+/// Fills an empty document through a legacy `fix.jq`.
+const JQ_FILL_RULE: &str = r#"
+id: test.fill
+description: an empty document gets a name
+severity: warn
+match: {format: yaml}
+check:
+  jq: 'select(. == null)'
+  message: empty
+fix:
+  jq: '{name: "filled"}'
+"#;
+
+/// A `fix.jq` in one document rewrites only that document's body: the
+/// BOM, a `%YAML` directive, `---` lines and their comments, a `...` end
+/// and every other document keep their bytes. Content on the marker line
+/// belongs to the body, so it moves below the `---`. No fallback warning.
+#[test]
+fn fix_jq_rewrites_one_document_body_and_keeps_the_markers_around_it() {
+    let scratch = Scratch::new();
+    scratch.write("jq.yml", JQ_NAME_RULE);
+    scratch.write("fill.yml", JQ_FILL_RULE);
+    let cases: [(&str, &str, &[&str], &str); 6] = [
+        (
+            "jq.yml",
+            "x: 1 # a\n--- # sep\nx: 2 # b\n---\nname: q # c\n",
+            &["--doc", "1"],
+            "x: 1 # a\n--- # sep\nx: 2\nname: fixed\n---\nname: q # c\n",
+        ),
+        (
+            "jq.yml",
+            "x: 1 # a\n...\n---\nname: b # k\n",
+            &[],
+            "x: 1\nname: fixed\n...\n---\nname: b # k\n",
+        ),
+        (
+            "jq.yml",
+            "--- {x: 1} # c\n---\nname: b # k\n",
+            &[],
+            "---\nx: 1\nname: fixed\n---\nname: b # k\n",
+        ),
+        (
+            "jq.yml",
+            "\u{feff}x: 1 # a\n---\nname: b # k\n",
+            &[],
+            "\u{feff}x: 1\nname: fixed\n---\nname: b # k\n",
+        ),
+        (
+            "jq.yml",
+            "%YAML 1.2\n---\nx: 1 # a\n---\nname: b # k\n",
+            &[],
+            "%YAML 1.2\n---\nx: 1\nname: fixed\n---\nname: b # k\n",
+        ),
+        (
+            "fill.yml",
+            "name: a # k\n---",
+            &[],
+            "name: a # k\n---\nname: filled\n",
+        ),
+    ];
+    for (rule, source, flags, expected) in cases {
+        scratch.write("m.yaml", source);
+        let mut argv: Vec<&str> = flags.to_vec();
+        argv.extend(["-i", "fix", "--rules", rule, "m.yaml"]);
+        let (code, _, stderr) = capture(&scratch, &argv);
+        assert_eq!((code, stderr.as_str()), (0, ""), "{source:?}");
+        assert_eq!(scratch.read("m.yaml"), expected, "{source:?}");
+    }
+}
+
+/// An `add` at path `""` is refused like `replace` / `remove`. In a bulk
+/// run with `--continue-on-error` each such file is one `Failed` entry,
+/// left untouched, and the other files are still fixed.
+#[test]
+fn fix_ops_adding_a_whole_document_fails_its_file_and_the_bulk_run_goes_on() {
+    let scratch = Scratch::new();
+    scratch.write(
+        "whole.yml",
+        r#"
+id: test.whole
+description: whole-document fix
+severity: warn
+match: {format: yaml}
+check:
+  jq: 'select(.bad == true)'
+  message: bad
+fix:
+  ops: '[{"op":"add","path":"","value":{"ok":true}}]'
+"#,
+    );
+    let refusal = |document: &str| {
+        format!(
+            "rule test.whole fix failed: fix.ops would add {document} as a whole (path \"\"): \
+             fix.ops edits values inside a document and cannot add a whole document yet"
+        )
+    };
+    scratch.write("bk/a.yaml", "bad: true\n");
+    scratch.write("bk/b.yaml", "ok: 1\n---\nbad: true\n");
+    scratch.write("bk/c.yaml", SINGLE);
+    scratch.write("bk/d.yaml", STREAM);
+
+    assert_eq!(
+        scratch.run(&["-i", "fix", "--rules", "whole.yml", "bk/a.yaml"]),
+        Err((3, format!("{}\n", refusal("the document"))))
+    );
+
+    let (code, stdout, stderr) = capture(
+        &scratch,
+        &[
+            "-i",
+            "--continue-on-error",
+            "fix",
+            "--rules",
+            "whole.yml",
+            "--rules",
+            "rule.yml",
+            "bk/*.yaml",
+        ],
+    );
+    assert_eq!(code, 7, "{stderr}");
+    assert_eq!(
+        stdout,
+        format!(
+            "Modified: 1, Skipped: 1, Failed: 2\n  - bk/a.yaml: {}\n  - bk/b.yaml: {}\n",
+            refusal("the document"),
+            refusal("document 1 of the stream"),
+        )
+    );
+    assert_eq!(stderr, "2 file(s) failed in bulk run\n");
+    assert_eq!(scratch.read("bk/a.yaml"), "bad: true\n");
+    assert_eq!(scratch.read("bk/b.yaml"), "ok: 1\n---\nbad: true\n");
+    assert_eq!(scratch.read("bk/c.yaml"), SINGLE);
+    assert_eq!(
+        scratch.read("bk/d.yaml"),
+        STREAM
+            .replace("{name: a}", "{name: fixed}")
+            .replace("{name: b}", "{name: fixed}")
+    );
+}
+
+/// `bk/a.yaml` and `bk/c.yaml` are streams, `bk/b.yaml` has no document 1.
+fn doc_one_glob(scratch: &Scratch) {
+    scratch.write("bk/a.yaml", STREAM);
+    scratch.write("bk/b.yaml", SINGLE);
+    scratch.write("bk/c.yaml", STREAM);
+}
+
+const SKIPPED_B: &str =
+    "skipped bk/b.yaml: --doc 1 is out of range: bk/b.yaml holds 1 document(s) (--doc 0)";
+
+/// `del`, `set --jq` and `check` with `--doc 1` over several files skip
+/// the file without document 1, note it on stderr, and go on.
+#[test]
+fn bulk_del_set_jq_and_check_doc_skip_the_file_without_that_document() {
+    let scratch = Scratch::new();
+
+    doc_one_glob(&scratch);
+    let (code, stdout, stderr) = capture(
+        &scratch,
+        &["-i", "--doc", "1", "del", "bk/*.yaml", "/apiVersion"],
+    );
+    assert_eq!(
+        (code, stdout.as_str()),
+        (0, "Modified: 2, Skipped: 1, Failed: 0\n"),
+        "{stderr}"
+    );
+    assert_eq!(skipped_notes(&stderr), vec![SKIPPED_B]);
+    let deleted =
+        "apiVersion: v1\nkind: Pod\nmetadata: {name: a}\n---\nkind: Pod\nmetadata: {name: b}\n";
+    assert_eq!(scratch.read("bk/a.yaml"), deleted);
+    assert_eq!(scratch.read("bk/b.yaml"), SINGLE);
+    assert_eq!(scratch.read("bk/c.yaml"), deleted);
+
+    doc_one_glob(&scratch);
+    let (code, stdout, stderr) = capture(
+        &scratch,
+        &[
+            "-i",
+            "--doc",
+            "1",
+            "set",
+            "bk/*.yaml",
+            "--jq",
+            ".kind = \"Q\"",
+        ],
+    );
+    assert_eq!(
+        (code, stdout.as_str()),
+        (0, "Modified: 2, Skipped: 1, Failed: 0\n"),
+        "{stderr}"
+    );
+    assert_eq!(skipped_notes(&stderr), vec![SKIPPED_B]);
+    let rewritten = "apiVersion: v1\nkind: Pod\nmetadata:\n  name: a\n---\napiVersion: v1\nkind: Q\nmetadata:\n  name: b\n";
+    assert_eq!(scratch.read("bk/a.yaml"), rewritten);
+    assert_eq!(scratch.read("bk/b.yaml"), SINGLE);
+    assert_eq!(scratch.read("bk/c.yaml"), rewritten);
+
+    doc_one_glob(&scratch);
+    let output = scratch
+        .dq()
+        .args(["-F", "json", "--doc", "1", "check", "--rule", "rule.yml"])
+        .args(["bk/a.yaml", "bk/b.yaml", "bk/c.yaml"])
+        .output()
+        .expect("spawn dq");
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8");
+    assert_eq!(output.status.code(), Some(4), "{stderr}");
+    assert_eq!(skipped_notes(&stderr), vec![SKIPPED_B]);
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    let found: Vec<(String, u64)> = body["diagnostics"]
+        .as_array()
+        .expect("diagnostics")
+        .iter()
+        .map(|d| {
+            (
+                d["path"].as_str().expect("path").to_owned(),
+                d["line"].as_u64().expect("line"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        found,
+        vec![("bk/a.yaml".to_owned(), 7), ("bk/c.yaml".to_owned(), 7)]
+    );
+
+    // One explicit file without document 1 stays exit 2, for every one of
+    // these commands.
+    for argv in [
+        &["--doc", "1", "del", "bk/b.yaml", "/kind"][..],
+        &["--doc", "1", "set", "bk/b.yaml", "--jq", "."],
+        &["--doc", "1", "check", "--rule", "rule.yml", "bk/b.yaml"],
+    ] {
+        let (code, _) = scratch.run(argv).unwrap_err();
+        assert_eq!(code, 2, "dq {argv:?}");
+    }
+}
+
+/// `fix --check` / `--diff` with `--doc 1` over several files: the file
+/// without document 1 is skipped, the others are reported.
+#[test]
+fn bulk_fix_check_and_diff_doc_skip_the_file_without_that_document() {
+    let scratch = Scratch::new();
+    doc_one_glob(&scratch);
+
+    let (code, stdout, stderr) = capture(
+        &scratch,
+        &[
+            "--check",
+            "--doc",
+            "1",
+            "fix",
+            "--rules",
+            "rule.yml",
+            "bk/*.yaml",
+        ],
+    );
+    assert_eq!(code, 1, "{stderr}");
+    assert_eq!(stdout, "would modify: bk/a.yaml\nwould modify: bk/c.yaml\n");
+    assert_eq!(skipped_notes(&stderr), vec![SKIPPED_B]);
+    assert!(
+        stderr.ends_with("2 file(s) would be modified\n"),
+        "{stderr}"
+    );
+
+    let hunk = "@@ -4,4 +4,4 @@\n ---\n apiVersion: v1\n kind: Pod\n-metadata: {name: b}\n+metadata: {name: fixed}\n";
+    let (code, stdout, stderr) = capture(
+        &scratch,
+        &[
+            "--diff",
+            "--doc",
+            "1",
+            "fix",
+            "--rules",
+            "rule.yml",
+            "bk/*.yaml",
+        ],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(
+        stdout,
+        format!(
+            "=== bk/a.yaml ===\n--- a/bk/a.yaml\n+++ b/bk/a.yaml\n{hunk}\
+             === bk/c.yaml ===\n--- a/bk/c.yaml\n+++ b/bk/c.yaml\n{hunk}\
+             Modified: 2, Skipped: 1, Failed: 0\n"
+        )
+    );
+    assert_eq!(skipped_notes(&stderr), vec![SKIPPED_B]);
+
+    assert_eq!(
+        scratch.read("bk/a.yaml"),
+        STREAM,
+        "--check / --diff write nothing"
+    );
+    assert_eq!(scratch.read("bk/c.yaml"), STREAM);
+}
+
+/// With `--continue-on-error` a skip is still a skip, not a failure: only
+/// the real errors land under `Failed`.
+#[test]
+fn bulk_doc_skip_is_not_a_failure_under_continue_on_error() {
+    let scratch = Scratch::new();
+    doc_one_glob(&scratch);
+    let (code, stdout, stderr) = capture(
+        &scratch,
+        &[
+            "-i",
+            "--continue-on-error",
+            "--doc",
+            "1",
+            "del",
+            "bk/*.yaml",
+            "/nope",
+        ],
+    );
+    assert_eq!(code, 7, "{stderr}");
+    assert_eq!(
+        stdout,
+        "Modified: 0, Skipped: 1, Failed: 2\n\
+         \x20 - bk/a.yaml: path '/1/nope' not found (matched up to '/1')\n\
+         \x20 - bk/c.yaml: path '/1/nope' not found (matched up to '/1')\n"
+    );
+    assert_eq!(skipped_notes(&stderr), vec![SKIPPED_B]);
+    assert!(
+        stderr.ends_with("2 file(s) failed in bulk run\n"),
+        "{stderr}"
+    );
+    assert_eq!(scratch.read("bk/a.yaml"), STREAM);
+}
+
+/// The skip notes of a parallel run come in file order, whatever order
+/// the workers finish in: the driver collects the results in input order
+/// and reports them afterwards. Repeated to give a race a chance to show.
+#[test]
+fn bulk_doc_skip_notes_keep_file_order_in_a_parallel_run() {
+    let scratch = Scratch::new();
+    let singles: Vec<String> = (0..8).map(|i| format!("p/{i}.yaml")).collect();
+    for name in &singles {
+        scratch.write(name, SINGLE);
+    }
+    scratch.write("p/9.yaml", STREAM);
+    let expected: Vec<String> = singles
+        .iter()
+        .map(|name| {
+            format!("skipped {name}: --doc 1 is out of range: {name} holds 1 document(s) (--doc 0)")
+        })
+        .collect();
+    for _ in 0..5 {
+        let (code, stdout, stderr) = capture(
+            &scratch,
+            &[
+                "--parallel",
+                "4",
+                "--doc",
+                "1",
+                "set",
+                "p/*.yaml",
+                "/kind",
+                "X",
+            ],
+        );
+        assert_eq!(code, 0, "{stderr}");
+        assert!(
+            stdout.ends_with("Modified: 1, Skipped: 8, Failed: 0\n"),
+            "{stdout}"
+        );
+        assert_eq!(skipped_notes(&stderr), expected);
+    }
+}
+
+/// `set --jq '[]'` over a whole stream is refused without `-i` as well:
+/// exit 6, nothing on stdout — with `--diff` and `--check` too.
+#[test]
+fn set_jq_empty_array_over_a_stream_prints_nothing() {
+    let scratch = Scratch::new();
+    let message = "s.yaml is a stream of 2 documents: --jq returned an empty array, which \
+                   would leave the file with no document; pass --doc N to transform one \
+                   document\n";
+    for flags in [&[][..], &["--diff"], &["--check"]] {
+        let mut argv: Vec<&str> = flags.to_vec();
+        argv.extend(["set", "s.yaml", "--jq", "[]"]);
+        assert_eq!(
+            capture(&scratch, &argv),
+            (6, String::new(), message.to_owned()),
+            "dq {argv:?}"
+        );
+    }
+    assert_eq!(scratch.read("s.yaml"), STREAM);
+}
