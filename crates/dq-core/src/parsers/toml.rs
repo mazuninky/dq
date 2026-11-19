@@ -852,18 +852,20 @@ fn extract_line_snippet(bytes: &[u8], idx: usize) -> String {
 // ---------------------------------------------------------------------------
 
 /// `v` as the `value_only` fallback writes it: the `toml` crate's pretty
-/// printer, then every float it spelled in full that has an exponent
-/// spelling respelled as [`shortest_float`](crate::document::shortest_float)
-/// does (`1e300`, not 301 digits; `1.5e20`, not `150000000000000000000.0`).
-/// The `toml` crate prints a float with Rust's `Display`, which never
-/// writes an exponent; every other byte stays as it printed it.
+/// printer, then every float it spelled otherwise respelled as
+/// [`shortest_float`](crate::document::shortest_float) does (`1e300`, not
+/// 301 digits; `1.5e20`, not `150000000000000000000.0`;
+/// `1658206780088562.2`, not `…562.3`). The `toml` crate prints a float
+/// with Rust's `Display`, which never writes an exponent and breaks a
+/// 17th-digit tie to the odd digit; every other byte stays as it printed
+/// it.
 fn emit_toml(v: &Value) -> Result<String> {
     let toml_value = value_to_toml(v)?;
     let text = toml::to_string_pretty(&toml_value).map_err(|e| Error::Format {
         format: "toml",
         message: e.to_string(),
     })?;
-    if !has_exponent_float(v) {
+    if !has_respelled_float(v) {
         return Ok(text);
     }
     let mut doc: toml_edit::DocumentMut =
@@ -876,18 +878,35 @@ fn emit_toml(v: &Value) -> Result<String> {
     Ok(doc.to_string())
 }
 
-/// Whether `v` holds a float whose shortest spelling has an exponent.
-fn has_exponent_float(v: &Value) -> bool {
+/// Whether `v` holds a finite float the `toml` crate spells otherwise than
+/// [`shortest_float`](crate::document::shortest_float): one with an
+/// exponent spelling, or one on a tie in its 17th digit, where Rust's
+/// `Display` picks the odd digit and `shortest_float` the even one
+/// (`1658206780088562.2`, not `…562.3`).
+fn has_respelled_float(v: &Value) -> bool {
     match v {
-        Value::Float(f) => f.is_finite() && crate::document::shortest_float(*f).contains('e'),
-        Value::Array(items) => items.iter().any(has_exponent_float),
-        Value::Map(map) => map.values().any(has_exponent_float),
+        Value::Float(f) => {
+            f.is_finite() && crate::document::shortest_float(*f) != display_float(*f)
+        }
+        Value::Array(items) => items.iter().any(has_respelled_float),
+        Value::Map(map) => map.values().any(has_respelled_float),
         Value::Null
         | Value::Bool(_)
         | Value::Int(_)
         | Value::BigInt(_)
         | Value::BigFloat(_)
         | Value::String(_) => false,
+    }
+}
+
+/// A finite float as the `toml` crate prints it: Rust's `Display`, `.0`
+/// added to a whole number.
+fn display_float(f: f64) -> String {
+    let display = f.to_string();
+    if display.contains('.') {
+        display
+    } else {
+        format!("{display}.0")
     }
 }
 
@@ -908,7 +927,7 @@ fn respell_floats_in_value(value: &mut toml_edit::Value) {
     match value {
         toml_edit::Value::Float(f) if f.value().is_finite() => {
             let spelled = crate::document::shortest_float(*f.value());
-            if spelled.contains('e')
+            if spelled != display_float(*f.value())
                 && let Ok(mut respelled) = spelled.parse::<toml_edit::Value>()
             {
                 *respelled.decor_mut() = f.decor().clone();

@@ -38,8 +38,8 @@ use crate::ir::{Ir, Provenance, ProvenanceMap};
 use crate::pointer::{Pointer, Segment};
 use crate::textual_edit::{insertion_renderer_for_format, renderer_for_format};
 
-pub use number::shortest_float;
 pub(crate) use number::{DecimalParts, float_literal_value, may_exceed_f64};
+pub use number::{plain_float, shortest_float};
 pub use spans::{SpanContext, SpanMap, SpanRecomputeDelta, ValueSpan, apply_delta};
 
 /// A single value node within a parsed document.
@@ -366,7 +366,9 @@ impl Value {
     fn finite_literal(&self) -> Option<std::borrow::Cow<'_, str>> {
         match self {
             Self::Int(i) => Some(i.to_string().into()),
-            Self::Float(f) if f.is_finite() => Some(format!("{f:e}").into()),
+            // `shortest_float`, not `{f:e}`: on a tie in the 17th digit Rust
+            // picks the odd digit, serde_json and every dq writer the even one.
+            Self::Float(f) if f.is_finite() => Some(number::shortest_float(*f).into()),
             Self::BigInt(s) | Self::BigFloat(s) if non_finite_literal(s).is_none() => {
                 Some(s.as_str().into())
             }
@@ -5314,7 +5316,7 @@ impl fmt::Display for Value {
             Self::Bool(b) => write!(f, "{b}"),
             Self::Int(n) => write!(f, "{n}"),
             Self::BigInt(s) | Self::BigFloat(s) => f.write_str(s),
-            Self::Float(n) => write!(f, "{n}"),
+            Self::Float(n) => f.write_str(&number::shortest_float(*n)),
             Self::String(s) => write!(f, "{s:?}"),
             Self::Array(items) => {
                 f.write_str("[")?;

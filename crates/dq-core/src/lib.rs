@@ -15,7 +15,7 @@ pub mod transform;
 pub mod write_options;
 
 pub use document::{
-    Document, FormatTag, FrontmatterKind, FrontmatterPayload, Value, shortest_float,
+    Document, FormatTag, FrontmatterKind, FrontmatterPayload, Value, plain_float, shortest_float,
 };
 pub use edit_ops::{EditOp, EditScript};
 pub use enumerate::enumerate_pointers;

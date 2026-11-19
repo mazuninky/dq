@@ -21,8 +21,13 @@ pub struct ToonReporter;
 impl Reporter for ToonReporter {
     fn report(&self, value: &serde_json::Value, w: &mut dyn Write) -> anyhow::Result<()> {
         ensure_toon_numbers(value)?;
-        let encoded = toon_format::encode_default(value)
+        let mut respelled = Vec::new();
+        let marked = mark_tie_floats(value, &mut respelled);
+        let mut encoded = toon_format::encode_default(marked.as_ref())
             .map_err(|e| anyhow::anyhow!("toon encode failed: {e}"))?;
+        for (at, spelling) in respelled.iter().enumerate() {
+            encoded = encoded.replacen(&float_marker(at), spelling, 1);
+        }
         w.write_all(encoded.as_bytes())?;
         if !encoded.ends_with('\n') {
             w.write_all(b"\n")?;
@@ -37,6 +42,73 @@ impl Reporter for ToonReporter {
         ensure_toon_value(value)?;
         self.report(&value.to_serde_json(), w)
     }
+}
+
+/// The placeholder [`mark_tie_floats`] puts in place of the `at`-th float
+/// it respells: private-use characters, which TOON writes bare.
+fn float_marker(at: usize) -> String {
+    format!("\u{E000}{at}\u{E001}")
+}
+
+/// `value` with each float that `toon_format` would spell otherwise than
+/// [`dq_core::plain_float`] replaced by a [`float_marker`] string, its
+/// spelling pushed to `respelled`. `toon_format` writes a non-whole float
+/// with Rust's `Display`, which breaks a tie in the 17th digit to the odd
+/// digit (`1658206780088562.3`), while every other dq writer picks the
+/// even one (`…562.2`). Borrowed when there is none — or when some string
+/// already holds a private-use marker character, which is left as it is.
+fn mark_tie_floats<'v>(
+    value: &'v serde_json::Value,
+    respelled: &mut Vec<String>,
+) -> std::borrow::Cow<'v, serde_json::Value> {
+    fn respelling(n: &serde_json::Number) -> Option<String> {
+        if n.as_i64().is_some() || n.as_u64().is_some() {
+            return None;
+        }
+        let f = n.as_f64().filter(|f| f.is_finite())?;
+        // `toon_format` writes a whole float in `i64` range, [-2^63, 2^63),
+        // as that integer.
+        const TWO_TO_63: f64 = 9_223_372_036_854_775_808.0;
+        let in_i64 = f.fract() == 0.0 && (-TWO_TO_63..TWO_TO_63).contains(&f);
+        let plain = dq_core::plain_float(f);
+        (!in_i64 && plain != f.to_string()).then_some(plain)
+    }
+    fn has_tie(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Number(n) => respelling(n).is_some(),
+            serde_json::Value::Array(items) => items.iter().any(has_tie),
+            serde_json::Value::Object(map) => map.values().any(has_tie),
+            _ => false,
+        }
+    }
+    fn holds_marker(value: &serde_json::Value) -> bool {
+        let marks = |s: &str| s.contains(['\u{E000}', '\u{E001}']);
+        match value {
+            serde_json::Value::String(s) => marks(s),
+            serde_json::Value::Array(items) => items.iter().any(holds_marker),
+            serde_json::Value::Object(map) => map.iter().any(|(k, v)| marks(k) || holds_marker(v)),
+            _ => false,
+        }
+    }
+    fn mark(value: &mut serde_json::Value, respelled: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Number(n) => {
+                if let Some(plain) = respelling(n) {
+                    *value = serde_json::Value::String(float_marker(respelled.len()));
+                    respelled.push(plain);
+                }
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(|v| mark(v, respelled)),
+            serde_json::Value::Object(map) => map.values_mut().for_each(|v| mark(v, respelled)),
+            _ => {}
+        }
+    }
+    if !has_tie(value) || holds_marker(value) {
+        return std::borrow::Cow::Borrowed(value);
+    }
+    let mut owned = value.clone();
+    mark(&mut owned, respelled);
+    std::borrow::Cow::Owned(owned)
 }
 
 /// Fail on the first number of `value` that `toon_format` would not write

@@ -1677,3 +1677,33 @@ fn xml_refuses_a_bom_its_declaration_contradicts_and_keeps_a_utf8_bom() {
         ],
     );
 }
+
+/// A float on a tie in its 17th digit (`1658206780088562.2` and `…562.3`
+/// both read back as the same `f64`) is spelled with the even digit by
+/// every writer, as serde_json does. TOML and TOON spelled it with Rust's
+/// `Display`, which picks the odd one.
+#[test]
+fn a_float_on_a_17th_digit_tie_is_spelled_alike_by_every_writer() {
+    let dir = dir_with(&[
+        ("tie.json", "{\"v\":1658206780088562.2}"),
+        ("list.json", "{\"a\":[1658206780088562.2,2.5,\"x\"]}"),
+    ]);
+    let convert = |file, to| vec!["-q", "convert", file, "-F", to];
+    assert_cases(
+        &dir,
+        &[
+            (
+                convert("tie.json", "json"),
+                ok("{\"v\":1658206780088562.2}\n"),
+            ),
+            (convert("tie.json", "yaml"), ok("v: 1658206780088562.2\n")),
+            (convert("tie.json", "toml"), ok("v = 1658206780088562.2\n")),
+            (convert("tie.json", "hcl"), ok("v = 1658206780088562.2\n")),
+            (convert("tie.json", "toon"), ok("v: 1658206780088562.2\n")),
+            (
+                convert("list.json", "toon"),
+                ok("a[3]: 1658206780088562.2,2.5,x\n"),
+            ),
+        ],
+    );
+}

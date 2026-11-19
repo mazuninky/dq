@@ -1276,3 +1276,25 @@ fn a_divisor_below_f64_is_spelled_as_written_where_a_message_prints_the_schema()
         ),
     ]);
 }
+
+/// A float on a tie in its 17th digit compares by the digits serde_json
+/// spells it with (the even one): `1658206780088562.2` is within a maximum
+/// of `1658206780088562.25`, and `662936471232937.2` a multiple of `0.2`.
+/// Rust's `{:e}` spelled them `…562.3` and `…937.3`.
+#[test]
+fn a_float_on_a_17th_digit_tie_compares_by_its_even_spelling() {
+    use Some as Fails;
+    assert_schema_cases(&[
+        ("{maximum: 1658206780088562.25}", "1658206780088562.2", None),
+        ("{multipleOf: 0.2}", "662936471232937.2", None),
+        ("{const: 1658206780088562.2}", "1658206780088562.2", None),
+        (
+            "{maximum: 1658206780088562.1}",
+            "1658206780088562.2",
+            Fails(
+                "/properties/x/maximum: 1658206780088562.2 is greater than the maximum of \
+                 1658206780088562.1",
+            ),
+        ),
+    ]);
+}

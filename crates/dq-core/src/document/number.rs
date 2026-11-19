@@ -605,6 +605,32 @@ pub fn shortest_float(f: f64) -> String {
     }
 }
 
+/// A finite `f` in plain decimal — no exponent, no `.0` on a whole
+/// number — with [`shortest_float`]'s digits: `1658206780088562.2` (Rust's
+/// `Display` breaks that 17th-digit tie to `…562.3`), `0.0001`,
+/// `100000000000000000000`. For a writer whose format forbids exponents
+/// (TOON). NaN and the infinities as `Display` spells them.
+#[must_use]
+pub fn plain_float(f: f64) -> String {
+    let Some((digits, kk)) = shortest_digits(f) else {
+        return f.to_string();
+    };
+    let sign = if f.is_sign_negative() { "-" } else { "" };
+    if digits.is_empty() {
+        return format!("{sign}0");
+    }
+    let len = i32::try_from(digits.len()).unwrap_or(i32::MAX);
+    let zeros = |n: i32| "0".repeat(usize::try_from(n).unwrap_or(0));
+    if kk >= len {
+        format!("{sign}{digits}{}", zeros(kk - len))
+    } else if kk > 0 {
+        let split = usize::try_from(kk).unwrap_or(0);
+        format!("{sign}{}.{}", &digits[..split], &digits[split..])
+    } else {
+        format!("{sign}0.{}{digits}", zeros(-kk))
+    }
+}
+
 /// The significant digits serde_json spells a finite `f` with, and the
 /// power of ten `kk` just above it: `|f| = 0.digits × 10^kk`. Empty digits
 /// for a zero; `None` for NaN and the infinities.
@@ -678,6 +704,21 @@ impl fmt::Write for StackText {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_float_keeps_shortest_digits_without_an_exponent() {
+        for (f, spelled) in [
+            (1_658_206_780_088_562.2, "1658206780088562.2"),
+            (1e20, "100000000000000000000"),
+            (1e-5, "0.00001"),
+            (-2.5, "-2.5"),
+            (0.0, "0"),
+            (-0.0, "-0"),
+            (3.0, "3"),
+        ] {
+            assert_eq!(plain_float(f), spelled, "{f:e}");
+        }
+    }
 
     #[test]
     fn shortest_float_spells_as_ryu_lays_it_out() {
