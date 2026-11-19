@@ -18,7 +18,7 @@
 //! checked against each other there, so a repeat is named where it
 //! occurs: an `f64` key by value as serde_norway checks it (`-0.0` repeats
 //! `0.0`), any key by the [`Value::Map`] key it becomes (`1` and `"1"`, a
-//! big number and its quoted twin). Wherever the two parsers disagree on the
+//! big number and its quoted twin, a collection and its flow text). Wherever the two parsers disagree on the
 //! shape, the file is read as serde_norway reads it.
 //!
 //! The events are walked as they come (only anchored values are kept), and
@@ -26,13 +26,16 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 
 use indexmap::IndexMap;
 use saphyr_parser::{Event, Parser as YamlParser, ScalarStyle, Span, StrInput, Tag};
+use serde_norway::Value as YamlValue;
 
 use super::yaml::{
     Entry, KeyKind, Node, is_tagged_number, map_yaml_err, node_to_value, read_nodes,
 };
+use super::yaml_emit::flow_key_text;
 use crate::Result;
 use crate::document::{DecimalParts, Value, float_literal_value, may_exceed_f64};
 use crate::error::Error;
@@ -88,8 +91,9 @@ pub(super) fn may_lose_numbers(bytes: &[u8]) -> bool {
 /// [`Error::Parse`] when serde_norway fails on `bytes` (a `!!float` /
 /// `!!int` number it has no type for aside), or for a mapping key that
 /// repeats an earlier one — an `f64` by value, any key as the
-/// [`Value::Map`] key it becomes (`1` and `"1"`) — at the repeated key's
-/// line and column. Two spellings of one big number (`1e400`, `1.0e+400`)
+/// [`Value::Map`] key it becomes (`1` and `"1"`, `[1,2]` and `[1, 2]`), a
+/// collection or tagged key also by value ([`Twins`]) — at the repeated
+/// key's line and column. Two spellings of one big number (`1e400`, `1.0e+400`)
 /// are two keys.
 pub(super) fn read_exact(bytes: &[u8]) -> Result<Vec<Value>> {
     let as_serde_norway_reads = || {
@@ -139,79 +143,18 @@ pub(super) fn read_exact(bytes: &[u8]) -> Result<Vec<Value>> {
 /// serde_norway reads as untagged; the events of `text` give the value.
 /// Every node keeps its column, so a tagged block-map key stays a key:
 /// spaces in the tag's place would move the key right of its siblings.
-/// `None` when there is none, or saphyr-parser fails on `text` — and
-/// when such a scalar sits in a collection used as a mapping key
-/// (`[!!float 1e400]: a`): dq names such a key by its debug text, which
-/// would show the stand-in tag, so the file stays refused, as before.
+/// The stand-in tag reaches no output: dq drops every tag, and names a
+/// collection key by its value ([`super::yaml_emit::flow_key_text`]).
+/// `None` when there is none, or saphyr-parser fails on `text`.
 fn untag_numbers(text: &str) -> Option<String> {
-    /// An open collection: whether it is a mapping whose next node is a
-    /// key, whether it is (in) a collection used as a key, its anchor, and
-    /// whether it holds a scalar whose tag is rewritten.
-    struct Open {
-        key_next: Option<bool>,
-        in_key: bool,
-        anchor: usize,
-        rewritten: bool,
-    }
-    fn advance(open: &mut [Open], rewritten: bool) {
-        if let Some(top) = open.last_mut() {
-            top.rewritten |= rewritten;
-            if let Some(key_next) = &mut top.key_next {
-                *key_next = !*key_next;
-            }
-        }
-    }
     let mut starts = Vec::new();
-    let mut open: Vec<Open> = Vec::new();
-    // Anchors of nodes holding a rewritten tag: whether each is a collection.
-    let mut rewritten_anchors: HashMap<usize, bool> = HashMap::new();
     let mut events = YamlParser::new_from_str(text);
     while let Some(item) = events.next_event() {
         let (event, span) = item.ok()?;
-        let in_key = open.last().is_some_and(|o| o.in_key);
-        let at_key = open.last().is_some_and(|o| o.key_next == Some(true));
-        match &event {
-            Event::Scalar(literal, _, anchor, tag) => {
-                let rewrite = tag.as_ref().is_some_and(|tag| {
-                    core_typing(tag).is_some_and(|typing| serde_norway_refuses(literal, typing))
-                });
-                if rewrite {
-                    if in_key {
-                        return None;
-                    }
-                    starts.push(span.start.index());
-                    if *anchor != 0 {
-                        rewritten_anchors.insert(*anchor, false);
-                    }
-                }
-                advance(&mut open, rewrite);
-            }
-            Event::Alias(id) => {
-                let rewritten = rewritten_anchors.get(id).copied();
-                if let Some(collection) = rewritten
-                    && (in_key || (at_key && collection))
-                {
-                    return None;
-                }
-                advance(&mut open, rewritten.is_some());
-            }
-            Event::SequenceStart(anchor, _) | Event::MappingStart(anchor, _) => {
-                let key_next = matches!(event, Event::MappingStart(..)).then_some(true);
-                open.push(Open {
-                    key_next,
-                    in_key: in_key || at_key,
-                    anchor: *anchor,
-                    rewritten: false,
-                });
-            }
-            Event::SequenceEnd | Event::MappingEnd => {
-                let closed = open.pop()?;
-                if closed.rewritten && closed.anchor != 0 {
-                    rewritten_anchors.insert(closed.anchor, true);
-                }
-                advance(&mut open, closed.rewritten);
-            }
-            _ => {}
+        if let Event::Scalar(literal, _, _, Some(tag)) = &event
+            && core_typing(tag).is_some_and(|typing| serde_norway_refuses(literal, typing))
+        {
+            starts.push(span.start.index());
         }
     }
     if starts.is_empty() {
@@ -422,6 +365,71 @@ impl FloatKey {
     }
 }
 
+/// The keys of a mapping that are collections or carry a tag, as
+/// serde_norway reads each and as dq does. Two such keys repeat when both
+/// readers call them equal, though they print apart: `{a: 1, b: 2}` and
+/// `{b: 2, a: 1}`, `[-0.0]` and `[0.0]` — serde_norway failed on them, so
+/// they fail still. Keys only one reader calls equal stay two:
+/// `{1: a, b: c}` and `{b: c, '1': a}` (equal to dq, not to
+/// serde_norway), `[1e400]` and `[2e400]` (the other way round: big
+/// numbers repeat only as the same key text). Keys of the same text
+/// repeat whatever the readers say (`[!a 1]` and `[!b 1]`).
+#[derive(Default)]
+struct Twins {
+    /// By [`hash_value`]: each key's index, serde_norway's value and dq's.
+    seen: HashMap<u64, Vec<(usize, YamlValue, Value)>>,
+}
+
+impl Twins {
+    /// The index of the first key both readers call equal to this one.
+    fn first(&self, yaml: &YamlValue, value: &Value) -> Option<usize> {
+        self.seen
+            .get(&hash_value(value))?
+            .iter()
+            .find(|(_, y, v)| y == yaml && v == value)
+            .map(|(index, _, _)| *index)
+    }
+
+    fn insert(&mut self, index: usize, yaml: YamlValue, value: Value) {
+        self.seen
+            .entry(hash_value(&value))
+            .or_default()
+            .push((index, yaml, value));
+    }
+}
+
+/// A hash of `value` that agrees with its `==`: `-0.0` hashes as `0.0`, a
+/// map's entries in any order alike.
+fn hash_value(value: &Value) -> u64 {
+    fn feed(value: &Value, state: &mut DefaultHasher) {
+        std::mem::discriminant(value).hash(state);
+        match value {
+            Value::Null => {}
+            Value::Bool(b) => b.hash(state),
+            Value::Int(i) => i.hash(state),
+            Value::Float(f) => (if *f == 0.0 { 0 } else { f.to_bits() }).hash(state),
+            Value::BigInt(s) | Value::BigFloat(s) | Value::String(s) => s.hash(state),
+            Value::Array(items) => {
+                items.len().hash(state);
+                items.iter().for_each(|item| feed(item, state));
+            }
+            Value::Map(map) => {
+                let mut entries = 0u64;
+                for (key, item) in map {
+                    let mut entry = DefaultHasher::new();
+                    key.hash(&mut entry);
+                    feed(item, &mut entry);
+                    entries ^= entry.finish();
+                }
+                (map.len(), entries).hash(state);
+            }
+        }
+    }
+    let mut state = DefaultHasher::new();
+    feed(value, &mut state);
+    state.finish()
+}
+
 /// Where a node is, as serde_norway names it in an error: `a.b[0]`.
 enum Path<'a> {
     Root,
@@ -596,6 +604,7 @@ impl<'t> Walk<'t> {
         // (`0.10`, not the `0.1` it reads as), any other as `out` holds it.
         let mut names: Vec<(KeyKind, Option<String>)> = Vec::with_capacity(entries.len());
         let mut floats: HashMap<FloatKey, usize> = HashMap::new();
+        let mut twins = Twins::default();
         for entry in entries {
             let Entry {
                 key,
@@ -604,7 +613,7 @@ impl<'t> Walk<'t> {
                 value,
             } = entry;
             let (event, span) = self.next()?;
-            let (key, kind, id, key_text) = match event {
+            let (key, kind, id, key_text, twin) = match event {
                 Event::Scalar(literal, style, anchor, tag) => {
                     let read = match &key_node {
                         Some(node) => SerdeRead::of(node),
@@ -612,6 +621,10 @@ impl<'t> Walk<'t> {
                     };
                     let exact = exact_value(&literal, style, tag.as_deref(), &read);
                     self.note_literal(anchor, exact.is_some(), &literal);
+                    let tagged = key_node
+                        .as_ref()
+                        .filter(|node| matches!(node, Node::Tagged(..)))
+                        .and_then(Node::to_yaml_value);
                     let (key, kind, id, anchored) = match exact {
                         Some(exact) => (
                             literal.to_string(),
@@ -628,35 +641,58 @@ impl<'t> Walk<'t> {
                             (key, kind, id, anchored)
                         }
                     };
+                    let twin = tagged.map(|yaml| (yaml, anchored.clone()));
                     if anchor != 0 {
                         self.anchors.insert(anchor, anchored);
                     }
-                    (key, kind, id, Some(literal))
+                    (key, kind, id, Some(literal), twin)
                 }
                 Event::Alias(id) => {
                     let anchored = self.anchors.get(&id).ok_or(Stop::Disagree)?;
-                    match anchored {
-                        Value::BigInt(s) | Value::BigFloat(s) => (
-                            self.literals.get(&id).unwrap_or(s).clone(),
-                            KeyKind::Number,
-                            FloatKey::of_value(anchored),
-                            None,
-                        ),
-                        anchored => {
-                            let id = FloatKey::of_value(anchored);
-                            (key, kind, id, None)
+                    let twin = key_node
+                        .as_ref()
+                        .filter(|node| {
+                            matches!(
+                                node,
+                                Node::Tagged(..) | Node::Sequence(_) | Node::Mapping(_)
+                            )
+                        })
+                        .and_then(Node::to_yaml_value)
+                        .map(|yaml| (yaml, anchored.clone()));
+                    let (key, kind) = match anchored {
+                        Value::BigInt(s) | Value::BigFloat(s) => {
+                            (self.literals.get(&id).unwrap_or(s).clone(), KeyKind::Number)
                         }
-                    }
+                        Value::Array(_) | Value::Map(_) => {
+                            (flow_key_text(anchored), KeyKind::Other)
+                        }
+                        _ => (key, kind),
+                    };
+                    (key, kind, FloatKey::of_value(anchored), None, twin)
                 }
                 event => {
                     let node = key_node.ok_or(Stop::Disagree)?;
-                    self.node_from(event, node, &Path::Unknown { parent: path })?;
-                    (key, kind, None, None)
+                    let yaml = node.to_yaml_value();
+                    let value = self.node_from(event, node, &Path::Unknown { parent: path })?;
+                    // The key is named by its value, so a stand-in tag
+                    // (`untag_numbers`) does not show.
+                    let key = flow_key_text(&value);
+                    (
+                        key,
+                        KeyKind::Other,
+                        None,
+                        None,
+                        yaml.map(|yaml| (yaml, value)),
+                    )
                 }
             };
             let first = out
                 .get_index_of(&key)
-                .or_else(|| id.as_ref().and_then(|id| floats.get(id).copied()));
+                .or_else(|| id.as_ref().and_then(|id| floats.get(id).copied()))
+                .or_else(|| {
+                    twin.as_ref()
+                        .and_then(|(yaml, value)| twins.first(yaml, value))
+                });
             if let Some(first) = first {
                 let (first_key, _) = out.get_index(first).ok_or(Stop::Disagree)?;
                 let (first_kind, written) = &names[first];
@@ -675,6 +711,9 @@ impl<'t> Walk<'t> {
             };
             if let Some(id) = id {
                 floats.insert(id, out.len());
+            }
+            if let Some((yaml, value)) = twin {
+                twins.insert(out.len(), yaml, value);
             }
             let written = key_text
                 .filter(|_| kind == KeyKind::Number)
@@ -911,22 +950,63 @@ mod tests {
     }
 
     #[test]
-    fn a_tagged_big_number_in_a_collection_key_stays_refused() {
-        for text in [
-            "[!!float 1e400]: a\n",
-            "? {k: !!float 1e400}\n: a\n",
-            "a: &x !!float 1e400\n[*x]: b\n",
-            "a: &x [!!float 1e400]\n? *x\n: b\n",
+    fn a_collection_key_holding_a_tagged_big_number_is_named_by_its_value() {
+        for (text, key) in [
+            ("[!!float 1e400]: a\n", "[1e400]"),
+            ("? {k: !!float 1e400}\n: a\n", "{k: 1e400}"),
+            (
+                "? [!!int 123456789012345678901234567890123456789012]\n: a\n",
+                "[123456789012345678901234567890123456789012]",
+            ),
         ] {
-            let message = error(text);
-            assert!(message.contains("expected a float"), "{text}: {message}");
-            assert!(!message.contains("xxx"), "{text}: {message}");
+            let Value::Map(m) = read(text) else {
+                panic!("{text}")
+            };
+            let keys: Vec<&str> = m.keys().map(String::as_str).collect();
+            assert_eq!(keys, [key], "{text}");
         }
+        // Through an alias, inside the key or as the key.
+        let Value::Map(m) = read("a: &x !!float 1e400\n[*x]: b\n") else {
+            panic!()
+        };
+        assert_eq!(m["[1e400]"], Value::String("b".into()));
+        let Value::Map(m) = read("a: &x [!!float 1e400]\n? *x\n: b\n") else {
+            panic!()
+        };
+        assert_eq!(m["[1e400]"], Value::String("b".into()));
         // A scalar alias as a key is a plain key.
         let Value::Map(m) = read("a: &x !!float 1e400\n*x : b\n") else {
             panic!()
         };
         assert_eq!(m["1e400"], Value::String("b".into()));
+    }
+
+    #[test]
+    fn collection_keys_repeat_by_text_or_when_both_readers_call_them_equal() {
+        for text in [
+            "[1, 2]: a\n[1,2]: b\n",
+            "[1, 2]: a\n'[1, 2]': b\n",
+            "{a: 1, b: 2}: x\n{b: 2, a: 1}: y\n",
+            "[-0.0]: x\n[0.0]: y\n",
+            "[!a 1]: x\n[!b 1]: y\n",
+            "[!!float 1e400]: x\n[1e400]: y\n",
+            "!foo 0.0: x\n!foo -0.0: y\n",
+        ] {
+            let message = error(text);
+            assert!(message.contains("duplicate entry"), "{text}: {message}");
+            assert!(message.ends_with("at line 2 column 1"), "{text}: {message}");
+        }
+        // Equal to dq only (maps in another order, a key typed apart) or
+        // to serde_norway only (two big numbers past the `f64` range).
+        let Value::Map(m) = read("{1: a, b: c}: x\n{b: c, '1': a}: y\n[1e400]: x\n[2e400]: y\n")
+        else {
+            panic!()
+        };
+        let keys: Vec<&str> = m.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            ["{'1': a, b: c}", "{b: c, '1': a}", "[1e400]", "[2e400]"]
+        );
     }
 
     #[test]

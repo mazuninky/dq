@@ -175,7 +175,7 @@ pub(super) fn is_tagged_number(err: &serde_norway::Error) -> bool {
 /// integers past `u64` / `i64` that `YamlValue` has no room for (its
 /// visitor fails on them with "invalid type: integer as u128"), with each
 /// mapping key stringified as [`Value::Map`] holds it.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) enum Node {
     Null,
     Bool(bool),
@@ -189,7 +189,7 @@ pub(super) enum Node {
 }
 
 /// A mapping entry of a [`Node`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct Entry {
     /// The key as the [`Value::Map`] key.
     pub(super) key: String,
@@ -206,7 +206,7 @@ pub(super) enum KeyKind {
     Bool,
     String,
     Number,
-    /// A collection or a tagged node.
+    /// A collection.
     Other,
 }
 
@@ -227,7 +227,7 @@ impl KeyKind {
 impl Node {
     /// The [`YamlValue`] this node is, `None` when it is or holds a
     /// [`Node::BigInt`].
-    fn to_yaml_value(&self) -> Option<YamlValue> {
+    pub(super) fn to_yaml_value(&self) -> Option<YamlValue> {
         Some(match self {
             Self::Null => YamlValue::Null,
             Self::Bool(b) => YamlValue::Bool(*b),
@@ -263,7 +263,9 @@ impl Node {
 
     /// The key a [`Value::Map`] holds for this key node, and its kind: a
     /// string as it is, a number as serde_norway prints it, `null` as the
-    /// empty key; a collection or a tagged key as its debug text.
+    /// empty key; a collection as its flow text
+    /// ([`super::yaml_emit::flow_key_text`]). A tag is dropped, as it is
+    /// from a value: `!foo a` is the key `a`.
     fn stringify_key(&self) -> (String, KeyKind) {
         match self {
             Self::String(s) => (s.clone(), KeyKind::String),
@@ -271,13 +273,9 @@ impl Node {
             Self::Bool(b) => (b.to_string(), KeyKind::Bool),
             Self::Number(n) => (n.to_string(), KeyKind::Number),
             Self::Null => (String::new(), KeyKind::Null),
-            // Composite keys are rare in real configs; M1 surfaces them as
-            // their textual form rather than failing.
-            other => (
-                match other.to_yaml_value() {
-                    Some(plain) => format!("{plain:?}"),
-                    None => format!("{other:?}"),
-                },
+            Self::Tagged(_, inner) => inner.stringify_key(),
+            collection @ (Self::Sequence(_) | Self::Mapping(_)) => (
+                super::yaml_emit::flow_key_text(&node_to_value(collection.clone())),
                 KeyKind::Other,
             ),
         }
@@ -397,14 +395,15 @@ impl<'de> Visitor<'de> for NodeVisitor {
             if self.check_keys {
                 let mut repeats = !seen.insert(hasher.hash_one(("text", &text)));
                 // Equal values that print apart: `-0.0` and `0.0`, and
-                // collections holding them.
+                // collections or tagged keys holding them, or maps in
+                // another order.
                 if let Node::Number(n) = &key
                     && let Some(f) = n.as_f64()
                     && n.is_f64()
                 {
                     let bits = if f == 0.0 { 0 } else { f.to_bits() };
                     repeats |= !seen.insert(hasher.hash_one(("float", bits)));
-                } else if kind == KeyKind::Other
+                } else if matches!(key, Node::Tagged(..) | Node::Sequence(_) | Node::Mapping(_))
                     && let Some(plain) = key.to_yaml_value()
                 {
                     repeats |= !seen.insert(hasher.hash_one(("value", plain)));
@@ -636,7 +635,23 @@ mod tests {
         let Value::Map(m) = doc.value() else { panic!() };
         assert_eq!(m["a"], Value::BigInt("18446744073709551616".into()));
         let keys: Vec<&str> = m.keys().map(String::as_str).collect();
-        assert_eq!(keys[1], "Sequence [Number(1), Number(2)]");
+        assert_eq!(keys[1], "[1, 2]");
+    }
+
+    #[test]
+    fn a_collection_key_writes_back_as_the_same_string_key() {
+        let src = "[1, 2]: a\n? {k: [on, 'a: b']}\n: b\n!foo t: c\n";
+        let doc = parse(src);
+        let Value::Map(m) = doc.value() else { panic!() };
+        let keys: Vec<&str> = m.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["[1, 2]", "{k: ['on', 'a: b']}", "t"]);
+        let mut out = Vec::new();
+        Yaml.write(&doc, &mut out).unwrap();
+        let written = String::from_utf8(out).unwrap();
+        assert!(written.starts_with("'[1, 2]': a\n"), "{written}");
+        assert_eq!(parse(&written).value(), doc.value(), "{written}");
+        let spans = crate::parsers::yaml_spans::parse_yaml_with_spans(src.as_bytes()).unwrap();
+        assert_eq!(spans.value(), doc.value());
     }
 
     #[test]

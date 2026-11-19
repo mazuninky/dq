@@ -988,6 +988,9 @@ enum Frame {
         /// frame, so `MappingEnd` can tell empty from non-empty without
         /// re-walking the SpanMap.
         saw_child: bool,
+        /// Number of keys seen so far: the index of the next key among
+        /// the mapping's keys in the value tree.
+        keys: usize,
         /// Where this container sits in its parent; see [`ContainerFrame`].
         container: ContainerFrame,
     },
@@ -1182,6 +1185,14 @@ struct State<'src> {
     /// with `layout`. saphyr-parser gives each definition its own id, a
     /// redefinition included.
     anchor_defs: HashMap<usize, AnchorDef>,
+    /// The collection used as a mapping key being walked: its start byte
+    /// and how many collections deep the walk is in it. Nothing inside
+    /// such a key has a pointer.
+    collection_key: Option<(usize, usize)>,
+    /// The value tree, read the first time a collection is a key: the
+    /// value tree keys its entry by the collection's text, which only the
+    /// reader makes ([`State::tree_key`]). `Some(None)` when it fails.
+    tree: Option<Option<Value>>,
 }
 
 impl<'src> State<'src> {
@@ -1206,6 +1217,82 @@ impl<'src> State<'src> {
             flow_depth: 0,
             layout: None,
             anchor_defs: HashMap::new(),
+            collection_key: None,
+            tree: None,
+        }
+    }
+
+    /// The key the value tree holds for the key about to be set in the
+    /// innermost mapping — its keys come in the order of the key events,
+    /// one per event — escaped as a pointer segment.
+    ///
+    /// `~` when the tree cannot tell: no pointer escapes to a lone `~`,
+    /// so the entry stays unaddressable and clashes with no other.
+    fn tree_key(&mut self) -> String {
+        let Some(Frame::Mapping { keys, .. }) = self.stack.last() else {
+            return "~".to_owned();
+        };
+        let index = *keys;
+        let bytes = self.bytes;
+        let tree = self.tree.get_or_insert_with(|| {
+            crate::parsers::Yaml
+                .parse(bytes)
+                .ok()
+                .map(|doc| match doc.values() {
+                    Some(values) => Value::Array(values.to_vec()),
+                    None => doc.value().clone(),
+                })
+        });
+        let mut node = tree.as_ref();
+        for segment in &self.path {
+            node = node.and_then(|node| match node {
+                Value::Map(map) => map.get(&pointer_unescape(segment)),
+                Value::Array(items) => segment.parse::<usize>().ok().and_then(|i| items.get(i)),
+                _ => None,
+            });
+        }
+        match node {
+            Some(Value::Map(map)) => map
+                .get_index(index)
+                .map_or_else(|| "~".to_owned(), |(key, _)| pointer_escape(key)),
+            _ => "~".to_owned(),
+        }
+    }
+
+    /// One event inside a collection used as a mapping key: anchors and
+    /// aliases are noted as a key's are (no pointer); the key's end sets
+    /// the pending key, as the value tree names the collection.
+    fn observe_in_key(&mut self, event: &Event<'_>, span: Span) {
+        let Some((start, depth)) = self.collection_key.as_mut() else {
+            return;
+        };
+        match event {
+            Event::SequenceStart(anchor, _) | Event::MappingStart(anchor, _) => {
+                *depth += 1;
+                let anchor = *anchor;
+                self.note_anchor(anchor, span, None);
+            }
+            Event::SequenceEnd | Event::MappingEnd => {
+                *depth -= 1;
+                if *depth == 0 {
+                    let start = *start;
+                    self.collection_key = None;
+                    let end = char_index_to_byte(self.char_to_byte, span.end.index());
+                    let key = self.tree_key();
+                    self.set_pending_key(key, start..end);
+                }
+            }
+            Event::Scalar(value, _, anchor, _) => {
+                if *anchor != 0 {
+                    self.anchored_scalars.insert(*anchor, value.to_string());
+                }
+                self.note_anchor(*anchor, span, None);
+            }
+            Event::Alias(anchor) => {
+                let at = char_index_to_byte(self.char_to_byte, span.start.index());
+                self.note_alias(*anchor, at, None);
+            }
+            _ => {}
         }
     }
 
@@ -1227,11 +1314,13 @@ impl<'src> State<'src> {
             pending_key,
             pending_key_range,
             saw_child,
+            keys,
             ..
         }) = self.stack.last_mut()
         {
             *pending_key = Some(key);
             *pending_key_range = Some(range);
+            *keys += 1;
             // A key event proves the mapping is non-empty, so `MappingEnd`
             // should NOT record an empty-container span. Setting `saw_child`
             // here keeps the bookkeeping consistent even if the matching
@@ -1364,6 +1453,7 @@ impl<'src> State<'src> {
                 style,
                 start_byte,
                 saw_child: false,
+                keys: 0,
                 container,
             }
         } else {
@@ -1386,6 +1476,32 @@ impl<'src> State<'src> {
     ) -> std::result::Result<(), Error> {
         let ordinal = self.next_ordinal;
         self.next_ordinal += 1;
+        if self.collection_key.is_some() {
+            self.observe_in_key(&event, span);
+            return Ok(());
+        }
+        if matches!(event, Event::SequenceStart(..) | Event::MappingStart(..)) && self.expects_key()
+        {
+            // A collection used as a key (`[1, 2]: a`, `? {k: v}`): its
+            // nodes are no values, and the value tree keys the entry by
+            // its text.
+            let start = char_index_to_byte(self.char_to_byte, span.start.index());
+            // A block mapping whose first key is a flow collection starts
+            // at that key's `[` / `{`, which `open_container` took for a
+            // flow mapping's; nothing was walked inside it since.
+            if let Some(Frame::Mapping {
+                style, start_byte, ..
+            }) = self.stack.last_mut()
+                && *style == ContextStyle::Flow
+                && *start_byte == start
+            {
+                *style = ContextStyle::Block;
+                self.flow_depth -= 1;
+            }
+            self.collection_key = Some((start, 0));
+            self.observe_in_key(&event, span);
+            return Ok(());
+        }
         match event {
             Event::StreamStart | Event::StreamEnd | Event::Nothing => {}
             Event::DocumentStart(_) => {
@@ -1483,13 +1599,12 @@ impl<'src> State<'src> {
                 let range = span_to_range(span, self.char_to_byte);
                 if self.expects_key() {
                     self.note_alias(anchor, range.start, None);
-                    // An alias of a collection keys the value tree by its
-                    // debug rendering, which no pointer can spell; the
-                    // empty segment keeps the entry unaddressable.
-                    let key = self
-                        .anchored_scalars
-                        .get(&anchor)
-                        .map_or_else(String::new, |text| pointer_escape(text));
+                    // An alias of a collection keys the value tree by the
+                    // collection's text, which the tree tells.
+                    let key = match self.anchored_scalars.get(&anchor) {
+                        Some(text) => pointer_escape(text),
+                        None => self.tree_key(),
+                    };
                     self.set_pending_key(key, range);
                 } else {
                     let entry = self.entry_anchor(range.start);
@@ -2086,6 +2201,11 @@ fn pointer_escape(segment: &str) -> String {
     // Order matters: `~` MUST be escaped before `/`; otherwise we'd
     // double-escape the `~` we just emitted for `/`.
     segment.replace('~', "~0").replace('/', "~1")
+}
+
+/// The key a pointer segment [`pointer_escape`] made spells.
+fn pointer_unescape(segment: &str) -> String {
+    segment.replace("~1", "/").replace("~0", "~")
 }
 
 /// Convert a `saphyr_parser::Span` (char-indexed) into a byte-indexed

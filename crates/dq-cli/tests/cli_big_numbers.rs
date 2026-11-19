@@ -1119,7 +1119,7 @@ fn a_float_tagged_big_key_reads_in_a_block_map() {
 /// repeats that key; a tagged big number inside a collection key is
 /// refused as it was, never shown with a stand-in tag.
 #[test]
-fn an_alias_key_repeats_its_anchor_and_a_tagged_collection_key_stays_refused() {
+fn an_alias_key_repeats_its_anchor_and_a_tagged_collection_key_reads() {
     let dir = dir_with(&[
         ("alias.yaml", "k: &x +1e400\n*x : v\n+1e400: w\n"),
         ("flow.yaml", "{&x +1e400: a, *x : b}\n"),
@@ -1140,10 +1140,8 @@ fn an_alias_key_repeats_its_anchor_and_a_tagged_collection_key_stays_refused() {
         assert_eq!(stdout, "", "{file}");
         assert_eq!(stderr, format!("parse error in {file}: {message}\n"));
     }
-    let (code, _, stderr) = failure_of(&dir, &["get", "seq.yaml", ""]);
-    assert_eq!(code, Some(3));
-    assert!(stderr.contains("expected a float"), "{stderr}");
-    assert!(!stderr.contains("xxx"), "{stderr}");
+    // A collection key holding one is named by its value, with no tag.
+    assert_eq!(stdout_of(&dir, &["keys", "seq.yaml", ""]), "[1e400]\n");
 }
 
 /// Exponents compare by value at any size, on either side of where one

@@ -442,6 +442,96 @@ pub(super) fn yaml11_float(literal: &str) -> Option<String> {
     Some(out)
 }
 
+/// The text a collection used as a mapping key becomes: `v` written as
+/// compact flow YAML — `[1, 2]`, `{k: v}`, `{a: [1, {b: c}]}`, `[]`, `{}`.
+/// A string is quoted when this writer would quote it as a value (`'on'`,
+/// `'a: b'`, `''`) or when it holds a flow indicator (`,` `[` `]` `{` `}`),
+/// which a plain scalar cannot hold in flow; a number is spelled as dq
+/// spells a number key (`1.5`, `1e400`); null is `null`. The text depends
+/// on `v` alone: no tag or anchor of the key, nor how it was written.
+pub(super) fn flow_key_text(v: &Value) -> String {
+    let mut out = String::new();
+    write_flow(v, &mut out);
+    out
+}
+
+fn write_flow(v: &Value, out: &mut String) {
+    match v {
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Int(i) => out.push_str(&i.to_string()),
+        // As serde_norway prints the number key it reads (ryu).
+        Value::Float(f) => out.push_str(&serde_norway::Number::from(*f).to_string()),
+        Value::BigInt(s) | Value::BigFloat(s) => out.push_str(s),
+        Value::String(s) => write_flow_string(s, out),
+        Value::Array(items) => {
+            out.push('[');
+            for (at, item) in items.iter().enumerate() {
+                if at > 0 {
+                    out.push_str(", ");
+                }
+                write_flow(item, out);
+            }
+            out.push(']');
+        }
+        Value::Map(map) => {
+            out.push('{');
+            for (at, (key, item)) in map.iter().enumerate() {
+                if at > 0 {
+                    out.push_str(", ");
+                }
+                write_flow_string(key, out);
+                out.push_str(": ");
+                write_flow(item, out);
+            }
+            out.push('}');
+        }
+    }
+}
+
+/// `s` as a flow scalar: plain when this writer writes it plain and it
+/// holds no flow indicator, else single-quoted, else — for a line break or
+/// a character a single-quoted scalar cannot hold — double-quoted.
+fn write_flow_string(s: &str, out: &mut String) {
+    if !s.contains([',', '[', ']', '{', '}']) && !typed_by_another_schema(s) && emitted_plain(s) {
+        out.push_str(s);
+    } else if s.chars().all(single_quotable) {
+        out.push('\'');
+        out.push_str(&s.replace('\'', "''"));
+        out.push('\'');
+    } else {
+        out.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\t' => out.push_str("\\t"),
+                '\r' => out.push_str("\\r"),
+                '\0' => out.push_str("\\0"),
+                '\u{85}' => out.push_str("\\N"),
+                '\u{2028}' => out.push_str("\\L"),
+                '\u{2029}' => out.push_str("\\P"),
+                c if single_quotable(c) => out.push(c),
+                c if u32::from(c) <= 0xFF => out.push_str(&format!("\\x{:02X}", u32::from(c))),
+                c if u32::from(c) <= 0xFFFF => out.push_str(&format!("\\u{:04X}", u32::from(c))),
+                c => out.push_str(&format!("\\U{:08X}", u32::from(c))),
+            }
+        }
+        out.push('"');
+    }
+}
+
+/// Whether a single-quoted scalar holds `c` as it is: a printable
+/// character (as libyaml, serde_norway's emitter, counts them) that is no
+/// line break.
+fn single_quotable(c: char) -> bool {
+    matches!(
+        c,
+        ' '..='~' | '\u{A0}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..
+    ) && !matches!(c, '\u{FEFF}' | '\u{2028}' | '\u{2029}')
+}
+
 /// Replaces the placeholders of `out` with their text, or `None` unless
 /// the marker occurs exactly once per placeholder, each time at one.
 fn substitute(out: &str, marker: &str, fixes: &[Fix]) -> Option<String> {
@@ -490,6 +580,45 @@ mod tests {
 
     fn s(text: &str) -> Value {
         Value::String(text.to_owned())
+    }
+
+    #[test]
+    fn flow_key_text_is_compact_flow_yaml_of_the_value() {
+        let nested = map(&[(
+            "a",
+            Value::Array(vec![Value::Int(1), map(&[("b", s("c"))])]),
+        )]);
+        assert_eq!(flow_key_text(&nested), "{a: [1, {b: c}]}");
+        let scalars = Value::Array(vec![
+            s("on"),
+            s("a: b"),
+            s(""),
+            s("x,y"),
+            s("it's"),
+            s("'q'"),
+            s("1e400"),
+            Value::BigFloat("1e400".into()),
+            Value::BigInt("123456789012345678901234567890".into()),
+            Value::Float(1.5),
+            Value::Float(1e16),
+            Value::Float(-0.0),
+            Value::Int(-3),
+            Value::Bool(true),
+            Value::Null,
+            Value::Array(vec![]),
+            map(&[]),
+        ]);
+        assert_eq!(
+            flow_key_text(&scalars),
+            "['on', 'a: b', '', 'x,y', it's, '''q''', '1e400', 1e400, \
+             123456789012345678901234567890, 1.5, 1e16, -0.0, -3, true, null, [], {}]"
+        );
+        let escaped = Value::Array(vec![s("a\nb"), s("tab\there"), s("\u{7}\"\\")]);
+        assert_eq!(
+            flow_key_text(&escaped),
+            r#"["a\nb", "tab\there", "\x07\"\\"]"#
+        );
+        assert_eq!(flow_key_text(&map(&[("", Value::Null)])), "{'': null}");
     }
 
     #[test]
