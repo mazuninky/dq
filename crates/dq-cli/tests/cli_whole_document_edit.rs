@@ -1468,30 +1468,43 @@ fn set_refuses_a_chain_with_no_create_or_under_a_scalar() {
     }
 }
 
-/// `dq patch` creates the chain for `add`; `--no-create` makes the
-/// parent of each `add` target a must.
+/// `dq patch` follows RFC 6902: `add`, `copy` and `move` into a missing
+/// parent are refused (exit 2, naming the op's own path), `--no-create`
+/// or not; a parent an earlier op made is there.
 #[test]
-fn patch_add_creates_the_chain_unless_no_create() {
-    let ops = r#"[{"op":"add","path":"/b/c","value":2}]"#;
-    check(&[Case {
-        name: "f.yaml",
-        src: "a: 1\n",
-        args: &["patch", "f.yaml", ops],
-        want: "a: 1\nb:\n  c: 2\n",
-        reads: json!({"a": 1, "b": {"c": 2}}),
-    }]);
-    refused(
-        "f.yaml",
-        "a: 1\n",
-        &["-i", "patch", "--no-create", "f.yaml", ops],
-        2,
-    );
+fn patch_never_creates_a_missing_parent() {
+    for ops in [
+        r#"[{"op":"add","path":"/b/c","value":2}]"#,
+        r#"[{"op":"copy","from":"/a","path":"/b/c"}]"#,
+        r#"[{"op":"move","from":"/a","path":"/b/c"}]"#,
+    ] {
+        for args in [
+            &["-i", "patch", "f.yaml", ops][..],
+            &["-i", "patch", "--no-create", "f.yaml", ops][..],
+        ] {
+            let stderr = refused("f.yaml", "a: 1\n", args, 2);
+            assert!(stderr.starts_with("path '/b/c' not found"), "{stderr}");
+        }
+    }
     let stepwise = r#"[{"op":"add","path":"/b","value":{}},{"op":"add","path":"/b/c","value":2}]"#;
     check(&[Case {
         name: "f.yaml",
         src: "a: 1\n",
-        args: &["patch", "--no-create", "f.yaml", stepwise],
+        args: &["patch", "f.yaml", stepwise],
         want: "a: 1\nb: {c: 2}\n",
         reads: json!({"a": 1, "b": {"c": 2}}),
+    }]);
+}
+
+/// The last `[[array]]` item of a CRLF file goes, and the `key = []`
+/// written in its place ends in `\r\n` too.
+#[test]
+fn del_of_the_last_toml_array_item_keeps_the_crlf_line_break() {
+    check(&[Case {
+        name: "f.toml",
+        src: "[[arr]]\r\nx = 1\r\n",
+        args: &["del", "f.toml", "/arr/0"],
+        want: "arr = []\r\n",
+        reads: json!({"arr": []}),
     }]);
 }

@@ -2914,6 +2914,7 @@ impl Document {
                 .then(|| self.toml_emptied_table(&tables, first, &parent_ptr))
                 .flatten()
                 .map(|line| with_line_ending_at(&self.original_bytes, first, line));
+            let line_break = LineBreak::at(&self.original_bytes, first);
             for range in ranges.into_iter().rev() {
                 self.original_bytes.drain(range);
             }
@@ -2931,13 +2932,21 @@ impl Document {
                 } else {
                     Value::Array(Vec::new())
                 };
-                return self
-                    .set_at_unchecked(&parent_ptr, empty, &LayoutCache::new())
+                // A file left with no line break cannot tell the new line
+                // how to end: it ends as the file's did.
+                let no_line_break_left = !self.original_bytes.contains(&b'\n');
+                self.set_at_unchecked(&parent_ptr, empty, &LayoutCache::new())
                     .map_err(|_| Error::EditRejected {
                         action: "delete",
                         pointer: canonical.clone(),
                         reason: "dq cannot keep the table it empties".to_owned(),
-                    });
+                    })?;
+                if no_line_break_left && line_break != LineBreak::Lf {
+                    let bytes = std::mem::take(&mut self.original_bytes);
+                    self.original_bytes = with_line_break(line_break, bytes);
+                    return self.adopt_reparse("delete", &canonical);
+                }
+                return Ok(());
             }
             return Ok(());
         }

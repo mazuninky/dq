@@ -24,8 +24,8 @@ pub struct PatchArgs {
     #[arg(long = "line-format")]
     pub line_format: bool,
 
-    /// Reject the operation if any intermediate node along an `add`/`replace`
-    /// pointer is missing. Equivalent to set's `--no-create`.
+    /// Accepted for symmetry with `set --no-create`; changes nothing here:
+    /// `patch` follows RFC 6902 and never creates missing parents.
     #[arg(long = "no-create")]
     pub no_create: bool,
 }

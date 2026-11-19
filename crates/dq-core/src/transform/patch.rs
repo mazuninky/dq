@@ -39,8 +39,10 @@ use crate::pointer::{Pointer, Segment};
 pub enum PatchOp {
     /// `{"op":"add","path":"/a/b","value":...}` — insert or replace at `path`.
     ///
-    /// Missing mappings on the way to `path` are created, as `set_at`
-    /// creates them (`dq patch --no-create` refuses them instead).
+    /// As RFC 6902 §4.1 asks, the parent of `path` must exist: a missing
+    /// one is [`Error::Path`] with `kind = MissingKey` for `path`, and
+    /// nothing is created on the way (unlike `Document::set_at`). `copy`
+    /// and `move` targets follow the same rule.
     Add {
         /// Target pointer.
         path: Pointer,
@@ -291,9 +293,31 @@ pub fn apply_patch(doc: &mut Document, ops: &[PatchOp]) -> Result<()> {
     Ok(())
 }
 
+/// RFC 6902 §4.1: the target of an `add` (and of a `copy` / `move`) is
+/// the root, a member of an existing object or an element of an existing
+/// array. A missing parent is the `MissingKey` error for `path` itself.
+fn parent_exists(doc: &Document, path: &Pointer) -> Result<()> {
+    let Some((_, parent)) = path.segments().split_last() else {
+        return Ok(());
+    };
+    match Pointer::new(parent.to_vec()).resolve(doc.value()) {
+        Ok(_) => Ok(()),
+        Err(Error::Path { matched_prefix, .. }) => Err(Error::Path {
+            pointer: path.as_canonical(),
+            matched_prefix,
+            kind: PathErrorKind::MissingKey,
+            did_you_mean: Vec::new(),
+        }),
+        Err(err) => Err(err),
+    }
+}
+
 fn apply_one(doc: &mut Document, op: &PatchOp) -> Result<()> {
     match op {
-        PatchOp::Add { path, value } => doc.set_at(path, value.clone()),
+        PatchOp::Add { path, value } => {
+            parent_exists(doc, path)?;
+            doc.set_at(path, value.clone())
+        }
         PatchOp::Remove { path } => doc.del_at(path),
         PatchOp::Replace { path, value } => {
             // RFC 6902 §4.3: target MUST exist. M2's `set_at` already returns
@@ -308,11 +332,13 @@ fn apply_one(doc: &mut Document, op: &PatchOp) -> Result<()> {
         }
         PatchOp::Move { from, path } => {
             let v = read_value_at(doc, from)?;
+            parent_exists(doc, path)?;
             doc.del_at(from)?;
             doc.set_at(path, v)
         }
         PatchOp::Copy { from, path } => {
             let v = read_value_at(doc, from)?;
+            parent_exists(doc, path)?;
             doc.set_at(path, v)
         }
         PatchOp::Test { path, value } => {
@@ -515,6 +541,34 @@ mod tests {
         match doc.value() {
             Value::Map(m) => assert_eq!(m.get("a"), Some(&Value::Int(5))),
             other => panic!("expected map, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_patch_add_into_a_missing_parent_is_missing_key_for_its_path() {
+        let path = Pointer::parse("/b/c").unwrap();
+        for op in [
+            PatchOp::Add {
+                path: path.clone(),
+                value: Value::Int(2),
+            },
+            PatchOp::Copy {
+                from: Pointer::parse("/a").unwrap(),
+                path: path.clone(),
+            },
+            PatchOp::Move {
+                from: Pointer::parse("/a").unwrap(),
+                path: path.clone(),
+            },
+        ] {
+            let mut doc = yaml_doc_one("a", 3);
+            let err = apply_patch(&mut doc, &[op]).expect_err("no parent");
+            assert!(
+                matches!(&err, Error::Path { pointer, matched_prefix, kind: PathErrorKind::MissingKey, .. }
+                    if pointer == "/b/c" && matched_prefix.is_empty()),
+                "{err:?}"
+            );
+            assert_eq!(doc.original_bytes(), b"a: 3\n");
         }
     }
 
