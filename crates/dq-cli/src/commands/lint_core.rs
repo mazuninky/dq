@@ -28,8 +28,8 @@ use dq_exec::{Diagnostic, Evaluator, LoaderArgs, RuleLoader, RuleSet, Severity};
 use indexmap::IndexSet;
 use walkdir::WalkDir;
 
-use crate::cli::Cli;
-use crate::commands::io_helpers::{load_document_for_lint, pick_format};
+use crate::cli::{Cli, DocSelector};
+use crate::commands::io_helpers::{checked_index, load_document_for_lint, pick_format};
 use crate::commands::plugin_loader::{self, LoadedPlugins};
 use crate::error::{InvalidInput, LintFail, LintWarnStrict};
 use crate::output::Reporter;
@@ -140,24 +140,35 @@ pub(crate) fn run_with_rulesets(
         // by the evaluator's `loc.pointer` chain) needs to resolve to a
         // real `(line, col)`. See `load_document_for_lint` for the rationale.
         let (_doc_fmt, doc) = load_document_for_lint(file, input_format)?;
-        let ir = doc.as_ir();
-        let mut file_diags = evaluator.evaluate_file(file, &ir, &format_name);
-        diagnostics.append(&mut file_diags);
-        // After the rule engine runs every `@std/*` and `--rules`-loaded
-        // rule, give every plugin loaded from `--plugins <DIR>` a chance to
-        // contribute its own diagnostics. Plugin invocation errors
-        // propagate up — they bubble through `exit_code_for_error` and
-        // route via `PluginError::kind_name()`. We do NOT swallow them
-        // here, mirroring the rule-engine semantics for buggy rules.
-        if let Some(loaded) = plugins.as_ref()
-            && let Some(runtime) = loaded.runtime.as_ref()
-        {
-            for handle in &loaded.handles {
-                let mut plugin_diags = runtime
-                    .invoke_lint(handle, &ir, Some(file.as_path()))
-                    .map_err(anyhow::Error::new)?;
-                diagnostics.append(&mut plugin_diags);
+        // Each document of a multi-document stream is linted as a document
+        // of its own — `match.filter`, `check`, `loc.*`, composite
+        // `extract` and plugins all see one document, as they would in a
+        // file of its own. `--doc N` keeps only document N.
+        let only = match cli.doc {
+            Some(DocSelector::Index(index)) => Some(checked_index(&doc, index, file)?),
+            Some(DocSelector::All) | None => None,
+        };
+        match doc.stream_documents() {
+            Some(parts) => {
+                for part in parts.iter().filter(|p| only.is_none_or(|i| p.index() == i)) {
+                    lint_document(
+                        &evaluator,
+                        plugins.as_ref(),
+                        file,
+                        &part.as_ir(),
+                        &format_name,
+                        &mut diagnostics,
+                    )?;
+                }
             }
+            None => lint_document(
+                &evaluator,
+                plugins.as_ref(),
+                file,
+                &doc.as_ir(),
+                &format_name,
+                &mut diagnostics,
+            )?,
         }
     }
 
@@ -165,6 +176,39 @@ pub(crate) fn run_with_rulesets(
     reporter.report(&envelope, out)?;
 
     classify_exit(&diagnostics, cli.strict)
+}
+
+/// Lint one document — a whole file, or one document of a stream — with
+/// the rule engine and then every loaded plugin, appending to
+/// `diagnostics`.
+///
+/// After the rule engine runs every `@std/*` and `--rules`-loaded rule,
+/// every plugin loaded from `--plugins <DIR>` gets a chance to contribute
+/// its own diagnostics. Plugin invocation errors propagate — they bubble
+/// through `exit_code_for_error` and route via `PluginError::kind_name()`;
+/// they are not swallowed, mirroring the rule-engine semantics for buggy
+/// rules.
+fn lint_document(
+    evaluator: &Evaluator,
+    plugins: Option<&LoadedPlugins>,
+    file: &Utf8Path,
+    ir: &dq_core::Ir<'_>,
+    format_name: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> anyhow::Result<()> {
+    let mut found = evaluator.evaluate_file(file, ir, format_name);
+    diagnostics.append(&mut found);
+    if let Some(loaded) = plugins
+        && let Some(runtime) = loaded.runtime.as_ref()
+    {
+        for handle in &loaded.handles {
+            let mut plugin_diags = runtime
+                .invoke_lint(handle, ir, Some(file))
+                .map_err(anyhow::Error::new)?;
+            diagnostics.append(&mut plugin_diags);
+        }
+    }
+    Ok(())
 }
 
 /// Expand each input path: if it contains glob metacharacters (`*`/`?`/`[`)

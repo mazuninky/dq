@@ -134,3 +134,27 @@ pub struct LintWarnStrict {
     /// Number of warn-severity diagnostics emitted during the run.
     pub count: usize,
 }
+
+/// `--doc N` named a document the file does not have. Maps to exit code 2
+/// (`NOT_FOUND`) — the same family as a JSON Pointer that addresses no
+/// node: the file is fine, the address is not in it.
+#[derive(Debug, thiserror::Error)]
+#[error("--doc {index} is out of range: {file} holds {count} document(s){}", index_hint(*.count))]
+pub struct DocOutOfRange {
+    /// The requested index.
+    pub index: usize,
+    /// How many documents the file holds (1 for a file that is not a
+    /// multi-document stream).
+    pub count: usize,
+    /// The file, as given on the command line (`-` for stdin).
+    pub file: String,
+}
+
+/// `" (0..=N)"` — the valid `--doc` indices for `count` documents.
+fn index_hint(count: usize) -> String {
+    match count {
+        0 => String::new(),
+        1 => " (--doc 0)".to_owned(),
+        n => format!(" (--doc 0 to {})", n - 1),
+    }
+}

@@ -40,10 +40,12 @@ use camino::Utf8Path;
 use dq_core::{Document, Pointer, Value};
 use indexmap::IndexMap;
 
-use super::io_helpers::{load_document_with_path, pick_format, read_bytes};
+use super::io_helpers::{
+    checked_index, load_document_with_path, pick_format, pointer_in_document, read_bytes,
+};
 use super::query::jq_compile_to_parse;
 use crate::bulk::{self, FileOp, FileOpResult};
-use crate::cli::{Cli, SetArgs};
+use crate::cli::{Cli, DocSelector, SetArgs};
 use crate::error::InvalidInput;
 
 /// Run `dq set`.
@@ -74,6 +76,16 @@ pub fn run(
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
     cli.ensure_write_flags_consistent()?;
+    let doc_index = match cli.doc {
+        Some(DocSelector::All) => {
+            return Err(cli.doc_usage_error(
+                "set",
+                "it edits one document; pass --doc N, or address the stream as /N/...",
+            ));
+        }
+        Some(DocSelector::Index(index)) => Some(index),
+        None => None,
+    };
 
     // M4 §4 / design D5: `--sort-keys` and `--indent` are no-ops on the
     // textual-edit splice path. The set handler reads `doc.original_bytes()`
@@ -104,7 +116,15 @@ pub fn run(
                 "--jq applies to the document root; positional POINTER is not accepted (got '{p}')",
             ))));
         }
-        return run_jq_transform(cli, args, expression, input_format, use_color, out);
+        return run_jq_transform(
+            cli,
+            args,
+            expression,
+            input_format,
+            doc_index,
+            use_color,
+            out,
+        );
     }
 
     // The non-jq path requires a pointer. Surface a structured InvalidInput
@@ -135,6 +155,7 @@ pub fn run(
         input_format,
         use_color,
         pointer: &pointer,
+        doc_index,
         value: &value,
         no_create: args.no_create,
     };
@@ -151,6 +172,8 @@ struct SetFileOp<'a> {
     input_format: Option<&'a str>,
     use_color: bool,
     pointer: &'a Pointer,
+    /// `--doc N`: `pointer` is relative to document `N` of a stream.
+    doc_index: Option<usize>,
     value: &'a Value,
     /// When `true`, fail (exit 2) instead of creating missing keys via
     /// the mkdir-p path in `Document::set_at`. Mirrors `--no-create` on
@@ -191,6 +214,7 @@ impl<'a> FileOp for SetFileOp<'a> {
         //    via `Toml::parse`; JSONL is read-only, so `set_at` will return
         //    `WriteUnavailable` and the exit-code mapper picks 7).
         let mut document = parse_to_document(format, &parse_input, path)?;
+        let pointer = pointer_in_document(&document, self.doc_index, self.pointer, path)?;
 
         // 5. Apply the write. Cloning the value is unavoidable because
         //    `set_at` consumes a `Value` (the engine takes ownership of the
@@ -204,12 +228,12 @@ impl<'a> FileOp for SetFileOp<'a> {
         // Skip pre-resolve on the read-only sentinel so `set_at` returns the
         // more accurate `WriteUnavailable` instead of `MissingKey`.
         if self.no_create && !document.original_bytes().is_empty() {
-            self.pointer
+            pointer
                 .resolve(document.value())
                 .map_err(anyhow::Error::new)?;
         }
         document
-            .set_at(self.pointer, self.value.clone())
+            .set_at(&pointer, self.value.clone())
             .map_err(anyhow::Error::new)?;
 
         // 6. Compute the final output bytes, restoring template
@@ -250,6 +274,8 @@ impl<'a> FileOp for SetFileOp<'a> {
 struct JqFileOp<'a> {
     cli: &'a Cli,
     input_format: Option<&'a str>,
+    /// `--doc N`: the filter transforms document `N` of a stream alone.
+    doc_index: Option<usize>,
     use_color: bool,
     engine: Arc<dq_transform::JqEngine>,
 }
@@ -273,9 +299,20 @@ impl<'a> FileOp for JqFileOp<'a> {
         // The value goes to jq as a `dq_core::Value`, not through
         // `serde_json::Value`: that one has no NaN or infinity, and an
         // untouched `.nan` would come back as the string `'.nan'`.
+        //
+        // `--doc N` hands the filter one document of a stream; without it
+        // a stream reaches the filter as the array of its documents.
+        let target = match self.doc_index {
+            Some(index) => Some(checked_index(&document, index, path)?),
+            None => None,
+        };
+        let input = match (target, document.values()) {
+            (Some(index), Some(values)) => &values[index],
+            _ => document.value(),
+        };
         let outputs = self
             .engine
-            .run_value(document.value())
+            .run_value(input)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         // The single-output rule (design D5): collect outputs, require
@@ -299,7 +336,7 @@ impl<'a> FileOp for JqFileOp<'a> {
 
         // Build a value-only document for the re-emit path. A NaN or an
         // infinity is a float here: YAML / TOML write it, JSON fails.
-        let new_doc = Document::value_only(single, document.format());
+        let new_doc = rebuild_document(&document, target, single, path)?;
 
         // Re-emit through `write_with_options` so global `--sort-keys` /
         // `--indent` are honoured (this is one of the differences vs the
@@ -331,6 +368,44 @@ impl<'a> FileOp for JqFileOp<'a> {
     }
 }
 
+/// The document `set --jq` writes back, given the filter's single output.
+///
+/// A multi-document stream stays one, so the writer emits every document
+/// with its `---` instead of one document holding a sequence: with
+/// `--doc N` (`target`) the output replaces document `N` alone; without it
+/// the filter saw the array of the documents and must return such an
+/// array, each item becoming a document.
+///
+/// # Errors
+///
+/// [`InvalidInput`] (exit 6) when a filter over a whole stream returns
+/// anything but an array.
+fn rebuild_document(
+    document: &Document,
+    target: Option<usize>,
+    output: Value,
+    path: &Utf8Path,
+) -> anyhow::Result<Document> {
+    let Some(values) = document.values() else {
+        return Ok(Document::value_only(output, document.format()));
+    };
+    match (target, output) {
+        (Some(index), output) => {
+            let mut documents = values.to_vec();
+            documents[index] = output;
+            Ok(Document::multi_value_only(documents, document.format()))
+        }
+        (None, Value::Array(documents)) => {
+            Ok(Document::multi_value_only(documents, document.format()))
+        }
+        (None, other) => Err(anyhow::Error::new(InvalidInput::new(format!(
+            "{path} is a stream of {} documents: --jq sees them as an array and must return an array of documents (got {}); pass --doc N to transform one document",
+            values.len(),
+            other.type_name(),
+        )))),
+    }
+}
+
 /// Compile the jq expression once and dispatch the bulk driver against the
 /// resulting [`JqFileOp`]. The engine is wrapped in an [`Arc`] so each rayon
 /// worker shares the same compiled filter (the engine is `Send + Sync` but
@@ -340,6 +415,7 @@ fn run_jq_transform(
     args: &SetArgs,
     expression: &str,
     input_format: Option<&str>,
+    doc_index: Option<usize>,
     use_color: bool,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
@@ -372,6 +448,7 @@ fn run_jq_transform(
     let op = JqFileOp {
         cli,
         input_format,
+        doc_index,
         use_color,
         engine: Arc::new(engine),
     };
@@ -393,7 +470,9 @@ fn parse_to_document(
 ) -> anyhow::Result<Document> {
     let path_label = camino::Utf8PathBuf::from(file);
     let doc_result: dq_core::Result<Document> = match format.name() {
-        "yaml" => dq_core::parse_yaml_with_spans(parse_input),
+        // Stream-aware, so `--doc N` can tell a stream of documents from a
+        // document holding a sequence; the edit itself is the same.
+        "yaml" => dq_core::parse_yaml_stream_with_spans(parse_input),
         "json" => dq_core::parse_json_with_spans(parse_input),
         _ => format.parse(parse_input),
     };

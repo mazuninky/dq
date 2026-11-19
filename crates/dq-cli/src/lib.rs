@@ -14,7 +14,7 @@ pub mod exit_code;
 pub mod output;
 
 pub use cli::{Cli, Command};
-pub use error::{LintFail, SilentError, ValidateFail};
+pub use error::{DocOutOfRange, LintFail, SilentError, ValidateFail};
 
 use std::io::Write;
 
@@ -59,7 +59,14 @@ fn dispatch(
     err: &mut dyn Write,
 ) -> anyhow::Result<()> {
     let input_format = cli.format.as_input_format_name();
-    let doc_arg = cli.doc.as_deref();
+    // `--doc` is global, so clap accepts it on every command; refuse it
+    // where the command would otherwise ignore it.
+    if cli.doc.is_some()
+        && let Some(why) = cli.command.doc_unsupported_reason()
+    {
+        return Err(cli.doc_usage_error(cli.command.name(), why));
+    }
+    let doc_arg = cli.doc;
     // M4 §3: snapshot the global re-emit flags into a `WriteOptions` so
     // every handler that touches `Format::write_with_options` shares the
     // same view. Read commands ignore it; `set`/`del`/`patch`/`merge`
@@ -268,6 +275,11 @@ pub fn render_error(err: &anyhow::Error, w: &mut dyn Write) -> std::io::Result<(
         // The validate handler already wrote a structured error through its
         // reporter to the caller-supplied stderr writer. Don't print again.
         return Ok(());
+    }
+    if let Some(usage) = err.downcast_ref::<clap::Error>() {
+        // Rendered the way clap renders its own usage errors: `error: …`,
+        // the usage line, the `--help` hint.
+        return write!(w, "{usage}");
     }
     if let Some(dq_core::Error::Path {
         pointer,

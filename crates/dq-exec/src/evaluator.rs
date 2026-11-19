@@ -743,15 +743,17 @@ fn run_schema_check(
             // `instance_path → span` lookup the schema check used
             // before Phase 2.
             match Pointer::parse(pointer_str) {
-                Ok(pointer) => ir.line_col_for(&pointer).unwrap_or((1, 1)),
+                Ok(pointer) => ir
+                    .line_col_for(&pointer)
+                    .unwrap_or_else(|| ir.origin_line_col()),
                 Err(parse_err) => {
                     tracing::trace!(
                         rule_id = %rule.rule.id,
                         pointer = %pointer_str,
                         error = %parse_err,
-                        "schema instance_path failed to parse as RFC 6901; defaulting to (1, 1)",
+                        "schema instance_path failed to parse as RFC 6901; defaulting to the document start",
                     );
-                    (1, 1)
+                    ir.origin_line_col()
                 }
             }
         };
@@ -939,8 +941,9 @@ fn resolve_loc_position(
         }
     }
 
-    // Step 3: default.
-    (1, 1)
+    // Step 3: default — the top of the file, or of the document for one
+    // document of a stream.
+    ir.origin_line_col()
 }
 
 #[cfg(test)]

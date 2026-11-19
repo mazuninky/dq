@@ -228,6 +228,24 @@ check:
 
 `dq rules add @std/<ns>` materialises a standard ruleset into `./.dq/rules/<ns>/` for local override or vendoring.
 
+## Multi-document YAML streams
+
+A YAML file with several `---`-separated documents (a Kubernetes manifest bundle, say) is a stream. `lint`, `check` and `fix` treat each document as a file of its own: rules match, check, locate and fix one document at a time, and diagnostics carry the line in the file. `dq fix` writes every document back, `---` separators included.
+
+`--doc N|all` picks the document a command works on; a file that is not a stream is document 0:
+
+```sh
+dq get bundle.yaml /metadata/name                 # document 0
+dq --doc 1 get bundle.yaml /metadata/name         # the second document
+dq --doc all query '.[].kind' bundle.yaml         # the stream as an array of documents
+dq --doc 1 set bundle.yaml /spec/replicas 3 -i    # pointer relative to document 1
+dq set bundle.yaml /1/spec/replicas 3 -i          # the same edit without --doc
+dq --doc 1 lint bundle.yaml                       # lint the second document only
+dq --doc 1 convert bundle.yaml -F json            # convert one document
+```
+
+Read commands (`get`, `exists`, `keys`, `values`, `len`, `type`, `paths`, `select`, `query`) read document 0 unless told otherwise. `set --jq` without `--doc` sees the stream as an array of documents and must return one. `--doc all` is refused by `set` and `del`, any `--doc` by `convert -i` and by commands that work on the whole file (`fmt`, `validate`, `diff`, `patch`, `merge`, …): a usage error, exit 2. An index past the last document is exit 2 as well.
+
 ## Global write flags & exit codes
 
 Write commands (`set`, `del`, `patch`, `merge`, `convert`, `fmt`, `fix`) share these flags:
@@ -250,7 +268,7 @@ Bulk multi-file mode prints `Modified: N, Skipped: M, Failed: K`. Single-file in
 |---|---|
 | 0 | success |
 | 1 | generic (`--check` changes pending, `PatchTestFailed`, a value `convert`, `query` or `set --jq` cannot write in the output format, such as NaN or Infinity in JSON) |
-| 2 | not found |
+| 2 | not found (a JSON Pointer or a `--doc N` the file does not have); usage error (incl. `--doc` on a command that cannot honour it) |
 | 3 | parse error (incl. templated file) |
 | 4 | validate fail |
 | 5 | I/O error (read; `self check` / `update` network errors) |

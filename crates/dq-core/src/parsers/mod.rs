@@ -34,7 +34,7 @@ pub use xml::Xml;
 pub use yaml::Yaml;
 pub use yaml_spans::{
     YamlInsertionRenderer, YamlScalarRenderer, parse_with_spans as parse_yaml_with_spans_pair,
-    parse_yaml_with_spans,
+    parse_yaml_stream_with_spans, parse_yaml_with_spans,
 };
 
 use crate::format::Format;

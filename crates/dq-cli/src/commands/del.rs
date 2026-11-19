@@ -31,9 +31,9 @@ use std::io::Write;
 use camino::Utf8Path;
 use dq_core::{Document, Pointer};
 
-use super::io_helpers::{pick_format, read_bytes};
+use super::io_helpers::{pick_format, pointer_in_document, read_bytes};
 use crate::bulk::{self, FileOp, FileOpResult};
-use crate::cli::{Cli, DelArgs};
+use crate::cli::{Cli, DelArgs, DocSelector};
 
 /// Run `dq del`.
 ///
@@ -67,6 +67,17 @@ pub fn run(
         );
     }
 
+    let doc_index = match cli.doc {
+        Some(DocSelector::All) => {
+            return Err(cli.doc_usage_error(
+                "del",
+                "it edits one document; pass --doc N, or address the stream as /N/...",
+            ));
+        }
+        Some(DocSelector::Index(index)) => Some(index),
+        None => None,
+    };
+
     // Parse the pointer ONCE — every file uses the same pointer.
     let pointer = Pointer::parse(&args.pointer).map_err(anyhow::Error::new)?;
 
@@ -75,6 +86,7 @@ pub fn run(
         input_format,
         use_color,
         pointer: &pointer,
+        doc_index,
     };
 
     let files = bulk::expand_glob(&args.file)?;
@@ -88,6 +100,8 @@ struct DelFileOp<'a> {
     input_format: Option<&'a str>,
     use_color: bool,
     pointer: &'a Pointer,
+    /// `--doc N`: `pointer` is relative to document `N` of a stream.
+    doc_index: Option<usize>,
 }
 
 impl<'a> FileOp for DelFileOp<'a> {
@@ -113,7 +127,8 @@ impl<'a> FileOp for DelFileOp<'a> {
         };
 
         let mut document = parse_to_document(format, &parse_input, path)?;
-        document.del_at(self.pointer).map_err(anyhow::Error::new)?;
+        let pointer = pointer_in_document(&document, self.doc_index, self.pointer, path)?;
+        document.del_at(&pointer).map_err(anyhow::Error::new)?;
 
         let mut final_bytes = document.original_bytes().to_vec();
         if let Some(map) = &placeholder_map {
@@ -155,7 +170,9 @@ fn parse_to_document(
 ) -> anyhow::Result<Document> {
     let path_label = camino::Utf8PathBuf::from(file);
     let doc_result: dq_core::Result<Document> = match format.name() {
-        "yaml" => dq_core::parse_yaml_with_spans(parse_input),
+        // Stream-aware, so `--doc N` can tell a stream of documents from a
+        // document holding a sequence; the edit itself is the same.
+        "yaml" => dq_core::parse_yaml_stream_with_spans(parse_input),
         "json" => dq_core::parse_json_with_spans(parse_input),
         _ => format.parse(parse_input),
     };

@@ -155,6 +155,38 @@ impl EditScript {
         self.0.is_empty()
     }
 
+    /// The same script with every op's path moved below `parent`.
+    ///
+    /// A fix written against one document of a multi-document stream (a
+    /// rule's `fix.ops`, a plugin's script) addresses that document's root
+    /// as `""`; the stream's write-aware [`Document`] addresses it as
+    /// `/N`. `script.under(&Pointer::new(vec![Segment::Index(n)]))` is the
+    /// script for the whole stream.
+    ///
+    /// [`Segment`]: crate::pointer::Segment
+    #[must_use]
+    pub fn under(&self, parent: &Pointer) -> Self {
+        let rebase = |path: &Pointer| {
+            let mut segments = parent.segments().to_vec();
+            segments.extend_from_slice(path.segments());
+            Pointer::new(segments)
+        };
+        self.0
+            .iter()
+            .map(|op| match op {
+                EditOp::Add { path, value } => EditOp::Add {
+                    path: rebase(path),
+                    value: value.clone(),
+                },
+                EditOp::Replace { path, value } => EditOp::Replace {
+                    path: rebase(path),
+                    value: value.clone(),
+                },
+                EditOp::Remove { path } => EditOp::Remove { path: rebase(path) },
+            })
+            .collect()
+    }
+
     /// Apply every op to `doc` in declaration order.
     ///
     /// Each op is dispatched to [`Document::set_at`] (for [`EditOp::Add`] /
@@ -917,5 +949,32 @@ mod tests {
             }
             other => panic!("expected map, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn under_prefixes_every_op_path_with_the_parent() {
+        let mut script = EditScript::new();
+        script.push(EditOp::Add {
+            path: Pointer::parse("/a").unwrap(),
+            value: Value::Int(1),
+        });
+        script.push(EditOp::Replace {
+            path: Pointer::parse("").unwrap(),
+            value: Value::Null,
+        });
+        script.push(EditOp::Remove {
+            path: Pointer::parse("/b/0").unwrap(),
+        });
+        let rebased = script.under(&Pointer::parse("/2").unwrap());
+        let paths: Vec<String> = rebased
+            .ops()
+            .iter()
+            .map(|op| match op {
+                EditOp::Add { path, .. }
+                | EditOp::Replace { path, .. }
+                | EditOp::Remove { path } => path.as_canonical(),
+            })
+            .collect();
+        assert_eq!(paths, vec!["/2/a", "/2", "/2/b/0"]);
     }
 }

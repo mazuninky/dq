@@ -20,6 +20,7 @@ mod completions;
 mod convert;
 mod del;
 mod diff;
+mod doc;
 mod exists;
 mod explain;
 mod fix;
@@ -48,6 +49,7 @@ pub use completions::CompletionsArgs;
 pub use convert::ConvertArgs;
 pub use del::DelArgs;
 pub use diff::DiffArgs;
+pub use doc::DocSelector;
 pub use exists::ExistsArgs;
 pub use explain::ExplainArgs;
 pub use fix::FixArgs;
@@ -97,12 +99,29 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_pager: bool,
 
-    /// Document index for multi-document streams ("0", "1", ...) or "all".
+    /// Which document of a multi-document YAML stream (`---`-separated) to
+    /// work on: an index counting from 0, or `all`.
     ///
-    /// Parsed in M1 but not yet wired into command handlers; semantics arrive
-    /// in M2.
-    #[arg(long, value_name = "IDX", global = true)]
-    pub doc: Option<String>,
+    /// A file that is not a stream is document 0; any other index is out of
+    /// range (exit 2).
+    ///
+    /// get, exists, keys, values, len, type, paths, select, query: read
+    /// document 0 unless told otherwise; `--doc all` reads the stream as an
+    /// array of its documents (`/1/...` is the second one).
+    ///
+    /// convert: writes only the chosen document (`--doc all`: every
+    /// document); not with -i, which would delete the other documents
+    /// along with the source.
+    ///
+    /// set, del: the pointer is relative to the chosen document. Without
+    /// `--doc` a stream is addressed as `/N/...`. `--doc all` is refused.
+    ///
+    /// lint, check, fix: every document of a stream is linted and fixed as
+    /// a document of its own; `--doc N` limits them to one.
+    ///
+    /// Every other command refuses `--doc` (exit 2).
+    #[arg(long, value_name = "N|all", global = true)]
+    pub doc: Option<DocSelector>,
 
     /// Edit the file in place. Only meaningful for write subcommands
     /// (`set`, `del`); read subcommands reject this flag.
@@ -327,6 +346,22 @@ impl Cli {
         ))))
     }
 
+    /// The usage error (exit 2) for a `--doc` value `command` cannot
+    /// honour, built by clap so it reads like every other usage error.
+    ///
+    /// Returned instead of ignoring the flag: a command that silently reads
+    /// document 0, or the whole stream, when asked for document 3 answers a
+    /// question nobody asked.
+    #[must_use]
+    pub fn doc_usage_error(&self, command: &str, why: &str) -> anyhow::Error {
+        let shown = self.doc.map_or_else(String::new, |doc| format!(" {doc}"));
+        let message = format!("`--doc{shown}` is not supported by `dq {command}`: {why}");
+        anyhow::Error::new(
+            <Self as clap::CommandFactory>::command()
+                .error(clap::error::ErrorKind::ArgumentConflict, message),
+        )
+    }
+
     /// Build a [`dq_core::WriteOptions`] snapshot from the current global
     /// flags.
     ///
@@ -414,6 +449,78 @@ pub enum Command {
     /// Generate man pages and shell completions (hidden).
     #[command(hide = true)]
     GenerateDocs(GenerateDocsArgs),
+}
+
+impl Command {
+    /// Why this command cannot take `--doc` at all, or `None` when it
+    /// honours the flag (see [`Cli::doc`] for what each of them does with
+    /// it). The dispatcher turns a `Some` into [`Cli::doc_usage_error`].
+    #[must_use]
+    pub fn doc_unsupported_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Get(_)
+            | Self::Exists(_)
+            | Self::Keys(_)
+            | Self::Values(_)
+            | Self::Len(_)
+            | Self::Type(_)
+            | Self::Paths(_)
+            | Self::Select(_)
+            | Self::Query(_)
+            | Self::Convert(_)
+            | Self::Set(_)
+            | Self::Del(_)
+            | Self::Lint(_)
+            | Self::Check(_)
+            | Self::Fix(_) => None,
+            Self::Fmt(_) => Some("it re-emits the whole file"),
+            Self::Validate(_) => Some("it checks that the whole file parses"),
+            Self::Diff(_) => Some("it compares two whole files"),
+            Self::Patch(_) => Some("address a document in the patch paths as /N/..."),
+            Self::Merge(_) => Some("it merges into the whole file"),
+            Self::Completions(_)
+            | Self::Man(_)
+            | Self::Self_(_)
+            | Self::Test(_)
+            | Self::Explain(_)
+            | Self::Rules(_)
+            | Self::GenerateDocs(_) => Some("it reads no data file"),
+        }
+    }
+
+    /// The command's name as typed on the command line.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Get(_) => "get",
+            Self::Exists(_) => "exists",
+            Self::Keys(_) => "keys",
+            Self::Values(_) => "values",
+            Self::Len(_) => "len",
+            Self::Type(_) => "type",
+            Self::Paths(_) => "paths",
+            Self::Select(_) => "select",
+            Self::Convert(_) => "convert",
+            Self::Fmt(_) => "fmt",
+            Self::Validate(_) => "validate",
+            Self::Diff(_) => "diff",
+            Self::Set(_) => "set",
+            Self::Del(_) => "del",
+            Self::Patch(_) => "patch",
+            Self::Query(_) => "query",
+            Self::Merge(_) => "merge",
+            Self::Completions(_) => "completions",
+            Self::Man(_) => "man",
+            Self::Self_(_) => "self",
+            Self::Lint(_) => "lint",
+            Self::Check(_) => "check",
+            Self::Test(_) => "test",
+            Self::Explain(_) => "explain",
+            Self::Rules(_) => "rules",
+            Self::Fix(_) => "fix",
+            Self::GenerateDocs(_) => "generate-docs",
+        }
+    }
 }
 
 #[cfg(test)]

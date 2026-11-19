@@ -16,9 +16,10 @@ use std::fs;
 use std::io::Read;
 
 use camino::Utf8Path;
-use dq_core::{Document, Format, Value};
+use dq_core::{Document, Format, Pointer, Segment, Value};
 
-use crate::error::InvalidInput;
+use crate::cli::DocSelector;
+use crate::error::{DocOutOfRange, InvalidInput};
 
 /// Load and parse a file (or stdin when `file == "-"`), returning the chosen
 /// [`Format`] together with the parsed [`Document`].
@@ -97,7 +98,9 @@ pub(crate) fn load_document_for_lint(
         Some(file.to_path_buf())
     };
     let doc_result: dq_core::Result<Document> = match format.name() {
-        "yaml" => dq_core::parse_yaml_with_spans(&bytes),
+        // Stream-aware: a multi-document stream comes back as one, so the
+        // lint pipeline and `dq fix` work on each document by itself.
+        "yaml" => dq_core::parse_yaml_stream_with_spans(&bytes),
         "json" => dq_core::parse_json_with_spans(&bytes),
         _ => format.parse(&bytes),
     };
@@ -185,41 +188,91 @@ pub(crate) fn read_bytes(file: &Utf8Path) -> anyhow::Result<Vec<u8>> {
     })
 }
 
-/// Resolve `cli.doc` (`"all"`, `"<idx>"`, or `None`) against `doc`, returning
-/// the [`Value`] view to operate on.
+/// How many documents `doc` holds: the stream's length for a
+/// multi-document stream, 1 for anything else.
+pub(crate) fn document_count(doc: &Document) -> usize {
+    doc.values().map_or(1, <[Value]>::len)
+}
+
+/// Check `--doc N` against `doc`: `Ok(index)` when the file holds that
+/// many documents, [`DocOutOfRange`] (exit 2) when it does not.
+pub(crate) fn checked_index(
+    doc: &Document,
+    index: usize,
+    file: &Utf8Path,
+) -> anyhow::Result<usize> {
+    let count = document_count(doc);
+    if index < count {
+        Ok(index)
+    } else {
+        Err(anyhow::Error::new(DocOutOfRange {
+            index,
+            count,
+            file: file.to_string(),
+        }))
+    }
+}
+
+/// Resolve `--doc` against `doc`, returning the [`Value`] a read command
+/// works on.
 ///
-/// - Single-document `Document` → its `value()` regardless of `doc_arg`.
-/// - Multi-document `Document`: `Some("all")` → array of every doc,
-///   `Some(n)` or `None` → the requested index (default 0). Out-of-range
-///   index returns a structured anyhow error mapped to exit code 1.
+/// - No `--doc`: document 0 of a multi-document stream, the value of any
+///   other file.
+/// - `--doc N`: document `N`; a file that is not a stream is document 0.
+///   An index past the last document is [`DocOutOfRange`] (exit 2).
+/// - `--doc all`: an array of every document — of the one document, for a
+///   file that is not a stream — so `/N/...` addresses document `N` the
+///   same way whatever the file holds.
 pub(crate) fn select_document<'a>(
     doc: &'a Document,
-    doc_arg: Option<&str>,
+    doc_arg: Option<DocSelector>,
+    file: &Utf8Path,
 ) -> anyhow::Result<std::borrow::Cow<'a, Value>> {
     use std::borrow::Cow;
-    if let Some(values) = doc.values() {
-        match doc_arg {
-            Some("all") => Ok(Cow::Owned(Value::Array(values.to_vec()))),
-            Some(s) => {
-                let idx: usize = s.parse().map_err(|_| {
-                    anyhow::anyhow!("--doc must be 'all' or a non-negative integer, got {s:?}")
-                })?;
-                values.get(idx).map(Cow::Borrowed).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "--doc index {} out of range (have {} document(s))",
-                        idx,
-                        values.len()
-                    )
-                })
-            }
-            None => values
-                .first()
-                .map(Cow::Borrowed)
-                .ok_or_else(|| anyhow::anyhow!("multi-document stream is empty")),
+    match (doc.values(), doc_arg) {
+        (_, Some(DocSelector::All)) => Ok(Cow::Owned(Value::Array(
+            doc.values()
+                .map_or_else(|| vec![doc.value().clone()], <[Value]>::to_vec),
+        ))),
+        (Some(values), None) => values
+            .first()
+            .map(Cow::Borrowed)
+            .ok_or_else(|| anyhow::anyhow!("multi-document stream is empty")),
+        (Some(values), Some(DocSelector::Index(index))) => {
+            let index = checked_index(doc, index, file)?;
+            Ok(Cow::Borrowed(&values[index]))
         }
-    } else {
-        Ok(Cow::Borrowed(doc.value()))
+        (None, None) => Ok(Cow::Borrowed(doc.value())),
+        (None, Some(DocSelector::Index(index))) => {
+            checked_index(doc, index, file)?;
+            Ok(Cow::Borrowed(doc.value()))
+        }
     }
+}
+
+/// The pointer a `set` / `del` at `pointer` edits once `--doc N`
+/// (`index`) is applied: `/N` + `pointer` in a multi-document stream,
+/// `pointer` itself in any other file (where only `N == 0` exists).
+/// Without `--doc` the pointer is taken as given — a stream is then
+/// addressed as `/N/...`, as it always was.
+pub(crate) fn pointer_in_document(
+    doc: &Document,
+    index: Option<usize>,
+    pointer: &Pointer,
+    file: &Utf8Path,
+) -> anyhow::Result<Pointer> {
+    let Some(index) = index else {
+        return Ok(pointer.clone());
+    };
+    let index = checked_index(doc, index, file)?;
+    if !doc.is_multi() {
+        return Ok(pointer.clone());
+    }
+    // A `Key` segment, like the `/1` a user types: the edit is then the
+    // very one `set FILE /1/...` makes.
+    let mut segments = vec![Segment::Key(index.to_string())];
+    segments.extend_from_slice(pointer.segments());
+    Ok(Pointer::new(segments))
 }
 
 #[cfg(test)]
@@ -284,27 +337,76 @@ mod tests {
         assert_eq!(m.get("a"), Some(&Value::Int(1)));
     }
 
+    fn file() -> &'static Utf8Path {
+        Utf8Path::new("x.yaml")
+    }
+
     #[test]
     fn select_document_default_is_index_zero() {
         let doc = Document::multi(vec![Value::Int(1), Value::Int(2)]);
-        let v = select_document(&doc, None).unwrap();
+        let v = select_document(&doc, None, file()).unwrap();
         assert_eq!(*v, Value::Int(1));
+    }
+
+    #[test]
+    fn select_document_index_picks_that_document() {
+        let doc = Document::multi(vec![Value::Int(1), Value::Int(2)]);
+        let v = select_document(&doc, Some(DocSelector::Index(1)), file()).unwrap();
+        assert_eq!(*v, Value::Int(2));
     }
 
     #[test]
     fn select_document_all_wraps_in_array() {
         let doc = Document::multi(vec![Value::Int(1), Value::Int(2)]);
-        let v = select_document(&doc, Some("all")).unwrap();
-        let Value::Array(items) = v.as_ref() else {
-            panic!("expected array, got {v:?}");
-        };
-        assert_eq!(items.len(), 2);
+        let v = select_document(&doc, Some(DocSelector::All), file()).unwrap();
+        assert_eq!(*v, Value::Array(vec![Value::Int(1), Value::Int(2)]));
     }
 
     #[test]
-    fn select_document_single_ignores_doc_arg() {
+    fn select_document_all_wraps_a_single_document_too() {
         let doc = Document::single(Value::Int(7));
-        let v = select_document(&doc, Some("3")).unwrap();
+        let v = select_document(&doc, Some(DocSelector::All), file()).unwrap();
+        assert_eq!(*v, Value::Array(vec![Value::Int(7)]));
+    }
+
+    #[test]
+    fn select_document_single_is_document_zero() {
+        let doc = Document::single(Value::Int(7));
+        let v = select_document(&doc, Some(DocSelector::Index(0)), file()).unwrap();
         assert_eq!(*v, Value::Int(7));
+    }
+
+    #[test]
+    fn select_document_out_of_range_is_doc_out_of_range() {
+        let single = Document::single(Value::Int(7));
+        let err = select_document(&single, Some(DocSelector::Index(3)), file()).unwrap_err();
+        let out = err.downcast_ref::<DocOutOfRange>().expect("DocOutOfRange");
+        assert_eq!((out.index, out.count), (3, 1));
+
+        let multi = Document::multi(vec![Value::Int(1), Value::Int(2)]);
+        let err = select_document(&multi, Some(DocSelector::Index(2)), file()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "--doc 2 is out of range: x.yaml holds 2 document(s) (--doc 0 to 1)"
+        );
+    }
+
+    #[test]
+    fn pointer_in_document_prefixes_the_index_in_a_stream_only() {
+        let pointer = Pointer::parse("/a").unwrap();
+        let multi = Document::multi(vec![Value::Int(1), Value::Int(2)]);
+        let rebased = pointer_in_document(&multi, Some(1), &pointer, file()).unwrap();
+        assert_eq!(rebased.as_canonical(), "/1/a");
+        let as_given = pointer_in_document(&multi, None, &pointer, file()).unwrap();
+        assert_eq!(as_given.as_canonical(), "/a");
+
+        let single = Document::single(Value::Int(7));
+        let same = pointer_in_document(&single, Some(0), &pointer, file()).unwrap();
+        assert_eq!(same.as_canonical(), "/a");
+        let err = pointer_in_document(&single, Some(1), &pointer, file()).unwrap_err();
+        assert!(
+            err.downcast_ref::<DocOutOfRange>().is_some(),
+            "got: {err:?}"
+        );
     }
 }

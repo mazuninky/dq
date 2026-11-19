@@ -13,6 +13,17 @@
 //! and `fix.ops` are set on a rule, the OPS branch takes the call and a
 //! `tracing::warn!` line records the shadowing.
 //!
+//! ## Multi-document streams
+//!
+//! A YAML stream parsed by [`dq_core::parse_yaml_stream_with_spans`] is
+//! fixed one document at a time ([`Fixer::apply_to`] narrows it to one):
+//! for each document, every rule runs against that document's value as
+//! if it were a file of its own. A `fix.ops` script is rebased under the
+//! document's `/N` with [`EditScript::under`] before it is applied, so
+//! the textual edit lands in that document and every `---` survives; a
+//! `fix.jq` output replaces that document alone and the result stays a
+//! stream ([`Document::multi_value_only`]).
+//!
 //! ## OPS branch (Phase 4)
 //!
 //! 1. Eval the `fix.ops` jq-expression against the current
@@ -63,7 +74,7 @@
 use std::sync::Arc;
 
 use camino::Utf8Path;
-use dq_core::{Document, EditScript};
+use dq_core::{Document, EditScript, Pointer, Segment};
 
 use crate::error::{ExecError, Result};
 use crate::evaluator::{CompiledRule, Evaluator, run_on_document};
@@ -77,11 +88,13 @@ pub struct FixOutcome {
     /// `true` when at least one fix was applied — i.e.
     /// `applied_rules.is_empty() == false`.
     pub fixed: bool,
-    /// Rule ids whose fix produced a different, idempotent result.
+    /// Rule ids whose fix produced a different, idempotent result — once
+    /// per document of a multi-document stream the fix changed.
     pub applied_rules: Vec<String>,
     /// Rule ids whose fix would have changed the value but was not
     /// idempotent on a second application — skipped at runtime, with
-    /// the document restored from the pre-apply clone.
+    /// the document restored from the pre-apply clone. Once per document
+    /// of a stream, like `applied_rules`.
     pub skipped_non_idempotent: Vec<String>,
     /// `true` if any rule on this run took the legacy `fix.jq` path.
     /// The CLI handler consumes this to decide whether the post-fix
@@ -123,6 +136,9 @@ impl Fixer {
     /// no-op outcome the document is left unchanged for that rule (or
     /// restored from a working clone in the OPS branch).
     ///
+    /// A multi-document stream ([`Document::is_multi`]) is fixed one
+    /// document at a time — see [`Fixer::apply_to`].
+    ///
     /// See the module-level docs for the per-rule pipeline and the
     /// precedence rule when both `fix.jq` and `fix.ops` are set.
     ///
@@ -137,91 +153,148 @@ impl Fixer {
         doc: &mut Document,
         format_name: &str,
     ) -> Result<FixOutcome> {
-        let mut applied_rules: Vec<String> = Vec::new();
-        let mut skipped_non_idempotent: Vec<String> = Vec::new();
-        let mut legacy_jq_applied = false;
+        self.apply_to(path, doc, format_name, None)
+    }
 
-        for rule in &self.rules {
-            // 1. No fix → report-only rule.
-            let has_jq = rule.fix_engine.is_some();
-            let has_ops = rule.fix_ops_engine.is_some();
-            if !has_jq && !has_ops {
-                continue;
+    /// [`Fixer::apply`], limited to one document of a stream when
+    /// `document` is `Some(index)`.
+    ///
+    /// Each document of a multi-document stream is fixed as a document of
+    /// its own, the way `dq lint` evaluates it: `match.filter`, `check.jq`
+    /// and the fix run over that document's value, a `fix.ops` script is
+    /// applied below the document's `/N` in the stream, and a legacy
+    /// `fix.jq` result replaces that document alone, so the stream keeps
+    /// every document. `Some(index)` on a document that is not a stream
+    /// fixes the whole document when `index == 0` and nothing otherwise —
+    /// the caller reports an index out of range before getting here.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Fixer::apply`].
+    pub fn apply_to(
+        &self,
+        path: &Utf8Path,
+        doc: &mut Document,
+        format_name: &str,
+        document: Option<usize>,
+    ) -> Result<FixOutcome> {
+        let slots: Vec<Option<usize>> = match (doc.values().map(<[_]>::len), document) {
+            (Some(_), Some(index)) => vec![Some(index)],
+            (Some(count), None) => (0..count).map(Some).collect(),
+            (None, Some(0) | None) => vec![None],
+            (None, Some(_)) => Vec::new(),
+        };
+        let mut audit = Audit::default();
+        for slot in slots {
+            for rule in &self.rules {
+                self.apply_rule(rule, path, doc, slot, format_name, &mut audit)?;
             }
+        }
+        Ok(FixOutcome {
+            fixed: !audit.applied_rules.is_empty(),
+            applied_rules: audit.applied_rules,
+            skipped_non_idempotent: audit.skipped_non_idempotent,
+            legacy_jq_applied: audit.legacy_jq_applied,
+        })
+    }
 
-            // 2. Match-gate: format / glob / filter. Every engine below
-            // runs over the current `doc.value()` — earlier rules in the
-            // loop may have mutated `doc`.
-            if !rule_applies_to(rule, path, doc.value(), format_name) {
-                continue;
-            }
+    /// Run one rule's fix pipeline against the document in `slot`.
+    fn apply_rule(
+        &self,
+        rule: &CompiledRule,
+        path: &Utf8Path,
+        doc: &mut Document,
+        slot: Slot,
+        format_name: &str,
+        audit: &mut Audit,
+    ) -> Result<()> {
+        // 1. No fix → report-only rule.
+        let has_jq = rule.fix_engine.is_some();
+        let has_ops = rule.fix_ops_engine.is_some();
+        if !has_jq && !has_ops {
+            return Ok(());
+        }
 
-            // 3. Confirm there is at least one violation. Only the
-            // legacy `Check::Jq` variant carries a `fix:` block today —
-            // schema and composite checks ship without autofix support
-            // (an authoring-time limitation we'll lift in a follow-up).
-            // Runtime errors during the violation probe are tolerated
-            // (log + skip) — same contract as the lint evaluator.
-            let check_engine = match &rule.check {
-                crate::evaluator::CompiledCheck::Jq { engine, .. } => engine,
-                crate::evaluator::CompiledCheck::Schema { .. }
-                | crate::evaluator::CompiledCheck::Composite(_) => {
-                    tracing::warn!(
-                        rule_id = %rule.rule.id,
-                        "fix on non-jq check is not supported yet; skipping rule",
-                    );
-                    continue;
-                }
-            };
-            match run_on_document(check_engine, doc.value()) {
-                Ok(violations) if violations.is_empty() => continue,
-                Ok(_) => {}
-                Err(err) => {
-                    tracing::warn!(
-                        rule_id = %rule.rule.id,
-                        error = %err,
-                        "check.jq raised a runtime error before fix; skipping rule",
-                    );
-                    continue;
-                }
-            }
+        // 2. Match-gate: format / glob / filter. Every engine below runs
+        // over the current value of the document in `slot` — earlier
+        // rules may have mutated `doc`. A slot past the end (an earlier
+        // fix removed a document) has nothing left to fix.
+        let Some(value) = slot_value(doc, slot) else {
+            return Ok(());
+        };
+        if !rule_applies_to(rule, path, value, format_name) {
+            return Ok(());
+        }
 
-            // 4. Precedence: ops wins over jq.
-            if has_ops && has_jq {
+        // 3. Confirm there is at least one violation. Only the legacy
+        // `Check::Jq` variant carries a `fix:` block today — schema and
+        // composite checks ship without autofix support (an
+        // authoring-time limitation we'll lift in a follow-up). Runtime
+        // errors during the violation probe are tolerated (log + skip) —
+        // same contract as the lint evaluator.
+        let check_engine = match &rule.check {
+            crate::evaluator::CompiledCheck::Jq { engine, .. } => engine,
+            crate::evaluator::CompiledCheck::Schema { .. }
+            | crate::evaluator::CompiledCheck::Composite(_) => {
                 tracing::warn!(
                     rule_id = %rule.rule.id,
-                    "fix.jq is shadowed by fix.ops",
+                    "fix on non-jq check is not supported yet; skipping rule",
                 );
+                return Ok(());
             }
-
-            if has_ops {
-                apply_ops_branch(
-                    rule,
-                    path,
-                    doc,
-                    &mut applied_rules,
-                    &mut skipped_non_idempotent,
-                )?;
-            } else {
-                debug_assert!(has_jq);
-                if apply_jq_branch(
-                    rule,
-                    path,
-                    doc,
-                    &mut applied_rules,
-                    &mut skipped_non_idempotent,
-                )? {
-                    legacy_jq_applied = true;
-                }
+        };
+        match run_on_document(check_engine, value) {
+            Ok(violations) if violations.is_empty() => return Ok(()),
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(
+                    rule_id = %rule.rule.id,
+                    error = %err,
+                    "check.jq raised a runtime error before fix; skipping rule",
+                );
+                return Ok(());
             }
         }
 
-        Ok(FixOutcome {
-            fixed: !applied_rules.is_empty(),
-            applied_rules,
-            skipped_non_idempotent,
-            legacy_jq_applied,
-        })
+        // 4. Precedence: ops wins over jq.
+        if has_ops && has_jq {
+            tracing::warn!(
+                rule_id = %rule.rule.id,
+                "fix.jq is shadowed by fix.ops",
+            );
+        }
+
+        if has_ops {
+            apply_ops_branch(rule, path, doc, slot, audit)
+        } else {
+            debug_assert!(has_jq);
+            if apply_jq_branch(rule, path, doc, slot, audit)? {
+                audit.legacy_jq_applied = true;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Which document of `doc` a fix works on: `None` for a document that is
+/// not a stream, `Some(index)` for one document of a stream.
+type Slot = Option<usize>;
+
+/// The audit fields [`Fixer::apply_to`] collects across documents and
+/// rules.
+#[derive(Default)]
+struct Audit {
+    applied_rules: Vec<String>,
+    skipped_non_idempotent: Vec<String>,
+    legacy_jq_applied: bool,
+}
+
+/// The value of the document in `slot`; `None` when the stream no longer
+/// has that many documents.
+fn slot_value(doc: &Document, slot: Slot) -> Option<&dq_core::Value> {
+    match slot {
+        None => Some(doc.value()),
+        Some(index) => doc.values()?.get(index),
     }
 }
 
@@ -233,15 +306,18 @@ fn apply_ops_branch(
     rule: &CompiledRule,
     path: &Utf8Path,
     doc: &mut Document,
-    applied_rules: &mut Vec<String>,
-    skipped_non_idempotent: &mut Vec<String>,
+    slot: Slot,
+    audit: &mut Audit,
 ) -> Result<()> {
     let engine = rule
         .fix_ops_engine
         .as_ref()
         .expect("fix_ops_engine present in OPS branch");
 
-    let ops_value = run_ops_output(engine, doc.value(), &rule.rule.id)?;
+    let Some(value) = slot_value(doc, slot) else {
+        return Ok(());
+    };
+    let ops_value = run_ops_output(engine, value, &rule.rule.id)?;
     let script: EditScript = match serde_json::from_value::<EditScript>(ops_value) {
         Ok(s) => s,
         Err(err) => {
@@ -256,6 +332,12 @@ fn apply_ops_branch(
     if script.is_noop() {
         return Ok(());
     }
+    // The script addresses the document's root as `""`; in a stream that
+    // document is `/N`.
+    let script = match slot {
+        Some(index) => script.under(&Pointer::new(vec![Segment::Key(index.to_string())])),
+        None => script,
+    };
 
     // Clone the doc so a failed apply leaves `*doc` untouched.
     let mut working = doc.clone();
@@ -298,7 +380,18 @@ fn apply_ops_branch(
     // emits a non-empty patch (e.g. `[replace /x = 1]` on a doc that
     // already has `x: 1`) pass as silently-skipped instead of being
     // recorded on `skipped_non_idempotent`.
-    let ops_value2 = run_ops_output(engine, working.value(), &rule.rule.id)?;
+    let Some(value_after) = slot_value(&working, slot) else {
+        // The script removed the document it was written for: there is
+        // nothing to re-evaluate it against, so it cannot be shown to be
+        // idempotent.
+        tracing::warn!(
+            rule_id = %rule.rule.id,
+            "fix.ops removed the document it fixes; skipping",
+        );
+        audit.skipped_non_idempotent.push(rule.rule.id.clone());
+        return Ok(());
+    };
+    let ops_value2 = run_ops_output(engine, value_after, &rule.rule.id)?;
     let script2: EditScript = match serde_json::from_value::<EditScript>(ops_value2) {
         Ok(s) => s,
         Err(err) => {
@@ -313,7 +406,7 @@ fn apply_ops_branch(
             rule_id = %rule.rule.id,
             "fix.ops is non-idempotent; skipping (second application produced non-empty script)",
         );
-        skipped_non_idempotent.push(rule.rule.id.clone());
+        audit.skipped_non_idempotent.push(rule.rule.id.clone());
         return Ok(());
     }
 
@@ -331,7 +424,7 @@ fn apply_ops_branch(
         "applied fix.ops",
     );
     *doc = working;
-    applied_rules.push(rule.rule.id.clone());
+    audit.applied_rules.push(rule.rule.id.clone());
     Ok(())
 }
 
@@ -343,17 +436,20 @@ fn apply_jq_branch(
     rule: &CompiledRule,
     path: &Utf8Path,
     doc: &mut Document,
-    applied_rules: &mut Vec<String>,
-    skipped_non_idempotent: &mut Vec<String>,
+    slot: Slot,
+    audit: &mut Audit,
 ) -> Result<bool> {
     let engine = rule
         .fix_engine
         .as_ref()
         .expect("fix_engine present in JQ branch");
 
+    let Some(value) = slot_value(doc, slot) else {
+        return Ok(false);
+    };
     // Run fix.jq and require single output. The document goes to jq as a
     // `dq_core::Value`, so a NaN or an infinity stays a float.
-    let new_value = run_single_output(engine, doc.value(), &rule.rule.id, "fix.jq")?;
+    let new_value = run_single_output(engine, value, &rule.rule.id, "fix.jq")?;
 
     // Idempotency check: the second application must produce the same
     // value as the first. Mirrors the M10 byte-equality semantics.
@@ -364,13 +460,13 @@ fn apply_jq_branch(
             rule_id = %rule.rule.id,
             "fix.jq is non-idempotent; skipping (second application produced a different value)",
         );
-        skipped_non_idempotent.push(rule.rule.id.clone());
+        audit.skipped_non_idempotent.push(rule.rule.id.clone());
         return Ok(false);
     }
 
     // No change → already conformant. A YAML `.nan` comes back from jq
     // as `Float(NaN)`, which `same_data` counts as the same.
-    if new_value.same_data(doc.value()) {
+    if new_value.same_data(value) {
         return Ok(false);
     }
 
@@ -385,8 +481,19 @@ fn apply_jq_branch(
     // on the same file will surface `WriteUnavailable` from
     // `EditScript::apply`; that is caught and downgraded to a warn in
     // `apply_ops_branch`.
-    *doc = Document::value_only(new_value, doc.format());
-    applied_rules.push(rule.rule.id.clone());
+    //
+    // In a stream the result replaces its own document only, and the
+    // document stays a stream, so the format writer emits every document
+    // with its `---` again instead of one document holding a sequence.
+    *doc = match (slot, doc.values()) {
+        (Some(index), Some(documents)) => {
+            let mut documents = documents.to_vec();
+            documents[index] = new_value;
+            Document::multi_value_only(documents, doc.format())
+        }
+        _ => Document::value_only(new_value, doc.format()),
+    };
+    audit.applied_rules.push(rule.rule.id.clone());
     Ok(true)
 }
 
@@ -1396,5 +1503,70 @@ fix:
         );
         // Document bytes must be untouched.
         assert_eq!(doc.original_bytes(), initial_bytes.as_slice());
+    }
+
+    /// `fix.ops` renaming every `kind: Pod` to `fixed`.
+    const RULE_POD_NAME_OPS: &str = r#"
+id: test.pod-name
+description: every Pod is named fixed
+severity: warn
+match:
+  format: yaml
+  filter: '.kind == "Pod"'
+check:
+  jq: 'select(.name != "fixed")'
+  message: 'not fixed'
+fix:
+  ops: 'if .name != "fixed" then [{"op":"replace","path":"/name","value":"fixed"}] else [] end'
+"#;
+
+    const POD_STREAM: &[u8] =
+        b"kind: Pod\nname: a # one\n---\nkind: Svc\nname: s\n---\nkind: Pod\nname: b\n";
+
+    #[test]
+    fn fixer_ops_fixes_each_document_of_a_stream_in_place() {
+        let fixer = Fixer::new(&evaluator_from_yaml(RULE_POD_NAME_OPS));
+        let mut doc = dq_core::parse_yaml_stream_with_spans(POD_STREAM).expect("stream");
+        let out = fixer
+            .apply(Utf8Path::new("s.yaml"), &mut doc, "yaml")
+            .expect("fix");
+        assert_eq!(out.applied_rules, vec!["test.pod-name"; 2]);
+        assert_eq!(
+            String::from_utf8(doc.original_bytes().to_vec()).unwrap(),
+            "kind: Pod\nname: fixed # one\n---\nkind: Svc\nname: s\n---\nkind: Pod\nname: fixed\n",
+        );
+    }
+
+    #[test]
+    fn fixer_apply_to_one_document_leaves_the_others() {
+        let fixer = Fixer::new(&evaluator_from_yaml(RULE_POD_NAME_OPS));
+        let mut doc = dq_core::parse_yaml_stream_with_spans(POD_STREAM).expect("stream");
+        let out = fixer
+            .apply_to(Utf8Path::new("s.yaml"), &mut doc, "yaml", Some(2))
+            .expect("fix");
+        assert_eq!(out.applied_rules, vec!["test.pod-name"]);
+        let bytes = String::from_utf8(doc.original_bytes().to_vec()).unwrap();
+        assert!(bytes.contains("name: a # one"), "{bytes}");
+        assert!(bytes.ends_with("name: fixed\n"), "{bytes}");
+    }
+
+    #[test]
+    fn fixer_jq_on_a_stream_replaces_only_the_fixed_document() {
+        let rule = RULE_POD_NAME_OPS.replace(
+            "ops: 'if .name != \"fixed\" then [{\"op\":\"replace\",\"path\":\"/name\",\"value\":\"fixed\"}] else [] end'",
+            "jq: '.name = \"fixed\"'",
+        );
+        let fixer = Fixer::new(&evaluator_from_yaml(&rule));
+        let mut doc = dq_core::parse_yaml_stream_with_spans(POD_STREAM).expect("stream");
+        let out = fixer
+            .apply(Utf8Path::new("s.yaml"), &mut doc, "yaml")
+            .expect("fix");
+        assert!(out.legacy_jq_applied);
+        let documents = doc.values().expect("still a stream");
+        let names: Vec<_> = documents
+            .iter()
+            .map(|d| d.to_serde_json()["name"].clone())
+            .collect();
+        assert_eq!(names, vec![json!("fixed"), json!("s"), json!("fixed")]);
     }
 }

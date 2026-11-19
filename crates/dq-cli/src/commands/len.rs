@@ -33,13 +33,13 @@ pub fn run(
     cli: &Cli,
     args: &LenArgs,
     input_format: Option<&str>,
-    doc_arg: Option<&str>,
+    doc_arg: Option<crate::cli::DocSelector>,
     reporter: &dyn Reporter,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
     cli.ensure_no_write_flags()?;
     let (_fmt, doc) = load_document_with_path(&args.file, input_format)?;
-    let view = select_document(&doc, doc_arg)?;
+    let view = select_document(&doc, doc_arg, &args.file)?;
     let pointer = Pointer::parse(&args.pointer).map_err(anyhow::Error::new)?;
     let value = pointer.resolve(view.as_ref()).map_err(anyhow::Error::new)?;
     let len: i64 = match value {

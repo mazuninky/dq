@@ -10,7 +10,10 @@
 //!
 //! - 0 — `SUCCESS` — command completed.
 //! - 1 — `GENERIC` — unclassified failure; also used for `exists` returning "false".
-//! - 2 — `NOT_FOUND` — JSON Pointer did not address an existing node.
+//! - 2 — `NOT_FOUND` — JSON Pointer did not address an existing node, or
+//!   `--doc N` named a document the file does not have. clap's usage
+//!   errors exit 2 as well, including the one for `--doc` on a command
+//!   that cannot honour it.
 //! - 3 — `PARSE_ERROR` — source could not be parsed (includes Go-template
 //!   guard rejections from [`dq_core::Error::TemplatedFile`]).
 //! - 4 — `VALIDATE_FAIL` — `validate` reports the document is invalid.
@@ -51,7 +54,8 @@ use dq_exec::ExecError;
 use dq_plugin::PluginError;
 
 use crate::error::{
-    BulkPartialFailure, CheckPending, InvalidInput, LintFail, LintWarnStrict, ValidateFail,
+    BulkPartialFailure, CheckPending, DocOutOfRange, InvalidInput, LintFail, LintWarnStrict,
+    ValidateFail,
 };
 
 /// Successful exit.
@@ -101,6 +105,14 @@ pub fn exit_code_for_error(err: &anyhow::Error) -> i32 {
     }
     if err.downcast_ref::<InvalidInput>().is_some() {
         return INVALID_INPUT;
+    }
+    // A usage error a handler raises through clap (`--doc` on a command
+    // that cannot honour it) exits like the ones clap raises while parsing.
+    if let Some(usage) = err.downcast_ref::<clap::Error>() {
+        return usage.exit_code();
+    }
+    if err.downcast_ref::<DocOutOfRange>().is_some() {
+        return NOT_FOUND;
     }
     // Bulk-mode markers from the M3 §3 driver. `CheckPending` is the
     // `--check` "changes pending" signal (semantically a yes/no question

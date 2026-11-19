@@ -50,12 +50,13 @@ use std::io::Write;
 use std::sync::Arc;
 
 use camino::{Utf8Path, Utf8PathBuf};
+use dq_core::{Document, Pointer, Segment};
 use dq_exec::{Evaluator, FixOutcome, Fixer, LoaderArgs, RuleLoader};
 use indexmap::IndexSet;
 
 use crate::bulk::{self, FileOp, FileOpResult};
-use crate::cli::{Cli, FixArgs};
-use crate::commands::io_helpers::{load_document_for_lint, pick_format, read_bytes};
+use crate::cli::{Cli, DocSelector, FixArgs};
+use crate::commands::io_helpers::{checked_index, load_document_for_lint, pick_format, read_bytes};
 use crate::commands::lint_core::expand_lint_inputs;
 use crate::commands::plugin_loader::{self, LoadedPlugins};
 use crate::error::InvalidInput;
@@ -184,10 +185,17 @@ impl<'a> FileOp for FixFileOp<'a> {
         // for the simpler call site.
         let original_bytes = read_bytes(path)?;
         let (format, mut document) = load_document_for_lint(path, self.input_format)?;
+        // A multi-document stream is fixed one document at a time, and
+        // written back with every document; `--doc N` fixes document N
+        // alone.
+        let only = match self.cli.doc {
+            Some(DocSelector::Index(index)) => Some(checked_index(&document, index, path)?),
+            Some(DocSelector::All) | None => None,
+        };
 
         let outcome = self
             .fixer
-            .apply(path, &mut document, format.name())
+            .apply_to(path, &mut document, format.name(), only)
             .map_err(anyhow::Error::new)?;
 
         // Audit log — visible at `-v` (info) verbosity. The check path
@@ -208,28 +216,46 @@ impl<'a> FileOp for FixFileOp<'a> {
             && let Some(runtime) = loaded.runtime.as_ref()
         {
             for handle in &loaded.handles {
-                let ir = document.as_ir();
-                let script = runtime
-                    .invoke_fix(handle, &ir)
-                    .map_err(anyhow::Error::new)?;
-                if script.is_noop() {
-                    continue;
-                }
-                match script.apply(&mut document) {
-                    Ok(()) => {
-                        plugin_fixed = true;
+                for slot in document_slots(&document, only) {
+                    // The plugin sees one document of a stream as a document
+                    // of its own; its script then applies below that
+                    // document's `/N`.
+                    let script = match slot {
+                        None => runtime
+                            .invoke_fix(handle, &document.as_ir())
+                            .map_err(anyhow::Error::new)?,
+                        Some(index) => {
+                            let Some(part) = document
+                                .stream_documents()
+                                .and_then(|parts| parts.into_iter().nth(index))
+                            else {
+                                continue;
+                            };
+                            runtime
+                                .invoke_fix(handle, &part.as_ir())
+                                .map_err(anyhow::Error::new)?
+                                .under(&Pointer::new(vec![Segment::Key(index.to_string())]))
+                        }
+                    };
+                    if script.is_noop() {
+                        continue;
                     }
-                    Err(e) => {
-                        // The feature-disabled `PluginHandle` stub does not
-                        // expose `rule_id()`, so we keep the warning
-                        // log path-keyed. The path uniquely identifies the
-                        // file under fix; per-plugin attribution is
-                        // recoverable from the load order printed at -vv.
-                        tracing::warn!(
-                            path = %path,
-                            error = %e,
-                            "plugin EditScript failed to apply; skipping",
-                        );
+                    match script.apply(&mut document) {
+                        Ok(()) => {
+                            plugin_fixed = true;
+                        }
+                        Err(e) => {
+                            // The feature-disabled `PluginHandle` stub does not
+                            // expose `rule_id()`, so we keep the warning
+                            // log path-keyed. The path uniquely identifies the
+                            // file under fix; per-plugin attribution is
+                            // recoverable from the load order printed at -vv.
+                            tracing::warn!(
+                                path = %path,
+                                error = %e,
+                                "plugin EditScript failed to apply; skipping",
+                            );
+                        }
                     }
                 }
             }
@@ -275,6 +301,17 @@ impl<'a> FileOp for FixFileOp<'a> {
             output_bytes: final_bytes,
             diff,
         })
+    }
+}
+
+/// The documents a plugin fixes in `document`: `[None]` (the whole file)
+/// for a file that is not a stream, otherwise `Some(index)` for every
+/// document of the stream, or for `only` alone.
+fn document_slots(document: &Document, only: Option<usize>) -> Vec<Option<usize>> {
+    match (document.values(), only) {
+        (Some(_), Some(index)) => vec![Some(index)],
+        (Some(values), None) => (0..values.len()).map(Some).collect(),
+        (None, _) => vec![None],
     }
 }
 

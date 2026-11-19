@@ -543,14 +543,16 @@ mod plugins_enabled {
     /// resolution mirrors the spec's "if `pointer: None`, line/col default
     /// to `1`" rule: when the pointer parses and resolves through
     /// [`Ir::line_col_for`], use those values; otherwise fall back to
-    /// `(1, 1)`.
+    /// [`Ir::origin_line_col`] — `(1, 1)` for a file, the document's start
+    /// for one document of a multi-document stream, which the host hands
+    /// to the plugin as a document of its own.
     fn marshal_diagnostic(wit: WitDiagnostic, ir: &Ir<'_>, file: Option<&Utf8Path>) -> Diagnostic {
         let (line, col) = wit
             .pointer
             .as_deref()
             .and_then(|p| Pointer::parse(p).ok())
             .and_then(|pointer| ir.line_col_for(&pointer))
-            .unwrap_or((1, 1));
+            .unwrap_or_else(|| ir.origin_line_col());
         Diagnostic {
             rule_id: wit.rule_id,
             severity: severity_from_wit(wit.severity),

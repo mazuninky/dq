@@ -76,8 +76,22 @@ use super::yaml_emit::typed_by_another_schema;
 ///   short snippet matching the failing line, so the CLI's diagnostic
 ///   formatting works without further introspection.
 pub fn parse_with_spans(bytes: &[u8]) -> Result<(Value, SpanMap)> {
-    let (value, spans, _block_scalars) = parse_with_spans_and_block_scalars(bytes)?;
-    Ok((value, spans))
+    let parsed = parse_with_spans_and_block_scalars(bytes)?;
+    Ok((parsed.value, parsed.spans))
+}
+
+/// What [`parse_with_spans_and_block_scalars`] learns about a YAML source.
+struct SpanParse {
+    /// The value tree — a `Value::Array` of the documents for a stream.
+    value: Value,
+    /// Spans, keyed `/{doc_idx}/...` for a stream.
+    spans: SpanMap,
+    /// Canonical pointers of the block-scalar leaves.
+    block_scalars: HashSet<String>,
+    /// Whether the source is a stream of more than one document — the one
+    /// thing `value` cannot tell apart from a single document holding a
+    /// sequence.
+    stream: bool,
 }
 
 /// Parse `bytes` as YAML and additionally surface the canonical pointer set of
@@ -95,7 +109,7 @@ pub fn parse_with_spans(bytes: &[u8]) -> Result<(Value, SpanMap)> {
 /// # Errors
 ///
 /// Same as [`parse_with_spans`].
-fn parse_with_spans_and_block_scalars(bytes: &[u8]) -> Result<(Value, SpanMap, HashSet<String>)> {
+fn parse_with_spans_and_block_scalars(bytes: &[u8]) -> Result<SpanParse> {
     // Reuse the M1 read path verbatim for the value tree. Any divergence
     // between this parser's view and the spike-validated spans would cause
     // `Document::set_at` to splice into bytes that the in-memory tree does
@@ -111,7 +125,12 @@ fn parse_with_spans_and_block_scalars(bytes: &[u8]) -> Result<(Value, SpanMap, H
         read_doc.value().clone()
     };
     let (spans, block_scalars) = build_span_map_and_block_scalars(bytes)?;
-    Ok((value, spans, block_scalars))
+    Ok(SpanParse {
+        value,
+        spans,
+        block_scalars,
+        stream: read_doc.is_multi(),
+    })
 }
 
 /// Parse `bytes` as YAML and assemble a [`Document`] carrying the value tree,
@@ -138,15 +157,43 @@ fn parse_with_spans_and_block_scalars(bytes: &[u8]) -> Result<(Value, SpanMap, H
 ///
 /// Forwards [`parse_with_spans`] errors verbatim.
 pub fn parse_yaml_with_spans(bytes: &[u8]) -> Result<Document> {
-    let (value, spans, block_scalars) = parse_with_spans_and_block_scalars(bytes)?;
-    let provenance = build_provenance_with_inline_offsets(&spans, &block_scalars);
-    Ok(Document::with_spans_and_provenance(
-        value,
+    parse_with_spans_and_block_scalars(bytes).map(|parsed| span_document(parsed, bytes))
+}
+
+/// [`parse_yaml_with_spans`], except that a stream of more than one
+/// document comes back as one: [`Document::is_multi`] is `true` and
+/// [`Document::values`] / [`Document::stream_documents`] hand out the
+/// documents.
+///
+/// The value tree, spans, and bytes are those [`parse_yaml_with_spans`]
+/// returns — the textual edits behave the same on either; only the
+/// stream-aware callers (the lint pipeline, `dq fix`, `--doc` on `set` /
+/// `del`) need to know a sequence of documents from a document holding a
+/// sequence.
+///
+/// # Errors
+///
+/// Forwards [`parse_with_spans`] errors verbatim.
+pub fn parse_yaml_stream_with_spans(bytes: &[u8]) -> Result<Document> {
+    let parsed = parse_with_spans_and_block_scalars(bytes)?;
+    let stream = parsed.stream;
+    let mut doc = span_document(parsed, bytes);
+    if stream {
+        doc.mark_stream();
+    }
+    Ok(doc)
+}
+
+/// The write-aware [`Document`] for a [`SpanParse`] of `bytes`.
+fn span_document(parsed: SpanParse, bytes: &[u8]) -> Document {
+    let provenance = build_provenance_with_inline_offsets(&parsed.spans, &parsed.block_scalars);
+    Document::with_spans_and_provenance(
+        parsed.value,
         bytes.to_vec(),
-        spans,
+        parsed.spans,
         FormatTag::Yaml,
         provenance,
-    ))
+    )
 }
 
 /// Build a [`ProvenanceMap`] from `spans`, populating `inline_offset` for every
@@ -3363,5 +3410,45 @@ mod tests {
             .expect("ranges are disjoint");
         assert_eq!(blanked, "k:     |\n  é\nr: xxx\n");
         assert_eq!(blanked.chars().count(), text.chars().count());
+    }
+
+    #[test]
+    fn stream_parse_marks_only_a_real_stream() {
+        let stream = parse_yaml_stream_with_spans(b"a: 1\n---\nb: 2\n").unwrap();
+        assert!(stream.is_multi());
+        assert_eq!(stream.values().map(<[Value]>::len), Some(2));
+
+        // A single document holding a sequence is not a stream.
+        let sequence = parse_yaml_stream_with_spans(b"- 1\n- 2\n").unwrap();
+        assert!(!sequence.is_multi());
+        assert!(sequence.stream_documents().is_none());
+
+        // The plain span parser still returns one array document.
+        assert!(
+            !parse_yaml_with_spans(b"a: 1\n---\nb: 2\n")
+                .unwrap()
+                .is_multi()
+        );
+    }
+
+    #[test]
+    fn stream_documents_rebase_provenance_and_keep_file_lines() {
+        let bytes = b"a: 1\n---\n\nb:\n  c: 2\n";
+        let doc = parse_yaml_stream_with_spans(bytes).unwrap();
+        let parts = doc.stream_documents().expect("a stream");
+        assert_eq!(parts.len(), 2);
+
+        let second = &parts[1];
+        assert_eq!(second.index(), 1);
+        let ir = second.as_ir();
+        // `/b/c` of document 1 is `/1/b/c` of the stream, on line 5.
+        let pointer = Pointer::parse("/b/c").unwrap();
+        assert_eq!(ir.line_col_for(&pointer).map(|(line, _)| line), Some(5));
+        assert!(ir.line_col_for(&Pointer::parse("/a").unwrap()).is_none());
+        // A position no pointer resolves falls back into the document —
+        // its first line holding a spanned value (`c: 2`; the non-empty
+        // map `b` has no span of its own) — not to line 1 of the file.
+        assert_eq!(ir.origin_line_col().0, 5);
+        assert_eq!(parts[0].as_ir().origin_line_col(), (1, 1));
     }
 }

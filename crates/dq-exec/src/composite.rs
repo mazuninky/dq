@@ -200,6 +200,7 @@ pub(crate) fn run_composite(
         out.push(error_diagnostic(
             outer_rule,
             path,
+            ir,
             format!(
                 "composite recursion exceeded depth bound (depth={current_depth}, max={max_depth})"
             ),
@@ -219,6 +220,7 @@ pub(crate) fn run_composite(
             out.push(error_diagnostic(
                 outer_rule,
                 path,
+                ir,
                 format!("composite extract jq runtime error: {err}"),
                 "composite-error",
             ));
@@ -236,6 +238,7 @@ pub(crate) fn run_composite(
             out.push(error_diagnostic(
                 outer_rule,
                 path,
+                ir,
                 "composite extract did not return an array".to_owned(),
                 "composite-extract-not-array",
             ));
@@ -249,6 +252,7 @@ pub(crate) fn run_composite(
             out.push(error_diagnostic(
                 outer_rule,
                 path,
+                ir,
                 "composite extract produced no outputs (expected exactly one array)".to_owned(),
                 "composite-extract-not-array",
             ));
@@ -264,6 +268,7 @@ pub(crate) fn run_composite(
             out.push(error_diagnostic(
                 outer_rule,
                 path,
+                ir,
                 format!("composite extract produced {count} outputs (expected exactly one array)"),
                 "composite-extract-not-array",
             ));
@@ -311,6 +316,7 @@ fn process_extract_item(
             out.push(error_diagnostic(
                 outer_rule,
                 path,
+                outer_ir,
                 "composite extract item is not an object".to_owned(),
                 "composite-extract-malformed",
             ));
@@ -323,6 +329,7 @@ fn process_extract_item(
             out.push(error_diagnostic(
                 outer_rule,
                 path,
+                outer_ir,
                 "composite extract item missing field `value`".to_owned(),
                 "composite-extract-malformed",
             ));
@@ -335,6 +342,7 @@ fn process_extract_item(
             out.push(error_diagnostic(
                 outer_rule,
                 path,
+                outer_ir,
                 "composite extract item missing field `format`".to_owned(),
                 "composite-extract-malformed",
             ));
@@ -347,6 +355,7 @@ fn process_extract_item(
             out.push(error_diagnostic(
                 outer_rule,
                 path,
+                outer_ir,
                 "composite extract item missing field `anchor`".to_owned(),
                 "composite-extract-malformed",
             ));
@@ -358,6 +367,7 @@ fn process_extract_item(
         out.push(error_diagnostic(
             outer_rule,
             path,
+            outer_ir,
             format!("composite extract item names unknown format `{format_str}`"),
             "composite-extract-unknown-format",
         ));
@@ -373,6 +383,7 @@ fn process_extract_item(
             out.push(error_diagnostic(
                 outer_rule,
                 path,
+                outer_ir,
                 format!(
                     "composite extract item names format `{format_str}` with no registered parser"
                 ),
@@ -523,9 +534,10 @@ fn resolve_anchor_position(
                 error = %err,
                 "composite rule: anchor pointer failed to parse; retaining inner coordinates",
             );
+            let (line, col) = outer_ir.origin_line_col();
             return AnchorPosition {
-                line: 1,
-                col: 1,
+                line,
+                col,
                 span_line: None,
                 span_col: None,
                 inline_col: None,
@@ -541,7 +553,7 @@ fn resolve_anchor_position(
         );
     }
     let inline = outer_ir.inline_offset_for(&pointer);
-    let (line, col) = span.unwrap_or((1, 1));
+    let (line, col) = span.unwrap_or_else(|| outer_ir.origin_line_col());
     AnchorPosition {
         line,
         col,
@@ -561,16 +573,18 @@ fn resolve_anchor_position(
 fn error_diagnostic(
     outer_rule: &CompiledRule,
     path: &Utf8Path,
+    ir: &dq_core::Ir<'_>,
     message: String,
     kind: &str,
 ) -> Diagnostic {
+    let (line, col) = ir.origin_line_col();
     Diagnostic {
         rule_id: format!("{}.{}", outer_rule.rule.id, kind),
         severity: Severity::Error,
         message,
         file: Some(path.to_path_buf()),
-        line: 1,
-        col: 1,
+        line,
+        col,
         span: None,
         references: outer_rule.rule.references.clone(),
         fix: None,

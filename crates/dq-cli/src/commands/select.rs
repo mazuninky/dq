@@ -17,7 +17,7 @@ use std::io::Write;
 
 use jsonpath_rust::JsonPath;
 
-use super::io_helpers::load_document_with_path;
+use super::io_helpers::{load_document_with_path, select_document};
 use crate::cli::{Cli, SelectArgs};
 use crate::output::Reporter;
 
@@ -40,17 +40,9 @@ pub fn run(
 ) -> anyhow::Result<()> {
     cli.ensure_no_write_flags()?;
     let (_fmt, doc) = load_document_with_path(&args.file, input_format)?;
-    // The `--doc` flag is meaningful for multi-doc YAML, but for `select` we
-    // adopt the same M1 default as `get`: doc 0 for `Multi`. We don't honour
-    // `--doc` here yet because the spec does not mandate it for `select`.
-    let value: serde_json::Value = if let Some(values) = doc.values() {
-        values
-            .first()
-            .map(dq_core::Value::to_serde_json)
-            .unwrap_or(serde_json::Value::Null)
-    } else {
-        doc.value().to_serde_json()
-    };
+    // Same view as `get`: document 0 of a stream unless `--doc` says
+    // otherwise; `--doc all` queries the array of every document.
+    let value = select_document(&doc, cli.doc, &args.file)?.to_serde_json();
 
     let matched: Vec<serde_json::Value> = value
         .query(args.jsonpath.as_str())

@@ -101,6 +101,18 @@ cat deploy.yaml | dq query '.metadata.name' - -F yaml
 
 `dq query` argument order is `EXPR FILE` (mirrors `jq`). Stdin requires `-F` since there's no extension to sniff.
 
+### Multi-document YAML (`---` streams)
+
+```bash
+dq get bundle.yaml /metadata/name                 # reads document 0
+dq --doc 1 get bundle.yaml /metadata/name         # the second document
+dq --doc all query '.[].kind' bundle.yaml         # the stream as an array of documents
+dq --doc 1 set bundle.yaml /spec/replicas 3 -i    # pointer relative to document 1 (same as /1/spec/replicas)
+dq lint bundle.yaml                               # every document linted on its own
+```
+
+`lint` / `check` / `fix` evaluate each document separately; `fix` keeps every document and `---`. `--doc` on a command that cannot honour it (`fmt`, `validate`, `diff`, `patch`, `merge`, `convert -i`, `--doc all` with `set` / `del`) is a usage error, exit 2; so is an index past the last document.
+
 ## Write — in-place with round-trip preservation
 
 ```bash
@@ -231,7 +243,7 @@ Full matrix, write-mode semantics, and pointer prefixes per format: [references/
 |-----:|-------------------------------------------------------------------------|
 |    0 | Success.                                                                |
 |    1 | Generic failure (`--check` saw pending changes; JSON Patch `test` op failed; `lint --strict` saw a warn; `convert`, `query` or `set --jq` cannot write a value in the output format, e.g. NaN/Infinity in JSON). |
-|    2 | NOT_FOUND — JSON Pointer addressed a node that does not exist.          |
+|    2 | NOT_FOUND — JSON Pointer addressed a node that does not exist, or `--doc N` a document the file lacks; also clap usage errors (incl. `--doc` on a command that cannot honour it). |
 |    3 | PARSE_ERROR — input failed format parsing (or templated file without `--raw-template-strings`). |
 |    4 | LINT_FAIL / VALIDATE_FAIL — `lint` produced an error-severity diagnostic, or `validate` saw a parse error. |
 |    5 | IO_ERROR — read failed; `self check`/`update` network failure.          |

@@ -50,9 +50,9 @@ use std::io::Write;
 use camino::{Utf8Path, Utf8PathBuf};
 use dq_core::{Document, FormatTag, FrontmatterKind, WriteOptions};
 
-use super::io_helpers::load_document_with_path;
+use super::io_helpers::{checked_index, load_document_with_path};
 use crate::bulk;
-use crate::cli::{Cli, ConvertArgs};
+use crate::cli::{Cli, ConvertArgs, DocSelector};
 use crate::error::InvalidInput;
 use crate::output::{ConsoleReporter, OutputFormat, Reporter, ToonReporter};
 
@@ -90,6 +90,13 @@ pub fn run(
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
     if cli.in_place {
+        if cli.doc.is_some() {
+            return Err(cli.doc_usage_error(
+                "convert -i",
+                "writing one document and removing the source would delete the others; \
+                 convert to stdout instead",
+            ));
+        }
         run_in_place(cli, args, output_format, use_color, opts, out)
     } else {
         // Read-only mode: existing M2 contract. We do NOT call the generic
@@ -98,7 +105,15 @@ pub fn run(
         // `ensure_no_write_flags` rejects every flag the read mode forbids
         // (everything except `-i`, which we already filtered above).
         cli.ensure_no_write_flags()?;
-        run_to_stdout(args, input_format, output_format, use_color, opts, out)
+        run_to_stdout(
+            args,
+            cli.doc,
+            input_format,
+            output_format,
+            use_color,
+            opts,
+            out,
+        )
     }
 }
 
@@ -108,6 +123,7 @@ pub fn run(
 /// set, the rendering path picks them up via `Format::write_with_options`.
 fn run_to_stdout(
     args: &ConvertArgs,
+    doc_arg: Option<DocSelector>,
     input_format: Option<&str>,
     output_format: OutputFormat,
     use_color: bool,
@@ -115,10 +131,33 @@ fn run_to_stdout(
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
     let (input_fmt, doc) = load_document_with_path(&args.file, input_format)?;
+    let doc = select_for_convert(doc, doc_arg, &args.file)?;
     maybe_warn_lossy(input_fmt.name(), output_format);
     let bytes = render_to_format(&doc, output_format, use_color, opts)?;
     out.write_all(&bytes)?;
     Ok(())
+}
+
+/// Apply `--doc` to the document `convert` writes.
+///
+/// `--doc N` keeps only document `N` of a multi-document stream, which is
+/// then written as a single document; in a file that is not a stream only
+/// `N == 0` exists, and it is the file itself. No `--doc` and `--doc all`
+/// both write every document: a stream stays a stream (YAML) or an array
+/// of the documents (JSON), as it always has.
+fn select_for_convert(
+    doc: Document,
+    doc_arg: Option<DocSelector>,
+    file: &Utf8Path,
+) -> anyhow::Result<Document> {
+    let Some(DocSelector::Index(index)) = doc_arg else {
+        return Ok(doc);
+    };
+    let index = checked_index(&doc, index, file)?;
+    Ok(match doc.values() {
+        Some(values) => Document::value_only(values[index].clone(), doc.format()),
+        None => doc,
+    })
 }
 
 /// M3 §8 in-place mode: read source, render to target format, atomic-write

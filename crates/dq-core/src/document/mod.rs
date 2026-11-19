@@ -632,6 +632,32 @@ impl Document {
         }
     }
 
+    /// Each document of a multi-document stream as a document of its own,
+    /// with its provenance rebased onto the document's root — see
+    /// [`crate::StreamDocument`]. `None` when this is not a stream
+    /// (`!is_multi()`), so a single document that holds a sequence is never
+    /// split into its items.
+    #[must_use]
+    pub fn stream_documents(&self) -> Option<Vec<crate::StreamDocument<'_>>> {
+        let documents = self.values()?;
+        Some(crate::ir::split_stream(
+            documents,
+            &self.provenance,
+            self.format,
+            &self.original_bytes,
+        ))
+    }
+
+    /// Mark a write-aware parse of a multi-document stream as the stream
+    /// it is. The span parsers return a stream as one document holding a
+    /// `Value::Array` of the documents, because that is the tree the
+    /// `/{doc_idx}/...` spans describe; this flag is what tells it apart
+    /// from a single document holding a sequence. The textual edits read
+    /// neither, so they behave the same either way.
+    pub(crate) fn mark_stream(&mut self) {
+        self.multi_doc = matches!(self.value, Value::Array(_));
+    }
+
     /// Borrow the original source bytes, if this document was parsed by a
     /// write-aware parser.
     #[must_use]
