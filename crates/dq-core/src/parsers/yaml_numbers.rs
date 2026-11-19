@@ -157,6 +157,50 @@ fn untag_numbers(text: &str) -> Option<String> {
             starts.push(span.start.index());
         }
     }
+    stand_in_tags(text, &starts)
+}
+
+/// `bytes` with the tag of every plain scalar under a global tag outside
+/// the core schema — written through a `%TAG` handle (`!!str` once `!!` is
+/// bound to `tag:example.com,2000:`) or verbatim (`!<tag:example.com:x>`)
+/// — made a local tag of the same length (`!xxxx`), so the scalar reads
+/// as untagged, the way one under a local tag (`!foo 1`) does: serde_norway
+/// would read it as a string whatever it holds, though dq drops the tag.
+/// The core tags keep their typing however they are spelled.
+///
+/// `None` when no such tag can be there (no `%TAG` directive, no `!<`), when
+/// there is none, or when `bytes` is no UTF-8 or saphyr-parser fails on it.
+pub(super) fn untag_foreign(bytes: &[u8]) -> Option<String> {
+    let maybe = bytes.windows(4).any(|w| w == b"%TAG") || bytes.windows(2).any(|w| w == b"!<");
+    if !maybe {
+        return None;
+    }
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut starts = Vec::new();
+    let mut events = YamlParser::new_from_str(text);
+    while let Some(item) = events.next_event() {
+        let (event, span) = item.ok()?;
+        if let Event::Scalar(_, ScalarStyle::Plain, _, Some(tag)) = &event
+            && foreign(tag)
+        {
+            starts.push(span.start.index());
+        }
+    }
+    stand_in_tags(text, &starts)
+}
+
+/// Whether `tag` is a global tag outside the core schema, which
+/// serde_norway types as a string.
+fn foreign(tag: &Tag) -> bool {
+    const CORE: &str = "tag:yaml.org,2002:";
+    let full = format!("{}{}", tag.handle, tag.suffix);
+    !full.starts_with('!') && !full.starts_with(CORE)
+}
+
+/// `text` with the tag of the node whose properties start at each char
+/// index of `starts` (in document order) made a local tag of the same
+/// length; `None` when `starts` is empty or a tag is not found there.
+fn stand_in_tags(text: &str, starts: &[usize]) -> Option<String> {
     if starts.is_empty() {
         return None;
     }

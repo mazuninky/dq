@@ -193,17 +193,33 @@ impl Fixer {
         format_name: &str,
         document: Option<usize>,
     ) -> Result<FixOutcome> {
-        let slots: Vec<Option<usize>> = match (doc.values().map(<[_]>::len), document) {
-            (Some(_), Some(index)) => vec![Some(index)],
-            (Some(count), None) => (0..count).map(Some).collect(),
-            (None, Some(0) | None) => vec![None],
-            (None, Some(_)) => Vec::new(),
-        };
         let mut audit = Audit::default();
-        for slot in slots {
-            for rule in &self.rules {
-                self.apply_rule(rule, path, doc, slot, format_name, &mut audit)?;
+        match (doc.values().map(<[_]>::len), document) {
+            (Some(_), Some(index)) => {
+                self.fix_slot(path, doc, Some(index), format_name, &mut audit)?;
             }
+            (Some(_), None) => {
+                let mut index = 0;
+                while doc
+                    .values()
+                    .is_some_and(|documents| index < documents.len())
+                {
+                    // A `fix.ops` `remove ""` takes the document away: the
+                    // next one moves into its place.
+                    if !self.fix_slot(path, doc, Some(index), format_name, &mut audit)? {
+                        index += 1;
+                    }
+                }
+                // Down to one document, which is no stream any more: the
+                // second, when the first went.
+                if !doc.is_multi() && index == 0 {
+                    self.fix_slot(path, doc, None, format_name, &mut audit)?;
+                }
+            }
+            (None, Some(0) | None) => {
+                self.fix_slot(path, doc, None, format_name, &mut audit)?;
+            }
+            (None, Some(_)) => {}
         }
         Ok(FixOutcome {
             fixed: !audit.applied_rules.is_empty(),
@@ -211,6 +227,27 @@ impl Fixer {
             skipped_non_idempotent: audit.skipped_non_idempotent,
             legacy_jq_applied: audit.legacy_jq_applied,
         })
+    }
+
+    /// Run every rule against the document in `slot`, in order; `true`
+    /// when one of them removed that document from its stream, which ends
+    /// the run on it.
+    fn fix_slot(
+        &self,
+        path: &Utf8Path,
+        doc: &mut Document,
+        slot: Slot,
+        format_name: &str,
+        audit: &mut Audit,
+    ) -> Result<bool> {
+        for rule in &self.rules {
+            let documents = document_count(doc);
+            self.apply_rule(rule, path, doc, slot, format_name, audit)?;
+            if document_count(doc) != documents {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Run one rule's fix pipeline against the document in `slot`.
@@ -304,6 +341,11 @@ struct Audit {
     legacy_jq_applied: bool,
 }
 
+/// How many documents `doc` holds: one unless it is a stream.
+fn document_count(doc: &Document) -> usize {
+    doc.values().map_or(1, <[_]>::len)
+}
+
 /// The value of the document in `slot`; `None` when the stream no longer
 /// has that many documents.
 fn slot_value(doc: &Document, slot: Slot) -> Option<&dq_core::Value> {
@@ -347,7 +389,7 @@ fn apply_ops_branch(
     if script.is_noop() {
         return Ok(());
     }
-    refuse_whole_document_ops(&script, slot, &rule.rule.id)?;
+    refuse_document_removal(&script, slot, &rule.rule.id)?;
     // The script addresses the document's root as `""`; in a stream that
     // document is `/N`.
     let script = match slot {
@@ -396,10 +438,22 @@ fn apply_ops_branch(
     // emits a non-empty patch (e.g. `[replace /x = 1]` on a doc that
     // already has `x: 1`) pass as silently-skipped instead of being
     // recorded on `skipped_non_idempotent`.
+    if document_count(&working) != document_count(doc) {
+        // `remove ""` took the document out of its stream: there is no
+        // document left to run the script on again.
+        tracing::info!(
+            rule_id = %rule.rule.id,
+            path = %path,
+            "applied fix.ops: removed {}",
+            document_name(slot),
+        );
+        *doc = working;
+        audit.applied_rules.push(rule.rule.id.clone());
+        return Ok(());
+    }
     let Some(value_after) = slot_value(&working, slot) else {
-        // Not reachable through a script `refuse_whole_document_ops`
-        // let through — every path lies below the document — but a
-        // document that vanished must not pass as fixed.
+        // Not reachable: the document is still there. A document that
+        // vanished must not pass as fixed.
         return Err(ExecError::FixApply {
             rule_id: rule.rule.id.clone(),
             message: format!("fix.ops left no {}", document_name(slot)),
@@ -442,38 +496,44 @@ fn apply_ops_branch(
     Ok(())
 }
 
-/// Refuse a `fix.ops` script with an op on the document itself (path
-/// `""`): `add` / `replace` of the whole document, or its `remove`.
+/// Refuse a `fix.ops` script that removes its document (`remove` of the
+/// path `""`) where that cannot be done: a document that is not part of
+/// a stream is the whole file, and in a stream any op after the removal
+/// would address the document that moves into its place.
 ///
-/// A textual edit splices a value into its parent, and a document has
-/// none, so `set_at` / `del_at` cannot make such an edit — in a single
-/// document it failed as an unaddressable root, and in a stream it would
-/// become an edit of `/N` that the stream's writer refuses. One error for
-/// both, naming the rule, the document and why, so the finding is never
-/// left in place behind an exit 0. When whole-document replacement
-/// becomes a textual edit, this check is what to lift.
+/// `add` / `replace` of `""` write the whole document, and `remove ""`
+/// in a stream removes that document with its `---` line; both go through
+/// [`Document::set_at`] / [`Document::del_at`] like any other op.
 ///
 /// # Errors
 ///
-/// [`ExecError::FixApply`] (exit 3) for the first such op.
-fn refuse_whole_document_ops(script: &EditScript, slot: Slot, rule_id: &str) -> Result<()> {
-    let whole = script.ops().iter().find_map(|op| match op {
-        dq_core::EditOp::Add { path, .. } if path.segments().is_empty() => Some("add"),
-        dq_core::EditOp::Replace { path, .. } if path.segments().is_empty() => Some("replace"),
-        dq_core::EditOp::Remove { path } if path.segments().is_empty() => Some("remove"),
-        _ => None,
-    });
-    match whole {
-        None => Ok(()),
-        Some(op) => Err(ExecError::FixApply {
-            rule_id: rule_id.to_owned(),
-            message: format!(
-                "fix.ops would {op} {} as a whole (path \"\"): fix.ops edits values inside \
-                 a document and cannot {op} a whole document yet",
-                document_name(slot)
-            ),
-        }),
-    }
+/// [`ExecError::FixApply`] (exit 3) naming the rule and the document.
+fn refuse_document_removal(script: &EditScript, slot: Slot, rule_id: &str) -> Result<()> {
+    let ops = script.ops();
+    let Some(at) = ops.iter().position(
+        |op| matches!(op, dq_core::EditOp::Remove { path } if path.segments().is_empty()),
+    ) else {
+        return Ok(());
+    };
+    let message = if slot.is_none() {
+        format!(
+            "fix.ops would remove {} as a whole (remove \"\"): it is the whole file; \
+             only a document of a stream can be removed",
+            document_name(slot)
+        )
+    } else if at + 1 < ops.len() {
+        format!(
+            "fix.ops removes {} (remove \"\") and then runs more ops, which would \
+             edit the document after it; remove \"\" must be the last op",
+            document_name(slot)
+        )
+    } else {
+        return Ok(());
+    };
+    Err(ExecError::FixApply {
+        rule_id: rule_id.to_owned(),
+        message,
+    })
 }
 
 /// `the document`, or `document N of the stream`, for messages.
@@ -1687,11 +1747,9 @@ fix:
         );
     }
 
-    #[test]
-    fn fixer_ops_on_the_whole_document_is_fix_apply_in_a_file_and_a_stream() {
-        for (op, value) in [("replace", r#","value":{"ok":true}"#), ("remove", "")] {
-            let rule = format!(
-                r#"
+    fn whole_document_rule(ops: &str) -> Fixer {
+        let rule = format!(
+            r#"
 id: test.whole
 description: whole-document fix
 severity: warn
@@ -1700,28 +1758,77 @@ check:
   jq: 'select(.bad == true)'
   message: bad
 fix:
-  ops: '[{{"op":"{op}","path":""{value}}}]'
+  ops: '{ops}'
 "#
+        );
+        Fixer::new(&evaluator_from_yaml(&rule))
+    }
+
+    fn fixed(fixer: &Fixer, source: &str) -> Result<String> {
+        let mut doc = dq_core::parse_yaml_stream_with_spans(source.as_bytes()).unwrap();
+        let outcome = fixer.apply(Utf8Path::new("f.yaml"), &mut doc, "yaml")?;
+        assert_eq!(outcome.applied_rules.is_empty(), !outcome.fixed);
+        Ok(String::from_utf8(doc.original_bytes().to_vec()).unwrap())
+    }
+
+    #[test]
+    fn fixer_ops_replace_the_whole_document_in_a_file_and_a_stream() {
+        for op in ["replace", "add"] {
+            let fixer = whole_document_rule(&format!(
+                r#"if .bad then [{{"op":"{op}","path":"","value":{{"ok":true}}}}] else [] end"#
+            ));
+            assert_eq!(
+                fixed(&fixer, "# head\nbad: true\n").unwrap(),
+                "# head\nok: true\n"
             );
-            let fixer = Fixer::new(&evaluator_from_yaml(&rule));
-            for (source, document) in [
-                (&b"bad: true\n"[..], "the document"),
-                (&b"ok: 1\n---\nbad: true\n"[..], "document 1 of the stream"),
-            ] {
-                let mut doc = dq_core::parse_yaml_stream_with_spans(source).unwrap();
-                let err = fixer
-                    .apply(Utf8Path::new("f.yaml"), &mut doc, "yaml")
-                    .expect_err("refused");
-                let ExecError::FixApply { rule_id, message } = err else {
-                    panic!("expected FixApply, got {err:?}");
-                };
-                assert_eq!(rule_id, "test.whole");
-                assert!(
-                    message.starts_with(&format!("fix.ops would {op} {document} as a whole")),
-                    "{message}"
-                );
-                assert_eq!(doc.original_bytes(), source, "untouched");
-            }
+            assert_eq!(
+                fixed(&fixer, "ok: 1 # keep\n---\nbad: true\n").unwrap(),
+                "ok: 1 # keep\n---\nok: true\n"
+            );
         }
+    }
+
+    #[test]
+    fn fixer_ops_remove_a_document_of_a_stream_and_fix_the_next() {
+        let fixer = whole_document_rule(r#"[{"op":"remove","path":""}]"#);
+        assert_eq!(
+            fixed(
+                &fixer,
+                "ok: 1\n---\nbad: true\n---\nbad: true\n---\nok: 2\n"
+            )
+            .unwrap(),
+            "ok: 1\n---\nok: 2\n"
+        );
+        // Down to one document: the one left is fixed as a document, and
+        // a document that is no stream cannot be removed.
+        let err = fixed(&fixer, "bad: true\n---\nbad: true\n").expect_err("refused");
+        let ExecError::FixApply { rule_id, message } = err else {
+            panic!("expected FixApply, got {err:?}");
+        };
+        assert_eq!(rule_id, "test.whole");
+        assert!(
+            message.starts_with("fix.ops would remove the document as a whole"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn fixer_ops_refuse_a_removal_of_the_file_or_ops_after_one() {
+        let fixer = whole_document_rule(r#"[{"op":"remove","path":""}]"#);
+        let err = fixed(&fixer, "bad: true\n").expect_err("refused");
+        assert!(
+            matches!(&err, ExecError::FixApply { message, .. }
+                if message.contains("it is the whole file")),
+            "{err:?}"
+        );
+        let fixer = whole_document_rule(
+            r#"[{"op":"remove","path":""},{"op":"add","path":"/x","value":1}]"#,
+        );
+        let err = fixed(&fixer, "ok: 1\n---\nbad: true\n").expect_err("refused");
+        assert!(
+            matches!(&err, ExecError::FixApply { message, .. }
+                if message.contains("must be the last op")),
+            "{err:?}"
+        );
     }
 }

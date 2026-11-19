@@ -53,15 +53,6 @@ const REFUSALS: &[Refusal] = &[
         message: "cannot set '/a/0': the edit would change other parts of the document; ",
     },
     Refusal {
-        // A comment between the entry and `}`: removing the entry would
-        // leave the comment swallowing the bracket.
-        name: "doc.yaml",
-        src: "a: {x: 1, y: 2 # c\n}\n",
-        command: "del",
-        args: &["/a/y"],
-        message: "cannot delete '/a/y': dq cannot remove it as a textual edit; ",
-    },
-    Refusal {
         // A duplicate member: removing one leaves the other, so `a` is
         // still there.
         name: "doc.json",
@@ -299,7 +290,15 @@ fn the_same_edits_are_made_where_they_read_back() {
             "a: {x: 1, y: 2, # c\n}\n",
             "del",
             &["/a/y"],
-            "a: {x: 1,  # c\n}\n",
+            "a: {x: 1 # c\n}\n",
+        ),
+        // A comment between the entry and `}` stays, on its line.
+        (
+            "doc.yaml",
+            "a: {x: 1, y: 2 # c\n}\n",
+            "del",
+            &["/a/y"],
+            "a: {x: 1 # c\n}\n",
         ),
         (
             "doc.json",

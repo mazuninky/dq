@@ -118,7 +118,14 @@ impl Format for Yaml {
 /// [`super::yaml_numbers::read_exact`] reads it — also for a key that
 /// repeats an earlier one, which that reader names where it repeats, and
 /// for a `!!float` / `!!int` number serde_norway refuses.
+///
+/// A plain scalar under a tag of no schema dq knows — a `%TAG` handle
+/// bound to another prefix (`!!str` after `%TAG !! tag:example.com,2000:`),
+/// a verbatim `!<tag:example.com,2000:x>` — reads as untagged, as one under
+/// a local tag (`!foo`) does ([`super::yaml_numbers::untag_foreign`]).
 fn read_documents(bytes: &[u8]) -> Result<Vec<Value>> {
+    let untagged = super::yaml_numbers::untag_foreign(bytes);
+    let bytes = untagged.as_deref().map_or(bytes, str::as_bytes);
     if !super::yaml_numbers::may_lose_numbers(bytes) {
         match read_nodes(bytes, true) {
             Ok(nodes) => return Ok(nodes.into_iter().map(node_to_value).collect()),

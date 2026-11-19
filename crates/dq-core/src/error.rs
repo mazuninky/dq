@@ -73,8 +73,9 @@ pub enum Error {
         message: String,
     },
 
-    /// JSON Pointer did not address an existing node.
-    #[error("path '{pointer}' not found (matched up to '{matched_prefix}')")]
+    /// JSON Pointer did not address an existing node — or addressed the
+    /// root of a document, or of a stream, that the edit cannot apply to.
+    #[error("{}", path_message(pointer, matched_prefix, kind))]
     Path {
         /// The pointer the user supplied.
         pointer: String,
@@ -172,6 +173,23 @@ pub enum Error {
         /// The value actually present at `pointer`.
         actual: Box<Value>,
     },
+}
+
+/// The message of an [`Error::Path`].
+fn path_message(pointer: &str, matched_prefix: &str, kind: &PathErrorKind) -> String {
+    match kind {
+        PathErrorKind::TypeMismatch { found: "root", .. } => format!(
+            "cannot delete the root '{pointer}': it is the whole document; delete a value \
+             inside it, or one document of a stream as /N"
+        ),
+        PathErrorKind::TypeMismatch {
+            found: "stream", ..
+        } => format!(
+            "cannot set the root '{pointer}' of a stream of documents: set one document \
+             as /N, or pass --doc N"
+        ),
+        _ => format!("path '{pointer}' not found (matched up to '{matched_prefix}')"),
+    }
 }
 
 impl Error {

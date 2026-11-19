@@ -4,7 +4,7 @@ use super::{Document, FormatTag, Value, first_difference, with_line_ending_at};
 use crate::Result;
 use crate::error::Error;
 use crate::format::Format as _;
-use crate::parsers::yaml_spans::{document_extents, parse_yaml_stream_with_spans};
+use crate::parsers::yaml_spans::{DocumentExtent, document_extents, parse_yaml_stream_with_spans};
 
 impl Document {
     /// Replace document `index` of a write-aware multi-document YAML
@@ -40,22 +40,64 @@ impl Document {
         if self.format != FormatTag::Yaml || self.original_bytes.is_empty() {
             return Err(unavailable("not a write-aware YAML stream"));
         }
-        let mut expected = self
+        let expected = self
             .values()
             .ok_or_else(|| unavailable("not a multi-document stream"))?
             .to_vec();
-        let Some(slot) = expected.get_mut(index) else {
+        if index >= expected.len() {
             return Err(unavailable(&format!("the stream has no document {index}")));
+        }
+        self.reemit_yaml_document(Some(index), expected, value)
+    }
+
+    /// Replace the value of a write-aware YAML file that is one document
+    /// (not a stream) with `value`, the way [`Document::reemit_stream_document`]
+    /// replaces one document of a stream: the comment and blank lines before
+    /// the content, the `---` line with any directives above it, and the
+    /// comment lines after the last content line stay byte for byte. A file
+    /// with no content (only comments) gets the value after them.
+    ///
+    /// # Errors
+    ///
+    /// As [`Document::reemit_stream_document`], for a file that is not one
+    /// write-aware YAML document.
+    pub(crate) fn reemit_yaml_root(&mut self, value: Value) -> Result<()> {
+        if self.format != FormatTag::Yaml || self.original_bytes.is_empty() || self.multi_doc {
+            return Err(Error::WriteUnavailable {
+                reason: "not a write-aware YAML document".to_owned(),
+            });
+        }
+        let expected = vec![self.value.clone()];
+        self.reemit_yaml_document(None, expected, value)
+    }
+
+    /// Re-emit document `index` of a stream (`None`: the file's only
+    /// document) whose documents are `expected` as `value`.
+    fn reemit_yaml_document(
+        &mut self,
+        index: Option<usize>,
+        mut expected: Vec<Value>,
+        value: Value,
+    ) -> Result<()> {
+        let unavailable = |reason: &str| Error::WriteUnavailable {
+            reason: reason.to_owned(),
         };
-        let previous = std::mem::replace(slot, value);
-        let extents = document_extents(&self.original_bytes)
-            .filter(|extents| extents.len() == expected.len())
-            .ok_or_else(|| unavailable("the stream's documents could not be located"))?;
-        let extent = &extents[index];
+        let at = index.unwrap_or(0);
+        let pointer = index.map_or_else(String::new, |index| format!("/{index}"));
+        let previous = std::mem::replace(&mut expected[at], value);
+        let mut extents = document_extents(&self.original_bytes).unwrap_or_default();
+        if index.is_none() && extents.is_empty() {
+            // Comments alone: no document to locate; the value goes after them.
+            extents.push(end_of_file_extent(&self.original_bytes));
+        }
+        if extents.len() != expected.len() {
+            return Err(unavailable("the stream's documents could not be located"));
+        }
+        let extent = &extents[at];
 
         let mut emitted = Vec::new();
         crate::parsers::Yaml.write(
-            &Document::value_only(expected[index].clone(), FormatTag::Yaml),
+            &Document::value_only(expected[at].clone(), FormatTag::Yaml),
             &mut emitted,
         )?;
 
@@ -69,7 +111,7 @@ impl Document {
             tags_fit(
                 &self.original_bytes[extent.body.start..end],
                 &previous,
-                &expected[index],
+                &expected[at],
                 &emitted,
             )
         }) {
@@ -82,7 +124,7 @@ impl Document {
         let mut rejected = None;
         for ((start, needs_line_break), end) in attempts {
             let bytes = self.splice(start..end.max(start), needs_line_break, &emitted);
-            match read_back(&bytes, &expected, index) {
+            match read_back(&bytes, &expected, index.is_some(), &pointer, "set") {
                 Ok(reparsed) => {
                     *self = reparsed;
                     return Ok(());
@@ -91,6 +133,76 @@ impl Document {
             }
         }
         Err(rejected.unwrap_or_else(|| unavailable("nothing to rewrite")))
+    }
+
+    /// Remove document `index` of a write-aware multi-document YAML
+    /// stream, with its `---` line and the comment lines just above that
+    /// line, which lead into it; every other byte stays. Its own trailing
+    /// comment lines lead into the next document and stay. A stream left
+    /// with one document is read as that document, no longer a stream.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::WriteUnavailable`] — the document is not a write-aware
+    ///   YAML stream, or has no document `index`.
+    /// - [`Error::EditRejected`] — the rest of the file would not read back
+    ///   as the other documents (or an alias elsewhere names an anchor in
+    ///   the removed one); `self` is unchanged.
+    pub(crate) fn remove_stream_document(&mut self, index: usize) -> Result<()> {
+        let unavailable = |reason: &str| Error::WriteUnavailable {
+            reason: reason.to_owned(),
+        };
+        if self.format != FormatTag::Yaml || self.original_bytes.is_empty() {
+            return Err(unavailable("not a write-aware YAML stream"));
+        }
+        let mut expected = self
+            .values()
+            .ok_or_else(|| unavailable("not a multi-document stream"))?
+            .to_vec();
+        if index >= expected.len() {
+            return Err(unavailable(&format!("the stream has no document {index}")));
+        }
+        expected.remove(index);
+        let extents = document_extents(&self.original_bytes)
+            .filter(|extents| extents.len() == expected.len() + 1)
+            .ok_or_else(|| unavailable("the stream's documents could not be located"))?;
+        let extent = &extents[index];
+        // The `...` line that ends a document, when one does.
+        let end_marker = |at: usize| {
+            let extent = &extents[at];
+            let next = extents
+                .get(at + 1)
+                .map_or(self.original_bytes.len(), |next| next.line_start);
+            (extent.body.end < next).then(|| {
+                self.original_bytes[extent.body.end..next]
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map_or(next, |newline| extent.body.end + newline + 1)
+            })
+        };
+        let start = match index.checked_sub(1) {
+            // The lead-in after the document before: unless that one ends
+            // with a `...` line, which stays to end it.
+            Some(before) if end_marker(before).is_none() => extents[before].content_end,
+            Some(_) => extent.line_start,
+            None => extent.line_start.max(super::bom_end(&self.original_bytes)),
+        };
+        let mut end = extent.content_end.max(extent.body.start).max(start);
+        // Its own `...` line goes too where nothing is left for it to end:
+        // before the first document, or after another `...` line.
+        if (index == 0 || start == extent.line_start)
+            && let Some(marker_end) = end_marker(index)
+        {
+            end = marker_end;
+        }
+        let mut bytes = self.original_bytes[..start].to_vec();
+        bytes.extend_from_slice(&self.original_bytes[end..]);
+        // An alias cannot name an anchor of another document, so what
+        // is left reads as the other documents or the read-back says why.
+        let stream = expected.len() > 1;
+        let reparsed = read_back(&bytes, &expected, stream, &format!("/{index}"), "delete")?;
+        *self = reparsed;
+        Ok(())
     }
 
     /// The original bytes with `range` replaced by `emitted` — the
@@ -172,17 +284,45 @@ fn tags_fit(properties: &[u8], previous: &Value, value: &Value, emitted: &[u8]) 
         })
 }
 
+/// The extent of a document after the last byte of `bytes`, for a file
+/// that holds no document yet (only comments).
+fn end_of_file_extent(bytes: &[u8]) -> DocumentExtent {
+    let end = bytes.len();
+    DocumentExtent {
+        line_start: end,
+        body: end..end,
+        needs_line_break: !bytes.is_empty() && !bytes.ends_with(b"\n"),
+        content_end: end,
+        after_properties: None,
+    }
+}
+
 /// `bytes` parsed as a stream, when it reads back as the documents
-/// `expected` — [`Error::EditRejected`] for document `index` otherwise.
-fn read_back(bytes: &[u8], expected: &[Value], index: usize) -> Result<Document> {
+/// `expected` — as one document, not a stream, unless `stream` — and
+/// [`Error::EditRejected`] for `pointer` otherwise.
+fn read_back(
+    bytes: &[u8],
+    expected: &[Value],
+    stream: bool,
+    pointer: &str,
+    action: &'static str,
+) -> Result<Document> {
     let rejected = |reason: String| Error::EditRejected {
-        action: "set",
-        pointer: format!("/{index}"),
+        action,
+        pointer: pointer.to_owned(),
         reason,
     };
     let reparsed = parse_yaml_stream_with_spans(bytes)
         .map_err(|err| rejected(format!("the rewritten file does not parse: {err}")))?;
-    let documents = reparsed.values().unwrap_or_default();
+    let single;
+    let documents = match (stream, reparsed.values()) {
+        (true, Some(documents)) => documents,
+        (false, None) => {
+            single = [reparsed.value().clone()];
+            &single[..]
+        }
+        _ => &[],
+    };
     if documents.len() != expected.len() {
         return Err(rejected(format!(
             "the rewritten file holds {} document(s) instead of {}",

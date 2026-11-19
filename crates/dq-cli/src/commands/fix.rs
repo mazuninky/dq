@@ -227,7 +227,10 @@ impl<'a> FileOp for FixFileOp<'a> {
             && let Some(runtime) = loaded.runtime.as_ref()
         {
             for handle in &loaded.handles {
-                for slot in document_slots(&document, only) {
+                let mut slots = document_slots(&document, only);
+                let mut at = 0;
+                while let Some(&slot) = slots.get(at) {
+                    at += 1;
                     // The plugin sees one document of a stream as a document
                     // of its own; its script then applies below that
                     // document's `/N`.
@@ -251,6 +254,11 @@ impl<'a> FileOp for FixFileOp<'a> {
                     if script.is_noop() {
                         continue;
                     }
+                    if let Some(why) = unappliable_removal(&script, slot) {
+                        tracing::warn!(path = %path, "plugin EditScript {why}; skipping");
+                        continue;
+                    }
+                    let documents = document.values().map_or(1, <[_]>::len);
                     match script.apply(&mut document) {
                         Ok(()) => {
                             plugin_fixed = true;
@@ -267,6 +275,20 @@ impl<'a> FileOp for FixFileOp<'a> {
                                 "plugin EditScript failed to apply; skipping",
                             );
                         }
+                    }
+                    // `remove ""` took the document out of its stream: the
+                    // next one moved into its place, and a stream down to
+                    // one document is a document of its own.
+                    if only.is_none()
+                        && let Some(index) = slot
+                        && document.values().map_or(1, <[_]>::len) != documents
+                    {
+                        slots = match document.values() {
+                            Some(left) => (index..left.len()).map(Some).collect(),
+                            None if index == 0 => vec![None],
+                            None => Vec::new(),
+                        };
+                        at = 0;
                     }
                 }
             }
@@ -324,6 +346,28 @@ fn document_slots(document: &Document, only: Option<usize>) -> Vec<Option<usize>
         (Some(_), Some(index)) => vec![Some(index)],
         (Some(values), None) => (0..values.len()).map(Some).collect(),
         (None, _) => vec![None],
+    }
+}
+
+/// Why a plugin's `script` that removes its document (`remove ""`, below
+/// `/N` in a stream) cannot be applied to the document in `slot`: a file
+/// that is no stream would be emptied, and ops after the removal would
+/// edit the document that moves into its place. `None` when it can be.
+fn unappliable_removal(script: &dq_core::EditScript, slot: Option<usize>) -> Option<&'static str> {
+    let document = match slot {
+        None => Pointer::new(Vec::new()),
+        Some(index) => Pointer::new(vec![Segment::Key(index.to_string())]),
+    };
+    let ops = script.ops();
+    let at = ops
+        .iter()
+        .position(|op| matches!(op, dq_core::EditOp::Remove { path } if *path == document))?;
+    if slot.is_none() {
+        Some("would remove the whole file")
+    } else if at + 1 < ops.len() {
+        Some("removes its document and then runs more ops")
+    } else {
+        None
     }
 }
 

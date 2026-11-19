@@ -1298,23 +1298,6 @@ fn comment_lines_count_their_columns_past_a_byte_order_mark() {
     ]);
 }
 
-/// Run `dq -i set doc.yaml <args…>` on `src`: exit 7, empty stdout, the
-/// file untouched; the stderr.
-fn set_refused(src: &str, args: &[&str]) -> String {
-    let dir = TempDir::new().expect("tempdir");
-    let path = dir.path().join("doc.yaml");
-    std::fs::write(&path, src).expect("write fixture");
-    let out = dq()
-        .current_dir(dir.path())
-        .args(["-i", "--no-color", "set", "doc.yaml"])
-        .args(args)
-        .assert()
-        .code(7)
-        .stdout("");
-    assert_eq!(std::fs::read_to_string(&path).expect("read back"), src);
-    String::from_utf8(out.get_output().stderr.clone()).expect("UTF-8 stderr")
-}
-
 #[test]
 fn a_tag_directive_binds_its_handle_for_its_own_document() {
     check_read(&[
@@ -1359,16 +1342,24 @@ fn a_tag_directive_binds_its_handle_for_its_own_document() {
             "%TAG !! tag:x,1:\n---\na: 1\n---\nb: 7\n",
             serde_json::json!([{"a": 1}, {"b": 7}]),
         ),
+        // A rebound `!!str` is an application's tag: dq reads the scalar
+        // under it as untagged, as under `!foo`, so a kept tag over a
+        // number reads back as the number.
+        (
+            "%TAG !! tag:x,1:\n---\na: !!str 5\nb: 2\n",
+            "set",
+            &["/a", "7"],
+            "%TAG !! tag:x,1:\n---\na: !!str 7\nb: 2\n",
+            serde_json::json!({"a": 7, "b": 2}),
+        ),
+        (
+            "%TAG !! tag:x,1:\n---\na: !!map\n  c: 1\nb: 2\n",
+            "set",
+            &["/a", "7"],
+            "%TAG !! tag:x,1:\n---\na: !!map 7\nb: 2\n",
+            serde_json::json!({"a": 7, "b": 2}),
+        ),
     ]);
-    // A kept `!!str` on a number, or `!!map` on one, would not read back
-    // as the number dq reads: refused.
-    for src in [
-        "%TAG !! tag:x,1:\n---\na: !!str 5\nb: 2\n",
-        "%TAG !! tag:x,1:\n---\na: !!map\n  c: 1\nb: 2\n",
-    ] {
-        let err = set_refused(src, &["/a", "7"]);
-        assert!(err.contains("cannot set '/a'"), "{err}");
-    }
 }
 
 #[test]
@@ -1396,14 +1387,28 @@ fn a_tag_on_the_document_start_line() {
             "--- !!map\na: 1\nb: 2\n",
             serde_json::json!({"a": 1, "b": 2}),
         ),
+        // A document of a stream is written anew as a whole: a tag that
+        // no longer fits its value goes, one that does stays.
+        (
+            "--- !!map {a: 1}\n--- !!map {b: 1}\n",
+            "set",
+            &["/1", "5"],
+            "--- !!map {a: 1}\n---\n5\n",
+            serde_json::json!([{"a": 1}, 5]),
+        ),
+        (
+            "--- !!map\na: 1\n--- !!map\nb: 1\n",
+            "set",
+            &["/1", "{\"c\": 2}"],
+            "--- !!map\na: 1\n--- !!map\nc: 2\n",
+            serde_json::json!([{"a": 1}, {"c": 2}]),
+        ),
+        (
+            "--- {a: 1}\n--- {b: 1}\n",
+            "set",
+            &["/1", "5"],
+            "--- {a: 1}\n---\n5\n",
+            serde_json::json!([{"a": 1}, 5]),
+        ),
     ]);
-    // Replacing a document's root is refused, tagged or not.
-    for src in [
-        "--- !!map {a: 1}\n--- !!map {b: 1}\n",
-        "--- !!map\na: 1\n--- !!map\nb: 1\n",
-        "--- {a: 1}\n--- {b: 1}\n",
-    ] {
-        let err = set_refused(src, &["/1", "5"]);
-        assert!(err.contains("cannot set '/1'"), "{err}");
-    }
 }

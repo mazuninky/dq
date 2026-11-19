@@ -864,12 +864,120 @@ impl Document {
     /// - [`Error::EditRejected`] when the edited bytes fail the read-back
     ///   check.
     pub fn set_at(&mut self, pointer: &Pointer, value: Value) -> Result<()> {
-        let before = self.clone();
-        let layout = LayoutCache::new();
-        let result = self.set_at_unchecked(pointer, value.clone(), &layout);
-        self.check_edit(before, result, "set", pointer, &layout, |tree, at| {
-            set_value_at(tree, at, value.clone())
+        self.with_lf_line_breaks("set", pointer, |doc| {
+            if doc.format == FormatTag::Yaml && !doc.original_bytes.is_empty() {
+                // A whole document: one of a stream whose content is a
+                // collection, or a file's only document, which has no
+                // bytes of its own to replace; the YAML writer writes it
+                // and the comments around it stay.
+                // An empty document (null) has no text to replace either.
+                if let Some(index) = doc.stream_document_index(pointer)
+                    && doc
+                        .values()
+                        .is_some_and(|documents| match &documents[index] {
+                            Value::Map(map) => !map.is_empty(),
+                            Value::Array(items) => !items.is_empty(),
+                            value => *value == Value::Null,
+                        })
+                {
+                    return doc.reemit_stream_document(index, value);
+                }
+                if pointer.is_root() && (!doc.spans.contains_key("") || doc.value == Value::Null) {
+                    if doc.multi_doc {
+                        return Err(Error::Path {
+                            pointer: String::new(),
+                            matched_prefix: String::new(),
+                            kind: PathErrorKind::TypeMismatch {
+                                expected: "a document of the stream",
+                                found: "stream",
+                            },
+                            did_you_mean: Vec::new(),
+                        });
+                    }
+                    return doc.reemit_yaml_root(value);
+                }
+            }
+            let before = doc.clone();
+            let layout = LayoutCache::new();
+            let result = doc.set_at_unchecked(pointer, value.clone(), &layout);
+            doc.check_edit(before, result, "set", pointer, &layout, |tree, at| {
+                set_value_at(tree, at, value.clone())
+            })
         })
+    }
+
+    /// Run `edit` on a YAML or JSON file whose lines end in a lone `\r`
+    /// as on the same file with `\n` line breaks — each `\r` is a line
+    /// break to both, and the textual edits look for `\n` — then turn every
+    /// `\n` back into `\r`, so the lines the edit writes end the way the
+    /// file's do. The bytes as written are parsed again and must read as
+    /// the `\n` form did; otherwise, as on any error, `self` is left as it
+    /// was. Other files go to `edit` as they are.
+    pub(crate) fn with_lf_line_breaks(
+        &mut self,
+        action: &'static str,
+        pointer: &Pointer,
+        edit: impl FnOnce(&mut Self) -> Result<()>,
+    ) -> Result<()> {
+        if !matches!(self.format, FormatTag::Yaml | FormatTag::Json)
+            || !LineBreak::cr_only(&self.original_bytes)
+        {
+            return edit(self);
+        }
+        let before = self.clone();
+        let swap = |bytes: &mut Vec<u8>, from: u8, to: u8| {
+            bytes
+                .iter_mut()
+                .filter(|b| **b == from)
+                .for_each(|b| *b = to);
+        };
+        swap(&mut self.original_bytes, b'\r', b'\n');
+        // The spans of the `\n` form: a line range ends past a `\n`.
+        if let Some(Ok(fresh)) = parse_again(self.format, &self.original_bytes) {
+            self.spans = fresh.spans;
+            self.provenance = fresh.provenance;
+        }
+        if let Err(err) = edit(self) {
+            *self = before;
+            return Err(err);
+        }
+        swap(&mut self.original_bytes, b'\n', b'\r');
+        match parse_again(self.format, &self.original_bytes) {
+            Some(Ok(fresh)) if first_difference(&self.value, &fresh.value, "").is_none() => {
+                self.value = fresh.value;
+                self.spans = fresh.spans;
+                self.provenance = fresh.provenance;
+                Ok(())
+            }
+            _ => {
+                *self = before;
+                Err(Error::EditRejected {
+                    action,
+                    pointer: pointer.as_canonical(),
+                    reason: format!("the edited document would not parse; {JQ_REWRITE_HINT}"),
+                })
+            }
+        }
+    }
+
+    /// The index of the document of a write-aware YAML stream `pointer`
+    /// names (`/1`), `None` for any other pointer or document.
+    fn stream_document_index(&self, pointer: &Pointer) -> Option<usize> {
+        if self.format != FormatTag::Yaml || self.original_bytes.is_empty() {
+            return None;
+        }
+        let documents = self.values()?;
+        let [segment] = pointer.segments() else {
+            return None;
+        };
+        let index = match segment {
+            Segment::Index(index) => *index,
+            Segment::Key(key) => key
+                .parse()
+                .ok()
+                .filter(|index: &usize| index.to_string() == *key)?,
+        };
+        (index < documents.len()).then_some(index)
     }
 
     /// The YAML edit layout of the bytes as they were before the edit
@@ -891,6 +999,86 @@ impl Document {
                     .flatten()
             })
             .as_ref()
+    }
+
+    /// Write `value` over the whole JSON or TOML document: JSON as the
+    /// textual-edit renderer writes a value, in place of the content between
+    /// the file's leading and trailing blanks; TOML through its writer, after
+    /// the block of comment and blank lines the file starts with. The caller's
+    /// read-back checks the result.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::EditRejected`] for a TOML value that is no table — a TOML
+    /// document is one — and the TOML writer's error for a table it cannot
+    /// write.
+    fn replace_root_text(
+        &mut self,
+        value: Value,
+        renderer: &dyn crate::textual_edit::ScalarRenderer,
+    ) -> Result<()> {
+        let bytes = &self.original_bytes;
+        let content_start = bom_end(bytes);
+        let (range, inserted) = if self.format == FormatTag::Toml {
+            if !matches!(value, Value::Map(_)) {
+                return Err(Error::EditRejected {
+                    action: "set",
+                    pointer: String::new(),
+                    reason: format!(
+                        "{TOML_ROOT_TABLE}, not {}",
+                        match value {
+                            Value::Null => "null",
+                            Value::Bool(_) => "a boolean",
+                            Value::Int(_) | Value::BigInt(_) => "an integer",
+                            Value::Float(_) | Value::BigFloat(_) => "a float",
+                            Value::String(_) => "a string",
+                            Value::Array(_) | Value::Map(_) => "an array",
+                        }
+                    ),
+                });
+            }
+            let mut emitted = Vec::new();
+            crate::format::Format::write(
+                &crate::parsers::Toml,
+                &Document::value_only(value, FormatTag::Toml),
+                &mut emitted,
+            )?;
+            // Past the comment and blank lines that open the file.
+            let mut keep = content_start;
+            while keep < bytes.len() {
+                let line_end = bytes[keep..]
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map_or(bytes.len(), |at| keep + at + 1);
+                let line = bytes[keep..line_end].trim_ascii();
+                if !(line.is_empty() || line.starts_with(b"#")) {
+                    break;
+                }
+                keep = line_end;
+            }
+            let mut inserted = Vec::with_capacity(emitted.len() + 1);
+            if keep > content_start && bytes[keep - 1] != b'\n' && !emitted.is_empty() {
+                inserted.push(b'\n');
+            }
+            inserted.extend_from_slice(&emitted);
+            (
+                keep..bytes.len(),
+                with_line_ending_at(bytes, keep, inserted),
+            )
+        } else {
+            let start = bytes[content_start..]
+                .iter()
+                .position(|b| !b.is_ascii_whitespace())
+                .map_or(bytes.len(), |at| content_start + at);
+            let end = bytes
+                .iter()
+                .rposition(|b| !b.is_ascii_whitespace())
+                .map_or(start, |at| (at + 1).max(start));
+            let rendered = renderer.render_replacement(&value, SpanContext::BlockMapValue, &[]);
+            (start..end, rendered)
+        };
+        self.original_bytes.splice(range, inserted);
+        Ok(())
     }
 
     /// [`Document::set_at`] without the read-back check.
@@ -940,6 +1128,12 @@ impl Document {
                 reason: format!("{TOML_BIG_NUMBER} {number}"),
             });
         }
+        if pointer.is_root()
+            && (self.format == FormatTag::Toml
+                || (self.format == FormatTag::Json && !self.spans.contains_key("")))
+        {
+            return self.replace_root_text(value, renderer);
+        }
         if self.format == FormatTag::Yaml
             && match pointer.resolve(&self.value) {
                 // `key: !!str` reads as "".
@@ -956,8 +1150,17 @@ impl Document {
             // recorded span sits on the token after it.
             let tags = CoreTags::at(&self.original_bytes, at.start);
             let rendered = renderer.render_replacement(&value, span.context, &[]);
-            let (mut replacement, mut value_offset) =
-                empty_node_replacement(&self.original_bytes[at.clone()], &rendered, &tags);
+            let flow_prefix = self
+                .edit_layout(layout)
+                .and_then(|layout| layout.flow_value_prefixes.get(&canonical).copied());
+            let (mut replacement, mut value_offset) = if let Some(prefix) = flow_prefix {
+                // `{n}` / `{n: }`: the value, with the `:` or blank it needs.
+                let mut out = prefix.to_vec();
+                out.extend_from_slice(&rendered);
+                (out, prefix.len())
+            } else {
+                empty_node_replacement(&self.original_bytes[at.clone()], &rendered, &tags)
+            };
             // `? key` with no `:` line: the value needs its indicator, on
             // a line of its own at the `?` column.
             let explicit_key = self
@@ -1337,10 +1540,7 @@ impl Document {
         if self.format == FormatTag::Toml && flow_layout.is_none() {
             // A sibling written under a dotted key (`r0.k0 = 1`) has its
             // parent in the key, not in a header: the new key needs it too.
-            let line_start = self.original_bytes[..sibling_span.value_range.start]
-                .iter()
-                .rposition(|&b| b == b'\n')
-                .map_or(0, |i| i + 1);
+            let line_start = line_start(&self.original_bytes, sibling_span.value_range.start);
             if let Some(prefix) = toml_dotted_key_parent(&self.original_bytes[line_start..]) {
                 let prefix = prefix.trim_ascii_start();
                 let at = fragment.len() - fragment.trim_ascii_start().len();
@@ -1612,9 +1812,12 @@ impl Document {
                 .and_then(|(at, line)| {
                     toml_dotted_key_prefix(&self.original_bytes[line.clone()], at, pointer)
                 });
+            // The line break of the file, which the removal may take all of.
+            let line_break = LineBreak::at(&self.original_bytes, first);
             for range in ranges.into_iter().rev() {
                 self.original_bytes.drain(range);
             }
+            let emptied = !self.original_bytes.contains(&b'\n');
             self.adopt_reparse("set", canonical)?;
             if pointer.resolve(&self.value).is_ok() {
                 return Err(rejected());
@@ -1623,7 +1826,7 @@ impl Document {
                 line.extend_from_slice(b" = ");
                 line.extend(renderer.render_replacement(&value, SpanContext::BlockMapValue, &[]));
                 line.push(b'\n');
-                let line = with_line_ending_at(&self.original_bytes, first, line);
+                let line = with_line_break(line_break, line);
                 self.original_bytes.splice(first..first, line);
                 return self.adopt_reparse("set", canonical);
             }
@@ -1642,7 +1845,7 @@ impl Document {
             }
             let mut target = at;
             target.push_segment(key.ok_or_else(rejected)?);
-            return self
+            let written = self
                 .set_at_unchecked(&target, value, &LayoutCache::new())
                 .map_err(|err| match err {
                     // `a` still stands, made by another `[a.…]` section:
@@ -1655,6 +1858,12 @@ impl Document {
                     },
                     err => err,
                 });
+            if written.is_ok() && emptied {
+                // Every line break there is now is one the value brought.
+                let bytes = std::mem::take(&mut self.original_bytes);
+                self.original_bytes = with_line_break(line_break, bytes);
+            }
+            return written;
         }
         Err(rejected())
     }
@@ -1672,7 +1881,7 @@ impl Document {
         at: usize,
     ) -> Result<()> {
         let mut inserted = Vec::new();
-        if at > 0 && self.original_bytes[at - 1] != b'\n' {
+        if at > bom_end(&self.original_bytes) && self.original_bytes[at - 1] != b'\n' {
             inserted.push(b'\n');
         }
         inserted.extend(insertion_renderer.render_insertion(
@@ -1916,10 +2125,7 @@ impl Document {
                         return Some((pointer.clone(), span.clone()));
                     }
                     let collection = layout.containers.get(pointer)?;
-                    let line_start = self.original_bytes[..entry.at]
-                        .iter()
-                        .rposition(|&b| b == b'\n')
-                        .map_or(0, |i| i + 1);
+                    let line_start = line_start(&self.original_bytes, entry.at);
                     let end = collection.end;
                     return Some((
                         pointer.clone(),
@@ -2050,10 +2256,16 @@ impl Document {
     ///   anchor that an alias outside them refers to, or when the edited
     ///   bytes fail the read-back check [`Document::set_at`] describes.
     pub fn del_at(&mut self, pointer: &Pointer) -> Result<()> {
-        let before = self.clone();
-        let layout = LayoutCache::new();
-        let result = self.del_at_unchecked(pointer, &layout);
-        self.check_edit(before, result, "delete", pointer, &layout, delete_value_at)
+        self.with_lf_line_breaks("delete", pointer, |doc| {
+            // A document of a stream goes with its `---` line.
+            if let Some(index) = doc.stream_document_index(pointer) {
+                return doc.remove_stream_document(index);
+            }
+            let before = doc.clone();
+            let layout = LayoutCache::new();
+            let result = doc.del_at_unchecked(pointer, &layout);
+            doc.check_edit(before, result, "delete", pointer, &layout, delete_value_at)
+        })
     }
 
     /// Finish an edit of `pointer` whose unchecked step returned `result`:
@@ -2085,7 +2297,8 @@ impl Document {
                     reason,
                 } if !reason.contains(JQ_REWRITE_HINT)
                     && reason != JSON_NON_FINITE
-                    && !reason.starts_with(TOML_BIG_NUMBER) =>
+                    && !reason.starts_with(TOML_BIG_NUMBER)
+                    && !reason.starts_with(TOML_ROOT_TABLE) =>
                 {
                     Error::EditRejected {
                         action,
@@ -2341,7 +2554,10 @@ impl Document {
             && (target_is_collection
                 || parent_loses_last_child
                 || self.spans.get(&canonical).is_none_or(|span| {
-                    self.original_bytes[span.line_range.start..]
+                    matches!(
+                        span.context,
+                        SpanContext::FlowMapValue | SpanContext::FlowSeqItem
+                    ) || self.original_bytes[span.line_range.start..]
                         .iter()
                         .find(|&&b| b != b' ' && b != b'\t')
                         .is_none_or(|b| matches!(b, b'-' | b'?' | b':'))
@@ -2368,6 +2584,22 @@ impl Document {
         if compact_entry.is_some() && parent_loses_last_child {
             inserted = if in_map { b"{}" } else { b"[]" }.to_vec();
         }
+        // An entry of a YAML flow collection, by where the parse put it and
+        // its siblings.
+        let yaml_flow_entry = layout.as_ref().and_then(|layout| {
+            let children = match parent_ptr.resolve(&self.value) {
+                Ok(Value::Map(map)) => map.len(),
+                Ok(Value::Array(items)) => items.len(),
+                _ => return None,
+            };
+            yaml_flow_entry_removal(
+                &self.original_bytes,
+                layout,
+                &canonical,
+                &parent_ptr.as_canonical(),
+                children,
+            )
+        });
         let collection = layout
             .as_ref()
             .filter(|_| target_is_collection)
@@ -2404,10 +2636,7 @@ impl Document {
                 if in_flow {
                     flow_entry_removal(&self.original_bytes, &value, in_map, self.format)
                 } else {
-                    let line_start = self.original_bytes[..value.start]
-                        .iter()
-                        .rposition(|&b| b == b'\n')
-                        .map_or(0, |i| i + 1);
+                    let line_start = line_start(&self.original_bytes, value.start);
                     Some(line_start..past_line_break(&self.original_bytes, value.end))
                 }
             });
@@ -2485,6 +2714,7 @@ impl Document {
             })
             .flatten();
         let collection_entry = compact_entry
+            .or(yaml_flow_entry.clone().filter(|_| target_is_collection))
             .or(collection_entry)
             .or(json_collection_entry)
             .or(toml_collection_entry)
@@ -2533,12 +2763,14 @@ impl Document {
                     );
                 in_flow
                     .then(|| {
-                        flow_entry_removal(
-                            &self.original_bytes,
-                            &span.value_range,
-                            in_map,
-                            self.format,
-                        )
+                        yaml_flow_entry.clone().or_else(|| {
+                            flow_entry_removal(
+                                &self.original_bytes,
+                                &span.value_range,
+                                in_map,
+                                self.format,
+                            )
+                        })
                     })
                     .flatten()
                     .unwrap_or_else(|| span.line_range.clone())
@@ -2894,10 +3126,7 @@ impl Document {
         // Past the separating space, if one was inserted.
         let marker_start = if parent.top_level { at } else { at + 1 };
         let marker_range = marker_start..marker_start + marker.len();
-        let line_start = self.original_bytes[..marker_start]
-            .iter()
-            .rposition(|&b| b == b'\n')
-            .map_or(0, |i| i + 1);
+        let line_start = line_start(&self.original_bytes, marker_start);
         self.spans
             .entry(parent_ptr.as_canonical())
             .or_insert_with(|| ValueSpan {
@@ -2937,10 +3166,16 @@ fn flow_entry_removal(
             b':'
         };
         let sep = skip_blanks_back(bytes, start);
-        if sep == 0 || bytes[sep - 1] != indicator {
+        let key_end = if sep > 0 && bytes[sep - 1] == indicator {
+            skip_blanks_back(bytes, sep - 1)
+        } else if yaml && value.is_empty() && start == value.start && sep == start {
+            // The empty value of a key with no `:` (`{n}`), spanned right
+            // past the key.
+            sep
+        } else {
             return None;
-        }
-        start = flow_key_start(bytes, skip_blanks_back(bytes, sep - 1), format)?;
+        };
+        start = flow_key_start(bytes, key_end, format)?;
         if yaml {
             start = yaml_properties_start(bytes, start);
             let explicit = skip_blanks_back(bytes, start);
@@ -2975,6 +3210,86 @@ fn flow_entry_removal(
         },
         _ => None,
     }
+}
+
+/// The bytes `del` removes for the entry of the YAML flow collection at
+/// `canonical`, from where the parse put the entries of its parent at
+/// `parent` (which has `children` entries): the entry with the comma after
+/// it, or — for the last one — with the comma before it and the blanks
+/// before that comma; for the only one, everything between the brackets.
+/// `None` when the layout does not account for every entry of the parent.
+fn yaml_flow_entry_removal(
+    bytes: &[u8],
+    layout: &crate::parsers::yaml_spans::EditLayout,
+    canonical: &str,
+    parent: &str,
+    children: usize,
+) -> Option<std::ops::Range<usize>> {
+    let entry = layout.flow_entries.get(canonical)?.clone();
+    let brackets = layout.containers.get(parent)?.brackets.clone()?;
+    let prefix = format!("{parent}/");
+    let mut siblings: Vec<std::ops::Range<usize>> = layout
+        .flow_entries
+        .iter()
+        .filter(|(pointer, _)| {
+            pointer
+                .strip_prefix(&prefix)
+                .is_some_and(|tail| !tail.contains('/'))
+        })
+        .map(|(_, range)| range.clone())
+        .collect();
+    if siblings.len() != children {
+        return None;
+    }
+    siblings.sort_by_key(|range| range.start);
+    let at = siblings.iter().position(|range| *range == entry)?;
+    // What follows the entry: its comma or the closing bracket.
+    let after = skip_blanks_and_comments(bytes, entry.end);
+    let close = brackets.end.checked_sub(1)?;
+    if let Some(next) = siblings.get(at + 1) {
+        if bytes.get(after) != Some(&b',') {
+            return None;
+        }
+        let past = skip_blanks(bytes, after + 1);
+        // Keep the blank that makes a comment a comment.
+        return Some(if bytes.get(past) == Some(&b'#') {
+            entry.start..after + 1
+        } else {
+            entry.start..next.start
+        });
+    }
+    let end = match bytes.get(after) {
+        // A trailing comma goes with the last entry.
+        Some(b',') => after + 1,
+        _ if after == close => entry.end,
+        _ => return None,
+    };
+    let Some(previous) = at.checked_sub(1).map(|i| &siblings[i]) else {
+        // The only entry: the collection is left empty.
+        return (matches!(bytes.get(brackets.start), Some(b'{' | b'['))
+            && matches!(bytes.get(close), Some(b'}' | b']')))
+        .then_some(brackets.start + 1..close);
+    };
+    let comma = skip_blanks_and_comments(bytes, previous.end);
+    if bytes.get(comma) != Some(&b',') {
+        return None;
+    }
+    // A comment after the comma stays, and the comma with it: a trailing
+    // comma is no error in a flow collection.
+    if bytes[comma..entry.start].contains(&b'#') {
+        return Some(entry.start..end);
+    }
+    // The blanks before the comma go too (`{a: 1 , b: 2}`), a comment
+    // there stays.
+    let start = if bytes[previous.end..comma]
+        .iter()
+        .all(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+    {
+        previous.end
+    } else {
+        comma
+    };
+    Some(start..end)
 }
 
 /// Start of the key that ends at `end` in a flow mapping: a quoted key, a
@@ -3312,10 +3627,8 @@ fn locate_value_in_fragment(fragment: &[u8], scalar_bytes: &[u8]) -> usize {
 /// scan is harmless when called on those formats.
 fn sibling_key_column(bytes: &[u8], value_start: usize) -> u32 {
     let cap = bytes.len();
-    let mut line_start = value_start.min(cap);
-    while line_start > 0 && bytes[line_start - 1] != b'\n' {
-        line_start -= 1;
-    }
+    // Past a byte-order mark: it is no column.
+    let line_start = line_start(bytes, value_start);
     let mut key_col = line_start;
     while key_col < cap && matches!(bytes[key_col], b' ' | b'\t') {
         key_col += 1;
@@ -3444,10 +3757,7 @@ fn empty_node_replacement(props: &[u8], rendered: &[u8], tags: &CoreTags) -> (Ve
 /// The `#` of the first line between the line holding `from` and `to`
 /// that holds only a comment; `None` when there is none.
 fn first_comment_line(bytes: &[u8], from: usize, to: usize) -> Option<usize> {
-    let line_start = bytes[..from]
-        .iter()
-        .rposition(|&b| b == b'\n')
-        .map_or(0, |i| i + 1);
+    let line_start = line_start(bytes, from);
     // A span can end inside the next line's indentation.
     let mut line = if bytes[line_start..from]
         .iter()
@@ -3472,29 +3782,63 @@ fn first_comment_line(bytes: &[u8], from: usize, to: usize) -> Option<usize> {
 
 /// Byte offset of `pos` from the start of its line.
 fn line_column(bytes: &[u8], pos: usize) -> usize {
-    pos - bytes[..pos]
-        .iter()
-        .rposition(|&b| b == b'\n')
-        .map_or(0, |i| i + 1)
+    pos - line_start(bytes, pos)
+}
+
+/// How a file breaks its lines around a byte: the one detector every
+/// textual edit asks before it writes a line break.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LineBreak {
+    /// `\n`.
+    Lf,
+    /// `\r\n`.
+    CrLf,
+    /// A lone `\r`, in a file with no `\n` at all.
+    Cr,
+}
+
+impl LineBreak {
+    /// The line break nearest `at` in `bytes` — the last one before it, or
+    /// else the first after; [`LineBreak::Cr`] when there is no `\n` but a
+    /// `\r`, [`LineBreak::Lf`] when there is no line break at all.
+    pub(crate) fn at(bytes: &[u8], at: usize) -> Self {
+        let at = at.min(bytes.len());
+        let nearest = bytes[..at]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .or_else(|| bytes[at..].iter().position(|&b| b == b'\n').map(|i| at + i));
+        match nearest {
+            Some(i) if i > 0 && bytes[i - 1] == b'\r' => Self::CrLf,
+            Some(_) => Self::Lf,
+            None if bytes.contains(&b'\r') => Self::Cr,
+            None => Self::Lf,
+        }
+    }
+
+    /// Whether every line of `bytes` ends in a lone `\r`.
+    pub(crate) fn cr_only(bytes: &[u8]) -> bool {
+        Self::at(bytes, 0) == Self::Cr
+    }
 }
 
 /// `inserted`, to go in `bytes` at `at`, with each bare `\n` turned into
-/// `\r\n` when the line break nearest `at` — the last one before it, or
-/// else the first after — is one.
+/// the line break nearest `at` ([`LineBreak::at`]): `\r\n` or a lone `\r`.
 fn with_line_ending_at(bytes: &[u8], at: usize, inserted: Vec<u8>) -> Vec<u8> {
-    let at = at.min(bytes.len());
-    let nearest = bytes[..at]
-        .iter()
-        .rposition(|&b| b == b'\n')
-        .or_else(|| bytes[at..].iter().position(|&b| b == b'\n').map(|i| at + i));
-    let crlf = nearest.is_some_and(|i| i > 0 && bytes[i - 1] == b'\r');
-    if !crlf || !inserted.contains(&b'\n') {
+    with_line_break(LineBreak::at(bytes, at), inserted)
+}
+
+/// `inserted` with each bare `\n` turned into `line_break`.
+fn with_line_break(line_break: LineBreak, inserted: Vec<u8>) -> Vec<u8> {
+    if line_break == LineBreak::Lf || !inserted.contains(&b'\n') {
         return inserted;
     }
     let mut out = Vec::with_capacity(inserted.len() + 4);
     for (i, &b) in inserted.iter().enumerate() {
         if b == b'\n' && (i == 0 || inserted[i - 1] != b'\r') {
             out.push(b'\r');
+            if line_break == LineBreak::Cr {
+                continue;
+            }
         }
         out.push(b);
     }
@@ -3716,9 +4060,6 @@ fn past_blank_lines(bytes: &[u8], mut at: usize) -> usize {
     at
 }
 
-/// Start of the line holding byte `pos`; on the first line, past a
-/// byte-order mark — so that columns count from the first character, and
-/// bytes removed or inserted at a line start leave the mark first.
 /// The offset just past a leading UTF-8 byte order mark, or 0.
 pub(crate) fn bom_end(bytes: &[u8]) -> usize {
     if bytes.starts_with("\u{feff}".as_bytes()) {
@@ -3728,6 +4069,9 @@ pub(crate) fn bom_end(bytes: &[u8]) -> usize {
     }
 }
 
+/// Start of the line holding byte `pos`; on the first line, past a
+/// byte-order mark — so that columns count from the first character, and
+/// bytes removed or inserted at a line start leave the mark first.
 pub(crate) fn line_start(bytes: &[u8], pos: usize) -> usize {
     const BOM: &[u8] = "\u{feff}".as_bytes();
     let pos = pos.min(bytes.len());
@@ -3866,6 +4210,9 @@ const JSON_NON_FINITE: &str = "JSON has no NaN or Infinity";
 /// Why a TOML `set` of a number past `i64` / `f64` is refused — by the
 /// TOML writer too, so with no way around it. The number follows.
 const TOML_BIG_NUMBER: &str = "TOML cannot represent arbitrary-precision number";
+
+/// Why a TOML `set` of the root to a value that is no table is refused.
+const TOML_ROOT_TABLE: &str = "a TOML document is a table, so its root is one";
 
 /// The way around an edit the read-back check refuses.
 const JQ_REWRITE_HINT: &str =

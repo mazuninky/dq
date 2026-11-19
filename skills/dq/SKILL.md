@@ -108,10 +108,12 @@ dq get bundle.yaml /metadata/name                 # reads document 0
 dq --doc 1 get bundle.yaml /metadata/name         # the second document
 dq --doc all query '.[].kind' bundle.yaml         # the stream as an array of documents
 dq --doc 1 set bundle.yaml /spec/replicas 3 -i    # pointer relative to document 1 (same as /1/spec/replicas)
+dq set bundle.yaml /1 '{"kind": "Namespace"}' -i  # replace document 1 as a whole (comments around it stay)
+dq del bundle.yaml /1 -i                          # remove document 1 with its --- line
 dq lint bundle.yaml                               # every document linted on its own
 ```
 
-`lint` / `check` / `fix` evaluate each document separately; `fix` keeps every document and `---`. `--doc` on a command that cannot honour it (`fmt`, `validate`, `diff`, `patch`, `merge`, `convert -i`, `--doc all` with `set` / `del`) is a usage error, exit 2; so is an index past the last document of a single file (over several files such a file is skipped with a stderr note; exit 2 again when no file holds it).
+`lint` / `check` / `fix` evaluate each document separately; `fix` keeps every document and `---` (a `fix.ops` `remove ""` drops its own document). `set FILE '' VALUE` on a file that is no stream replaces the whole document (TOML: only by a table); `del FILE ''` is exit 2. `--doc` on a command that cannot honour it (`fmt`, `validate`, `diff`, `patch`, `merge`, `convert -i`, `--doc all` with `set` / `del`) is a usage error, exit 2; so is an index past the last document of a single file (over several files such a file is skipped with a stderr note; exit 2 again when no file holds it).
 
 ## Write — in-place with round-trip preservation
 

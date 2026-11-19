@@ -230,7 +230,7 @@ check:
 
 ## Multi-document YAML streams
 
-A YAML file with several `---`-separated documents (a Kubernetes manifest bundle, say) is a stream. `lint`, `check` and `fix` treat each document as a file of its own: rules match, check, locate and fix one document at a time, and diagnostics carry the line in the file. `dq fix` writes every document back, `---` separators included; a `fix.jq` re-emits only the content of the document it fixes (dropping the comments among it) and leaves its `---` line, the comment lines before the next `---` and the other documents byte for byte.
+A YAML file with several `---`-separated documents (a Kubernetes manifest bundle, say) is a stream. `lint`, `check` and `fix` treat each document as a file of its own: rules match, check, locate and fix one document at a time, and diagnostics carry the line in the file. `dq fix` writes every document back, `---` separators included (a `fix.ops` script's `remove ""` drops its own document); a `fix.jq` re-emits only the content of the document it fixes (dropping the comments among it) and leaves its `---` line, the comment lines before the next `---` and the other documents byte for byte.
 
 `--doc N|all` picks the document a command works on; a file that is not a stream is document 0:
 
@@ -240,11 +240,15 @@ dq --doc 1 get bundle.yaml /metadata/name         # the second document
 dq --doc all query '.[].kind' bundle.yaml         # the stream as an array of documents
 dq --doc 1 set bundle.yaml /spec/replicas 3 -i    # pointer relative to document 1
 dq set bundle.yaml /1/spec/replicas 3 -i          # the same edit without --doc
+dq set bundle.yaml /1 '{"kind": "Namespace"}' -i  # replace document 1 as a whole
+dq del bundle.yaml /1 -i                          # remove document 1 with its --- line
 dq --doc 1 lint bundle.yaml                       # lint the second document only
 dq --doc 1 convert bundle.yaml -F json            # convert one document
 ```
 
 Read commands (`get`, `exists`, `keys`, `values`, `len`, `type`, `paths`, `select`, `query`) read document 0 unless told otherwise. `set --jq` without `--doc` sees the stream as an array of documents and must return one. `--doc all` is refused by `set` and `del`, any `--doc` by `convert -i` and by commands that work on the whole file (`fmt`, `validate`, `diff`, `patch`, `merge`, …): a usage error, exit 2. An index past the last document is exit 2 as well; over several files (a glob, a directory, a list), a file without that document is skipped with a note on stderr and the run goes on — unless no file holds it, which is exit 2.
+
+`set FILE /N VALUE` (or `dq --doc N set FILE '' VALUE`) writes document N anew through the YAML writer: its `---` line, the comment lines after its content and every other document stay byte for byte, the comments among its content go. `del FILE /N` removes document N with its `---` line and the comment lines just above it. In a file that is no stream, `set FILE '' VALUE` replaces the whole document the same way, keeping the comment lines it starts with (YAML, JSON and TOML; a TOML document must stay a table). `del FILE ''` and `set FILE ''` on a whole stream are usage errors, exit 2.
 
 ## Global write flags & exit codes
 

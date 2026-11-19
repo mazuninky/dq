@@ -1025,6 +1025,9 @@ struct ContainerFrame {
     /// Where the first child's entry begins (its line start), once a child
     /// was seen: `Some(None)` when that entry could not be located.
     first_entry: Option<Option<usize>>,
+    /// Where the container's entry begins when its parent is a flow
+    /// collection; see [`EditLayout::flow_entries`].
+    flow_entry_start: Option<usize>,
 }
 
 impl Frame {
@@ -1072,10 +1075,22 @@ pub(crate) struct EditLayout {
     /// Every alias, in document order.
     pub(crate) aliases: Vec<AliasRef>,
     /// For every empty node of a block collection (`key:`, `-`, `key: &a`,
-    /// `key: !!str`), keyed by canonical pointer: the bytes a value set
-    /// there replaces — its node properties, or without any the empty range
-    /// just past the key's `:` / the item's `-`.
+    /// `key: !!str`) and every empty value of a flow mapping (`{n}`,
+    /// `{n: &a}`), keyed by canonical pointer: the bytes a value set there
+    /// replaces — its node properties, or without any the empty range just
+    /// past the key's `:` / the item's `-` (in a flow mapping: where the
+    /// value goes, see [`EditLayout::flow_value_prefixes`]).
     pub(crate) empty_values: HashMap<String, Range<usize>>,
+    /// For an empty value of a flow mapping without node properties, keyed
+    /// by canonical pointer: what a value set there needs before it — `": "`
+    /// after a key with no `:` (`{n}`), `" "` right after a `:` (`{"n":}`),
+    /// nothing right after a blank (`{n: }`). Its range in
+    /// [`EditLayout::empty_values`] is empty, where the value goes.
+    pub(crate) flow_value_prefixes: HashMap<String, &'static [u8]>,
+    /// The bytes of every entry of a flow collection, keyed by the
+    /// canonical pointer of its value: from its key (node properties and a
+    /// `?` included) or its item's node through the end of its value.
+    pub(crate) flow_entries: HashMap<String, Range<usize>>,
     /// Where the entry of every value of a block collection begins, keyed
     /// by canonical pointer.
     pub(crate) entries: HashMap<String, EntryStart>,
@@ -1427,6 +1442,7 @@ impl<'src> State<'src> {
                 })
             )
             && !starts_line(self.bytes, start_byte);
+        let flow_entry_start = self.flow_entry_start(event_start);
         let entry = self.entry_anchor(event_start);
         let props_end = (n_properties > 0)
             .then(|| skip_node_properties(self.bytes, event_start, n_properties).0);
@@ -1442,6 +1458,7 @@ impl<'src> State<'src> {
             props_end,
             content_end: 0,
             first_entry: None,
+            flow_entry_start,
         };
         if style == ContextStyle::Flow {
             self.flow_depth += 1;
@@ -1529,17 +1546,43 @@ impl<'src> State<'src> {
                     self.note_anchor(anchor, span, None);
                     self.set_pending_key(key_str, span_to_range(span, self.char_to_byte));
                 } else {
-                    let entry = self
-                        .entry_anchor(char_index_to_byte(self.char_to_byte, span.start.index()));
+                    // The key of an empty value in a flow mapping (`{n}`,
+                    // `{n: }`, `{? n}`, `[n: ]`), which `entry_anchor` takes.
+                    let flow_key =
+                        (self.flow_depth > 0 && style == ScalarStyle::Plain && value.is_empty())
+                            .then(|| match self.stack.last() {
+                                Some(Frame::Mapping {
+                                    pending_key_range, ..
+                                }) => pending_key_range.clone(),
+                                _ => None,
+                            })
+                            .flatten();
+                    let node_start = char_index_to_byte(self.char_to_byte, span.start.index());
+                    let flow_entry_start = self.flow_entry_start(node_start);
+                    let entry = self.entry_anchor(node_start);
                     let pointer = self.value_pointer();
                     self.note_entry(&pointer, entry);
                     self.note_anchor(anchor, span, Some(pointer.clone()));
-                    let (value_range, col) = if n_properties == 0 {
+                    let (mut value_range, col) = if n_properties == 0 {
                         (span_to_range(span, self.char_to_byte), span.start.col())
                     } else {
                         let is_empty_node = style == ScalarStyle::Plain && value.is_empty();
                         self.legacy_scalar_span(span, style, is_empty_node, n_properties, ordinal)
                     };
+                    if let Some(key) = flow_key {
+                        // saphyr spans an empty flow value at the token
+                        // after it (`}`); it is empty where a value goes.
+                        let empty = flow_empty_value(self.bytes, &key);
+                        value_range = empty.at.end..empty.at.end;
+                        if let Some(layout) = self.layout.as_mut() {
+                            if empty.at.is_empty() {
+                                layout
+                                    .flow_value_prefixes
+                                    .insert(pointer.clone(), empty.prefix);
+                            }
+                            layout.empty_values.insert(pointer.clone(), empty.at);
+                        }
+                    }
                     let context = self.value_context();
                     let node_end = char_index_to_byte(self.char_to_byte, span.end.index());
                     if style == ScalarStyle::Plain
@@ -1564,6 +1607,7 @@ impl<'src> State<'src> {
                     } else {
                         value_range.clone()
                     };
+                    self.note_flow_entry(&pointer, flow_entry_start, value_range.end);
                     let line_range =
                         self.compute_line_range(&line_basis, context, style, entry, node_end);
                     let indent = u32::try_from(col).unwrap_or(u32::MAX);
@@ -1607,9 +1651,11 @@ impl<'src> State<'src> {
                     };
                     self.set_pending_key(key, range);
                 } else {
+                    let flow_entry_start = self.flow_entry_start(range.start);
                     let entry = self.entry_anchor(range.start);
                     let pointer = self.value_pointer();
                     self.note_entry(&pointer, entry);
+                    self.note_flow_entry(&pointer, flow_entry_start, range.end);
                     self.note_alias(anchor, range.start, Some(pointer.clone()));
                     let context = self.value_context();
                     let line_range = self.compute_line_range(
@@ -1652,6 +1698,49 @@ impl<'src> State<'src> {
             }
         }
         Ok(())
+    }
+
+    /// Where the entry of the value about to be recorded begins when its
+    /// parent is a flow collection: its key — node properties and a `?`
+    /// included — or, in a sequence, the item's node at `item_start`. Call
+    /// it before [`State::entry_anchor`], which takes the pending key.
+    fn flow_entry_start(&self, item_start: usize) -> Option<usize> {
+        match self.stack.last()? {
+            Frame::Mapping {
+                style: ContextStyle::Flow,
+                pending_key_range,
+                ..
+            } => {
+                let key = pending_key_range.as_ref()?;
+                let mut before = key.start;
+                while before > 0 && matches!(self.bytes[before - 1], b' ' | b'\t' | b'\n' | b'\r') {
+                    before -= 1;
+                }
+                Some(if before > 0 && self.bytes[before - 1] == b'?' {
+                    before - 1
+                } else {
+                    key.start
+                })
+            }
+            Frame::Sequence {
+                style: ContextStyle::Flow,
+                ..
+            } => Some(item_start),
+            _ => None,
+        }
+    }
+
+    /// Record the entry `start..end` of the value at `pointer` in a flow
+    /// collection, when collecting the [`EditLayout`]; `end` is moved back
+    /// over the blanks a single-quoted scalar's span takes after it.
+    fn note_flow_entry(&mut self, pointer: &str, start: Option<usize>, end: usize) {
+        if let (Some(layout), Some(start)) = (self.layout.as_mut(), start) {
+            let mut end = end;
+            while end > start && matches!(self.bytes[end - 1], b' ' | b'\t') {
+                end -= 1;
+            }
+            layout.flow_entries.insert(pointer.to_owned(), start..end);
+        }
     }
 
     /// Record where the entry of the value at `pointer` begins, when
@@ -1932,7 +2021,8 @@ impl<'src> State<'src> {
         };
         let style = frame.style();
         let in_flow_parent = self.flow_depth > usize::from(style == ContextStyle::Flow);
-        let (entry, props_end, content_end, first_entry, start_byte) = match frame {
+        let (entry, props_end, content_end, first_entry, start_byte, flow_entry_start) = match frame
+        {
             Frame::Mapping {
                 container,
                 start_byte,
@@ -1948,6 +2038,7 @@ impl<'src> State<'src> {
                 container.content_end,
                 container.first_entry,
                 *start_byte,
+                container.flow_entry_start,
             ),
         };
         let end = match style {
@@ -1963,6 +2054,14 @@ impl<'src> State<'src> {
         {
             let container = parent.container_mut();
             container.content_end = container.content_end.max(end);
+        }
+        if self.layout.is_some() {
+            let pointer = if self.path.is_empty() {
+                String::new()
+            } else {
+                format!("/{}", self.path.join("/"))
+            };
+            self.note_flow_entry(&pointer, flow_entry_start, end_byte);
         }
         if let Some(layout) = self.layout.as_mut().map(|layout| &mut layout.containers) {
             let top_level = self.stack.len() == 1;
@@ -2317,6 +2416,51 @@ fn empty_node_end(bytes: &[u8], from: usize, limit: usize) -> usize {
             return last;
         }
         last = end;
+    }
+}
+
+/// Where the empty value of the flow-mapping key spanning `key` is.
+struct FlowEmptyValue {
+    /// Its node properties (`{n: &a }`), or the empty range a value goes
+    /// at without any.
+    at: Range<usize>,
+    /// What a value set there needs before it; see
+    /// [`EditLayout::flow_value_prefixes`].
+    prefix: &'static [u8],
+}
+
+/// [`FlowEmptyValue`] of the key spanning `key`: past its `:` and node
+/// properties, or right past the key when it has no `:` (`{n}`, `{? n}`).
+fn flow_empty_value(bytes: &[u8], key: &Range<usize>) -> FlowEmptyValue {
+    let colon = skip_separation(bytes, key.end);
+    if bytes.get(colon) != Some(&b':') {
+        // A single-quoted key's span takes the blanks after it.
+        let mut end = key.end;
+        while end > key.start && matches!(bytes[end - 1], b' ' | b'\t') {
+            end -= 1;
+        }
+        return FlowEmptyValue {
+            at: end..end,
+            prefix: b": ",
+        };
+    }
+    let value_from = colon + 1;
+    let props_end = empty_node_end(bytes, value_from, bytes.len());
+    if props_end > value_from {
+        return FlowEmptyValue {
+            at: skip_separation(bytes, value_from)..props_end,
+            prefix: b"",
+        };
+    }
+    match bytes.get(value_from) {
+        Some(b' ' | b'\t') => FlowEmptyValue {
+            at: value_from + 1..value_from + 1,
+            prefix: b"",
+        },
+        _ => FlowEmptyValue {
+            at: value_from..value_from,
+            prefix: b" ",
+        },
     }
 }
 

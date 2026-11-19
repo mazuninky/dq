@@ -1281,17 +1281,16 @@ fix:
     );
 }
 
-/// A `fix.ops` script that replaces or removes the whole document is the
-/// same error in a single file and in a stream: exit 3, naming the rule
-/// and the document, the file untouched.
+/// A `fix.ops` script that replaces the whole document (path `""`) writes
+/// it anew, in a single file and in a stream; one that removes it drops a
+/// document of a stream with its `---` line, and is an error (exit 3,
+/// naming the rule, the file untouched) in a file that is no stream.
 #[test]
-fn fix_ops_on_a_whole_document_is_one_error_in_a_file_and_in_a_stream() {
+fn fix_ops_on_a_whole_document_replace_it_or_remove_it_from_a_stream() {
     let scratch = Scratch::new();
-    for (op, value) in [("replace", r#","value":{"ok":true}"#), ("remove", "")] {
-        scratch.write(
-            "whole.yml",
-            &format!(
-                r#"
+    let rule = |ops: &str| {
+        format!(
+            r#"
 id: test.whole
 description: whole-document fix
 severity: warn
@@ -1300,32 +1299,53 @@ check:
   jq: 'select(.bad == true)'
   message: bad
 fix:
-  ops: '[{{"op":"{op}","path":""{value}}}]'
+  ops: '{ops}'
 "#
-            ),
+        )
+    };
+    for op in ["replace", "add"] {
+        scratch.write(
+            "whole.yml",
+            &rule(&format!(
+                r#"if .bad then [{{"op":"{op}","path":"","value":{{"ok":true}}}}] else [] end"#
+            )),
         );
-        for (file, source, document) in [
-            ("single.yaml", "bad: true\n", "the document"),
+        for (file, source, fixed) in [
+            ("single.yaml", "# head\nbad: true\n", "# head\nok: true\n"),
             (
                 "stream.yaml",
-                "ok: 1\n---\nbad: true\n",
-                "document 1 of the stream",
+                "ok: 1 # keep\n---\nbad: true\n",
+                "ok: 1 # keep\n---\nok: true\n",
             ),
         ] {
             scratch.write(file, source);
-            let (code, stderr) = scratch
+            scratch
                 .run(&["-i", "fix", "--rules", "whole.yml", file])
-                .expect_err("a whole-document fix.ops is refused");
-            assert_eq!(code, 3, "{op} {file}: {stderr}");
-            assert!(
-                stderr.starts_with(&format!(
-                    "rule test.whole fix failed: fix.ops would {op} {document} as a whole"
-                )),
-                "{op} {file}: {stderr}"
-            );
-            assert_eq!(scratch.read(file), source, "{op} {file}: untouched");
+                .expect("fix -i");
+            assert_eq!(scratch.read(file), fixed, "{op} {file}");
         }
     }
+
+    scratch.write("whole.yml", &rule(r#"[{"op":"remove","path":""}]"#));
+    scratch.write("stream.yaml", "ok: 1\n---\nbad: true\n---\nok: 2\n");
+    scratch
+        .run(&["-i", "fix", "--rules", "whole.yml", "stream.yaml"])
+        .expect("fix -i");
+    assert_eq!(scratch.read("stream.yaml"), "ok: 1\n---\nok: 2\n");
+
+    scratch.write("single.yaml", "bad: true\n");
+    let (code, stderr) = scratch
+        .run(&["-i", "fix", "--rules", "whole.yml", "single.yaml"])
+        .expect_err("removing the whole file is refused");
+    assert_eq!(code, 3, "{stderr}");
+    assert!(
+        stderr.starts_with(
+            "rule test.whole fix failed: fix.ops would remove the document as a whole \
+             (remove \"\"): it is the whole file"
+        ),
+        "{stderr}"
+    );
+    assert_eq!(scratch.read("single.yaml"), "bad: true\n", "untouched");
 }
 
 /// `--doc N` over several files: lint and fix skip a file without
@@ -1736,11 +1756,12 @@ fn fix_jq_rewrites_one_document_body_and_keeps_the_markers_around_it() {
     }
 }
 
-/// An `add` at path `""` is refused like `replace` / `remove`. In a bulk
-/// run with `--continue-on-error` each such file is one `Failed` entry,
-/// left untouched, and the other files are still fixed.
+/// A `remove` at path `""` of a file that is no stream is refused. In a
+/// bulk run with `--continue-on-error` each such file is one `Failed`
+/// entry, left untouched, and the other files are still fixed — a stream
+/// losing the document the script removes.
 #[test]
-fn fix_ops_adding_a_whole_document_fails_its_file_and_the_bulk_run_goes_on() {
+fn fix_ops_removing_a_whole_file_fails_it_and_the_bulk_run_goes_on() {
     let scratch = Scratch::new();
     scratch.write(
         "whole.yml",
@@ -1753,15 +1774,11 @@ check:
   jq: 'select(.bad == true)'
   message: bad
 fix:
-  ops: '[{"op":"add","path":"","value":{"ok":true}}]'
+  ops: '[{"op":"remove","path":""}]'
 "#,
     );
-    let refusal = |document: &str| {
-        format!(
-            "rule test.whole fix failed: fix.ops would add {document} as a whole (path \"\"): \
-             fix.ops edits values inside a document and cannot add a whole document yet"
-        )
-    };
+    let refusal = "rule test.whole fix failed: fix.ops would remove the document as a whole \
+                   (remove \"\"): it is the whole file; only a document of a stream can be removed";
     scratch.write("bk/a.yaml", "bad: true\n");
     scratch.write("bk/b.yaml", "ok: 1\n---\nbad: true\n");
     scratch.write("bk/c.yaml", SINGLE);
@@ -1769,7 +1786,7 @@ fix:
 
     assert_eq!(
         scratch.run(&["-i", "fix", "--rules", "whole.yml", "bk/a.yaml"]),
-        Err((3, format!("{}\n", refusal("the document"))))
+        Err((3, format!("{refusal}\n")))
     );
 
     let (code, stdout, stderr) = capture(
@@ -1788,15 +1805,11 @@ fix:
     assert_eq!(code, 7, "{stderr}");
     assert_eq!(
         stdout,
-        format!(
-            "Modified: 1, Skipped: 1, Failed: 2\n  - bk/a.yaml: {}\n  - bk/b.yaml: {}\n",
-            refusal("the document"),
-            refusal("document 1 of the stream"),
-        )
+        format!("Modified: 2, Skipped: 1, Failed: 1\n  - bk/a.yaml: {refusal}\n")
     );
-    assert_eq!(stderr, "2 file(s) failed in bulk run\n");
+    assert_eq!(stderr, "1 file(s) failed in bulk run\n");
     assert_eq!(scratch.read("bk/a.yaml"), "bad: true\n");
-    assert_eq!(scratch.read("bk/b.yaml"), "ok: 1\n---\nbad: true\n");
+    assert_eq!(scratch.read("bk/b.yaml"), "ok: 1\n");
     assert_eq!(scratch.read("bk/c.yaml"), SINGLE);
     assert_eq!(
         scratch.read("bk/d.yaml"),
