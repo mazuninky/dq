@@ -2218,18 +2218,16 @@ impl Document {
             insertion_renderer.render_insertion(&new_key, &value, renderer_indent, context);
 
         // In a JSON container written on one line the new entry is written
-        // on that line too.
+        // on that line too; the root `{}` is that container itself.
         let one_line = self.format == FormatTag::Json
-            && parent_canonical.rfind('/').is_some_and(|cut| {
-                crate::parsers::json::json_container_ranges(&self.original_bytes)
+            && match parent_canonical.rfind('/') {
+                Some(cut) => crate::parsers::json::json_container_ranges(&self.original_bytes)
                     .ok()
-                    .and_then(|ranges| ranges.get(&parent_canonical[..cut]).cloned())
-                    .is_some_and(|range| {
-                        !self.original_bytes[range]
-                            .iter()
-                            .any(|&b| matches!(b, b'\n' | b'\r'))
-                    })
-            });
+                    .and_then(|ranges| ranges.get(&parent_canonical[..cut]).cloned()),
+                None => Some(parent_span.value_range.clone()),
+            }
+            .and_then(|range| self.original_bytes.get(range))
+            .is_some_and(|holder| !holder.iter().any(|&b| matches!(b, b'\n' | b'\r')));
         let (splice_at, splice_bytes) = format_specific_empty_parent_splice(
             self.format,
             &fragment,
@@ -4742,6 +4740,15 @@ fn json_empty_parent_splice(
             .position(|&b| !matches!(b, b'\n' | b' '))
             .unwrap_or(fragment.len());
         return (close_pos, fragment[entry..].to_vec());
+    }
+    // `{` and `}` on lines of their own already: the entry goes right
+    // after the `{`, onto a line of its own, and the `}` keeps its line.
+    let open = parent_span.value_range.start + 1;
+    if original_bytes
+        .get(open..close_pos)
+        .is_some_and(|inside| inside.contains(&b'\n'))
+    {
+        return (open, fragment.to_vec());
     }
     let indent = json_line_indent(original_bytes, parent_span.value_range.start);
     let mut out = Vec::with_capacity(fragment.len() + indent + 1);

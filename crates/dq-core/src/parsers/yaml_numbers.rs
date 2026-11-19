@@ -233,37 +233,119 @@ pub(super) fn untag_empty_nulls(bytes: &[u8]) -> Option<String> {
         .filter(|(_, quoted)| *quoted)
     {
         let tag = tag_range(&out, at)?;
-        let quote = (tag.end..out.len()).find(|&i| !out[i].is_ascii_whitespace())?;
+        // The quotes come after the tag and an anchor, if any (`!!null &a ""`).
+        let past_blanks = |from: usize| (from..out.len()).find(|&i| !out[i].is_ascii_whitespace());
+        let mut quote = past_blanks(tag.end)?;
+        if out[quote] == b'&' {
+            let name_end = (quote..out.len())
+                .find(|&i| out[i].is_ascii_whitespace())
+                .unwrap_or(out.len());
+            quote = past_blanks(name_end)?;
+        }
         if !matches!(&out[quote..], [b'"', b'"', ..] | [b'\'', b'\'', ..]) {
             return None;
         }
-        match out.get(quote + 2) {
-            // A `:` right after a quoted key is a value indicator, after a
-            // plain `~` only with a blank after it (`~ :1` is one scalar):
-            // the tag's place holds the `~:`, and blanks the rest up to the
-            // value, which keeps its position. A key and its `:` share a line.
-            Some(b':') => {
-                let colon = quote + 2;
+        let after = quote + 2;
+        let next = (after..out.len()).find(|&i| !matches!(out[i], b' ' | b'\t'));
+        match next.map(|i| (i, out[i])) {
+            // A `:` after a quoted key (blanks between or not) is a value
+            // indicator, after a plain `~` only with a blank after it
+            // (`~ :1` is one scalar): the quotes' place holds the `~:`, and
+            // blanks the rest up to the value, which keeps its position.
+            Some((colon, b':')) => {
                 if out[tag.start..colon]
                     .iter()
                     .any(|&b| matches!(b, b'\n' | b'\r'))
                 {
                     return None;
                 }
-                out[tag.start] = b'~';
-                out[tag.start + 1] = b':';
-                out[tag.start + 2..=colon].fill(b' ');
+                out[quote] = b'~';
+                out[quote + 1] = b':';
+                out[after..=colon].fill(b' ');
             }
-            None | Some(b' ' | b'\t' | b'\n' | b'\r' | b',' | b']' | b'}') => {
+            // `""#c` is no null to the reader either: its error stands.
+            Some((at, b'#')) if at == after => return None,
+            // Up to a line break or a comment: a `:` that comes next is the
+            // key's on another line, which only an explicit `?` key may
+            // have. There the tag's place ends the `~` key with a comment
+            // (`~ #`), as a plain `~ ` would run on into a `:1`.
+            Some((at, b'\n' | b'\r' | b'#')) => {
+                if next_token(&out, at) == Some(b':') {
+                    if !explicit_key(&out, tag.start) {
+                        return None;
+                    }
+                    if matches!(out[after], b' ' | b'\t') {
+                        out[quote] = b'~';
+                        out[quote + 1] = b' ';
+                        out[after] = b'#';
+                    } else if out[tag.end..quote]
+                        .iter()
+                        .all(|&b| matches!(b, b' ' | b'\t'))
+                    {
+                        // The quotes end the line: the comment starts in
+                        // the tag's place, which nothing else shares.
+                        out[tag.start..after].fill(b' ');
+                        out[tag.start] = b'~';
+                        out[tag.start + 2] = b'#';
+                    } else {
+                        return None;
+                    }
+                } else {
+                    out[quote] = b'~';
+                    out[quote + 1] = b' ';
+                }
+            }
+            None | Some((_, b',' | b']' | b'}')) => {
                 out[quote] = b'~';
                 out[quote + 1] = b' ';
             }
-            // Anything else (`""#c`) is no null to the reader either: its
-            // error stands.
+            // Anything else after the node (`"" x`) is no null either.
             Some(_) => return None,
         }
     }
     String::from_utf8(out).ok()
+}
+
+/// The first byte at or after `at` that is no blank, line break or
+/// comment.
+fn next_token(bytes: &[u8], mut at: usize) -> Option<u8> {
+    while let Some(&b) = bytes.get(at) {
+        match b {
+            b' ' | b'\t' | b'\n' | b'\r' => at += 1,
+            b'#' => {
+                at = (at..bytes.len())
+                    .find(|&i| matches!(bytes[i], b'\n' | b'\r'))
+                    .unwrap_or(bytes.len());
+            }
+            _ => return Some(b),
+        }
+    }
+    None
+}
+
+/// Whether the node whose properties start at `at` is the key of an
+/// explicit `? ` entry, an anchor before its tag or not.
+fn explicit_key(bytes: &[u8], at: usize) -> bool {
+    let blanks = |end: usize| {
+        bytes[..end]
+            .iter()
+            .rposition(|&b| !matches!(b, b' ' | b'\t'))
+            .map_or(0, |i| i + 1)
+    };
+    let mut end = blanks(at);
+    let token = bytes[..end]
+        .iter()
+        .rposition(|b| b.is_ascii_whitespace())
+        .map_or(0, |i| i + 1);
+    if bytes.get(token) == Some(&b'&') && token < end {
+        end = blanks(token);
+    }
+    end > 0
+        && bytes[end - 1] == b'?'
+        && matches!(bytes.get(end), Some(b' ' | b'\t'))
+        && end
+            .checked_sub(2)
+            .is_none_or(|i| matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r' | b'{' | b'[' | b','))
 }
 
 /// Whether `tag` is a global tag outside the core schema, which
@@ -951,12 +1033,46 @@ mod tests {
             read("[!!null \"\",1]\n"),
             seq(&[Value::Null, Value::Int(1)])
         );
+        // Blanks before the `:`, CRLF, an anchor after the tag.
+        for src in [
+            "{!!null \"\" :1}\n",
+            "{!!null '' :1}\n",
+            "{!!null \"\"  :  1}\r\n",
+            "{!!null &x \"\" :1}\n",
+        ] {
+            assert_eq!(read(src), map(&[("", Value::Int(1))]), "{src:?}");
+        }
+        assert_eq!(
+            read("[!!null \"\" :1]\n"),
+            seq(&[map(&[("", Value::Int(1))])])
+        );
+        // An explicit `?` key may have its `:` on the next line.
+        for src in [
+            "? !!null \"\"\n: 1\n",
+            "{? !!null \"\"\n  :1}\n",
+            "{? !!null \"\" #c\r\n  :1}\r\n",
+            "? !!null &a \"\" \n: 1\n",
+        ] {
+            assert_eq!(read(src), map(&[("", Value::Int(1))]), "{src:?}");
+        }
         assert_eq!(read("{!!null : 1}\n"), map(&[("", Value::Int(1))]));
         assert_eq!(read("[!!null ,1]\n"), seq(&[Value::Null, Value::Int(1)]));
         // A key on another line than its `:`, a `#` right after: no reader
         // takes them as null, and the reader's error stands.
-        assert!(crate::parsers::Yaml.parse(b"{!!null\n  \"\":1}\n").is_err());
-        assert!(crate::parsers::Yaml.parse(b"[!!null \"\"#c]\n").is_err());
+        // A split implicit key, or what is no node after the quotes, too.
+        for src in [
+            "{!!null\n  \"\":1}\n",
+            "[!!null \"\"#c]\n",
+            "{!!null \"\"\n  :1}\n",
+            "{!!null \"\" #c\r\n  : 1}\r\n",
+            "[!!null \"\"\n :1]\n",
+            "{!!null \"\" x: 1}\n",
+        ] {
+            assert!(
+                crate::parsers::Yaml.parse(src.as_bytes()).is_err(),
+                "{src:?}"
+            );
+        }
         // untag_foreign: `x:1` is one plain scalar in flow, `x: 1` a pair.
         assert_eq!(
             read("%TAG !e! tag:example.com,2000:\n--- {!e!a x: 1, b: [!e!a 3,4]}\n"),

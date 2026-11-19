@@ -3285,10 +3285,22 @@ fn an_empty_quoted_null_key_before_its_colon_reads_as_null() {
         ("{!!null '':, a: 1}\n", json!({"": null, "a": 1})),
         ("{&x !!null \"\":[1], b: *x}\n", json!({"": [1], "b": null})),
         ("[!!null \"\", 1]\n", json!([null, 1])),
+        ("{!!null \"\" :1}\n", json!({"": 1})),
+        ("{!!null '' :1}\n", json!({"": 1})),
+        ("[!!null \"\" :1]\n", json!([{"": 1}])),
+        ("{!!null \"\" :1}\r\n", json!({"": 1})),
+        ("{!!null &x \"\" :1, b: *x}\n", json!({"": 1, "b": null})),
+        ("? !!null \"\"\n: 1\n", json!({"": 1})),
+        ("{? !!null \"\"\n  :1}\n", json!({"": 1})),
     ] {
         assert_eq!(read("s.yaml", src), want, "{src:?}");
     }
-    for src in ["{!!null\n  \"\":1}\n", "[!!null \"\"#c]\n"] {
+    for src in [
+        "{!!null\n  \"\":1}\n",
+        "[!!null \"\"#c]\n",
+        "{!!null \"\"\n  :1}\n",
+        "{!!null \"\"\r\n  : 1}\r\n",
+    ] {
         let out = run("s.yaml", src, &["-q", "-F", "json", "convert", "s.yaml"]);
         assert_eq!(
             (out.code, out.stdout.as_str()),
@@ -3453,8 +3465,9 @@ fn json_output_ends_with_one_line_break() {
 }
 
 /// A value inserted into an empty object of a JSON container written on
-/// one line is written on that line; in a multi-line file it gets lines
-/// of its own, indented from the line the `{` is on.
+/// one line, or into a root `{}`, is written on that line; in a
+/// multi-line file it gets lines of its own, indented from the line the
+/// `{` is on, and a `{` and `}` on lines of their own keep them.
 #[test]
 fn a_json_insert_into_an_empty_object_follows_the_layout() {
     check(&[
@@ -3468,6 +3481,20 @@ fn a_json_insert_into_an_empty_object_follows_the_layout() {
             ],
             want: "{\"a\": {\"b\": 1}}\n",
             reads: json!({"a": {"b": 1}}),
+        },
+        Case {
+            name: "f.json",
+            src: "{}\n",
+            args: &["set", "f.json", "/x/y", "1"],
+            want: "{\"x\": {\"y\":1}}\n",
+            reads: json!({"x": {"y": 1}}),
+        },
+        Case {
+            name: "f.json",
+            src: "{\r\n}\r\n",
+            args: &["set", "f.json", "/x", "1"],
+            want: "{\r\n  \"x\": 1\r\n}\r\n",
+            reads: json!({"x": 1}),
         },
         Case {
             name: "f.json",
