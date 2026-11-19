@@ -162,8 +162,13 @@ CR-only line ends are invalid per the TOML spec and are not supported.
 HCL 2 through `hcl-rs`. Blocks map to nested maps with labels as keys:
 `terraform { backend "s3" { region = "x" } }` becomes
 `{terraform: {backend: {s3: {region: x}}}}`; each extra label nests one
-level. Object keys `a` and `"a"` are a duplicate (exit 3). Writing goes
-through `hcl::to_string`: comments, spacing and layout are not kept.
+level. Object keys `a` and `"a"` are a duplicate (exit 3). Numbers are read
+as their literal spells them: a whole float (`3.0`, `1e16`) stays a float
+and is written back as `3.0` / `1e16`, not `3`; an integer past 64 bits or
+a decimal with more digits than an `f64` holds keeps its exact value, which
+`-F hcl` cannot write back (exit 1, see the value model above). Writing
+lays a body out as `hcl::to_string` does: comments, spacing and layout are
+not kept.
 
 Limits: HCL documents carry no spans, so every Terraform diagnostic reports
 line 1; repeated blocks with the same type and labels (`x { a = 1 }` twice)
@@ -247,15 +252,49 @@ appends the body verbatim.
 | comments | `#comments: [..]` on the parent |
 | CDATA | `#cdata: [..]` |
 | processing instructions | `#pi: [..]` on the parent |
-| XML declaration | top-level `#xml: {version, encoding, standalone}` |
+| XML declaration, byte order mark, encoding told from the bytes | top-level `#xml: {version, encoding, standalone, bom, detected}` |
 | namespace prefixes, `xmlns:*` | kept verbatim in names and `@attrs` |
 
 So `<project><version>1</version></project>` is read as
 `/project/0/version/0/#text`. Round trip is partial: structure, attributes,
 comments, CDATA, PIs, prefixes and the declaration survive; whitespace
 between elements is normalised; mixed content (`<p>Hello <b>w</b>!</p>`) is
-folded into `#text` with a warning. Only UTF-8-compatible input is accepted
-(no UTF-16 or legacy code pages).
+folded into `#text` with a warning. Text that is only whitespace is
+written as character references (`&#32;`), so it reads back as text, not
+as indentation.
+
+Encodings. A file is decoded per its byte order mark, else per the
+declaration's `encoding`, else as UTF-8. Labels are the WHATWG Encoding
+Standard's (UTF-16, Shift_JIS, ISO-2022-JP, windows-1252, …), except
+`US-ASCII`, which is strict 7-bit, and `ISO-8859-1`, which maps each byte
+to its code point, as the XML spec and other XML parsers have it. The
+writer encodes in the declared encoding (UTF-8 without one), starting
+with the byte order mark `bom` names (a file with a BOM and no
+declaration reads as `#xml: {bom: …}` alone). A `UTF-16` label always
+gets a BOM, little-endian unless `bom` says otherwise; `UTF-16LE` and
+`UTF-16BE` get one only when `bom` names it. Two cases keep what the bytes were in `detected`:
+
+- UTF-16 with no BOM, told by its leading `<?`: `detected: UTF-16LE` or
+  `UTF-16BE`, written back in that byte order with no BOM.
+- UTF-8 bytes under a UTF-16 label (.NET's `XmlSerializer` writes
+  `encoding="utf-16"` into UTF-8): read as UTF-8, `detected: UTF-8`, and
+  written back as UTF-8 with no BOM under the same label, byte for byte.
+  The writer takes `detected: UTF-8` only under a UTF-16 label (exit 1
+  otherwise).
+
+The reader refuses, with exit 3:
+
+- an encoding dq does not know (`UTF-32`) or cannot read (`ISO-2022-KR`),
+  and an `encoding` that is not an encoding name;
+- a declaration that the BOM, or the UTF-16 a BOM-less file begins in,
+  contradicts (a UTF-16 BOM declaring `ISO-8859-1`);
+- a namespace prefix no `xmlns:p` declares, on an element (`<a:b/>`) or
+  an attribute (`<r a:x="1"/>`);
+- `xmlns:p=""` unless the declaration says `version="1.1"`. Namespaces in
+  XML 1.1 allow it, and the prefix is then undeclared inside that element.
+
+The writer refuses the same, and a character the declared encoding cannot
+hold, with exit 1, leaving an `-i` file as it was.
 
 ### Dockerfile
 

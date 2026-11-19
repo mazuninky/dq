@@ -46,7 +46,7 @@
 //! item skipped, no declaration. Anything the writer could not put into the
 //! XML is refused with `Error::Format` instead of dropped: a container where
 //! a scalar belongs, an `#xml` key other than `version` / `encoding` /
-//! `standalone`, a second root element, and `@attrs` / `#text` / `#cdata`
+//! `standalone` / `bom` / `detected`, a second root element, and `@attrs` / `#text` / `#cdata`
 //! with content at the top level, outside the root.
 //!
 //! The writer never emits XML that is not well-formed, and never alters
@@ -133,8 +133,10 @@ use crate::format::Format;
 const KEY_XML_DECL: &str = "#xml";
 /// `#xml` field naming the byte order mark the file began with.
 const KEY_BOM: &str = "bom";
-/// `#xml` field naming the UTF-16 byte order of a file that began with no
-/// byte order mark and whose declaration names no byte order.
+/// `#xml` field naming the encoding told from the bytes where neither a
+/// byte order mark nor the declaration names it: the UTF-16 byte order of
+/// a file with no BOM whose declaration names no byte order, or `UTF-8`
+/// for a file in 8-bit bytes that declares UTF-16.
 const KEY_DETECTED: &str = "detected";
 /// Conventional key holding an element's attribute map.
 const KEY_ATTRS: &str = "@attrs";
@@ -1955,8 +1957,8 @@ struct Declaration {
 /// (absent or null). Each field is written as its [`scalar_text`] — a YAML
 /// `version: 1.1` is a float and stays `1.1` — and a missing or null
 /// `version` is `1.0`; a boolean `standalone` is `yes` / `no`. A non-map
-/// entry, a key other than `version` / `encoding` / `standalone`, a
-/// container as a field, and a field the declaration grammar does not allow
+/// entry, a key other than `version` / `encoding` / `standalone` / `bom` /
+/// `detected`, a container as a field, and a field the declaration grammar does not allow
 /// (`version` not `1.` and digits, `encoding` not an encoding name,
 /// `standalone` not `yes` / `no`) are refused.
 fn declaration(entry: Option<&Value>) -> Result<Option<Declaration>> {
