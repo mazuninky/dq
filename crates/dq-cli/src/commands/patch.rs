@@ -19,11 +19,9 @@
 //!    `--diff`, and `-i` are all driver concerns.
 
 use std::io::{Read, Write};
-use std::str::FromStr;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use dq_core::{Document, PatchOp, Pointer, Value};
-use indexmap::IndexMap;
 
 use crate::bulk::{self, FileOp, FileOpResult};
 use crate::cli::{Cli, PatchArgs};
@@ -346,67 +344,7 @@ fn parse_json_value(rest: &str, line_no: usize) -> anyhow::Result<Value> {
             "line {line_no}: invalid JSON value: {e}"
         )))
     })?;
-    Ok(serde_json_to_dq_value(&json))
-}
-
-/// Convert a [`serde_json::Value`] into a [`Value`].
-///
-/// TODO(M3 §10): this is a third copy of
-/// [`crate::commands::set::serde_json_to_dq_value`] (the second copy lives
-/// in `dq-core::transform::patch` for serde plumbing). Extract to a shared
-/// helper once §5 (merge) lands its own copy — three call sites makes the
-/// case for a `commands::value_convert` module. The same extraction batch
-/// also covers `f64_matches_literal`, `literal_round_trips_to`, and
-/// `number_to_value`, which are duplicated alongside this helper.
-fn serde_json_to_dq_value(v: &serde_json::Value) -> Value {
-    match v {
-        serde_json::Value::Null => Value::Null,
-        serde_json::Value::Bool(b) => Value::Bool(*b),
-        serde_json::Value::Number(n) => number_to_value(n),
-        serde_json::Value::String(s) => Value::String(s.clone()),
-        serde_json::Value::Array(items) => {
-            Value::Array(items.iter().map(serde_json_to_dq_value).collect())
-        }
-        serde_json::Value::Object(map) => {
-            let mut out = IndexMap::with_capacity(map.len());
-            for (k, child) in map {
-                out.insert(k.clone(), serde_json_to_dq_value(child));
-            }
-            Value::Map(out)
-        }
-    }
-}
-
-fn number_to_value(n: &serde_json::Number) -> Value {
-    let literal = n.to_string();
-    if let Ok(i) = literal.parse::<i64>() {
-        return Value::Int(i);
-    }
-    if literal.contains('.') || literal.contains('e') || literal.contains('E') {
-        if let Ok(f) = f64::from_str(&literal)
-            && f.is_finite()
-            && f64_matches_literal(f, &literal)
-        {
-            return Value::Float(f);
-        }
-        return Value::BigFloat(literal);
-    }
-    Value::BigInt(literal)
-}
-
-/// Lossless-round-trip check for a parsed `f64` against its source literal.
-///
-/// Mirrors `dq_core::parsers::json::f64_matches_literal`: re-parse the
-/// shortest float formatting and compare for exact equality so cosmetic
-/// reformatting (e.g. `1e2` vs `100`) doesn't trigger the BigFloat branch.
-fn f64_matches_literal(f: f64, literal: &str) -> bool {
-    let formatted = format!("{f}");
-    f64::from_str(&formatted).is_ok_and(|round_trip| round_trip.to_bits() == f.to_bits())
-        && literal_round_trips_to(literal, f)
-}
-
-fn literal_round_trips_to(literal: &str, f: f64) -> bool {
-    f64::from_str(literal).is_ok_and(|parsed| parsed.to_bits() == f.to_bits())
+    Ok(Value::from_serde_json(&json))
 }
 
 #[cfg(test)]

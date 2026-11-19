@@ -914,38 +914,14 @@ fn json_value_to_value(v: JsonValue) -> Value {
     }
 }
 
+/// The number a JSON literal spells, with its exact value
+/// ([`Value::from_number_literal`]): a float literal with more digits than
+/// an `f64` holds stays a [`Value::BigFloat`] instead of rounding.
 fn json_number_to_value(n: &JsonNumber) -> Value {
     // With `arbitrary_precision` enabled, the underlying representation is the
     // original textual literal; `as_str()` gives it back to us verbatim.
     let literal = n.as_str();
-    if let Ok(i) = literal.parse::<i64>() {
-        return Value::Int(i);
-    }
-    if literal.contains('.') || literal.contains('e') || literal.contains('E') {
-        // Float branch: only use `f64` when round-trip is lossless.
-        if let Ok(f) = f64::from_str(literal) {
-            // The shortest-round-trip formatting (Rust's `f64::Display`) is
-            // compared against the original literal. If they match we keep
-            // the parsed `f64`; otherwise the literal is preserved verbatim.
-            if f.is_finite() && f64_matches_literal(f, literal) {
-                return Value::Float(f);
-            }
-        }
-        return Value::BigFloat(literal.to_owned());
-    }
-    // Integer that overflowed `i64` — keep the literal verbatim.
-    Value::BigInt(literal.to_owned())
-}
-
-fn f64_matches_literal(f: f64, literal: &str) -> bool {
-    // Re-parse the shortest representation and check exact equality. This is
-    // enough to detect precision loss without relying on string equality
-    // (which would fail innocuous reformatting like `1e2` vs `100`).
-    let formatted = f.to_string();
-    f64::from_str(&formatted)
-        .ok()
-        .zip(f64::from_str(literal).ok())
-        .is_some_and(|(a, b)| a.to_bits() == b.to_bits())
+    Value::from_number_literal(literal).unwrap_or_else(|| Value::BigFloat(literal.to_owned()))
 }
 
 /// Write a `Value` as pretty-printed JSON with the M2 default 2-space indent
@@ -1322,6 +1298,19 @@ mod tests {
         let doc = parse(&s);
         let Value::Map(m) = doc.value() else { panic!() };
         assert_eq!(m.get("id"), Some(&Value::BigInt(big.to_owned())));
+    }
+
+    #[test]
+    fn parse_keeps_a_float_literal_longer_than_f64() {
+        let doc = parse(r#"{"b": 0.1000000000000000000000000001, "c": 0.5, "d": 1e400}"#);
+        let Value::Map(m) = doc.value() else { panic!() };
+        assert_eq!(
+            m.get("b"),
+            Some(&Value::BigFloat("0.1000000000000000000000000001".into()))
+        );
+        assert_eq!(m.get("c"), Some(&Value::Float(0.5)));
+        // serde_json's `arbitrary_precision` spells it `1e+400`.
+        assert!(m["d"].same_data(&Value::BigFloat("1e400".into())));
     }
 
     #[test]

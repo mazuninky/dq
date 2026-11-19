@@ -198,24 +198,31 @@ fn merge_key_over_a_map_or_a_list_of_maps_stays_plain() {
 }
 
 #[test]
-fn an_integer_up_to_u64_max_stays_a_plain_int() {
+fn a_big_integer_stays_a_plain_int() {
     let dir = dir_with(&[(
         "i.json",
         r#"{"max": 18446744073709551615, "past": 18446744073709551616, "neg": -9223372036854775809}"#,
     )]);
     let out = to_yaml(&dir, "i.json");
-    // Past `u64` (or below `i64::MIN`) the literal stays a quoted string —
-    // a documented limit: dq's YAML reader (serde_norway) rejects a plain
-    // `u128` / `i128`, so a plain spelling would make the file unreadable
-    // to dq itself (exit 3).
+    // Past `u64` (or below `i64::MIN`) too: dq's YAML reader reads a plain
+    // `u128` / `i128` (it failed with exit 3 before), and longer integers,
+    // back as the same integer.
     assert_eq!(
         out,
-        "max: 18446744073709551615\npast: '18446744073709551616'\nneg: '-9223372036854775809'\n"
+        "max: 18446744073709551615\npast: 18446744073709551616\nneg: -9223372036854775809\n"
     );
     let back = dir_with(&[("i.yaml", &out)]);
-    assert_eq!(stdout_of(&back, &["type", "i.yaml", "/max"]), "int\n");
-    assert_eq!(stdout_of(&back, &["type", "i.yaml", "/past"]), "string\n");
-    assert_eq!(stdout_of(&back, &["type", "i.yaml", "/neg"]), "string\n");
+    for (key, literal) in [
+        ("/max", "18446744073709551615"),
+        ("/past", "18446744073709551616"),
+        ("/neg", "-9223372036854775809"),
+    ] {
+        assert_eq!(stdout_of(&back, &["type", "i.yaml", key]), "int\n");
+        assert_eq!(
+            stdout_of(&back, &["get", "i.yaml", key]),
+            format!("{literal}\n")
+        );
+    }
 }
 
 /// Floats serde_norway writes in exponent form, and `-0.0`.
@@ -262,10 +269,10 @@ fn a_big_float_is_written_as_a_yaml_1_1_float() {
     let dir = dir_with(&[("b.json", r#"{"e": 1e400}"#)]);
     let out = to_yaml(&dir, "b.json");
     assert_eq!(out, "e: 1.0e+400\n");
-    // dq's own reader cannot give the big float back: serde_norway reads a
-    // float past `f64` as a string (documented in `yaml_emit.rs`).
+    // dq's own reader gives the big float back.
     let back = dir_with(&[("b.yaml", &out)]);
-    assert_eq!(stdout_of(&back, &["type", "b.yaml", "/e"]), "string\n");
+    assert_eq!(stdout_of(&back, &["type", "b.yaml", "/e"]), "float\n");
+    assert_eq!(stdout_of(&back, &["get", "b.yaml", "/e"]), "1.0e+400\n");
 
     // A 30-digit π from a jq literal keeps its digits, plain.
     let pi = "3.14159265358979323846264338327";

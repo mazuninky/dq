@@ -2422,7 +2422,7 @@ impl ScalarRenderer for YamlScalarRenderer {
             Value::Int(i) => i.to_string().into_bytes(),
             Value::BigInt(s) => s.clone().into_bytes(),
             Value::Float(f) => render_float(*f),
-            Value::BigFloat(s) => s.clone().into_bytes(),
+            Value::BigFloat(s) => render_big_float(s),
             Value::String(s) => render_string_in_style(s, original_style, context),
             // A collection at a scalar's position is written in flow style
             // on the scalar's line.
@@ -2603,7 +2603,7 @@ fn render_scalar_inline(value: &Value) -> Vec<u8> {
         Value::Int(i) => i.to_string().into_bytes(),
         Value::BigInt(s) => s.clone().into_bytes(),
         Value::Float(f) => render_float(*f),
-        Value::BigFloat(s) => s.clone().into_bytes(),
+        Value::BigFloat(s) => render_big_float(s),
         Value::String(s) => {
             render_string_in_style(s, ScalarStyle::Plain, SpanContext::BlockMapValue)
         }
@@ -2641,6 +2641,15 @@ fn render_null(original_style: ScalarStyle) -> Vec<u8> {
 /// Render an `f64`. NaN/Inf are emitted as YAML's `.nan` / `.inf` (with sign),
 /// finite values use the standard `Display` form which already matches what
 /// YAML accepts as a `Float` token.
+/// A big-float literal as a float to every YAML reader: with a `.` and a
+/// signed exponent (`1e400` → `1.0e+400`), which a YAML 1.1 reader (PyYAML)
+/// needs; any other literal (`.nan`) as it is.
+fn render_big_float(literal: &str) -> Vec<u8> {
+    super::yaml_emit::yaml11_float(literal)
+        .unwrap_or_else(|| literal.to_owned())
+        .into_bytes()
+}
+
 fn render_float(f: f64) -> Vec<u8> {
     if f.is_nan() {
         b".nan".to_vec()

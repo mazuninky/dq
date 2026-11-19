@@ -85,7 +85,7 @@ pub fn run(
     // `PatchOp`'s `Serialize` impl renders to the RFC 6902 wire shape; convert
     // to a `serde_json::Value` so the standard reporter pipeline can format
     // it (JSON / YAML / TOML / TOON / JSONL all work this way).
-    let json = serde_json::to_value(&ops)?;
+    let json = ops_to_json(&ops)?;
 
     // Console output for `Vec<PatchOp>` would render as one cryptic line per
     // op (no structure markers). The spec calls JSON Patch the default
@@ -99,6 +99,26 @@ pub fn run(
     }
     reporter.report(&json, out)?;
     Ok(())
+}
+
+/// The RFC 6902 wire shape of `ops`, each `value` with its number exact.
+///
+/// `Value`'s generic `Serialize` writes a big number (`BigInt` / `BigFloat`)
+/// as a string; [`dq_core::Value::to_serde_json`] keeps it a number.
+fn ops_to_json(ops: &[dq_core::PatchOp]) -> serde_json::Result<serde_json::Value> {
+    let mut json = serde_json::to_value(ops)?;
+    if let serde_json::Value::Array(items) = &mut json {
+        for (op, item) in ops.iter().zip(items) {
+            if let dq_core::PatchOp::Add { value, .. }
+            | dq_core::PatchOp::Replace { value, .. }
+            | dq_core::PatchOp::Test { value, .. } = op
+                && let Some(slot) = item.get_mut("value")
+            {
+                *slot = value.to_serde_json();
+            }
+        }
+    }
+    Ok(json)
 }
 
 #[cfg(test)]
@@ -321,6 +341,25 @@ mod tests {
         assert!(
             err.to_string().contains("--in-place"),
             "error message should mention --in-place, got: {err}",
+        );
+    }
+
+    #[test]
+    fn ops_to_json_keeps_a_big_number_a_number() {
+        let ops = dq_core::diff(
+            &serde_json::from_str::<serde_json::Value>(r#"{"a": 1, "b": 2}"#)
+                .map(|v| dq_core::Value::from_serde_json(&v))
+                .unwrap(),
+            &serde_json::from_str::<serde_json::Value>(
+                r#"{"a": 0.1000000000000000000000000002, "b": 2, "c": 18446744073709551616}"#,
+            )
+            .map(|v| dq_core::Value::from_serde_json(&v))
+            .unwrap(),
+        );
+        let json = serde_json::to_string(&ops_to_json(&ops).unwrap()).unwrap();
+        assert_eq!(
+            json,
+            r#"[{"op":"add","path":"/c","value":18446744073709551616},{"op":"replace","path":"/a","value":0.1000000000000000000000000002}]"#
         );
     }
 }

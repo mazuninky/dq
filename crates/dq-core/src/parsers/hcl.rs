@@ -55,11 +55,10 @@ impl Format for Hcl {
 
     fn write(&self, doc: &Document, w: &mut dyn Write) -> Result<()> {
         // Re-emit through `hcl::to_string` on an `hcl::Value`. Comments are
-        // not preserved (M5 v1). Big-numeric scalars (`Value::BigInt` /
-        // `Value::BigFloat`) are best-effort emitted as their textual form
-        // through `HclValue::String` — the `hcl-rs` `Number` type cannot
-        // carry arbitrary-precision literals.
-        let hcl_value = value_to_hcl_value(doc.value());
+        // not preserved (M5 v1). The `hcl-rs` `Number` type cannot carry an
+        // arbitrary-precision literal: a big number past `u64` / `f64` is
+        // refused rather than written as another value.
+        let hcl_value = value_to_hcl_value(doc.value())?;
         let serialized = hcl::to_string(&hcl_value).map_err(|e| Error::Format {
             format: "hcl",
             message: format!("failed to serialize HCL: {e}"),
@@ -232,26 +231,51 @@ fn hcl_number_to_value(n: &Number) -> Value {
 
 /// Convert our `Value` back into `hcl::Value` for the write path.
 ///
-/// `Value::BigInt` / `Value::BigFloat` are emitted through their textual form
-/// as `HclValue::String` (best-effort — the `hcl-rs` Number type cannot
-/// carry arbitrary-precision literals). The write path documents this v1
-/// limitation in the module comment.
-fn value_to_hcl_value(v: &Value) -> HclValue {
-    match v {
+/// A [`Value::BigInt`] that fits `u64` becomes that number. Any other
+/// finite big number (`Value::BigInt` / `Value::BigFloat`) has no `hcl-rs`
+/// `Number` — written as a string or the nearest `f64` it would come back
+/// another value — and fails. A NaN or an infinity spelled as a
+/// `Value::BigFloat` (`.nan`) is emitted as its textual form, as before.
+///
+/// # Errors
+///
+/// [`Error::Format`] naming the first big number HCL cannot hold.
+fn value_to_hcl_value(v: &Value) -> Result<HclValue> {
+    Ok(match v {
         Value::Null => HclValue::Null,
         Value::Bool(b) => HclValue::Bool(*b),
         Value::Int(n) => HclValue::Number(Number::from(*n)),
         Value::Float(n) => Number::from_f64(*n).map_or(HclValue::Null, HclValue::Number),
-        Value::BigInt(s) | Value::BigFloat(s) => HclValue::String(s.clone()),
+        Value::BigInt(s) => match s.parse::<u64>() {
+            Ok(u) if u.to_string() == *s => HclValue::Number(Number::from(u)),
+            _ => return Err(big_number_error(s)),
+        },
+        Value::BigFloat(s) if crate::document::non_finite_literal(s).is_some() => {
+            HclValue::String(s.clone())
+        }
+        Value::BigFloat(s) => return Err(big_number_error(s)),
         Value::String(s) => HclValue::String(s.clone()),
-        Value::Array(items) => HclValue::Array(items.iter().map(value_to_hcl_value).collect()),
+        Value::Array(items) => HclValue::Array(
+            items
+                .iter()
+                .map(value_to_hcl_value)
+                .collect::<Result<_>>()?,
+        ),
         Value::Map(map) => {
             let mut out = hcl::Map::with_capacity(map.len());
             for (k, val) in map {
-                out.insert(k.clone(), value_to_hcl_value(val));
+                out.insert(k.clone(), value_to_hcl_value(val)?);
             }
             HclValue::Object(out)
         }
+    })
+}
+
+/// HCL numbers are `u64` / `i64` / `f64`.
+fn big_number_error(literal: &str) -> Error {
+    Error::Format {
+        format: "hcl",
+        message: format!("HCL cannot represent arbitrary-precision number {literal}"),
     }
 }
 
@@ -311,5 +335,38 @@ mod tests {
     fn parse_invalid_returns_parse_error() {
         let err = Hcl.parse(b"this = =\n").expect_err("must parse-error");
         assert_eq!(err.kind_name(), "parse");
+    }
+
+    fn write(value: Value) -> Result<String> {
+        let mut out = Vec::new();
+        Hcl.write(&Document::single(value), &mut out)?;
+        Ok(String::from_utf8(out).expect("UTF-8"))
+    }
+
+    #[test]
+    fn write_refuses_a_big_number_hcl_cannot_hold() {
+        for big in [
+            Value::BigInt("18446744073709551616".into()),
+            Value::BigInt("-9223372036854775809".into()),
+            Value::BigFloat("1e400".into()),
+        ] {
+            let mut map = indexmap::IndexMap::new();
+            map.insert("a".to_owned(), Value::Array(vec![big.clone()]));
+            let err = write(Value::Map(map)).expect_err("big number refused");
+            assert_eq!(
+                err.to_string(),
+                format!("hcl format error: HCL cannot represent arbitrary-precision number {big}")
+            );
+        }
+    }
+
+    #[test]
+    fn write_keeps_a_big_integer_in_u64_a_number() {
+        let mut map = indexmap::IndexMap::new();
+        map.insert("a".to_owned(), Value::BigInt("18446744073709551615".into()));
+        assert_eq!(
+            write(Value::Map(map)).unwrap(),
+            "a = 18446744073709551615\n"
+        );
     }
 }

@@ -4,9 +4,10 @@
 //! serde_norway decides a string's style with its own YAML 1.2 resolver, so
 //! it writes `1:20`, `y`, `on` or `2001-12-14` plain — and a YAML 1.1 reader
 //! (PyYAML; go-yaml as used by Kubernetes and Helm) takes them for an int, a
-//! bool, a date. It has no style hook, and it writes a [`Value::BigInt`] or
-//! a [`Value::BigFloat`] as a string. This module walks the [`Value`] tree
-//! itself and hands the emitter, in place of each such scalar:
+//! bool, a date. It has no style hook, and it writes a [`Value::BigInt`]
+//! past `u64` or a [`Value::BigFloat`] as a string. This module walks the
+//! [`Value`] tree itself and hands the emitter, in place of each such
+//! scalar:
 //!
 //! - a call that already yields the right scalar — `serialize_char` (always
 //!   single-quoted) for a one-character string, `serialize_u64` (plain) for
@@ -236,6 +237,7 @@ impl Serialize for Node<'_> {
             },
             Value::BigInt(s) => match plain_u64(s) {
                 Some(u) => serializer.serialize_u64(u),
+                None if plain_integer(s) => self.ctx.placeholder(serializer, s.clone(), 0),
                 None => serializer.serialize_str(s),
             },
             Value::BigFloat(s) => {
@@ -375,9 +377,8 @@ fn yaml11_exponent_float(f: f64) -> Option<String> {
 }
 
 /// The `u64` a big-integer literal spells exactly — a plain integer that
-/// dq's reader reads back as the same [`Value::BigInt`]. A literal past
-/// `u64` (or below `i64::MIN`) stays a string: serde_norway's reader
-/// rejects a plain `u128` / `i128` and rounds anything longer to a float.
+/// dq's reader reads back as the same [`Value::BigInt`], and that
+/// serde_norway's emitter writes itself.
 fn plain_u64(literal: &str) -> Option<u64> {
     literal
         .parse::<u64>()
@@ -385,15 +386,23 @@ fn plain_u64(literal: &str) -> Option<u64> {
         .filter(|u| u.to_string() == literal)
 }
 
+/// Whether a big-integer literal is a decimal integer as dq spells one
+/// (`-?digits`, no leading zero), written plain: dq's reader reads it back
+/// as the same [`Value::BigInt`], a YAML 1.1 reader (PyYAML) as an int.
+/// serde_norway's emitter would quote it, as a string its reader types.
+fn plain_integer(literal: &str) -> bool {
+    matches!(Value::from_number_literal(literal), Some(Value::BigInt(spelled)) if spelled == literal)
+}
+
 /// A float literal spelled as a float to a YAML 1.1 reader too: a `.` in
 /// the mantissa and a signed exponent (`1e400` → `1.0e+400`), which a
 /// YAML 1.2 core reader also matches as a float. `None` for anything not
 /// shaped `[-+]digits[.digits][e[-+]digits]`.
 ///
-/// dq's own reader cannot give the [`Value::BigFloat`] back whatever the
-/// spelling: serde_norway rounds a long literal to an `f64` and reads one
-/// past `f64` (`1.0e+400`) as a string, like a quoted one.
-fn yaml11_float(literal: &str) -> Option<String> {
+/// dq's own reader reads it back as the same [`Value::BigFloat`] (the same
+/// decimal: [`Value::same_data`]), whether it holds more digits than an
+/// `f64` or lies past its range.
+pub(super) fn yaml11_float(literal: &str) -> Option<String> {
     let (sign, rest) = match literal.as_bytes().first()? {
         b'-' | b'+' => literal.split_at(1),
         _ => ("", literal),
@@ -519,9 +528,38 @@ mod tests {
     }
 
     #[test]
-    fn keeps_a_big_integer_past_u64_a_string() {
-        let v = map(&[("c", Value::BigInt("123456789012345678901234567890".into()))]);
-        assert_eq!(yaml(&v), "c: '123456789012345678901234567890'\n");
+    fn writes_a_big_integer_past_u64_plain_and_reads_it_back() {
+        let v = map(&[
+            ("c", Value::BigInt("123456789012345678901234567890".into())),
+            ("d", Value::BigInt("-9223372036854775809".into())),
+            // Not a literal dq spells: written as the string it may be.
+            ("e", Value::BigInt("+18446744073709551616".into())),
+        ]);
+        let out = yaml(&v);
+        assert_eq!(
+            out,
+            "c: 123456789012345678901234567890\nd: -9223372036854775809\ne: '+18446744073709551616'\n"
+        );
+        let back = crate::parsers::Yaml.parse(out.as_bytes()).unwrap();
+        let Value::Map(m) = back.value() else {
+            panic!()
+        };
+        assert_eq!(m["c"], v_at(&v, "c"));
+        assert_eq!(m["d"], v_at(&v, "d"));
+    }
+
+    fn v_at(v: &Value, key: &str) -> Value {
+        let Value::Map(m) = v else { panic!() };
+        m[key].clone()
+    }
+
+    #[test]
+    fn a_big_float_reads_back_as_the_same_number() {
+        for literal in ["1e400", "-1.5E-400", "3.14159265358979323846264338327"] {
+            let v = map(&[("f", Value::BigFloat(literal.into()))]);
+            let back = crate::parsers::Yaml.parse(yaml(&v).as_bytes()).unwrap();
+            assert!(back.value().same_data(&v), "{literal}: {:?}", back.value());
+        }
     }
 
     #[test]

@@ -318,7 +318,7 @@ fn apply_one(doc: &mut Document, op: &PatchOp) -> Result<()> {
         }
         PatchOp::Test { path, value } => {
             let actual = read_value_at(doc, path)?;
-            if &actual != value {
+            if actual != *value && !actual.same_big_number(value) {
                 return Err(Error::PatchTestFailed {
                     pointer: path.as_canonical(),
                     expected: Box::new(value.clone()),
@@ -586,6 +586,18 @@ mod tests {
         }];
         apply_patch(&mut doc, &ops).expect("matching test op passes");
         assert_eq!(doc.original_bytes(), b"a: 3\n");
+    }
+
+    #[test]
+    fn apply_patch_test_matches_a_big_number_spelled_another_way() {
+        let mut doc = crate::parse_yaml_with_spans(b"a: 1e400\n").unwrap();
+        let test = |value: &str| PatchOp::Test {
+            path: Pointer::parse("/a").unwrap(),
+            value: Value::BigFloat(value.into()),
+        };
+        apply_patch(&mut doc, &[test("1e+400")]).expect("the same number passes");
+        let err = apply_patch(&mut doc, &[test("1e401")]).unwrap_err();
+        assert!(matches!(err, Error::PatchTestFailed { .. }), "{err:?}");
     }
 
     // ---- read_value_at ----

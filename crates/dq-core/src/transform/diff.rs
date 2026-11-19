@@ -76,7 +76,7 @@ pub fn diff(a: &Value, b: &Value) -> Vec<PatchOp> {
 /// it was in on entry. Internal helpers preserve this by pairing each
 /// `push_segment` with a matching `pop_segment`.
 fn diff_into(path: &mut Pointer, a: &Value, b: &Value, ops: &mut Vec<PatchOp>) {
-    if a == b {
+    if a == b || a.same_big_number(b) {
         return;
     }
     match (a, b) {

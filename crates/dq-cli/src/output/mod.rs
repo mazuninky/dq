@@ -20,8 +20,6 @@ pub mod yaml;
 use std::io::IsTerminal;
 use std::io::Write;
 
-use indexmap::IndexMap;
-
 pub use console::ConsoleReporter;
 pub use json::JsonReporter;
 pub use jsonl::JsonlReporter;
@@ -233,39 +231,12 @@ fn color_decision(
 /// Convert a `serde_json::Value` into a `dq_core::Value` so the reporter can
 /// reuse `dq-core`'s format implementations for YAML / TOML / JSONL output.
 ///
-/// The conversion is lossy in the same direction `dq-core::parsers::json` is
-/// lossy when *reading* user JSON: numeric precision beyond `i64`/`f64` is
-/// preserved as `BigInt`/`BigFloat` if the input came from `arbitrary_precision`
-/// `serde_json`, otherwise it falls back to whichever variant fits.
+/// A number keeps its exact value, as [`dq_core::Value::from_serde_json`]
+/// reads it: with `serde_json`'s `arbitrary_precision`, a literal no `i64`
+/// or `f64` holds stays a `BigInt` / `BigFloat`.
 #[must_use]
 pub fn from_serde_value(v: &serde_json::Value) -> dq_core::Value {
-    match v {
-        serde_json::Value::Null => dq_core::Value::Null,
-        serde_json::Value::Bool(b) => dq_core::Value::Bool(*b),
-        serde_json::Value::Number(n) => number_to_value(n),
-        serde_json::Value::String(s) => dq_core::Value::String(s.clone()),
-        serde_json::Value::Array(items) => {
-            dq_core::Value::Array(items.iter().map(from_serde_value).collect())
-        }
-        serde_json::Value::Object(map) => {
-            let mut out = IndexMap::with_capacity(map.len());
-            for (k, child) in map {
-                out.insert(k.clone(), from_serde_value(child));
-            }
-            dq_core::Value::Map(out)
-        }
-    }
-}
-
-fn number_to_value(n: &serde_json::Number) -> dq_core::Value {
-    if let Some(i) = n.as_i64() {
-        return dq_core::Value::Int(i);
-    }
-    if let Some(f) = n.as_f64() {
-        return dq_core::Value::Float(f);
-    }
-    // `arbitrary_precision` / u64 > i64::MAX path: keep the original literal.
-    dq_core::Value::BigInt(n.to_string())
+    dq_core::Value::from_serde_json(v)
 }
 
 #[cfg(test)]

@@ -274,8 +274,11 @@ impl Value {
     ///
     /// Unlike `==`, a NaN equals a NaN, a non-finite float equals the
     /// literal spelling it (`Float(NaN)` and `BigFloat(".nan")`), and
-    /// `-0.0` differs from `0.0` (finite floats compare by bits); map key
-    /// order is ignored, as `==` ignores it.
+    /// `-0.0` differs from `0.0` (finite floats compare by bits), and a
+    /// big-number literal equals another spelling of the same decimal
+    /// (`BigFloat("1e400")` and `BigFloat("1.0e+400")`) — never a number of
+    /// another value, so `0.1000000000000000000000000001` differs from
+    /// `Float(0.1)`; map key order is ignored, as `==` ignores it.
     #[must_use]
     pub fn same_data(&self, other: &Self) -> bool {
         match (self, other) {
@@ -287,16 +290,69 @@ impl Value {
             (Self::Array(a), Self::Array(b)) => {
                 a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.same_data(b))
             }
-            (a, b) => match (a.non_finite_float(), b.non_finite_float()) {
-                (Some(a), Some(b)) => a == b || (a.is_nan() && b.is_nan()),
-                // By bits: `-0.0 == 0.0`, but a fix from one to the other
-                // is a change.
-                _ => match (a, b) {
-                    (Self::Float(a), Self::Float(b)) => a.to_bits() == b.to_bits(),
-                    _ => a == b,
-                },
-            },
+            (a, b) => {
+                match (a.non_finite_float(), b.non_finite_float()) {
+                    (Some(a), Some(b)) => a == b || (a.is_nan() && b.is_nan()),
+                    (Some(_), None) | (None, Some(_)) => false,
+                    // By bits: `-0.0 == 0.0`, but a fix from one to the other
+                    // is a change.
+                    (None, None) => match (a, b) {
+                        (Self::Float(a), Self::Float(b)) => a.to_bits() == b.to_bits(),
+                        // A literal by its decimal value: `1e400` is `1.0e+400`,
+                        // and a float the decimal its shortest spelling is.
+                        (Self::BigInt(a), Self::BigInt(b))
+                        | (Self::BigFloat(a), Self::BigFloat(b)) => a == b || same_decimal(a, b),
+                        (Self::Float(f), Self::BigFloat(s))
+                        | (Self::BigFloat(s), Self::Float(f)) => same_decimal(s, &format!("{f:e}")),
+                        _ => a == b,
+                    },
+                }
+            }
         }
+    }
+
+    /// Whether `self` and `other` are the same number, one of them a big
+    /// number literal ([`Value::BigInt`] / [`Value::BigFloat`]) — `1e400`
+    /// and `1e+400`, which `==` tells apart by their spelling. `false` for
+    /// any pair of other values, collections included.
+    #[must_use]
+    pub fn same_big_number(&self, other: &Self) -> bool {
+        let big = |v: &Self| matches!(v, Self::BigInt(_) | Self::BigFloat(_));
+        (big(self) || big(other)) && self.same_data(other)
+    }
+
+    /// The number a decimal literal spells, with its exact value:
+    ///
+    /// - an integer that fits `i64` is an [`Value::Int`], any other a
+    ///   [`Value::BigInt`];
+    /// - a literal with a fraction or an exponent is a [`Value::Float`] when
+    ///   the nearest `f64` is the same decimal (`1.10`, `1e3`), else a
+    ///   [`Value::BigFloat`] — more digits than an `f64` holds
+    ///   (`0.1000000000000000000000000001`), or past its range (`1e400`,
+    ///   `1e-400`).
+    ///
+    /// A big literal is kept as JSON spells it: without a leading `+` or
+    /// leading zeros, with a digit on both sides of a `.` (`+.5e400` is
+    /// `0.5e400`), so every writer can copy it. `None` for anything not
+    /// shaped `[-+]digits[.digits][(e|E)[-+]digits]` (a `.` may lead or end
+    /// the mantissa, not both): hex, `.inf`, `1_000`, words.
+    #[must_use]
+    pub fn from_number_literal(literal: &str) -> Option<Self> {
+        let parts = DecimalParts::parse(literal)?;
+        if let Ok(i) = literal.parse::<i64>() {
+            return Some(Self::Int(i));
+        }
+        if parts.frac.is_none() && parts.exponent.is_none() {
+            return Some(Self::BigInt(parts.json_spelling()));
+        }
+        let f = literal.parse::<f64>().ok()?;
+        Some(
+            if f.is_finite() && same_decimal(literal, &format!("{f:e}")) {
+                Self::Float(f)
+            } else {
+                Self::BigFloat(parts.json_spelling())
+            },
+        )
     }
 
     /// Stable type name used by the `type` command and error messages.
@@ -386,41 +442,112 @@ impl Value {
     }
 }
 
-/// Convert a [`serde_json::Number`] into a [`Value`] that preserves
-/// big-int / big-float literals.
+/// Convert a [`serde_json::Number`] into a [`Value`] with its exact value.
 ///
 /// With the workspace's `arbitrary_precision` feature on `serde_json`,
 /// `Number::to_string()` returns the original textual literal verbatim —
 /// `as_i64()` / `as_f64()` lossily collapse a 22-digit integer to a
-/// `Float(4.7e21)`. Mirror the parsing heuristic
-/// `dq-core::parsers::json::json_number_to_value` uses on the read side:
-/// try `i64` first, then float-with-round-trip, falling back to `BigInt` /
-/// `BigFloat` literals.
+/// `Float(4.7e21)`; [`Value::from_number_literal`] reads the literal.
 fn serde_json_number_to_value(n: &serde_json::Number) -> Value {
     let literal = n.to_string();
-    if let Ok(i) = literal.parse::<i64>() {
-        return Value::Int(i);
-    }
-    if literal.contains('.') || literal.contains('e') || literal.contains('E') {
-        if let Ok(f) = f64::from_str(&literal)
-            && f.is_finite()
-            && literal_round_trips_to(&literal, f)
-        {
-            return Value::Float(f);
-        }
-        return Value::BigFloat(literal);
-    }
-    Value::BigInt(literal)
+    Value::from_number_literal(&literal).unwrap_or(Value::BigFloat(literal))
 }
 
-/// Lossless round-trip check for a parsed `f64` against its source
-/// literal. Mirrors `dq_core::parsers::json::f64_matches_literal` and
-/// `dq-cli::commands::set::f64_matches_literal`: re-parse the shortest
-/// float formatting and compare for exact equality so cosmetic
-/// reformatting (e.g. `1e2` vs `100`) does not trigger the BigFloat
-/// branch.
-fn literal_round_trips_to(literal: &str, f: f64) -> bool {
-    f64::from_str(literal).is_ok_and(|parsed| parsed.to_bits() == f.to_bits())
+/// The parts of a decimal number literal: sign, integer digits, fraction
+/// digits after a `.`, and the exponent after an `e` / `E`.
+struct DecimalParts<'a> {
+    negative: bool,
+    int: &'a str,
+    frac: Option<&'a str>,
+    /// The exponent with its `e` / `E`: `e+400`.
+    exponent: Option<&'a str>,
+}
+
+impl<'a> DecimalParts<'a> {
+    /// `None` unless `literal` is `[-+]digits[.digits][(e|E)[-+]digits]`
+    /// with a digit somewhere in the mantissa.
+    fn parse(literal: &'a str) -> Option<Self> {
+        let (negative, rest) = match literal.as_bytes().first()? {
+            b'-' => (true, &literal[1..]),
+            b'+' => (false, &literal[1..]),
+            _ => (false, literal),
+        };
+        let (mantissa, exponent) = match rest.find(['e', 'E']) {
+            Some(at) => (&rest[..at], Some(&rest[at..])),
+            None => (rest, None),
+        };
+        let (int, frac) = match mantissa.split_once('.') {
+            Some((int, frac)) => (int, Some(frac)),
+            None => (mantissa, None),
+        };
+        let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+        if !digits(int) || !frac.is_none_or(digits) || int.len() + frac.map_or(0, str::len) == 0 {
+            return None;
+        }
+        if let Some(exponent) = exponent {
+            let exponent = &exponent[1..];
+            let unsigned = exponent.strip_prefix(['-', '+']).unwrap_or(exponent);
+            if unsigned.is_empty() || !digits(unsigned) {
+                return None;
+            }
+        }
+        Some(Self {
+            negative,
+            int,
+            frac,
+            exponent,
+        })
+    }
+
+    /// The literal as JSON writes it: no `+`, no leading zeros, a digit on
+    /// both sides of a `.`.
+    fn json_spelling(&self) -> String {
+        let int = self.int.trim_start_matches('0');
+        let mut out = String::from(if self.negative { "-" } else { "" });
+        out.push_str(if int.is_empty() { "0" } else { int });
+        if let Some(frac) = self.frac {
+            out.push('.');
+            out.push_str(if frac.is_empty() { "0" } else { frac });
+        }
+        if let Some(exponent) = self.exponent {
+            out.push_str(exponent);
+        }
+        out
+    }
+}
+
+/// Whether two decimal literals spell the same number: sign, digits and
+/// exponent are compared after dropping leading and trailing zeros, so
+/// `1.10` equals `1.1` and `1e3` equals `1000`. `false` when either is not
+/// a plain decimal literal.
+fn same_decimal(a: &str, b: &str) -> bool {
+    match (normalized_decimal(a), normalized_decimal(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// `literal` as `(negative, significant digits, exponent of the last
+/// digit)`: `-0.0120e2` (-1.2) is `(true, "12", -1)`. Zero has no digits
+/// and no sign, so `-0` equals `0` here — a [`Value::Float`] pair is
+/// compared by bits instead.
+fn normalized_decimal(literal: &str) -> Option<(bool, String, i64)> {
+    let parts = DecimalParts::parse(literal)?;
+    let exponent = match parts.exponent {
+        Some(exponent) => exponent[1..].parse::<i64>().ok()?,
+        None => 0,
+    };
+    let frac = parts.frac.unwrap_or("");
+    let frac_len = i64::try_from(frac.len()).ok()?;
+    let digits = format!("{}{frac}", parts.int);
+    let significant = digits.trim_start_matches('0');
+    let trimmed = significant.trim_end_matches('0');
+    if trimmed.is_empty() {
+        return Some((false, String::new(), 0));
+    }
+    let trailing = i64::try_from(significant.len() - trimmed.len()).ok()?;
+    let exponent = exponent.checked_sub(frac_len)?.checked_add(trailing)?;
+    Some((parts.negative, trimmed.to_owned(), exponent))
 }
 
 impl Document {
@@ -5142,6 +5269,84 @@ mod tests {
             );
         }
         assert!(doc.holds_non_finite());
+    }
+
+    #[test]
+    fn from_number_literal_keeps_the_exact_value() {
+        let big = |s: &str| Value::BigFloat(s.into());
+        let cases = [
+            ("12", Value::Int(12)),
+            (
+                "-9223372036854775809",
+                Value::BigInt("-9223372036854775809".into()),
+            ),
+            (
+                "+18446744073709551616",
+                Value::BigInt("18446744073709551616".into()),
+            ),
+            ("1.10", Value::Float(1.1)),
+            ("1e3", Value::Float(1000.0)),
+            ("0.30000000000000004", Value::Float(0.30000000000000004)),
+            ("-0.0", Value::Float(-0.0)),
+            (
+                "0.1000000000000000000000000001",
+                big("0.1000000000000000000000000001"),
+            ),
+            ("1e400", big("1e400")),
+            ("1E-400", big("1E-400")),
+            ("+.5e400", big("0.5e400")),
+            ("007.e+400", big("7.0e+400")),
+        ];
+        for (literal, want) in cases {
+            let got = Value::from_number_literal(literal);
+            assert!(
+                got.as_ref().is_some_and(|got| got.same_data(&want)),
+                "{literal}: {got:?}"
+            );
+            assert_eq!(got, Some(want), "{literal}");
+        }
+        for not_a_number in [
+            "", ".", "-", "1e", "0x10", "1_000", ".inf", "nan", "1.2.3", "e5",
+        ] {
+            assert_eq!(
+                Value::from_number_literal(not_a_number),
+                None,
+                "{not_a_number}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_data_compares_big_numbers_by_their_decimal_value() {
+        let big = |s: &str| Value::BigFloat(s.into());
+        assert!(big("1e400").same_data(&big("1.0e+400")));
+        assert!(big("1e400").same_data(&big("10E399")));
+        assert!(!big("1e400").same_data(&big("1e401")));
+        assert!(!big("0.1000000000000000000000000001").same_data(&Value::Float(0.1)));
+        assert!(big("0.10").same_data(&Value::Float(0.1)));
+        assert!(
+            Value::BigInt("18446744073709551616".into())
+                .same_data(&Value::BigInt("+18446744073709551616".into()))
+        );
+        assert!(
+            !Value::BigInt("18446744073709551616".into())
+                .same_data(&Value::BigInt("18446744073709551617".into()))
+        );
+        assert!(!Value::BigInt("100".into()).same_data(&big("100.0")));
+        assert!(!big(".nan").same_data(&big("1e400")));
+        // An exponent past `i64` compares by spelling.
+        assert!(big("1e99999999999999999999").same_data(&big("1e99999999999999999999")));
+    }
+
+    #[test]
+    fn same_big_number_wants_a_big_number_on_one_side() {
+        let big = |s: &str| Value::BigFloat(s.into());
+        assert!(big("1e400").same_big_number(&big("1e+400")));
+        assert!(big("0.10").same_big_number(&Value::Float(0.1)));
+        assert!(!big("1e400").same_big_number(&big("1e401")));
+        assert!(!Value::Float(f64::NAN).same_big_number(&Value::Float(f64::NAN)));
+        let list = Value::Array(vec![big("1e400")]);
+        assert!(!list.same_big_number(&Value::Array(vec![big("1e+400")])));
     }
 
     #[test]
