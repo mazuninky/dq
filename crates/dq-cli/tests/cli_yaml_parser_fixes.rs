@@ -227,3 +227,39 @@ fn textual_edits_next_to_a_collection_key_keep_the_file() {
         "# top\n[1, 2]: x  # one\n? {k: [on, 'a: b']}\n: b\nz: 1  # keep\n"
     );
 }
+
+#[test]
+fn a_collection_key_quotes_strings_that_start_with_a_flow_indicator() {
+    // Before: `[?a, :x]`, which reads back as `[{a: null}, …]` or fails.
+    let file = write_yaml(b"? [\"?a\", \":x\", -x]\n: v\n");
+    assert_eq!(
+        String::from_utf8(stdout_of(&["keys"], &file, &[""])).unwrap(),
+        "['?a', ':x', -x]\n"
+    );
+    let yaml = stdout_of(&["-q", "-F", "yaml", "convert"], &file, &[]);
+    let again = write_yaml(&yaml);
+    assert_eq!(
+        String::from_utf8(stdout_of(&["keys"], &again, &[""])).unwrap(),
+        "['?a', ':x', -x]\n"
+    );
+}
+
+#[test]
+fn del_of_a_collection_key_in_a_flow_mapping_takes_its_entry() {
+    // Before: exit 7, "the edited document would not parse".
+    for (src, pointer, left) in [
+        (&b"{[1]: a, z: 1}\n"[..], "/[1]", "{z: 1}\n"),
+        (b"{z: 1, [1]: a}\n", "/[1]", "{z: 1}\n"),
+        (b"k: {[1]: a}\n", "/k/[1]", "k: {}\n"),
+        (b"k: {? [1] : a}\n", "/k/[1]", "k: {}\n"),
+        (b"{[1]: [2], z: 1}\n", "/[1]", "{z: 1}\n"),
+    ] {
+        let file = write_yaml(src);
+        assert_eq!(
+            String::from_utf8(stdout_of(&["del"], &file, &[pointer])).unwrap(),
+            left,
+            "{}",
+            String::from_utf8_lossy(src)
+        );
+    }
+}

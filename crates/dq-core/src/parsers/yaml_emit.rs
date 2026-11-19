@@ -489,11 +489,17 @@ fn write_flow(v: &Value, out: &mut String) {
     }
 }
 
-/// `s` as a flow scalar: plain when this writer writes it plain and it
-/// holds no flow indicator, else single-quoted, else — for a line break or
-/// a character a single-quoted scalar cannot hold — double-quoted.
+/// `s` as a flow scalar: plain when this writer writes it plain, it holds
+/// no flow indicator and starts with no `?` or `:` (in flow, a key or a
+/// value indicator: `[?a]` reads as `[{a: null}]`), else single-quoted,
+/// else — for a line break or a character a single-quoted scalar cannot
+/// hold — double-quoted.
 fn write_flow_string(s: &str, out: &mut String) {
-    if !s.contains([',', '[', ']', '{', '}']) && !typed_by_another_schema(s) && emitted_plain(s) {
+    if !s.contains([',', '[', ']', '{', '}'])
+        && !s.starts_with(['?', ':'])
+        && !typed_by_another_schema(s)
+        && emitted_plain(s)
+    {
         out.push_str(s);
     } else if s.chars().all(single_quotable) {
         out.push('\'');
@@ -619,6 +625,95 @@ mod tests {
             r#"["a\nb", "tab\there", "\x07\"\\"]"#
         );
         assert_eq!(flow_key_text(&map(&[("", Value::Null)])), "{'': null}");
+    }
+
+    #[test]
+    fn flow_key_text_reads_back_as_the_same_value() {
+        let tricky = [
+            "?a",
+            ":x",
+            "?x",
+            ":>",
+            "?",
+            ":",
+            "??",
+            "::",
+            "-",
+            "-x",
+            "- x",
+            "-1",
+            "--",
+            "---",
+            "...",
+            "? x",
+            ": x",
+            "a:b",
+            "a: b",
+            "a:",
+            "a?",
+            "#a",
+            "a #b",
+            "a#b",
+            "&a",
+            "*a",
+            "!a",
+            "|",
+            ">",
+            "%a",
+            "@a",
+            "`a",
+            "'",
+            "\"",
+            "a'b",
+            "a\"b",
+            "[",
+            "]",
+            "{",
+            "}",
+            ",",
+            "a,b",
+            "{a}",
+            "[a]",
+            "a: [b]",
+            " a",
+            "a ",
+            "",
+            "~",
+            "null",
+            "true",
+            "on",
+            "y",
+            "1",
+            "1.5",
+            "0x1",
+            "1e400",
+            ".inf",
+            "<<",
+            "=",
+            "2001-12-14",
+            "a\nb",
+            "a\tb",
+            "\u{7}",
+            "é",
+            "\u{FEFF}x",
+            "x\u{85}y",
+            "x\u{2028}y",
+            "a\\b",
+            "\\",
+        ];
+        for text in tricky {
+            for v in [
+                Value::Array(vec![s(text)]),
+                map(&[(text, s(text))]),
+                map(&[("k", Value::Array(vec![s(text), map(&[(text, s(text))])]))]),
+            ] {
+                let flow = flow_key_text(&v);
+                let read = crate::parsers::Yaml
+                    .parse(flow.as_bytes())
+                    .unwrap_or_else(|err| panic!("{text:?} as {flow:?}: {err}"));
+                assert_eq!(read.value(), &v, "{text:?} as {flow:?}");
+            }
+        }
     }
 
     #[test]

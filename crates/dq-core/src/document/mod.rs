@@ -2978,12 +2978,18 @@ fn flow_entry_removal(
 }
 
 /// Start of the key that ends at `end` in a flow mapping: a quoted key, a
-/// TOML dotted key (`a."b".c`), or a plain key back to the flow indicator
-/// before it.
+/// TOML dotted key (`a."b".c`), a YAML flow collection (`[1, 2]`), or a
+/// plain key back to the flow indicator before it.
 fn flow_key_start(bytes: &[u8], end: usize, format: FormatTag) -> Option<usize> {
     let mut end = end;
     loop {
         let last = *bytes.get(end.checked_sub(1)?)?;
+        if format == FormatTag::Yaml
+            && matches!(last, b']' | b'}')
+            && let Some(open) = yaml_flow_collection_start(bytes, end)
+        {
+            return Some(open);
+        }
         let start = match last {
             b'"' => {
                 // The opening quote: the nearest `"` before the closing one
@@ -3034,6 +3040,91 @@ fn flow_key_start(bytes: &[u8], end: usize, format: FormatTag) -> Option<usize> 
         }
         return Some(start);
     }
+}
+
+/// Start of the YAML flow collection that ends at `end` (with its `]` or
+/// `}`): the nearest `[` / `{` before it that opens a collection closing
+/// exactly at `end` — [`yaml_flow_closes_at`] reads forward from each, as
+/// quotes can only be told apart from a plain scalar's `'` that way.
+fn yaml_flow_collection_start(bytes: &[u8], end: usize) -> Option<usize> {
+    let mut at = end.checked_sub(1)?;
+    while let Some(open) = bytes[..at].iter().rposition(|&b| matches!(b, b'[' | b'{')) {
+        if yaml_flow_closes_at(bytes, open, end) {
+            return Some(open);
+        }
+        at = open;
+    }
+    None
+}
+
+/// Whether the YAML flow collection opening at `open` closes exactly at
+/// `end`: brackets counted outside quoted scalars and comments. A quote
+/// starts a scalar only where a node can start — after `[` `{` `,`, or a
+/// `?` / `:` indicator — not inside a plain scalar (`it's`).
+fn yaml_flow_closes_at(bytes: &[u8], open: usize, end: usize) -> bool {
+    let mut depth = 0usize;
+    let mut node_next = true;
+    let mut i = open;
+    while i < end {
+        let b = bytes[i];
+        i += 1;
+        match b {
+            b'[' | b'{' => {
+                depth += 1;
+                node_next = true;
+            }
+            b']' | b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i == end;
+                }
+                node_next = false;
+            }
+            b',' => node_next = true,
+            b' ' | b'\t' | b'\r' | b'\n' => {}
+            b'#' if matches!(bytes[i - 2], b' ' | b'\t' | b'\r' | b'\n') => {
+                while i < end && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'"' if node_next => {
+                loop {
+                    match bytes.get(i) {
+                        Some(b'\\') => i += 2,
+                        Some(b'"') => break,
+                        Some(_) => i += 1,
+                        None => return false,
+                    }
+                }
+                i += 1;
+                node_next = false;
+            }
+            b'\'' if node_next => {
+                loop {
+                    match (bytes.get(i), bytes.get(i + 1)) {
+                        (Some(b'\''), Some(b'\'')) => i += 2,
+                        (Some(b'\''), _) => break,
+                        (Some(_), _) => i += 1,
+                        (None, _) => return false,
+                    }
+                }
+                i += 1;
+                node_next = false;
+            }
+            b':' | b'?'
+                if bytes.get(i).is_none_or(|&next| {
+                    matches!(
+                        next,
+                        b' ' | b'\t' | b'\r' | b'\n' | b',' | b'[' | b']' | b'{' | b'}'
+                    )
+                }) =>
+            {
+                node_next = true;
+            }
+            _ => node_next = false,
+        }
+    }
+    false
 }
 
 /// Start of the YAML node properties (`&anchor`, `!tag`) right before
@@ -5610,6 +5701,14 @@ mod tests {
             (FormatTag::Yaml, "{b: 2, '': 1}", "''"),
             (FormatTag::Yaml, "{b: 2,  plain key: 1}", "plain key"),
             (FormatTag::Yaml, "{b: 2,\n  k: 1}", "k"),
+            (FormatTag::Yaml, "{b: 2, [1]: 1}", "[1]"),
+            (FormatTag::Yaml, "{[x, [1]]: 1}", "[x, [1]]"),
+            (
+                FormatTag::Yaml,
+                "{b: 2, {k: ']', it's: '['}: 1}",
+                "{k: ']', it's: '['}",
+            ),
+            (FormatTag::Yaml, "{b: 2, [\"a\\\"[\"]: 1}", "[\"a\\\"[\"]"),
             (
                 FormatTag::Toml,
                 "{b = 2, x . \"y z\" . w = 1}",
@@ -5637,6 +5736,10 @@ mod tests {
             (FormatTag::Yaml, "{a: 1, b: 2}", "2", true, "{a: 1}"),
             (FormatTag::Yaml, "{a: 1}", "1", true, "{}"),
             (FormatTag::Yaml, "[1, 2]", "2", false, "[1]"),
+            // A flow collection as the key.
+            (FormatTag::Yaml, "{[1]: a, z: 1}", "a", true, "{z: 1}"),
+            (FormatTag::Yaml, "{z: 1, [1]: a}", "a", true, "{z: 1}"),
+            (FormatTag::Yaml, "{? {k: v} : a}", "a", true, "{}"),
             // A trailing comma: the last entry takes the comma before it.
             (FormatTag::Yaml, "{a: 1, b: 2,}", "2", true, "{a: 1}"),
             (FormatTag::Yaml, "{a: 1,}", "1", true, "{}"),
