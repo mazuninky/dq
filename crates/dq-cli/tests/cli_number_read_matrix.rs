@@ -640,3 +640,92 @@ fn the_console_and_every_writer_spell_a_float_without_a_digit_run() {
         ],
     );
 }
+
+/// `convert -F hcl` wrote the float `3.0` as `e = 3`, and dq read
+/// `e = 3.0` back as the integer 3: a whole float lost its float-ness both
+/// ways. `1e16` came out as 17 digits and read back as an integer too.
+#[test]
+fn hcl_keeps_a_whole_float_a_float_both_ways() {
+    let dir = dir_with(&[
+        (
+            "f.yaml",
+            "e: 3.0\nn: -3.0\nh: 1e16\nl: [1.0, {m: 2.0}]\ni: 4\n",
+        ),
+        ("w.tf", "e = 3.0\nh = 1e16\nz = -0.0\ni = 4\nn = -3.0\n"),
+    ]);
+    assert_cases(
+        &dir,
+        &[
+            (
+                vec!["-q", "convert", "f.yaml", "-F", "hcl"],
+                ok(
+                    "e = 3.0\nn = -3.0\nh = 1e16\nl = [\n  1.0,\n  {\n    \"m\" = 2.0\n  }\n]\ni = 4\n",
+                ),
+            ),
+            (
+                vec!["convert", "w.tf", "-F", "json"],
+                ok(
+                    "{\n  \"e\": 3.0,\n  \"h\": 1e16,\n  \"z\": -0.0,\n  \"i\": 4,\n  \"n\": -3.0\n}\n",
+                ),
+            ),
+            (vec!["type", "w.tf", "/e"], ok("float\n")),
+            (vec!["type", "w.tf", "/i"], ok("int\n")),
+        ],
+    );
+}
+
+/// The XML writer wrote a `#text` that was no string — a number, a
+/// boolean, a big integer — as an empty element, and dropped an array or a
+/// map there, or an `@attrs` that was no map, without a word.
+#[test]
+fn xml_writes_a_scalar_text_and_refuses_a_container() {
+    let dir = dir_with(&[
+        (
+            "t.yaml",
+            "r:\n- \"@attrs\": {a: 1e300, b: true, c: null}\n  \
+             x: [{\"#text\": 1.5e20}]\n  t: [{\"#text\": true}]\n  \
+             i: [{\"#text\": 42}]\n  z: [{\"#text\": null}]\n  \
+             big: [{\"#text\": 18446744073709551617}]\n",
+        ),
+        ("list.yaml", "r:\n- x: [{\"#text\": [1, 2]}]\n"),
+        ("map.yaml", "r:\n- x: [{\"#text\": {a: 1}}]\n"),
+        ("attrs.yaml", "r:\n- \"@attrs\": 5\n"),
+    ]);
+    assert_cases(
+        &dir,
+        &[
+            (
+                vec!["-q", "convert", "t.yaml", "-F", "xml"],
+                ok(
+                    "<r a=\"1e300\" b=\"true\" c=\"\">\n  <x>1.5e20</x>\n  <t>true</t>\n  \
+                    <i>42</i>\n  <z/>\n  <big>18446744073709551617</big>\n</r>",
+                ),
+            ),
+            (
+                vec!["-q", "convert", "list.yaml", "-F", "xml"],
+                (
+                    1,
+                    "",
+                    "xml format error: XML write: '#text' of <x> must be a scalar (got array)\n",
+                ),
+            ),
+            (
+                vec!["-q", "convert", "map.yaml", "-F", "xml"],
+                (
+                    1,
+                    "",
+                    "xml format error: XML write: '#text' of <x> must be a scalar (got object)\n",
+                ),
+            ),
+            (
+                vec!["-q", "convert", "attrs.yaml", "-F", "xml"],
+                (
+                    1,
+                    "",
+                    "xml format error: XML write: '@attrs' of <r> must be a map of attributes \
+                     (got int)\n",
+                ),
+            ),
+        ],
+    );
+}

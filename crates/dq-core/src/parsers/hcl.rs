@@ -65,6 +65,7 @@ impl Format for Hcl {
             format: "hcl",
             message: format!("failed to serialize HCL: {e}"),
         })?;
+        let serialized = respell_whole_floats(serialized, doc.value());
         w.write_all(serialized.as_bytes())
             .map_err(|source| Error::Io {
                 path: Utf8PathBuf::from("<hcl-writer>"),
@@ -252,9 +253,10 @@ fn hcl_value_to_value(v: HclValue) -> Value {
 /// Put back the exact value of every number literal that `hcl-rs` read
 /// as the `f64` nearest it: an integer past 64 bits
 /// (`18446744073709551617`, `-9223372036854775809`) or a decimal with more
-/// digits than an `f64` holds. `hcl-rs` keeps no literal; `hcl-edit`, which
-/// it parses with, does, so `text` is parsed once more with it and walked
-/// alongside `value`.
+/// digits than an `f64` holds — and the float-ness of a whole float
+/// literal (`3.0`, `1e16`), which `hcl-rs` reads as an integer. `hcl-rs`
+/// keeps no literal; `hcl-edit`, which it parses with, does, so `text` is
+/// parsed once more with it and walked alongside `value`.
 fn restore_exact_numbers(text: &str, value: &mut Value) {
     let (Ok(body), Value::Map(map)) = (text.parse::<hcl::edit::structure::Body>(), value) else {
         return;
@@ -295,24 +297,29 @@ fn restore_in_body(body: &hcl::edit::structure::Body, map: &mut IndexMap<String,
 fn restore_in_expression(expr: &hcl::edit::expr::Expression, value: &mut Value) {
     use hcl::edit::expr::Expression as EditExpression;
     match (expr, value) {
-        (EditExpression::Number(number), value @ Value::Float(_)) => {
+        (EditExpression::Number(number), value @ (Value::Float(_) | Value::Int(_))) => {
             let Some(repr) = number.as_repr() else {
                 return;
             };
             // `- 5` is a number too.
             let literal: String = repr.chars().filter(|c| !c.is_whitespace()).collect();
-            let Value::Float(read) = value else {
+            // Only the number `hcl-rs` read from this very literal: a later
+            // block merged over it may have put another one there. It reads
+            // a whole float (`3.0`, `-0.0`) as an integer.
+            let Ok(parsed) = literal.parse::<f64>() else {
                 return;
             };
-            // Only the number `hcl-rs` read from this very literal: a later
-            // block merged over it may have put another one there.
-            if literal.parse::<f64>().map(f64::to_bits) != Ok(read.to_bits()) {
+            let read_from_literal = match value {
+                Value::Float(f) => parsed.to_bits() == f.to_bits(),
+                Value::Int(i) => parsed == *i as f64,
+                _ => false,
+            };
+            if !read_from_literal {
                 return;
             }
-            if let Some(exact @ (Value::BigInt(_) | Value::BigFloat(_))) =
-                Value::from_number_literal(&literal)
-            {
-                *value = exact;
+            match Value::from_number_literal(&literal) {
+                Some(Value::Int(_)) | None => {}
+                Some(exact) => *value = exact,
             }
         }
         (EditExpression::Array(items), Value::Array(values)) if items.len() == values.len() => {
@@ -353,6 +360,74 @@ fn hcl_number_to_value(n: &Number) -> Value {
     // Fallback: stringify the number's textual form. The `Number` type
     // implements Display so this is non-lossy in practice.
     Value::BigFloat(n.to_string())
+}
+
+/// `text`, which `hcl::to_string` wrote for `value`, with every whole
+/// float spelled as one again. `hcl-rs` keeps a whole `f64` that fits 64
+/// bits as an integer (`3.0` → `3`, `1e16` → `10000000000000000`), which
+/// reads back as an int; each such number is respelled
+/// [`shortest_float`](crate::document::shortest_float)'s way (`3.0`,
+/// `1e16`) by walking `text`, parsed with `hcl-edit`, alongside `value`.
+/// Every other byte stays as `hcl-rs` wrote it.
+fn respell_whole_floats(text: String, value: &Value) -> String {
+    let Value::Map(map) = value else {
+        return text;
+    };
+    if !map.values().any(has_whole_float) {
+        return text;
+    }
+    let Ok(mut body) = text.parse::<hcl::edit::structure::Body>() else {
+        return text;
+    };
+    for mut attr in body.attributes_mut() {
+        if let Some(value) = map.get(attr.get().key.as_str()) {
+            respell_whole_floats_in(attr.value_mut(), value);
+        }
+    }
+    body.to_string()
+}
+
+/// Whether `v` is or holds a finite float with no fraction.
+fn has_whole_float(v: &Value) -> bool {
+    match v {
+        Value::Float(f) => f.is_finite() && f.fract() == 0.0,
+        Value::Array(items) => items.iter().any(has_whole_float),
+        Value::Map(map) => map.values().any(has_whole_float),
+        Value::Null
+        | Value::Bool(_)
+        | Value::Int(_)
+        | Value::BigInt(_)
+        | Value::BigFloat(_)
+        | Value::String(_) => false,
+    }
+}
+
+fn respell_whole_floats_in(expr: &mut hcl::edit::expr::Expression, value: &Value) {
+    use hcl::edit::Decorate as _;
+    use hcl::edit::expr::Expression as EditExpression;
+    match (expr, value) {
+        // `-3` parses as a negation of `3`.
+        (expr @ (EditExpression::Number(_) | EditExpression::UnaryOp(_)), Value::Float(f))
+            if f.is_finite() && f.fract() == 0.0 =>
+        {
+            if let Ok(mut respelled) = crate::document::shortest_float(*f).parse::<EditExpression>()
+            {
+                *respelled.decor_mut() = expr.decor().clone();
+                *expr = respelled;
+            }
+        }
+        (EditExpression::Array(items), Value::Array(values)) if items.len() == values.len() => {
+            for (item, value) in items.iter_mut().zip(values) {
+                respell_whole_floats_in(item, value);
+            }
+        }
+        (EditExpression::Object(object), Value::Map(map)) if object.len() == map.len() => {
+            for ((_, member), value) in object.iter_mut().zip(map.values()) {
+                respell_whole_floats_in(member.expr_mut(), value);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Convert our `Value` back into `hcl::Value` for the write path.
@@ -531,6 +606,24 @@ mod tests {
         let mut out = Vec::new();
         Hcl.write(&Document::single(value), &mut out)?;
         Ok(String::from_utf8(out).expect("UTF-8"))
+    }
+
+    #[test]
+    fn a_whole_float_stays_a_float_written_and_read() {
+        let value = Value::Map(
+            [
+                ("e".to_owned(), Value::Float(3.0)),
+                ("n".to_owned(), Value::Float(-3.0)),
+                ("h".to_owned(), Value::Float(1e16)),
+                ("i".to_owned(), Value::Int(4)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let text = write(value.clone()).expect("writes");
+        assert_eq!(text, "e = 3.0\nn = -3.0\nh = 1e16\ni = 4\n");
+        let back = Hcl.parse(text.as_bytes()).expect("reads back");
+        assert_eq!(back.value(), &value);
     }
 
     #[test]

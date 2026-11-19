@@ -714,23 +714,30 @@ fn write_element(
     indent_level: usize,
 ) -> Result<()> {
     let mut start = BytesStart::new(tag);
+    match body.get(KEY_ATTRS) {
+        None | Some(Value::Map(_)) => {}
+        Some(other) => {
+            return Err(Error::Format {
+                format: "xml",
+                message: format!(
+                    "XML write: '{KEY_ATTRS}' of <{tag}> must be a map of attributes (got {})",
+                    other.type_name(),
+                ),
+            });
+        }
+    }
     if let Some(Value::Map(attrs)) = body.get(KEY_ATTRS) {
         for (k, v) in attrs {
             let v = match v {
-                Value::String(s) => s.clone(),
-                Value::Bool(b) => b.to_string(),
-                Value::Int(i) => i.to_string(),
-                Value::Float(f) => crate::document::shortest_float(*f),
-                Value::BigInt(s) | Value::BigFloat(s) => s.clone(),
+                // An attribute is present or not: a null one is empty.
                 Value::Null => String::new(),
-                _ => {
-                    return Err(Error::Format {
-                        format: "xml",
-                        message: format!(
-                            "XML write: attribute '{k}' on <{tag}> must be a scalar (got non-scalar)",
-                        ),
-                    });
-                }
+                scalar => scalar_text(scalar).ok_or_else(|| Error::Format {
+                    format: "xml",
+                    message: format!(
+                        "XML write: attribute '{k}' on <{tag}> must be a scalar (got {})",
+                        scalar.type_name(),
+                    ),
+                })?,
             };
             start.push_attribute(Attribute {
                 key: QName(k.as_str()),
@@ -739,11 +746,23 @@ fn write_element(
         }
     }
 
+    // The text of a scalar `#text`: a number or a boolean as it is
+    // spelled, a null as no text (an empty element). An array or a map has
+    // no text: refuse it rather than drop it.
+    let text = match body.get(KEY_TEXT) {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(scalar_text(v).ok_or_else(|| Error::Format {
+            format: "xml",
+            message: format!(
+                "XML write: '{KEY_TEXT}' of <{tag}> must be a scalar (got {})",
+                v.type_name(),
+            ),
+        })?),
+    };
+
     // Determine if the element has any body content. If not, emit as
     // self-closing `<tag/>`.
-    let has_text = body
-        .get(KEY_TEXT)
-        .is_some_and(|v| !matches!(v, Value::Null));
+    let has_text = text.is_some();
     let has_cdata = body.get(KEY_CDATA).is_some_and(non_empty_array);
     let has_pi = body.get(KEY_PI).is_some_and(non_empty_array);
     let has_comments = body.get(KEY_COMMENTS).is_some_and(non_empty_array);
@@ -803,7 +822,7 @@ fn write_element(
             }
         }
     }
-    if let Some(Value::String(s)) = body.get(KEY_TEXT) {
+    if let Some(s) = &text {
         writer
             .write_event(Event::Text(text_event(s)))
             .map_err(map_write_err)?;
@@ -838,41 +857,22 @@ fn write_element(
                 Value::Map(child_body) => {
                     write_element(writer, k, child_body, child_indent)?;
                 }
-                Value::String(s) => {
-                    // String-shaped child: best-effort emit as
-                    // `<k>text</k>`. This shape arises when JSON input is
-                    // converted to XML — `{"name": ["Alice"]}` becomes
-                    // `<name>Alice</name>`.
-                    let mut tmp = IndexMap::new();
-                    tmp.insert(KEY_TEXT.to_owned(), Value::String(s.clone()));
-                    write_element(writer, k, &tmp, child_indent)?;
-                }
                 Value::Null => {
                     // Empty child element.
                     let tmp = IndexMap::new();
                     write_element(writer, k, &tmp, child_indent)?;
                 }
-                Value::Bool(b) => {
+                // Scalar-shaped child: emitted as `<k>text</k>`. This shape
+                // arises when JSON input is converted to XML —
+                // `{"name": ["Alice"]}` becomes `<name>Alice</name>`.
+                scalar @ (Value::String(_)
+                | Value::Bool(_)
+                | Value::Int(_)
+                | Value::Float(_)
+                | Value::BigInt(_)
+                | Value::BigFloat(_)) => {
                     let mut tmp = IndexMap::new();
-                    tmp.insert(KEY_TEXT.to_owned(), Value::String(b.to_string()));
-                    write_element(writer, k, &tmp, child_indent)?;
-                }
-                Value::Int(i) => {
-                    let mut tmp = IndexMap::new();
-                    tmp.insert(KEY_TEXT.to_owned(), Value::String(i.to_string()));
-                    write_element(writer, k, &tmp, child_indent)?;
-                }
-                Value::Float(f) => {
-                    let mut tmp = IndexMap::new();
-                    tmp.insert(
-                        KEY_TEXT.to_owned(),
-                        Value::String(crate::document::shortest_float(*f)),
-                    );
-                    write_element(writer, k, &tmp, child_indent)?;
-                }
-                Value::BigInt(s) | Value::BigFloat(s) => {
-                    let mut tmp = IndexMap::new();
-                    tmp.insert(KEY_TEXT.to_owned(), Value::String(s.clone()));
+                    tmp.insert(KEY_TEXT.to_owned(), scalar.clone());
                     write_element(writer, k, &tmp, child_indent)?;
                 }
                 Value::Array(_) => {
@@ -898,6 +898,24 @@ fn write_element(
         .write_event(Event::End(BytesEnd::new(tag)))
         .map_err(map_write_err)?;
     Ok(())
+}
+
+/// The text a scalar is written as: a string as is, a boolean or an
+/// integer as it prints, a float its [shortest round-trip
+/// spelling](crate::document::shortest_float) (`1.5e20`, `3.0`) — a NaN or
+/// an infinity `.nan` / `.inf` / `-.inf` — and a big number as dq holds its
+/// literal. `None` for a null, an array or a map.
+fn scalar_text(v: &Value) -> Option<String> {
+    if let Some(spelled) = v.non_finite_spelling() {
+        return Some(spelled.to_owned());
+    }
+    match v {
+        Value::String(s) | Value::BigInt(s) | Value::BigFloat(s) => Some(s.clone()),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Int(i) => Some(i.to_string()),
+        Value::Float(f) => Some(crate::document::shortest_float(*f)),
+        Value::Null | Value::Array(_) | Value::Map(_) => None,
+    }
 }
 
 fn is_conventional(k: &str) -> bool {
@@ -971,6 +989,30 @@ mod tests {
     fn render(v: &Value) -> String {
         let bytes = render_xml(v).expect("render xml");
         String::from_utf8(bytes).expect("utf-8")
+    }
+
+    #[test]
+    fn a_scalar_text_is_written_and_a_container_one_refused() {
+        let element = |text: Value| {
+            let mut body = IndexMap::new();
+            body.insert(KEY_TEXT.to_owned(), text);
+            let mut top = IndexMap::new();
+            top.insert("x".to_owned(), Value::Array(vec![Value::Map(body)]));
+            Value::Map(top)
+        };
+        for (text, xml) in [
+            (Value::Float(1.5e20), "<x>1.5e20</x>"),
+            (Value::Bool(false), "<x>false</x>"),
+            (Value::Int(-2), "<x>-2</x>"),
+            (Value::Null, "<x/>"),
+        ] {
+            assert_eq!(render(&element(text)), xml);
+        }
+        let err = render_xml(&element(Value::Array(vec![]))).expect_err("refused");
+        assert!(
+            err.to_string().contains("must be a scalar (got array)"),
+            "{err}"
+        );
     }
 
     fn root_element_body<'a>(v: &'a Value, tag: &str) -> &'a IndexMap<String, Value> {
