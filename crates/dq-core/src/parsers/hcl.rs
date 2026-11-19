@@ -64,8 +64,12 @@ impl Format for Hcl {
         // `u64` / `f64` is refused rather than written as another value.
         let serialized = match doc.value() {
             Value::Map(map) => write_body(map)?,
-            // Not a body: `hcl-rs` refuses it, with its own message.
-            other => hcl::to_string(&value_to_hcl_value(other)?).map_err(serialize_error)?,
+            other => {
+                return Err(Error::Format {
+                    format: "hcl",
+                    message: hcl_root_refusal(other),
+                });
+            }
         };
         w.write_all(serialized.as_bytes())
             .map_err(|source| Error::Io {
@@ -433,47 +437,15 @@ fn hcl_text<T: hcl::format::Format>(value: &T) -> Result<String> {
     hcl::format::to_string(value).map_err(serialize_error)
 }
 
-/// Convert our `Value` back into `hcl::Value`, for a value that is not a
-/// map — which `hcl-rs` refuses to write as a body.
-///
-/// A [`Value::BigInt`] that fits `u64` becomes that number. Any other
-/// finite big number (`Value::BigInt` / `Value::BigFloat`) has no `hcl-rs`
-/// `Number` — written as a string or the nearest `f64` it would come back
-/// another value — and fails. A NaN or an infinity spelled as a
-/// `Value::BigFloat` (`.nan`) is emitted as its textual form, as before.
-///
-/// # Errors
-///
-/// [`Error::Format`] naming the first big number HCL cannot hold.
-fn value_to_hcl_value(v: &Value) -> Result<HclValue> {
-    Ok(match v {
-        Value::Null => HclValue::Null,
-        Value::Bool(b) => HclValue::Bool(*b),
-        Value::Int(n) => HclValue::Number(Number::from(*n)),
-        Value::Float(n) => Number::from_f64(*n).map_or(HclValue::Null, HclValue::Number),
-        Value::BigInt(s) => match s.parse::<u64>() {
-            Ok(u) if u.to_string() == *s => HclValue::Number(Number::from(u)),
-            _ => return Err(big_number_error(s)),
-        },
-        Value::BigFloat(s) if crate::document::non_finite_literal(s).is_some() => {
-            HclValue::String(s.clone())
-        }
-        Value::BigFloat(s) => return Err(big_number_error(s)),
-        Value::String(s) => HclValue::String(s.clone()),
-        Value::Array(items) => HclValue::Array(
-            items
-                .iter()
-                .map(value_to_hcl_value)
-                .collect::<Result<_>>()?,
-        ),
-        Value::Map(map) => {
-            let mut out = hcl::Map::with_capacity(map.len());
-            for (k, val) in map {
-                out.insert(k.clone(), value_to_hcl_value(val)?);
-            }
-            HclValue::Object(out)
-        }
-    })
+/// Why `value`, which is no map, cannot be the root of an HCL document: a
+/// file is a body of attributes and blocks, which only a map holds.
+/// `hcl-rs` would refuse it in words that change with the value's type
+/// (`serialize_u64 not supported`).
+fn hcl_root_refusal(value: &Value) -> String {
+    format!(
+        "an HCL document is a body of attributes, so its root is a map, not {}",
+        value.kind_with_article()
+    )
 }
 
 /// HCL numbers are `u64` / `i64` / `f64`.
@@ -509,6 +481,49 @@ fn map_hcl_parse_error(e: hcl::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Convert our `Value` back into `hcl::Value`: the oracle [`write_body`]
+    /// lays its output out against, `hcl-rs`'s own writer.
+    ///
+    /// A [`Value::BigInt`] that fits `u64` becomes that number. Any other
+    /// finite big number (`Value::BigInt` / `Value::BigFloat`) has no `hcl-rs`
+    /// `Number` — written as a string or the nearest `f64` it would come back
+    /// another value — and fails. A NaN or an infinity spelled as a
+    /// `Value::BigFloat` (`.nan`) is emitted as its textual form, as before.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Format`] naming the first big number HCL cannot hold.
+    fn value_to_hcl_value(v: &Value) -> Result<HclValue> {
+        Ok(match v {
+            Value::Null => HclValue::Null,
+            Value::Bool(b) => HclValue::Bool(*b),
+            Value::Int(n) => HclValue::Number(Number::from(*n)),
+            Value::Float(n) => Number::from_f64(*n).map_or(HclValue::Null, HclValue::Number),
+            Value::BigInt(s) => match s.parse::<u64>() {
+                Ok(u) if u.to_string() == *s => HclValue::Number(Number::from(u)),
+                _ => return Err(big_number_error(s)),
+            },
+            Value::BigFloat(s) if crate::document::non_finite_literal(s).is_some() => {
+                HclValue::String(s.clone())
+            }
+            Value::BigFloat(s) => return Err(big_number_error(s)),
+            Value::String(s) => HclValue::String(s.clone()),
+            Value::Array(items) => HclValue::Array(
+                items
+                    .iter()
+                    .map(value_to_hcl_value)
+                    .collect::<Result<_>>()?,
+            ),
+            Value::Map(map) => {
+                let mut out = hcl::Map::with_capacity(map.len());
+                for (k, val) in map {
+                    out.insert(k.clone(), value_to_hcl_value(val)?);
+                }
+                HclValue::Object(out)
+            }
+        })
+    }
 
     #[test]
     fn parse_keeps_numbers_an_f64_misreads_exact() {
@@ -734,6 +749,26 @@ mod tests {
             text,
             "w = 2.0\na = [\n  1658206780088562.2,\n  {\n    \"k\" = -0.5\n  },\n  null\n]\n"
         );
+    }
+
+    #[test]
+    fn write_refuses_a_root_that_is_no_map() {
+        for (value, kind) in [
+            (Value::Array(vec![Value::Int(1)]), "an array"),
+            (Value::Array(vec![Value::Float(1.5)]), "an array"),
+            (Value::String("s".into()), "a string"),
+            (Value::BigInt("18446744073709551617".into()), "an integer"),
+            (Value::Bool(true), "a boolean"),
+            (Value::Null, "null"),
+        ] {
+            assert_eq!(
+                write(value).unwrap_err().to_string(),
+                format!(
+                    "hcl format error: an HCL document is a body of attributes, so its root is \
+                     a map, not {kind}"
+                )
+            );
+        }
     }
 
     #[test]

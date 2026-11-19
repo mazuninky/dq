@@ -551,7 +551,10 @@ fn hcl_output_names_the_first_value_it_cannot_write() {
         ("key_first.json", "{\"a b\": 1, \"x\": {\"y\": 1e400}}"),
         ("two_keys.json", "{\"a b\": 1, \"c d\": 2}"),
         ("array.json", "[1, 2]"),
+        ("floats.json", "[1.5]"),
         ("scalar.json", "\"s\""),
+        ("number.json", "5"),
+        ("null.json", "null"),
     ]);
     let refused = |literal: &str| {
         format!("hcl format error: HCL cannot represent arbitrary-precision number {literal}\n")
@@ -572,12 +575,27 @@ fn hcl_output_names_the_first_value_it_cannot_write() {
             "{file}"
         );
     }
-    for file in ["array.json", "scalar.json"] {
-        let (code, stdout, stderr) = failure_of(&dir, &["-q", "-F", "hcl", "convert", file]);
-        assert_eq!((code, stdout.as_str()), (Some(1), ""), "{file}");
-        assert!(
-            stderr.starts_with("hcl format error: failed to serialize HCL: "),
-            "{file}: {stderr}"
+    // A root that is no map: one dq message, whatever the value's type or
+    // its first item's. Before, `hcl-rs`'s own (`serialize_u64` not
+    // supported, `serialize_f64` …).
+    for (file, kind) in [
+        ("array.json", "an array"),
+        ("floats.json", "an array"),
+        ("scalar.json", "a string"),
+        ("number.json", "an integer"),
+        ("null.json", "null"),
+    ] {
+        assert_eq!(
+            failure_of(&dir, &["-q", "-F", "hcl", "convert", file]),
+            (
+                Some(1),
+                String::new(),
+                format!(
+                    "hcl format error: an HCL document is a body of attributes, so its root is a \
+                     map, not {kind}\n"
+                )
+            ),
+            "{file}"
         );
     }
 }

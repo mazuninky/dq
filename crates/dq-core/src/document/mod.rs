@@ -521,6 +521,22 @@ impl Value {
         number::number_value(literal)
     }
 
+    /// The kind of value this is, as a message names it in a sentence:
+    /// `a map`, `an array`, `a string`, `an integer`, `a float`,
+    /// `a boolean`, `null`.
+    #[must_use]
+    pub(crate) fn kind_with_article(&self) -> &'static str {
+        match self {
+            Self::Null => "null",
+            Self::Bool(_) => "a boolean",
+            Self::Int(_) | Self::BigInt(_) => "an integer",
+            Self::Float(_) | Self::BigFloat(_) => "a float",
+            Self::String(_) => "a string",
+            Self::Array(_) => "an array",
+            Self::Map(_) => "a map",
+        }
+    }
+
     /// Stable type name used by the `type` command and error messages.
     #[must_use]
     pub fn type_name(&self) -> &'static str {
@@ -4734,16 +4750,13 @@ const TOML_ROOT_TABLE: &str = "a TOML document is a table, so its root is one";
 /// Why `value` cannot be the root of a TOML document — the textual `set`
 /// of the root and the TOML writer both refuse it so; `None` for a table.
 pub(crate) fn toml_root_refusal(value: &Value) -> Option<String> {
-    let kind = match value {
-        Value::Map(_) => return None,
-        Value::Null => "null",
-        Value::Bool(_) => "a boolean",
-        Value::Int(_) | Value::BigInt(_) => "an integer",
-        Value::Float(_) | Value::BigFloat(_) => "a float",
-        Value::String(_) => "a string",
-        Value::Array(_) => "an array",
-    };
-    Some(format!("{TOML_ROOT_TABLE}, not {kind}"))
+    if matches!(value, Value::Map(_)) {
+        return None;
+    }
+    Some(format!(
+        "{TOML_ROOT_TABLE}, not {}",
+        value.kind_with_article()
+    ))
 }
 
 /// The way around an edit the read-back check refuses.

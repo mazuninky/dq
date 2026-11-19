@@ -168,7 +168,10 @@ and is written back as `3.0` / `1e16`, not `3`; an integer past 64 bits or
 a decimal with more digits than an `f64` holds keeps its exact value, which
 `-F hcl` cannot write back (exit 1, see the value model above). Writing
 lays a body out as `hcl::to_string` does: comments, spacing and layout are
-not kept.
+not kept. An HCL file is a body of attributes, so only a map can be written
+as one: `-F hcl` of an array, a string, a number, a boolean or null exits 1
+("an HCL document is a body of attributes, so its root is a map, not an
+array").
 
 Limits: HCL documents carry no spans, so every Terraform diagnostic reports
 line 1; repeated blocks with the same type and labels (`x { a = 1 }` twice)
