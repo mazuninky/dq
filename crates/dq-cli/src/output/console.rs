@@ -63,6 +63,17 @@ fn escape_control(s: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
+/// A number as the console prints it: an integer as its literal, a float
+/// as dq's YAML writer spells it (`3.0`, `1.0e+300`, `1.0e+400`), so `get`
+/// and `-F yaml` agree, as they do on `.nan` — not serde_json's `1e+300`.
+fn number_text(n: &serde_json::Number) -> String {
+    let literal = n.to_string();
+    dq_core::Value::from_number_literal(&literal)
+        .as_ref()
+        .and_then(dq_core::parsers::yaml_float_text)
+        .unwrap_or(literal)
+}
+
 fn write_top(value: &serde_json::Value, w: &mut dyn Write, use_color: bool) -> std::io::Result<()> {
     match value {
         serde_json::Value::Array(items) => {
@@ -105,7 +116,7 @@ fn write_inline(
             }
         }
         serde_json::Value::Bool(b) => write!(w, "{b}"),
-        serde_json::Value::Number(n) => write!(w, "{n}"),
+        serde_json::Value::Number(n) => w.write_all(number_text(n).as_bytes()),
         serde_json::Value::String(s) => {
             let safe = escape_control(s);
             w.write_all(safe.as_bytes())
@@ -160,6 +171,26 @@ mod tests {
         assert_eq!(
             String::from_utf8(buf).unwrap(),
             ".nan\n.inf\n[-.inf]\n{t: .inf, y: .nan}\n1.5\n"
+        );
+    }
+
+    #[test]
+    fn report_value_spells_floats_as_the_yaml_writer_does() {
+        let value = dq_core::Value::Array(vec![
+            dq_core::Value::Float(1e300),
+            dq_core::Value::Float(3.0),
+            dq_core::Value::Float(1e-7),
+            dq_core::Value::BigFloat("1e400".to_owned()),
+            dq_core::Value::BigInt("18446744073709551617".to_owned()),
+            dq_core::Value::Int(7),
+        ]);
+        let mut buf: Vec<u8> = Vec::new();
+        ConsoleReporter::new(false)
+            .report_value(&value, &mut buf)
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "1.0e+300\n3.0\n1.0e-7\n1.0e+400\n18446744073709551617\n7\n"
         );
     }
 

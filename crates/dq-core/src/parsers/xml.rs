@@ -720,7 +720,7 @@ fn write_element(
                 Value::String(s) => s.clone(),
                 Value::Bool(b) => b.to_string(),
                 Value::Int(i) => i.to_string(),
-                Value::Float(f) => f.to_string(),
+                Value::Float(f) => crate::document::shortest_float(*f),
                 Value::BigInt(s) | Value::BigFloat(s) => s.clone(),
                 Value::Null => String::new(),
                 _ => {
@@ -864,7 +864,10 @@ fn write_element(
                 }
                 Value::Float(f) => {
                     let mut tmp = IndexMap::new();
-                    tmp.insert(KEY_TEXT.to_owned(), Value::String(f.to_string()));
+                    tmp.insert(
+                        KEY_TEXT.to_owned(),
+                        Value::String(crate::document::shortest_float(*f)),
+                    );
                     write_element(writer, k, &tmp, child_indent)?;
                 }
                 Value::BigInt(s) | Value::BigFloat(s) => {

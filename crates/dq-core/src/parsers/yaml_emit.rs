@@ -355,6 +355,22 @@ fn emitted_plain(s: &str) -> bool {
     serde_norway::to_string(s).is_ok_and(|out| out.strip_suffix('\n').is_some_and(|text| text == s))
 }
 
+/// The plain scalar dq's YAML writer spells a finite float with — a
+/// [`Value::Float`] or a decimal [`Value::BigFloat`]: ryu's shortest
+/// round-trip digits, an exponent in the YAML 1.1 shape (`3.0`, `123.25`,
+/// `1.0e+300`, `1.5e+20`, `1.0e-7`, `1.0e+400`). `None` for any other
+/// value, a NaN or an infinity included.
+#[must_use]
+pub fn yaml_float_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Float(f) if f.is_finite() => Some(
+            yaml11_exponent_float(*f).unwrap_or_else(|| serde_norway::Number::from(*f).to_string()),
+        ),
+        Value::BigFloat(s) if non_finite_literal(s).is_none() => yaml11_float(s),
+        _ => None,
+    }
+}
+
 /// The respelling of a finite float serde_norway writes in exponent form
 /// that a YAML 1.1 reader takes for a string — no `.` (`1e16`, `-1e-7`) or
 /// an unsigned exponent (`1.5e300`): `1.0e+16`, `-1.0e-7`, `1.5e+300`.

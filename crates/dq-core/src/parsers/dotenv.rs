@@ -105,7 +105,7 @@ impl Format for DotEnv {
                 Value::String(s) => s.clone(),
                 Value::Bool(b) => b.to_string(),
                 Value::Int(n) => n.to_string(),
-                Value::Float(n) => n.to_string(),
+                Value::Float(n) => crate::document::shortest_float(*n),
                 Value::BigInt(s) | Value::BigFloat(s) => s.clone(),
                 Value::Null => String::new(),
                 Value::Array(_) | Value::Map(_) => {

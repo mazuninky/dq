@@ -24,8 +24,9 @@ package dq:plugin@0.1.0;
 //
 // `get-root` / `get-at` return UTF-8 JSON. Map keys keep the document's
 // order. A number past 64 bits or past `f64` is a JSON number literal with
-// its exact value (`18446744073709551616`, `1e+400`); a guest JSON parser
-// without arbitrary precision rounds it. JSON has no NaN or infinity: a
+// its exact value (`18446744073709551616`, `1e400`); a guest JSON parser
+// without arbitrary precision rounds it. A float is spelled shortest, with
+// an exponent past the plain-decimal range (`3.0`, `1e300`, `1e-7`). JSON has no NaN or infinity: a
 // YAML `.nan` / `.inf` / `-.inf` or a TOML `nan` / `inf` / `-inf` arrives as
 // the JSON string `".nan"`, `".inf"` or `"-.inf"` — the same three spellings
 // whatever format the document came from. A plugin that must tell such a

@@ -117,14 +117,14 @@ fn get_query_and_convert_print_each_big_number_exact() {
         (
             "e.yaml",
             "a: 1e400\n".to_owned(),
-            "1e+400",
+            "1.0e+400",
             "1e400",
             "1.0e+400",
         ),
         (
             "ne.yaml",
             "a: -1e400\n".to_owned(),
-            "-1e+400",
+            "-1.0e+400",
             "-1e400",
             "-1.0e+400",
         ),
@@ -185,14 +185,14 @@ ver: 1.2.3.4.5.6.7.8.9.0.1.2.3.4.5.6
         ("/d15", "0.123456789012345"),
         ("/d16fit", "1.234567890123457"),
         ("/e2", "1.5e+99"),
-        ("/e3fit", "1e+308"),
+        ("/e3fit", "1.0e+308"),
         // The smallest subnormal rounds to `4.9e-324` at two digits.
-        ("/sub", "5e-324"),
+        ("/sub", "5.0e-324"),
         // Do not: the literal (the nearest `f64` is 9999999999999.998,
         // infinity and 0.0).
         ("/d16lost", "9999999999999.999"),
         ("/e3past", "1.8e+308"),
-        ("/under", "1e-400"),
+        ("/under", "1.0e-400"),
     ] {
         assert_eq!(
             stdout_of(&dir, &["get", "f.yaml", key]),
@@ -865,10 +865,10 @@ b: !y!int 1234567890123456789012345678901234567890
         )
     );
     for (key, printed, type_name) in [
-        ("/a", "1e+400", "float"),
-        ("/b", "1e+400", "float"),
+        ("/a", "1.0e+400", "float"),
+        ("/b", "1.0e+400", "float"),
         ("/c", int40, "int"),
-        ("/d", "1e+400", "float"),
+        ("/d", "1.0e+400", "float"),
         ("/e", "18446744073709551617.0", "float"),
     ] {
         assert_eq!(

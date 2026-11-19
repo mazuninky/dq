@@ -477,14 +477,49 @@ mod plugins_enabled {
     }
 
     /// A value as the JSON a plugin reads (`get-root`, `get-at`, the
-    /// outputs of `jq::eval`): [`dq_core::Value::to_serde_json`], so a big
-    /// number is a JSON number with its exact value, and a NaN or an
-    /// infinity — which JSON has no number for — is the string `".nan"`,
+    /// outputs of `jq::eval`), compact, through dq-core's JSON writer as
+    /// every JSON output of dq: a big number is a JSON number with its
+    /// exact literal (`1e400`), a float its shortest round-trip spelling
+    /// ([`dq_core::shortest_float`]: `1e300`, `3.0`), and a NaN or an
+    /// infinity — which JSON has no number for — the string `".nan"`,
     /// `".inf"` or `"-.inf"`, whatever format the document came from.
     fn value_json(value: &dq_core::Value) -> Vec<u8> {
-        // Infallible for a `serde_json::Value`; an empty payload beats a
-        // panic mid-invocation if it ever fails.
-        serde_json::to_vec(&value.to_serde_json()).unwrap_or_default()
+        use dq_core::Format as _;
+        let mut opts = dq_core::WriteOptions::default();
+        opts.indent = Some(0);
+        let doc = dq_core::Document::single(non_finite_as_strings(value));
+        let mut out = Vec::new();
+        // Infallible: the tree holds no NaN or infinity and a `Vec` takes
+        // every write; an empty payload beats a panic mid-invocation if it
+        // ever fails.
+        if dq_core::parsers::Json
+            .write_with_options(&doc, &mut out, &opts)
+            .is_err()
+        {
+            return Vec::new();
+        }
+        if out.last() == Some(&b'\n') {
+            out.pop();
+        }
+        out
+    }
+
+    /// `value` with every NaN and infinity replaced by its string spelling
+    /// (`".nan"`, `".inf"`, `"-.inf"`).
+    fn non_finite_as_strings(value: &dq_core::Value) -> dq_core::Value {
+        use dq_core::Value;
+        if let Some(spelled) = value.non_finite_spelling() {
+            return Value::String(spelled.to_owned());
+        }
+        match value {
+            Value::Array(items) => Value::Array(items.iter().map(non_finite_as_strings).collect()),
+            Value::Map(map) => Value::Map(
+                map.iter()
+                    .map(|(k, v)| (k.clone(), non_finite_as_strings(v)))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
     }
 
     /// Returns `true` when `name` identifies a WASI host import the
@@ -711,6 +746,9 @@ mod plugins_enabled {
                     ("y".to_owned(), Value::BigFloat(".NaN".into())),
                     ("i".to_owned(), Value::Float(f64::NEG_INFINITY)),
                     ("b".to_owned(), Value::BigInt("18446744073709551616".into())),
+                    ("e".to_owned(), Value::BigFloat("1e400".into())),
+                    ("f".to_owned(), Value::Float(1e300)),
+                    ("w".to_owned(), Value::Float(3.0)),
                 ]
                 .into_iter()
                 .collect(),
@@ -721,7 +759,11 @@ mod plugins_enabled {
             let text = |bytes: Vec<u8>| String::from_utf8(bytes).expect("utf-8");
             assert_eq!(
                 text(state.get_root()),
-                r#"{"t":".nan","y":".nan","i":"-.inf","b":18446744073709551616}"#
+                r#"{"t":".nan","y":".nan","i":"-.inf","b":18446744073709551616,"e":1e400,"f":1e300,"w":3.0}"#
+            );
+            assert_eq!(
+                state.get_at("/f".into()).map(text).as_deref(),
+                Some("1e300")
             );
             assert_eq!(
                 state.get_at("/t".into()).map(text).as_deref(),

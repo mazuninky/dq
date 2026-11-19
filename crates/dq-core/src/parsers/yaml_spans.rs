@@ -3010,12 +3010,9 @@ fn render_float(f: f64) -> Vec<u8> {
         // whole float with its `.0`, an exponent past the plain-decimal
         // range in the YAML 1.1 shape (`1e300` -> `1.0e+300`, not 301
         // digits).
-        let s = crate::document::shortest_float(f);
-        if s.contains('e') {
-            super::yaml_emit::yaml11_float(&s).unwrap_or(s).into_bytes()
-        } else {
-            s.into_bytes()
-        }
+        super::yaml_emit::yaml_float_text(&Value::Float(f))
+            .unwrap_or_else(|| crate::document::shortest_float(f))
+            .into_bytes()
     }
 }
 

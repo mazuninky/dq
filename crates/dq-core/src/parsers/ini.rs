@@ -166,14 +166,16 @@ impl Format for Ini {
 ///
 /// INI is fundamentally `string → string`; numeric / boolean scalars in the
 /// in-memory tree (typically introduced by callers converting from another
-/// format) are stringified through `Display`. Containers (Map / Array) are
+/// format) are stringified through `Display`, a float as
+/// [`shortest_float`](crate::document::shortest_float) spells it (`3.0`,
+/// `1e300` — not 301 digits). Containers (Map / Array) are
 /// not representable in INI and surface as `Error::Format`.
 fn scalar_to_ini_string(section: &str, key: &str, val: &Value) -> Result<String> {
     match val {
         Value::String(s) => Ok(s.clone()),
         Value::Bool(b) => Ok(b.to_string()),
         Value::Int(n) => Ok(n.to_string()),
-        Value::Float(n) => Ok(n.to_string()),
+        Value::Float(n) => Ok(crate::document::shortest_float(*n)),
         Value::BigInt(s) | Value::BigFloat(s) => Ok(s.clone()),
         Value::Null => Ok(String::new()),
         Value::Array(_) | Value::Map(_) => Err(Error::Format {

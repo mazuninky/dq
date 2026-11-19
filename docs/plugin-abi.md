@@ -221,8 +221,11 @@ and TOML. On formats without textual edits the apply fails.
 
 - Map keys keep the document's order.
 - A number past 64 bits or past `f64` is a JSON number literal with its exact
-  value (`18446744073709551616`, `1e+400`); a guest JSON parser without
+  value (`18446744073709551616`, `1e400`); a guest JSON parser without
   arbitrary precision will round it.
+- A float is its shortest spelling that reads back as the same `f64`, with an
+  exponent outside `[1e-5, 1e16)`: `3.0`, `123.25`, `1e300`, `1e-7` — the
+  way every JSON output of dq spells it.
 - JSON has no NaN or infinity. A YAML `.nan` / `.inf` / `-.inf` or a TOML
   `nan` / `inf` / `-inf` arrives as the JSON **string** `".nan"`, `".inf"` or
   `"-.inf"` — the same three spellings whatever format the document came

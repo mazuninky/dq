@@ -174,7 +174,7 @@ fn write_with_delimiter(
                 Some(Value::String(s)) => cells.push(s.clone()),
                 Some(Value::Bool(b)) => cells.push(b.to_string()),
                 Some(Value::Int(n)) => cells.push(n.to_string()),
-                Some(Value::Float(n)) => cells.push(n.to_string()),
+                Some(Value::Float(n)) => cells.push(crate::document::shortest_float(*n)),
                 Some(Value::BigInt(s)) | Some(Value::BigFloat(s)) => cells.push(s.clone()),
                 Some(Value::Null) => cells.push(String::new()),
                 Some(Value::Array(_) | Value::Map(_)) => {

@@ -244,22 +244,23 @@ fn every_output_format_spells_non_finite_and_big_numbers_one_way() {
     assert_cases(
         &dir,
         &[
-            // Console: a YAML and a TOML NaN alike.
+            // Console: a YAML and a TOML NaN alike; a big float as `-F yaml`
+            // spells it.
             (
                 vec!["get", "n.yaml", ""],
-                ok("x: .nan\nz: -.inf\nb: 18446744073709551616\ne: 1e+400\n"),
+                ok("x: .nan\nz: -.inf\nb: 18446744073709551616\ne: 1.0e+400\n"),
             ),
             (
                 vec!["values", "n.yaml", ""],
-                ok(".nan\n-.inf\n18446744073709551616\n1e+400\n"),
+                ok(".nan\n-.inf\n18446744073709551616\n1.0e+400\n"),
             ),
             (
                 vec!["select", "n.yaml", "$.*"],
-                ok(".nan\n-.inf\n18446744073709551616\n1e+400\n"),
+                ok(".nan\n-.inf\n18446744073709551616\n1.0e+400\n"),
             ),
             (
                 vec!["query", ".[]", "n.yaml"],
-                ok(".nan\n-.inf\n18446744073709551616\n1e+400\n"),
+                ok(".nan\n-.inf\n18446744073709551616\n1.0e+400\n"),
             ),
             (
                 vec!["get", "n.toml", ""],
@@ -582,6 +583,60 @@ fn toml_and_textual_edits_spell_a_float_without_a_digit_run() {
                 ok("a = 1.5e20 # kept\n"),
             ),
             (vec!["set", "s.json", "/a", "1e-7"], ok("{\"a\": 1e-7}\n")),
+        ],
+    );
+}
+
+const SOME_FLOATS_YAML: &str = "a: 1e300\nb: -1e-300\nc: 1.5e20\nd: 123.25\ne: 3.0\nf: 1e-7\n";
+
+/// The console printed serde_json's `1e+300`, `-F yaml` `1.0e+300`; the
+/// line-oriented writers and XML printed 301 digits (and `3` for `3.0`).
+/// Now the console spells a float as the YAML writer does, every other
+/// writer as `-F json` does.
+#[test]
+fn the_console_and_every_writer_spell_a_float_without_a_digit_run() {
+    let dir = dir_with(&[
+        ("v.yaml", SOME_FLOATS_YAML),
+        ("i.yaml", "s:\n  a: 1e300\n  e: 3.0\n"),
+        ("rows.yaml", "- {a: 1e300, b: 1.5e20, e: 3.0}\n"),
+        ("x.yaml", "r:\n- \"@attrs\": {a: 1e300}\n  y: [3.0, 1e-7]\n"),
+    ]);
+    let yaml_spelled = "a: 1.0e+300\nb: -1.0e-300\nc: 1.5e+20\nd: 123.25\ne: 3.0\nf: 1.0e-7\n";
+    assert_cases(
+        &dir,
+        &[
+            (vec!["get", "v.yaml", "/a"], ok("1.0e+300\n")),
+            (vec!["get", "v.yaml", ""], ok(yaml_spelled)),
+            (
+                vec!["-q", "convert", "v.yaml", "-F", "yaml"],
+                ok(yaml_spelled),
+            ),
+            (
+                vec!["values", "v.yaml", ""],
+                ok("1.0e+300\n-1.0e-300\n1.5e+20\n123.25\n3.0\n1.0e-7\n"),
+            ),
+            (vec!["select", "v.yaml", "$.c"], ok("1.5e+20\n")),
+            (vec!["query", ".f, .e", "v.yaml"], ok("1.0e-7\n3.0\n")),
+            (
+                vec!["-q", "convert", "v.yaml", "-F", "dot-env"],
+                ok("a=1e300\nb=-1e-300\nc=1.5e20\nd=123.25\ne=3.0\nf=1e-7\n"),
+            ),
+            (
+                vec!["-q", "convert", "i.yaml", "-F", "ini"],
+                ok("[s]\na=1e300\ne=3.0\n"),
+            ),
+            (
+                vec!["-q", "convert", "rows.yaml", "-F", "csv"],
+                ok("a,b,e\n1e300,1.5e20,3.0\n"),
+            ),
+            (
+                vec!["-q", "convert", "rows.yaml", "-F", "tsv"],
+                ok("a\tb\te\n1e300\t1.5e20\t3.0\n"),
+            ),
+            (
+                vec!["-q", "convert", "x.yaml", "-F", "xml"],
+                ok("<r a=\"1e300\">\n  <y>3.0</y>\n  <y>1e-7</y>\n</r>"),
+            ),
         ],
     );
 }
