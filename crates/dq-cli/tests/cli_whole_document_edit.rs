@@ -2253,3 +2253,121 @@ fn json_with_a_byte_order_mark_is_read_and_edited_keeping_it() {
         );
     }
 }
+
+/// A document inserted before one that directives lead into goes before
+/// the directives, ended by `...`: the directives stay with their
+/// document, byte for byte.
+#[test]
+fn patch_add_of_a_stream_document_keeps_directives_with_their_document() {
+    check(&[
+        Case {
+            name: "s.yaml",
+            src: "%TAG !e! tag:example.com,2000:\n---\na: !e!x 1\n---\nb: 2\n",
+            args: &[
+                "patch",
+                "s.yaml",
+                r#"[{"op":"add","path":"/0","value":{"x":1}}]"#,
+            ],
+            want: "---\nx: 1\n...\n%TAG !e! tag:example.com,2000:\n---\na: !e!x 1\n---\nb: 2\n",
+            reads: json!([{"x": 1}, {"a": 1}, {"b": 2}]),
+        },
+        Case {
+            name: "s.yaml",
+            src: "# top\r\n%YAML 1.2\r\n---\r\na: 1\r\n---\r\nb: 2\r\n",
+            args: &[
+                "patch",
+                "s.yaml",
+                r#"[{"op":"add","path":"/0","value":{"x":1}}]"#,
+            ],
+            want: "# top\r\n---\r\nx: 1\r\n...\r\n%YAML 1.2\r\n---\r\na: 1\r\n---\r\nb: 2\r\n",
+            reads: json!([{"x": 1}, {"a": 1}, {"b": 2}]),
+        },
+        Case {
+            name: "s.yaml",
+            src: "a: 1\n...\n%TAG !e! tag:example.com,2000:\n---\nb: !e!x 2\n",
+            args: &[
+                "patch",
+                "s.yaml",
+                r#"[{"op":"add","path":"/1","value":{"x":1}}]"#,
+            ],
+            want: "a: 1\n...\n---\nx: 1\n...\n%TAG !e! tag:example.com,2000:\n---\nb: !e!x 2\n",
+            reads: json!([{"a": 1}, {"x": 1}, {"b": 2}]),
+        },
+    ]);
+}
+
+/// An insert into an anchored array is seen through its aliases, as a
+/// `set` there is; under the alias it is refused as `set` is.
+#[test]
+fn patch_add_into_an_anchored_array_shows_through_its_aliases() {
+    check(&[
+        Case {
+            name: "s.yaml",
+            src: "a: &q [1] # kept\nb: *q\n",
+            args: &[
+                "patch",
+                "s.yaml",
+                r#"[{"op":"add","path":"/a/0","value":9}]"#,
+            ],
+            want: "a: &q [9, 1] # kept\nb: *q\n",
+            reads: json!({"a": [9, 1], "b": [9, 1]}),
+        },
+        Case {
+            name: "s.yaml",
+            src: "x: &r\n  a:\n    - 1\ny: *r\n",
+            args: &[
+                "patch",
+                "s.yaml",
+                r#"[{"op":"add","path":"/x/a/-","value":{"k":2}}]"#,
+            ],
+            want: "x: &r\n  a:\n    - 1\n    - {k: 2}\ny: *r\n",
+            reads: json!({"x": {"a": [1, {"k": 2}]}, "y": {"a": [1, {"k": 2}]}}),
+        },
+    ]);
+    let stderr = refused(
+        "s.yaml",
+        "a: &q [1]\nb: *q\n",
+        &[
+            "-i",
+            "patch",
+            "s.yaml",
+            r#"[{"op":"add","path":"/b/0","value":9}]"#,
+        ],
+        7,
+    );
+    assert!(
+        stderr.contains("it lies under the alias on line 2, a copy of /a"),
+        "{stderr}"
+    );
+}
+
+/// An insert before the first item of a compact sequence (`- - 1`) puts
+/// the new item on that line and moves the old one to the next, at its
+/// column, comments kept.
+#[test]
+fn patch_add_before_a_compact_first_item_inserts() {
+    check(&[
+        Case {
+            name: "s.yaml",
+            src: "a:\n  - - 1 # one\n    - 2\n  - 3\n",
+            args: &[
+                "patch",
+                "s.yaml",
+                r#"[{"op":"add","path":"/a/0/0","value":9}]"#,
+            ],
+            want: "a:\n  - - 9\n    - 1 # one\n    - 2\n  - 3\n",
+            reads: json!({"a": [[9, 1, 2], 3]}),
+        },
+        Case {
+            name: "s.yaml",
+            src: "- - k: 1\r\n    j: 2\r\n",
+            args: &[
+                "patch",
+                "s.yaml",
+                r#"[{"op":"add","path":"/0/0","value":[5, 6]}]"#,
+            ],
+            want: "- - [5, 6]\r\n  - k: 1\r\n    j: 2\r\n",
+            reads: json!([[[5, 6], {"k": 1, "j": 2}]]),
+        },
+    ]);
+}

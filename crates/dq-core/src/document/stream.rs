@@ -279,7 +279,13 @@ impl Document {
                     document = emitted;
                     document.extend_from_slice(b"---\n");
                 }
-                first.line_start.max(super::bom_end(bytes))
+                // Directives (`%YAML`, `%TAG`) belong to the document they
+                // lead into: the new one goes before them.
+                let start = super::bom_end(bytes);
+                lines_from(bytes, start)
+                    .take_while(|&line| line < first.line_start)
+                    .find(|&line| bytes[line] == b'%')
+                    .unwrap_or(first.line_start.max(start))
             }
             Some(before) => {
                 let next = extents
@@ -305,6 +311,11 @@ impl Document {
             if matches!(bytes.get(at), Some(b'\n' | b'\r')) {
                 document.pop();
             }
+        }
+        // A document that directives follow ends with `...`: YAML takes
+        // no directive before that marker once a document has begun.
+        if directives_follow(bytes, at) {
+            document.extend_from_slice(b"...\n");
         }
         let bytes = self.splice(at..at, false, &document);
         expected.insert(index, value);
@@ -465,6 +476,26 @@ fn read_back(
         }
     }
     Ok(reparsed)
+}
+
+/// The starts of the lines of `bytes` from `at`, a line start, on.
+fn lines_from(bytes: &[u8], at: usize) -> impl Iterator<Item = usize> + '_ {
+    std::iter::successors(Some(at), move |&line| {
+        bytes[line..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|newline| line + newline + 1)
+    })
+    .take_while(move |&line| line < bytes.len())
+}
+
+/// Whether the first line from `at`, a line start, that is neither blank
+/// nor a comment is a directive (`%YAML`, `%TAG`).
+fn directives_follow(bytes: &[u8], at: usize) -> bool {
+    lines_from(bytes, at)
+        .map(|line| bytes[line..].trim_ascii_start())
+        .find(|rest| !rest.is_empty() && !rest.starts_with(b"#"))
+        .is_some_and(|rest| rest.starts_with(b"%"))
 }
 
 #[cfg(test)]

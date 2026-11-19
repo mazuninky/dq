@@ -149,8 +149,16 @@ impl Document {
             };
             (at, text.into_bytes())
         });
-        self.splice_placeholder(splice, parent, index, placeholder.clone())
-            .map_err(|()| cannot())?;
+        if self
+            .splice_placeholder(splice, parent, index, placeholder.clone())
+            .is_err()
+        {
+            // An array under an alias is the anchored node's: its bytes,
+            // and the place to edit, are there.
+            return Err(self
+                .through_alias(&item, &LayoutCache::new(), "insert")
+                .unwrap_or_else(cannot));
+        }
         if value.same_data(&placeholder) && !matches!(placeholder, Value::Int(_)) {
             return Ok(());
         }
@@ -168,23 +176,44 @@ impl Document {
     ) -> std::result::Result<(), ()> {
         let (at, text) = splice.ok_or(())?;
         let text = with_line_ending_at(&self.original_bytes, at, text);
-        let mut expected = self.value.clone();
-        match value_mut(&mut expected, parent) {
-            Some(Value::Array(items)) => items.insert(index, placeholder),
-            _ => return Err(()),
-        }
+        // The edited node is the array: an alias of the item at `index`
+        // keeps naming that item, now one further on.
+        let insert = |tree: &mut Value, array: &Pointer| -> Result<()> {
+            match value_mut(tree, array) {
+                Some(Value::Array(items)) if index <= items.len() => {
+                    items.insert(index, placeholder.clone());
+                    Ok(())
+                }
+                _ => Err(Error::WriteUnavailable {
+                    reason: "no array to insert into".to_owned(),
+                }),
+            }
+        };
         let mut bytes = self.original_bytes.clone();
         bytes.splice(at..at, text);
-        match parse_again(self.format, &bytes) {
-            Some(Ok(fresh)) if first_difference(&expected, &fresh.value, "").is_none() => {
-                self.original_bytes = bytes;
-                self.value = fresh.value;
-                self.spans = fresh.spans;
-                self.provenance = fresh.provenance;
-                Ok(())
-            }
-            _ => Err(()),
+        let Some(Ok(fresh)) = parse_again(self.format, &bytes) else {
+            return Err(());
+        };
+        // The edit alone first; in YAML with aliases, also under every
+        // alias of an anchored node at or above the array, which shares
+        // the new item — as `set_at` expects it.
+        let reads_back = |aliases: Option<&LayoutCache>| {
+            self.expected_after_edit(parent, aliases, &insert)
+                .is_some_and(|tree| first_difference(&tree, &fresh.value, "").is_none())
+        };
+        let layout = LayoutCache::new();
+        let fits = reads_back(None)
+            || (self.format == FormatTag::Yaml
+                && self.original_bytes.contains(&b'*')
+                && reads_back(Some(&layout)));
+        if !fits {
+            return Err(());
         }
+        self.original_bytes = bytes;
+        self.value = fresh.value;
+        self.spans = fresh.spans;
+        self.provenance = fresh.provenance;
+        Ok(())
     }
 
     /// Where a new item of the YAML array at `parent` goes, and its text.
@@ -208,10 +237,13 @@ impl Document {
         if index < len {
             let entry = entry(index)?;
             let start = line_start(bytes, entry.at);
-            if !entry.owns_line || bytes[start..entry.at].iter().any(|&b| b != b' ') {
-                return None;
-            }
             let column = entry.at - start;
+            if !entry.owns_line || bytes[start..entry.at].iter().any(|&b| b != b' ') {
+                // The first item of a compact sequence (`- - 1`) shares its
+                // line with what holds it: the new item takes its place
+                // there, and it moves to the next line, at its column.
+                return Some((entry.at, format!("- {PLACEHOLDER}\n{}", " ".repeat(column))));
+            }
             // The comment lines right above an item lead into it.
             let at = if index == 0 {
                 start
@@ -539,6 +571,32 @@ mod tests {
     fn inserts_a_document_into_a_stream() {
         let got = inserted("yaml", "a: 1\n---\nb: 2\n", "/1", Value::Int(9)).unwrap();
         assert_eq!(got, "a: 1\n---\n9\n---\nb: 2\n");
+        // Before a document's directives, ended by `...`.
+        let got = inserted(
+            "yaml",
+            "%YAML 1.2\n---\na: 1\n---\nb\n",
+            "/0",
+            Value::Int(9),
+        )
+        .unwrap();
+        assert_eq!(got, "---\n9\n...\n%YAML 1.2\n---\na: 1\n---\nb\n");
+    }
+
+    #[test]
+    fn inserts_into_an_anchored_array_and_before_a_compact_first_item() {
+        let got = inserted("yaml", "a: &q [1]\nb: *q\n", "/a/0", Value::Int(9)).unwrap();
+        assert_eq!(got, "a: &q [9, 1]\nb: *q\n");
+        let got = inserted("yaml", "- - 1\n  - 2\n", "/0/0", Value::Int(9)).unwrap();
+        assert_eq!(got, "- - 9\n  - 1\n  - 2\n");
+    }
+
+    #[test]
+    fn refuses_under_an_alias_naming_it() {
+        let err = inserted("yaml", "a: &q [1]\nb: *q\n", "/b/0", Value::Int(9)).unwrap_err();
+        assert!(
+            matches!(&err, Error::EditRejected { reason, .. } if reason.contains("alias on line 2")),
+            "{err:?}"
+        );
     }
 
     #[test]
