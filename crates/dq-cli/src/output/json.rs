@@ -2,6 +2,8 @@
 
 use std::io::Write;
 
+use dq_core::Format;
+
 use super::Reporter;
 
 /// Pretty-printed JSON reporter (two-space indent, trailing newline).
@@ -15,11 +17,16 @@ impl Reporter for JsonReporter {
         Ok(())
     }
 
-    /// JSON has no NaN or infinity: fail as `convert -F json` does
-    /// rather than print one as a string.
+    /// Writes through `dq-core`'s JSON writer, as `convert -F json` and
+    /// the JSONL reporter do, so a number is spelled one way on every JSON
+    /// output: a big number as dq holds its literal (`1e400`, not
+    /// serde_json's `1e+400`), an `f64` as the writer spells it. JSON has
+    /// no NaN or infinity: fail as `convert -F json` does rather than
+    /// print one as a string.
     fn report_value(&self, value: &dq_core::Value, w: &mut dyn Write) -> anyhow::Result<()> {
         dq_core::parsers::json::ensure_finite(value)?;
-        self.report(&value.to_serde_json(), w)
+        dq_core::parsers::Json.write(&dq_core::Document::single(value.clone()), w)?;
+        Ok(())
     }
 }
 

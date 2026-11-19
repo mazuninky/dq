@@ -82,7 +82,9 @@ fn compile_json(
         return Err(external_ref_error(rule_id, uri));
     }
     // Offline: see `schema_value::options`.
-    let built = crate::schema_value::options().build(schema_json);
+    // A `multipleOf` the meta-schema would read as 0 gets a stand-in.
+    let built = crate::schema_value::options()
+        .build(&crate::schema_value::stand_in_tiny_divisors(schema_json));
     // A `$schema` naming a meta-schema the validator does not bundle is
     // an external reference too. jsonschema ≤ 0.34 tried to retrieve it
     // while building the registry and failed the compile; 0.61 with an

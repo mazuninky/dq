@@ -451,3 +451,63 @@ fn a_select_filter_literal_past_i64_is_exit_1() {
         );
     }
 }
+
+#[test]
+fn json_and_jsonl_spell_a_big_number_as_dq_holds_it() {
+    let dir = dir_with(&[(
+        "n.yaml",
+        "e: 1e400\nu: 1.0E+400\nb: 18446744073709551617\nf: 1.5\n",
+    )]);
+    assert_cases(
+        &dir,
+        &[
+            (
+                vec!["query", ".e, .u, .b, .f", "n.yaml", "-F", "json"],
+                ok("[\n  1e400,\n  1.0E+400,\n  18446744073709551617,\n  1.5\n]\n"),
+            ),
+            (
+                vec!["query", ".e, .u, .b, .f", "n.yaml", "-F", "jsonl"],
+                ok("1e400\n1.0E+400\n18446744073709551617\n1.5\n"),
+            ),
+            (
+                vec!["convert", "n.yaml", "-F", "jsonl"],
+                ok("{\"e\":1e400,\"u\":1.0E+400,\"b\":18446744073709551617,\"f\":1.5}\n"),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn hcl_keeps_integers_past_64_bits_exact() {
+    let dir = dir_with(&[(
+        "m.tf",
+        "x = 18446744073709551617\nn = -9223372036854775809\nu = 18446744073709551615\n",
+    )]);
+    assert_cases(
+        &dir,
+        &[
+            (vec!["get", "m.tf", "/x"], ok("18446744073709551617\n")),
+            (vec!["get", "m.tf", "/n"], ok("-9223372036854775809\n")),
+            (
+                vec!["query", ".x == 18446744073709551616", "m.tf"],
+                ok("false\n"),
+            ),
+            (
+                vec!["convert", "m.tf", "-F", "json"],
+                ok(
+                    "{\n  \"x\": 18446744073709551617,\n  \"n\": -9223372036854775809,\n  \
+                    \"u\": 18446744073709551615\n}\n",
+                ),
+            ),
+            (
+                vec!["convert", "m.tf", "-F", "hcl"],
+                (
+                    1,
+                    "",
+                    "hcl format error: HCL cannot represent arbitrary-precision number \
+                     18446744073709551617\n",
+                ),
+            ),
+        ],
+    );
+}

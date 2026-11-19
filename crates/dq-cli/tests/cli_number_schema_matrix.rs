@@ -281,16 +281,11 @@ fn every_bound_compares_a_big_limit_exactly_at_its_edge() {
 }
 
 #[test]
-fn multiple_of_refuses_non_finite_and_past_f64_numbers() {
+fn multiple_of_refuses_non_finite_numbers_and_divides_big_ones_exactly() {
     use Some as Fails;
     let mut cases = Vec::new();
     for divisor in ["2", "0.5"] {
-        for (x, spelled) in [
-            (".nan", ".nan"),
-            (".inf", ".inf"),
-            ("-.inf", "-.inf"),
-            ("1e400", "1e+400"),
-        ] {
+        for (x, spelled) in [(".nan", ".nan"), (".inf", ".inf"), ("-.inf", "-.inf")] {
             cases.push((
                 divisor,
                 x,
@@ -299,6 +294,8 @@ fn multiple_of_refuses_non_finite_and_past_f64_numbers() {
         }
         cases.push((divisor, "4", None));
         cases.push((divisor, "18446744073709551616", None));
+        // 10^400 is whole and even: x / d is an integer.
+        cases.push((divisor, "1e400", None));
         cases.push((
             divisor,
             "0.3",
@@ -856,7 +853,7 @@ fn a_message_template_spells_nested_non_finite_and_big_numbers() {
 }
 
 #[test]
-fn a_composite_extract_item_whose_value_is_nan_is_malformed() {
+fn a_composite_extract_item_whose_value_is_nan_is_malformed_and_says_why() {
     let rule = "id: t.comp\ndescription: x\nseverity: error\nmatch: { format: yaml }\n\
                 check:\n  extract: '[{value: .x, format: \"yaml\", anchor: \"/x\"}]'\n  \
                 message: m\n  nested:\n    id: t.inner\n    description: y\n    \
@@ -874,7 +871,7 @@ fn a_composite_extract_item_whose_value_is_nan_is_malformed() {
         messages_in(dir.path(), &check("nan.yaml")),
         (
             4,
-            vec!["composite extract item missing field `value`".to_owned()]
+            vec!["composite extract item field `value` must be a string, got a number".to_owned()]
         )
     );
     assert_eq!(
@@ -958,4 +955,94 @@ fn dq_test_hands_markdown_hcl_and_dockerfile_values_to_the_rule() {
             "{stdout}"
         );
     }
+}
+
+#[test]
+fn multiple_of_spells_a_big_divisor_as_the_schema_does() {
+    use Some as Fails;
+    assert_schema_cases(&[(
+        "{multipleOf: 18446744073709551616}",
+        "4",
+        Fails("/properties/x/multipleOf: 4 is not a multiple of 18446744073709551616"),
+    )]);
+}
+
+#[test]
+fn multiple_of_a_divisor_past_f64_holds_no_finite_number_but_zero() {
+    use Some as Fails;
+    assert_schema_cases(&[
+        ("{multipleOf: 1e400}", "0", None),
+        (
+            "{multipleOf: 1e400}",
+            "4",
+            Fails("/properties/x/multipleOf: 4 is not a multiple of 1e+400"),
+        ),
+        (
+            "{multipleOf: 1e400}",
+            "18446744073709551616",
+            Fails("/properties/x/multipleOf: 18446744073709551616 is not a multiple of 1e+400"),
+        ),
+    ]);
+}
+
+#[test]
+fn multiple_of_a_divisor_below_f64_compiles_and_divides_exactly() {
+    use Some as Fails;
+    assert_schema_cases(&[
+        ("{multipleOf: 1e-400}", "2e-400", None),
+        ("{multipleOf: 1e-400}", "0.3", None),
+        (
+            "{multipleOf: 1e-400}",
+            "1.5e-400",
+            Fails("/properties/x/multipleOf: 1.5e-400 is not a multiple of 1e-400"),
+        ),
+        ("{multipleOf: 0.1}", "0.3", None),
+    ]);
+}
+
+#[test]
+fn a_schema_file_multiple_of_past_f64_divides_exactly() {
+    let rule = "id: t.file\ndescription: x\nseverity: error\nmatch: { format: yaml }\n\
+                check:\n  schema_file: s.json\n";
+    let schema =
+        r#"{"properties": {"big": {"multipleOf": 1e400}, "tiny": {"multipleOf": 1e-400}}}"#;
+    let dir = dir_with(&[
+        ("rule.yml", rule),
+        ("s.json", schema),
+        ("ok.yaml", "big: 0\ntiny: 3e-400\n"),
+        ("bad.yaml", "big: 4\ntiny: 2.5e-400\n"),
+    ]);
+    let check = |file| vec!["check", "--rule", "rule.yml", file];
+    assert_eq!(messages_in(dir.path(), &check("ok.yaml")), (0, Vec::new()));
+    assert_eq!(
+        messages_in(dir.path(), &check("bad.yaml")),
+        (
+            4,
+            vec![
+                "/properties/big/multipleOf: 4 is not a multiple of 1e+400".to_owned(),
+                "/properties/tiny/multipleOf: 2.5e-400 is not a multiple of 1e-400".to_owned(),
+            ]
+        )
+    );
+}
+
+#[test]
+fn dq_test_reads_yaml_and_json_inputs_as_check_does() {
+    let rule = "id: t.nan\ndescription: x\nseverity: error\nmatch: { format: [yaml, json] }\n\
+                check:\n  jq: 'select((.x | isnan) or .b == 18446744073709551617) | .b'\n  \
+                message: 'b is {{ . }}'\n";
+    let cases = "tests:\n  - name: yaml nan\n    input: |\n      x: .nan\n      b: 1\n    \
+                 expected:\n      violations:\n        - rule: t.nan\n          \
+                 message_contains: \"b is 1\"\n  - name: json big\n    format: json\n    \
+                 input: '{\"x\": 1, \"b\": 18446744073709551617}'\n    expected:\n      \
+                 violations:\n        - rule: t.nan\n          \
+                 message_contains: \"b is 18446744073709551617\"\n  - name: finite\n    \
+                 input: |\n      x: 1\n      b: 2\n    expected:\n      violations: []\n";
+    let dir = dir_with(&[("r/nan.yml", rule), ("r/nan.test.yml", cases)]);
+    let (code, stdout, stderr) = run_in(dir.path(), &["test", "r"]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(
+        stdout.ends_with("summary: 3 passed, 0 failed, 0 errored, 3 total\n"),
+        "{stdout}"
+    );
 }

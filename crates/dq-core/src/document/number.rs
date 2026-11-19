@@ -106,6 +106,19 @@ enum Exponent {
     Big(bool, String),
 }
 
+impl Exponent {
+    /// The exponent as a whole number of any size.
+    fn whole(&self) -> BigWhole {
+        match self {
+            Self::Small(n) => BigWhole::of_i128(*n),
+            Self::Big(negative, digits) => BigWhole {
+                negative: *negative,
+                digits: digits.clone(),
+            },
+        }
+    }
+}
+
 impl<'a> Normal<'a> {
     fn of(parts: &DecimalParts<'a>) -> Self {
         let frac = parts.frac.unwrap_or("");
@@ -304,6 +317,132 @@ pub(crate) fn compare_decimal(a: &str, b: &str) -> Option<Ordering> {
     })
 }
 
+/// Whether the decimal literal `x` is a whole multiple of the decimal
+/// literal `d`, by their exact values and at any size: `x / d` is an
+/// integer. `0.3` is a multiple of `0.1`, `18446744073709551616` of `2`,
+/// `4` not of `1e400` — of which only `0` is, among finite numbers.
+/// `None` when either is not a decimal literal or `d` is zero.
+pub(crate) fn decimal_is_multiple(x: &str, d: &str) -> Option<bool> {
+    let (x, d) = (DecimalParts::parse(x)?, DecimalParts::parse(d)?);
+    let (x, d) = (Normal::of(&x), Normal::of(&d));
+    if d.len == 0 {
+        return None;
+    }
+    if x.len == 0 {
+        return Some(true);
+    }
+    // x = X·10^ex and d = D·10^ed with X, D whole: x / d = X·10^k / D for
+    // k = ex - ed.
+    let (big_x, big_d) = (whole_digits(&x), whole_digits(&d));
+    let k = x.exponent.whole().minus(&d.exponent.whole());
+    // Too long for a `usize` is past every literal's length.
+    let steps = k.digits.parse::<usize>().unwrap_or(usize::MAX);
+    if k.negative {
+        // D·10^|k| must divide X, which is below 10^(its length).
+        if steps >= big_x.len() {
+            return Some(false);
+        }
+        let divisor = format!("{big_d}{}", "0".repeat(steps));
+        return Some(remainder(&big_x, &divisor) == "0");
+    }
+    // D divides X·10^k iff D / gcd(D, 10^k) divides X; each power of ten
+    // takes one 2 and one 5 out of D, while it has them.
+    let mut rest = big_d;
+    for _ in 0..steps {
+        let last = rest.as_bytes().last().map_or(0, |b| b - b'0');
+        rest = match (last % 2 == 0, last % 5 == 0) {
+            (true, true) => divide_small(&rest, 10),
+            (true, false) => divide_small(&rest, 2),
+            (false, true) => divide_small(&rest, 5),
+            (false, false) => break,
+        };
+    }
+    Some(remainder(&big_x, &rest) == "0")
+}
+
+/// A nonzero [`Normal`]'s significant digits, as a whole number.
+fn whole_digits(normal: &Normal<'_>) -> String {
+    normal.digits().map(char::from).collect()
+}
+
+/// `a mod m` for whole numbers in decimal without leading zeros, `m`
+/// nonzero.
+fn remainder(a: &str, m: &str) -> String {
+    let mut rest = String::from("0");
+    for digit in a.chars() {
+        if rest == "0" {
+            rest.clear();
+        }
+        rest.push(digit);
+        while compare_whole(&rest, m) != Ordering::Less {
+            rest = subtract_whole(&rest, m);
+        }
+    }
+    rest
+}
+
+/// `a / divisor` for a whole number in decimal that `divisor` divides.
+fn divide_small(a: &str, divisor: u8) -> String {
+    let mut out = String::with_capacity(a.len());
+    let mut carry = 0u8;
+    for digit in a.bytes() {
+        let current = carry * 10 + (digit - b'0');
+        let quotient = current / divisor;
+        carry = current % divisor;
+        if !(out.is_empty() && quotient == 0) {
+            out.push(char::from(b'0' + quotient));
+        }
+    }
+    if out.is_empty() {
+        out.push('0');
+    }
+    out
+}
+
+/// How two whole numbers in decimal without leading zeros order.
+fn compare_whole(a: &str, b: &str) -> Ordering {
+    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+}
+
+/// `a + b` for whole numbers in decimal without leading zeros.
+fn add_whole(a: &str, b: &str) -> String {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut out = Vec::with_capacity(a.len().max(b.len()) + 1);
+    let mut carry = 0u8;
+    for i in 0..a.len().max(b.len()) {
+        let digit = |n: &[u8]| n.len().checked_sub(i + 1).map_or(0, |at| n[at] - b'0');
+        let sum = digit(a) + digit(b) + carry;
+        out.push(sum % 10);
+        carry = sum / 10;
+    }
+    if carry > 0 {
+        out.push(carry);
+    }
+    out.iter().rev().map(|d| char::from(b'0' + d)).collect()
+}
+
+/// `a - b` for whole numbers in decimal without leading zeros, `a >= b`.
+fn subtract_whole(a: &str, b: &str) -> String {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut out = Vec::with_capacity(a.len());
+    let mut borrow = 0u8;
+    for i in 0..a.len() {
+        let top = a[a.len() - 1 - i] - b'0';
+        let bottom = b.len().checked_sub(i + 1).map_or(0, |at| b[at] - b'0') + borrow;
+        if top >= bottom {
+            out.push(top - bottom);
+            borrow = 0;
+        } else {
+            out.push(top + 10 - bottom);
+            borrow = 1;
+        }
+    }
+    while out.len() > 1 && out.last() == Some(&0) {
+        out.pop();
+    }
+    out.iter().rev().map(|d| char::from(b'0' + d)).collect()
+}
+
 /// A signed whole number of any size: sign and digits without leading
 /// zeros (`0` is `false`, `"0"`).
 #[derive(Debug, PartialEq, Eq)]
@@ -317,6 +456,36 @@ impl BigWhole {
         Self {
             negative: n < 0,
             digits: n.unsigned_abs().to_string(),
+        }
+    }
+
+    /// `self - other`.
+    fn minus(&self, other: &Self) -> Self {
+        // self + (-other): one sign adds magnitudes, two subtract the
+        // smaller from the larger, which keeps its sign.
+        let negated = !other.negative && other.digits != "0";
+        if self.negative == negated || self.digits == "0" || other.digits == "0" {
+            let digits = add_whole(&self.digits, &other.digits);
+            let negative = if self.digits == "0" {
+                negated
+            } else {
+                self.negative
+            };
+            return Self {
+                negative: negative && digits != "0",
+                digits,
+            };
+        }
+        match compare_whole(&self.digits, &other.digits) {
+            Ordering::Equal => Self::of_i128(0),
+            Ordering::Greater => Self {
+                negative: self.negative,
+                digits: subtract_whole(&self.digits, &other.digits),
+            },
+            Ordering::Less => Self {
+                negative: negated,
+                digits: subtract_whole(&other.digits, &self.digits),
+            },
         }
     }
 
@@ -572,6 +741,58 @@ mod tests {
             assert_eq!(compare_decimal(b, a), Some(order.reverse()), "{b} vs {a}");
         }
         assert_eq!(compare_decimal("x", "1"), None);
+    }
+
+    #[test]
+    fn decimal_is_multiple_divides_exact_values_of_any_size() {
+        for (x, d) in [
+            ("0", "1e400"),
+            ("0.3", "0.1"),
+            ("18446744073709551616", "2"),
+            ("18446744073709551616", "18446744073709551616"),
+            ("-36893488147419103232", "18446744073709551616"),
+            ("3e400", "3e399"),
+            ("1e400", "1e-400"),
+            ("1e99999999999999999999999999999999999999999", "5e3"),
+            ("2e-400", "1e-400"),
+            ("12.5", "2.5"),
+            ("1000", "8"),
+            ("1", "1e-99999999999999999999999999999999999999999"),
+        ] {
+            assert_eq!(decimal_is_multiple(x, d), Some(true), "{x} by {d}");
+        }
+        for (x, d) in [
+            ("4", "1e400"),
+            ("18446744073709551616", "1e400"),
+            ("18446744073709551617", "2"),
+            ("0.1", "0.3"),
+            ("1e400", "3"),
+            ("1e-400", "2e-400"),
+            ("1", "3e-99999999999999999999999999999999999999999"),
+            ("1e-99999999999999999999999999999999999999999", "1"),
+            ("100", "16"),
+        ] {
+            assert_eq!(decimal_is_multiple(x, d), Some(false), "{x} by {d}");
+        }
+        assert_eq!(decimal_is_multiple("1", "0.0"), None);
+        assert_eq!(decimal_is_multiple("x", "1"), None);
+    }
+
+    #[test]
+    fn whole_arithmetic_carries_and_borrows() {
+        assert_eq!(add_whole("999", "1"), "1000");
+        assert_eq!(subtract_whole("1000", "1"), "999");
+        assert_eq!(remainder("1000", "7"), "6");
+        assert_eq!(divide_small("1000", 8), "125");
+        let big = |negative: bool, digits: &str| BigWhole {
+            negative,
+            digits: digits.to_owned(),
+        };
+        assert_eq!(big(false, "5").minus(&big(false, "7")), big(true, "2"));
+        assert_eq!(big(true, "5").minus(&big(true, "7")), big(false, "2"));
+        assert_eq!(big(true, "5").minus(&big(false, "7")), big(true, "12"));
+        assert_eq!(big(false, "0").minus(&big(false, "7")), big(true, "7"));
+        assert_eq!(big(false, "7").minus(&big(false, "7")), big(false, "0"));
     }
 
     #[test]

@@ -21,9 +21,12 @@
 //!   finite limit on its side (`.inf` fails every maximum and meets every
 //!   minimum), and a NaN, unordered as every IEEE comparison with one is
 //!   false, fails every bound;
-//! - `multipleOf` computes in `f64`, as jsonschema does: it fails on a
-//!   NaN, an infinity and a number past the `f64` range (`1e400`), and
-//!   reads any other number, and the divisor, as the `f64` nearest it;
+//! - `multipleOf` holds when the instance divided by the divisor is an
+//!   integer, by their exact values ([`dq_core::Value::is_multiple_of`]):
+//!   `0.3` is a multiple of `0.1`, of `1e400` only `0` is among finite
+//!   numbers, and a divisor too small for an `f64` (`1e-400`) compiles
+//!   ([`stand_in_tiny_divisors`]); a NaN and an infinity are multiples of
+//!   nothing;
 //! - `enum` and `const` compare numbers by their exact value
 //!   ([`dq_core::Value::same_number`]: `1` is `1.0`, a 40-digit integer is
 //!   only itself); an infinity equals only the infinity of its sign (which
@@ -455,43 +458,143 @@ impl<'i> jsonschema::Keyword<'i, DqJson> for Bound {
     }
 }
 
-/// `multipleOf` around jsonschema's own, which computes in `f64` and so
-/// came out true for a NaN, an infinity and a number past the `f64` range
-/// (`.nan` a multiple of `0.5`). Those fail; every other number gets
-/// jsonschema's answer and message.
+/// `multipleOf` in place of jsonschema's own, which computes in `f64`:
+/// it found `.nan` a multiple of `0.5`, every finite number one of
+/// `1e400` (`x / inf` is `0`, a whole number), and spelled a divisor past
+/// 64 bits as the `f64` nearest it. Here `x` is a multiple of `d` when
+/// `x / d` is an integer, by their exact values
+/// ([`Value::is_multiple_of`]); a NaN and an infinity are multiples of
+/// nothing. jsonschema's message, with the divisor as the schema spells it.
 struct MultipleOf {
-    /// jsonschema's validator for the keyword alone.
-    builtin: jsonschema::Validator<DqJson>,
     /// The divisor as the schema spells it.
-    divisor: serde_json::Value,
+    spelling: String,
+    /// The divisor's exact value.
+    exact: Value,
 }
 
 impl MultipleOf {
-    /// A number no `f64` holds: no arithmetic for it.
-    fn refused(instance: DqNode<'_>) -> bool {
-        instance
-            .as_number()
-            .is_some_and(|number| number.as_f64().is_none_or(|f| !f.is_finite()))
+    /// `None` when `instance` is a multiple of the divisor (a value that is
+    /// not a number is one), else why it is not.
+    fn check(&self, instance: &Value) -> Option<String> {
+        match instance {
+            Value::Int(_) | Value::BigInt(_) | Value::Float(_) | Value::BigFloat(_) => {}
+            _ => return None,
+        }
+        if instance.is_multiple_of(&self.exact) == Some(true) {
+            return None;
+        }
+        Some(format!(
+            "{} is not a multiple of {}",
+            instance_json(instance),
+            self.spelling
+        ))
     }
 }
 
 impl<'i> jsonschema::Keyword<'i, DqJson> for MultipleOf {
     fn validate(&self, instance: DqNode<'i>) -> Result<(), jsonschema::ValidationError<'i>> {
-        if Self::refused(instance) {
-            return Err(jsonschema::ValidationError::custom(format!(
-                "{} is not a multiple of {}",
-                instance_json(instance.0),
-                self.divisor
-            )));
-        }
-        match self.builtin.iter_errors(instance).next() {
+        match self.check(instance.0) {
             None => Ok(()),
-            Some(error) => Err(jsonschema::ValidationError::custom(error.to_string())),
+            Some(message) => Err(jsonschema::ValidationError::custom(message)),
         }
     }
 
     fn is_valid(&self, instance: DqNode<'i>) -> bool {
-        !Self::refused(instance) && self.builtin.is_valid(instance)
+        self.check(instance.0).is_none()
+    }
+}
+
+/// The member that holds a `multipleOf` divisor's literal next to the
+/// stand-in [`stand_in_tiny_divisors`] puts in its place.
+const TINY_DIVISOR: &str = "\u{0}dq.multipleOf";
+
+/// `schema` with every positive `multipleOf` divisor that the `f64`
+/// nearest it reads as `0` (`1e-400`) replaced by `1`, its literal kept
+/// next to it under [`TINY_DIVISOR`].
+///
+/// The meta-schema's `exclusiveMinimum: 0` reads the divisor as an `f64`,
+/// so such a divisor did not compile (`1e-400 is less than or equal to the
+/// minimum of 0`); and the meta-schema check cannot be turned off. dq's
+/// `multipleOf` reads the literal back. Borrowed when there is none.
+pub(crate) fn stand_in_tiny_divisors(schema: &serde_json::Value) -> Cow<'_, serde_json::Value> {
+    if !has_tiny_divisor(schema) {
+        return Cow::Borrowed(schema);
+    }
+    let mut owned = schema.clone();
+    replace_tiny_divisors(&mut owned);
+    Cow::Owned(owned)
+}
+
+/// Keywords whose value is data, not a schema: no `multipleOf` inside is
+/// one.
+const DATA_KEYWORDS: [&str; 4] = ["const", "enum", "default", "examples"];
+
+/// Keywords whose value maps names to schemas: a member named
+/// `multipleOf` there is a schema.
+const SCHEMA_MAPS: [&str; 5] = [
+    "properties",
+    "patternProperties",
+    "$defs",
+    "definitions",
+    "dependentSchemas",
+];
+
+/// Whether `divisor` is a positive number that its nearest `f64` reads as
+/// zero or less.
+fn is_tiny_divisor(divisor: &serde_json::Value) -> bool {
+    let serde_json::Value::Number(number) = divisor else {
+        return false;
+    };
+    number.as_f64().is_none_or(|f| f <= 0.0)
+        && Value::from_serde_json(divisor).compare_number(&Value::Int(0)) == Some(Ordering::Greater)
+}
+
+/// Whether some schema in `node` has a tiny `multipleOf`.
+fn has_tiny_divisor(node: &serde_json::Value) -> bool {
+    match node {
+        serde_json::Value::Object(schema) => {
+            schema
+                .iter()
+                .any(|(keyword, value)| match keyword.as_str() {
+                    "multipleOf" => is_tiny_divisor(value),
+                    k if DATA_KEYWORDS.contains(&k) => false,
+                    k if SCHEMA_MAPS.contains(&k) => value
+                        .as_object()
+                        .is_some_and(|map| map.values().any(has_tiny_divisor)),
+                    _ => has_tiny_divisor(value),
+                })
+        }
+        serde_json::Value::Array(items) => items.iter().any(has_tiny_divisor),
+        _ => false,
+    }
+}
+
+/// [`stand_in_tiny_divisors`] in place.
+fn replace_tiny_divisors(node: &mut serde_json::Value) {
+    match node {
+        serde_json::Value::Object(schema) => {
+            let mut literal = None;
+            for (keyword, value) in schema.iter_mut() {
+                match keyword.as_str() {
+                    "multipleOf" if is_tiny_divisor(value) => {
+                        literal = Some(value.to_string());
+                        *value = serde_json::Value::from(1);
+                    }
+                    k if DATA_KEYWORDS.contains(&k) => {}
+                    k if SCHEMA_MAPS.contains(&k) => {
+                        if let Some(map) = value.as_object_mut() {
+                            map.values_mut().for_each(replace_tiny_divisors);
+                        }
+                    }
+                    _ => replace_tiny_divisors(value),
+                }
+            }
+            if let Some(literal) = literal {
+                schema.insert(TINY_DIVISOR.to_owned(), serde_json::Value::String(literal));
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(replace_tiny_divisors),
+        _ => {}
     }
 }
 
@@ -615,14 +718,21 @@ pub(crate) fn options<'i>()
                 "{other} is not of type \"array\""
             ))),
         })
-        .with_keyword("multipleOf", |_, divisor, _| {
-            let builtin = builtin_options()
-                .build(&serde_json::json!({ "multipleOf": divisor }))
-                .map_err(|error| jsonschema::ValidationError::custom(error.to_string()))?;
-            Ok(Box::new(MultipleOf {
-                builtin,
-                divisor: divisor.clone(),
-            }))
+        .with_keyword("multipleOf", |schema, divisor, _| {
+            // A tiny divisor's literal stands next to its stand-in.
+            let literal = schema
+                .get(TINY_DIVISOR)
+                .and_then(serde_json::Value::as_str)
+                .and_then(|literal| serde_json::from_str::<serde_json::Value>(literal).ok());
+            match literal.as_ref().unwrap_or(divisor) {
+                divisor @ serde_json::Value::Number(_) => Ok(Box::new(MultipleOf {
+                    spelling: divisor.to_string(),
+                    exact: Value::from_serde_json(divisor),
+                })),
+                other => Err(jsonschema::ValidationError::custom(format!(
+                    "{other} is not of type \"number\""
+                ))),
+            }
         });
     for keyword in Bound::KEYWORDS {
         options = options.with_keyword(keyword, move |_, limit, _| match limit {
@@ -822,13 +932,17 @@ mod tests {
     }
 
     #[test]
-    fn multiple_of_fails_where_no_f64_holds_the_value() {
+    fn multiple_of_divides_exact_values_and_refuses_nan_and_infinities() {
         for multiple in [serde_json::json!(2), serde_json::json!(0.5)] {
             let v = validator(serde_json::json!({"multipleOf": multiple}));
-            for value in [big(".nan"), big(".inf"), big("-.inf"), big("1e400")] {
+            for value in [big(".nan"), big(".inf"), big("-.inf")] {
                 assert!(!v.is_valid(DqNode(&value)), "{multiple} {value:?}");
             }
-            for value in [Value::BigInt("18446744073709551616".into()), Value::Int(4)] {
+            for value in [
+                Value::BigInt("18446744073709551616".into()),
+                Value::Int(4),
+                big("1e400"),
+            ] {
                 assert!(v.is_valid(DqNode(&value)), "{multiple} {value:?}");
             }
             assert!(!v.is_valid(DqNode(&Value::Float(0.3))), "{multiple}");
@@ -912,6 +1026,57 @@ mod tests {
         options()
             .build(&schema_json(doc.value()))
             .expect("schema compiles")
+    }
+
+    /// A validator for the JSON `schema`, built as a rule's is.
+    fn rule_validator(schema: &str) -> jsonschema::Validator<DqJson> {
+        let schema: serde_json::Value = serde_json::from_str(schema).expect("JSON schema");
+        options()
+            .build(&stand_in_tiny_divisors(&schema))
+            .expect("schema compiles")
+    }
+
+    #[test]
+    fn multiple_of_reads_divisors_past_f64_exactly() {
+        let huge = rule_validator(r#"{"multipleOf": 1e400}"#);
+        assert!(huge.is_valid(DqNode(&Value::Int(0))));
+        assert!(huge.is_valid(DqNode(&big("2e400"))));
+        assert!(!huge.is_valid(DqNode(&Value::Int(4))));
+        assert!(!huge.is_valid(DqNode(&Value::BigInt("18446744073709551616".into()))));
+        let message = huge
+            .iter_errors(DqNode(&Value::Int(4)))
+            .next()
+            .expect("error")
+            .to_string();
+        assert_eq!(message, "4 is not a multiple of 1e+400");
+        let wide = rule_validator(r#"{"multipleOf": 18446744073709551616}"#);
+        let message = wide
+            .iter_errors(DqNode(&Value::Int(4)))
+            .next()
+            .expect("error")
+            .to_string();
+        assert_eq!(message, "4 is not a multiple of 18446744073709551616");
+        let tiny = rule_validator(
+            r#"{"properties": {"multipleOf": {"multipleOf": 1e-400}},
+                "const": {"multipleOf": 1e-400}, "$defs": {"t": {"multipleOf": 3e-400}}}"#,
+        );
+        let doc = |x: Value| Value::Map([("multipleOf".to_owned(), x)].into_iter().collect());
+        assert!(!tiny.is_valid(DqNode(&doc(big("1.5e-400")))));
+        let tiny = rule_validator(r#"{"multipleOf": 1e-400}"#);
+        assert!(tiny.is_valid(DqNode(&big("2e-400"))));
+        assert!(tiny.is_valid(DqNode(&Value::Float(0.3))));
+        assert!(!tiny.is_valid(DqNode(&big("1.5e-400"))));
+        let message = tiny
+            .iter_errors(DqNode(&big("1.5e-400")))
+            .next()
+            .expect("error")
+            .to_string();
+        assert_eq!(message, "1.5e-400 is not a multiple of 1e-400");
+        let schema = serde_json::json!({"const": {"multipleOf": 0}, "multipleOf": 2});
+        assert!(matches!(stand_in_tiny_divisors(&schema), Cow::Borrowed(_)));
+        let negative: serde_json::Value =
+            serde_json::from_str(r#"{"multipleOf": -1e-400}"#).expect("JSON");
+        assert!(options().build(&stand_in_tiny_divisors(&negative)).is_err());
     }
 
     #[test]

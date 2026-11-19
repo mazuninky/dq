@@ -349,6 +349,16 @@ impl Value {
         }
     }
 
+    /// Whether `self` is a whole multiple of `divisor`, as numbers and by
+    /// their exact value: `self / divisor` is an integer. `0.3` is a
+    /// multiple of `0.1`, `4` is not one of `1e400`, `0` is one of every
+    /// divisor. `None` when either is not a finite number or `divisor` is
+    /// zero.
+    #[must_use]
+    pub fn is_multiple_of(&self, divisor: &Self) -> Option<bool> {
+        number::decimal_is_multiple(&self.finite_literal()?, &divisor.finite_literal()?)
+    }
+
     /// A finite number as a decimal literal of its exact value: an `f64`
     /// in its shortest round-trip form (`1.5e-1`); `None` for anything
     /// else.

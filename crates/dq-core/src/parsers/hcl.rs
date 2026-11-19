@@ -50,7 +50,8 @@ impl Format for Hcl {
             .parse()
             .map_err(|e: hcl::Error| map_hcl_parse_error(e))?;
         check_body_keys(&body)?;
-        let value = body_to_value(&body);
+        let mut value = body_to_value(&body);
+        restore_exact_numbers(text, &mut value);
         Ok(Document::value_only(value, FormatTag::Hcl))
     }
 
@@ -248,6 +249,87 @@ fn hcl_value_to_value(v: HclValue) -> Value {
     }
 }
 
+/// Put back the exact value of every number literal that `hcl-rs` read
+/// as the `f64` nearest it: an integer past 64 bits
+/// (`18446744073709551617`, `-9223372036854775809`) or a decimal with more
+/// digits than an `f64` holds. `hcl-rs` keeps no literal; `hcl-edit`, which
+/// it parses with, does, so `text` is parsed once more with it and walked
+/// alongside `value`.
+fn restore_exact_numbers(text: &str, value: &mut Value) {
+    let (Ok(body), Value::Map(map)) = (text.parse::<hcl::edit::structure::Body>(), value) else {
+        return;
+    };
+    restore_in_body(&body, map);
+}
+
+fn restore_in_body(body: &hcl::edit::structure::Body, map: &mut IndexMap<String, Value>) {
+    use hcl::edit::structure::{BlockLabel as EditLabel, Structure as EditStructure};
+    for structure in body.iter() {
+        match structure {
+            EditStructure::Attribute(attr) => {
+                if let Some(value) = map.get_mut(attr.key.as_str()) {
+                    restore_in_expression(&attr.value, value);
+                }
+            }
+            // Where `insert_block` put the block's body.
+            EditStructure::Block(block) => {
+                let mut cursor = map.get_mut(block.ident.as_str());
+                for label in &block.labels {
+                    let label = match label {
+                        EditLabel::Ident(ident) => ident.as_str(),
+                        EditLabel::String(s) => s.as_str(),
+                    };
+                    cursor = match cursor {
+                        Some(Value::Map(inner)) => inner.get_mut(label),
+                        _ => None,
+                    };
+                }
+                if let Some(Value::Map(inner)) = cursor {
+                    restore_in_body(&block.body, inner);
+                }
+            }
+        }
+    }
+}
+
+fn restore_in_expression(expr: &hcl::edit::expr::Expression, value: &mut Value) {
+    use hcl::edit::expr::Expression as EditExpression;
+    match (expr, value) {
+        (EditExpression::Number(number), value @ Value::Float(_)) => {
+            let Some(repr) = number.as_repr() else {
+                return;
+            };
+            // `- 5` is a number too.
+            let literal: String = repr.chars().filter(|c| !c.is_whitespace()).collect();
+            let Value::Float(read) = value else {
+                return;
+            };
+            // Only the number `hcl-rs` read from this very literal: a later
+            // block merged over it may have put another one there.
+            if literal.parse::<f64>().map(f64::to_bits) != Ok(read.to_bits()) {
+                return;
+            }
+            if let Some(exact @ (Value::BigInt(_) | Value::BigFloat(_))) =
+                Value::from_number_literal(&literal)
+            {
+                *value = exact;
+            }
+        }
+        (EditExpression::Array(items), Value::Array(values)) if items.len() == values.len() => {
+            for (item, value) in items.iter().zip(values) {
+                restore_in_expression(item, value);
+            }
+        }
+        (EditExpression::Object(object), Value::Map(map)) if object.len() == map.len() => {
+            for ((_, member), value) in object.iter().zip(map.values_mut()) {
+                restore_in_expression(member.expr(), value);
+            }
+        }
+        (EditExpression::Parenthesis(inner), value) => restore_in_expression(inner.inner(), value),
+        _ => {}
+    }
+}
+
 /// Map an `hcl_primitives::Number` into our `Value` numeric variants.
 ///
 /// Integer-shaped numbers go to `Value::Int` when they fit `i64`, otherwise
@@ -348,6 +430,54 @@ fn map_hcl_parse_error(e: hcl::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_keeps_numbers_an_f64_misreads_exact() {
+        let text = "x = 18446744073709551617\nn = - 9223372036854775809\n\
+                    f = 0.10000000000000000001\nl = [1, (18446744073709551616)]\n\
+                    o = { k = 18446744073709551618 }\nu = 18446744073709551615\n\
+                    h = 1.5\nb \"lbl\" {\n  y = 36893488147419103232\n}\n";
+        let doc = Hcl.parse(text.as_bytes()).expect("parse");
+        let Value::Map(map) = doc.value() else {
+            panic!("{:?}", doc.value());
+        };
+        let int = |s: &str| Value::BigInt(s.to_owned());
+        assert_eq!(map["x"], int("18446744073709551617"));
+        assert_eq!(map["n"], int("-9223372036854775809"));
+        assert_eq!(map["f"], Value::BigFloat("0.10000000000000000001".into()));
+        assert_eq!(
+            map["l"],
+            Value::Array(vec![Value::Int(1), int("18446744073709551616")])
+        );
+        assert_eq!(
+            map["o"],
+            Value::Map(
+                [("k".to_owned(), int("18446744073709551618"))]
+                    .into_iter()
+                    .collect()
+            )
+        );
+        assert_eq!(map["u"], int("18446744073709551615"));
+        assert_eq!(map["h"], Value::Float(1.5));
+        let Value::Map(b) = &map["b"] else {
+            panic!("{:?}", map["b"]);
+        };
+        let Value::Map(lbl) = &b["lbl"] else {
+            panic!("{:?}", b["lbl"]);
+        };
+        assert_eq!(lbl["y"], int("36893488147419103232"));
+        // A block merged over another keeps the last block's number.
+        let doc = Hcl
+            .parse(b"b {\n  x = 18446744073709551617\n}\nb {\n  x = 2.5\n}\n")
+            .expect("parse");
+        let Value::Map(map) = doc.value() else {
+            panic!("{:?}", doc.value());
+        };
+        assert_eq!(
+            map["b"],
+            Value::Map([("x".to_owned(), Value::Float(2.5))].into_iter().collect())
+        );
+    }
 
     #[test]
     fn parse_fails_on_object_keys_that_repeat_as_strings() {

@@ -323,40 +323,19 @@ fn process_extract_item(
             return;
         }
     };
-    let value_str = match map.get("value").and_then(as_str) {
-        Some(s) => s,
-        None => {
+    let fields = ["value", "format", "anchor"].map(|field| string_field(map, field));
+    let [value_str, format_str, anchor_str] = match fields {
+        [Ok(value), Ok(format), Ok(anchor)] => [value, format, anchor],
+        fields => {
+            let message = fields
+                .into_iter()
+                .find_map(std::result::Result::err)
+                .unwrap_or_default();
             out.push(error_diagnostic(
                 outer_rule,
                 path,
                 outer_ir,
-                "composite extract item missing field `value`".to_owned(),
-                "composite-extract-malformed",
-            ));
-            return;
-        }
-    };
-    let format_str = match map.get("format").and_then(as_str) {
-        Some(s) => s,
-        None => {
-            out.push(error_diagnostic(
-                outer_rule,
-                path,
-                outer_ir,
-                "composite extract item missing field `format`".to_owned(),
-                "composite-extract-malformed",
-            ));
-            return;
-        }
-    };
-    let anchor_str = match map.get("anchor").and_then(as_str) {
-        Some(s) => s,
-        None => {
-            out.push(error_diagnostic(
-                outer_rule,
-                path,
-                outer_ir,
-                "composite extract item missing field `anchor`".to_owned(),
+                message,
                 "composite-extract-malformed",
             ));
             return;
@@ -605,6 +584,25 @@ fn describe_value_shape(v: &dq_core::Value) -> &'static str {
     }
 }
 
+/// The string an extract item holds under `field`, or what is wrong with
+/// it: missing, or present but not a string (`.nan` is a number).
+fn string_field<'v>(
+    item: &'v indexmap::IndexMap<String, dq_core::Value>,
+    field: &str,
+) -> std::result::Result<&'v str, String> {
+    match item.get(field) {
+        None => Err(format!("composite extract item missing field `{field}`")),
+        Some(value) => as_str(value).ok_or_else(|| {
+            let got = match describe_value_shape(value) {
+                "null" => "null".to_owned(),
+                shape @ ("array" | "object") => format!("an {shape}"),
+                shape => format!("a {shape}"),
+            };
+            format!("composite extract item field `{field}` must be a string, got {got}")
+        }),
+    }
+}
+
 /// The text of a string value; `None` for any other.
 fn as_str(v: &dq_core::Value) -> Option<&str> {
     match v {
@@ -808,6 +806,31 @@ check:
             eval.evaluate_file(&Utf8PathBuf::from("doc.yaml"), &owned.to_borrowed(), "yaml");
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("`format`"));
+    }
+
+    #[test]
+    fn extract_item_field_of_another_type_says_what_it_got() {
+        let eval = evaluator(PASSTHROUGH_COMPOSITE_RULE);
+        for (item, message) in [
+            (
+                json!({"value": 1.5, "format": "yaml", "anchor": ""}),
+                "composite extract item field `value` must be a string, got a number",
+            ),
+            (
+                json!({"value": "x", "format": ["yaml"], "anchor": ""}),
+                "composite extract item field `format` must be a string, got an array",
+            ),
+            (
+                json!({"value": "x", "format": "yaml", "anchor": null}),
+                "composite extract item field `anchor` must be a string, got null",
+            ),
+        ] {
+            let owned = ir_for_test(&json!({ "items": [item] }));
+            let diags =
+                eval.evaluate_file(&Utf8PathBuf::from("doc.yaml"), &owned.to_borrowed(), "yaml");
+            assert_eq!(diags.len(), 1, "{diags:?}");
+            assert!(diags[0].message.contains(message), "{}", diags[0].message);
+        }
     }
 
     #[test]

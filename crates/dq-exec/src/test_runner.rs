@@ -13,15 +13,14 @@
 //!
 //! ## Format-input parsing scope
 //!
-//! The runner parses a fixture's `input:` text by name. M8 supported
-//! `yaml` / `json`; M9 added `markdown` (CommonMark + GFM AST); M11
-//! Phase 5 added `hcl` so the `@std/terraform` ruleset can ship with
-//! co-located fixtures; `dockerfile` lets the `@std/dockerfile` fixtures
-//! feed real Dockerfile text through the parser. Any other format produces an [`TestOutcome::Error`]
-//! with a "format not yet supported in test runner" message — that
-//! message intentionally points future authors at the
-//! `dq_core::by_name` registry, since adding a format here is a
-//! one-arm change.
+//! The runner parses a fixture's `input:` text with dq's own reader for
+//! the format, as `dq check` reads a file: `yaml`, `json`, `markdown`
+//! (CommonMark + GFM AST), `hcl` (so the `@std/terraform` ruleset can ship
+//! with co-located fixtures) and `dockerfile`. Any other format produces a
+//! [`TestOutcome::Error`] with a "format not yet supported in test runner"
+//! message — that message intentionally points future authors at the
+//! `dq_core::by_name` registry, since adding a format here is a one-word
+//! change.
 
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::Deserialize;
@@ -313,72 +312,36 @@ fn run_case(
     )
 }
 
-/// Parse a fixture's `input:` text under `format`. `yaml` and `json` are
-/// wired through `serde_norway` / `serde_json` directly; `markdown` (M9 — the
-/// CommonMark + GFM AST format) routes through `dq_core::by_name("markdown")`
-/// so the fixture sees the same typed-discriminator-Map shape that the
-/// `@std/markdown` rules check.dispatch against; `hcl` and `dockerfile` go
-/// through their parsers the same way. Other formats yield an
-/// `Err(message)` for the caller to surface as a [`TestOutcome::Error`].
-///
-/// The parsed formats hand their own [`dq_core::Value`] over as it is;
-/// `yaml` and `json` still go through `serde_json::Value`, which reads a
-/// YAML `.nan` as `null`.
+/// Parse a fixture's `input:` text under `format` with dq's own reader
+/// for it ([`dq_core::by_name`]), so a fixture's input is the value
+/// `dq check` sees in a file: a YAML `.nan` is a number, not `null`, and
+/// `18446744073709551617` keeps its digits. `markdown` gives the AST
+/// (CommonMark and GFM) the `@std/markdown` rules check; `hcl` and
+/// `dockerfile` give their parsers' shapes (no spans: diagnostics fall
+/// back to `(1, 1)`). A YAML stream of more than one document, and a
+/// format the runner does not read, yield an `Err(message)` for the
+/// caller to surface as a [`TestOutcome::Error`].
 fn parse_input(input: &str, format: &str) -> std::result::Result<dq_core::Value, String> {
-    match format {
-        "yaml" => serde_norway::from_str::<serde_json::Value>(input)
-            .map(|value| dq_core::Value::from_serde_json(&value))
-            .map_err(|err| format!("yaml parse error: {err}")),
-        "json" => serde_json::from_str::<serde_json::Value>(input)
-            .map(|value| dq_core::Value::from_serde_json(&value))
-            .map_err(|err| format!("json parse error: {err}")),
-        "markdown" => {
-            let parser = dq_core::by_name("markdown")
-                .ok_or_else(|| "markdown format not registered".to_owned())?;
-            let doc = parser
-                .parse(input.as_bytes())
-                .map_err(|err| format!("markdown parse error: {err}"))?;
-            Ok(doc.value().clone())
-        }
-        "hcl" => {
-            // M11 Phase 5: `@std/terraform` rules carry `format: hcl` in
-            // their `match`, so fixtures need to parse `.tf` syntax. The
-            // HCL parser produces a `Value::Map` shaped per the M5 nesting
-            // contract (see `crates/dq-core/src/parsers/hcl.rs` —
-            // `block_type "label" { ... }` becomes `Map { block_type:
-            // { label: { ... } } }`), which the evaluator takes as it is.
-            // HCL has no spans
-            // (`set_at`/`del_at` round-trip is unsupported per the parser
-            // module comment), so diagnostics emitted from these fixtures
-            // resolve to the default `(line=1, col=1)`. The fixture
-            // runner exercises the rule logic; the no-spans limitation is
-            // documented in CHANGELOG.md and the rule descriptions.
-            let parser =
-                dq_core::by_name("hcl").ok_or_else(|| "hcl format not registered".to_owned())?;
-            let doc = parser
-                .parse(input.as_bytes())
-                .map_err(|err| format!("hcl parse error: {err}"))?;
-            Ok(doc.value().clone())
-        }
-        "dockerfile" => {
-            // The `@std/dockerfile` fixtures are Dockerfile text, so the rules
-            // see the parser's IR (`[{instruction, arguments, line}]`) rather
-            // than a hand-spelled copy of it. No spans: diagnostics resolve
-            // to the default `(line=1, col=1)`, as for HCL.
-            let parser = dq_core::by_name("dockerfile")
-                .ok_or_else(|| "dockerfile format not registered".to_owned())?;
-            let doc = parser
-                .parse(input.as_bytes())
-                .map_err(|err| format!("dockerfile parse error: {err}"))?;
-            Ok(doc.value().clone())
-        }
-        other => Err(format!(
-            "format not yet supported in test runner: {other} (supported: yaml, json, markdown, hcl, dockerfile; add a new arm in test_runner::parse_input that calls dq_core::by_name)",
-        )),
+    const SUPPORTED: [&str; 5] = ["yaml", "json", "markdown", "hcl", "dockerfile"];
+    if !SUPPORTED.contains(&format) {
+        return Err(format!(
+            "format not yet supported in test runner: {format} (supported: yaml, json, markdown, hcl, dockerfile; add it to SUPPORTED in test_runner::parse_input if dq_core::by_name reads it)",
+        ));
     }
+    let parser =
+        dq_core::by_name(format).ok_or_else(|| format!("{format} format not registered"))?;
+    let doc = parser
+        .parse(input.as_bytes())
+        .map_err(|err| format!("{format} parse error: {err}"))?;
+    if let Some(documents) = doc.values() {
+        return Err(format!(
+            "{format} parse error: a fixture input holds one document, this one holds {}",
+            documents.len()
+        ));
+    }
+    Ok(doc.value().clone())
 }
 
-/// Match expected violations against actual diagnostics per design D10.
 fn compare(
     fixture: Utf8PathBuf,
     name: String,
@@ -693,6 +656,30 @@ tests:
             }
             other => panic!("expected Error outcome, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn yaml_and_json_inputs_read_as_check_reads_them() {
+        let value = parse_input("x: .nan\ny: 18446744073709551617\n", "yaml").expect("yaml");
+        let dq_core::Value::Map(map) = &value else {
+            panic!("expected a map: {value:?}");
+        };
+        let x = map.get("x").and_then(dq_core::Value::non_finite_float);
+        assert!(x.is_some_and(f64::is_nan), "{value:?}");
+        assert_eq!(
+            map.get("y"),
+            Some(&dq_core::Value::BigInt("18446744073709551617".into()))
+        );
+        let value = parse_input(r#"{"y": 18446744073709551617}"#, "json").expect("json");
+        assert!(matches!(&value, dq_core::Value::Map(map)
+            if map.get("y") == Some(&dq_core::Value::BigInt("18446744073709551617".into()))));
+        let err = parse_input("a: 1\n---\nb: 2\n", "yaml").expect_err("stream");
+        assert!(
+            err.contains("holds one document, this one holds 2"),
+            "{err}"
+        );
+        let err = parse_input("a: [", "yaml").expect_err("broken");
+        assert!(err.starts_with("yaml parse error: "), "{err}");
     }
 
     #[test]
