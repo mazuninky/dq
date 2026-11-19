@@ -9,7 +9,7 @@
 //!   counting requires `unicode-segmentation` and is deferred — see the
 //!   workspace-level `dq-plan.md` M2/M9 notes.
 //! - Anything else (null, bool, int, float, big-int, big-float) is a
-//!   `TypeMismatch` `Path` error.
+//!   [`WrongType`] error (exit 1).
 
 use std::io::Write;
 
@@ -17,6 +17,7 @@ use dq_core::{Pointer, Value};
 
 use super::io_helpers::{load_document_with_path, select_document};
 use crate::cli::{Cli, LenArgs};
+use crate::error::WrongType;
 use crate::output::Reporter;
 
 /// Run the `len` command.
@@ -25,8 +26,8 @@ use crate::output::Reporter;
 ///
 /// - [`crate::error::InvalidInput`] (exit 6) when any write-mode flag
 ///   (`-i`, `--diff`, `--backup`) is set — `len` is a read subcommand.
-/// - `dq_core::Error::Path { kind: TypeMismatch, .. }` when the pointer
-///   addresses an unsized value (null/bool/int/float).
+/// - [`WrongType`] (exit 1) when the pointer addresses an unsized value
+///   (null/bool/int/float).
 /// - `dq_core::Error::*` for the usual I/O, parse, and unsupported-format
 ///   failures.
 pub fn run(
@@ -47,14 +48,11 @@ pub fn run(
         Value::Map(map) => map.len() as i64,
         Value::String(s) => s.chars().count() as i64,
         other => {
-            return Err(anyhow::Error::new(dq_core::Error::Path {
+            return Err(anyhow::Error::new(WrongType {
+                action: "take the length of",
                 pointer: pointer.as_canonical(),
-                matched_prefix: pointer.as_canonical(),
-                kind: dq_core::PathErrorKind::TypeMismatch {
-                    expected: "array, string, or object",
-                    found: other.type_name(),
-                },
-                did_you_mean: Vec::new(),
+                found: other.type_name(),
+                expected: "an array, a string or an object",
             }));
         }
     };
@@ -128,8 +126,8 @@ mod tests {
         let reporter = ConsoleReporter::new(false);
         let mut out: Vec<u8> = Vec::new();
         let err = run(&cli, &args, None, None, &reporter, &mut out).unwrap_err();
-        let domain = err.downcast_ref::<dq_core::Error>().unwrap();
-        assert_eq!(domain.kind_name(), "path");
+        let wrong = err.downcast_ref::<WrongType>().expect("WrongType");
+        assert_eq!((wrong.pointer.as_str(), wrong.found), ("/flag", "bool"));
     }
 
     #[test]

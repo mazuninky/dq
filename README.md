@@ -181,6 +181,8 @@ A rule's `check:` is a `oneOf` over four kinds:
 - `jq` — embedded jq expression returning a boolean or an array of failures.
 - `schema` — inline JSON Schema 2020-12.
 - `schema_file` — path to a JSON Schema file (resolved relative to the rule directory; `..` escapes rejected, `$ref` restricted to internal references).
+
+A schema reads the document's own numbers. A NaN or an infinity (`.nan`, `-.inf`, TOML `nan`) is a `number`, never a `string` or an `integer`; an infinity is past every bound on its side, and a NaN fails every bound (`minimum`, `maximum`, the exclusive ones) and every `multipleOf`, as does a number past the `f64` range. `integer`, `enum` and `const` read a big number by its exact value (`18446744073709551616` is an integer, `1e-400` is not), and two NaNs equal nothing — though `uniqueItems` counts them as one item. Messages spell these values as the document does: `.nan is not of type "string"`.
 - `extract` + `nested` — composite cross-format rule. The outer jq returns `[{value, format, anchor}]`; each item is reparsed as the inner format and run through a `nested:` rule. Recursion bounded at depth 4. Inner-format parse failures emit `<outer>.parse-failed`.
 
 Reference composite rules ship out of the box: `@std/markdown/code-blocks-yaml-valid`, `@std/jsonschema/{kubernetes-crd-shape, helm-values-against-schema, openapi-3.1-shape}`.
@@ -246,7 +248,7 @@ dq --doc 1 lint bundle.yaml                       # lint the second document onl
 dq --doc 1 convert bundle.yaml -F json            # convert one document
 ```
 
-Read commands (`get`, `exists`, `keys`, `values`, `len`, `type`, `paths`, `select`, `query`) read document 0 unless told otherwise. `set --jq` without `--doc` sees the stream as an array of documents and must return one. `--doc all` is refused by `set` and `del`, any `--doc` by `convert -i` and by commands that work on the whole file (`fmt`, `validate`, `diff`, `patch`, `merge`, …): a usage error, exit 2. An index past the last document is exit 2 as well; over several files (a glob, a directory, a list), a file without that document is skipped with a note on stderr and the run goes on — unless no file holds it, which is exit 2.
+Read commands (`get`, `exists`, `keys`, `values`, `len`, `type`, `paths`, `select`, `query`) read document 0 unless told otherwise. `keys` and `values` list an object's keys and values, or an array's indices and items; on a scalar they — and `len` on a number, a boolean or a null — are exit 1 (`cannot list the keys of '/n': it is int, not an object or an array`). `get`, `values`, `select` and `query` write a NaN or an infinity one way per output format, whatever format it came from: `.nan` / `.inf` / `-.inf` on the console, in YAML and in TOON, `nan` / `inf` in TOML, exit 1 in JSON and JSONL; a number too big for 64 bits keeps its exact literal. `set --jq` without `--doc` sees the stream as an array of documents and must return one. `--doc all` is refused by `set` and `del`, any `--doc` by `convert -i` and by commands that work on the whole file (`fmt`, `validate`, `diff`, `patch`, `merge`, …): a usage error, exit 2. An index past the last document is exit 2 as well; over several files (a glob, a directory, a list), a file without that document is skipped with a note on stderr and the run goes on — unless no file holds it, which is exit 2.
 
 `set FILE /N VALUE` (or `dq --doc N set FILE '' VALUE`) writes document N anew through the YAML writer: its `---` line, the comment lines after its content and every other document stay byte for byte, the comments among its content go. `del FILE /N` removes document N with its `---` line and the comment lines just above it. In a file that is no stream, `set FILE '' VALUE` replaces the whole document the same way, keeping the comment lines it starts with (YAML, JSON and TOML; a TOML document must stay a table). `del FILE ''` and `set FILE ''` on a whole stream are usage errors, exit 2. `patch` addresses the documents of a stream as `/N` the same way (`remove /N`, `replace /N`, `/N/...` inside one; `add /N` inserts a new document there, `add /-` appends one); `merge` refuses a stream, exit 6: a merge patch applies to one document.
 
@@ -271,7 +273,7 @@ Bulk multi-file mode prints `Modified: N, Skipped: M, Failed: K`. Single-file in
 | Code | Meaning |
 |---|---|
 | 0 | success |
-| 1 | generic (`--check` changes pending, `PatchTestFailed`, a value `convert`, `query` or `set --jq` cannot write in the output format, such as NaN or Infinity in JSON) |
+| 1 | generic (`--check` changes pending, `PatchTestFailed`, a value a read command, `convert` or `set --jq` cannot write in the output format, such as NaN or Infinity in JSON; `keys` / `values` / `len` on a node of the wrong type) |
 | 2 | not found (a JSON Pointer or a `--doc N` the file does not have); usage error (incl. `--doc` on a command that cannot honour it) |
 | 3 | parse error (incl. templated file) |
 | 4 | validate fail |
@@ -299,6 +301,8 @@ dq fix  --plugins ./plugins config.yaml
 ```
 
 `--plugins <DIR>` discovery is non-recursive and lexically sorted. Without the feature flag the flag is parsed but loading any `*.wasm` exits 6 (`InvalidInput`).
+
+`get-root` and `get-at` hand a plugin the document as JSON: a number too big for 64 bits keeps its exact digits, and a NaN or an infinity — which JSON cannot hold — comes as the string `".nan"`, `".inf"` or `"-.inf"`. `jq.eval` runs the filter over the document's own value at an RFC 6901 pointer, so there a NaN is a number (`isnan` holds); its outputs come back encoded the same way.
 
 > **v0.1.0 experimental WIT preview.** Breaking changes to the WIT schema, host-imported interfaces, and diagnostic / EditScript marshalling are possible before `v1.0.0`. Pin a specific dq version in CI until the ABI stabilizes.
 

@@ -237,6 +237,20 @@ pub(crate) fn same_decimal(a: &str, b: &str) -> bool {
     }
 }
 
+/// Whether a decimal literal spells a whole number, at any size: `1e400`,
+/// `1.50e1` and `-0.0` do, `1.5` and `1e-400` do not. `false` when it is
+/// not a decimal literal.
+pub(crate) fn decimal_is_whole(literal: &str) -> bool {
+    DecimalParts::parse(literal).is_some_and(|parts| {
+        let normal = Normal::of(&parts);
+        normal.len == 0
+            || match normal.exponent {
+                Exponent::Small(last) => last >= 0,
+                Exponent::Big(negative, _) => !negative,
+            }
+    })
+}
+
 /// The value of a decimal literal: an `i64` integer is a [`Value::Int`],
 /// a longer one a [`Value::BigInt`], a literal with a fraction or an
 /// exponent as [`float_value`] decides. `None` for anything else.
@@ -436,6 +450,30 @@ mod tests {
         for bad in ["", "-", ".", "1e", "NaN", "1_0", "1.2.3"] {
             assert!(!same_decimal(bad, bad), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn decimal_is_whole_reads_the_exact_value() {
+        for whole in [
+            "0",
+            "-0.0",
+            "12",
+            "1e400",
+            "1.50e1",
+            "150e-1",
+            "1e99999999999999999999999999999999999999999",
+        ] {
+            assert!(decimal_is_whole(whole), "{whole}");
+        }
+        for fraction in [
+            "1.5",
+            "1e-400",
+            "1e-99999999999999999999999999999999999999999",
+            "0.1",
+        ] {
+            assert!(!decimal_is_whole(fraction), "{fraction}");
+        }
+        assert!(!decimal_is_whole(".nan"));
     }
 
     #[test]

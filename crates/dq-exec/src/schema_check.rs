@@ -46,7 +46,9 @@ use crate::ruleset::RuleSource;
 pub(crate) struct CompiledSchemaCheck {
     /// Compiled JSON Schema 2020-12 validator. Reused across every
     /// `evaluate_file` call against the owning [`crate::Evaluator`].
-    pub(crate) validator: jsonschema::Validator,
+    /// It validates the document's own [`dq_core::Value`] — see
+    /// [`crate::schema_value`].
+    pub(crate) validator: jsonschema::Validator<crate::schema_value::DqJson>,
     /// Optional message prefix — when set, prepended to the
     /// auto-generated `keywordLocation`-based message in each
     /// diagnostic.
@@ -83,13 +85,8 @@ fn compile_json(
     if let Some(uri) = find_external_ref(schema_json) {
         return Err(external_ref_error(rule_id, uri));
     }
-    // `offline()` swaps the default retriever for one that refuses every
-    // URI not already in the registry, so even if `resolve-http` /
-    // `resolve-file` were ever unified on by another crate in the graph,
-    // the validator cannot reach the network or the filesystem.
-    let built = jsonschema::draft202012::options()
-        .offline()
-        .build(schema_json);
+    // Offline: see `schema_value::options`.
+    let built = crate::schema_value::options().build(schema_json);
     // A `$schema` naming a meta-schema the validator does not bundle is
     // an external reference too. jsonschema ≤ 0.34 tried to retrieve it
     // while building the registry and failed the compile; 0.61 with an
@@ -676,6 +673,14 @@ mod tests {
     use crate::ruleset::RuleSource;
     use pretty_assertions::assert_eq;
 
+    /// Whether the document `instance` is valid against `compiled`.
+    fn holds(compiled: &CompiledSchemaCheck, instance: &serde_json::Value) -> bool {
+        let value = dq_core::Value::from_serde_json(instance);
+        compiled
+            .validator
+            .is_valid(crate::schema_value::DqNode(&value))
+    }
+
     #[test]
     fn compile_inline_with_valid_schema_succeeds() {
         let yaml: serde_norway::Value = serde_norway::from_str(
@@ -693,8 +698,8 @@ properties:
         assert_eq!(compiled.message_prefix.as_deref(), Some("prefix: "));
         let valid = serde_json::json!({"name": "x"});
         let invalid = serde_json::json!({});
-        assert!(compiled.validator.is_valid(&valid));
-        assert!(!compiled.validator.is_valid(&invalid));
+        assert!(holds(&compiled, &valid));
+        assert!(!holds(&compiled, &invalid));
     }
 
     #[test]
@@ -829,16 +834,8 @@ $defs:
         )
         .expect("yaml parse");
         let compiled = compile_inline("test.rule", &yaml, None).expect("internal $ref compiles");
-        assert!(
-            compiled
-                .validator
-                .is_valid(&serde_json::json!({"code": "AA"}))
-        );
-        assert!(
-            !compiled
-                .validator
-                .is_valid(&serde_json::json!({"code": "CC"}))
-        );
+        assert!(holds(&compiled, &serde_json::json!({"code": "AA"})));
+        assert!(!holds(&compiled, &serde_json::json!({"code": "CC"})));
     }
 
     #[test]
@@ -936,12 +933,8 @@ $defs:
         let schema_text =
             r#"{"type":"object","required":["name"],"properties":{"name":{"type":"string"}}}"#;
         let compiled = compile_from_embedded("test.rule", schema_text, None).expect("compile ok");
-        assert!(
-            compiled
-                .validator
-                .is_valid(&serde_json::json!({"name":"x"}))
-        );
-        assert!(!compiled.validator.is_valid(&serde_json::json!({})));
+        assert!(holds(&compiled, &serde_json::json!({"name":"x"})));
+        assert!(!holds(&compiled, &serde_json::json!({})));
     }
 
     #[test]
@@ -1394,8 +1387,8 @@ $defs:
         let yaml: serde_norway::Value =
             serde_norway::from_str(r#"{"$schema": "", "type": "integer"}"#).expect("yaml");
         let compiled = compile_inline("test.ok", &yaml, None).expect("compiles");
-        assert!(compiled.validator.is_valid(&serde_json::json!(1)));
-        assert!(!compiled.validator.is_valid(&serde_json::json!({"a": 1})));
+        assert!(holds(&compiled, &serde_json::json!(1)));
+        assert!(!holds(&compiled, &serde_json::json!({"a": 1})));
     }
 
     #[test]

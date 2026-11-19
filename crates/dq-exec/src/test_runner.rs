@@ -297,15 +297,13 @@ fn run_case(
             };
         }
     };
-    // The fixture path doesn't carry spans — fixtures parse via
-    // `serde_norway`/`serde_json`/markdown which give us a bare
-    // `serde_json::Value` with no provenance metadata. Build a fresh
-    // `OwnedIr` with an empty provenance map so the evaluator sees the
-    // new IR signature; rules that use `loc.pointer` simply fall through
-    // to the default (1, 1) position in the fixture context.
-    let dq_value = dq_core::Value::from_serde_json(&value);
+    // The fixture path doesn't carry spans — `parse_input` gives a bare
+    // value with no provenance metadata. Build a fresh `OwnedIr` with an
+    // empty provenance map so the evaluator sees the new IR signature;
+    // rules that use `loc.pointer` simply fall through to the default
+    // (1, 1) position in the fixture context.
     let format_tag = dq_core::FormatTag::from_name(&format).unwrap_or(dq_core::FormatTag::Yaml);
-    let owned = dq_core::OwnedIr::new(dq_value, dq_core::ProvenanceMap::new(), format_tag);
+    let owned = dq_core::OwnedIr::new(value, dq_core::ProvenanceMap::new(), format_tag);
     let actual = evaluator.evaluate_file(fixture, &owned.to_borrowed(), &format);
     compare(
         fixture.to_path_buf(),
@@ -322,11 +320,17 @@ fn run_case(
 /// `@std/markdown` rules check.dispatch against; `hcl` and `dockerfile` go
 /// through their parsers the same way. Other formats yield an
 /// `Err(message)` for the caller to surface as a [`TestOutcome::Error`].
-fn parse_input(input: &str, format: &str) -> std::result::Result<serde_json::Value, String> {
+///
+/// The parsed formats hand their own [`dq_core::Value`] over as it is;
+/// `yaml` and `json` still go through `serde_json::Value`, which reads a
+/// YAML `.nan` as `null`.
+fn parse_input(input: &str, format: &str) -> std::result::Result<dq_core::Value, String> {
     match format {
         "yaml" => serde_norway::from_str::<serde_json::Value>(input)
+            .map(|value| dq_core::Value::from_serde_json(&value))
             .map_err(|err| format!("yaml parse error: {err}")),
         "json" => serde_json::from_str::<serde_json::Value>(input)
+            .map(|value| dq_core::Value::from_serde_json(&value))
             .map_err(|err| format!("json parse error: {err}")),
         "markdown" => {
             let parser = dq_core::by_name("markdown")
@@ -334,12 +338,7 @@ fn parse_input(input: &str, format: &str) -> std::result::Result<serde_json::Val
             let doc = parser
                 .parse(input.as_bytes())
                 .map_err(|err| format!("markdown parse error: {err}"))?;
-            // The evaluator and check.jq path consume `serde_json::Value`,
-            // so convert the typed AST tree through `serde_json::to_value`.
-            // `Value` (the dq-core type) implements `Serialize` per the
-            // top-level `document/mod.rs`, so this is a single hop.
-            serde_json::to_value(doc.value())
-                .map_err(|err| format!("markdown AST serialize error: {err}"))
+            Ok(doc.value().clone())
         }
         "hcl" => {
             // M11 Phase 5: `@std/terraform` rules carry `format: hcl` in
@@ -347,8 +346,8 @@ fn parse_input(input: &str, format: &str) -> std::result::Result<serde_json::Val
             // HCL parser produces a `Value::Map` shaped per the M5 nesting
             // contract (see `crates/dq-core/src/parsers/hcl.rs` —
             // `block_type "label" { ... }` becomes `Map { block_type:
-            // { label: { ... } } }`); we serialize that to a
-            // `serde_json::Value` for the jq evaluator. HCL has no spans
+            // { label: { ... } } }`), which the evaluator takes as it is.
+            // HCL has no spans
             // (`set_at`/`del_at` round-trip is unsupported per the parser
             // module comment), so diagnostics emitted from these fixtures
             // resolve to the default `(line=1, col=1)`. The fixture
@@ -359,8 +358,7 @@ fn parse_input(input: &str, format: &str) -> std::result::Result<serde_json::Val
             let doc = parser
                 .parse(input.as_bytes())
                 .map_err(|err| format!("hcl parse error: {err}"))?;
-            serde_json::to_value(doc.value())
-                .map_err(|err| format!("hcl value serialize error: {err}"))
+            Ok(doc.value().clone())
         }
         "dockerfile" => {
             // The `@std/dockerfile` fixtures are Dockerfile text, so the rules
@@ -372,8 +370,7 @@ fn parse_input(input: &str, format: &str) -> std::result::Result<serde_json::Val
             let doc = parser
                 .parse(input.as_bytes())
                 .map_err(|err| format!("dockerfile parse error: {err}"))?;
-            serde_json::to_value(doc.value())
-                .map_err(|err| format!("dockerfile value serialize error: {err}"))
+            Ok(doc.value().clone())
         }
         other => Err(format!(
             "format not yet supported in test runner: {other} (supported: yaml, json, markdown, hcl, dockerfile; add a new arm in test_runner::parse_input that calls dq_core::by_name)",
@@ -659,7 +656,7 @@ tests:
     fn dockerfile_input_goes_through_the_dockerfile_parser() {
         let value = parse_input("FROM alpine\nRUN [\"sh\"]\n", "dockerfile").expect("parse");
         assert_eq!(
-            value,
+            value.to_serde_json(),
             serde_json::json!([
                 {"instruction": "FROM", "arguments": "alpine", "line": 1},
                 {"instruction": "RUN", "arguments": ["sh"], "line": 2},

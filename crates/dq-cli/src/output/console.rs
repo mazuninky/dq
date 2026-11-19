@@ -35,33 +35,6 @@ impl Reporter for ConsoleReporter {
         write_top(value, w, self.use_color)?;
         Ok(())
     }
-
-    /// Spells a NaN or an infinity `.nan` / `.inf` / `-.inf`, as YAML
-    /// does, whatever format it was read from or jq made it in.
-    fn report_value(&self, value: &dq_core::Value, w: &mut dyn Write) -> anyhow::Result<()> {
-        self.report(&console_json(value), w)
-    }
-}
-
-/// `value` as the console renders it: [`dq_core::Value::to_serde_json`],
-/// with a non-finite float spelled the YAML way.
-fn console_json(value: &dq_core::Value) -> serde_json::Value {
-    match value {
-        dq_core::Value::Array(items) => {
-            serde_json::Value::Array(items.iter().map(console_json).collect())
-        }
-        dq_core::Value::Map(map) => serde_json::Value::Object(
-            map.iter()
-                .map(|(k, child)| (k.clone(), console_json(child)))
-                .collect(),
-        ),
-        scalar => match scalar.non_finite_float() {
-            Some(f) if f.is_nan() => serde_json::Value::String(".nan".to_owned()),
-            Some(f) if f > 0.0 => serde_json::Value::String(".inf".to_owned()),
-            Some(_) => serde_json::Value::String("-.inf".to_owned()),
-            None => scalar.to_serde_json(),
-        },
-    }
 }
 
 /// Escape every control byte (`< 0x20`, `0x7f`, including `\n`/`\t`/`\r`/`\x1b`)

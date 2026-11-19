@@ -12,9 +12,17 @@
 //!
 //! Per spec, an empty match list is NOT an error: stdout becomes `[]` and the
 //! exit code is 0.
+//!
+//! The query runs over the document's `serde_json::Value` (the only shape the
+//! crate takes), where a NaN or an infinity is the string `".nan"` /
+//! `".inf"` / `"-.inf"` — a filter compares it as that string. The matched
+//! nodes are then printed as the document's own values, so every output
+//! format writes a NaN, an infinity or a big number as `get` does.
 
+use std::collections::HashMap;
 use std::io::Write;
 
+use dq_core::Value;
 use jsonpath_rust::JsonPath;
 
 use super::io_helpers::{load_document_with_path, select_document};
@@ -42,18 +50,57 @@ pub fn run(
     let (_fmt, doc) = load_document_with_path(&args.file, input_format)?;
     // Same view as `get`: document 0 of a stream unless `--doc` says
     // otherwise; `--doc all` queries the array of every document.
-    let value = select_document(&doc, cli.doc, &args.file)?.to_serde_json();
+    let view = select_document(&doc, cli.doc, &args.file)?;
+    let json = view.to_serde_json();
 
-    let matched: Vec<serde_json::Value> = value
+    let matched = json
         .query(args.jsonpath.as_str())
-        .map_err(|e| anyhow::anyhow!("invalid JSONPath expression: {e}"))?
+        .map_err(|e| anyhow::anyhow!("invalid JSONPath expression: {e}"))?;
+    let mut nodes = HashMap::new();
+    index_nodes(&json, &view, &mut nodes);
+    let items = matched
         .into_iter()
-        .cloned()
+        .map(|node| match nodes.get(&node_address(node)) {
+            Some(value) => (*value).clone(),
+            // Every match is a node of `json`; kept total all the same.
+            None => Value::from_serde_json(node),
+        })
         .collect();
 
-    let arr = serde_json::Value::Array(matched);
-    reporter.report(&arr, out)?;
+    reporter.report_value(&Value::Array(items), out)?;
     Ok(())
+}
+
+/// The address of a node of the queried JSON — the key [`index_nodes`]
+/// files its document value under.
+fn node_address(node: &serde_json::Value) -> usize {
+    std::ptr::from_ref(node) as usize
+}
+
+/// File every node of `json` under its address, with the node of `value`
+/// it was made from: `json` is `value.to_serde_json()`, so the two trees
+/// have one shape (same keys in the same order, same array lengths).
+fn index_nodes<'v>(
+    json: &serde_json::Value,
+    value: &'v Value,
+    nodes: &mut HashMap<usize, &'v Value>,
+) {
+    nodes.insert(node_address(json), value);
+    match (json, value) {
+        (serde_json::Value::Array(json_items), Value::Array(items)) => {
+            for (json_item, item) in json_items.iter().zip(items) {
+                index_nodes(json_item, item, nodes);
+            }
+        }
+        (serde_json::Value::Object(json_map), Value::Map(map)) => {
+            for (key, member) in map {
+                if let Some(json_member) = json_map.get(key) {
+                    index_nodes(json_member, member, nodes);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]

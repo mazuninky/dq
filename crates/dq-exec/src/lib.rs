@@ -30,6 +30,9 @@ pub mod ruleset;
 /// M11 Phase 3: JSON Schema 2020-12 compilation + validation for the
 /// `Check::Schema` / `Check::SchemaFile` rule variants.
 pub(crate) mod schema_check;
+/// A `dq_core::Value` as a JSON Schema instance — NaN, infinities and big
+/// numbers stay numbers for the validator.
+pub(crate) mod schema_value;
 /// Mustache-style template renderer for `check.message` — `template::render`.
 pub mod template;
 /// `*.test.yml` fixture runner — `RuleTester::run_dir`.

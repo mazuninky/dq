@@ -228,7 +228,7 @@ pub(crate) fn run_composite(
         }
     };
     let array = match extract_outputs.as_slice() {
-        [serde_json::Value::Array(items)] => items,
+        [dq_core::Value::Array(items)] => items,
         [other] => {
             tracing::warn!(
                 rule_id = %outer_id,
@@ -299,15 +299,15 @@ fn process_extract_item(
     composite: &CompiledCompositeCheck,
     path: &Utf8Path,
     outer_ir: &dq_core::Ir<'_>,
-    item: &serde_json::Value,
+    item: &dq_core::Value,
     current_depth: usize,
     max_depth: usize,
     out: &mut Vec<Diagnostic>,
 ) {
     let outer_id = outer_rule.rule.id.as_str();
-    let map = match item.as_object() {
-        Some(m) => m,
-        None => {
+    let map = match item {
+        dq_core::Value::Map(m) => m,
+        _ => {
             tracing::warn!(
                 rule_id = %outer_id,
                 shape = %describe_value_shape(item),
@@ -323,7 +323,7 @@ fn process_extract_item(
             return;
         }
     };
-    let value_str = match map.get("value").and_then(|v| v.as_str()) {
+    let value_str = match map.get("value").and_then(as_str) {
         Some(s) => s,
         None => {
             out.push(error_diagnostic(
@@ -336,7 +336,7 @@ fn process_extract_item(
             return;
         }
     };
-    let format_str = match map.get("format").and_then(|v| v.as_str()) {
+    let format_str = match map.get("format").and_then(as_str) {
         Some(s) => s,
         None => {
             out.push(error_diagnostic(
@@ -349,7 +349,7 @@ fn process_extract_item(
             return;
         }
     };
-    let anchor_str = match map.get("anchor").and_then(|v| v.as_str()) {
+    let anchor_str = match map.get("anchor").and_then(as_str) {
         Some(s) => s,
         None => {
             out.push(error_diagnostic(
@@ -429,7 +429,6 @@ fn process_extract_item(
     // Build the inner IR from the parsed Document and run the nested
     // rule's evaluation. The nested rule is bounded by depth+1.
     let inner_ir = inner_doc.as_ir();
-    let inner_value = inner_ir.value().to_serde_json();
     let inner_format = parser.name();
 
     let mut inner_diags: Vec<Diagnostic> = Vec::new();
@@ -437,7 +436,6 @@ fn process_extract_item(
         &composite.nested,
         path,
         &inner_ir,
-        &inner_value,
         inner_format,
         current_depth + 1,
         max_depth,
@@ -592,16 +590,26 @@ fn error_diagnostic(
 }
 
 /// Short type-name string for `tracing::warn!` payloads. Uses a closed set
-/// of names so log lines stay grep-friendly; defaults to `"unknown"`
-/// for serde-json variants we never expect in this code path.
-fn describe_value_shape(v: &serde_json::Value) -> &'static str {
+/// of names (the JSON types) so log lines stay grep-friendly.
+fn describe_value_shape(v: &dq_core::Value) -> &'static str {
     match v {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "bool",
-        serde_json::Value::Number(_) => "number",
-        serde_json::Value::String(_) => "string",
-        serde_json::Value::Array(_) => "array",
-        serde_json::Value::Object(_) => "object",
+        dq_core::Value::Null => "null",
+        dq_core::Value::Bool(_) => "bool",
+        dq_core::Value::Int(_)
+        | dq_core::Value::BigInt(_)
+        | dq_core::Value::Float(_)
+        | dq_core::Value::BigFloat(_) => "number",
+        dq_core::Value::String(_) => "string",
+        dq_core::Value::Array(_) => "array",
+        dq_core::Value::Map(_) => "object",
+    }
+}
+
+/// The text of a string value; `None` for any other.
+fn as_str(v: &dq_core::Value) -> Option<&str> {
+    match v {
+        dq_core::Value::String(s) => Some(s),
+        _ => None,
     }
 }
 

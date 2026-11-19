@@ -114,14 +114,14 @@ mod plugins_enabled {
     /// `interface jq` host imports project from, plus the store-wide
     /// [`PluginLimiter`].
     pub(crate) struct HostState {
-        /// Pre-serialized JSON of the IR root. `interface ir`'s `get-root`
-        /// returns a clone of these bytes; `get-at` walks the underlying
-        /// `serde_json::Value` (parsed back from these bytes is wasteful, so
-        /// we keep the structured value alongside).
+        /// Pre-serialized JSON of the IR root ([`value_json`]).
+        /// `interface ir`'s `get-root` returns a clone of these bytes.
         ir_root_bytes: Vec<u8>,
-        /// Structured form of the IR root, used by `get-at` / `iterate` /
-        /// `jq::eval` for pointer-based projection.
-        ir_root_value: serde_json::Value,
+        /// The document's own value, used by `get-at` / `iterate` /
+        /// `jq::eval` for pointer-based projection. `jq::eval` runs over
+        /// it directly, so a NaN or an infinity is a jq number there and a
+        /// big number keeps its exact value.
+        ir_root: dq_core::Value,
         /// Format tag returned by `interface ir`'s `get-format-tag`.
         format_tag: String,
         /// Pool of compiled jq engines. `jq::compile` pushes a new engine
@@ -134,16 +134,12 @@ mod plugins_enabled {
 
     impl HostState {
         fn new(ir: &Ir<'_>) -> Self {
-            let ir_root_value = ir.value().to_serde_json();
-            // Serializing through `to_vec` is infallible for any
-            // `serde_json::Value`; if it ever fails we'd rather surface an
-            // empty payload than panic mid-invocation. Plugins receive an
-            // empty document in that case.
-            let ir_root_bytes = serde_json::to_vec(&ir_root_value).unwrap_or_default();
+            let ir_root = ir.value().clone();
+            let ir_root_bytes = value_json(&ir_root);
             let limits = PluginLimiter::new(MEMORY_LIMIT, TABLE_ELEMENTS_LIMIT);
             Self {
                 ir_root_bytes,
-                ir_root_value,
+                ir_root,
                 format_tag: ir.format().name().to_owned(),
                 jq_engines: Vec::new(),
                 limits,
@@ -168,23 +164,23 @@ mod plugins_enabled {
 
         fn get_at(&mut self, p: String) -> Option<Vec<u8>> {
             let pointer = Pointer::parse(&p).ok()?;
-            let sub = resolve_serde(&self.ir_root_value, &pointer)?;
-            serde_json::to_vec(sub).ok()
+            let sub = pointer.resolve(&self.ir_root).ok()?;
+            Some(value_json(sub))
         }
 
         fn iterate(&mut self, p: String) -> Vec<String> {
             let Ok(pointer) = Pointer::parse(&p) else {
                 return Vec::new();
             };
-            let Some(sub) = resolve_serde(&self.ir_root_value, &pointer) else {
+            let Ok(sub) = pointer.resolve(&self.ir_root) else {
                 return Vec::new();
             };
             match sub {
-                serde_json::Value::Object(map) => map
+                dq_core::Value::Map(map) => map
                     .keys()
                     .map(|k| pointer.with_segment(Segment::Key(k.clone())).as_canonical())
                     .collect(),
-                serde_json::Value::Array(items) => (0..items.len())
+                dq_core::Value::Array(items) => (0..items.len())
                     .map(|i| pointer.with_segment(Segment::Index(i)).as_canonical())
                     .collect(),
                 _ => Vec::new(),
@@ -216,19 +212,16 @@ mod plugins_enabled {
             input: String,
         ) -> std::result::Result<Vec<Vec<u8>>, String> {
             let pointer = Pointer::parse(&input).map_err(|e| format!("invalid pointer: {e}"))?;
-            let sub = resolve_serde(&self.ir_root_value, &pointer)
-                .ok_or_else(|| format!("pointer {input} did not resolve"))?
-                .clone();
+            let sub = pointer
+                .resolve(&self.ir_root)
+                .map_err(|_| format!("pointer {input} did not resolve"))?;
             let idx = usize::try_from(handle).map_err(|_| "invalid jq engine handle".to_owned())?;
             let engine = self
                 .jq_engines
                 .get(idx)
                 .ok_or_else(|| "invalid jq engine handle".to_owned())?;
-            let outputs = engine.run(&sub).map_err(|e| format!("{e}"))?;
-            outputs
-                .iter()
-                .map(|v| serde_json::to_vec(v).map_err(|e| format!("{e}")))
-                .collect()
+            let outputs = engine.run_value(sub).map_err(|e| format!("{e}"))?;
+            Ok(outputs.iter().map(value_json).collect())
         }
     }
 
@@ -483,29 +476,15 @@ mod plugins_enabled {
         call(store).map_err(|e| classify_trap_error(&e, rule_id, store.data().memory_limit_hit()))
     }
 
-    /// Walk `value` along `pointer`, returning the addressed sub-value.
-    ///
-    /// Mirrors [`Pointer::resolve`] but operates on a `serde_json::Value`
-    /// (the pre-converted IR root we keep in [`HostState`]). Returns
-    /// `None` for unmapped pointers, type mismatches, or out-of-bounds
-    /// indices.
-    fn resolve_serde<'a>(
-        value: &'a serde_json::Value,
-        pointer: &Pointer,
-    ) -> Option<&'a serde_json::Value> {
-        let mut current = value;
-        for seg in pointer.segments() {
-            current = match (current, seg) {
-                (serde_json::Value::Object(map), Segment::Key(k)) => map.get(k)?,
-                (serde_json::Value::Array(items), Segment::Index(i)) => items.get(*i)?,
-                (serde_json::Value::Array(items), Segment::Key(k)) => {
-                    let idx: usize = k.parse().ok()?;
-                    items.get(idx)?
-                }
-                _ => return None,
-            };
-        }
-        Some(current)
+    /// A value as the JSON a plugin reads (`get-root`, `get-at`, the
+    /// outputs of `jq::eval`): [`dq_core::Value::to_serde_json`], so a big
+    /// number is a JSON number with its exact value, and a NaN or an
+    /// infinity — which JSON has no number for — is the string `".nan"`,
+    /// `".inf"` or `"-.inf"`, whatever format the document came from.
+    fn value_json(value: &dq_core::Value) -> Vec<u8> {
+        // Infallible for a `serde_json::Value`; an empty payload beats a
+        // panic mid-invocation if it ever fails.
+        serde_json::to_vec(&value.to_serde_json()).unwrap_or_default()
     }
 
     /// Returns `true` when `name` identifies a WASI host import the
@@ -721,21 +700,55 @@ mod plugins_enabled {
         }
 
         #[test]
-        fn resolve_serde_walks_objects_and_arrays() {
-            let v: serde_json::Value = serde_json::json!({
-                "a": [1, 2, {"b": "c"}],
-            });
-            let p = Pointer::parse("/a/2/b").expect("/a/2/b parses");
-            assert_eq!(
-                resolve_serde(&v, &p),
-                Some(&serde_json::Value::String("c".to_owned()))
+        fn host_state_spells_non_finite_and_big_numbers_one_way() {
+            use bindings::dq::plugin::ir::Host as _;
+            use bindings::dq::plugin::jq::Host as _;
+            use dq_core::FormatTag;
+            use dq_core::ProvenanceMap;
+            let value = Value::Map(
+                [
+                    ("t".to_owned(), Value::Float(f64::NAN)),
+                    ("y".to_owned(), Value::BigFloat(".NaN".into())),
+                    ("i".to_owned(), Value::Float(f64::NEG_INFINITY)),
+                    ("b".to_owned(), Value::BigInt("18446744073709551616".into())),
+                ]
+                .into_iter()
+                .collect(),
             );
-            // Out-of-bounds index returns None (does not panic).
-            let p_oob = Pointer::parse("/a/9").expect("/a/9 parses");
-            assert!(resolve_serde(&v, &p_oob).is_none());
-            // Type mismatch (string keyed into a non-object) returns None.
-            let p_bad = Pointer::parse("/a/0/x").expect("/a/0/x parses");
-            assert!(resolve_serde(&v, &p_bad).is_none());
+            let prov = ProvenanceMap::new();
+            let ir = Ir::new(&value, &prov, FormatTag::Toml);
+            let mut state = HostState::new(&ir);
+            let text = |bytes: Vec<u8>| String::from_utf8(bytes).expect("utf-8");
+            assert_eq!(
+                text(state.get_root()),
+                r#"{"t":".nan","y":".nan","i":"-.inf","b":18446744073709551616}"#
+            );
+            assert_eq!(
+                state.get_at("/t".into()).map(text).as_deref(),
+                Some(r#"".nan""#)
+            );
+            assert_eq!(state.get_at("/x".into()), None);
+            let handle = state
+                .compile("[type, isnan, isinfinite]".into())
+                .expect("compiles");
+            for (pointer, out) in [
+                ("/t", r#"["number",true,false]"#),
+                ("/y", r#"["number",true,false]"#),
+                ("/i", r#"["number",false,true]"#),
+                ("/b", r#"["number",false,false]"#),
+            ] {
+                let got = state.eval(handle, pointer.into()).expect("eval");
+                assert_eq!(
+                    got.into_iter().map(text).collect::<Vec<_>>(),
+                    [out],
+                    "{pointer}"
+                );
+            }
+            let handle = state.compile(".".into()).expect("compiles");
+            let got = state.eval(handle, "/b".into()).expect("eval");
+            assert_eq!(text(got[0].clone()), "18446744073709551616");
+            let got = state.eval(handle, "/t".into()).expect("eval");
+            assert_eq!(text(got[0].clone()), r#"".nan""#);
         }
 
         #[test]

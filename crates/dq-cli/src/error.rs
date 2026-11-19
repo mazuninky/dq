@@ -163,6 +163,32 @@ pub struct DocOutOfRangeEverywhere {
     pub files: usize,
 }
 
+/// The pointer addresses a node of a type the command cannot read: `keys`
+/// or `values` on a scalar, `len` on a number, a bool or null. Maps to exit
+/// code 1 (`GENERIC`): the node is there (not exit 2), it is the wrong
+/// kind of node for the question.
+#[derive(Debug, thiserror::Error)]
+#[error("cannot {action} {}: it is {found}, not {expected}", node(pointer))]
+pub struct WrongType {
+    /// What the command does, as a verb phrase: `"list the keys of"`.
+    pub action: &'static str,
+    /// The canonical pointer of the node (`""` for the document root).
+    pub pointer: String,
+    /// The node's type, as `dq type` names it.
+    pub found: &'static str,
+    /// The types the command reads: `"object or array"`.
+    pub expected: &'static str,
+}
+
+/// `'/a/b'`, or `the document root` for the empty pointer.
+fn node(pointer: &str) -> String {
+    if pointer.is_empty() {
+        "the document root".to_owned()
+    } else {
+        format!("'{pointer}'")
+    }
+}
+
 /// `" (0..=N)"` — the valid `--doc` indices for `count` documents.
 fn index_hint(count: usize) -> String {
     match count {

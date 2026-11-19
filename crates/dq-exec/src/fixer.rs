@@ -678,10 +678,7 @@ fn rule_applies_to(
                 let Some(first) = out.first() else {
                     return false;
                 };
-                if matches!(
-                    first,
-                    serde_json::Value::Bool(false) | serde_json::Value::Null
-                ) {
+                if !crate::evaluator::is_truthy(first) {
                     return false;
                 }
             }

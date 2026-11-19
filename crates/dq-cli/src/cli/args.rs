@@ -389,9 +389,9 @@ pub enum Command {
     Get(GetArgs),
     /// Test whether a JSON Pointer addresses an existing node (silent on success).
     Exists(ExistsArgs),
-    /// List the keys of an object.
+    /// List the keys of an object, or the indices of an array.
     Keys(KeysArgs),
-    /// List the values of an object.
+    /// List the values of an object, or the items of an array.
     Values(ValuesArgs),
     /// Print the length of an array, string, or object.
     Len(LenArgs),

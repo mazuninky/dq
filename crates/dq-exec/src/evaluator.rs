@@ -330,20 +330,17 @@ impl Evaluator {
         ir: &dq_core::Ir<'_>,
         format_name: &str,
     ) -> Vec<Diagnostic> {
-        // Convert once at the boundary: the JSON Schema validator
-        // consumes `serde_json::Value`, so we materialise it here. The
-        // jq engines run over `ir.value()` directly (see
-        // [`run_on_document`]); the `Ir` is forwarded into per-rule helpers
-        // so they also retain access to [`dq_core::Ir::line_col_for`] for
-        // `loc.pointer` resolution.
-        let value = ir.value().to_serde_json();
+        // The jq engines and the JSON Schema validator both run over
+        // `ir.value()` itself (see [`run_on_document`] and
+        // [`crate::schema_value`]); the `Ir` also gives the per-rule
+        // helpers [`dq_core::Ir::line_col_for`] for `loc.pointer`
+        // resolution.
         let mut diagnostics = Vec::new();
         for rule in &self.rules {
             evaluate_one_rule_at_depth(
                 rule,
                 path,
                 ir,
-                &value,
                 format_name,
                 0,
                 self.max_extract_depth,
@@ -539,15 +536,11 @@ fn compile_check(
     }
 }
 
-/// Run the per-rule pipeline against `(path, ir, value, format_name)` and
+/// Run the per-rule pipeline against `(path, ir, format_name)` and
 /// push any resulting diagnostics into `out`. `current_depth` /
 /// `max_depth` carry the composite-recursion budget so a `Composite`
 /// dispatch can recurse into its `nested` rule and trip the bound
-/// without crashing.
-///
-/// `value` is the result of `ir.value().to_serde_json()` — pre-computed
-/// once per file by the caller for the JSON Schema check. The jq engines
-/// run over `ir.value()` itself (see [`run_on_document`]).
+/// without crashing. Every check runs over `ir.value()` itself.
 ///
 /// Crate-internal: [`crate::composite::run_composite`] re-enters this
 /// helper on the `nested` rule with `current_depth + 1`, so the composite
@@ -558,7 +551,6 @@ pub(crate) fn evaluate_one_rule_at_depth(
     rule: &CompiledRule,
     path: &Utf8Path,
     ir: &dq_core::Ir<'_>,
-    value: &serde_json::Value,
     format_name: &str,
     current_depth: usize,
     max_depth: usize,
@@ -583,10 +575,7 @@ pub(crate) fn evaluate_one_rule_at_depth(
                 let Some(first) = out.first() else {
                     return;
                 };
-                if matches!(
-                    first,
-                    serde_json::Value::Bool(false) | serde_json::Value::Null
-                ) {
+                if !is_truthy(first) {
                     return;
                 }
             }
@@ -620,7 +609,7 @@ pub(crate) fn evaluate_one_rule_at_depth(
             }
         }
         CompiledCheck::Schema(compiled) => {
-            run_schema_check(rule, compiled, path, ir, value, out);
+            run_schema_check(rule, compiled, path, ir, out);
         }
         CompiledCheck::Composite(compiled) => {
             run_composite(rule, compiled, path, ir, current_depth, max_depth, out);
@@ -633,19 +622,23 @@ pub(crate) fn evaluate_one_rule_at_depth(
 ///
 /// The document goes to jq as a [`dq_core::Value`], so a NaN or an
 /// infinity in the file is a jq number there (`type == "number"`,
-/// `isnan`), not the string `serde_json::Value` would make of it. The
-/// outputs come back through [`dq_core::Value::to_serde_json`], which
-/// spells a non-finite float as a string — they only feed messages,
-/// `loc.*` expressions and truthiness checks.
+/// `isnan`), not the string `serde_json::Value` would make of it, and a
+/// big number keeps its exact literal. The outputs stay
+/// [`dq_core::Value`]s for the same reason: they feed `loc.*`
+/// expressions, messages, `extract:` items and truthiness checks, and a
+/// NaN a check returns is a number for `loc.*` too.
 pub(crate) fn run_on_document(
     engine: &JqEngine,
     value: &dq_core::Value,
-) -> std::result::Result<Vec<serde_json::Value>, dq_transform::JqError> {
-    Ok(engine
-        .run_value(value)?
-        .iter()
-        .map(dq_core::Value::to_serde_json)
-        .collect())
+) -> std::result::Result<Vec<dq_core::Value>, dq_transform::JqError> {
+    engine.run_value(value)
+}
+
+/// jq truthiness: everything but `false` and `null` holds. The first
+/// output of a `match.filter` (or a fix's gate) must hold for the rule to
+/// run.
+pub(crate) fn is_truthy(value: &dq_core::Value) -> bool {
+    !matches!(value, dq_core::Value::Bool(false) | dq_core::Value::Null)
 }
 
 /// Render a diagnostic for one jq-driven violation value.
@@ -653,7 +646,7 @@ fn build_jq_diagnostic(
     rule: &CompiledRule,
     path: &Utf8Path,
     ir: &dq_core::Ir<'_>,
-    violation: &serde_json::Value,
+    violation: &dq_core::Value,
     message_template: &str,
 ) -> Diagnostic {
     let message = template::render(message_template, violation);
@@ -684,17 +677,21 @@ fn build_jq_diagnostic(
 /// `loc.file`, `loc.pointer`, and `loc.line` overrides on the rule are
 /// honored via the same [`resolve_loc_file`] / [`resolve_loc_position`]
 /// helpers that the jq path uses. The `violation` argument passed to
-/// those helpers is the JSON value at the schema error's
+/// those helpers is the document's value at the schema error's
 /// `instance_path` (or `Null` when the pointer is unresolvable), so any
 /// jq expressions in the `loc.*` fields run against meaningful context.
+///
+/// The validator reads `ir.value()` through [`crate::schema_value`]: a
+/// NaN, an infinity and a big number are numbers to it, and its messages
+/// spell them `.nan` / `.inf` / `-.inf` / the exact literal.
 fn run_schema_check(
     rule: &CompiledRule,
     compiled: &CompiledSchemaCheck,
     path: &Utf8Path,
     ir: &dq_core::Ir<'_>,
-    value: &serde_json::Value,
     out: &mut Vec<Diagnostic>,
 ) {
+    let value = ir.value();
     // Dedup key per `run_schema_check` invocation. JSON Schemas may
     // declare the same constraint at multiple schema locations
     // (e.g. a top-level `required` plus an `allOf`/`oneOf` subschema
@@ -707,14 +704,17 @@ fn run_schema_check(
     // because two legitimately-distinct rules can produce the same
     // `(instance_path, error_text)` against the same file.
     let mut seen: IndexSet<(String, String, String)> = IndexSet::new();
-    for error in compiled.validator.iter_errors(value) {
+    for error in compiled
+        .validator
+        .iter_errors(crate::schema_value::DqNode(value))
+    {
         let pointer_str = error.instance_path().as_str();
         // The validator's error text (without the schema_path prefix)
         // is what the user sees as the actual violation. Use it for
         // dedup so duplicates at different `schema_path` locations
         // collapse, while distinct violations at the same path
         // (different `error_text`) are preserved.
-        let error_text = error.to_string();
+        let error_text = crate::schema_value::restore(&error.to_string()).into_owned();
         let dedup_key = (
             rule.rule.id.clone(),
             pointer_str.to_owned(),
@@ -726,12 +726,11 @@ fn run_schema_check(
 
         // Lift the offending sub-value out of the document so any
         // `loc.*` jq expressions run against the same shape an
-        // equivalent jq check would have produced. `serde_json::Value::pointer`
-        // accepts the same RFC 6901 string the validator produced.
-        let violation = value
-            .pointer(pointer_str)
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
+        // equivalent jq check would have produced.
+        let violation = Pointer::parse(pointer_str)
+            .ok()
+            .and_then(|pointer| pointer.resolve(value).ok().cloned())
+            .unwrap_or(dq_core::Value::Null);
         let file = resolve_loc_file(rule, path, &violation);
         let (line, col) = if rule.has_position_override() {
             // The user opted into overrides; trust whatever the chain
@@ -785,12 +784,12 @@ fn run_schema_check(
 fn resolve_loc_file(
     rule: &CompiledRule,
     path: &Utf8Path,
-    violation: &serde_json::Value,
+    violation: &dq_core::Value,
 ) -> Option<Utf8PathBuf> {
     if let Some(engine) = rule.loc_file_engine.as_ref() {
-        match engine.run(violation) {
+        match engine.run_value(violation) {
             Ok(out) => {
-                if let Some(serde_json::Value::String(s)) = out.first()
+                if let Some(dq_core::Value::String(s)) = out.first()
                     && !s.is_empty()
                 {
                     return Some(Utf8PathBuf::from(s));
@@ -834,14 +833,14 @@ fn resolve_loc_file(
 fn resolve_loc_position(
     rule: &CompiledRule,
     ir: &dq_core::Ir<'_>,
-    violation: &serde_json::Value,
+    violation: &dq_core::Value,
 ) -> (u32, u32) {
     // Step 1: loc.pointer.
     if let Some(engine) = rule.loc_pointer_engine.as_ref() {
-        match engine.run(violation) {
+        match engine.run_value(violation) {
             Ok(out) => {
                 if let Some(first) = out.first() {
-                    if let serde_json::Value::String(s) = first
+                    if let dq_core::Value::String(s) = first
                         && !s.is_empty()
                     {
                         match Pointer::parse(s) {
@@ -903,32 +902,18 @@ fn resolve_loc_position(
 
     // Step 2: loc.line (M8 legacy path).
     if let Some(engine) = rule.loc_line_engine.as_ref() {
-        match engine.run(violation) {
+        match engine.run_value(violation) {
             Ok(out) => {
-                if let Some(first) = out.first() {
-                    if let Some(n) = first.as_u64()
-                        && n >= 1
-                        && n <= u64::from(u32::MAX)
-                    {
-                        let line = u32::try_from(n).unwrap_or(1);
-                        tracing::trace!(
-                            rule_id = %rule.rule.id,
-                            line,
-                            "loc.line legacy path resolved",
-                        );
-                        return (line, 1);
-                    } else if let Some(n) = first.as_i64()
-                        && n >= 1
-                        && n <= i64::from(u32::MAX)
-                    {
-                        let line = u32::try_from(n).unwrap_or(1);
-                        tracing::trace!(
-                            rule_id = %rule.rule.id,
-                            line,
-                            "loc.line legacy path resolved",
-                        );
-                        return (line, 1);
-                    }
+                if let Some(dq_core::Value::Int(n)) = out.first()
+                    && let Ok(line) = u32::try_from(*n)
+                    && line >= 1
+                {
+                    tracing::trace!(
+                        rule_id = %rule.rule.id,
+                        line,
+                        "loc.line legacy path resolved",
+                    );
+                    return (line, 1);
                 }
             }
             Err(err) => {
@@ -1026,6 +1011,60 @@ check:
         let diags = eval.evaluate_file(&Utf8PathBuf::from("doc.yaml"), &doc.as_ir(), "yaml");
         let messages: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
         assert_eq!(messages, ["x is a NaN number"]);
+    }
+
+    #[test]
+    fn loc_runs_over_a_violation_nan_as_a_number() {
+        // The violation is the NaN itself; `loc.pointer` / `loc.file` /
+        // `loc.line` see a jq number, so `isnan` holds instead of raising
+        // on the string a serde_json copy made of it.
+        let rule = r#"
+id: test.loc-nan
+description: x
+severity: error
+match:
+  format: yaml
+check:
+  jq: '.x | select(isnan)'
+  message: 'x is {{ . }}'
+loc:
+  pointer: 'if isnan then "/x" else "/nope" end'
+  file: 'if isnan then "nan.yaml" else "other.yaml" end'
+"#;
+        let eval = evaluator_from_yaml(rule);
+        let doc = dq_core::parse_yaml_with_spans(b"a: 1\nx: .nan\n").expect("parse yaml");
+        let diags = eval.evaluate_file(&Utf8PathBuf::from("doc.yaml"), &doc.as_ir(), "yaml");
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].message, "x is .nan");
+        assert_eq!((diags[0].line, diags[0].col), (2, 4));
+        assert_eq!(diags[0].file.as_deref(), Some(Utf8Path::new("nan.yaml")));
+    }
+
+    #[test]
+    fn schema_check_reads_a_yaml_nan_as_a_number() {
+        let rule = r#"
+id: test.schema-nan
+description: x
+severity: error
+match:
+  format: yaml
+check:
+  schema:
+    properties:
+      n: { type: number }
+      s: { type: string }
+loc:
+  line: 'if isnan then 7 else 9 end'
+"#;
+        let eval = evaluator_from_yaml(rule);
+        let doc = dq_core::parse_yaml_with_spans(b"n: .nan\ns: -.inf\n").expect("parse yaml");
+        let diags = eval.evaluate_file(&Utf8PathBuf::from("doc.yaml"), &doc.as_ir(), "yaml");
+        let messages: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            [r#"/properties/s/type: -.inf is not of type "string""#]
+        );
+        assert_eq!(diags[0].line, 9, "loc.line ran over the -.inf: not a NaN");
     }
 
     #[test]

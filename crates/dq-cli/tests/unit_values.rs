@@ -1,7 +1,8 @@
 //! Unit tests for `dq values` driven through `dq::run`.
 //!
-//! Spec contract: lists values of an object, returns Path/TypeMismatch when
-//! the pointer addresses a non-object node. JSON output is a JSON array.
+//! Spec contract: lists the values of an object or the items of an array,
+//! returns `WrongType` (exit 1) when the pointer addresses a scalar. JSON
+//! output is a JSON array.
 
 use std::io::Write as _;
 
@@ -32,22 +33,31 @@ fn values_emits_one_per_line_in_source_order() {
 }
 
 #[test]
-fn values_against_array_returns_type_mismatch() {
-    let tmp = write_yaml("- 1\n- 2\n");
+fn values_against_array_lists_its_items() {
+    let tmp = write_yaml("- 1\n- [2, 3]\n");
     let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "values", path, "", "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
-    let e = dq::run(&cli, false, &mut out, &mut err).expect_err("values on array must error");
-    let domain = e.downcast_ref::<dq_core::Error>().unwrap();
-    assert_eq!(domain.kind_name(), "path");
-    match domain {
-        dq_core::Error::Path { kind, .. } => assert!(
-            matches!(kind, dq_core::PathErrorKind::TypeMismatch { .. }),
-            "expected TypeMismatch, got {kind:?}"
-        ),
-        _ => panic!(),
-    }
+    dq::run(&cli, false, &mut out, &mut err).expect("values on an array lists its items");
+    assert_eq!(String::from_utf8(out).unwrap(), "1\n[2, 3]\n");
+}
+
+#[test]
+fn values_against_scalar_is_a_wrong_type_error() {
+    let tmp = write_yaml("a: hi\n");
+    let path = tmp.to_str().unwrap();
+    let cli = Cli::parse_from(["dq", "values", path, "/a", "--no-color"]);
+    let mut out: Vec<u8> = Vec::new();
+    let mut err: Vec<u8> = Vec::new();
+    let e = dq::run(&cli, false, &mut out, &mut err).expect_err("values on a scalar must error");
+    let wrong = e.downcast_ref::<dq::WrongType>().expect("WrongType");
+    assert_eq!(wrong.found, "string");
+    assert_eq!(
+        e.to_string(),
+        "cannot list the values of '/a': it is string, not an object or an array"
+    );
+    assert_eq!(dq::exit_code::exit_code_for_error(&e), 1);
 }
 
 #[test]

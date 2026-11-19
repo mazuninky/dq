@@ -163,12 +163,14 @@ pub trait Reporter {
     /// error (e.g. TOML cannot represent a top-level scalar).
     fn report(&self, value: &serde_json::Value, w: &mut dyn Write) -> anyhow::Result<()>;
 
-    /// Write a [`dq_core::Value`] to `w` — the shape `query` results come
-    /// in, which may hold a NaN or an infinity no `serde_json::Value` can.
+    /// Write a [`dq_core::Value`] to `w` — the shape the values `get`,
+    /// `values`, `select` and `query` print come in, which may hold a NaN
+    /// or an infinity no `serde_json::Value` can.
     ///
     /// The default renders [`dq_core::Value::to_serde_json`], which spells
-    /// a non-finite float as a string; a reporter whose format has (YAML,
-    /// TOML) or forbids (JSON) such a number overrides it.
+    /// a non-finite float `.nan` / `.inf` / `-.inf` (console, TOON); a
+    /// reporter whose format has (YAML, TOML) or forbids (JSON, JSONL) such
+    /// a number overrides it.
     ///
     /// # Errors
     ///

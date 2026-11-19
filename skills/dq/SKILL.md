@@ -82,11 +82,13 @@ dq get post.md /frontmatter/value/title                  # Markdown frontmatter 
 
 # Pointer-style metadata
 dq paths values.yaml | head -20
-dq keys deploy.yaml /spec
-dq values deploy.yaml /metadata/labels
+dq keys deploy.yaml /spec                                 # an array gives its indices 0, 1, …
+dq values deploy.yaml /metadata/labels                    # an array gives its items
 dq len deploy.yaml /spec/template/spec/containers
 dq type deploy.yaml /spec/replicas                        # int / string / array / object / null / bool
 dq exists deploy.yaml /spec/foo                           # exit 0 if present, 2 otherwise
+# keys / values on a scalar, len on a number / bool / null → exit 1 (wrong type), not exit 2
+# NaN / infinity print as .nan / .inf / -.inf (console, YAML, TOON), nan / inf (TOML), exit 1 in JSON
 
 # JSONPath — multi-match queries (RFC 9535)
 dq select kustomize.yaml '$.resources[*].name'
@@ -246,7 +248,7 @@ Full matrix, write-mode semantics, and pointer prefixes per format: [references/
 | Code | Meaning                                                                 |
 |-----:|-------------------------------------------------------------------------|
 |    0 | Success.                                                                |
-|    1 | Generic failure (`--check` saw pending changes; JSON Patch `test` op failed; `lint --strict` saw a warn; `convert`, `query` or `set --jq` cannot write a value in the output format, e.g. NaN/Infinity in JSON). |
+|    1 | Generic failure (`--check` saw pending changes; JSON Patch `test` op failed; `lint --strict` saw a warn; a read command, `convert` or `set --jq` cannot write a value in the output format, e.g. NaN/Infinity in JSON; `keys` / `values` / `len` on a node of the wrong type). |
 |    2 | NOT_FOUND — JSON Pointer addressed a node that does not exist, or `--doc N` a document the file lacks; also clap usage errors (incl. `--doc` on a command that cannot honour it). |
 |    3 | PARSE_ERROR — input failed format parsing (or templated file without `--raw-template-strings`). |
 |    4 | LINT_FAIL / VALIDATE_FAIL — `lint` produced an error-severity diagnostic, or `validate` saw a parse error. |

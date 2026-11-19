@@ -55,7 +55,7 @@ use dq_plugin::PluginError;
 
 use crate::error::{
     BulkPartialFailure, CheckPending, DocOutOfRange, DocOutOfRangeEverywhere, InvalidInput,
-    LintFail, LintWarnStrict, ValidateFail,
+    LintFail, LintWarnStrict, ValidateFail, WrongType,
 };
 
 /// Successful exit.
@@ -123,6 +123,11 @@ pub fn exit_code_for_error(err: &anyhow::Error) -> i32 {
     // `--continue-on-error` aggregator — at least one file in the run
     // failed to write, so we surface the standard write-failure code.
     if err.downcast_ref::<CheckPending>().is_some() {
+        return GENERIC;
+    }
+    // `keys` / `values` / `len` on a node of the wrong type: the node is
+    // there, so not NOT_FOUND.
+    if err.downcast_ref::<WrongType>().is_some() {
         return GENERIC;
     }
     if err.downcast_ref::<BulkPartialFailure>().is_some() {

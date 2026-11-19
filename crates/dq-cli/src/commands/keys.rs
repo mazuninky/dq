@@ -1,4 +1,5 @@
-//! `dq keys FILE POINTER` — list the keys of the addressed object.
+//! `dq keys FILE POINTER` — list the keys of the addressed object, or the
+//! indices of the addressed array (`0`, `1`, … — the keys a pointer takes).
 //!
 //! Output shape:
 //! - Console: one key per line (handled by [`crate::output::ConsoleReporter`]
@@ -6,9 +7,8 @@
 //! - JSON: a JSON array of strings — also produced by passing the same array
 //!   to the reporter; [`crate::output::JsonReporter`] pretty-prints it.
 //!
-//! When the pointer addresses a non-object value, the handler returns
-//! `dq_core::Error::Path { kind: TypeMismatch, .. }` so the exit-code mapper
-//! can route it.
+//! When the pointer addresses a scalar, the handler returns [`WrongType`]
+//! (exit 1).
 
 use std::io::Write;
 
@@ -16,6 +16,7 @@ use dq_core::{Pointer, Value};
 
 use super::io_helpers::{load_document_with_path, select_document};
 use crate::cli::{Cli, KeysArgs};
+use crate::error::WrongType;
 use crate::output::Reporter;
 
 /// Run the `keys` command.
@@ -24,8 +25,8 @@ use crate::output::Reporter;
 ///
 /// - [`crate::error::InvalidInput`] (exit 6) when any write-mode flag
 ///   (`-i`, `--diff`, `--backup`) is set — `keys` is a read subcommand.
-/// - `dq_core::Error::Path` when the pointer is invalid, missing, or the
-///   resolved node is not an object — the latter via `kind = TypeMismatch`.
+/// - `dq_core::Error::Path` when the pointer is invalid or missing.
+/// - [`WrongType`] (exit 1) when the resolved node is a scalar.
 /// - `dq_core::Error::Io` / `Parse` / `UnsupportedFormat` for the usual
 ///   I/O and parse failures.
 pub fn run(
@@ -41,22 +42,22 @@ pub fn run(
     let view = select_document(&doc, doc_arg, &args.file)?;
     let pointer = Pointer::parse(&args.pointer).map_err(anyhow::Error::new)?;
     let value = pointer.resolve(view.as_ref()).map_err(anyhow::Error::new)?;
-    let Value::Map(map) = value else {
-        return Err(anyhow::Error::new(dq_core::Error::Path {
-            pointer: pointer.as_canonical(),
-            matched_prefix: pointer.as_canonical(),
-            kind: dq_core::PathErrorKind::TypeMismatch {
-                expected: "object",
-                found: value.type_name(),
-            },
-            did_you_mean: Vec::new(),
-        }));
+    let keys: Vec<serde_json::Value> = match value {
+        Value::Map(map) => map
+            .keys()
+            .map(|k| serde_json::Value::String(k.clone()))
+            .collect(),
+        Value::Array(items) => (0..items.len()).map(serde_json::Value::from).collect(),
+        scalar => {
+            return Err(anyhow::Error::new(WrongType {
+                action: "list the keys of",
+                pointer: pointer.as_canonical(),
+                found: scalar.type_name(),
+                expected: "an object or an array",
+            }));
+        }
     };
-    let array: Vec<serde_json::Value> = map
-        .keys()
-        .map(|k| serde_json::Value::String(k.clone()))
-        .collect();
-    reporter.report(&serde_json::Value::Array(array), out)?;
+    reporter.report(&serde_json::Value::Array(keys), out)?;
     Ok(())
 }
 
@@ -99,7 +100,7 @@ mod tests {
     }
 
     #[test]
-    fn keys_rejects_non_object_pointer() {
+    fn keys_rejects_a_scalar() {
         let tmp = write_yaml("a: 1\n");
         let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = cli_no_flags(path.as_str());
@@ -110,14 +111,8 @@ mod tests {
         let reporter = ConsoleReporter::new(false);
         let mut out: Vec<u8> = Vec::new();
         let err = run(&cli, &args, None, None, &reporter, &mut out).unwrap_err();
-        let domain = err.downcast_ref::<dq_core::Error>().unwrap();
-        assert_eq!(domain.kind_name(), "path");
-        match domain {
-            dq_core::Error::Path { kind, .. } => {
-                assert!(matches!(kind, dq_core::PathErrorKind::TypeMismatch { .. }))
-            }
-            _ => panic!("expected Path"),
-        }
+        let wrong = err.downcast_ref::<WrongType>().expect("WrongType");
+        assert_eq!((wrong.pointer.as_str(), wrong.found), ("/a", "int"));
     }
 
     #[test]

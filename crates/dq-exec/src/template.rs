@@ -13,6 +13,10 @@
 //! - `{{ .a.b }}` — nested object lookup.
 //! - `{{ .arr.0 }}` — array index by integer literal.
 //!
+//! A NaN or an infinity renders `.nan` / `.inf` / `-.inf`, bare, also
+//! inside compact JSON (`{"x":.nan}`); a big number renders its exact
+//! literal.
+//!
 //! Unknown paths render as the literal `<missing>` instead of erroring —
 //! this is the documented contract so rules can reference optional fields
 //! without crashing the run.
@@ -32,7 +36,7 @@
 /// verbatim. An unterminated `{{` (no matching `}}`) is treated as
 /// literal text and copied through unchanged.
 #[must_use]
-pub fn render(template: &str, value: &serde_json::Value) -> String {
+pub fn render(template: &str, value: &dq_core::Value) -> String {
     let mut out = String::with_capacity(template.len());
     let mut cursor = 0;
     let bytes = template.as_bytes();
@@ -82,7 +86,7 @@ pub fn render(template: &str, value: &serde_json::Value) -> String {
 ///
 /// Non-conforming paths (`..`, `.`, `field` without leading dot, mixed
 /// separators) return `None` rather than panicking.
-fn lookup<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+fn lookup<'a>(value: &'a dq_core::Value, path: &str) -> Option<&'a dq_core::Value> {
     if !path.starts_with('.') {
         return None;
     }
@@ -100,11 +104,11 @@ fn lookup<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json
         if !is_valid_segment(segment) {
             return None;
         }
-        if let Ok(index) = segment.parse::<usize>() {
-            current = current.as_array()?.get(index)?;
-        } else {
-            current = current.as_object()?.get(segment)?;
-        }
+        current = match current {
+            dq_core::Value::Array(items) => items.get(segment.parse::<usize>().ok()?)?,
+            dq_core::Value::Map(map) if segment.parse::<usize>().is_err() => map.get(segment)?,
+            _ => return None,
+        };
     }
     Some(current)
 }
@@ -126,12 +130,51 @@ fn is_valid_segment(segment: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Render a JSON value for interpolation: strings become their bare
-/// content; everything else is rendered as compact JSON.
-fn render_value(v: &serde_json::Value) -> String {
+/// Render a value for interpolation: strings become their bare
+/// content; everything else is rendered as compact JSON, a NaN or an
+/// infinity as `.nan` / `.inf` / `-.inf`.
+fn render_value(v: &dq_core::Value) -> String {
     match v {
-        serde_json::Value::String(s) => s.clone(),
-        other => serde_json::to_string(other).unwrap_or_else(|_| String::new()),
+        dq_core::Value::String(s) => s.clone(),
+        other => {
+            let mut out = String::new();
+            write_compact(other, &mut out);
+            out
+        }
+    }
+}
+
+/// Compact JSON of `v`, with a NaN or an infinity spelled bare
+/// (`.nan`), as dq writes one where JSON has no number.
+fn write_compact(v: &dq_core::Value, out: &mut String) {
+    if let Some(spelling) = v.non_finite_spelling() {
+        out.push_str(spelling);
+        return;
+    }
+    match v {
+        dq_core::Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_compact(item, out);
+            }
+            out.push(']');
+        }
+        dq_core::Value::Map(map) => {
+            out.push('{');
+            for (i, (key, member)) in map.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&serde_json::Value::String(key.clone()).to_string());
+                out.push(':');
+                write_compact(member, out);
+            }
+            out.push('}');
+        }
+        scalar => out.push_str(&scalar.to_serde_json().to_string()),
     }
 }
 
@@ -140,6 +183,34 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+
+    /// [`super::render`] over the `dq_core::Value` of a JSON value.
+    fn render(template: &str, value: &serde_json::Value) -> String {
+        super::render(template, &dq_core::Value::from_serde_json(value))
+    }
+
+    #[test]
+    fn non_finite_and_big_numbers_render_as_dq_writes_them() {
+        let doc = dq_core::Value::Map(indexmap::IndexMap::from([
+            ("x".to_owned(), dq_core::Value::Float(f64::NAN)),
+            (
+                "y".to_owned(),
+                dq_core::Value::Array(vec![
+                    dq_core::Value::BigFloat("-.Inf".into()),
+                    dq_core::Value::BigInt("18446744073709551616".into()),
+                ]),
+            ),
+        ]));
+        assert_eq!(super::render("{{ .x }}", &doc), ".nan");
+        assert_eq!(
+            super::render("{{ .y.0 }} {{ .y.1 }}", &doc),
+            "-.inf 18446744073709551616"
+        );
+        assert_eq!(
+            super::render("{{ . }}", &doc),
+            r#"{"x":.nan,"y":[-.inf,18446744073709551616]}"#
+        );
+    }
 
     #[test]
     fn no_markers_returns_template_unchanged() {
@@ -258,7 +329,7 @@ mod tests {
 
     #[test]
     fn lookup_helper_returns_none_for_invalid_paths() {
-        let value = json!({"a": 1});
+        let value = dq_core::Value::from_serde_json(&json!({"a": 1}));
         assert!(lookup(&value, "no-leading-dot").is_none());
         assert!(lookup(&value, "..").is_none());
         assert!(lookup(&value, ".").is_some()); // empty path = whole value
@@ -267,11 +338,9 @@ mod tests {
 
     #[test]
     fn render_value_helper_strings_render_bare() {
-        let s = json!("hello");
-        assert_eq!(render_value(&s), "hello");
-        let n = json!(42);
-        assert_eq!(render_value(&n), "42");
-        let arr = json!([1, 2]);
-        assert_eq!(render_value(&arr), "[1,2]");
+        let value = |json| dq_core::Value::from_serde_json(&json);
+        assert_eq!(render_value(&value(json!("hello"))), "hello");
+        assert_eq!(render_value(&value(json!(42))), "42");
+        assert_eq!(render_value(&value(json!([1, 2]))), "[1,2]");
     }
 }

@@ -253,7 +253,27 @@ pub(crate) fn non_finite_literal(literal: &str) -> Option<f64> {
     }
 }
 
+/// `.nan`, `.inf` or `-.inf`: a non-finite float spelled the YAML way.
+fn non_finite_spelling(f: f64) -> &'static str {
+    if f.is_nan() {
+        ".nan"
+    } else if f > 0.0 {
+        ".inf"
+    } else {
+        "-.inf"
+    }
+}
+
 impl Value {
+    /// How dq writes the NaN or infinity this scalar is where a format
+    /// has no number for it (console output, JSON handed to a plugin,
+    /// messages): `.nan`, `.inf`, `-.inf`, the YAML way, whatever format
+    /// it was read from. `None` for anything else.
+    #[must_use]
+    pub fn non_finite_spelling(&self) -> Option<&'static str> {
+        self.non_finite_float().map(non_finite_spelling)
+    }
+
     /// The NaN or infinite float this scalar is — a [`Value::Float`]
     /// holding one, or a [`Value::BigFloat`] spelling one (YAML `.nan` /
     /// `-.inf`, TOML `nan` / `+inf`); `None` for anything else.
@@ -274,6 +294,52 @@ impl Value {
             Self::Array(items) => items.iter().any(Self::holds_non_finite),
             Self::Map(map) => map.values().any(Self::holds_non_finite),
             scalar => scalar.non_finite_float().is_some(),
+        }
+    }
+
+    /// Whether this is a number whose exact value is a whole number:
+    /// any [`Value::Int`] / [`Value::BigInt`], a finite [`Value::Float`]
+    /// without a fraction, a [`Value::BigFloat`] literal such as `1e400`
+    /// or `1.50e1`. `false` for a NaN, an infinity, `1e-400` and anything
+    /// that is not a number — the JSON Schema `integer` type.
+    #[must_use]
+    pub fn is_whole_number(&self) -> bool {
+        match self {
+            Self::Int(_) | Self::BigInt(_) => true,
+            Self::Float(f) => f.is_finite() && f.fract() == 0.0,
+            Self::BigFloat(s) => number::decimal_is_whole(s),
+            _ => false,
+        }
+    }
+
+    /// Whether `self` and `other` are numbers of the same value, exactly
+    /// and whatever their variant: `Int(1)`, `Float(1.0)` and
+    /// `BigFloat("1e0")` are one number, `-0.0` is `0`, `1e400` is
+    /// `1.0e+400`. An infinity equals the infinity of its sign; a NaN
+    /// equals no number. `false` when either is not a number.
+    #[must_use]
+    pub fn same_number(&self, other: &Self) -> bool {
+        match (self.non_finite_float(), other.non_finite_float()) {
+            (Some(a), Some(b)) => a == b,
+            (Some(_), None) | (None, Some(_)) => false,
+            (None, None) => match (self.finite_literal(), other.finite_literal()) {
+                (Some(a), Some(b)) => number::same_decimal(&a, &b),
+                _ => false,
+            },
+        }
+    }
+
+    /// A finite number as a decimal literal of its exact value: an `f64`
+    /// in its shortest round-trip form (`1.5e-1`); `None` for anything
+    /// else.
+    fn finite_literal(&self) -> Option<std::borrow::Cow<'_, str>> {
+        match self {
+            Self::Int(i) => Some(i.to_string().into()),
+            Self::Float(f) if f.is_finite() => Some(format!("{f:e}").into()),
+            Self::BigInt(s) | Self::BigFloat(s) if non_finite_literal(s).is_none() => {
+                Some(s.as_str().into())
+            }
+            _ => None,
         }
     }
 
@@ -405,17 +471,22 @@ impl Value {
     ///
     /// Non-finite floats (`NaN`, `±Infinity`) — which are not
     /// representable in JSON — fall back to a [`serde_json::Value::String`]
-    /// carrying the textual rendering (`"NaN"`, `"inf"`, `"-inf"`) so the
-    /// value survives reporting instead of silently becoming `Null`.
+    /// spelling them the YAML way, `".nan"`, `".inf"`, `"-.inf"`, whatever
+    /// format they were read from (a TOML `nan`, a YAML `.NaN`) or jq made
+    /// them in, so the value survives reporting instead of silently
+    /// becoming `Null`. Callers that must tell such a value from a string
+    /// check [`Value::holds_non_finite`] first.
     #[must_use]
     pub fn to_serde_json(&self) -> serde_json::Value {
+        if let Some(f) = self.non_finite_float() {
+            return serde_json::Value::String(non_finite_spelling(f).to_owned());
+        }
         match self {
             Self::Null => serde_json::Value::Null,
             Self::Bool(b) => serde_json::Value::Bool(*b),
             Self::Int(n) => serde_json::Value::Number((*n).into()),
             Self::Float(f) => serde_json::Number::from_f64(*f)
-                .map(serde_json::Value::Number)
-                .unwrap_or_else(|| serde_json::Value::String(f.to_string())),
+                .map_or(serde_json::Value::Null, serde_json::Value::Number),
             // A float spelled as an integer (`!!float 18446744073709551617`)
             // gets a `.0`, so JSON reads it back as a float.
             Self::BigFloat(s) if DecimalParts::parse(s).is_some_and(|p| p.is_integer()) => {
@@ -6116,6 +6187,66 @@ mod tests {
         assert_eq!(Value::Float(1.5).non_finite_float(), None);
         assert_eq!(Value::BigFloat("1e400".into()).non_finite_float(), None);
         assert_eq!(Value::String(".nan".into()).non_finite_float(), None);
+    }
+
+    #[test]
+    fn to_serde_json_spells_every_non_finite_float_the_yaml_way() {
+        let cases = [
+            (Value::Float(f64::NAN), ".nan"),
+            (Value::Float(f64::INFINITY), ".inf"),
+            (Value::Float(f64::NEG_INFINITY), "-.inf"),
+            (Value::BigFloat(".NaN".into()), ".nan"),
+            (Value::BigFloat("+inf".into()), ".inf"),
+            (Value::BigFloat("-.Inf".into()), "-.inf"),
+        ];
+        for (value, spelling) in cases {
+            assert_eq!(value.non_finite_spelling(), Some(spelling), "{value:?}");
+            assert_eq!(
+                value.to_serde_json(),
+                serde_json::json!(spelling),
+                "{value:?}"
+            );
+        }
+        assert_eq!(Value::Float(1.5).non_finite_spelling(), None);
+    }
+
+    #[test]
+    fn is_whole_number_reads_the_exact_value() {
+        let big = |s: &str| Value::BigFloat(s.into());
+        for whole in [
+            Value::Int(-3),
+            Value::BigInt("18446744073709551616".into()),
+            Value::Float(2.0),
+            big("1e400"),
+            big("1.50e1"),
+        ] {
+            assert!(whole.is_whole_number(), "{whole:?}");
+        }
+        for other in [
+            Value::Float(2.5),
+            Value::Float(f64::INFINITY),
+            Value::Float(f64::NAN),
+            big(".inf"),
+            big("1e-400"),
+            Value::String("1".into()),
+        ] {
+            assert!(!other.is_whole_number(), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn same_number_compares_values_across_variants() {
+        let big = |s: &str| Value::BigFloat(s.into());
+        assert!(Value::Int(1).same_number(&Value::Float(1.0)));
+        assert!(Value::Int(1).same_number(&big("1e0")));
+        assert!(Value::Float(-0.0).same_number(&Value::Int(0)));
+        assert!(big("1e400").same_number(&big("1.0e+400")));
+        assert!(Value::Float(0.1).same_number(&big("0.1")));
+        assert!(!Value::Float(0.1).same_number(&big("0.1000000000000000000000000001")));
+        assert!(Value::Float(f64::INFINITY).same_number(&big(".inf")));
+        assert!(!Value::Float(f64::INFINITY).same_number(&big("-.inf")));
+        assert!(!Value::Float(f64::NAN).same_number(&big(".nan")));
+        assert!(!Value::Int(1).same_number(&Value::String("1".into())));
     }
 
     #[test]
