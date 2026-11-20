@@ -43,3 +43,25 @@ tests:
       violations:
         - rule: openapi.no-trailing-slash
           message_contains: "/users/{id}/comments/"
+  - name: list root produces no violations
+    input: |
+      - a
+      - b
+    expected:
+      violations: []
+  - name: scalar root produces no violations
+    input: |
+      just a string
+    expected:
+      violations: []
+  - name: empty document produces no violations
+    input: ""
+    expected:
+      violations: []
+  - name: paths as a list is skipped
+    input: |
+      openapi: "3.0.0"
+      info: {title: t, version: "1"}
+      paths: [/a/]
+    expected:
+      violations: []

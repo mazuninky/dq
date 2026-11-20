@@ -57,8 +57,8 @@ impl std::error::Error for ValidateFail {
 
 /// "Caller-side input error — map to exit 6 instead of the catch-all exit 1."
 ///
-/// Used for cases like `--in-place` rejection in M1 or stdin without a `-F`
-/// hint where the user can correct the mistake by passing different args.
+/// Used for cases like `--in-place` rejection on a read command, where the user can
+/// correct the mistake by passing different args.
 /// `exit_code_for_error` recognises this marker via `downcast_ref` before the
 /// generic fallback.
 #[derive(Debug)]
@@ -110,8 +110,8 @@ pub struct BulkPartialFailure {
 /// The diagnostics themselves are already rendered through the configured
 /// reporter before this marker bubbles up; the marker only carries the
 /// aggregate count for the shell to branch on. The lint exit-code mapping
-/// is documented in design D7
-/// (`openspec/changes/add-exec-engine/design.md`).
+/// is documented in the add-exec-engine section of `docs/decisions.md`
+/// and in `docs/reference/cli.md`.
 #[derive(Debug, thiserror::Error)]
 #[error("lint reported {count} error-severity diagnostic(s)")]
 pub struct LintFail {
@@ -133,4 +133,67 @@ pub struct LintFail {
 pub struct LintWarnStrict {
     /// Number of warn-severity diagnostics emitted during the run.
     pub count: usize,
+}
+
+/// `--doc N` named a document the file does not have. Maps to exit code 2
+/// (`NOT_FOUND`) — the same family as a JSON Pointer that addresses no
+/// node: the file is fine, the address is not in it.
+#[derive(Debug, thiserror::Error)]
+#[error("--doc {index} is out of range: {file} holds {count} document(s){}", index_hint(*.count))]
+pub struct DocOutOfRange {
+    /// The requested index.
+    pub index: usize,
+    /// How many documents the file holds (1 for a file that is not a
+    /// multi-document stream).
+    pub count: usize,
+    /// The file, as given on the command line (`-` for stdin).
+    pub file: String,
+}
+
+/// `--doc N` over several files, none of which holds document N. Maps to
+/// exit code 2 (`NOT_FOUND`), as [`DocOutOfRange`] does for one file: a
+/// run where every file would be skipped did nothing, so it is the same
+/// error, not a success.
+#[derive(Debug, thiserror::Error)]
+#[error("--doc {index} is out of range: none of the {files} files holds document {index}")]
+pub struct DocOutOfRangeEverywhere {
+    /// The requested index.
+    pub index: usize,
+    /// How many files the run covered.
+    pub files: usize,
+}
+
+/// The pointer addresses a node of a type the command cannot read: `keys`
+/// or `values` on a scalar, `len` on a number, a bool or null. Maps to exit
+/// code 1 (`GENERIC`): the node is there (not exit 2), it is the wrong
+/// kind of node for the question.
+#[derive(Debug, thiserror::Error)]
+#[error("cannot {action} {}: it is {found}, not {expected}", node(pointer))]
+pub struct WrongType {
+    /// What the command does, as a verb phrase: `"list the keys of"`.
+    pub action: &'static str,
+    /// The canonical pointer of the node (`""` for the document root).
+    pub pointer: String,
+    /// The node's type, as `dq type` names it.
+    pub found: &'static str,
+    /// The types the command reads: `"an object or an array"`.
+    pub expected: &'static str,
+}
+
+/// `'/a/b'`, or `the document root` for the empty pointer.
+fn node(pointer: &str) -> String {
+    if pointer.is_empty() {
+        "the document root".to_owned()
+    } else {
+        format!("'{pointer}'")
+    }
+}
+
+/// `" (0..=N)"` — the valid `--doc` indices for `count` documents.
+fn index_hint(count: usize) -> String {
+    match count {
+        0 => String::new(),
+        1 => " (--doc 0)".to_owned(),
+        n => format!(" (--doc 0 to {})", n - 1),
+    }
 }

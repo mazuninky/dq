@@ -800,8 +800,7 @@ static TERRAFORM_RULE_FILES: &[(&str, &str)] = &[
 // ---------------------------------------------------------------------------
 //
 // Phase 5 implementation took the no-`oas3` path (see
-// `openspec/changes/add-validation-and-extended-formats/design.md` D6
-// closing note) — every rule is authored with plain jq + JSON Schema
+// the validation section of `docs/decisions.md`) — every rule is authored with plain jq + JSON Schema
 // over the YAML/JSON parser, so the namespace ships unconditionally
 // without a feature gate.
 

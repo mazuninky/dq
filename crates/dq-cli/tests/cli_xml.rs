@@ -167,8 +167,9 @@ fn smoke_convert_yaml_to_xml_exit_code() {
 
 // --- UTF-8 BOM on XML input ------------------------------------------------
 //
-// The BOM is skipped on read and never written back. Expected bytes were
-// checked against the dq build on quick-xml 0.40.
+// The BOM is kept as `#xml.bom: UTF-8` on read and written back, so the
+// file round-trips byte for byte. Expected bytes were checked against the
+// dq build on quick-xml 0.40, BOM aside.
 
 /// An XML document with a non-ASCII text node, without its BOM.
 const XML_BODY: &[u8] = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -176,9 +177,10 @@ const XML_BODY: &[u8] = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
 
 const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
 
-/// `XML_BODY` as written by the XML writer (`convert -F xml`, `fmt -i`).
-const XML_WRITTEN: &[u8] = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><cfg name=\"dq\">\n  \
-<port>8080</port>\n  <tag>caf\xC3\xA9</tag>\n</cfg>";
+/// `XML_BODY` as written by the XML writer (`convert -F xml`, `fmt -i`),
+/// after the BOM when the source had one.
+const XML_WRITTEN: &[u8] = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<cfg name=\"dq\">\n  \
+<port>8080</port>\n  <tag>caf\xC3\xA9</tag>\n</cfg>\n";
 
 /// Write `XML_BODY`, prefixed with a UTF-8 BOM when `bom` is set, to
 /// `cfg.xml` in a fresh tempdir.
@@ -208,12 +210,13 @@ fn convert_stdout(path: &std::path::Path, format: &str) -> Vec<u8> {
 }
 
 #[test]
-fn convert_utf8_bom_xml_to_json_reads_the_data_without_the_bom() {
+fn convert_utf8_bom_xml_to_json_reads_the_data_and_names_the_bom() {
     let (_dir, with_bom) = xml_input(true);
     let expected = r##"{
   "#xml": {
     "version": "1.0",
-    "encoding": "UTF-8"
+    "encoding": "UTF-8",
+    "bom": "UTF-8"
   },
   "cfg": [
     {
@@ -239,39 +242,36 @@ fn convert_utf8_bom_xml_to_json_reads_the_data_without_the_bom() {
 
     let (_dir, without_bom) = xml_input(false);
     assert_eq!(
-        stdout,
-        convert_stdout(&without_bom, "json"),
-        "a BOM must not change the parsed data"
+        String::from_utf8(convert_stdout(&without_bom, "json")).expect("utf-8"),
+        expected.replace(",\n    \"bom\": \"UTF-8\"", ""),
+        "the BOM must change nothing but `#xml.bom`"
     );
 }
 
 #[test]
-fn convert_utf8_bom_xml_to_xml_does_not_write_the_bom() {
+fn convert_utf8_bom_xml_to_xml_writes_the_bom_back() {
     let (_dir, with_bom) = xml_input(true);
     let stdout = convert_stdout(&with_bom, "xml");
-    assert!(
-        !stdout.starts_with(UTF8_BOM),
-        "the BOM must not be written back"
-    );
     assert_eq!(
         String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&[UTF8_BOM, XML_WRITTEN].concat())
+    );
+    let (_dir, without_bom) = xml_input(false);
+    assert_eq!(
+        String::from_utf8_lossy(&convert_stdout(&without_bom, "xml")),
         String::from_utf8_lossy(XML_WRITTEN)
     );
 }
 
 #[test]
-fn fmt_in_place_drops_the_utf8_bom_from_xml() {
+fn fmt_in_place_keeps_the_utf8_bom_of_xml() {
     let (_dir, with_bom) = xml_input(true);
     dq().args(["fmt", with_bom.to_str().unwrap(), "-i", "--no-color"])
         .assert()
         .success();
     let written = std::fs::read(&with_bom).expect("read rewritten file");
-    assert!(
-        !written.starts_with(UTF8_BOM),
-        "fmt -i must not keep the BOM"
-    );
     assert_eq!(
         String::from_utf8_lossy(&written),
-        String::from_utf8_lossy(XML_WRITTEN)
+        String::from_utf8_lossy(&[UTF8_BOM, XML_WRITTEN].concat())
     );
 }

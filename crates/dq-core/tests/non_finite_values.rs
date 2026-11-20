@@ -48,7 +48,8 @@ fn the_json_writer_refuses_a_yaml_nan_or_infinity() {
 fn the_yaml_writer_keeps_nan_and_infinity_floats() {
     assert_eq!(
         write("yaml", &parse("yaml", NON_FINITE_YAML)).expect("writes"),
-        "x: .nan\ny: -.inf\nl:\n- .inf\n"
+        // `'y'`: the key is a bool to a YAML 1.1 reader.
+        "x: .nan\n'y': -.inf\nl:\n- .inf\n"
     );
 }
 

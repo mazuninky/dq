@@ -4,6 +4,8 @@
 //! `*.test.yaml` files, parses them as [`RuleTestFile`], and executes
 //! each test case against the matching rule (a sibling `*.yml` file
 //! with the same stem minus the `.test` suffix).
+//! [`RuleTester::run_std`] does the same over the fixtures embedded in
+//! `dq-lint` for one `@std/<namespace>` (`dq test @std/k8s`).
 //!
 //! The comparison policy is described in design D10: every expected
 //! violation must match at least one actual diagnostic, and every actual
@@ -13,22 +15,22 @@
 //!
 //! ## Format-input parsing scope
 //!
-//! The runner parses a fixture's `input:` text by name. M8 supported
-//! `yaml` / `json`; M9 added `markdown` (CommonMark + GFM AST); M11
-//! Phase 5 added `hcl` so the `@std/terraform` ruleset can ship with
-//! co-located fixtures. Any other format produces an [`TestOutcome::Error`]
-//! with a "format not yet supported in test runner" message — that
-//! message intentionally points future authors at the
-//! `dq_core::by_name` registry, since adding a format here is a
-//! one-arm change.
+//! The runner parses a fixture's `input:` text with dq's own reader for
+//! the format, as `dq check` reads a file: `yaml`, `json`, `markdown`
+//! (CommonMark + GFM AST), `hcl` (so the `@std/terraform` ruleset can ship
+//! with co-located fixtures) and `dockerfile`. Any other format produces a
+//! [`TestOutcome::Error`] with a "format not yet supported in test runner"
+//! message — that message intentionally points future authors at the
+//! `dq_core::by_name` registry, since adding a format here is a one-word
+//! change.
 
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::Deserialize;
 
 use crate::diagnostic::Diagnostic;
 use crate::error::{ExecError, Result};
-use crate::evaluator::Evaluator;
-use crate::ruleset::RuleSet;
+use crate::evaluator::{Evaluation, Evaluator};
+use crate::ruleset::{RuleSet, RuleSource};
 
 /// Top-level fixture file shape.
 #[derive(Debug, Deserialize)]
@@ -98,7 +100,9 @@ pub enum TestOutcome {
     },
     /// Test failed — `missing` lists expected violations that didn't
     /// match any actual diagnostic; `extra` lists actual diagnostics
-    /// that weren't expected.
+    /// that weren't expected; `raised` lists the rule expressions that
+    /// raised a runtime error on the input. Any one of them non-empty
+    /// fails the case.
     Fail {
         /// Fixture file that produced this outcome.
         fixture: Utf8PathBuf,
@@ -110,6 +114,11 @@ pub enum TestOutcome {
         /// Human-readable descriptions of actual diagnostics that
         /// weren't expected.
         extra: Vec<String>,
+        /// One [`crate::RuleError`] per rule expression that raised,
+        /// rendered as `rule=<id> <field>: <jq error>`. A rule that
+        /// raises is a bug in the rule even when no violation is
+        /// expected: `dq lint` would skip it on such a file.
+        raised: Vec<String>,
     },
     /// The runner couldn't even attempt the comparison — fixture parse
     /// error, missing rule file, unsupported format, etc. The `error`
@@ -163,6 +172,37 @@ impl RuleTester {
         }
         Ok(outcomes)
     }
+
+    /// Execute every fixture embedded for the standard rule namespace
+    /// `namespace` (`"k8s"`, without the `@std/` prefix), in file-name
+    /// order, against the embedded rules — what [`RuleTester::run_dir`]
+    /// does on `crates/dq-lint/rules/<namespace>/`, without the source
+    /// tree. Outcomes name a fixture `@std/<namespace>/<file>.test.yml`.
+    ///
+    /// # Errors
+    ///
+    /// - [`ExecError::UnknownRule`] (id `@std/<namespace>`, with typo
+    ///   suggestions) when `dq-lint` has no such namespace.
+    pub fn run_std(namespace: &str) -> Result<Vec<TestOutcome>> {
+        let arg = format!("@std/{namespace}");
+        let Some(namespace) = dq_lint::list_std_rulesets()
+            .iter()
+            .copied()
+            .find(|ns| *ns == namespace)
+        else {
+            return Err(crate::loader::unknown_rule(&arg));
+        };
+        let mut fixtures: Vec<(&str, &str)> = dq_lint::std_test_files(namespace)
+            .unwrap_or_default()
+            .to_vec();
+        fixtures.sort_unstable_by_key(|(name, _)| *name);
+        let mut outcomes = Vec::new();
+        for (name, text) in fixtures {
+            let label = Utf8PathBuf::from(format!("{arg}/{name}"));
+            outcomes.extend(run_std_fixture(namespace, &label, text));
+        }
+        Ok(outcomes)
+    }
 }
 
 /// Returns `true` for `*.test.yml` / `*.test.yaml` files.
@@ -176,73 +216,87 @@ fn is_fixture_file(path: &Utf8Path) -> bool {
 /// Run one fixture file and emit one [`TestOutcome`] per test case.
 fn run_fixture(fixture: &Utf8Path) -> Vec<TestOutcome> {
     // 1. Locate the parent rule file (same stem minus `.test`).
-    let rule_path = match parent_rule_path(fixture) {
-        Some(p) => p,
-        None => {
-            return vec![TestOutcome::Error {
-                fixture: fixture.to_path_buf(),
-                name: "<file>".to_owned(),
-                error: format!("could not derive parent rule path from fixture: {fixture}"),
-            }];
-        }
+    let Some(rule_path) = parent_rule_path(fixture) else {
+        return file_error(
+            fixture,
+            format!("could not derive parent rule path from fixture: {fixture}"),
+        );
     };
     if !rule_path.is_file() {
-        return vec![TestOutcome::Error {
-            fixture: fixture.to_path_buf(),
-            name: "<file>".to_owned(),
-            error: format!("rule file not found: {rule_path}"),
-        }];
+        return file_error(fixture, format!("rule file not found: {rule_path}"));
     }
-
-    // 2. Parse the fixture.
     let fixture_yaml = match std::fs::read_to_string(fixture) {
         Ok(s) => s,
-        Err(err) => {
-            return vec![TestOutcome::Error {
-                fixture: fixture.to_path_buf(),
-                name: "<file>".to_owned(),
-                error: format!("failed to read fixture: {err}"),
-            }];
-        }
+        Err(err) => return file_error(fixture, format!("failed to read fixture: {err}")),
     };
-    let fixture_file: RuleTestFile = match serde_norway::from_str(&fixture_yaml) {
+    run_fixture_text(fixture, &fixture_yaml, &rule_path, || {
+        RuleSet::from_path(&rule_path)
+    })
+}
+
+/// Run one embedded `@std/<namespace>` fixture. `fixture` is the
+/// `@std/<namespace>/<file>.test.yml` label outcomes carry; the rule is
+/// the embedded sibling file, loaded as `RuleSource::Std` so a
+/// `schema_file` resolves to the embedded sidecar, as in `dq lint`.
+fn run_std_fixture(
+    namespace: &'static str,
+    fixture: &Utf8Path,
+    fixture_yaml: &str,
+) -> Vec<TestOutcome> {
+    let Some(rule_path) = parent_rule_path(fixture) else {
+        return file_error(
+            fixture,
+            format!("could not derive parent rule path from fixture: {fixture}"),
+        );
+    };
+    let rule_name = rule_path.file_name().unwrap_or_default();
+    let rule_text = dq_lint::std_rule_files(namespace)
+        .unwrap_or_default()
+        .iter()
+        .find(|(name, _)| *name == rule_name)
+        .map(|(_, text)| *text);
+    let Some(rule_text) = rule_text else {
+        return file_error(fixture, format!("rule file not found: {rule_path}"));
+    };
+    run_fixture_text(fixture, fixture_yaml, &rule_path, || {
+        RuleSet::from_str(rule_text, RuleSource::Std(namespace))
+    })
+}
+
+/// One [`TestOutcome::Error`] for a fixture that could not run at all.
+fn file_error(fixture: &Utf8Path, error: String) -> Vec<TestOutcome> {
+    vec![TestOutcome::Error {
+        fixture: fixture.to_path_buf(),
+        name: "<file>".to_owned(),
+        error,
+    }]
+}
+
+/// Parse `fixture_yaml`, load its rule with `load_rule` (`rule_path`
+/// names it in errors) and run every case.
+fn run_fixture_text(
+    fixture: &Utf8Path,
+    fixture_yaml: &str,
+    rule_path: &Utf8Path,
+    load_rule: impl FnOnce() -> Result<RuleSet>,
+) -> Vec<TestOutcome> {
+    // 2. Parse the fixture.
+    let fixture_file: RuleTestFile = match serde_norway::from_str(fixture_yaml) {
         Ok(f) => f,
-        Err(err) => {
-            return vec![TestOutcome::Error {
-                fixture: fixture.to_path_buf(),
-                name: "<file>".to_owned(),
-                error: format!("fixture parse error: {err}"),
-            }];
-        }
+        Err(err) => return file_error(fixture, format!("fixture parse error: {err}")),
     };
 
     // 3. Load the rule and build a one-rule evaluator.
-    let ruleset = match RuleSet::from_path(&rule_path) {
+    let ruleset = match load_rule() {
         Ok(s) => s,
-        Err(err) => {
-            return vec![TestOutcome::Error {
-                fixture: fixture.to_path_buf(),
-                name: "<file>".to_owned(),
-                error: format!("rule load error: {err}"),
-            }];
-        }
+        Err(err) => return file_error(fixture, format!("rule load error: {err}")),
     };
     if ruleset.rules.is_empty() {
-        return vec![TestOutcome::Error {
-            fixture: fixture.to_path_buf(),
-            name: "<file>".to_owned(),
-            error: format!("rule file produced no rules: {rule_path}"),
-        }];
+        return file_error(fixture, format!("rule file produced no rules: {rule_path}"));
     }
     let evaluator = match Evaluator::new(vec![ruleset.clone()]) {
         Ok(e) => e,
-        Err(err) => {
-            return vec![TestOutcome::Error {
-                fixture: fixture.to_path_buf(),
-                name: "<file>".to_owned(),
-                error: format!("rule compile error: {err}"),
-            }];
-        }
+        Err(err) => return file_error(fixture, format!("rule compile error: {err}")),
     };
     // The rule's primary format — used as a default when a test case
     // omits the `format:` field.
@@ -286,8 +340,8 @@ fn run_case(
         .format
         .clone()
         .unwrap_or_else(|| default_format.to_owned());
-    let value = match parse_input(&case.input, &format) {
-        Ok(v) => v,
+    let doc = match parse_input(&case.input, &format) {
+        Ok(doc) => doc,
         Err(msg) => {
             return TestOutcome::Error {
                 fixture: fixture.to_path_buf(),
@@ -296,16 +350,12 @@ fn run_case(
             };
         }
     };
-    // The fixture path doesn't carry spans — fixtures parse via
-    // `serde_norway`/`serde_json`/markdown which give us a bare
-    // `serde_json::Value` with no provenance metadata. Build a fresh
-    // `OwnedIr` with an empty provenance map so the evaluator sees the
-    // new IR signature; rules that use `loc.pointer` simply fall through
-    // to the default (1, 1) position in the fixture context.
-    let dq_value = dq_core::Value::from_serde_json(&value);
-    let format_tag = dq_core::FormatTag::from_name(&format).unwrap_or(dq_core::FormatTag::Yaml);
-    let owned = dq_core::OwnedIr::new(dq_value, dq_core::ProvenanceMap::new(), format_tag);
-    let actual = evaluator.evaluate_file(fixture, &owned.to_borrowed(), &format);
+    // The document as the format's reader produced it, positions included:
+    // where the reader records them (Dockerfile), a `loc.pointer` resolves
+    // to the `line:col` `dq lint` reports, so a fixture's `line:` holds;
+    // elsewhere (the span-less YAML and JSON readers) it falls through to
+    // `(1, 1)`.
+    let actual = evaluator.evaluate(fixture, &doc.as_ir(), &format);
     compare(
         fixture.to_path_buf(),
         case.name,
@@ -314,65 +364,43 @@ fn run_case(
     )
 }
 
-/// Parse a fixture's `input:` text under `format`. `yaml` and `json` are
-/// wired through `serde_norway` / `serde_json` directly; `markdown` (M9 — the
-/// CommonMark + GFM AST format) routes through `dq_core::by_name("markdown")`
-/// so the fixture sees the same typed-discriminator-Map shape that the
-/// `@std/markdown` rules check.dispatch against. Other formats yield an
+/// Parse a fixture's `input:` text under `format` with dq's own reader
+/// for it ([`dq_core::by_name`]), so a fixture's input is the value
+/// `dq check` sees in a file: a YAML `.nan` is a number, not `null`, and
+/// `18446744073709551617` keeps its digits. `markdown` gives the AST
+/// (CommonMark and GFM) the `@std/markdown` rules check; `hcl` and
+/// `dockerfile` give their parsers' shapes, a Dockerfile with the
+/// positions its instructions start at. A YAML stream of more than one
+/// document, and a format the runner does not read, yield an
 /// `Err(message)` for the caller to surface as a [`TestOutcome::Error`].
-fn parse_input(input: &str, format: &str) -> std::result::Result<serde_json::Value, String> {
-    match format {
-        "yaml" => serde_norway::from_str::<serde_json::Value>(input)
-            .map_err(|err| format!("yaml parse error: {err}")),
-        "json" => serde_json::from_str::<serde_json::Value>(input)
-            .map_err(|err| format!("json parse error: {err}")),
-        "markdown" => {
-            let parser = dq_core::by_name("markdown")
-                .ok_or_else(|| "markdown format not registered".to_owned())?;
-            let doc = parser
-                .parse(input.as_bytes())
-                .map_err(|err| format!("markdown parse error: {err}"))?;
-            // The evaluator and check.jq path consume `serde_json::Value`,
-            // so convert the typed AST tree through `serde_json::to_value`.
-            // `Value` (the dq-core type) implements `Serialize` per the
-            // top-level `document/mod.rs`, so this is a single hop.
-            serde_json::to_value(doc.value())
-                .map_err(|err| format!("markdown AST serialize error: {err}"))
-        }
-        "hcl" => {
-            // M11 Phase 5: `@std/terraform` rules carry `format: hcl` in
-            // their `match`, so fixtures need to parse `.tf` syntax. The
-            // HCL parser produces a `Value::Map` shaped per the M5 nesting
-            // contract (see `crates/dq-core/src/parsers/hcl.rs` —
-            // `block_type "label" { ... }` becomes `Map { block_type:
-            // { label: { ... } } }`); we serialize that to a
-            // `serde_json::Value` for the jq evaluator. HCL has no spans
-            // (`set_at`/`del_at` round-trip is unsupported per the parser
-            // module comment), so diagnostics emitted from these fixtures
-            // resolve to the default `(line=1, col=1)`. The fixture
-            // runner exercises the rule logic; the no-spans limitation is
-            // documented in CHANGELOG.md and the rule descriptions.
-            let parser =
-                dq_core::by_name("hcl").ok_or_else(|| "hcl format not registered".to_owned())?;
-            let doc = parser
-                .parse(input.as_bytes())
-                .map_err(|err| format!("hcl parse error: {err}"))?;
-            serde_json::to_value(doc.value())
-                .map_err(|err| format!("hcl value serialize error: {err}"))
-        }
-        other => Err(format!(
-            "format not yet supported in test runner: {other} (supported: yaml, json, markdown, hcl; add a new arm in test_runner::parse_input that calls dq_core::by_name)",
-        )),
+fn parse_input(input: &str, format: &str) -> std::result::Result<dq_core::Document, String> {
+    const SUPPORTED: [&str; 5] = ["yaml", "json", "markdown", "hcl", "dockerfile"];
+    if !SUPPORTED.contains(&format) {
+        return Err(format!(
+            "format not yet supported in test runner: {format} (supported: yaml, json, markdown, hcl, dockerfile; add it to SUPPORTED in test_runner::parse_input if dq_core::by_name reads it)",
+        ));
     }
+    let parser =
+        dq_core::by_name(format).ok_or_else(|| format!("{format} format not registered"))?;
+    let doc = parser
+        .parse(input.as_bytes())
+        .map_err(|err| format!("{format} parse error: {err}"))?;
+    if let Some(documents) = doc.values() {
+        return Err(format!(
+            "{format} parse error: a fixture input holds one document, this one holds {}",
+            documents.len()
+        ));
+    }
+    Ok(doc)
 }
 
-/// Match expected violations against actual diagnostics per design D10.
 fn compare(
     fixture: Utf8PathBuf,
     name: String,
     expected: &[ExpectedViolation],
-    actual: &[Diagnostic],
+    evaluation: &Evaluation,
 ) -> TestOutcome {
+    let actual = &evaluation.diagnostics;
     let mut actual_matched = vec![false; actual.len()];
     let mut missing: Vec<String> = Vec::new();
     for exp in expected {
@@ -398,7 +426,13 @@ fn compare(
         .map(|(_, d)| describe_actual(d))
         .collect();
 
-    if missing.is_empty() && extra.is_empty() {
+    let raised: Vec<String> = evaluation
+        .rule_errors
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+
+    if missing.is_empty() && extra.is_empty() && raised.is_empty() {
         TestOutcome::Pass { fixture, name }
     } else {
         TestOutcome::Fail {
@@ -406,6 +440,7 @@ fn compare(
             name,
             missing,
             extra,
+            raised,
         }
     }
 }
@@ -641,6 +676,21 @@ tests:
     }
 
     #[test]
+    fn dockerfile_input_goes_through_the_dockerfile_parser() {
+        let doc = parse_input("FROM alpine\nRUN [\"sh\"]\n", "dockerfile").expect("parse");
+        let value = doc.value();
+        assert_eq!(
+            value.to_serde_json(),
+            serde_json::json!([
+                {"instruction": "FROM", "arguments": "alpine", "line": 1},
+                {"instruction": "RUN", "arguments": ["sh"], "line": 2},
+            ])
+        );
+        let err = parse_input("FOO x\n", "dockerfile").expect_err("unknown instruction");
+        assert!(err.contains("dockerfile parse error"), "got: {err}");
+    }
+
+    #[test]
     fn unsupported_format_in_test_case_yields_error_outcome() {
         let (_t, dir) = tempdir_utf8();
         // Use a format that the test runner does NOT have a parse arm for.
@@ -649,7 +699,7 @@ tests:
         let fixture = r#"
 tests:
   - name: unsupported format
-    format: dockerfile
+    format: ini
     input: ""
     expected:
       violations: []
@@ -667,6 +717,31 @@ tests:
             }
             other => panic!("expected Error outcome, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn yaml_and_json_inputs_read_as_check_reads_them() {
+        let doc = parse_input("x: .nan\ny: 18446744073709551617\n", "yaml").expect("yaml");
+        let value = doc.value();
+        let dq_core::Value::Map(map) = value else {
+            panic!("expected a map: {value:?}");
+        };
+        let x = map.get("x").and_then(dq_core::Value::non_finite_float);
+        assert!(x.is_some_and(f64::is_nan), "{value:?}");
+        assert_eq!(
+            map.get("y"),
+            Some(&dq_core::Value::BigInt("18446744073709551617".into()))
+        );
+        let doc = parse_input(r#"{"y": 18446744073709551617}"#, "json").expect("json");
+        assert!(matches!(doc.value(), dq_core::Value::Map(map)
+            if map.get("y") == Some(&dq_core::Value::BigInt("18446744073709551617".into()))));
+        let err = parse_input("a: 1\n---\nb: 2\n", "yaml").expect_err("stream");
+        assert!(
+            err.contains("holds one document, this one holds 2"),
+            "{err}"
+        );
+        let err = parse_input("a: [", "yaml").expect_err("broken");
+        assert!(err.starts_with("yaml parse error: "), "{err}");
     }
 
     #[test]
@@ -710,5 +785,81 @@ tests:
             Some(Utf8PathBuf::from("/d/foo.yaml"))
         );
         assert_eq!(parent_rule_path(Utf8Path::new("/d/foo.yml")), None);
+    }
+
+    /// A rule that raises on a case's input fails the case even when the
+    /// case expects no violation, naming the rule, the field and the jq
+    /// error. Before, the runner counted the raised rule as zero
+    /// violations and passed the case.
+    #[test]
+    fn rule_that_raises_fails_the_case() {
+        let (_t, dir) = tempdir_utf8();
+        let rule = r#"
+id: test.spec-template
+description: indexes spec as an object
+severity: error
+match:
+  format: yaml
+check:
+  jq: '.spec.template | select(. == null)'
+  message: no template
+"#;
+        let fixture = r#"
+tests:
+  - name: wrong-type spec
+    input: |
+      spec: x
+    expected:
+      violations: []
+"#;
+        write_rule_and_fixture(&dir, rule, fixture);
+
+        let outcomes = RuleTester::run_dir(&dir).expect("run");
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0] {
+            TestOutcome::Fail {
+                name,
+                missing,
+                extra,
+                raised,
+                ..
+            } => {
+                assert_eq!(name, "wrong-type spec");
+                assert!(missing.is_empty() && extra.is_empty());
+                assert_eq!(
+                    raised,
+                    &vec![
+                        "rule=test.spec-template check.jq: jq runtime error: cannot index \"x\" with \"template\""
+                            .to_owned()
+                    ]
+                );
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_std_runs_the_embedded_fixtures_of_a_namespace() {
+        let outcomes = RuleTester::run_std("npm").expect("known namespace");
+        assert!(!outcomes.is_empty());
+        for outcome in &outcomes {
+            match outcome {
+                TestOutcome::Pass { fixture, .. } => {
+                    assert!(fixture.as_str().starts_with("@std/npm/"), "{fixture}");
+                }
+                other => panic!("expected Pass, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn run_std_rejects_an_unknown_namespace_with_suggestions() {
+        match RuleTester::run_std("k8z") {
+            Err(ExecError::UnknownRule { id, did_you_mean }) => {
+                assert_eq!(id, "@std/k8z");
+                assert_eq!(did_you_mean, vec!["@std/k8s".to_owned()]);
+            }
+            other => panic!("expected UnknownRule, got {other:?}"),
+        }
     }
 }

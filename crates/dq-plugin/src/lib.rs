@@ -3,7 +3,7 @@
 //! This crate hosts third-party `lint` / `fix` plugins compiled to the
 //! WebAssembly Component Model and described by the WIT package
 //! `dq:plugin@0.1.0` (see `wit/dq-plugin.wit` for the full schema and
-//! `openspec/changes/add-ir-foundation/specs/data-query-plugin-abi/spec.md`
+//! `docs/plugin-abi.md`
 //! for the ABI contract).
 //!
 //! # Feature gating

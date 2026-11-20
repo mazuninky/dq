@@ -7,7 +7,7 @@ description: |
 severity: error
 match:
   format: [yaml, json]
-  filter: '.openapi != null and (.openapi | type == "string")'
+  filter: 'type == "object" and (.openapi | type == "string")'
 check:
   schema_file: ./openapi-info.schema.json
 references:

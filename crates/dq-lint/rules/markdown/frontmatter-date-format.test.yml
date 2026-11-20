@@ -36,3 +36,34 @@ tests:
       # Body
     expected:
       violations: []
+  - name: list frontmatter is skipped
+    input: |
+      ---
+      - a
+      ---
+      # T
+    expected:
+      violations: []
+  - name: scalar frontmatter is skipped
+    input: |
+      ---
+      just text
+      ---
+      # T
+    expected:
+      violations: []
+  - name: boolean date is skipped
+    input: |
+      ---
+      date: false
+      ---
+      # T
+    expected:
+      violations: []
+  - name: empty frontmatter block is skipped
+    input: |
+      ---
+      ---
+      # T
+    expected:
+      violations: []

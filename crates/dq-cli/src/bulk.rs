@@ -11,18 +11,19 @@
 //! matched-file order at the end of the run. This satisfies the spec's
 //! "per-file output ordering matches matched-file order regardless of
 //! execution order" requirement (see
-//! `openspec/changes/add-bulk-and-ci/specs/data-query-bulk/spec.md`,
-//! requirement "`--parallel <N>` for bulk throughput").
+//! `docs/reference/bulk.md`, and the `--parallel` decision in the
+//! add-bulk-and-ci section of `docs/decisions.md`).
 
 use std::io::{self, Write};
 
 use camino::{Utf8Path, Utf8PathBuf};
-use globset::Glob;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-use walkdir::WalkDir;
 
 use crate::cli::Cli;
-use crate::error::{BulkPartialFailure, CheckPending};
+use crate::commands::io_helpers::every_file_lacks;
+use crate::error::{BulkPartialFailure, CheckPending, DocOutOfRange};
+use crate::glob::{self, GlobError};
+use crate::output::terminal_text;
 
 /// Per-file outcome reported by an [`FileOp`] implementation.
 #[derive(Debug)]
@@ -40,11 +41,17 @@ pub enum FileOpResult {
         diff: Option<String>,
     },
     /// File is byte-identical to its prospective output (idempotent run).
+    /// Counted under `Skipped`, nothing printed. An op may return
+    /// [`FileOpResult::Modified`] with the same bytes instead: the driver
+    /// compares them with the file and treats that as unchanged too.
     Unchanged,
-    /// File was skipped for a non-error reason (e.g., path filter); the
-    /// string is shown to the user. Reserved for future use; M3 doesn't
-    /// produce `Skipped`.
-    Skipped(String),
+    /// In a bulk run, the file lacks the document `--doc N` names. The
+    /// driver counts it under `Skipped` and notes the reason on stderr (a
+    /// `tracing::warn!` line), keeping stdout for the files' output — or,
+    /// when *every* file of the run lacks it, fails the run with
+    /// [`DocOutOfRangeEverywhere`](crate::error::DocOutOfRangeEverywhere)
+    /// (exit 2) before writing anything.
+    Skipped(DocOutOfRange),
 }
 
 /// Strategy interface implemented by each command handler. The trait is
@@ -67,110 +74,40 @@ pub trait FileOp: Sync {
     fn apply(&self, path: &Utf8Path) -> anyhow::Result<FileOpResult>;
 }
 
-/// Detect whether `pattern` contains glob metacharacters.
-///
-/// We treat any of `*` / `?` / `[` / `{` as the trigger. False positives
-/// are documented in the change's design.md (D5): a literal path that
-/// happens to contain `[` will be misidentified, and the user must escape
-/// it via shell quoting (`\[`).
-fn pattern_has_meta(pattern: &Utf8Path) -> bool {
-    pattern
-        .as_str()
-        .chars()
-        .any(|c| matches!(c, '*' | '?' | '[' | '{'))
-}
-
-/// Compute the longest non-meta prefix of `pattern`.
-///
-/// Splits on `/`, takes the leading components free of metacharacters, and
-/// joins them back together. If every component contains a metacharacter
-/// (e.g. `'*.yaml'`), the prefix is `.` (the current directory).
-fn longest_non_meta_prefix(pattern: &Utf8Path) -> Utf8PathBuf {
-    let s = pattern.as_str();
-    let mut prefix_components: Vec<&str> = Vec::new();
-    for component in s.split('/') {
-        if component
-            .chars()
-            .any(|c| matches!(c, '*' | '?' | '[' | '{'))
-        {
-            break;
-        }
-        prefix_components.push(component);
-    }
-    if prefix_components.is_empty() {
-        return Utf8PathBuf::from(".");
-    }
-    // Preserve a leading slash for absolute patterns (the first split item
-    // is empty when the pattern starts with `/`).
-    let joined = prefix_components.join("/");
-    if joined.is_empty() {
-        Utf8PathBuf::from("/")
-    } else {
-        Utf8PathBuf::from(joined)
-    }
-}
-
 /// Expand a glob pattern (or pass through a literal path).
 ///
 /// Behaviour:
-/// - Pattern contains no glob metacharacters (`*`/`?`/`[`/`{`) → returns
-///   `vec![pattern.to_owned()]` without any FS access (M2 single-file fast
-///   path; preserves byte-identical behaviour).
-/// - Otherwise: walks from the longest non-meta prefix and filters via a
-///   compiled `globset::GlobMatcher`. The result is sorted alphabetically.
-/// - Zero matches on a glob pattern → `Err` mapping to IO_ERROR (5).
+/// - Not a glob ([`crate::glob::is_glob`]: no `*`/`?`/`[`/`{`, or a file
+///   exists at that literal path) → returns `vec![pattern.to_owned()]`; the
+///   command handler hits the real I/O error downstream if the file is
+///   missing.
+/// - Otherwise the matching files, sorted ([`crate::glob::expand`]: `*` and
+///   `?` stop at `/`, `**` crosses directories).
 ///
 /// # Errors
 ///
-/// - [`dq_core::Error::Io`] (kind `"io"`, exit 5) when the prefix
-///   directory does not exist or the glob matched no files.
-/// - `anyhow::Error` from `globset::Glob::new` when the pattern is
+/// - [`dq_core::Error::Io`] (kind `"io"`, exit 5) when the walk root does
+///   not exist or the glob matched no files.
+/// - `anyhow::Error` wrapping the `globset` error when the pattern is
 ///   syntactically invalid.
 pub fn expand_glob(pattern: &Utf8Path) -> anyhow::Result<Vec<Utf8PathBuf>> {
-    if !pattern_has_meta(pattern) {
-        // Literal path fast path: do NOT touch the filesystem here. The
-        // command handler will hit a real IO error downstream if the file
-        // doesn't exist, mapping to IO_ERROR via the standard path.
+    if !glob::is_glob(pattern) {
         return Ok(vec![pattern.to_owned()]);
     }
-
-    let glob = Glob::new(pattern.as_str())
-        .map_err(|e| anyhow::Error::new(e).context(format!("invalid glob pattern: {pattern}")))?;
-    let matcher = glob.compile_matcher();
-
-    let prefix = longest_non_meta_prefix(pattern);
-    if !prefix.as_std_path().exists() {
-        return Err(anyhow::Error::new(dq_core::Error::Io {
-            path: prefix.clone(),
-            source: io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("glob root {prefix} does not exist"),
-            ),
-        }));
-    }
-
-    let mut matches: Vec<Utf8PathBuf> = WalkDir::new(prefix.as_std_path())
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-        .filter(|entry| matcher.is_match(entry.path()))
-        .filter_map(|entry| Utf8PathBuf::from_path_buf(entry.into_path()).ok())
-        .collect();
-
-    if matches.is_empty() {
-        return Err(anyhow::Error::new(dq_core::Error::Io {
-            path: pattern.to_owned(),
-            source: io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("glob {pattern} matched zero files"),
-            ),
-        }));
-    }
-
-    // Deterministic ordering — the spec requires per-file output to appear
-    // in matched-file order regardless of execution order.
-    matches.sort();
-    Ok(matches)
+    glob::expand(pattern).map_err(|err| match err {
+        GlobError::Invalid { pattern, source } => anyhow::Error::new(source).context(format!(
+            "invalid glob pattern: {}",
+            dq_core::one_line(pattern.as_str())
+        )),
+        GlobError::RootMissing { ref root } => anyhow::Error::new(dq_core::Error::Io {
+            path: root.clone(),
+            source: io::Error::new(io::ErrorKind::NotFound, err.to_string()),
+        }),
+        GlobError::NoMatch { ref pattern } => anyhow::Error::new(dq_core::Error::Io {
+            path: pattern.clone(),
+            source: io::Error::new(io::ErrorKind::NotFound, err.to_string()),
+        }),
+    })
 }
 
 /// Resolve `cli.parallel` into a concrete worker count.
@@ -197,7 +134,9 @@ fn resolve_parallel(n: Option<usize>) -> usize {
 ///   mode (an error still aborts).
 /// - **Bulk (`files.len() > 1`)**: per-file output is buffered in
 ///   matched-file order; a `Modified: N, Skipped: M, Failed: K` summary
-///   line follows the per-file output. `--diff` and stdout-mode bulk
+///   line follows the per-file output. Skipped counts files whose bytes
+///   would not change (never rewritten, so their mtime stays) and files
+///   without the `--doc N` document. `--diff` and stdout-mode bulk
 ///   output are prefixed with `=== <path> ===` markers so consumers can
 ///   tell files apart.
 /// - **`--check`**: never writes to disk; the driver compares each op's
@@ -214,6 +153,9 @@ fn resolve_parallel(n: Option<usize>) -> usize {
 /// - [`CheckPending`] when `--check` finds files that would be modified.
 /// - [`BulkPartialFailure`] when `--continue-on-error` completes with one
 ///   or more file failures.
+/// - [`DocOutOfRangeEverywhere`](crate::error::DocOutOfRangeEverywhere)
+///   when every file of a bulk run lacks the document `--doc N` names
+///   (each op returned [`FileOpResult::Skipped`]).
 /// - The first per-file error verbatim when `--continue-on-error` is off.
 /// - I/O errors from writing to `out` or from the per-file atomic write.
 pub fn run_per_file(
@@ -249,13 +191,24 @@ pub fn run_per_file(
     let mut failed: Vec<(Utf8PathBuf, anyhow::Error)> = Vec::new();
     let mut would_modify: Vec<Utf8PathBuf> = Vec::new();
     let mut buffer: Vec<u8> = Vec::new();
+    let mut missing: Vec<(Utf8PathBuf, DocOutOfRange)> = Vec::new();
 
     for (path, result) in results {
         match result {
             Ok(FileOpResult::Modified { output_bytes, diff }) => {
                 if cli.check {
                     handle_check(&path, &output_bytes, &mut would_modify)?;
-                } else if cli.in_place {
+                    continue;
+                }
+                // A file whose bytes would not change is never rewritten
+                // (its mtime and any `.bak` stay as they are) and counts
+                // under Skipped, like an op's own `Unchanged`.
+                let unchanged = source_matches(&path, &output_bytes);
+                if cli.in_place {
+                    if unchanged {
+                        skipped += 1;
+                        continue;
+                    }
                     match dq_core::atomic_write::write(&path, &output_bytes, cli.backup) {
                         Ok(()) => modified += 1,
                         Err(e) => {
@@ -267,22 +220,32 @@ pub fn run_per_file(
                         }
                     }
                 } else if cli.diff {
+                    if unchanged {
+                        skipped += 1;
+                        continue;
+                    }
                     if let Some(d) = diff {
                         if is_bulk {
-                            writeln!(buffer, "=== {path} ===")?;
+                            writeln!(buffer, "=== {} ===", terminal_text(path.as_str()))?;
                         }
                         buffer.write_all(d.as_bytes())?;
                     }
                     modified += 1;
                 } else {
-                    // Plain stdout mode. In bulk we prefix a marker so
-                    // streams can be split per file; single-file mode
-                    // matches M2 byte-for-byte (no marker, no summary).
+                    // Plain stdout mode: the output is the command's
+                    // result, so every file is printed, changed or not.
+                    // In bulk we prefix a marker so streams can be split
+                    // per file; single-file mode matches M2 byte-for-byte
+                    // (no marker, no summary).
                     if is_bulk {
-                        writeln!(buffer, "=== {path} ===")?;
+                        writeln!(buffer, "=== {} ===", terminal_text(path.as_str()))?;
                     }
                     buffer.write_all(&output_bytes)?;
-                    modified += 1;
+                    if unchanged {
+                        skipped += 1;
+                    } else {
+                        modified += 1;
+                    }
                 }
             }
             Ok(FileOpResult::Unchanged) => {
@@ -290,7 +253,7 @@ pub fn run_per_file(
             }
             Ok(FileOpResult::Skipped(reason)) => {
                 skipped += 1;
-                writeln!(buffer, "Skipped: {path} ({reason})")?;
+                missing.push((path, reason));
             }
             Err(e) => {
                 if cli.continue_on_error && is_bulk {
@@ -306,12 +269,22 @@ pub fn run_per_file(
         }
     }
 
+    // Every file lacked the `--doc N` document: nothing was done, so the
+    // run fails as a single such file does. Skipped files are never
+    // written, so nothing reached the disk either.
+    if let Some(err) = every_file_lacks(&missing, files.len()) {
+        return Err(anyhow::Error::new(err));
+    }
+    for (path, reason) in &missing {
+        tracing::warn!("skipped {path}: {reason}");
+    }
+
     out.write_all(&buffer)?;
 
     // `--check` short-circuits before any summary.
     if cli.check {
         for p in &would_modify {
-            writeln!(out, "would modify: {p}")?;
+            writeln!(out, "would modify: {}", terminal_text(p.as_str()))?;
         }
         let count = would_modify.len();
         if count > 0 {
@@ -332,7 +305,10 @@ pub fn run_per_file(
             failed.len(),
         )?;
         for (path, err) in &failed {
-            writeln!(out, "  - {path}: {err:#}")?;
+            // One line per file: the path and the error chain, a parse
+            // error's snippet included, through `terminal_text`.
+            let entry = format!("{path}: {err:#}");
+            writeln!(out, "  - {}", terminal_text(&entry))?;
         }
     }
 
@@ -342,6 +318,13 @@ pub fn run_per_file(
         }));
     }
     Ok(())
+}
+
+/// Whether the file at `path` already holds exactly `output_bytes`. A file
+/// that cannot be read counts as different, so the write that follows
+/// reports the real error.
+fn source_matches(path: &Utf8Path, output_bytes: &[u8]) -> bool {
+    std::fs::read(path.as_std_path()).is_ok_and(|source| source == output_bytes)
 }
 
 /// Compare `output_bytes` to the file's on-disk bytes and append `path` to

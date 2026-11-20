@@ -1,6 +1,7 @@
 //! TAP (Test Anything Protocol) version 13 output reporter.
 //!
-//! Per design D9 in `openspec/changes/add-exec-engine/design.md`, the reporter
+//! Per the add-exec-engine section of `docs/decisions.md` (behaviour in
+//! `docs/reference/cli.md`), the reporter
 //! consumes the canonical lint-engine output shape `{ "diagnostics": [...] }`
 //! — the same shape produced by `dq_lint::Diagnostic::to_serde_json` and
 //! consumed by [`crate::output::sarif::SarifReporter`] and
@@ -173,11 +174,12 @@ fn normalize_severity(sev: Option<&str>) -> &'static str {
 
 /// Escape a string for inclusion inside a YAML double-quoted scalar.
 ///
-/// YAML double-quoted strings interpret `\` and `"`, plus C-style escapes for
-/// control characters. This helper handles the subset needed for diagnostic
-/// messages and reference URLs: backslash, double quote, newline, carriage
-/// return, and tab. Anything else passes through unchanged.
-fn yaml_escape_double_quoted(s: &str) -> String {
+/// YAML double-quoted strings interpret `\` and `"`, plus escapes for
+/// control characters: backslash, double quote, newline, carriage return
+/// and tab get their short form, every other control character (and the
+/// NEL / line / paragraph separators) a `\x` / `\u` escape. Anything else
+/// passes through unchanged.
+pub(crate) fn yaml_escape_double_quoted(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
@@ -186,6 +188,17 @@ fn yaml_escape_double_quoted(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                let code = u32::from(c);
+                if code <= 0xFF {
+                    out.push_str(&format!("\\x{code:02X}"));
+                } else {
+                    out.push_str(&format!("\\u{code:04X}"));
+                }
+            }
+            '\u{2028}' => out.push_str("\\L"),
+            '\u{2029}' => out.push_str("\\P"),
+            '\u{FEFF}' => out.push_str("\\uFEFF"),
             _ => out.push(ch),
         }
     }
@@ -391,5 +404,13 @@ mod tests {
         assert_eq!(normalize_severity(Some("warn")), "warn");
         assert_eq!(normalize_severity(Some("warning")), "warn");
         assert_eq!(normalize_severity(Some("info")), "info");
+    }
+
+    #[test]
+    fn escapes_control_characters_in_double_quoted_scalars() {
+        assert_eq!(
+            yaml_escape_double_quoted("a\u{1}b\u{7f}\u{85}\u{2028}c\\\"d"),
+            "a\\x01b\\x7F\\x85\\Lc\\\\\\\"d"
+        );
     }
 }

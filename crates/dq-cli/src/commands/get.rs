@@ -29,7 +29,7 @@ pub fn run(
     cli: &Cli,
     args: &GetArgs,
     input_format: Option<&str>,
-    doc_arg: Option<&str>,
+    doc_arg: Option<crate::cli::DocSelector>,
     reporter: &dyn Reporter,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
@@ -38,17 +38,16 @@ pub fn run(
         anyhow::bail!(
             "`get` accepts RFC 6901 JSON Pointer; for JSONPath use `dq select`. \
              Suggested fix: dq get {file} {hint}",
-            file = args.file,
-            hint = jsonpath_to_pointer_hint(&args.pointer),
+            file = dq_core::one_line(args.file.as_str()),
+            hint = dq_core::one_line(&jsonpath_to_pointer_hint(&args.pointer)),
         );
     }
 
-    let (_fmt, doc) = load_document_with_path(&args.file, input_format)?;
-    let view = select_document(&doc, doc_arg)?;
+    let (_fmt, doc) = load_document_with_path(&args.file, input_format, cli.template_mode())?;
+    let view = select_document(&doc, doc_arg, &args.file)?;
     let pointer = Pointer::parse(&args.pointer).map_err(anyhow::Error::new)?;
     let value = pointer.resolve(view.as_ref()).map_err(anyhow::Error::new)?;
-    let json = value.to_serde_json();
-    reporter.report(&json, out)?;
+    reporter.report_value(value, out)?;
     Ok(())
 }
 

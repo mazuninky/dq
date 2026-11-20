@@ -30,8 +30,8 @@
 //!   plumbing in the apply path.
 //!
 //! Convergence between the two types is left to a future change. They
-//! coexist as separate types per design decision D3 in
-//! `openspec/changes/add-ir-foundation/design.md`.
+//! coexist as separate types (see `docs/reference/ir-and-edit-ops.md` and
+//! the add-ir-foundation section of `docs/decisions.md`).
 //!
 //! # Layering on top of `Document::set_at` / `del_at`
 //!
@@ -155,6 +155,38 @@ impl EditScript {
         self.0.is_empty()
     }
 
+    /// The same script with every op's path moved below `parent`.
+    ///
+    /// A fix written against one document of a multi-document stream (a
+    /// rule's `fix.ops`, a plugin's script) addresses that document's root
+    /// as `""`; the stream's write-aware [`Document`] addresses it as
+    /// `/N`. `script.under(&Pointer::new(vec![Segment::Index(n)]))` is the
+    /// script for the whole stream.
+    ///
+    /// [`Segment`]: crate::pointer::Segment
+    #[must_use]
+    pub fn under(&self, parent: &Pointer) -> Self {
+        let rebase = |path: &Pointer| {
+            let mut segments = parent.segments().to_vec();
+            segments.extend_from_slice(path.segments());
+            Pointer::new(segments)
+        };
+        self.0
+            .iter()
+            .map(|op| match op {
+                EditOp::Add { path, value } => EditOp::Add {
+                    path: rebase(path),
+                    value: value.clone(),
+                },
+                EditOp::Replace { path, value } => EditOp::Replace {
+                    path: rebase(path),
+                    value: value.clone(),
+                },
+                EditOp::Remove { path } => EditOp::Remove { path: rebase(path) },
+            })
+            .collect()
+    }
+
     /// Apply every op to `doc` in declaration order.
     ///
     /// Each op is dispatched to [`Document::set_at`] (for [`EditOp::Add`] /
@@ -173,10 +205,21 @@ impl EditScript {
     /// clone the document before invoking `apply`. This is exactly what
     /// `Fixer::apply` does in Phase 4 of the IR-foundation change.
     ///
+    /// On a format dq rewrites whole (HCL, XML, INI, …) every op is made to
+    /// the value tree and the file is written once, after the last
+    /// ([`Document::edit_batch`]); a failing op leaves the document as it
+    /// was before the script.
+    ///
     /// [`Document::set_at`]: crate::document::Document::set_at
     /// [`Document::del_at`]: crate::document::Document::del_at
+    /// [`Document::edit_batch`]: crate::document::Document::edit_batch
     /// [`SpanMap`]: crate::document
     pub fn apply(&self, doc: &mut Document) -> Result<()> {
+        doc.edit_batch(|doc| self.apply_each(doc))
+    }
+
+    /// Apply every op to `doc` in declaration order, each on its own.
+    fn apply_each(&self, doc: &mut Document) -> Result<()> {
         for op in &self.0 {
             match op {
                 EditOp::Add { path, value } => {
@@ -196,7 +239,7 @@ impl EditScript {
                     // Skip the pre-resolve on the read-only sentinel so
                     // `set_at` returns `WriteUnavailable` instead of
                     // `MissingKey` for those documents.
-                    if !doc.original_bytes().is_empty() {
+                    if doc.is_editable() {
                         path.resolve(doc.value())?;
                     }
                     doc.set_at(path, value.clone())?;
@@ -812,8 +855,7 @@ mod tests {
     /// `Document::set_at` (which `Add` calls into) returns `MissingKey` for
     /// pointers whose parent doesn't already contain that key — full
     /// mkdir-p insertion is a separate change (see
-    /// `openspec/changes/add-ir-foundation/tasks.md` Phase 3 task 3.7
-    /// caveat). Two Replaces strictly exercise the "ops apply in declaration
+    /// `docs/reference/ir-and-edit-ops.md`). Two Replaces strictly exercise the "ops apply in declaration
     /// order" guarantee without hitting the mkdir-p limitation.
     #[test]
     fn multi_op_script_applies_in_declaration_order() {
@@ -917,5 +959,32 @@ mod tests {
             }
             other => panic!("expected map, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn under_prefixes_every_op_path_with_the_parent() {
+        let mut script = EditScript::new();
+        script.push(EditOp::Add {
+            path: Pointer::parse("/a").unwrap(),
+            value: Value::Int(1),
+        });
+        script.push(EditOp::Replace {
+            path: Pointer::parse("").unwrap(),
+            value: Value::Null,
+        });
+        script.push(EditOp::Remove {
+            path: Pointer::parse("/b/0").unwrap(),
+        });
+        let rebased = script.under(&Pointer::parse("/2").unwrap());
+        let paths: Vec<String> = rebased
+            .ops()
+            .iter()
+            .map(|op| match op {
+                EditOp::Add { path, .. }
+                | EditOp::Replace { path, .. }
+                | EditOp::Remove { path } => path.as_canonical(),
+            })
+            .collect();
+        assert_eq!(paths, vec!["/2/a", "/2", "/2/b/0"]);
     }
 }

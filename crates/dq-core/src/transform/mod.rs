@@ -30,4 +30,4 @@ pub mod patch;
 
 pub use diff::diff;
 pub use merge::apply_merge;
-pub use patch::{PatchOp, apply_patch};
+pub use patch::{PatchOp, apply_patch, apply_patch_edits};

@@ -10,10 +10,15 @@
 //!
 //! - 0 — `SUCCESS` — command completed.
 //! - 1 — `GENERIC` — unclassified failure; also used for `exists` returning "false".
-//! - 2 — `NOT_FOUND` — JSON Pointer did not address an existing node.
+//! - 2 — `NOT_FOUND` — JSON Pointer did not address an existing node, or
+//!   `--doc N` named a document the file does not have. clap's usage
+//!   errors exit 2 as well, including the ones dq raises after parsing:
+//!   `--doc` on a command that cannot honour it, stdin without
+//!   `--input-format`, a `-F` a write command cannot keep a file in.
 //! - 3 — `PARSE_ERROR` — source could not be parsed (includes Go-template
 //!   guard rejections from [`dq_core::Error::TemplatedFile`]).
-//! - 4 — `VALIDATE_FAIL` — `validate` reports the document is invalid.
+//! - 4 — `VALIDATE_FAIL` — `validate` reports the document is invalid;
+//!   also `self update` refusing a downloaded archive at its checksum gate.
 //! - 5 — `IO_ERROR` — read-side IO failure (couldn't read source file).
 //! - 6 — `INVALID_INPUT` — bad CLI usage / unsupported flag combination.
 //! - 7 — `WRITE_FAILED` — read+resolve+render succeeded but writing the
@@ -51,7 +56,8 @@ use dq_exec::ExecError;
 use dq_plugin::PluginError;
 
 use crate::error::{
-    BulkPartialFailure, CheckPending, InvalidInput, LintFail, LintWarnStrict, ValidateFail,
+    BulkPartialFailure, CheckPending, DocOutOfRange, DocOutOfRangeEverywhere, InvalidInput,
+    LintFail, LintWarnStrict, ValidateFail, WrongType,
 };
 
 /// Successful exit.
@@ -66,7 +72,7 @@ pub const PARSE_ERROR: i32 = 3;
 pub const VALIDATE_FAIL: i32 = 4;
 /// I/O failure (file not found, permission denied, broken writer, ...).
 pub const IO_ERROR: i32 = 5;
-/// Caller-side input error: bad CLI flags, unsupported `-F` value, etc.
+/// Caller-side input error: bad CLI flags, an unsupported file format, etc.
 pub const INVALID_INPUT: i32 = 6;
 /// File parse / resolution succeeded but writing failed (filesystem,
 /// permission, atomic rename collision). Distinct from [`IO_ERROR`] (read-side
@@ -99,8 +105,26 @@ pub fn exit_code_for_error(err: &anyhow::Error) -> i32 {
     if err.downcast_ref::<LintWarnStrict>().is_some() {
         return GENERIC;
     }
+    // `dq self update` refused the downloaded archive at its checksum gate:
+    // the download failed a verification, the "failed a check" family.
+    if err
+        .downcast_ref::<crate::commands::self_cmd::ChecksumError>()
+        .is_some()
+    {
+        return VALIDATE_FAIL;
+    }
     if err.downcast_ref::<InvalidInput>().is_some() {
         return INVALID_INPUT;
+    }
+    // A usage error a handler raises through clap (`--doc` on a command
+    // that cannot honour it) exits like the ones clap raises while parsing.
+    if let Some(usage) = err.downcast_ref::<clap::Error>() {
+        return usage.exit_code();
+    }
+    if err.downcast_ref::<DocOutOfRange>().is_some()
+        || err.downcast_ref::<DocOutOfRangeEverywhere>().is_some()
+    {
+        return NOT_FOUND;
     }
     // Bulk-mode markers from the M3 §3 driver. `CheckPending` is the
     // `--check` "changes pending" signal (semantically a yes/no question
@@ -109,6 +133,11 @@ pub fn exit_code_for_error(err: &anyhow::Error) -> i32 {
     // `--continue-on-error` aggregator — at least one file in the run
     // failed to write, so we surface the standard write-failure code.
     if err.downcast_ref::<CheckPending>().is_some() {
+        return GENERIC;
+    }
+    // `keys` / `values` / `len` on a node of the wrong type: the node is
+    // there, so not NOT_FOUND.
+    if err.downcast_ref::<WrongType>().is_some() {
         return GENERIC;
     }
     if err.downcast_ref::<BulkPartialFailure>().is_some() {
@@ -341,7 +370,7 @@ mod tests {
 
     #[test]
     fn maps_invalid_input_marker_to_invalid_input() {
-        let err = anyhow::Error::new(InvalidInput::new("missing -F for stdin"));
+        let err = anyhow::Error::new(InvalidInput::new("write-mode flag on a read command"));
         assert_eq!(exit_code_for_error(&err), INVALID_INPUT);
     }
 

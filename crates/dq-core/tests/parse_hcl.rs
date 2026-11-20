@@ -165,3 +165,425 @@ backend "s3" {
         "round-trip must preserve the value tree exactly",
     );
 }
+
+/// Write `doc` as HCL, panicking with the writer's message on failure.
+fn write_hcl(doc: &Document) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    hcl()
+        .write(doc, &mut buf)
+        .unwrap_or_else(|e| panic!("hcl write failed: {e}"));
+    String::from_utf8(buf).expect("hcl writer must produce utf-8")
+}
+
+/// `{key: value}`.
+fn map1(key: &str, value: Value) -> Value {
+    Value::Map([(key.to_owned(), value)].into_iter().collect())
+}
+
+#[test]
+fn fifty_nested_blocks_write_and_read_back() {
+    let depth = 50;
+    let source = format!("{}x = 1\n{}", "a {\n".repeat(depth), "}\n".repeat(depth));
+    let doc = parse_hcl(&source);
+    let expected = (0..depth).fold(map1("x", Value::Int(1)), |inner, _| map1("a", inner));
+    assert_eq!(doc.value(), &expected);
+    let written = write_hcl(&doc);
+    assert!(written.starts_with("a {\n  a {\n    a {\n"), "{written}");
+    assert_eq!(parse_hcl(&written).value(), &expected);
+}
+
+#[test]
+fn fifty_nested_arrays_and_objects_write_and_read_back() {
+    let expected = map1(
+        "v",
+        (0..50).fold(Value::Int(1), |inner, level| {
+            if level % 2 == 0 {
+                Value::Array(vec![inner, Value::Bool(true)])
+            } else {
+                map1("k", inner)
+            }
+        }),
+    );
+    let doc = Document::value_only(expected.clone(), dq_core::FormatTag::Hcl);
+    assert_eq!(parse_hcl(&write_hcl(&doc)).value(), &expected);
+}
+
+#[test]
+fn empty_arrays_and_objects_inside_arrays_write_and_read_back() {
+    let empty_array = || Value::Array(Vec::new());
+    let empty_map = || Value::Map(Default::default());
+    let expected = map1(
+        "a",
+        Value::Array(vec![
+            empty_array(),
+            empty_map(),
+            Value::Array(vec![empty_array()]),
+            Value::Array(vec![empty_map()]),
+            map1("k", empty_array()),
+        ]),
+    );
+    let doc = Document::value_only(expected.clone(), dq_core::FormatTag::Hcl);
+    let written = write_hcl(&doc);
+    assert_eq!(
+        written,
+        "a = [\n  [],\n  {},\n  [\n    []\n  ],\n  [\n    {}\n  ],\n  {\n    \"k\" = []\n  }\n]\n"
+    );
+    assert_eq!(parse_hcl(&written).value(), &expected);
+}
+
+// ---------------------------------------------------------------------------
+// Repeated blocks. A block type that occurs once keeps the documented shape
+// (`{type: {label: body}}`); blocks repeated with the same type and labels
+// become a list of their bodies, in source order. The writer writes every
+// key the reader read as a block back as blocks, so the text reads back to
+// the same tree.
+// ---------------------------------------------------------------------------
+
+/// Parse `source`, write it, and assert the written text is `expected` and
+/// reads back to the tree `source` read to. Returns that tree.
+fn round_trip(source: &str, expected: &str) -> Value {
+    let doc = parse_hcl(source);
+    let written = write_hcl(&doc);
+    assert_eq!(written, expected, "written HCL of:\n{source}");
+    assert_eq!(
+        parse_hcl(&written).value(),
+        doc.value(),
+        "re-read tree of:\n{written}"
+    );
+    doc.value().clone()
+}
+
+/// `{k: v, ...}`.
+fn map(members: Vec<(&str, Value)>) -> Value {
+    Value::Map(
+        members
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v))
+            .collect(),
+    )
+}
+
+#[test]
+fn repeated_unlabelled_blocks_read_as_a_list_and_write_back_as_blocks() {
+    let source = r#"
+resource "aws_security_group" "app" {
+  name = "app"
+  ingress {
+    from_port   = 443
+    cidr_blocks = ["10.0.0.0/8"]
+  }
+  ingress {
+    from_port   = 80
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  ingress {
+    from_port = 22
+  }
+  tags = { Name = "app" }
+}
+"#;
+    let tree = round_trip(
+        source,
+        "resource \"aws_security_group\" \"app\" {\n  name = \"app\"\n  ingress {\n    \
+         from_port = 443\n    cidr_blocks = [\n      \"10.0.0.0/8\"\n    ]\n  }\n  ingress {\n    \
+         from_port = 80\n    cidr_blocks = [\n      \"0.0.0.0/0\"\n    ]\n  }\n  ingress {\n    \
+         from_port = 22\n  }\n  tags = {\n    \"Name\" = \"app\"\n  }\n}\n",
+    );
+    let strings =
+        |items: &[&str]| Value::Array(items.iter().map(|s| Value::String((*s).into())).collect());
+    assert_eq!(
+        tree,
+        map1(
+            "resource",
+            map1(
+                "aws_security_group",
+                map1(
+                    "app",
+                    map(vec![
+                        ("name", Value::String("app".into())),
+                        (
+                            "ingress",
+                            Value::Array(vec![
+                                map(vec![
+                                    ("from_port", Value::Int(443)),
+                                    ("cidr_blocks", strings(&["10.0.0.0/8"])),
+                                ]),
+                                map(vec![
+                                    ("from_port", Value::Int(80)),
+                                    ("cidr_blocks", strings(&["0.0.0.0/0"])),
+                                ]),
+                                map1("from_port", Value::Int(22)),
+                            ]),
+                        ),
+                        ("tags", map1("Name", Value::String("app".into()))),
+                    ]),
+                ),
+            ),
+        ),
+    );
+}
+
+#[test]
+fn blocks_with_the_same_type_and_labels_become_a_list_under_the_last_label() {
+    let tree = round_trip(
+        "provider \"aws\" {\n  region = \"us-east-1\"\n}\n\
+         provider \"google\" {\n  project = \"p\"\n}\n\
+         provider \"aws\" {\n  alias = \"west\"\n  region = \"us-west-2\"\n}\n",
+        "provider \"aws\" {\n  region = \"us-east-1\"\n}\n\
+         provider \"aws\" {\n  alias = \"west\"\n  region = \"us-west-2\"\n}\n\
+         provider \"google\" {\n  project = \"p\"\n}\n",
+    );
+    assert_eq!(
+        tree,
+        map1(
+            "provider",
+            map(vec![
+                (
+                    "aws",
+                    Value::Array(vec![
+                        map1("region", Value::String("us-east-1".into())),
+                        map(vec![
+                            ("alias", Value::String("west".into())),
+                            ("region", Value::String("us-west-2".into())),
+                        ]),
+                    ]),
+                ),
+                ("google", map1("project", Value::String("p".into()))),
+            ]),
+        ),
+    );
+    // Two labels: only the bodies under the same pair become a list.
+    let tree = round_trip(
+        "resource \"t\" \"a\" {\n  n = 1\n}\nresource \"t\" \"b\" {\n  n = 2\n}\n\
+         resource \"t\" \"a\" {\n  n = 3\n}\n",
+        "resource \"t\" \"a\" {\n  n = 1\n}\nresource \"t\" \"a\" {\n  n = 3\n}\n\
+         resource \"t\" \"b\" {\n  n = 2\n}\n",
+    );
+    assert_eq!(
+        tree,
+        map1(
+            "resource",
+            map1(
+                "t",
+                map(vec![
+                    (
+                        "a",
+                        Value::Array(vec![map1("n", Value::Int(1)), map1("n", Value::Int(3))]),
+                    ),
+                    ("b", map1("n", Value::Int(2))),
+                ]),
+            ),
+        ),
+    );
+}
+
+#[test]
+fn blocks_that_occur_once_keep_their_shape_and_are_written_as_blocks() {
+    let source = "terraform {\n  required_version = \">= 1.5\"\n  backend \"s3\" {\n    \
+                  bucket = \"b\"\n  }\n}\nlifecycle {}\nlabel \"\" {}\n";
+    let tree = round_trip(source, source);
+    assert_eq!(
+        tree,
+        map(vec![
+            (
+                "terraform",
+                map(vec![
+                    ("required_version", Value::String(">= 1.5".into())),
+                    (
+                        "backend",
+                        map1("s3", map1("bucket", Value::String("b".into())))
+                    ),
+                ]),
+            ),
+            ("lifecycle", map(vec![])),
+            ("label", map1("", map(vec![]))),
+        ]),
+    );
+}
+
+#[test]
+fn nested_repeats_keep_every_block_at_every_level() {
+    // `dynamic` blocks with a repeated `content`, repeated `provisioner`s,
+    // and a repeated outer block whose bodies repeat inside, differently.
+    let source = r#"resource "aws_instance" "x" {
+  dynamic "ingress" {
+    for_each = "one"
+    content {
+      a = 1
+    }
+  }
+  dynamic "ingress" {
+    for_each = "two"
+    content {
+      a = 2
+    }
+    content {
+      a = 3
+    }
+  }
+  provisioner "local-exec" {
+    command = "one"
+  }
+  provisioner "local-exec" {
+    command = "two"
+  }
+}
+outer {
+  inner {
+    v = 1
+  }
+  inner {
+    v = 2
+  }
+}
+outer {
+  inner {
+    v = 3
+  }
+}
+"#;
+    let tree = round_trip(source, source);
+    let inner = |v: i64| map1("v", Value::Int(v));
+    let Value::Map(top) = &tree else {
+        panic!("{tree:?}")
+    };
+    assert_eq!(
+        top["outer"],
+        Value::Array(vec![
+            map1("inner", Value::Array(vec![inner(1), inner(2)])),
+            map1("inner", inner(3)),
+        ]),
+    );
+    let instance = &top["resource"];
+    let content = |a: i64| map1("a", Value::Int(a));
+    assert_eq!(
+        instance,
+        &map1(
+            "aws_instance",
+            map1(
+                "x",
+                map(vec![
+                    (
+                        "dynamic",
+                        map1(
+                            "ingress",
+                            Value::Array(vec![
+                                map(vec![
+                                    ("for_each", Value::String("one".into())),
+                                    ("content", content(1)),
+                                ]),
+                                map(vec![
+                                    ("for_each", Value::String("two".into())),
+                                    ("content", Value::Array(vec![content(2), content(3)])),
+                                ]),
+                            ]),
+                        ),
+                    ),
+                    (
+                        "provisioner",
+                        map1(
+                            "local-exec",
+                            Value::Array(vec![
+                                map1("command", Value::String("one".into())),
+                                map1("command", Value::String("two".into())),
+                            ]),
+                        ),
+                    ),
+                ]),
+            ),
+        ),
+    );
+}
+
+#[test]
+fn an_attribute_holding_a_list_of_objects_stays_an_attribute() {
+    let source = "ingress = [\n  {\n    \"p\" = 1\n  },\n  {\n    \"p\" = 2\n  }\n]\n\
+                  one = {\n  \"p\" = 1\n}\n";
+    round_trip(source, source);
+}
+
+#[test]
+fn a_key_read_as_blocks_stays_blocks_unless_it_lost_the_shape() {
+    // What a `set --jq` may leave at a key read as blocks: one body left in
+    // the list is one block, which reads back as the body alone; an empty
+    // label map is no block, so the key goes; a scalar is an attribute.
+    let mut doc = parse_hcl("x {\n  a = 1\n}\nx {\n  a = 2\n}\np \"l\" {}\ns {}\n");
+    let Value::Map(top) = doc.value_mut() else {
+        panic!()
+    };
+    top.insert("x".into(), Value::Array(vec![map1("a", Value::Int(1))]));
+    top.insert("p".into(), map(vec![]));
+    top.insert("s".into(), Value::String("v".into()));
+    let written = write_hcl(&doc);
+    assert_eq!(written, "x {\n  a = 1\n}\ns = \"v\"\n");
+    assert_eq!(
+        parse_hcl(&written).value(),
+        &map(vec![
+            ("x", map1("a", Value::Int(1))),
+            ("s", Value::String("v".into())),
+        ])
+    );
+    // A third body appended to two is three blocks.
+    let Value::Map(top) = doc.value_mut() else {
+        panic!()
+    };
+    top.insert(
+        "x".into(),
+        Value::Array((1..=3).map(|a| map1("a", Value::Int(a))).collect()),
+    );
+    assert_eq!(
+        write_hcl(&doc),
+        "x {\n  a = 1\n}\nx {\n  a = 2\n}\nx {\n  a = 3\n}\ns = \"v\"\n"
+    );
+}
+
+#[test]
+fn repeated_bodies_that_disagree_on_a_nested_key_still_read_back_the_same() {
+    // `y` has one label in the first `x` and none in the second: the
+    // writer cannot write both as blocks of one shape, so it writes `y` as
+    // attributes, which read back as the same tree.
+    for source in [
+        "x {\n  y \"a\" {\n    v = 1\n  }\n}\nx {\n  y {\n    a = 2\n  }\n}\n",
+        "x {\n  y {\n    v = 1\n  }\n}\nx {\n  y = {\n    v = 2\n  }\n}\n",
+    ] {
+        let doc = parse_hcl(source);
+        let written = write_hcl(&doc);
+        assert_eq!(parse_hcl(&written).value(), doc.value(), "{written}");
+    }
+}
+
+#[test]
+fn a_body_whose_keys_one_map_cannot_hold_apart_is_a_parse_error() {
+    for (source, message) in [
+        (
+            "x = 1\nx {\n  b = 2\n}\n",
+            "HCL error in line 2, column 1: block \"x\" has the name of an attribute of the \
+             same body; dq reads both as the key \"x\" and would lose one",
+        ),
+        (
+            "x {\n  b = 2\n}\nx = 1\n",
+            "HCL error in line 4, column 1: attribute \"x\" has the name of a block of the same \
+             body; dq reads both as the key \"x\" and would lose one",
+        ),
+        (
+            "x \"a\" {\n  k = 1\n}\n  x {\n  a = 2\n}\n",
+            "HCL error in line 4, column 3: block \"x\" has 0 labels here and 1 label on an \
+             earlier \"x\" block of the same body; dq nests one map level per label and would \
+             lose one",
+        ),
+        (
+            "o {\n  x \"a\" \"b\" {}\n  x \"c\" {}\n}\n",
+            "HCL error in line 3, column 3: block \"x\" has 1 label here and 2 labels on an \
+             earlier \"x\" block of the same body; dq nests one map level per label and would \
+             lose one",
+        ),
+    ] {
+        let err = hcl().parse(source.as_bytes()).expect_err(source);
+        let dq_core::Error::Parse { message: got, .. } = &err else {
+            panic!("{err:?}")
+        };
+        assert_eq!(got, message, "{source}");
+    }
+    // Blocks of one type in two different bodies are no clash.
+    parse_hcl("x \"a\" {}\ny {\n  x {}\n}\n");
+}

@@ -7,7 +7,7 @@ description: |
 severity: warn
 match:
   format: json
-  filter: 'has("name") and has("version")'
+  filter: 'type == "object" and has("name") and has("version")'
 check:
   jq: 'select((.private // false) != true and ((.license // "") == ""))'
   message: "package.json is missing the 'license' field"

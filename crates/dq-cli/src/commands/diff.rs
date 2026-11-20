@@ -42,10 +42,12 @@ use crate::output::{OutputFormat, Reporter};
 
 /// Run the `diff` command.
 ///
-/// `input_format` is the optional input parser override (used in tests to
-/// force a parser for both files). The dispatcher in [`crate::dispatch`]
-/// always passes `None` — `-F` for `diff` controls the OUTPUT renderer, not
-/// the input parser, mirroring `convert`'s behaviour.
+/// `input_format` is `--input-format`: when set, both files are read in it;
+/// otherwise each one's format is detected. `-F` only picks the renderer.
+///
+/// `use_color` is the dispatcher's colour decision
+/// ([`crate::output::resolve_color`]: `--no-color`, `NO_COLOR`,
+/// `CLICOLOR_FORCE`, stdout a terminal); it colours the `--unified` text.
 ///
 /// # Errors
 ///
@@ -57,23 +59,34 @@ pub fn run(
     cli: &Cli,
     args: &DiffArgs,
     input_format: Option<&str>,
+    use_color: bool,
     reporter: &dyn Reporter,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
     cli.ensure_no_write_flags()?;
 
-    let (_fmt_a, doc_a) = load_document_with_path(&args.a, input_format)?;
-    let (_fmt_b, doc_b) = load_document_with_path(&args.b, input_format)?;
+    let (_fmt_a, doc_a) = load_document_with_path(&args.a, input_format, cli.template_mode())?;
+    let (_fmt_b, doc_b) = load_document_with_path(&args.b, input_format, cli.template_mode())?;
 
     if args.unified {
         // Render both documents as pretty JSON (stable key order via
         // `preserve_order`) and unified-diff the textual forms. JSON is the
         // lowest-common-denominator stable representation that both YAML and
         // TOML inputs can be normalised through.
-        let a_json = serde_json::to_string_pretty(&doc_a.value().to_serde_json())?;
-        let b_json = serde_json::to_string_pretty(&doc_b.value().to_serde_json())?;
-        let label = format!("{} -> {}", args.a, args.b);
-        let unified = crate::diff::render_unified(&a_json, &b_json, &label, !cli.no_color);
+        //
+        // Each text ends with a line break: they are dq's renderings, not
+        // the files, so a `\ No newline at end of file` marker would say
+        // something about the files that is not so. The labels are the
+        // paths as given, as `diff -u FILE1 FILE2` prints them.
+        let a_json = pretty_json(&doc_a.value().to_serde_json())? + "\n";
+        let b_json = pretty_json(&doc_b.value().to_serde_json())? + "\n";
+        let unified = crate::diff::render_unified_files(
+            &a_json,
+            &b_json,
+            args.a.as_str(),
+            args.b.as_str(),
+            use_color,
+        );
         out.write_all(unified.as_bytes())?;
         return Ok(());
     }
@@ -85,7 +98,7 @@ pub fn run(
     // `PatchOp`'s `Serialize` impl renders to the RFC 6902 wire shape; convert
     // to a `serde_json::Value` so the standard reporter pipeline can format
     // it (JSON / YAML / TOML / TOON / JSONL all work this way).
-    let json = serde_json::to_value(&ops)?;
+    let json = ops_to_json(&ops)?;
 
     // Console output for `Vec<PatchOp>` would render as one cryptic line per
     // op (no structure markers). The spec calls JSON Patch the default
@@ -93,12 +106,44 @@ pub fn run(
     // JSON-pretty — closer to the user's intent than the "console reporter"
     // shape. Other formats route through the supplied reporter unchanged.
     if cli.format == OutputFormat::Console {
-        serde_json::to_writer_pretty(&mut *out, &json)?;
-        out.write_all(b"\n")?;
+        crate::output::JsonReporter.report(&json, out)?;
         return Ok(());
     }
     reporter.report(&json, out)?;
     Ok(())
+}
+
+/// `value` as the JSON reporter prints it — floats in their shortest
+/// round-trip spelling, as every JSON output spells them — without the
+/// trailing newline.
+fn pretty_json(value: &serde_json::Value) -> anyhow::Result<String> {
+    let mut buf = Vec::new();
+    crate::output::JsonReporter.report(value, &mut buf)?;
+    let mut text = String::from_utf8(buf)?;
+    if text.ends_with('\n') {
+        text.pop();
+    }
+    Ok(text)
+}
+
+/// The RFC 6902 wire shape of `ops`, each `value` with its number exact.
+///
+/// `Value`'s generic `Serialize` writes a big number (`BigInt` / `BigFloat`)
+/// as a string; [`dq_core::Value::to_serde_json`] keeps it a number.
+fn ops_to_json(ops: &[dq_core::PatchOp]) -> serde_json::Result<serde_json::Value> {
+    let mut json = serde_json::to_value(ops)?;
+    if let serde_json::Value::Array(items) = &mut json {
+        for (op, item) in ops.iter().zip(items) {
+            if let dq_core::PatchOp::Add { value, .. }
+            | dq_core::PatchOp::Replace { value, .. }
+            | dq_core::PatchOp::Test { value, .. } = op
+                && let Some(slot) = item.get_mut("value")
+            {
+                *slot = value.to_serde_json();
+            }
+        }
+    }
+    Ok(json)
 }
 
 #[cfg(test)]
@@ -171,7 +216,7 @@ mod tests {
         };
         let reporter = JsonReporter;
         let mut out: Vec<u8> = Vec::new();
-        run(&cli, &args, None, &reporter, &mut out).expect("equal files diff");
+        run(&cli, &args, None, false, &reporter, &mut out).expect("equal files diff");
         let stdout = String::from_utf8(out).expect("utf-8 stdout");
         // JsonReporter emits pretty-printed JSON with a trailing newline; the
         // empty array renders as `[]\n`.
@@ -198,7 +243,7 @@ mod tests {
         };
         let reporter = JsonReporter;
         let mut out: Vec<u8> = Vec::new();
-        run(&cli, &args, None, &reporter, &mut out).expect("single replace diff");
+        run(&cli, &args, None, false, &reporter, &mut out).expect("single replace diff");
         let stdout = String::from_utf8(out).expect("utf-8 stdout");
         let parsed: serde_json::Value =
             serde_json::from_str(&stdout).expect("output must be JSON array");
@@ -227,7 +272,7 @@ mod tests {
         };
         let reporter = JsonReporter;
         let mut out: Vec<u8> = Vec::new();
-        run(&cli, &args, None, &reporter, &mut out).expect("type-change diff");
+        run(&cli, &args, None, false, &reporter, &mut out).expect("type-change diff");
         let stdout = String::from_utf8(out).expect("utf-8 stdout");
         let parsed: serde_json::Value =
             serde_json::from_str(&stdout).expect("output must be JSON array");
@@ -259,7 +304,7 @@ mod tests {
         };
         let reporter = JsonReporter;
         let mut out: Vec<u8> = Vec::new();
-        run(&cli, &args, None, &reporter, &mut out).expect("cross-format diff");
+        run(&cli, &args, None, false, &reporter, &mut out).expect("cross-format diff");
         let stdout = String::from_utf8(out).expect("utf-8 stdout");
         assert_eq!(
             stdout.trim(),
@@ -284,8 +329,18 @@ mod tests {
         };
         let reporter = JsonReporter;
         let mut out: Vec<u8> = Vec::new();
-        run(&cli, &args, None, &reporter, &mut out).expect("unified diff");
+        let (label_a, label_b) = (args.a.to_string(), args.b.to_string());
+        run(&cli, &args, None, false, &reporter, &mut out).expect("unified diff");
         let stdout = String::from_utf8(out).expect("utf-8 stdout");
+        // The paths as given label the two sides; the JSON texts end with a
+        // line break, so no `\ No newline at end of file` marker.
+        assert_eq!(
+            stdout,
+            format!(
+                "--- {label_a}\n+++ {label_b}\n@@ -1,5 +1,5 @@\n {{\n   \"server\": {{\n\
+                 -    \"port\": 8080\n+    \"port\": 9090\n   }}\n }}\n"
+            )
+        );
         assert!(
             stdout.contains("---"),
             "unified diff must contain `---` header, got:\n{stdout}",
@@ -301,6 +356,27 @@ mod tests {
     }
 
     #[test]
+    fn diff_unified_colours_by_use_color_not_the_flag() {
+        // The colour decision is the caller's `use_color`; without
+        // `--no-color` the text is plain when `use_color` is false.
+        let a = write_tmp("x: 1\n", ".yaml");
+        let b = write_tmp("x: 2\n", ".yaml");
+        let (a_path, b_path) = (utf8_path(&a), utf8_path(&b));
+        let cli = cli_for(&a_path, &b_path, &[]);
+        let args = DiffArgs {
+            a: a_path,
+            b: b_path,
+            unified: true,
+        };
+        for (use_color, coloured) in [(false, false), (true, true)] {
+            let mut out: Vec<u8> = Vec::new();
+            run(&cli, &args, None, use_color, &JsonReporter, &mut out).expect("unified diff");
+            let stdout = String::from_utf8(out).expect("utf-8 stdout");
+            assert_eq!(stdout.contains('\x1b'), coloured, "{use_color}: {stdout:?}");
+        }
+    }
+
+    #[test]
     fn diff_rejects_in_place_flag() {
         // `diff` is a read-only subcommand: passing `-i` must be rejected
         // with `INVALID_INPUT` (exit 6) before any I/O happens.
@@ -313,7 +389,7 @@ mod tests {
         };
         let reporter = JsonReporter;
         let mut out: Vec<u8> = Vec::new();
-        let err = run(&cli, &args, None, &reporter, &mut out).expect_err("must reject -i");
+        let err = run(&cli, &args, None, false, &reporter, &mut out).expect_err("must reject -i");
         assert!(
             err.downcast_ref::<crate::error::InvalidInput>().is_some(),
             "rejection must carry InvalidInput so exit-code mapper picks 6, got: {err:?}",
@@ -321,6 +397,25 @@ mod tests {
         assert!(
             err.to_string().contains("--in-place"),
             "error message should mention --in-place, got: {err}",
+        );
+    }
+
+    #[test]
+    fn ops_to_json_keeps_a_big_number_a_number() {
+        let ops = dq_core::diff(
+            &serde_json::from_str::<serde_json::Value>(r#"{"a": 1, "b": 2}"#)
+                .map(|v| dq_core::Value::from_serde_json(&v))
+                .unwrap(),
+            &serde_json::from_str::<serde_json::Value>(
+                r#"{"a": 0.1000000000000000000000000002, "b": 2, "c": 18446744073709551616}"#,
+            )
+            .map(|v| dq_core::Value::from_serde_json(&v))
+            .unwrap(),
+        );
+        let json = serde_json::to_string(&ops_to_json(&ops).unwrap()).unwrap();
+        assert_eq!(
+            json,
+            r#"[{"op":"add","path":"/c","value":18446744073709551616},{"op":"replace","path":"/a","value":0.1000000000000000000000000002}]"#
         );
     }
 }

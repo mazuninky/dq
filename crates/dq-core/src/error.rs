@@ -5,6 +5,7 @@
 //! suggestions, and per-variant exit codes — see [`Error::kind_name`] for the
 //! stable string used by the CLI's exit-code mapping.
 
+use std::borrow::Cow;
 use std::ops::Range;
 
 use camino::Utf8PathBuf;
@@ -27,6 +28,19 @@ pub enum PathErrorKind {
         /// What we actually found.
         found: &'static str,
     },
+    /// An RFC 6902 `move` into one of the children of the value it moves:
+    /// its `from` is a proper prefix of its `path` (RFC 6902 §4.4).
+    IntoItsOwnChild {
+        /// The `from` of the move, in canonical form.
+        from: String,
+    },
+    /// A delete of the root pointer: it names the whole document.
+    DeleteRoot,
+    /// A `set` of the root pointer of a stream of documents, where it
+    /// names no one document.
+    StreamRoot,
+    /// An insert at the root pointer, which names no item of an array.
+    InsertAtRoot,
 }
 
 /// All errors `dq-core` may produce.
@@ -73,8 +87,9 @@ pub enum Error {
         message: String,
     },
 
-    /// JSON Pointer did not address an existing node.
-    #[error("path '{pointer}' not found (matched up to '{matched_prefix}')")]
+    /// JSON Pointer did not address an existing node — or addressed the
+    /// root of a document, or of a stream, that the edit cannot apply to.
+    #[error("{}", path_message(pointer, matched_prefix, kind))]
     Path {
         /// The pointer the user supplied.
         pointer: String,
@@ -86,7 +101,7 @@ pub enum Error {
         did_you_mean: Vec<String>,
     },
 
-    /// File extension or `-F` value did not match any known parser.
+    /// File extension or `--input-format` value did not match any known parser.
     #[error("unsupported format '{name}'")]
     UnsupportedFormat {
         /// The format name or extension that was rejected.
@@ -174,6 +189,44 @@ pub enum Error {
     },
 }
 
+/// `text` on one line: a line feed as `\x0a` and a carriage return as
+/// `\x0d`, as the CLI prints every other control character of a message on
+/// the terminal. For a message, or user data quoted in one — a pointer, a
+/// key, a path — on its way to the terminal, where a line break of its own
+/// could start a line that passes for one of the message's (`dq get x.json
+/// $'/a\nY'`). The errors' messages themselves keep the text as it is:
+/// machine-readable output carries it. Borrowed when there is none.
+#[must_use]
+pub fn one_line(text: &str) -> Cow<'_, str> {
+    if !text.contains(['\n', '\r']) {
+        return Cow::Borrowed(text);
+    }
+    Cow::Owned(text.replace('\n', "\\x0a").replace('\r', "\\x0d"))
+}
+
+/// The message of an [`Error::Path`].
+fn path_message(pointer: &str, matched_prefix: &str, kind: &PathErrorKind) -> String {
+    match kind {
+        PathErrorKind::DeleteRoot => format!(
+            "cannot delete the root '{pointer}': it is the whole document; delete a value \
+             inside it, or one document of a stream as /N"
+        ),
+        PathErrorKind::StreamRoot => format!(
+            "cannot set the root '{pointer}' of a stream of documents: set one document \
+             as /N, or pass --doc N"
+        ),
+        PathErrorKind::InsertAtRoot => format!(
+            "cannot insert at the root '{pointer}': it is the whole document, no item of \
+             an array; name an index of an array, as /a/0"
+        ),
+        PathErrorKind::IntoItsOwnChild { from } => format!(
+            "cannot move '{from}' to '{pointer}': a value cannot move into one of its own \
+             children"
+        ),
+        _ => format!("path '{pointer}' not found (matched up to '{matched_prefix}')"),
+    }
+}
+
 impl Error {
     /// Stable per-variant identifier used by the CLI to map errors to exit codes.
     #[must_use]
@@ -212,6 +265,26 @@ impl Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_line_escapes_line_breaks_only() {
+        assert!(matches!(one_line("/a/b"), Cow::Borrowed("/a/b")));
+        assert_eq!(one_line("/a\nY\r\tz"), "/a\\x0aY\\x0d\tz");
+    }
+
+    #[test]
+    fn a_message_keeps_the_user_data_it_quotes_as_it_is() {
+        // Machine-readable output (`validate -F json`) carries the message
+        // as it is; the terminal escapes it (`dq::render_error`).
+        let err = Error::Format {
+            format: "csv",
+            message: "row 0 key 'k\nz': nested".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "csv format error: row 0 key 'k\nz': nested"
+        );
+    }
 
     #[test]
     fn kind_name_is_stable_per_variant() {

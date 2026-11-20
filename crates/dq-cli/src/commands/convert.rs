@@ -50,9 +50,9 @@ use std::io::Write;
 use camino::{Utf8Path, Utf8PathBuf};
 use dq_core::{Document, FormatTag, FrontmatterKind, WriteOptions};
 
-use super::io_helpers::load_document_with_path;
+use super::io_helpers::{checked_index, load_document_with_path};
 use crate::bulk;
-use crate::cli::{Cli, ConvertArgs};
+use crate::cli::{Cli, ConvertArgs, DocSelector};
 use crate::error::InvalidInput;
 use crate::output::{ConsoleReporter, OutputFormat, Reporter, ToonReporter};
 
@@ -90,7 +90,14 @@ pub fn run(
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
     if cli.in_place {
-        run_in_place(cli, args, output_format, use_color, opts, out)
+        if cli.doc.is_some() {
+            return Err(cli.doc_usage_error(
+                "convert -i",
+                "writing one document and removing the source would delete the others; \
+                 convert to stdout instead",
+            ));
+        }
+        run_in_place(cli, args, input_format, output_format, use_color, opts, out)
     } else {
         // Read-only mode: existing M2 contract. We do NOT call the generic
         // `Cli::ensure_no_write_flags` because `--keep-source` is not a
@@ -98,7 +105,7 @@ pub fn run(
         // `ensure_no_write_flags` rejects every flag the read mode forbids
         // (everything except `-i`, which we already filtered above).
         cli.ensure_no_write_flags()?;
-        run_to_stdout(args, input_format, output_format, use_color, opts, out)
+        run_to_stdout(cli, args, input_format, output_format, use_color, opts, out)
     }
 }
 
@@ -107,6 +114,7 @@ pub fn run(
 /// must keep all golden tests passing. When `--sort-keys` / `--indent` are
 /// set, the rendering path picks them up via `Format::write_with_options`.
 fn run_to_stdout(
+    cli: &Cli,
     args: &ConvertArgs,
     input_format: Option<&str>,
     output_format: OutputFormat,
@@ -114,26 +122,74 @@ fn run_to_stdout(
     opts: &WriteOptions,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
-    let (input_fmt, doc) = load_document_with_path(&args.file, input_format)?;
+    let file = single_stdout_input(&args.file)?;
+    let (input_fmt, doc) = load_document_with_path(&file, input_format, cli.template_mode())?;
+    let doc = select_for_convert(doc, cli.doc, &file)?;
     maybe_warn_lossy(input_fmt.name(), output_format);
     let bytes = render_to_format(&doc, output_format, use_color, opts)?;
     out.write_all(&bytes)?;
     Ok(())
 }
 
+/// Resolve the one file `convert` writes to stdout.
+///
+/// A glob is expanded like any other (zero matches is exit 5) and must
+/// match exactly one file: the documents of several files written back to
+/// back are no longer one document of the output format, so more matches
+/// are refused instead of framed. `-i` converts every match.
+///
+/// # Errors
+///
+/// - [`InvalidInput`] (exit 6) when the glob matches more than one file.
+/// - The [`bulk::expand_glob`] errors (exit 5 on zero matches or a missing
+///   walk root).
+fn single_stdout_input(arg: &Utf8Path) -> anyhow::Result<Utf8PathBuf> {
+    let mut files = bulk::expand_glob(arg)?;
+    if files.len() > 1 {
+        return Err(anyhow::Error::new(InvalidInput::new(format!(
+            "convert to stdout takes one file, but '{arg}' matched {}; \
+             convert them one at a time, or with -i to write each match next to its source",
+            files.len(),
+        ))));
+    }
+    Ok(files.remove(0))
+}
+
+/// Apply `--doc` to the document `convert` writes.
+///
+/// `--doc N` keeps only document `N` of a multi-document stream, which is
+/// then written as a single document; in a file that is not a stream only
+/// `N == 0` exists, and it is the file itself. No `--doc` and `--doc all`
+/// both write every document: a stream stays a stream (YAML) or an array
+/// of the documents (JSON), as it always has.
+fn select_for_convert(
+    doc: Document,
+    doc_arg: Option<DocSelector>,
+    file: &Utf8Path,
+) -> anyhow::Result<Document> {
+    let Some(DocSelector::Index(index)) = doc_arg else {
+        return Ok(doc);
+    };
+    let index = checked_index(&doc, index, file)?;
+    Ok(match doc.values() {
+        Some(values) => Document::value_only(values[index].clone(), doc.format()),
+        None => doc,
+    })
+}
+
 /// M3 §8 in-place mode: read source, render to target format, atomic-write
 /// to a sibling file with the swapped extension, remove source on success.
 ///
-/// Validates the `-i`-specific flag combination directly (the global
-/// [`Cli::ensure_write_flags_consistent`] would reject `-i + -F`, which is
-/// exactly what `convert -i` requires; the cli-shell spec calls out
-/// `convert` as the one command that accepts that combination). We
-/// hand-check the subset of write-flag rules that DO apply: `-i` ⊥ `--diff`,
+/// Validates the `-i`-specific flag combination directly: `convert -i`
+/// writes a sibling in the `-F` format rather than the file itself, so it
+/// is the one write command whose `-F` need not match the file's format
+/// (the other write commands refuse a differing one). We hand-check the subset of write-flag rules that DO apply: `-i` ⊥ `--diff`,
 /// `-i` ⊥ `--check` (TODO M4+: `--check` for convert means "would this
 /// target be created/changed?"), and `--backup` requires `-i`.
 fn run_in_place(
     cli: &Cli,
     args: &ConvertArgs,
+    input_format: Option<&str>,
     output_format: OutputFormat,
     use_color: bool,
     opts: &WriteOptions,
@@ -141,12 +197,9 @@ fn run_in_place(
 ) -> anyhow::Result<()> {
     // -- 1. Validate the convert-specific write-flag subset --------------
     //
-    // Do NOT call `cli.ensure_write_flags_consistent()`: that helper
-    // rejects `-i + -F`, which is the entire point of `convert -i`. The
-    // cli-shell spec (`crates/dq-cli/specs/cli-shell/spec.md` in the
-    // `add-bulk-and-ci` change) explicitly notes "convert is special: it
-    // accepts `-i` (when paired with `-F`) but rejects the other write
-    // modes".
+    // Not `cli.ensure_write_flags_consistent()`: `convert -i` supports a
+    // narrower set of write modes, checked one by one below, with
+    // messages that name `convert`.
     if cli.diff {
         return Err(anyhow::Error::new(InvalidInput::new(
             "-i/--in-place and --diff are mutually exclusive (convert -i has no diff mode)",
@@ -194,6 +247,12 @@ fn run_in_place(
     // -- 3. Glob-expand the input pattern (single file fast path is built
     //       into `expand_glob`).
     let files = bulk::expand_glob(&args.file)?;
+    if files.iter().any(|f| f == "-") {
+        return Err(crate::cli::usage_error(
+            clap::error::ErrorKind::ArgumentConflict,
+            "-i/--in-place needs a file on disk; `dq convert -` reads stdin, which has none",
+        ));
+    }
 
     // -- 4. Loop ---------------------------------------------------------
     //
@@ -218,7 +277,8 @@ fn run_in_place(
         }
 
         // Parse + render.
-        let (input_fmt, doc) = load_document_with_path(source_path, None)?;
+        let (input_fmt, doc) =
+            load_document_with_path(source_path, input_format, cli.template_mode())?;
         maybe_warn_lossy(input_fmt.name(), output_format);
         let output_bytes = render_to_format(&doc, output_format, use_color, opts)?;
 
@@ -365,6 +425,16 @@ fn project_for_cross_format_render(doc: &Document, output_format: OutputFormat) 
     }
 }
 
+/// Make JSON `buf` end with exactly one line break: whitespace after the
+/// value is dropped and one line end put back — `\r\n` when the last one
+/// dropped was, `\n` otherwise.
+fn end_with_one_line_break(buf: &mut Vec<u8>) {
+    let kept = buf.trim_ascii_end().len();
+    let crlf = buf[kept..].ends_with(b"\r\n");
+    buf.truncate(kept);
+    buf.extend_from_slice(if crlf { b"\r\n" } else { b"\n" });
+}
+
 /// Render `doc` to a byte buffer in the requested output format.
 ///
 /// Mirrors the `match output_format` block from the original M2 `run` so
@@ -398,9 +468,10 @@ fn render_to_format(
             let json = dq_core::by_name("json").expect("json format always registered");
             json.write_with_options(doc, &mut buf, opts)
                 .map_err(anyhow::Error::new)?;
-            // The dq-core JSON writer does not append a trailing newline;
-            // shell-friendly output gets one.
-            writeln!(buf)?;
+            // A re-emit ends with one line break; source bytes copied as
+            // they are may end with none or with blank lines after the
+            // value. JSON output ends with exactly one either way.
+            end_with_one_line_break(&mut buf);
         }
         OutputFormat::Yaml => {
             let yaml = dq_core::by_name("yaml").expect("yaml format always registered");
@@ -495,16 +566,18 @@ fn render_to_format(
                 .map_err(anyhow::Error::new)?;
         }
         OutputFormat::Toon => {
-            // toon-format only accepts `serde::Serialize` types; route via
-            // serde_json::Value as the lowest-common-denominator
-            // representation.
-            let v = if let Some(values) = doc.values() {
-                serde_json::Value::Array(values.iter().map(dq_core::Value::to_serde_json).collect())
-            } else {
-                doc.value().to_serde_json()
+            // The reporter checks the numbers on dq's value, so a refusal
+            // names a number as dq holds it, then writes through
+            // serde_json::Value — toon-format only accepts `serde::Serialize`.
+            let stream;
+            let v = match doc.values() {
+                Some(values) => {
+                    stream = dq_core::Value::Array(values.to_vec());
+                    &stream
+                }
+                None => doc.value(),
             };
-            let reporter = ToonReporter;
-            reporter.report(&v, &mut buf)?;
+            ToonReporter.report_value(v, &mut buf)?;
         }
         OutputFormat::Console => {
             // Console is the default; for `convert` it produces a "what
@@ -547,8 +620,18 @@ fn render_to_format(
             )));
         }
     }
+    // A same-format render copies the source bytes, byte order mark
+    // included; converted output never carries one. XML is the exception:
+    // its tree carries the BOM as `#xml.bom`, and the writer begins with it
+    // only when that asks.
+    if !matches!(output_format, OutputFormat::Xml) && buf.starts_with(UTF8_BOM) {
+        buf.drain(..UTF8_BOM.len());
+    }
     Ok(buf)
 }
+
+/// The UTF-8 byte order mark a source file may open with.
+const UTF8_BOM: &[u8] = "\u{feff}".as_bytes();
 
 /// Build a fresh Frontmatter [`Document`] that wraps `input_doc`'s value as
 /// the YAML header with an empty body. Used when `convert -F frontmatter` is
@@ -790,12 +873,30 @@ mod tests {
     // comprehensive byte-level tests for each format land in Stage 4.
 
     #[test]
+    fn end_with_one_line_break_keeps_exactly_one() {
+        for (input, want) in [
+            (&b"{}"[..], &b"{}\n"[..]),
+            (b"{}\n", b"{}\n"),
+            (b"{}\n\n", b"{}\n"),
+            (b"{} \t\n \n", b"{}\n"),
+            (b"{}\r\n", b"{}\r\n"),
+            (b"{}\r\n\r\n", b"{}\r\n"),
+        ] {
+            let mut buf = input.to_vec();
+            end_with_one_line_break(&mut buf);
+            assert_eq!(buf, want, "{:?}", String::from_utf8_lossy(input));
+        }
+    }
+
+    #[test]
     fn render_to_format_emits_hcl_for_a_simple_map() {
         // HCL is registered in the M5 parsers::registry(); a flat
         // string-keyed map is the simplest shape its writer accepts.
         let tmp = write_yaml("region: eu-west-1\nzone: a\n");
         let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
-        let (_fmt, doc) = super::super::io_helpers::load_document_with_path(&path, None).unwrap();
+        let (_fmt, doc) =
+            super::super::io_helpers::load_document_with_path(&path, None, Default::default())
+                .unwrap();
         let opts = WriteOptions::default();
         let bytes = render_to_format(&doc, OutputFormat::Hcl, false, &opts).unwrap();
         let s = String::from_utf8(bytes).expect("hcl output must be utf-8");
@@ -812,7 +913,9 @@ mod tests {
         // parser produces the right shape.
         let tmp = write_yaml("- name: alice\n  age: 30\n- name: bob\n  age: 25\n");
         let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
-        let (_fmt, doc) = super::super::io_helpers::load_document_with_path(&path, None).unwrap();
+        let (_fmt, doc) =
+            super::super::io_helpers::load_document_with_path(&path, None, Default::default())
+                .unwrap();
         let opts = WriteOptions::default();
         let bytes = render_to_format(&doc, OutputFormat::Csv, false, &opts).unwrap();
         let s = String::from_utf8(bytes).expect("csv output must be utf-8");
@@ -836,7 +939,9 @@ mod tests {
         // document").
         let tmp = write_yaml("title: hello\nauthor: alice\n");
         let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
-        let (_fmt, doc) = super::super::io_helpers::load_document_with_path(&path, None).unwrap();
+        let (_fmt, doc) =
+            super::super::io_helpers::load_document_with_path(&path, None, Default::default())
+                .unwrap();
         let opts = WriteOptions::default();
         let bytes = render_to_format(&doc, OutputFormat::Frontmatter, false, &opts).unwrap();
         let s = String::from_utf8(bytes).expect("frontmatter output must be utf-8");

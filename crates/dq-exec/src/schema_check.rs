@@ -4,12 +4,20 @@
 //! The compiled validator is built once at `Evaluator::new` and stored on
 //! the [`crate::evaluator::CompiledRule`] so per-file `evaluate_file`
 //! calls reuse it without recompilation. External `$ref` is closed off
-//! three ways: [`find_external_ref`] rejects any non-fragment `$ref` before
-//! the validator is built, the validator is built `offline()` (a retriever
-//! that refuses every URI outside the registry), and the `resolve-http` /
-//! `resolve-file` features are off. Per design D2 the schema validates in
-//! isolation, with no network or filesystem reads beyond the rule's own
-//! sibling `*.schema.json`.
+//! three ways:
+//!
+//! - the validator is built `offline()` (a retriever that refuses every
+//!   URI outside the registry), and a build that fails on a resource it
+//!   could not retrieve becomes the contract error
+//!   `external $ref is not supported: <uri>` — the validator itself
+//!   decides what is external;
+//! - before that, [`find_external_ref`] rejects the `$ref`s it can see,
+//!   naming each one as written. It is a first layer for a clearer
+//!   message; correctness does not depend on it;
+//! - the `resolve-http` / `resolve-file` features are off.
+//!
+//! Per design D2 the schema validates in isolation, with no network or
+//! filesystem reads beyond the rule's own sibling `*.schema.json`.
 //!
 //! ## Path safety for `schema_file`
 //!
@@ -26,6 +34,7 @@ use jsonschema::Uri;
 
 use crate::error::{ExecError, Result};
 use crate::ruleset::RuleSource;
+use crate::schema_value::SchemaNotes;
 
 /// One compiled schema check, cached on the per-rule
 /// [`crate::evaluator::CompiledRule`].
@@ -38,136 +47,291 @@ use crate::ruleset::RuleSource;
 pub(crate) struct CompiledSchemaCheck {
     /// Compiled JSON Schema 2020-12 validator. Reused across every
     /// `evaluate_file` call against the owning [`crate::Evaluator`].
-    pub(crate) validator: jsonschema::Validator,
-    /// Optional message prefix — when set, prepended to the
+    /// It validates the document's own [`dq_core::Value`] — see
+    /// [`crate::schema_value`].
+    pub(crate) validator: jsonschema::Validator<crate::schema_value::DqJson>,
+    /// Optional message prefix — when set, put ahead of the
     /// auto-generated `keywordLocation`-based message in each
-    /// diagnostic.
+    /// diagnostic, separated by `: ` (see `evaluator::schema_message`).
     pub(crate) message_prefix: Option<String>,
 }
 
-/// Compile an inline `serde_norway::Value` schema into a
-/// [`CompiledSchemaCheck`].
+/// Compile an inline schema — a rule's `check.schema`, see
+/// [`crate::rule::Check::Schema`] — into a [`CompiledSchemaCheck`].
 ///
 /// `rule_id` flows into the [`ExecError::SchemaCompile`] payload so the
 /// error message names the offending rule.
 pub(crate) fn compile_inline(
     rule_id: &str,
-    schema_yaml: &serde_norway::Value,
+    schema_json: &serde_json::Value,
+    notes: &SchemaNotes,
     message_prefix: Option<String>,
 ) -> Result<CompiledSchemaCheck> {
-    let schema_json = yaml_to_serde_json(schema_yaml).map_err(|err| ExecError::SchemaCompile {
-        rule_id: rule_id.to_owned(),
-        message: format!("could not convert YAML schema to JSON: {err}"),
-    })?;
-    compile_json(rule_id, &schema_json, message_prefix)
+    compile_json(rule_id, schema_json, notes, message_prefix)
 }
 
-/// Compile an already-JSON-shaped schema. Shared by inline and
-/// embedded paths.
+/// Compile an already-JSON-shaped schema and what its JSON cannot hold
+/// (`notes`). Shared by inline and embedded paths.
 fn compile_json(
     rule_id: &str,
     schema_json: &serde_json::Value,
+    notes: &SchemaNotes,
     message_prefix: Option<String>,
 ) -> Result<CompiledSchemaCheck> {
-    // Per spec scenario "HTTP $ref rejected at compile-time" we walk
-    // the schema up front and reject any `$ref` that points at an
-    // external URL. Without this, jsonschema's default registry
-    // happily compiles the schema and only fails at validate-time when
-    // the `$ref` is actually traversed — which the spec does not
-    // accept.
+    // Per spec scenario "HTTP $ref rejected at compile-time", an external
+    // `$ref` fails the compile. The pre-walk names the `$ref`s it can see
+    // as written; the validator's build below catches every one it misses.
     if let Some(uri) = find_external_ref(schema_json) {
-        return Err(ExecError::SchemaCompile {
-            rule_id: rule_id.to_owned(),
-            message: format!("external $ref is not supported: {uri}"),
-        });
+        return Err(external_ref_error(rule_id, uri));
     }
+    // Offline: see `schema_value::options`.
+    // The notes go in band, under dq's tag, in the copy the validator
+    // compiles; a `multipleOf` the meta-schema would read as 0 gets a
+    // stand-in there.
+    let built = crate::schema_value::options()
+        .build(&crate::schema_value::compiled_json(schema_json, notes));
     // A `$schema` naming a meta-schema the validator does not bundle is
     // an external reference too. jsonschema ≤ 0.34 tried to retrieve it
     // while building the registry and failed the compile; 0.61 with an
     // explicit draft never looks it up and validates as 2020-12 instead.
-    // Keep the compile-time rejection — and its wording — here.
+    // Keep the compile-time rejection — and its wording — here, ahead of
+    // the validator's own errors as before.
     if let Some(message) = find_unresolvable_meta_schema(schema_json) {
         return Err(ExecError::SchemaCompile {
             rule_id: rule_id.to_owned(),
             message,
         });
     }
-    // Second layer, independent of Cargo features: `offline()` swaps the
-    // default retriever for one that refuses every URI not already in
-    // the registry, so even if `resolve-http` / `resolve-file` were ever
-    // unified on by another crate in the graph, the validator still
-    // cannot reach the network or the filesystem.
-    let validator = jsonschema::draft202012::options()
-        .offline()
-        .build(schema_json)
-        .map_err(|err| ExecError::SchemaCompile {
+    // A resource the registry does not hold and could not retrieve is an
+    // external reference, whatever path the registry took to it — while
+    // building (the offline retriever refused it) or after (0.61 then
+    // refuses to retrieve at all). The validator decides; the pre-walk
+    // and the crawl above only word it earlier.
+    let validator = built.map_err(|err| match err.kind() {
+        jsonschema::error::ValidationErrorKind::Referencing(
+            jsonschema::ReferencingError::Unretrievable { uri, .. },
+        ) => external_ref_error(rule_id, uri),
+        // A YAML schema's `.inf` where a number must stand reads `.inf`.
+        _ => ExecError::SchemaCompile {
             rule_id: rule_id.to_owned(),
-            message: format!("{err}"),
-        })?;
+            message: crate::schema_value::restore(&err.to_string()).into_owned(),
+        },
+    })?;
     Ok(CompiledSchemaCheck {
         validator,
         message_prefix,
     })
 }
 
+/// The contract error for an external `$ref`.
+fn external_ref_error(rule_id: &str, uri: &str) -> ExecError {
+    ExecError::SchemaCompile {
+        rule_id: rule_id.to_owned(),
+        message: format!("external $ref is not supported: {uri}"),
+    }
+}
+
 /// Recursively walk `schema` looking for a `$ref` that points at an
-/// external resource (`http://` / `https://` / `file://` / a path with
-/// any non-fragment scheme). Returns the offending URI if any.
+/// external resource. Returns the offending `$ref` as written, if any.
 ///
-/// Internal `$ref` (`#/...`) and pure JSON-pointer fragments are
-/// allowed — those are resolved entirely from within the schema's own
-/// `$id` graph and don't trigger the default retriever.
+/// A `$ref` is internal when it names a resource the document itself
+/// holds: a fragment (`#/$defs/x`, `#anchor`), or a reference that,
+/// resolved against the base of the schema it sits in (its own `$id`, else
+/// the nearest enclosing one, else `json-schema:///`), names the root or a
+/// schema's `$id` ([`embedded_resources`]) — `inner.json` beside an
+/// embedded `$id: inner.json`, `https://example.com/s.json#/$defs/x` in a
+/// schema whose `$id` is `https://example.com/s.json`. Anything else is
+/// external: another URI, a `file:` or `http:` one no `$id` names, a
+/// relative path to a file next to the schema.
+///
+/// The walk follows the schema's keywords ([`RefKeyword`]): the value of
+/// a data keyword (`const`, `enum`, `default`, `examples`) is an instance,
+/// not a schema, so a `$ref` key inside it is not a reference and is not
+/// looked at. Everything else is walked — subschemas, the schemas of
+/// name → schema maps such as `properties` (where a property may well be
+/// named `enum`), and, conservatively, the whole value of any keyword the
+/// walk does not know.
+///
+/// This is the first layer only, there for a message that names the
+/// `$ref` as written. A local fragment `$ref` makes the validator read its
+/// target as a schema wherever it sits — inside `default` included — and
+/// the registry resolves such fragments by its own rules, so the walk does
+/// not follow them: the validator's own build error catches what they
+/// lead to (`compile_json`).
 fn find_external_ref(schema: &serde_json::Value) -> Option<&str> {
-    fn is_external(uri: &str) -> bool {
-        // RFC 3986: a URI with a scheme is `scheme:rest`. We treat
-        // anything other than a pure fragment-only reference as
-        // potentially external. This is conservative — relative paths
-        // like `./other.json` would also be flagged, which matches the
-        // spec intent (the validator's default retriever can't fetch
-        // them either).
+    // A root `$id` that does not parse leaves no base to resolve against:
+    // every reference but a fragment counts as external then.
+    let root = root_base(schema).ok();
+    let resources = root
+        .as_ref()
+        .map(|root| embedded_resources(schema, root))
+        .unwrap_or_default();
+    let refs = RefScope {
+        resources: &resources,
+    };
+    refs.find_in(schema, RefWalk::Schema, root.as_ref())
+}
+
+/// The base URI of `schema`'s root: its `$id` without trailing `#`s, else
+/// `json-schema:///`, normalized.
+fn root_base(schema: &serde_json::Value) -> std::result::Result<Uri<String>, String> {
+    let root = jsonschema::uri::from_str(schema_id(schema).unwrap_or(DEFAULT_BASE_URI))
+        .map_err(|err| err.to_string())?;
+    jsonschema::uri::from_str(root.as_str().trim_end_matches('#')).map_err(|err| err.to_string())
+}
+
+/// The normalized URI of every resource `schema` holds: its root (`root`)
+/// and each schema's `$id`, resolved against the base of the schema around
+/// it. The schemas are the ones the registry crawls ([`subschemas`]); a
+/// `$id` in data (`const`, `default`, an unknown keyword) names nothing.
+fn embedded_resources(schema: &serde_json::Value, root: &Uri<String>) -> HashSet<String> {
+    let mut resources = HashSet::from([root.as_str().to_owned()]);
+    let mut queue = VecDeque::from([(root.clone(), schema)]);
+    while let Some((mut base, contents)) = queue.pop_front() {
+        if let Some(id) = schema_id(contents) {
+            // A `$id` that does not resolve names no resource; nothing
+            // under it is resolved against it either.
+            let Ok(resolved) = resolve_reference(&base.borrow(), id) else {
+                continue;
+            };
+            base = resolved;
+            resources.insert(base.as_str().to_owned());
+        }
+        if let serde_json::Value::Object(map) = contents {
+            queue.extend(subschemas(map).map(|child| (base.clone(), child)));
+        }
+    }
+    resources
+}
+
+/// What [`find_external_ref`] checks each `$ref` against.
+struct RefScope<'r> {
+    /// [`embedded_resources`] of the whole schema.
+    resources: &'r HashSet<String>,
+}
+
+/// How [`RefScope::find_in`] reads the value it walks.
+#[derive(Clone, Copy)]
+enum RefWalk {
+    /// A schema (or an array of schemas): keys are keywords.
+    Schema,
+    /// A value of unknown meaning: every `$ref` key anywhere below it
+    /// counts, whatever keyword name it sits under.
+    Opaque,
+}
+
+/// What the value of a schema keyword is, for [`RefScope::find_in`].
+enum RefKeyword {
+    /// An instance (`const`, `enum`, `default`, `examples`): not walked.
+    Data,
+    /// A schema, or an array of schemas.
+    Subschema,
+    /// An object mapping names to schemas; its keys are names, not keywords.
+    SchemaMap,
+    /// A keyword the walk does not know: walked opaquely.
+    Unknown,
+}
+
+impl RefKeyword {
+    fn of(keyword: &str) -> Self {
+        match keyword {
+            // The 2020-12 meta-data vocabulary's instance-valued keywords.
+            // OpenAPI's `example` is not a JSON Schema keyword and the
+            // validator here is 2020-12, so it stays unknown.
+            "const" | "default" | "enum" | "examples" => Self::Data,
+            "additionalItems"
+            | "additionalProperties"
+            | "allOf"
+            | "anyOf"
+            | "contains"
+            | "contentSchema"
+            | "else"
+            | "if"
+            | "items"
+            | "not"
+            | "oneOf"
+            | "prefixItems"
+            | "propertyNames"
+            | "then"
+            | "unevaluatedItems"
+            | "unevaluatedProperties" => Self::Subschema,
+            // `dependencies` (draft 4–7) maps a name to a schema or to an
+            // array of property names; walking the array finds nothing.
+            "$defs" | "definitions" | "dependencies" | "dependentSchemas" | "patternProperties"
+            | "properties" => Self::SchemaMap,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl RefScope<'_> {
+    /// [`find_external_ref`] over `value`, read the way `walk` says;
+    /// `base` is the base URI of the schema `value` sits in, `None` when
+    /// it did not resolve.
+    fn find_in<'s>(
+        &self,
+        value: &'s serde_json::Value,
+        walk: RefWalk,
+        base: Option<&Uri<String>>,
+    ) -> Option<&'s str> {
+        match value {
+            serde_json::Value::Object(map) => {
+                // A schema's own `$id` is the base of its `$ref`; one in
+                // data changes nothing.
+                let rebased = match (walk, schema_id(value)) {
+                    (RefWalk::Schema, Some(id)) => {
+                        Some(base.and_then(|base| resolve_reference(&base.borrow(), id).ok()))
+                    }
+                    _ => None,
+                };
+                let base = rebased.as_ref().map_or(base, Option::as_ref);
+                if let Some(serde_json::Value::String(uri)) = map.get("$ref")
+                    && self.is_external(uri, base)
+                {
+                    return Some(uri.as_str());
+                }
+                match walk {
+                    RefWalk::Opaque => map
+                        .values()
+                        .find_map(|child| self.find_in(child, RefWalk::Opaque, base)),
+                    RefWalk::Schema => map.iter().find_map(|(keyword, child)| {
+                        match (RefKeyword::of(keyword), child) {
+                            (RefKeyword::Data, _) => None,
+                            (RefKeyword::Subschema, _) => {
+                                self.find_in(child, RefWalk::Schema, base)
+                            }
+                            (RefKeyword::SchemaMap, serde_json::Value::Object(schemas)) => schemas
+                                .values()
+                                .find_map(|schema| self.find_in(schema, RefWalk::Schema, base)),
+                            (RefKeyword::SchemaMap | RefKeyword::Unknown, _) => {
+                                self.find_in(child, RefWalk::Opaque, base)
+                            }
+                        }
+                    }),
+                }
+            }
+            serde_json::Value::Array(items) => {
+                items.iter().find_map(|item| self.find_in(item, walk, base))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the `$ref` `uri`, in a schema whose base is `base`, names
+    /// something outside the schema document: anything but a fragment
+    /// that does not resolve, against `base`, to the root or an embedded
+    /// `$id` ([`embedded_resources`]). Without a base (`None`) only a
+    /// fragment is internal.
+    fn is_external(&self, uri: &str, base: Option<&Uri<String>>) -> bool {
         if uri.starts_with('#') || uri.is_empty() {
             return false;
         }
-        // Look for a scheme separator before any path-like char.
-        match uri.find(':') {
-            Some(idx) => {
-                let scheme = &uri[..idx];
-                // A scheme is alpha (1+) followed by alphanumerics / +
-                // / - / .
-                !scheme.is_empty()
-                    && scheme
-                        .chars()
-                        .next()
-                        .is_some_and(|c| c.is_ascii_alphabetic())
-            }
-            // Relative paths without a scheme are still external for
-            // the default-registry validator's purposes.
-            None => true,
-        }
-    }
-    match schema {
-        serde_json::Value::Object(map) => {
-            if let Some(serde_json::Value::String(uri)) = map.get("$ref")
-                && is_external(uri)
-            {
-                return Some(uri.as_str());
-            }
-            for child in map.values() {
-                if let Some(found) = find_external_ref(child) {
-                    return Some(found);
-                }
-            }
-            None
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                if let Some(found) = find_external_ref(item) {
-                    return Some(found);
-                }
-            }
-            None
-        }
-        _ => None,
+        let Some(base) = base else {
+            return true;
+        };
+        resolve_reference(&base.borrow(), uri).map_or(true, |resolved| {
+            !self.resources.contains(resolved.strip_fragment().as_str())
+        })
     }
 }
 
@@ -196,8 +360,10 @@ const DEFAULT_BASE_URI: &str = "json-schema:///";
 ///   hash set, so with several the one it reported varied between runs;
 ///   here it is the first in crawl order.
 ///
-/// `$ref`s are crawled the same way as 0.34 did, but by the time this runs
-/// [`find_external_ref`] has already rejected every one that is not local.
+/// `$ref`s are crawled the same way as 0.34 did. One the crawl cannot
+/// find in the document is reported with the contract message
+/// `external $ref is not supported: <$ref as written>`, not the 0.34
+/// wording, which is kept for `$schema` only.
 fn find_unresolvable_meta_schema(schema: &serde_json::Value) -> Option<String> {
     MetaSchemaCrawl::run(schema).err()
 }
@@ -210,17 +376,14 @@ struct MetaSchemaCrawl {
     resources: HashSet<String>,
     /// `(base, reference)` pairs already handled.
     seen: HashSet<(String, String)>,
-    /// `(reference as written, resolved URI)` of each reference that has to
-    /// be in `resources`, in crawl order.
-    external: Vec<(String, Uri<String>)>,
+    /// `(keyword, reference as written, resolved URI)` of each reference
+    /// that has to be in `resources`, in crawl order.
+    external: Vec<(&'static str, String, Uri<String>)>,
 }
 
 impl MetaSchemaCrawl {
     fn run(schema: &serde_json::Value) -> std::result::Result<(), String> {
-        let root = jsonschema::uri::from_str(schema_id(schema).unwrap_or(DEFAULT_BASE_URI))
-            .map_err(|err| err.to_string())?;
-        let root = jsonschema::uri::from_str(root.as_str().trim_end_matches('#'))
-            .map_err(|err| err.to_string())?;
+        let root = root_base(schema)?;
         let mut crawl = Self::default();
         crawl.resources.insert(root.as_str().to_owned());
         let mut queue = VecDeque::from([(root, schema)]);
@@ -234,9 +397,14 @@ impl MetaSchemaCrawl {
                 queue.extend(subschemas(map).map(|child| (base.clone(), child)));
             }
         }
-        for (reference, resolved) in &crawl.external {
+        for (keyword, reference, resolved) in &crawl.external {
             let fragmentless = resolved.strip_fragment();
             if !crawl.resources.contains(fragmentless.as_str()) {
+                // A `$ref` is an external reference whatever the crawl
+                // makes of it; only `$schema` keeps the 0.34 wording.
+                if *keyword == "$ref" {
+                    return Err(format!("external $ref is not supported: {reference}"));
+                }
                 return Err(unretrievable_meta_schema(
                     reference,
                     resolved.scheme().as_str(),
@@ -261,21 +429,24 @@ impl MetaSchemaCrawl {
             return Ok(());
         };
         // 0.34 read small objects in key order and larger ones `$ref` first.
-        let references: Vec<&str> = if object.len() < 3 {
+        let reference_keyword = |keyword: &str| match keyword {
+            "$ref" => Some("$ref"),
+            "$schema" => Some("$schema"),
+            _ => None,
+        };
+        let references: Vec<(&'static str, &str)> = if object.len() < 3 {
             object
                 .iter()
-                .filter(|(keyword, _)| matches!(keyword.as_str(), "$ref" | "$schema"))
-                .filter_map(|(_, value)| value.as_str())
+                .filter_map(|(keyword, value)| Some((reference_keyword(keyword)?, value.as_str()?)))
                 .collect()
         } else {
-            [object.get("$ref"), object.get("$schema")]
+            ["$ref", "$schema"]
                 .into_iter()
-                .flatten()
-                .filter_map(serde_json::Value::as_str)
+                .filter_map(|keyword| Some((keyword, object.get(keyword)?.as_str()?)))
                 .collect()
         };
-        for reference in references {
-            self.reference(base, contents, reference)?;
+        for (keyword, reference) in references {
+            self.reference(base, contents, keyword, reference)?;
         }
         Ok(())
     }
@@ -284,6 +455,7 @@ impl MetaSchemaCrawl {
         &mut self,
         base: &Uri<String>,
         contents: &serde_json::Value,
+        keyword: &'static str,
         reference: &str,
     ) -> std::result::Result<(), String> {
         if reference.starts_with("https://json-schema.org/draft/")
@@ -313,7 +485,8 @@ impl MetaSchemaCrawl {
         } else {
             resolve_reference(&base.borrow(), reference)?
         };
-        self.external.push((reference.to_owned(), resolved));
+        self.external
+            .push((keyword, reference.to_owned(), resolved));
         Ok(())
     }
 }
@@ -438,7 +611,8 @@ pub(crate) fn compile_from_file(
             rule_id: rule_id.to_owned(),
             message: format!("could not parse {path} as JSON: {err}"),
         })?;
-    compile_json(rule_id, &schema_json, message_prefix)
+    let notes = source_spellings(&bytes, &schema_json);
+    compile_json(rule_id, &schema_json, &notes, message_prefix)
 }
 
 /// Compile a schema sourced from a `&'static str` (the embedded
@@ -458,7 +632,36 @@ pub(crate) fn compile_from_embedded(
             rule_id: rule_id.to_owned(),
             message: format!("could not parse embedded schema as JSON: {err}"),
         })?;
-    compile_json(rule_id, &schema_json, message_prefix)
+    let notes = source_spellings(schema_text.as_bytes(), &schema_json);
+    compile_json(rule_id, &schema_json, &notes, message_prefix)
+}
+
+/// The source text of every limit in `schema`, read from the JSON `text`
+/// (see [`crate::schema_value::note_limit_spellings`]), so a message
+/// quotes `1e2` as the file writes it rather than serde_json's `1e+2`.
+/// Should dq's JSON span parse refuse `text`, which serde_json read, the
+/// limits keep serde_json's spelling.
+fn source_spellings(text: &[u8], schema: &serde_json::Value) -> SchemaNotes {
+    let mut notes = SchemaNotes::default();
+    let doc = match dq_core::parse_json_with_spans(text) {
+        Ok(doc) => doc,
+        Err(err) => {
+            tracing::debug!(error = %err, "schema limits keep serde_json's spelling");
+            return notes;
+        }
+    };
+    let literal_at = |at: &dq_core::Pointer| {
+        let span = doc.span_at(at)?;
+        let source = text.get(span.value_range.clone())?;
+        std::str::from_utf8(source).ok().map(str::to_owned)
+    };
+    crate::schema_value::note_limit_spellings(
+        schema,
+        &dq_core::Pointer::default(),
+        &literal_at,
+        &mut notes,
+    );
+    notes
 }
 
 /// Resolve a relative schema-file path against the rule's directory.
@@ -498,10 +701,12 @@ pub(crate) fn resolve_schema_file_path(
     let rule_dir = if rule_path.is_dir() {
         rule_path.clone()
     } else {
+        // A bare `rule.yml` has the parent `""`, which names no
+        // directory: it is the current one.
         rule_path
             .parent()
-            .map(Utf8Path::to_path_buf)
-            .unwrap_or_else(|| Utf8PathBuf::from("."))
+            .filter(|parent| !parent.as_str().is_empty())
+            .map_or_else(|| Utf8PathBuf::from("."), Utf8Path::to_path_buf)
     };
     let canonical_rule_dir = canonicalize_utf8(&rule_dir).map_err(|err| ExecError::Io {
         path: rule_dir,
@@ -532,36 +737,23 @@ fn canonicalize_utf8(path: &Utf8Path) -> std::io::Result<Utf8PathBuf> {
     })
 }
 
-/// Convert a `serde_norway::Value` to a `serde_json::Value`.
-///
-/// `serde_norway`'s `Value` is YAML-shaped: it carries tagged variants and
-/// allows non-string mapping keys. The `jsonschema` crate consumes
-/// `serde_json::Value`, so we round-trip through `serde_norway::to_string`
-/// then `serde_norway::from_str::<serde_json::Value>` — which mirrors
-/// what the test runner does for fixture inputs and gives us identical
-/// key-coercion semantics.
-fn yaml_to_serde_json(
-    value: &serde_norway::Value,
-) -> std::result::Result<serde_json::Value, String> {
-    // Round-trip via the YAML serializer to handle tagged values and
-    // non-string keys cleanly. `serde_norway::from_str::<serde_json::Value>`
-    // accepts the YAML text and emits a JSON-shaped value (or fails
-    // with a typed error if a non-string key sneaks through).
-    let yaml_text =
-        serde_norway::to_string(value).map_err(|err| format!("yaml serialize: {err}"))?;
-    serde_norway::from_str::<serde_json::Value>(&yaml_text)
-        .map_err(|err| format!("yaml→json transcode: {err}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ruleset::RuleSource;
     use pretty_assertions::assert_eq;
 
+    /// Whether the document `instance` is valid against `compiled`.
+    fn holds(compiled: &CompiledSchemaCheck, instance: &serde_json::Value) -> bool {
+        let value = dq_core::Value::from_serde_json(instance);
+        compiled
+            .validator
+            .is_valid(crate::schema_value::DqNode(&value))
+    }
+
     #[test]
     fn compile_inline_with_valid_schema_succeeds() {
-        let yaml: serde_norway::Value = serde_norway::from_str(
+        let yaml: serde_json::Value = serde_norway::from_str(
             r#"
 type: object
 required: [name]
@@ -571,13 +763,18 @@ properties:
 "#,
         )
         .expect("yaml parse");
-        let compiled =
-            compile_inline("test.rule", &yaml, Some("prefix: ".to_owned())).expect("compile ok");
+        let compiled = compile_inline(
+            "test.rule",
+            &yaml,
+            &SchemaNotes::default(),
+            Some("prefix: ".to_owned()),
+        )
+        .expect("compile ok");
         assert_eq!(compiled.message_prefix.as_deref(), Some("prefix: "));
         let valid = serde_json::json!({"name": "x"});
         let invalid = serde_json::json!({});
-        assert!(compiled.validator.is_valid(&valid));
-        assert!(!compiled.validator.is_valid(&invalid));
+        assert!(holds(&compiled, &valid));
+        assert!(!holds(&compiled, &invalid));
     }
 
     #[test]
@@ -586,13 +783,13 @@ properties:
         // schema that declares `$ref: https://...` must fail compile
         // because no HTTP resolver is wired up (resolve-http feature
         // is off in our `default-features = false` configuration).
-        let yaml: serde_norway::Value = serde_norway::from_str(
+        let yaml: serde_json::Value = serde_norway::from_str(
             r#"
 $ref: "https://json-schema.org/draft/2020-12/schema"
 "#,
         )
         .expect("yaml parse");
-        let result = compile_inline("test.bad", &yaml, None);
+        let result = compile_inline("test.bad", &yaml, &SchemaNotes::default(), None);
         match result {
             Err(ExecError::SchemaCompile { rule_id, .. }) => {
                 assert_eq!(rule_id, "test.bad");
@@ -604,9 +801,9 @@ $ref: "https://json-schema.org/draft/2020-12/schema"
     /// Compile `schema` inline and return the `SchemaCompile` message,
     /// panicking on any other outcome.
     fn compile_error_message(schema: serde_json::Value) -> String {
-        let yaml: serde_norway::Value =
+        let yaml: serde_json::Value =
             serde_norway::from_str(&schema.to_string()).expect("json is valid yaml");
-        match compile_inline("test.bad", &yaml, None) {
+        match compile_inline("test.bad", &yaml, &SchemaNotes::default(), None) {
             Err(ExecError::SchemaCompile { rule_id, message }) => {
                 assert_eq!(rule_id, "test.bad");
                 message
@@ -675,10 +872,10 @@ $ref: "https://json-schema.org/draft/2020-12/schema"
             serde_json::json!({"default": {"$schema": "https://example.com/m"}}),
             serde_json::json!({"x-ext": {"$schema": "https://example.com/m"}}),
         ] {
-            let yaml: serde_norway::Value =
+            let yaml: serde_json::Value =
                 serde_norway::from_str(&schema.to_string()).expect("json is valid yaml");
             assert!(
-                compile_inline("test.ok", &yaml, None).is_ok(),
+                compile_inline("test.ok", &yaml, &SchemaNotes::default(), None).is_ok(),
                 "{schema} should compile"
             );
         }
@@ -691,10 +888,10 @@ $ref: "https://json-schema.org/draft/2020-12/schema"
             serde_json::json!({"$schema": "http://json-schema.org/draft-07/schema#"}),
             serde_json::json!({"$id": "https://example.com/m", "$schema": "https://example.com/m#"}),
         ] {
-            let yaml: serde_norway::Value =
+            let yaml: serde_json::Value =
                 serde_norway::from_str(&schema.to_string()).expect("json is valid yaml");
             assert!(
-                compile_inline("test.ok", &yaml, None).is_ok(),
+                compile_inline("test.ok", &yaml, &SchemaNotes::default(), None).is_ok(),
                 "{schema} should compile"
             );
         }
@@ -702,7 +899,7 @@ $ref: "https://json-schema.org/draft/2020-12/schema"
 
     #[test]
     fn compile_inline_accepts_internal_ref() {
-        let yaml: serde_norway::Value = serde_norway::from_str(
+        let yaml: serde_json::Value = serde_norway::from_str(
             r##"
 properties:
   code: {$ref: "#/$defs/code"}
@@ -711,30 +908,26 @@ $defs:
 "##,
         )
         .expect("yaml parse");
-        let compiled = compile_inline("test.rule", &yaml, None).expect("internal $ref compiles");
-        assert!(
-            compiled
-                .validator
-                .is_valid(&serde_json::json!({"code": "AA"}))
-        );
-        assert!(
-            !compiled
-                .validator
-                .is_valid(&serde_json::json!({"code": "CC"}))
-        );
+        let compiled = compile_inline("test.rule", &yaml, &SchemaNotes::default(), None)
+            .expect("internal $ref compiles");
+        assert!(holds(&compiled, &serde_json::json!({"code": "AA"})));
+        assert!(!holds(&compiled, &serde_json::json!({"code": "CC"})));
     }
 
     #[test]
     fn compile_inline_rejects_external_dynamic_ref_at_compile_time() {
         // `$dynamicRef` is not covered by the `$ref` pre-walk; the
         // validator itself must still refuse it at compile time instead
-        // of deferring to validate-time or reaching the network.
+        // of deferring to validate-time or reaching the network. 0.61
+        // resolves it after the registry is built, without asking the
+        // retriever; the unretrievable resource is still reported with
+        // the contract message.
         let message = compile_error_message(serde_json::json!({
             "$dynamicRef": "https://example.com/remote.json",
         }));
-        assert!(
-            message.contains("https://example.com/remote.json"),
-            "message should name the refused URI, got: {message}"
+        assert_eq!(
+            message,
+            "external $ref is not supported: https://example.com/remote.json"
         );
     }
 
@@ -816,12 +1009,8 @@ $defs:
         let schema_text =
             r#"{"type":"object","required":["name"],"properties":{"name":{"type":"string"}}}"#;
         let compiled = compile_from_embedded("test.rule", schema_text, None).expect("compile ok");
-        assert!(
-            compiled
-                .validator
-                .is_valid(&serde_json::json!({"name":"x"}))
-        );
-        assert!(!compiled.validator.is_valid(&serde_json::json!({})));
+        assert!(holds(&compiled, &serde_json::json!({"name":"x"})));
+        assert!(!holds(&compiled, &serde_json::json!({})));
     }
 
     #[test]
@@ -832,6 +1021,50 @@ $defs:
             ExecError::SchemaCompile { rule_id, .. } => assert_eq!(rule_id, "test.rule"),
             other => panic!("expected SchemaCompile, got {other:?}"),
         }
+    }
+
+    /// An `@std` schema sidecar reaches the validator through
+    /// `compile_from_embedded`, its limit spellings read from its JSON
+    /// text. A member there named like one of dq's notes — the old
+    /// `"\u0000dq.spelling"` / `"\u0000dq.multipleOf"`, or `\0dq` and a
+    /// tag that is not this process's — is the schema's own, even in the
+    /// schema object whose limits dq does note: it changes no limit and no
+    /// message, and a `not` prints it. Before 66c9db3: `101 is not a multiple
+    /// of 7`.
+    #[test]
+    fn compile_from_embedded_ignores_members_named_like_dqs_notes() {
+        let schema_text = r#"{"properties": {
+            "x": {
+                "maximum": 1E2,
+                "multipleOf": 0.20,
+                "\u0000dq.spelling": {"maximum": "garbage", "multipleOf": "junk"},
+                "\u0000dq.multipleOf": "7",
+                "\u0000dq0123456789abcdef0123456789abcdef.spelling": {"maximum": "forged"}
+            },
+            "y": {"not": {"minimum": 1E1, "\u0000dq.spelling": {"minimum": "g"}}}
+        }}"#;
+        let compiled = compile_from_embedded("std.rule", schema_text, None).expect("compiles");
+        let errors = |document: serde_json::Value| -> Vec<String> {
+            let value = dq_core::Value::from_serde_json(&document);
+            compiled
+                .validator
+                .iter_errors(crate::schema_value::DqNode(&value))
+                .map(|error| crate::schema_value::error_text(&error))
+                .collect()
+        };
+        assert_eq!(
+            errors(serde_json::json!({"x": 101})),
+            ["101 is greater than the maximum of 1E2"]
+        );
+        assert_eq!(
+            errors(serde_json::json!({"x": 0.3})),
+            ["0.3 is not a multiple of 0.20"]
+        );
+        assert_eq!(
+            errors(serde_json::json!({"y": 20})),
+            [r#"{"minimum":1E1,"\u0000dq.spelling":{"minimum":"g"}} is not allowed for 20"#]
+        );
+        assert!(errors(serde_json::json!({"x": 0.4, "y": 5})).is_empty());
     }
 
     // --- `$schema` emulation of jsonschema 0.34 -----------------------------
@@ -850,9 +1083,9 @@ $defs:
 
     /// Compile `schema` inline, panicking with the error when it fails.
     fn assert_compiles(schema: &serde_json::Value) {
-        let yaml: serde_norway::Value =
+        let yaml: serde_json::Value =
             serde_norway::from_str(&schema.to_string()).expect("json is valid yaml");
-        if let Err(err) = compile_inline("test.ok", &yaml, None) {
+        if let Err(err) = compile_inline("test.ok", &yaml, &SchemaNotes::default(), None) {
             panic!("{schema} should compile, got {err:?}");
         }
     }
@@ -1271,11 +1504,12 @@ $defs:
             assert_compiles(&schema);
         }
         // And the schema still validates as 2020-12.
-        let yaml: serde_norway::Value =
+        let yaml: serde_json::Value =
             serde_norway::from_str(r#"{"$schema": "", "type": "integer"}"#).expect("yaml");
-        let compiled = compile_inline("test.ok", &yaml, None).expect("compiles");
-        assert!(compiled.validator.is_valid(&serde_json::json!(1)));
-        assert!(!compiled.validator.is_valid(&serde_json::json!({"a": 1})));
+        let compiled =
+            compile_inline("test.ok", &yaml, &SchemaNotes::default(), None).expect("compiles");
+        assert!(holds(&compiled, &serde_json::json!(1)));
+        assert!(!holds(&compiled, &serde_json::json!({"a": 1})));
     }
 
     #[test]
@@ -1384,9 +1618,6 @@ $defs:
     }
 
     #[test]
-    #[ignore = "bug: find_external_ref walks data positions, so a `$ref` key inside \
-                `const`/`enum`/`default`/`examples` is rejected as an external $ref \
-                (pre-existing, same in the jsonschema 0.34 build)"]
     fn compile_inline_ignores_ref_lookalikes_in_data_positions() {
         for schema in [
             serde_json::json!({"enum": [{"$ref": "https://x.com/y"}]}),
@@ -1395,6 +1626,280 @@ $defs:
             serde_json::json!({"examples": [{"$ref": "https://x.com/y"}]}),
         ] {
             assert_compiles(&schema);
+        }
+    }
+
+    #[test]
+    fn compile_inline_ignores_ref_lookalikes_in_nested_data_positions() {
+        for schema in [
+            serde_json::json!({"properties": {"a": {"default": {"$ref": "https://x.com/y"}}}}),
+            serde_json::json!({"items": {"const": {"$ref": "https://x.com/y"}}}),
+            serde_json::json!({"allOf": [{"enum": [{"$ref": "https://x.com/y"}]}]}),
+            serde_json::json!({"$defs": {"d": {"examples": [{"$ref": "https://x.com/y"}]}}}),
+        ] {
+            assert_compiles(&schema);
+        }
+    }
+
+    #[test]
+    fn compile_inline_rejects_external_ref_under_a_property_named_like_a_data_keyword() {
+        for schema in [
+            serde_json::json!({"properties": {"enum": {"$ref": "https://x.com/y"}}}),
+            serde_json::json!({"properties": {"const": {"items": {"$ref": "https://x.com/y"}}}}),
+            serde_json::json!({"patternProperties": {"default": {"$ref": "https://x.com/y"}}}),
+            serde_json::json!({"$defs": {"examples": {"$ref": "https://x.com/y"}}}),
+            serde_json::json!({"definitions": {"enum": {"$ref": "https://x.com/y"}}}),
+            serde_json::json!({"dependentSchemas": {"const": {"$ref": "https://x.com/y"}}}),
+            serde_json::json!({"dependencies": {"default": {"$ref": "https://x.com/y"}}}),
+        ] {
+            assert_eq!(
+                compile_error_message(schema.clone()),
+                "external $ref is not supported: https://x.com/y",
+                "for {schema}"
+            );
+        }
+    }
+
+    #[test]
+    fn compile_inline_rejects_external_ref_in_data_a_local_ref_points_at() {
+        for (schema, uri) in [
+            (
+                serde_json::json!({"$ref": "#/default", "default": {"$ref": "https://x.com/y"}}),
+                "https://x.com/y",
+            ),
+            (
+                serde_json::json!({"$ref": "#/enum/0", "enum": [{"$ref": "https://x.com/y"}]}),
+                "https://x.com/y",
+            ),
+            (
+                serde_json::json!({
+                    "$ref": "#/properties/a/default",
+                    "properties": {"a": {"default": {"$ref": "file:///etc/passwd"}}},
+                }),
+                "file:///etc/passwd",
+            ),
+            // Two hops: the second `$ref` sits in a subschema.
+            (
+                serde_json::json!({
+                    "$ref": "#/$defs/a",
+                    "$defs": {"a": {"$ref": "#/default"}},
+                    "default": {"$ref": "https://x.com/y"},
+                }),
+                "https://x.com/y",
+            ),
+            // JSON-pointer escapes and percent-encoding in the fragment.
+            (
+                serde_json::json!({
+                    "$ref": "#/$defs/a~1b%20c/default",
+                    "$defs": {"a/b c": {"default": {"$ref": "https://x.com/y"}}},
+                }),
+                "https://x.com/y",
+            ),
+            (
+                serde_json::json!({
+                    "$dynamicRef": "#/default",
+                    "default": {"$ref": "https://x.com/y"},
+                }),
+                "https://x.com/y",
+            ),
+        ] {
+            assert_eq!(
+                compile_error_message(schema.clone()),
+                format!("external $ref is not supported: {uri}"),
+                "for {schema}"
+            );
+        }
+    }
+
+    #[test]
+    fn compile_inline_rejects_external_ref_the_registry_reaches_by_its_own_pointer_rules() {
+        // The registry resolves a fragment on the raw text — no
+        // percent-decoding, `~` escapes its own way — so the pre-walk
+        // cannot predict the target; the validator's build error decides.
+        for (schema, uri) in [
+            (
+                serde_json::json!({
+                    "properties": {"q": {"$ref": "#/$defs/~~1/enum/0"}},
+                    "$defs": {"~~1": {"enum": [{"$ref": "https://x.com/t1"}]}},
+                }),
+                "https://x.com/t1",
+            ),
+            (
+                serde_json::json!({
+                    "properties": {"q": {"$ref": "#/$defs/a~~1b/default"}},
+                    "$defs": {"a~~1b": {"default": {"$ref": "https://x.com/t2"}}},
+                }),
+                "https://x.com/t2",
+            ),
+            (
+                serde_json::json!({
+                    "properties": {"p": {"$ref": "#/$defs/x%20y/enum/0"}},
+                    "$defs": {"x%20y": {"enum": [{"$ref": "https://x.com/h4"}]}},
+                }),
+                "https://x.com/h4",
+            ),
+            (
+                serde_json::json!({
+                    "$ref": "#/$defs/a%41/default",
+                    "$defs": {"a%41": {"default": {"$ref": "https://x.com/r1"}}},
+                }),
+                "https://x.com/r1",
+            ),
+            (
+                serde_json::json!({
+                    "$ref": "#/$defs/a%2Fb/default",
+                    "$defs": {"a%2Fb": {"default": {"$ref": "https://x.com/r2"}}},
+                }),
+                "https://x.com/r2",
+            ),
+            (
+                serde_json::json!({
+                    "$ref": "#/$defs/a%25b/default",
+                    "$defs": {"a%25b": {"default": {"$ref": "https://x.com/r3"}}},
+                }),
+                "https://x.com/r3",
+            ),
+            (
+                serde_json::json!({
+                    "$ref": "#/$defs/~~0/default",
+                    "$defs": {"~~0": {"default": {"$ref": "https://x.com/r4"}}},
+                }),
+                "https://x.com/r4",
+            ),
+            (
+                serde_json::json!({
+                    "properties": {"q": {"$ref": "#/$defs/~~0/default"}},
+                    "$defs": {"~~0": {"default": {"$ref": "file:///etc/passwd"}}},
+                }),
+                "file:///etc/passwd",
+            ),
+        ] {
+            assert_eq!(
+                compile_error_message(schema.clone()),
+                format!("external $ref is not supported: {uri}"),
+                "for {schema}"
+            );
+        }
+    }
+
+    #[test]
+    fn compile_inline_follows_local_ref_cycles_to_an_end() {
+        for schema in [
+            serde_json::json!({"$ref": "#"}),
+            serde_json::json!({
+                "$defs": {"a": {"$ref": "#/$defs/b"}, "b": {"$ref": "#/$defs/a"}},
+                "$ref": "#/$defs/a",
+            }),
+        ] {
+            assert_eq!(find_external_ref(&schema), None, "for {schema}");
+        }
+        let message = compile_error_message(serde_json::json!({
+            "$defs": {"a": {"$ref": "#/$defs/b"}, "b": {"$ref": "#/$defs/a"}},
+            "$ref": "#/$defs/a",
+            "default": {"$ref": "https://x.com/y"},
+            "items": {"$ref": "#/default"},
+        }));
+        assert_eq!(message, "external $ref is not supported: https://x.com/y");
+    }
+
+    #[test]
+    fn find_external_ref_resolves_against_the_schemas_own_and_embedded_ids() {
+        let root = "https://example.com/root.json";
+        for (schema, external) in [
+            // The root's own `$id`, absolute.
+            (
+                serde_json::json!({"$id": root, "$ref": "https://example.com/root.json#/$defs/x"}),
+                None,
+            ),
+            // An embedded `$id`, relative, with and without a fragment.
+            (
+                serde_json::json!({"$id": root, "$defs": {"i": {"$id": "inner.json"}},
+                    "properties": {"a": {"$ref": "inner.json"}, "b": {"$ref": "inner.json#/x"}}}),
+                None,
+            ),
+            // Inside the embedded resource, `inner.json` is its own base.
+            (
+                serde_json::json!({"$id": root, "$defs": {"i": {"$id": "dir/inner.json",
+                    "properties": {"a": {"$ref": "inner.json"}}}}}),
+                None,
+            ),
+            // No `$id` names these.
+            (
+                serde_json::json!({"$id": root, "$defs": {"i": {"$id": "inner.json"}},
+                    "properties": {"a": {"$ref": "other.json"}}}),
+                Some("other.json"),
+            ),
+            (
+                serde_json::json!({"$id": root, "x-data": {"$id": "inner.json"},
+                    "properties": {"a": {"$ref": "inner.json"}}}),
+                Some("inner.json"),
+            ),
+            (
+                serde_json::json!({"$id": root, "$defs": {"i": {"$id": "dir/inner.json"}},
+                    "properties": {"a": {"$ref": "inner.json"}}}),
+                Some("inner.json"),
+            ),
+        ] {
+            assert_eq!(find_external_ref(&schema), external, "for {schema}");
+        }
+    }
+
+    #[test]
+    fn compile_inline_resolves_a_ref_to_the_schemas_own_or_an_embedded_id() {
+        for schema in [
+            serde_json::json!({"$id": "https://example.com/s.json",
+                "$defs": {"x": {"maximum": 5}},
+                "properties": {"x": {"$ref": "https://example.com/s.json#/$defs/x"}}}),
+            serde_json::json!({"$id": "https://example.com/root.json",
+                "$defs": {"inner": {"$id": "inner.json", "maximum": 5}},
+                "properties": {"x": {"$ref": "inner.json"}}}),
+        ] {
+            let compiled = compile_inline("test.ok", &schema, &SchemaNotes::default(), None)
+                .unwrap_or_else(|err| panic!("{schema} should compile, got {err:?}"));
+            assert!(holds(&compiled, &serde_json::json!({"x": 5})), "{schema}");
+            assert!(!holds(&compiled, &serde_json::json!({"x": 6})), "{schema}");
+        }
+    }
+
+    #[test]
+    fn find_external_ref_does_not_follow_anchor_fragments() {
+        // `#foo` is not a JSON pointer: the walk leaves it to the
+        // validator, which does not look for anchors inside data either.
+        let in_data = serde_json::json!({
+            "$ref": "#foo",
+            "default": {"$anchor": "foo", "$ref": "https://x.com/y"},
+        });
+        assert_eq!(find_external_ref(&in_data), None);
+        assert_eq!(
+            compile_error_message(in_data),
+            "Anchor 'foo' does not exist"
+        );
+        // An anchored schema in a schema position is walked anyway.
+        assert_eq!(
+            find_external_ref(&serde_json::json!({
+                "$ref": "#foo",
+                "$defs": {"a": {"$anchor": "foo", "$ref": "https://x.com/y"}},
+            })),
+            Some("https://x.com/y")
+        );
+    }
+
+    #[test]
+    fn compile_inline_rejects_external_ref_beside_data_keywords_and_under_unknown_ones() {
+        for schema in [
+            serde_json::json!({"items": {"enum": [1], "$ref": "https://x.com/y"}}),
+            serde_json::json!({"allOf": [{"default": 1}, {"$ref": "https://x.com/y"}]}),
+            serde_json::json!({"prefixItems": [{"const": 1}, {"$ref": "https://x.com/y"}]}),
+            // An unknown keyword is walked whole: its `enum` is not known
+            // to be a data keyword there.
+            serde_json::json!({"x-ext": {"enum": [{"$ref": "https://x.com/y"}]}}),
+            serde_json::json!({"example": {"$ref": "https://x.com/y"}}),
+        ] {
+            assert_eq!(
+                compile_error_message(schema.clone()),
+                "external $ref is not supported: https://x.com/y",
+                "for {schema}"
+            );
         }
     }
 }

@@ -13,7 +13,7 @@ use camino::Utf8PathBuf;
 use indexmap::IndexMap;
 
 use crate::Result;
-use crate::document::{Document, FormatTag, Value};
+use crate::document::{Document, FormatTag, Layout, Value};
 use crate::error::Error;
 use crate::format::Format;
 
@@ -35,8 +35,10 @@ impl Format for Csv {
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<Document> {
-        let value = parse_with_delimiter(bytes, b',', "csv")?;
-        Ok(Document::value_only(value, FormatTag::Csv))
+        let (value, layout) = parse_with_delimiter(bytes, b',', "csv")?;
+        Ok(Document::value_only(value, FormatTag::Csv)
+            .with_layout(layout)
+            .with_source_bytes(bytes))
     }
 
     fn write(&self, doc: &Document, w: &mut dyn Write) -> Result<()> {
@@ -54,8 +56,10 @@ impl Format for Tsv {
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<Document> {
-        let value = parse_with_delimiter(bytes, b'\t', "tsv")?;
-        Ok(Document::value_only(value, FormatTag::Tsv))
+        let (value, layout) = parse_with_delimiter(bytes, b'\t', "tsv")?;
+        Ok(Document::value_only(value, FormatTag::Tsv)
+            .with_layout(layout)
+            .with_source_bytes(bytes))
     }
 
     fn write(&self, doc: &Document, w: &mut dyn Write) -> Result<()> {
@@ -63,8 +67,59 @@ impl Format for Tsv {
     }
 }
 
-/// Parse `bytes` as delimited records into `Value::Array<Value::Map>`.
-fn parse_with_delimiter(bytes: &[u8], delimiter: u8, format_name: &'static str) -> Result<Value> {
+/// What the CSV / TSV reader saw of a file beyond its value tree
+/// ([`Layout::Csv`]): its header, which the writer writes for a document
+/// with no rows left — a header alone has nothing else to hold it — and,
+/// for the tree the reader built and the point edits made to it, first,
+/// every column of it whether a row still holds it or not.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct CsvLayout {
+    header: Vec<String>,
+    /// Whether the header's columns come first and stay: false once a
+    /// filter rebuilt the tree ([`CsvLayout::rebuilt`]), whose rows then
+    /// decide the columns and their order.
+    kept: bool,
+}
+
+impl CsvLayout {
+    /// This layout for a tree a filter rebuilt (`set --jq`, `fix.jq`):
+    /// the header only for a tree with no rows left.
+    pub(crate) fn rebuilt(&self) -> Self {
+        Self {
+            header: self.header.clone(),
+            kept: false,
+        }
+    }
+}
+
+/// The columns to write `rows` with: the header the file was read with,
+/// its columns in its order, when `layout` keeps it; then every other key
+/// of every row, in the order first seen. The read-back check reads a row
+/// back with every one of them, a missing one empty.
+pub(crate) fn columns<'a>(layout: &'a Layout, rows: &'a [Value]) -> Vec<&'a str> {
+    let mut columns: IndexMap<&str, ()> = IndexMap::new();
+    if let Layout::Csv(CsvLayout { header, kept: true }) = layout {
+        for column in header {
+            columns.entry(column.as_str()).or_insert(());
+        }
+    }
+    for row in rows {
+        if let Value::Map(cells) = row {
+            for key in cells.keys() {
+                columns.entry(key.as_str()).or_insert(());
+            }
+        }
+    }
+    columns.into_keys().collect()
+}
+
+/// Parse `bytes` as delimited records into `Value::Array<Value::Map>`, and
+/// the header they were read with.
+fn parse_with_delimiter(
+    bytes: &[u8],
+    delimiter: u8,
+    format_name: &'static str,
+) -> Result<(Value, Layout)> {
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(true)
         .delimiter(delimiter)
@@ -112,7 +167,13 @@ fn parse_with_delimiter(bytes: &[u8], delimiter: u8, format_name: &'static str) 
         }
         rows.push(Value::Map(row));
     }
-    Ok(Value::Array(rows))
+    Ok((
+        Value::Array(rows),
+        Layout::Csv(CsvLayout {
+            header: headers,
+            kept: true,
+        }),
+    ))
 }
 
 /// Write a `Value::Array<Value::Map>` document as delimited records.
@@ -135,29 +196,24 @@ fn write_with_delimiter(
         .delimiter(delimiter)
         .from_writer(w);
 
+    // No rows: the header the file was read with, if any, alone.
     if items.is_empty() {
+        if let Layout::Csv(CsvLayout { header, .. }) = doc.layout()
+            && !header.is_empty()
+        {
+            wtr.write_record(header)
+                .map_err(|e| map_delim_write_err(format_name, e))?;
+        }
         return wtr.flush().map_err(|source| Error::Io {
             path: Utf8PathBuf::from(format!("<{format_name}-writer>")),
             source,
         });
     }
 
-    // Header is taken from the first map's keys in order. Subsequent maps
-    // must share the header set; missing keys emit empty cells, extra keys
-    // surface as Error::Format so callers see a clean diagnostic.
-    let Value::Map(first) = &items[0] else {
-        return Err(Error::Format {
-            format: format_name,
-            message: format!(
-                "expected array of objects at top level; row 0 is {}",
-                items[0].type_name(),
-            ),
-        });
-    };
-    let headers: Vec<String> = first.keys().cloned().collect();
-    wtr.write_record(&headers)
-        .map_err(|e| map_delim_write_err(format_name, e))?;
-
+    // The header is the file's, then every other key of every row, in the
+    // order first seen ([`columns`]); a row without one of them has an
+    // empty cell there.
+    let mut rows = Vec::with_capacity(items.len());
     for (idx, row) in items.iter().enumerate() {
         let Value::Map(map) = row else {
             return Err(Error::Format {
@@ -168,13 +224,20 @@ fn write_with_delimiter(
                 ),
             });
         };
+        rows.push(map);
+    }
+    let headers = columns(doc.layout(), items);
+    wtr.write_record(&headers)
+        .map_err(|e| map_delim_write_err(format_name, e))?;
+
+    for (idx, map) in rows.into_iter().enumerate() {
         let mut cells: Vec<String> = Vec::with_capacity(headers.len());
         for h in &headers {
-            match map.get(h) {
+            match map.get(*h) {
                 Some(Value::String(s)) => cells.push(s.clone()),
                 Some(Value::Bool(b)) => cells.push(b.to_string()),
                 Some(Value::Int(n)) => cells.push(n.to_string()),
-                Some(Value::Float(n)) => cells.push(n.to_string()),
+                Some(Value::Float(n)) => cells.push(crate::document::shortest_float(*n)),
                 Some(Value::BigInt(s)) | Some(Value::BigFloat(s)) => cells.push(s.clone()),
                 Some(Value::Null) => cells.push(String::new()),
                 Some(Value::Array(_) | Value::Map(_)) => {
@@ -182,20 +245,11 @@ fn write_with_delimiter(
                         format: format_name,
                         message: format!(
                             "row {idx} key '{h}': nested {} cannot be serialized to {format_name}",
-                            map.get(h).expect("just matched").type_name(),
+                            map.get(*h).expect("just matched").type_name(),
                         ),
                     });
                 }
                 None => cells.push(String::new()),
-            }
-        }
-        // Surface unexpected extra keys (header is the set of keys from row 0).
-        for k in map.keys() {
-            if !headers.iter().any(|h| h == k) {
-                return Err(Error::Format {
-                    format: format_name,
-                    message: format!("row {idx} has key '{k}' not present in header {headers:?}",),
-                });
             }
         }
         wtr.write_record(&cells)
@@ -244,6 +298,19 @@ mod tests {
     }
 
     #[test]
+    fn a_document_with_no_rows_writes_the_header_it_was_read_with() {
+        let mut doc = Csv.parse(b"a,b\n1,2\n").expect("parse");
+        doc.del_at(&crate::pointer::Pointer::parse("/0").unwrap())
+            .expect("del");
+        assert_eq!(doc.original_bytes(), b"a,b\n");
+        // Read from no file: no header to write.
+        let mut buf: Vec<u8> = Vec::new();
+        Csv.write(&Document::single(Value::Array(Vec::new())), &mut buf)
+            .expect("write");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
     fn write_rejects_non_array_top_level() {
         let mut m = IndexMap::new();
         m.insert("a".into(), Value::Int(1));
@@ -251,5 +318,40 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         let err = Csv.write(&doc, &mut buf).expect_err("must error");
         assert_eq!(err.kind_name(), "format");
+    }
+
+    #[test]
+    fn the_header_is_the_union_of_the_keys_in_first_seen_order() {
+        let row = |cells: &[(&str, &str)]| {
+            Value::Map(
+                cells
+                    .iter()
+                    .map(|(k, v)| ((*k).to_owned(), Value::String((*v).to_owned())))
+                    .collect(),
+            )
+        };
+        let rows = Value::Array(vec![
+            row(&[("a", "1"), ("b", "2")]),
+            row(&[("a", "3"), ("c", "4")]),
+            row(&[("c", "5")]),
+        ]);
+        for (format, delimited) in [
+            (&Csv as &dyn Format, "a,b,c\n1,2,\n3,,4\n,,5\n"),
+            (&Tsv, "a\tb\tc\n1\t2\t\n3\t\t4\n\t\t5\n"),
+        ] {
+            let mut buf: Vec<u8> = Vec::new();
+            format
+                .write(&Document::single(rows.clone()), &mut buf)
+                .expect("write");
+            assert_eq!(String::from_utf8(buf).unwrap(), delimited);
+        }
+        // And through a point edit that appends a row with a new column.
+        let mut doc = Csv.parse(b"a,b\n1,2\n").expect("parse");
+        doc.set_at(
+            &crate::pointer::Pointer::parse("/-").unwrap(),
+            row(&[("a", "3"), ("c", "4")]),
+        )
+        .expect("set");
+        assert_eq!(doc.original_bytes(), b"a,b,c\n1,2,\n3,,4\n");
     }
 }

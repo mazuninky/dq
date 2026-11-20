@@ -39,9 +39,15 @@ use crate::pointer::{Pointer, Segment};
 pub enum PatchOp {
     /// `{"op":"add","path":"/a/b","value":...}` — insert or replace at `path`.
     ///
-    /// In M3's baseline insertion is limited to existing parent containers
-    /// (M2's `set_at` returns `MissingKey` for unknown pointers); full mkdir-p
-    /// insertion is a post-M3 follow-up.
+    /// Into an array it inserts (RFC 6902 §4.1): at an existing index the
+    /// items from there on move up one; the array's length or `-` appends;
+    /// past the length is [`Error::Path`] with `kind = OutOfBounds`. In a
+    /// YAML stream `/N` inserts a document. A member of a mapping is set.
+    ///
+    /// As RFC 6902 §4.1 asks, the parent of `path` must exist: a missing
+    /// one is [`Error::Path`] with `kind = MissingKey` for `path`, and
+    /// nothing is created on the way (unlike `Document::set_at`). `copy`
+    /// and `move` targets follow the same rule.
     Add {
         /// Target pointer.
         path: Pointer,
@@ -64,15 +70,15 @@ pub enum PatchOp {
         value: Value,
     },
     /// `{"op":"move","from":"/a","path":"/b"}` — read at `from`, delete at
-    /// `from`, set at `path`.
+    /// `from`, add at `path` as [`PatchOp::Add`] does.
     Move {
         /// Source pointer.
         from: Pointer,
         /// Destination pointer.
         path: Pointer,
     },
-    /// `{"op":"copy","from":"/a","path":"/b"}` — read at `from`, set at
-    /// `path`. The source is left in place.
+    /// `{"op":"copy","from":"/a","path":"/b"}` — read at `from`, add at
+    /// `path` as [`PatchOp::Add`] does. The source is left in place.
     Copy {
         /// Source pointer.
         from: Pointer,
@@ -273,7 +279,12 @@ impl<'de> Visitor<'de> for PatchOpVisitor {
 /// The function clones `doc` once, applies every op to the clone in order,
 /// and only commits the result back into `doc` on success. Any error during
 /// any op (including a failing `test`) leaves `doc` byte-identical to its
-/// pre-call state — see [Decision D2 in the M3 design][D2].
+/// pre-call state — see the atomic-patch decision in the [add-bulk-and-ci
+/// section of the decision log][D2].
+///
+/// On a YAML stream the patch addresses each document as `/N`, as
+/// `Document::set_at` and `Document::del_at` do; a document removed by an
+/// earlier op shifts the ones after it, as in an array.
 ///
 /// # Errors
 ///
@@ -282,21 +293,200 @@ impl<'de> Visitor<'de> for PatchOpVisitor {
 ///   indices encountered during any op.
 /// - [`Error::WriteUnavailable`] when the document was loaded read-only.
 ///
-/// [D2]: ../../../openspec/changes/add-bulk-and-ci/design.md
+/// On a format dq rewrites whole (HCL, XML, INI, …) every op is made to the
+/// value tree and the file is written once, after the last
+/// ([`Document::edit_batch`]): each op sees the tree the one before it
+/// left, not that tree as the file would read back.
+///
+/// [D2]: ../../../../docs/decisions.md
 pub fn apply_patch(doc: &mut Document, ops: &[PatchOp]) -> Result<()> {
+    apply_patch_edits(doc, ops).map(drop)
+}
+
+/// [`apply_patch`], returning the nodes of `doc` as it was before the
+/// patch that the patch replaced or removed — the pointers whose templates
+/// the template guard lets go.
+///
+/// Each op addresses the document the ops before it left, so its pointer
+/// is carried back through their index shifts, as RFC 6902 sequences the
+/// ops: after an `add` at `/l/0`, `/l/2` names the original `/l/1`, and
+/// `/l/0` the new item, no original node. An `add` (or the `path` of a
+/// `copy` / `move`) into an array inserts and replaces nothing; into a map
+/// it replaces the member. A `remove` (or the `from` of a `move`) removes
+/// its node, a `replace` replaces it.
+///
+/// # Errors
+///
+/// As [`apply_patch`]; `doc` is left as it was.
+pub fn apply_patch_edits(doc: &mut Document, ops: &[PatchOp]) -> Result<Vec<Pointer>> {
     let mut working = doc.clone();
-    for op in ops {
-        apply_one(&mut working, op)?;
-    }
+    let stream = working.values().is_some();
+    let mut shifts: Vec<Shift> = Vec::new();
+    let mut edited = Vec::new();
+    // One batch: on a format dq rewrites whole each op, and each slot read
+    // for the shifts, sees the tree the ops before it left, not the file
+    // that tree would read back as (`Document::edit_batch`).
+    working.edit_batch(|working| {
+        for op in ops {
+            let removed = match op {
+                PatchOp::Remove { path } => Some(path),
+                PatchOp::Move { from, .. } => Some(from),
+                _ => None,
+            };
+            let removed_at = removed.and_then(|path| array_slot(working, path, false));
+            apply_one(working, op, stream)?;
+            if let Some(path) = removed {
+                edited.extend(to_original(path, &shifts));
+                if let Some(index) = removed_at {
+                    shifts.push(Shift::new(path, index, false));
+                }
+            }
+            match op {
+                PatchOp::Replace { path, .. } => edited.extend(to_original(path, &shifts)),
+                PatchOp::Add { path, .. }
+                | PatchOp::Copy { path, .. }
+                | PatchOp::Move { path, .. } => match array_slot(working, path, true) {
+                    Some(index) => shifts.push(Shift::new(path, index, true)),
+                    None => edited.extend(to_original(path, &shifts)),
+                },
+                PatchOp::Remove { .. } | PatchOp::Test { .. } => {}
+            }
+        }
+        Ok(())
+    })?;
     *doc = working;
+    Ok(edited)
+}
+
+/// An item an op inserted into or removed from an array, moving the items
+/// after it.
+struct Shift {
+    /// The array's pointer, as segments.
+    array: Vec<String>,
+    /// The item's index.
+    index: usize,
+    /// Inserted (`true`) or removed.
+    insert: bool,
+}
+
+impl Shift {
+    fn new(path: &Pointer, index: usize, insert: bool) -> Self {
+        let mut array = tokens(path);
+        array.pop();
+        Self {
+            array,
+            index,
+            insert,
+        }
+    }
+}
+
+/// The segments of `pointer` as text.
+fn tokens(pointer: &Pointer) -> Vec<String> {
+    pointer
+        .segments()
+        .iter()
+        .map(|segment| match segment {
+            Segment::Key(key) => key.clone(),
+            Segment::Index(index) => index.to_string(),
+        })
+        .collect()
+}
+
+/// The index of the item `path` names in its parent array in `doc`; `None`
+/// when the parent is not an array. `-` is the length — the slot an append
+/// fills, which is the last item once it is filled (`filled`).
+fn array_slot(doc: &Document, path: &Pointer, filled: bool) -> Option<usize> {
+    let (last, parent) = path.segments().split_last()?;
+    let Ok(Value::Array(items)) = Pointer::new(parent.to_vec()).resolve(doc.value()) else {
+        return None;
+    };
+    match last {
+        Segment::Index(index) => Some(*index),
+        Segment::Key(key) if key == "-" => Some(items.len() - usize::from(filled)),
+        Segment::Key(key) => key.parse().ok(),
+    }
+}
+
+/// `pointer`, which names a node after `shifts`, as it names the node
+/// before them; `None` when one of them inserted the node or a node above
+/// it.
+fn to_original(pointer: &Pointer, shifts: &[Shift]) -> Option<Pointer> {
+    let mut tokens = tokens(pointer);
+    for shift in shifts.iter().rev() {
+        let depth = shift.array.len();
+        if tokens.len() <= depth || tokens[..depth] != shift.array[..] {
+            continue;
+        }
+        let Ok(index) = tokens[depth].parse::<usize>() else {
+            continue;
+        };
+        let index = match (shift.insert, index.cmp(&shift.index)) {
+            (true, std::cmp::Ordering::Equal) => return None,
+            (true, std::cmp::Ordering::Greater) => index - 1,
+            (false, std::cmp::Ordering::Equal | std::cmp::Ordering::Greater) => index + 1,
+            (_, std::cmp::Ordering::Less) => index,
+        };
+        tokens[depth] = index.to_string();
+    }
+    Some(Pointer::new(tokens.into_iter().map(Segment::Key).collect()))
+}
+
+/// RFC 6902 §4.1: the target of an `add` (and of a `copy` / `move`) is
+/// the root, a member of an existing object or an element of an existing
+/// array. A missing parent is the `MissingKey` error for `path` itself, a
+/// parent that is a scalar the `TypeMismatch` one: a patch never creates
+/// the nodes on its way, as `set` does.
+fn parent_exists(doc: &Document, path: &Pointer) -> Result<()> {
+    let Some((_, parent)) = path.segments().split_last() else {
+        return Ok(());
+    };
+    match Pointer::new(parent.to_vec()).resolve(doc.value()) {
+        Ok(Value::Map(_) | Value::Array(_)) => Ok(()),
+        Ok(other) => Err(Error::Path {
+            pointer: path.as_canonical(),
+            matched_prefix: Pointer::new(parent.to_vec()).as_canonical(),
+            kind: PathErrorKind::TypeMismatch {
+                expected: "object or array",
+                found: other.type_name(),
+            },
+            did_you_mean: Vec::new(),
+        }),
+        Err(Error::Path { matched_prefix, .. }) => Err(Error::Path {
+            pointer: path.as_canonical(),
+            matched_prefix,
+            kind: PathErrorKind::MissingKey,
+            did_you_mean: Vec::new(),
+        }),
+        Err(err) => Err(err),
+    }
+}
+
+/// RFC 6902 §4.4: the `from` of a `move` must not be a proper prefix of
+/// its `path` — a value cannot move into one of its own children.
+fn not_into_itself(from: &Pointer, path: &Pointer) -> Result<()> {
+    let from_canonical = from.as_canonical();
+    if path
+        .as_canonical()
+        .starts_with(&format!("{from_canonical}/"))
+    {
+        return Err(Error::Path {
+            pointer: path.as_canonical(),
+            matched_prefix: String::new(),
+            kind: PathErrorKind::IntoItsOwnChild {
+                from: from_canonical,
+            },
+            did_you_mean: Vec::new(),
+        });
+    }
     Ok(())
 }
 
-fn apply_one(doc: &mut Document, op: &PatchOp) -> Result<()> {
+fn apply_one(doc: &mut Document, op: &PatchOp, stream: bool) -> Result<()> {
     match op {
-        PatchOp::Add { path, value } => doc.set_at(path, value.clone()),
-        PatchOp::Remove { path } => doc.del_at(path),
-        PatchOp::Replace { path, value } => {
+        PatchOp::Add { path, value } => add_at(doc, stream, path, value.clone()),
+        PatchOp::Remove { path } => at(doc, stream, path, |doc, path| doc.del_at(path)),
+        PatchOp::Replace { path, value } => at(doc, stream, path, |doc, path| {
             // RFC 6902 §4.3: target MUST exist. M2's `set_at` already returns
             // MissingKey for unknown pointers, so a pre-check via
             // `read_value_at` would be redundant — except `read_value_at` also
@@ -306,19 +496,21 @@ fn apply_one(doc: &mut Document, op: &PatchOp) -> Result<()> {
             // the error shape across all five non-scalar variants.
             read_value_at(doc, path)?;
             doc.set_at(path, value.clone())
-        }
+        }),
         PatchOp::Move { from, path } => {
-            let v = read_value_at(doc, from)?;
-            doc.del_at(from)?;
-            doc.set_at(path, v)
+            let v = at(doc, stream, from, |doc, from| read_value_at(doc, from))?;
+            not_into_itself(from, path)?;
+            at(doc, stream, from, |doc, from| doc.del_at(from))?;
+            // After the removal: `path`'s parent may be what moved away.
+            add_at(doc, stream, path, v)
         }
         PatchOp::Copy { from, path } => {
-            let v = read_value_at(doc, from)?;
-            doc.set_at(path, v)
+            let v = at(doc, stream, from, |doc, from| read_value_at(doc, from))?;
+            add_at(doc, stream, path, v)
         }
-        PatchOp::Test { path, value } => {
+        PatchOp::Test { path, value } => at(doc, stream, path, |doc, path| {
             let actual = read_value_at(doc, path)?;
-            if &actual != value {
+            if actual != *value && !actual.same_big_number(value) {
                 return Err(Error::PatchTestFailed {
                     pointer: path.as_canonical(),
                     expected: Box::new(value.clone()),
@@ -326,8 +518,115 @@ fn apply_one(doc: &mut Document, op: &PatchOp) -> Result<()> {
                 });
             }
             Ok(())
-        }
+        }),
     }
+}
+
+/// RFC 6902 §4.1 `add` of `value` at `path` — what `copy` and `move` do
+/// at their `path` too: into an array it inserts (`-` or the length
+/// appends), anywhere else it sets. The parent must exist.
+fn add_at(doc: &mut Document, stream: bool, path: &Pointer, value: Value) -> Result<()> {
+    // A stream the patch has taken down to one document: a new document
+    // goes before or after it.
+    if stream
+        && doc.values().is_none()
+        && let [segment] = path.segments()
+    {
+        let index = match segment {
+            Segment::Index(index) => Some(*index),
+            Segment::Key(key) if key == "-" => Some(1),
+            Segment::Key(key) => key.parse::<usize>().ok(),
+        };
+        return match index {
+            Some(index) if index <= 1 => doc.insert_stream_document(index, value),
+            _ => Err(Error::Path {
+                pointer: path.as_canonical(),
+                matched_prefix: String::new(),
+                kind: PathErrorKind::OutOfBounds,
+                did_you_mean: Vec::new(),
+            }),
+        };
+    }
+    at(doc, stream, path, |doc, path| {
+        parent_exists(doc, path)?;
+        let into_array = path.segments().split_last().is_some_and(|(_, parent)| {
+            matches!(
+                Pointer::new(parent.to_vec()).resolve(doc.value()),
+                Ok(Value::Array(_))
+            )
+        });
+        if into_array {
+            doc.insert_at(path, value)
+        } else {
+            doc.set_at(path, value)
+        }
+    })
+}
+
+/// Run `edit` on `doc` at `pointer`, as the patch addresses it.
+///
+/// A patch on a YAML stream addresses its documents as `/N`. When the
+/// patch has removed all but one of them, the file reads as that one
+/// document and no longer as a stream; `pointer` still names it as `/0`
+/// (any other `/N` is out of bounds), and is taken into it — so are the
+/// pointers in an error, back.
+fn at<T>(
+    doc: &mut Document,
+    stream: bool,
+    pointer: &Pointer,
+    edit: impl FnOnce(&mut Document, &Pointer) -> Result<T>,
+) -> Result<T> {
+    if !stream || doc.values().is_some() || pointer.is_root() {
+        return edit(doc, pointer);
+    }
+    let (first, rest) = pointer
+        .segments()
+        .split_first()
+        .expect("a pointer that is not the root has a segment");
+    let first_document = match first {
+        Segment::Index(index) => *index == 0,
+        Segment::Key(key) => key == "0",
+    };
+    if !first_document {
+        return Err(Error::Path {
+            pointer: pointer.as_canonical(),
+            matched_prefix: String::new(),
+            kind: PathErrorKind::OutOfBounds,
+            did_you_mean: Vec::new(),
+        });
+    }
+    edit(doc, &Pointer::new(rest.to_vec())).map_err(|err| match err {
+        Error::Path {
+            pointer,
+            matched_prefix,
+            kind,
+            did_you_mean,
+        } => Error::Path {
+            pointer: format!("/0{pointer}"),
+            matched_prefix: format!("/0{matched_prefix}"),
+            kind,
+            did_you_mean,
+        },
+        Error::PatchTestFailed {
+            pointer,
+            expected,
+            actual,
+        } => Error::PatchTestFailed {
+            pointer: format!("/0{pointer}"),
+            expected,
+            actual,
+        },
+        Error::EditRejected {
+            action,
+            pointer,
+            reason,
+        } => Error::EditRejected {
+            action,
+            pointer: format!("/0{pointer}"),
+            reason,
+        },
+        other => other,
+    })
 }
 
 /// Walk `doc.value()` to the value at `pointer`, returning a clone.
@@ -520,6 +819,146 @@ mod tests {
     }
 
     #[test]
+    fn apply_patch_add_into_a_missing_parent_is_missing_key_for_its_path() {
+        let path = Pointer::parse("/b/c").unwrap();
+        for op in [
+            PatchOp::Add {
+                path: path.clone(),
+                value: Value::Int(2),
+            },
+            PatchOp::Copy {
+                from: Pointer::parse("/a").unwrap(),
+                path: path.clone(),
+            },
+            PatchOp::Move {
+                from: Pointer::parse("/a").unwrap(),
+                path: path.clone(),
+            },
+        ] {
+            let mut doc = yaml_doc_one("a", 3);
+            let err = apply_patch(&mut doc, &[op]).expect_err("no parent");
+            assert!(
+                matches!(&err, Error::Path { pointer, matched_prefix, kind: PathErrorKind::MissingKey, .. }
+                    if pointer == "/b/c" && matched_prefix.is_empty()),
+                "{err:?}"
+            );
+            assert_eq!(doc.original_bytes(), b"a: 3\n");
+        }
+    }
+
+    #[test]
+    fn apply_patch_add_under_a_scalar_is_a_type_mismatch_for_its_path() {
+        let mut doc = yaml_doc_one("a", 3);
+        let op = PatchOp::Add {
+            path: Pointer::parse("/a/b").unwrap(),
+            value: Value::Int(2),
+        };
+        let err = apply_patch(&mut doc, &[op]).expect_err("a scalar parent");
+        assert!(
+            matches!(&err, Error::Path { pointer, kind: PathErrorKind::TypeMismatch { .. }, .. }
+                if pointer == "/a/b"),
+            "{err:?}"
+        );
+        assert_eq!(doc.original_bytes(), b"a: 3\n");
+    }
+
+    #[test]
+    fn apply_patch_move_into_its_own_child_is_refused() {
+        let mut doc = yaml_doc_one("a", 3);
+        let op = PatchOp::Move {
+            from: Pointer::parse("/a").unwrap(),
+            path: Pointer::parse("/a/b").unwrap(),
+        };
+        let err = apply_patch(&mut doc, &[op]).expect_err("into itself");
+        assert!(
+            matches!(&err, Error::Path { pointer, kind: PathErrorKind::IntoItsOwnChild { from }, .. }
+                if pointer == "/a/b" && from == "/a"),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "cannot move '/a' to '/a/b': a value cannot move into one of its own children"
+        );
+        assert_eq!(doc.original_bytes(), b"a: 3\n");
+    }
+
+    #[test]
+    fn apply_patch_on_a_stream_addresses_the_last_document_left_as_0() {
+        let mut doc = crate::parse_yaml_stream_with_spans(b"a: 1\n---\nb: 2\n").unwrap();
+        let ops = [
+            PatchOp::Remove {
+                path: Pointer::parse("/1").unwrap(),
+            },
+            PatchOp::Replace {
+                path: Pointer::parse("/0/a").unwrap(),
+                value: Value::Int(5),
+            },
+        ];
+        apply_patch(&mut doc, &ops).unwrap();
+        assert_eq!(doc.original_bytes(), b"a: 5\n");
+
+        let mut doc = crate::parse_yaml_stream_with_spans(b"a: 1\n---\nb: 2\n").unwrap();
+        let ops = [
+            PatchOp::Remove {
+                path: Pointer::parse("/1").unwrap(),
+            },
+            PatchOp::Test {
+                path: Pointer::parse("/1/b").unwrap(),
+                value: Value::Int(2),
+            },
+        ];
+        let err = apply_patch(&mut doc, &ops).expect_err("past the end");
+        assert!(
+            matches!(&err, Error::Path { pointer, kind: PathErrorKind::OutOfBounds, .. }
+                if pointer == "/1/b"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn apply_patch_add_copy_and_move_into_an_array_insert() {
+        let mut doc = crate::parse_yaml_with_spans(b"a: [1, 2]\n").unwrap();
+        let ops = [
+            PatchOp::Add {
+                path: Pointer::parse("/a/0").unwrap(),
+                value: Value::Int(0),
+            },
+            PatchOp::Add {
+                path: Pointer::parse("/a/-").unwrap(),
+                value: Value::Int(3),
+            },
+            PatchOp::Copy {
+                from: Pointer::parse("/a/1").unwrap(),
+                path: Pointer::parse("/a/4").unwrap(),
+            },
+            PatchOp::Move {
+                from: Pointer::parse("/a/0").unwrap(),
+                path: Pointer::parse("/a/1").unwrap(),
+            },
+        ];
+        apply_patch(&mut doc, &ops).unwrap();
+        assert_eq!(doc.original_bytes(), b"a: [1, 0, 2, 3, 1]\n");
+        let err = apply_patch(
+            &mut doc,
+            &[PatchOp::Add {
+                path: Pointer::parse("/a/6").unwrap(),
+                value: Value::Int(9),
+            }],
+        )
+        .expect_err("past the end");
+        assert!(
+            matches!(
+                &err,
+                Error::Path {
+                    kind: PathErrorKind::OutOfBounds,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
     fn apply_patch_remove_succeeds() {
         let mut doc = yaml_doc_one("a", 3);
         let ops = vec![PatchOp::Remove {
@@ -588,6 +1027,18 @@ mod tests {
         assert_eq!(doc.original_bytes(), b"a: 3\n");
     }
 
+    #[test]
+    fn apply_patch_test_matches_a_big_number_spelled_another_way() {
+        let mut doc = crate::parse_yaml_with_spans(b"a: 1e400\n").unwrap();
+        let test = |value: &str| PatchOp::Test {
+            path: Pointer::parse("/a").unwrap(),
+            value: Value::BigFloat(value.into()),
+        };
+        apply_patch(&mut doc, &[test("1e+400")]).expect("the same number passes");
+        let err = apply_patch(&mut doc, &[test("1e401")]).unwrap_err();
+        assert!(matches!(err, Error::PatchTestFailed { .. }), "{err:?}");
+    }
+
     // ---- read_value_at ----
 
     #[test]
@@ -639,5 +1090,59 @@ mod tests {
             other => panic!("expected Path/MissingKey, got {other:?}"),
         }
         assert_eq!(doc.original_bytes(), original.as_slice());
+    }
+
+    fn edits(text: &str, ops: &str) -> Vec<String> {
+        let mut doc = crate::parse_yaml_stream_with_spans(text.as_bytes()).unwrap();
+        let ops: Vec<PatchOp> = serde_json::from_str(ops).unwrap();
+        apply_patch_edits(&mut doc, &ops)
+            .unwrap()
+            .iter()
+            .map(Pointer::as_canonical)
+            .collect()
+    }
+
+    #[test]
+    fn edits_carry_each_path_back_through_earlier_index_shifts() {
+        let text = "l: [a, b, c]\nm: {k: 1}\n";
+        // An insert replaces nothing; the item after it is the original one
+        // before it.
+        assert_eq!(
+            edits(
+                text,
+                r#"[{"op":"add","path":"/l/0","value":"x"},
+                    {"op":"replace","path":"/l/2","value":"y"}]"#
+            ),
+            ["/l/1"]
+        );
+        // The inserted item itself is no original node.
+        assert!(
+            edits(
+                text,
+                r#"[{"op":"add","path":"/l/1","value":"x"},
+                    {"op":"replace","path":"/l/1","value":"y"}]"#
+            )
+            .is_empty()
+        );
+        // After a removal the index names the item that moved down; `-`
+        // appends.
+        assert_eq!(
+            edits(
+                text,
+                r#"[{"op":"remove","path":"/l/0"},
+                    {"op":"remove","path":"/l/0"},
+                    {"op":"add","path":"/l/-","value":"z"}]"#
+            ),
+            ["/l/0", "/l/1"]
+        );
+        // A move removes its `from`; into a map its `path` is a member set.
+        assert_eq!(
+            edits(
+                text,
+                r#"[{"op":"move","from":"/l/0","path":"/m/k"},
+                    {"op":"replace","path":"/l/0","value":"y"}]"#
+            ),
+            ["/l/0", "/m/k", "/l/1"]
+        );
     }
 }

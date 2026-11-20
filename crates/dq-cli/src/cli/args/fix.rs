@@ -1,4 +1,4 @@
-//! `dq fix FILE...` — apply every applicable rule's `fix.jq` to the
+//! `dq fix FILE...` — apply every applicable rule's fix (`fix.ops` / `fix.jq`) to the
 //! given files.
 //!
 //! Mirrors [`crate::cli::LintArgs`] in shape but is **read-write**: the

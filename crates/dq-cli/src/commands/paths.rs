@@ -13,9 +13,9 @@
 
 use std::io::Write;
 
-use dq_core::enumerate_pointers;
+use dq_core::{Document, enumerate_pointers};
 
-use super::io_helpers::load_document_with_path;
+use super::io_helpers::{load_document_with_path, select_document};
 use crate::cli::{Cli, PathsArgs};
 use crate::output::Reporter;
 
@@ -35,9 +35,20 @@ pub fn run(
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
     cli.ensure_no_write_flags()?;
-    let (_fmt, doc) = load_document_with_path(&args.file, input_format)?;
+    let (_fmt, doc) = load_document_with_path(&args.file, input_format, cli.template_mode())?;
+    // Without `--doc` a stream lists every document under its `/N` prefix,
+    // as it always has. With `--doc` the listing is of exactly the view
+    // `get --doc` reads, so every pointer printed is one `get` accepts
+    // with the same flag.
+    let entries: Vec<(dq_core::Pointer, &'static str)> = match cli.doc {
+        None => enumerate_pointers(&doc).collect(),
+        Some(selector) => {
+            let view = select_document(&doc, Some(selector), &args.file)?.into_owned();
+            enumerate_pointers(&Document::value_only(view, doc.format())).collect()
+        }
+    };
     let mut obj = serde_json::Map::new();
-    for (pointer, type_name) in enumerate_pointers(&doc) {
+    for (pointer, type_name) in entries {
         let key = pointer.as_canonical();
         obj.insert(key, serde_json::Value::String(type_name.to_owned()));
     }

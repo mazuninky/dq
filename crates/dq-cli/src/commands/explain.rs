@@ -15,7 +15,7 @@ use dq_exec::{Rule, RuleSet, RuleSource};
 
 use crate::cli::{Cli, ExplainArgs};
 use crate::error::InvalidInput;
-use crate::output::{OutputFormat, Reporter};
+use crate::output::{OutputFormat, Reporter, terminal_text};
 
 /// Run the `explain` command.
 ///
@@ -95,15 +95,20 @@ pub fn run(
 }
 
 fn render_console(rule: &Rule, out: &mut dyn Write) -> std::io::Result<()> {
-    writeln!(out, "Rule: {}", rule.id)?;
+    // The id, the description and the references come from the rule file:
+    // each prints with its controls escaped, the description line by line
+    // so its own line breaks stay.
+    writeln!(out, "Rule: {}", terminal_text(&rule.id))?;
     writeln!(out, "Severity: {}", rule.severity.as_str())?;
     writeln!(out)?;
-    writeln!(out, "{}", rule.description.trim_end())?;
+    for line in rule.description.trim_end().split('\n') {
+        writeln!(out, "{}", terminal_text(line))?;
+    }
     if !rule.references.is_empty() {
         writeln!(out)?;
         writeln!(out, "References:")?;
         for r in &rule.references {
-            writeln!(out, "  - {r}")?;
+            writeln!(out, "  - {}", terminal_text(r))?;
         }
     }
     Ok(())

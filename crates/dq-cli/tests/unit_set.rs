@@ -14,7 +14,7 @@
 //! - `--no-create` rejection
 //! - `--value-string` vs JSON-literal heuristic
 //! - `@<path>` and `--value-from <path>` value sources
-//! - flag-combination rejections (`-i --diff`, `-i -F`, `--backup` w/o `-i`)
+//! - flag-combination rejections (`-i --diff`, `-i -F <other format>`, `--backup` w/o `-i`)
 //! - write-failure handling with the original file left intact (Unix only).
 
 use std::io::Write as _;
@@ -137,10 +137,8 @@ fn set_diff_outputs_unified_diff() {
 #[test]
 fn set_no_create_rejects_missing_pointer() {
     // Spec: missing intermediate pointer with `--no-create` → `Error::Path`,
-    // which the exit-code mapper translates to NOT_FOUND (2). The M2 baseline
-    // also rejects non-existent pointers without `--no-create` because the
-    // mkdir-p path is not yet wired; this test pins the `--no-create` case
-    // so the future M3 work cannot accidentally regress the strict mode.
+    // which the exit-code mapper translates to NOT_FOUND (2). Without the
+    // flag the missing mappings are created; this test pins the strict mode.
     let tmp = write_yaml("a: 1\n");
     let path = tmp.to_str().unwrap();
     let cli =
@@ -204,8 +202,7 @@ fn set_inline_json_literal_int_heuristic() {
 fn set_at_file_value_from_path() {
     // `@<path>` shorthand: read the value from a file. The handler parses
     // the value source as a structured document and splices its top-level
-    // value into the target. We mutate an existing leaf (`/name`) so the
-    // M2 baseline's "no mkdir-p yet" restriction doesn't apply.
+    // value into the target. We mutate an existing leaf (`/name`).
     let target = write_yaml("name: old\n");
     let value_src = write_json(r#""loaded-from-file""#);
     let target_path = target.to_str().unwrap();
@@ -273,22 +270,25 @@ fn set_rejects_in_place_with_diff() {
 
 #[test]
 fn set_rejects_in_place_with_format_override() {
-    // `-i -F json` against a YAML file would imply an in-place format change,
-    // which is M3 territory. The handler must reject it before any I/O.
+    // `-i -F json` against a YAML file: `set` keeps the file in its own
+    // format, so a `-F` naming another is a usage error (exit 2) before
+    // any I/O. (It was `InvalidInput`, exit 6, for any `-F` with `-i`.)
     let tmp = write_yaml("a: 1\n");
     let path = tmp.to_str().unwrap();
     let cli = Cli::try_parse_from(["dq", "-i", "-F", "json", "set", path, "/a", "2"]).unwrap();
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
-    let e = dq::run(&cli, false, &mut out, &mut err).expect_err("`-i -F` must be rejected");
-    assert!(
-        e.downcast_ref::<dq::error::InvalidInput>().is_some(),
-        "rejection must carry InvalidInput marker (exit 6), got: {e:?}",
+    let e = dq::run(&cli, false, &mut out, &mut err).expect_err("`-i -F json` must be rejected");
+    assert_eq!(
+        dq::exit_code::exit_code_for_error(&e),
+        2,
+        "a -F the file cannot be kept in is a usage error, got: {e:?}",
     );
     assert!(
-        e.to_string().contains("-F") || e.to_string().contains("format"),
-        "error message must mention -F, got: {e}",
+        e.to_string().contains("--input-format"),
+        "error message must point to --input-format, got: {e}",
     );
+    assert_eq!(std::fs::read_to_string(&tmp).unwrap(), "a: 1\n");
 }
 
 #[test]

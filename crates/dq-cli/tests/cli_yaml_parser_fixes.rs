@@ -137,3 +137,129 @@ fn set_new_root_key_next_to_a_collection_sibling() {
         serde_json::json!({"root": {"inner": "x y"}, "zz": 1})
     );
 }
+
+/// Run `dq --no-color <args…> <file> <rest…>`, return (exit code, stdout,
+/// stderr).
+fn outcome_of(args: &[&str], file: &TempPath, rest: &[&str]) -> (Option<i32>, String, String) {
+    let out = dq()
+        .arg("--no-color")
+        .args(args)
+        .arg(file.to_str().unwrap())
+        .args(rest)
+        .output()
+        .expect("dq runs");
+    (
+        out.status.code(),
+        String::from_utf8(out.stdout).expect("UTF-8 stdout"),
+        String::from_utf8(out.stderr).expect("UTF-8 stderr"),
+    )
+}
+
+const COLLECTION_KEYS: &[u8] = b"# top\n[1, 2]: a  # one\n? {k: [on, 'a: b']}\n: b\nz: 1  # keep\n";
+
+#[test]
+fn a_collection_key_reads_as_its_flow_text() {
+    // Before: `"Sequence [Number(1), Number(2)]"` and `"Mapping {…}"`, Rust
+    // debug text.
+    let file = write_yaml(COLLECTION_KEYS);
+    assert_eq!(
+        read_back(&stdout_of(&["-q", "-F", "json", "convert"], &file, &[])),
+        serde_json::json!({"[1, 2]": "a", "{k: ['on', 'a: b']}": "b", "z": 1})
+    );
+    assert_eq!(
+        String::from_utf8(stdout_of(&["keys"], &file, &[""])).unwrap(),
+        "[1, 2]\n{k: ['on', 'a: b']}\nz\n"
+    );
+    assert_eq!(
+        String::from_utf8(stdout_of(&["get"], &file, &["/[1, 2]"])).unwrap(),
+        "a\n"
+    );
+    // The YAML writer quotes such a key: it is a string now, and reads back
+    // as the same key.
+    let yaml = stdout_of(&["-q", "-F", "yaml", "convert"], &file, &[]);
+    assert!(
+        yaml.starts_with(b"'[1, 2]': a\n"),
+        "{}",
+        String::from_utf8_lossy(&yaml)
+    );
+    let again = write_yaml(&yaml);
+    assert_eq!(
+        String::from_utf8(stdout_of(&["keys"], &again, &[""])).unwrap(),
+        "[1, 2]\n{k: ['on', 'a: b']}\nz\n"
+    );
+}
+
+#[test]
+fn a_collection_key_repeats_by_its_text() {
+    for (src, line) in [
+        (&b"[1, 2]: a\n[1, 2]: b\n"[..], 2),
+        (b"[1,2]: a\n[1, 2]: b\n", 2),
+        (b"[1, 2]: a\nx: 1\n'[1, 2]': b\n", 3),
+        (b"{a: 1, b: 2}: x\n{b: 2, a: 1}: y\n", 2),
+    ] {
+        let file = write_yaml(src);
+        let (code, stdout, stderr) = outcome_of(&["get"], &file, &[""]);
+        assert_eq!(code, Some(3), "{}", String::from_utf8_lossy(src));
+        assert_eq!(stdout, "");
+        assert!(
+            stderr.ends_with(&format!(
+                "duplicate entry in YAML map at line {line} column 1\n"
+            )),
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
+fn textual_edits_next_to_a_collection_key_keep_the_file() {
+    // Before: `path '/z' not found` (exit 2) for both.
+    let file = write_yaml(COLLECTION_KEYS);
+    assert_eq!(
+        String::from_utf8(stdout_of(&["set"], &file, &["/z", "2"])).unwrap(),
+        "# top\n[1, 2]: a  # one\n? {k: [on, 'a: b']}\n: b\nz: 2  # keep\n"
+    );
+    assert_eq!(
+        String::from_utf8(stdout_of(&["del"], &file, &["/z"])).unwrap(),
+        "# top\n[1, 2]: a  # one\n? {k: [on, 'a: b']}\n: b\n"
+    );
+    assert_eq!(
+        String::from_utf8(stdout_of(&["set"], &file, &["/[1, 2]", "x"])).unwrap(),
+        "# top\n[1, 2]: x  # one\n? {k: [on, 'a: b']}\n: b\nz: 1  # keep\n"
+    );
+}
+
+#[test]
+fn a_collection_key_quotes_strings_that_start_with_a_flow_indicator() {
+    // Before: `[?a, :x]`, which reads back as `[{a: null}, …]` or fails.
+    let file = write_yaml(b"? [\"?a\", \":x\", -x]\n: v\n");
+    assert_eq!(
+        String::from_utf8(stdout_of(&["keys"], &file, &[""])).unwrap(),
+        "['?a', ':x', -x]\n"
+    );
+    let yaml = stdout_of(&["-q", "-F", "yaml", "convert"], &file, &[]);
+    let again = write_yaml(&yaml);
+    assert_eq!(
+        String::from_utf8(stdout_of(&["keys"], &again, &[""])).unwrap(),
+        "['?a', ':x', -x]\n"
+    );
+}
+
+#[test]
+fn del_of_a_collection_key_in_a_flow_mapping_takes_its_entry() {
+    // Before: exit 7, "the edited document would not parse".
+    for (src, pointer, left) in [
+        (&b"{[1]: a, z: 1}\n"[..], "/[1]", "{z: 1}\n"),
+        (b"{z: 1, [1]: a}\n", "/[1]", "{z: 1}\n"),
+        (b"k: {[1]: a}\n", "/k/[1]", "k: {}\n"),
+        (b"k: {? [1] : a}\n", "/k/[1]", "k: {}\n"),
+        (b"{[1]: [2], z: 1}\n", "/[1]", "{z: 1}\n"),
+    ] {
+        let file = write_yaml(src);
+        assert_eq!(
+            String::from_utf8(stdout_of(&["del"], &file, &[pointer])).unwrap(),
+            left,
+            "{}",
+            String::from_utf8_lossy(src)
+        );
+    }
+}

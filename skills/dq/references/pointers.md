@@ -6,7 +6,7 @@
 |----------------|-------------------------|-------------------------------------------------------------|
 | `get`, `set`, `del`, `exists`, `keys`, `values`, `len`, `type` | JSON Pointer (RFC 6901) | A single addressable node. |
 | `select`       | JSONPath (RFC 9535)     | Multi-match queries with `[*]`, `[?(...)]`, recursive descent (`..`). |
-| `query`, `set --jq`, `fix` (`fix.jq`), rule `check.jq` | jq (jaq dialect)        | Transforms, conditionals, joins, programmable output shape.  |
+| `query`, `set --jq`, rule `check.jq`, `fix.ops`, `fix.jq` | jq (jaq dialect)        | Transforms, conditionals, joins, programmable output shape.  |
 
 `paths` lists every Pointer in a document; useful for "what can I address here?".
 
@@ -116,11 +116,10 @@ Document parses to:
 /children/1/type            → "paragraph"
 ```
 
-The frontmatter sits under `/frontmatter/value/<key>` — the `value` indirection is so `/frontmatter/kind` can tell you whether the frontmatter was YAML, TOML, or JSON. Body AST is queryable but **read-only**; writes only touch frontmatter.
+The frontmatter sits under `/frontmatter/value/<key>` — the `value` indirection is so `/frontmatter/kind` can tell you whether the frontmatter was YAML, TOML, or JSON. The whole document is queryable but **read-only**: `set` / `del` on a Markdown file exit 7, frontmatter included.
 
 ```bash
 dq get post.md /frontmatter/value/title
-dq set post.md /frontmatter/value/title "New Title" -i
 dq query '.children[] | select(.type == "heading") | .level' post.md
 ```
 
@@ -208,13 +207,17 @@ RUN apk add curl
 CMD ["sh"]
 ```
 ```
-/instructions/0/cmd  → "FROM"
-/instructions/0/args → ["alpine:3.18"]
-/instructions/1/cmd  → "RUN"
-/instructions/2/cmd  → "CMD"
+/0/instruction → "FROM"
+/0/arguments   → "alpine:3.18"
+/0/line        → 1
+/1/arguments   → "apk add curl"
+/2/arguments   → ["sh"]
 ```
 
-Read-only; no `set`/`del`.
+`arguments` is the text as written for the shell form (flags, joined continuations and heredoc
+bodies included), an array for the JSON form (`CMD ["sh"]`, `COPY ["a", "b"]`), and a map for
+`ENV` / `LABEL` / `ARG` (`ARG` without a default → `null`). `line` is the source line where the
+instruction starts. Read-only; no `set`/`del`.
 
 ### ignore-lists — flat array
 
@@ -252,9 +255,11 @@ dq select deploy.yaml '$.spec.containers[?(@.name == "app")].image'
 
 Output is a stream of matches. `-F json` gives an array of values; `-F toon` is compact.
 
+A filter compares numbers in `f64`: `.nan` / `.inf` are numbers (`[?@.n > 1]` matches `.inf`, never `.nan`), a NaN equals nothing, two infinities are not `==`, and integers past 2^53 compare approximately. For exact numeric tests use `query` (jq).
+
 ## jq (jaq dialect)
 
-Used by `dq query`, `dq set --jq`, rule `check.jq`, rule `fix.jq`.
+Used by `dq query`, `dq set --jq`, rule `check.jq`, rule `fix.ops` (which returns a JSON Patch) and rule `fix.jq`.
 
 The dialect is **jaq**, which implements `jq-core` + `jq-std` + `jq-json`. Standard `jq` filters work:
 

@@ -8,14 +8,15 @@ match:
   format: markdown
 check:
   jq: |
-    [.children[]? | select(.position != null)] as $bs
+    def kids: .children? | arrays | .[] | objects;
+    [kids | select(.position != null)] as $bs
     | range(1; $bs | length) as $i
-    | $bs[$i-1].position.end.line as $prev_end
-    | $bs[$i].position.start.line as $cur_start
+    | ($bs[$i-1].position | objects | .end | objects | .line | numbers) as $prev_end
+    | ($bs[$i].position | objects | .start | objects | .line | numbers) as $cur_start
     | select(($cur_start - $prev_end) > 2)
     | { gap: ($cur_start - $prev_end - 1), position: $bs[$i].position }
   message: "More than one blank line above this block ({{ .gap }} blank lines)"
 references:
   - https://commonmark.org/help/
 loc:
-  line: '.position.start.line // 1'
+  line: '(objects | .position | objects | .start | objects | .line) // 1'

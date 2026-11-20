@@ -472,17 +472,18 @@ fn set_over_a_block_collection_replaces_it_after_its_key() {
             serde_json::json!({"a": [1, 2], "b": [1, 2]}),
         ),
         // Comments inside the collection go with it, the comment lines
-        // before its first entry stay; the comment after it stays too.
+        // before its first entry too; the comment after it, shallower
+        // than its entries, stays.
         (
             "a:\n  # lead\n  x: 1 # one\n  # mid\n  y: 2\n# after\nb: 2\n",
             &["/a", "5"],
-            "a: 5\n  # lead\n# after\nb: 2\n",
+            "a: 5\n# after\nb: 2\n",
             serde_json::json!({"a": 5, "b": 2}),
         ),
         (
             "a:\n  x: 1 # one\n  y: [1, 2]\nb: 2\n",
             &["/a", "{\"q\": 1}"],
-            "a: {\"q\": 1}\nb: 2\n",
+            "a: {q: 1}\nb: 2\n",
             serde_json::json!({"a": {"q": 1}, "b": 2}),
         ),
         (
@@ -632,4 +633,800 @@ spec:
     // The `image` values, and the `name` of each container.
     assert_eq!(at("k8s.no-latest-tag"), [(17, 18), (20, 18)]);
     assert_eq!(at("k8s.missing-liveness-probe"), [(15, 17), (19, 17)]);
+}
+
+/// The stdout of `dq get doc.yaml <pointer>` with `bytes` as the file.
+fn get_back(bytes: &str, pointer: &str) -> String {
+    let dir = TempDir::new().expect("tempdir");
+    std::fs::write(dir.path().join("doc.yaml"), bytes).expect("write");
+    let out = dq()
+        .current_dir(dir.path())
+        .args(["--no-color", "get", "doc.yaml", pointer])
+        .assert()
+        .success();
+    String::from_utf8(out.get_output().stdout.clone()).expect("UTF-8 stdout")
+}
+
+/// Run each `(src, command, args, want, value)` case: the file becomes
+/// `want`, and reads back as `value`.
+fn check_read(cases: &[(&str, &str, &[&str], &str, serde_json::Value)]) {
+    for (src, command, args, want, value) in cases {
+        let out = in_place(src, command, args);
+        assert_eq!(out, *want, "{command} {args:?} on {src:?}");
+        assert_eq!(read_back(&out), *value, "{command} {args:?} on {src:?}");
+    }
+}
+
+#[test]
+fn del_of_an_explicit_key_without_a_value_keeps_the_keys_after_it() {
+    check_read(&[
+        (
+            "? k\n? j\n",
+            "del",
+            &["/k"],
+            "? j\n",
+            serde_json::json!({"j": null}),
+        ),
+        (
+            "? k\n? j\n? l\n",
+            "del",
+            &["/j"],
+            "? k\n? l\n",
+            serde_json::json!({"k": null, "l": null}),
+        ),
+        (
+            "? k\r\n? j\r\n",
+            "del",
+            &["/k"],
+            "? j\r\n",
+            serde_json::json!({"j": null}),
+        ),
+        (
+            "? k # c\n? j\n",
+            "del",
+            &["/k"],
+            "? j\n",
+            serde_json::json!({"j": null}),
+        ),
+        // The last one has no key after it to lose.
+        (
+            "? k\n? j\n",
+            "del",
+            &["/j"],
+            "? k\n",
+            serde_json::json!({"k": null}),
+        ),
+    ]);
+}
+
+#[test]
+fn set_over_a_tagged_collection_drops_a_core_tag_and_keeps_the_rest() {
+    let five = || serde_json::json!({"a": 5, "c": 2});
+    check_read(&[
+        (
+            "a: !!map\n  b: 1\nc: 2\n",
+            "set",
+            &["/a", "5"],
+            "a: 5\nc: 2\n",
+            five(),
+        ),
+        (
+            "a: !!map {b: 1}\nc: 2\n",
+            "set",
+            &["/a", "5"],
+            "a: 5\nc: 2\n",
+            five(),
+        ),
+        // The tag on a line of its own: the line goes.
+        (
+            "a:\n  !!map\n  b: 1\nc: 2\n",
+            "set",
+            &["/a", "5"],
+            "a: 5\nc: 2\n",
+            five(),
+        ),
+        (
+            "a: !!map # c\n  b: 1\nc: 2\n",
+            "set",
+            &["/a", "5"],
+            "a: 5 # c\nc: 2\n",
+            five(),
+        ),
+        (
+            "a: !!map\r\n  b: 1\r\nc: 2\r\n",
+            "set",
+            &["/a", "5"],
+            "a: 5\r\nc: 2\r\n",
+            five(),
+        ),
+        (
+            "a: !!map\n  b: 1\nc: 2\n",
+            "set",
+            &["/a", "[1]"],
+            "a: [1]\nc: 2\n",
+            serde_json::json!({"a": [1], "c": 2}),
+        ),
+        (
+            "a: !!seq\n  - 1\nc: 2\n",
+            "set",
+            &["/a", "5"],
+            "a: 5\nc: 2\n",
+            five(),
+        ),
+        (
+            "a: !!seq\n- 1\nc: 2\n",
+            "set",
+            &["/a", "5"],
+            "a: 5\nc: 2\n",
+            five(),
+        ),
+        (
+            "a: !!seq [1]\nc: 2\n",
+            "set",
+            &["/a", "5"],
+            "a: 5\nc: 2\n",
+            five(),
+        ),
+        (
+            "l:\n  - !!map\n    b: 1\n  - 2\n",
+            "set",
+            &["/l/0", "5"],
+            "l:\n  - 5\n  - 2\n",
+            serde_json::json!({"l": [5, 2]}),
+        ),
+        (
+            "l:\n  - !!seq [1]\n  - 2\n",
+            "set",
+            &["/l/0", "5"],
+            "l:\n  - 5\n  - 2\n",
+            serde_json::json!({"l": [5, 2]}),
+        ),
+        // The anchor stays, before the value, whichever came first; the
+        // aliases follow the new value.
+        (
+            "a: &x !!map\n  b: 1\n",
+            "set",
+            &["/a", "5"],
+            "a: &x 5\n",
+            serde_json::json!({"a": 5}),
+        ),
+        (
+            "a: !!map &x\n  b: 1\n",
+            "set",
+            &["/a", "5"],
+            "a: &x 5\n",
+            serde_json::json!({"a": 5}),
+        ),
+        (
+            "a: &x !!map\n  b: 1\nc: *x\n",
+            "set",
+            &["/a", "5"],
+            "a: &x 5\nc: *x\n",
+            serde_json::json!({"a": 5, "c": 5}),
+        ),
+        (
+            "a: &x !!seq [1]\nb: *x\n",
+            "set",
+            &["/a", "5"],
+            "a: &x 5\nb: *x\n",
+            serde_json::json!({"a": 5, "b": 5}),
+        ),
+        // A local tag is not the core schema's: it stays on the new value.
+        (
+            "a: !Foo\n  b: 1\nc: 2\n",
+            "set",
+            &["/a", "5"],
+            "a: !Foo 5\nc: 2\n",
+            five(),
+        ),
+        (
+            "a: !Foo {b: 1}\nc: 2\n",
+            "set",
+            &["/a", "5"],
+            "a: !Foo 5\nc: 2\n",
+            five(),
+        ),
+        (
+            "a: !Foo\n  - 1\nc: 2\n",
+            "set",
+            &["/a", "5"],
+            "a: !Foo 5\nc: 2\n",
+            five(),
+        ),
+        // An edit inside the collection keeps its tag.
+        (
+            "a: !!map\n  b: 1\nc: 2\n",
+            "del",
+            &["/a/b"],
+            "a: !!map {}\nc: 2\n",
+            serde_json::json!({"a": {}, "c": 2}),
+        ),
+    ]);
+    assert_eq!(get_back("a: &x 5\nc: *x\n", "/c"), "5\n");
+}
+
+#[test]
+fn set_over_a_block_collection_takes_the_comment_lines_inside_it() {
+    check_read(&[
+        (
+            "a:\n  # note\n  b: 1\n  c: 2\nd: 3\n",
+            "set",
+            &["/a", "5"],
+            "a: 5\nd: 3\n",
+            serde_json::json!({"a": 5, "d": 3}),
+        ),
+        (
+            "a:\n  # note\n  b: 1\n  c: 2\nd: 3\n",
+            "set",
+            &["/a", "{\"z\":3}"],
+            "a: {z: 3}\nd: 3\n",
+            serde_json::json!({"a": {"z": 3}, "d": 3}),
+        ),
+        // After its last entry, as deep as its entries: inside it.
+        (
+            "a:\n  b: 1\n  # tail\n# keep\nd: 3\n",
+            "set",
+            &["/a", "5"],
+            "a: 5\n# keep\nd: 3\n",
+            serde_json::json!({"a": 5, "d": 3}),
+        ),
+        // Blank lines between such comments go; the ones after them stay.
+        (
+            "a:\n  b: 1\n\n  # tail\nd: 3\n",
+            "set",
+            &["/a", "5"],
+            "a: 5\nd: 3\n",
+            serde_json::json!({"a": 5, "d": 3}),
+        ),
+        (
+            "a:\n  b: 1\n  # tail\n\nd: 3\n",
+            "set",
+            &["/a", "5"],
+            "a: 5\n\nd: 3\n",
+            serde_json::json!({"a": 5, "d": 3}),
+        ),
+        // A shallower comment is the parent's: it stays.
+        (
+            "a:\n  b: 1\n# keep\nd: 3\n",
+            "set",
+            &["/a", "5"],
+            "a: 5\n# keep\nd: 3\n",
+            serde_json::json!({"a": 5, "d": 3}),
+        ),
+        (
+            "a:\n  b:\n    c: 1\n    # deep\n  # mid\n# top\nd: 3\n",
+            "set",
+            &["/a/b", "5"],
+            "a:\n  b: 5\n  # mid\n# top\nd: 3\n",
+            serde_json::json!({"a": {"b": 5}, "d": 3}),
+        ),
+        (
+            "l:\n  - a: 1\n    # in\n  # tail\nz: 1\n",
+            "set",
+            &["/l", "5"],
+            "l: 5\nz: 1\n",
+            serde_json::json!({"l": 5, "z": 1}),
+        ),
+        // An indentless sequence has its `-` at its key's column: a comment
+        // there may as well be the parent's and stays; a deeper one goes.
+        (
+            "a:\n- 1\n# c\nb: 2\n",
+            "set",
+            &["/a", "5"],
+            "a: 5\n# c\nb: 2\n",
+            serde_json::json!({"a": 5, "b": 2}),
+        ),
+        (
+            "a:\n- 1\n  # c\nb: 2\n",
+            "set",
+            &["/a", "5"],
+            "a: 5\nb: 2\n",
+            serde_json::json!({"a": 5, "b": 2}),
+        ),
+    ]);
+    assert_eq!(get_back("a: 5\n# keep\nd: 3\n", "/a"), "5\n");
+}
+
+#[test]
+fn del_of_a_block_collection_takes_the_comment_lines_inside_it() {
+    check_read(&[
+        (
+            "a:\n  # note\n  b: 1\n  c: 2\nd: 3\n",
+            "del",
+            &["/a"],
+            "d: 3\n",
+            serde_json::json!({"d": 3}),
+        ),
+        (
+            "a:\n  b: 1\n  # tail\n\n  # tail2\n# keep\nd: 3\n",
+            "del",
+            &["/a"],
+            "# keep\nd: 3\n",
+            serde_json::json!({"d": 3}),
+        ),
+        (
+            "x: 0\na:\n  b: 1\n  # tail\n",
+            "del",
+            &["/a"],
+            "x: 0\n",
+            serde_json::json!({"x": 0}),
+        ),
+        // A shallower comment stays.
+        (
+            "a:\n  b: 1\n# keep\nd: 3\n",
+            "del",
+            &["/a"],
+            "# keep\nd: 3\n",
+            serde_json::json!({"d": 3}),
+        ),
+        (
+            "a:\n- 1\n# c\nb: 2\n",
+            "del",
+            &["/a"],
+            "# c\nb: 2\n",
+            serde_json::json!({"b": 2}),
+        ),
+    ]);
+}
+
+#[test]
+fn del_of_a_compact_first_key_before_an_empty_key() {
+    check_read(&[
+        (
+            "- a: 1\n  \"\": 2\n- b: 3\n",
+            "del",
+            &["/0/a"],
+            "- \"\": 2\n- b: 3\n",
+            serde_json::json!([{"": 2}, {"b": 3}]),
+        ),
+        (
+            "- a: 1\n  \"\": 2\n  c: 4\n",
+            "del",
+            &["/0/a"],
+            "- \"\": 2\n  c: 4\n",
+            serde_json::json!([{"": 2, "c": 4}]),
+        ),
+        (
+            "- a: 1\n  '': 2\n- b: 3\n",
+            "del",
+            &["/0/a"],
+            "- '': 2\n- b: 3\n",
+            serde_json::json!([{"": 2}, {"b": 3}]),
+        ),
+        (
+            "l:\n  - a: 1\n    \"\": 2\n  - b: 3\n",
+            "del",
+            &["/l/0/a"],
+            "l:\n  - \"\": 2\n  - b: 3\n",
+            serde_json::json!({"l": [{"": 2}, {"b": 3}]}),
+        ),
+        // A named key after it, as before.
+        (
+            "- a: 1\n  c: 4\n- b: 3\n",
+            "del",
+            &["/0/a"],
+            "- c: 4\n- b: 3\n",
+            serde_json::json!([{"c": 4}, {"b": 3}]),
+        ),
+    ]);
+}
+
+#[test]
+fn set_of_negative_zero_keeps_its_sign() {
+    let out = in_place("x: 0.0\n", "set", &["/x", "--", "-0.0"]);
+    assert_eq!(out, "x: -0.0\n");
+    assert_eq!(get_back(&out, "/x"), "-0.0\n");
+    let out = in_place("x: 1\n", "set", &["/y", "--", "-0.0"]);
+    assert_eq!(out, "x: 1\n\"y\": -0.0\n");
+    assert_eq!(get_back(&out, "/y"), "-0.0\n");
+}
+
+#[test]
+fn set_drops_a_core_tag_however_it_is_spelled() {
+    let hello = || serde_json::json!({"a": "hello", "c": 2});
+    check_read(&[
+        // Verbatim.
+        (
+            "a: !<tag:yaml.org,2002:map> {b: 1}\nc: 2\n",
+            "set",
+            &["/a", "hello"],
+            "a: hello\nc: 2\n",
+            hello(),
+        ),
+        (
+            "a: !<tag:yaml.org,2002:map>\n  b: 1\nc: 2\n",
+            "set",
+            &["/a", "hello"],
+            "a: hello\nc: 2\n",
+            hello(),
+        ),
+        (
+            "a: !<tag:yaml.org,2002:seq> [1]\nc: 2\n",
+            "set",
+            &["/a", "hello"],
+            "a: hello\nc: 2\n",
+            hello(),
+        ),
+        // A `%TAG` handle bound to the core prefix.
+        (
+            "%TAG !e! tag:yaml.org,2002:\n---\na: !e!map {b: 1}\n",
+            "set",
+            &["/a", "hello"],
+            "%TAG !e! tag:yaml.org,2002:\n---\na: hello\n",
+            serde_json::json!({"a": "hello"}),
+        ),
+        // The non-specific `!` makes a scalar a string, which `7` is not.
+        (
+            "a: ! 5\nc: 2\n",
+            "set",
+            &["/a", "7"],
+            "a: 7\nc: 2\n",
+            serde_json::json!({"a": 7, "c": 2}),
+        ),
+        (
+            "a: &x ! 5\nc: *x\n",
+            "set",
+            &["/a", "7"],
+            "a: &x 7\nc: *x\n",
+            serde_json::json!({"a": 7, "c": 7}),
+        ),
+        (
+            "a: !\nc: 2\n",
+            "set",
+            &["/a", "7"],
+            "a: 7\nc: 2\n",
+            serde_json::json!({"a": 7, "c": 2}),
+        ),
+        // Tags outside the core schema stay.
+        (
+            "a: !<tag:example.com,2000:x> {b: 1}\nc: 2\n",
+            "set",
+            &["/a", "hello"],
+            "a: !<tag:example.com,2000:x> hello\nc: 2\n",
+            hello(),
+        ),
+        (
+            "%TAG !e! tag:example.com,2000:\n---\na: !e!x {b: 1}\n",
+            "set",
+            &["/a", "hello"],
+            "%TAG !e! tag:example.com,2000:\n---\na: !e!x hello\n",
+            serde_json::json!({"a": "hello"}),
+        ),
+        // The `%TAG` of the document the node is in binds the handle.
+        (
+            "%TAG !e! tag:example.com,2000:\n---\na: 1\n...\n\
+             %TAG !e! tag:yaml.org,2002:\n---\nb: !e!map {c: 1}\n",
+            "set",
+            &["/1/b", "hello"],
+            "%TAG !e! tag:example.com,2000:\n---\na: 1\n...\n\
+             %TAG !e! tag:yaml.org,2002:\n---\nb: hello\n",
+            serde_json::json!([{"a": 1}, {"b": "hello"}]),
+        ),
+    ]);
+    assert_eq!(get_back("a: hello\nc: 2\n", "/a"), "hello\n");
+}
+
+#[test]
+fn set_keeps_a_tag_whose_handle_another_document_binds_to_the_core_prefix() {
+    check_read(&[(
+        "%TAG !e! tag:yaml.org,2002:\n---\na: 1\n...\n\
+         %TAG !e! tag:example.com,2000:\n---\nb: !e!x {c: 1}\n",
+        "set",
+        &["/1/b", "hello"],
+        "%TAG !e! tag:yaml.org,2002:\n---\na: 1\n...\n\
+         %TAG !e! tag:example.com,2000:\n---\nb: !e!x hello\n",
+        serde_json::json!([{"a": 1}, {"b": "hello"}]),
+    )]);
+}
+
+#[test]
+fn del_of_a_compact_first_key_takes_the_comment_lines_inside_its_value() {
+    check_read(&[
+        (
+            "- a:\n    b: 1\n    # c\n  d: 2\n",
+            "del",
+            &["/0/a"],
+            "- d: 2\n",
+            serde_json::json!([{"d": 2}]),
+        ),
+        (
+            "- a:\n    # in\n    b: 1\n  d: 2\n",
+            "del",
+            &["/0/a"],
+            "- d: 2\n",
+            serde_json::json!([{"d": 2}]),
+        ),
+        (
+            "l:\n  - a:\n      b: 1\n      # c\n    d: 2\n",
+            "del",
+            &["/l/0/a"],
+            "l:\n  - d: 2\n",
+            serde_json::json!({"l": [{"d": 2}]}),
+        ),
+        // The only key: the item is left empty.
+        (
+            "- a:\n    b: 1\n    # c\n- z: 1\n",
+            "del",
+            &["/0/a"],
+            "- {}\n- z: 1\n",
+            serde_json::json!([{}, {"z": 1}]),
+        ),
+        // A comment at the column of the item's keys is the item's: it
+        // stays, after the `-`.
+        (
+            "- a:\n    b: 1\n  # c\n  d: 2\n",
+            "del",
+            &["/0/a"],
+            "- # c\n  d: 2\n",
+            serde_json::json!([{"d": 2}]),
+        ),
+    ]);
+}
+
+#[test]
+fn del_at_the_top_of_the_file_leaves_no_blank_line_first() {
+    check_read(&[
+        (
+            "a:\n  b: 1\n  # tail\n\nd: 3\n",
+            "del",
+            &["/a"],
+            "d: 3\n",
+            serde_json::json!({"d": 3}),
+        ),
+        (
+            "a: 1\n\nd: 3\n",
+            "del",
+            &["/a"],
+            "d: 3\n",
+            serde_json::json!({"d": 3}),
+        ),
+        (
+            "a: 1\n\n\nd: 3\n",
+            "del",
+            &["/a"],
+            "d: 3\n",
+            serde_json::json!({"d": 3}),
+        ),
+        (
+            "a: 1\r\n\r\nd: 3\r\n",
+            "del",
+            &["/a"],
+            "d: 3\r\n",
+            serde_json::json!({"d": 3}),
+        ),
+        (
+            "\u{feff}a: 1\n\nd: 3\n",
+            "del",
+            &["/a"],
+            "\u{feff}d: 3\n",
+            serde_json::json!({"d": 3}),
+        ),
+        (
+            "c: !!str\n\nd: 1\n",
+            "del",
+            &["/c"],
+            "d: 1\n",
+            serde_json::json!({"d": 1}),
+        ),
+        // Not at the top: the blank line stays between what is left.
+        (
+            "x: 0\na: 1\n\nd: 3\n",
+            "del",
+            &["/a"],
+            "x: 0\n\nd: 3\n",
+            serde_json::json!({"x": 0, "d": 3}),
+        ),
+        (
+            "# top\na: 1\n\nd: 3\n",
+            "del",
+            &["/a"],
+            "# top\n\nd: 3\n",
+            serde_json::json!({"d": 3}),
+        ),
+        // Nothing after the blank lines: they stay after the `{}`.
+        ("a: 1\n\n", "del", &["/a"], "{}\n\n", serde_json::json!({})),
+        (
+            "c: !!str\n\n",
+            "del",
+            &["/c"],
+            "{}\n\n",
+            serde_json::json!({}),
+        ),
+    ]);
+}
+
+#[test]
+fn comment_lines_count_their_columns_past_a_byte_order_mark() {
+    check_read(&[
+        (
+            "\u{feff}a:\n  b: 1\n  # c\nd: 2\n",
+            "del",
+            &["/a"],
+            "\u{feff}d: 2\n",
+            serde_json::json!({"d": 2}),
+        ),
+        (
+            "\u{feff}a:\n  b: 1\n  # c\nd: 2\n",
+            "set",
+            &["/a", "5"],
+            "\u{feff}a: 5\nd: 2\n",
+            serde_json::json!({"a": 5, "d": 2}),
+        ),
+        (
+            "\u{feff}- a:\n    b: 1\n    # c\n  d: 2\n",
+            "del",
+            &["/0/a"],
+            "\u{feff}- d: 2\n",
+            serde_json::json!([{"d": 2}]),
+        ),
+        (
+            "\u{feff}a:\r\n  b: 1\r\n  # c\r\nd: 2\r\n",
+            "del",
+            &["/a"],
+            "\u{feff}d: 2\r\n",
+            serde_json::json!({"d": 2}),
+        ),
+        (
+            "\u{feff}a:\r\n  b: 1\r\n  # c\r\nd: 2\r\n",
+            "set",
+            &["/a", "5"],
+            "\u{feff}a: 5\r\nd: 2\r\n",
+            serde_json::json!({"a": 5, "d": 2}),
+        ),
+        (
+            "\u{feff}- a:\r\n    b: 1\r\n    # c\r\n  d: 2\r\n",
+            "del",
+            &["/0/a"],
+            "\u{feff}- d: 2\r\n",
+            serde_json::json!([{"d": 2}]),
+        ),
+        // A shallower comment stays, as without the mark.
+        (
+            "\u{feff}a:\n  b: 1\n# c\nd: 2\n",
+            "set",
+            &["/a", "5"],
+            "\u{feff}a: 5\n# c\nd: 2\n",
+            serde_json::json!({"a": 5, "d": 2}),
+        ),
+        (
+            "\u{feff}a:\n- 1\n# c\nb: 2\n",
+            "set",
+            &["/a", "5"],
+            "\u{feff}a: 5\n# c\nb: 2\n",
+            serde_json::json!({"a": 5, "b": 2}),
+        ),
+    ]);
+}
+
+#[test]
+fn a_tag_directive_binds_its_handle_for_its_own_document() {
+    check_read(&[
+        // `!e!` is the core prefix in the second document only.
+        (
+            "%TAG !e! tag:example.com,2000:\n---\na: !e!map {c: 1}\n...\n\
+             %TAG !e! tag:yaml.org,2002:\n---\nb: 1\n",
+            "set",
+            &["/0/a", "hello"],
+            "%TAG !e! tag:example.com,2000:\n---\na: !e!map hello\n...\n\
+             %TAG !e! tag:yaml.org,2002:\n---\nb: 1\n",
+            serde_json::json!([{"a": "hello"}, {"b": 1}]),
+        ),
+        // The primary handle bound to the core prefix.
+        (
+            "%TAG ! tag:yaml.org,2002:\n---\na: !map {c: 1}\n",
+            "set",
+            &["/a", "hello"],
+            "%TAG ! tag:yaml.org,2002:\n---\na: hello\n",
+            serde_json::json!({"a": "hello"}),
+        ),
+        // `!!` bound elsewhere: `!!str` is not the core `str`, and stays.
+        (
+            "%TAG !! tag:x,1:\n---\na: !!str {c: 1}\nb: 2\n",
+            "set",
+            &["/a", "hello"],
+            "%TAG !! tag:x,1:\n---\na: !!str hello\nb: 2\n",
+            serde_json::json!({"a": "hello", "b": 2}),
+        ),
+        (
+            "%TAG !! tag:x,1:\r\n---\r\na: !!str {c: 1}\r\n",
+            "set",
+            &["/a", "hello"],
+            "%TAG !! tag:x,1:\r\n---\r\na: !!str hello\r\n",
+            serde_json::json!({"a": "hello"}),
+        ),
+        // ...for the one document after it: in the next, `!!` is core again.
+        (
+            "%TAG !! tag:x,1:\n---\na: 1\n---\nb: !!map {c: 1}\n",
+            "set",
+            &["/1/b", "7"],
+            "%TAG !! tag:x,1:\n---\na: 1\n---\nb: 7\n",
+            serde_json::json!([{"a": 1}, {"b": 7}]),
+        ),
+        // A rebound `!!str` is an application's tag: dq reads the scalar
+        // under it as untagged, as under `!foo`, so a kept tag over a
+        // number reads back as the number.
+        (
+            "%TAG !! tag:x,1:\n---\na: !!str 5\nb: 2\n",
+            "set",
+            &["/a", "7"],
+            "%TAG !! tag:x,1:\n---\na: !!str 7\nb: 2\n",
+            serde_json::json!({"a": 7, "b": 2}),
+        ),
+        (
+            "%TAG !! tag:x,1:\n---\na: !!map\n  c: 1\nb: 2\n",
+            "set",
+            &["/a", "7"],
+            "%TAG !! tag:x,1:\n---\na: !!map 7\nb: 2\n",
+            serde_json::json!({"a": 7, "b": 2}),
+        ),
+    ]);
+}
+
+#[test]
+fn a_tag_on_the_document_start_line() {
+    check_read(&[
+        // Edits inside the root collection keep its tag: it stays a map.
+        (
+            "--- !!map {a: 1}\n",
+            "set",
+            &["/a", "5"],
+            "--- !!map {a: 5}\n",
+            serde_json::json!({"a": 5}),
+        ),
+        (
+            "--- !!map {a: 1}\n",
+            "del",
+            &["/a"],
+            "--- !!map {}\n",
+            serde_json::json!({}),
+        ),
+        (
+            "--- !!map\na: 1\n",
+            "set",
+            &["/b", "2"],
+            "--- !!map\na: 1\nb: 2\n",
+            serde_json::json!({"a": 1, "b": 2}),
+        ),
+        // A document of a stream is written anew as a whole: a tag that
+        // no longer fits its value goes, one that does stays.
+        (
+            "--- !!map {a: 1}\n--- !!map {b: 1}\n",
+            "set",
+            &["/1", "5"],
+            "--- !!map {a: 1}\n---\n5\n",
+            serde_json::json!([{"a": 1}, 5]),
+        ),
+        (
+            "--- !!map\na: 1\n--- !!map\nb: 1\n",
+            "set",
+            &["/1", "{\"c\": 2}"],
+            "--- !!map\na: 1\n--- !!map\nc: 2\n",
+            serde_json::json!([{"a": 1}, {"c": 2}]),
+        ),
+        (
+            "--- {a: 1}\n--- {b: 1}\n",
+            "set",
+            &["/1", "5"],
+            "--- {a: 1}\n---\n5\n",
+            serde_json::json!([{"a": 1}, 5]),
+        ),
+    ]);
+}
+
+#[test]
+fn set_in_an_empty_file_writes_the_first_key() {
+    for (src, args, want) in [
+        ("", &["/a", "1"][..], "a: 1\n"),
+        ("", &["", "{\"a\": 1}"][..], "a: 1\n"),
+        (
+            "# only a comment\n",
+            &["/a", "1"][..],
+            "# only a comment\na: 1\n",
+        ),
+        ("---\n", &["/a", "1"][..], "---\na: 1\n"),
+    ] {
+        let out = in_place(src, "set", args);
+        assert_eq!(out, want, "set {args:?} on {src:?}");
+        assert_eq!(read_back(&out), serde_json::json!({"a": 1}));
+    }
 }

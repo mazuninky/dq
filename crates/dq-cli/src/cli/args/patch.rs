@@ -6,7 +6,7 @@ use clap::Args;
 /// Arguments for `dq patch`.
 #[derive(Debug, Args, Clone)]
 pub struct PatchArgs {
-    /// File (or glob pattern) to mutate. Format is detected from extension or `-F`.
+    /// File (or glob pattern) to mutate. Format is detected from the extension or `--input-format`.
     #[arg(value_parser = clap::value_parser!(Utf8PathBuf))]
     pub file: Utf8PathBuf,
 
@@ -24,8 +24,8 @@ pub struct PatchArgs {
     #[arg(long = "line-format")]
     pub line_format: bool,
 
-    /// Reject the operation if any intermediate node along an `add`/`replace`
-    /// pointer is missing. Equivalent to set's `--no-create`.
+    /// Accepted for symmetry with `set --no-create`; changes nothing here:
+    /// `patch` follows RFC 6902 and never creates missing parents.
     #[arg(long = "no-create")]
     pub no_create: bool,
 }

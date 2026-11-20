@@ -1,12 +1,12 @@
 # Spike fixtures — sources
 
 All five fixtures are **original**, hand-written for the saphyr round-trip
-spike (Task 1.1 of [add-safe-writes](../../openspec/changes/add-safe-writes/tasks.md)).
+spike (task 1.1 of the add-safe-writes change; see [docs/decisions.md](../../docs/decisions.md#2026-05-03--safe-writes-add-safe-writes)).
 They are not copied from external projects, so no upstream URL or commit
 hash is needed; license is the same as the surrounding repository.
 
 The intent of each fixture mirrors the D11 design criteria
-([design.md](../../openspec/changes/add-safe-writes/design.md)):
+(recorded in [docs/decisions.md](../../docs/decisions.md#2026-05-03--safe-writes-add-safe-writes)):
 
 | File | Purpose | Round-trip features exercised |
 |------|---------|--------------------------------|

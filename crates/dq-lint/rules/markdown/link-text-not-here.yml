@@ -8,9 +8,11 @@ match:
   format: markdown
 check:
   jq: |
+    def kids: .children? | arrays | .[] | objects;
+    def text: [recurse(kids) | select(.type == "text") | .value | strings] | join("");
     [.. | objects | select(.type? == "link")][]
     | . as $l
-    | ([$l | recurse(.children?[]?) | select(.type == "text") | .value] | join("") | gsub("^\\s+|\\s+$"; "") | ascii_downcase)
+    | ($l | text | gsub("^\\s+|\\s+$"; "") | ascii_downcase)
     | select(. == "click here" or . == "this page" or . == "this link" or . == "here" or . == "this")
     | { text: ., url: $l.url }
   message: "Link text '{{ .text }}' is generic; describe the target instead"

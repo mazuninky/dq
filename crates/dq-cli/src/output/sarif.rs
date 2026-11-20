@@ -1,11 +1,14 @@
 //! SARIF 2.1.0 output reporter.
 //!
-//! Per design D4 in `openspec/changes/add-distribution/design.md`, the
+//! Per the add-distribution section of `docs/decisions.md`, the
 //! reporter expects an input value shaped as `{ "diagnostics": [...] }`
-//! where each diagnostic carries `path`, `line`, `col`, `message`, and
-//! `severity`. M6 ships exactly one consumer — the `validate` handler —
-//! and M8's lint engine reuses the same shape so the two producers don't
-//! diverge.
+//! where each diagnostic carries `path`, `line`, `col`, `message`,
+//! `severity` and `rule_id`. M6 ships exactly one consumer — the `validate`
+//! handler — and M8's lint engine reuses the same shape so the two
+//! producers don't diverge. Next to `diagnostics` the envelope may carry
+//! the rule catalogue the reporter asks for through
+//! [`Reporter::wants_rule_catalog`]: `"rules": [{ "id", "description",
+//! "references" }]`.
 //!
 //! Anything else (a top-level array, a scalar, an object missing the
 //! `diagnostics` field) errors with [`crate::error::InvalidInput`] so the
@@ -19,9 +22,19 @@
 //!   "$schema": "https://schemastore.azurewebsites.net/schemas/json/sarif-2.1.0-rtm.5.json",
 //!   "version": "2.1.0",
 //!   "runs": [{
-//!     "tool": { "driver": { "name": "dq", "version": "X.Y.Z", "informationUri": "https://github.com/mazuninky/dq" } },
+//!     "tool": { "driver": {
+//!       "name": "dq", "version": "X.Y.Z", "informationUri": "https://github.com/mazuninky/dq",
+//!       "rules": [{
+//!         "id": "k8s.no-latest-tag",
+//!         "shortDescription": { "text": "..." },
+//!         "fullDescription": { "text": "..." },
+//!         "helpUri": "https://..."
+//!       }]
+//!     } },
 //!     "results": [
 //!       {
+//!         "ruleId": "k8s.no-latest-tag",
+//!         "ruleIndex": 0,
 //!         "level": "error",
 //!         "message": { "text": "..." },
 //!         "locations": [{ "physicalLocation": {
@@ -38,8 +51,29 @@
 //! `"warning"`, `"info"` / `"note"` → `"note"`. Anything else collapses to
 //! `"warning"` so an unknown severity from a future producer never lands as
 //! the more dangerous `"error"`.
+//!
+//! # Rules
+//!
+//! A result's `ruleId` is its diagnostic's `rule_id` — the rule's `id:`
+//! (`k8s.no-latest-tag`), a plugin's id, `<outer>.parse-failed`, or
+//! `validate.parse` — and `ruleIndex` points at its descriptor in
+//! `tool.driver.rules`. That array describes each rule the results name,
+//! once, in order of first appearance; a run without results has an empty
+//! one. A descriptor takes from the catalogue entry with the same id:
+//!
+//! - `shortDescription` — the first sentence of the description's first
+//!   paragraph, its lines joined with spaces;
+//! - `fullDescription` — the whole description, trimmed, when it says more
+//!   than the short one;
+//! - `helpUri` — the first reference that is an `http://` / `https://` URL.
+//!
+//! A rule without a catalogue entry (a plugin's, a composite's
+//! `parse-failed`) is described by its `id` alone. A diagnostic without a
+//! `rule_id` gets neither `ruleId` nor `ruleIndex`; no producer emits one.
 
 use std::io::Write;
+
+use indexmap::IndexSet;
 
 use crate::error::InvalidInput;
 use crate::output::Reporter;
@@ -59,21 +93,53 @@ impl Reporter for SarifReporter {
                      selecting `-F sarif` is only valid for `validate` and the M8+ lint commands",
                 ))
             })?;
-        let sarif = build_sarif(diagnostics);
+        let catalog = value
+            .get("rules")
+            .and_then(|v| v.as_array())
+            .map_or(&[][..], Vec::as_slice);
+        let sarif = build_sarif(diagnostics, catalog);
         serde_json::to_writer_pretty(&mut *w, &sarif)?;
         w.write_all(b"\n")?;
         Ok(())
     }
+
+    fn wants_rule_catalog(&self) -> bool {
+        true
+    }
 }
 
 /// Build a SARIF 2.1.0 `serde_json::Value` from a slice of diagnostic
-/// values, each shaped as `{ path, line, col, message, severity }`.
+/// values, each shaped as `{ path, line, col, message, severity, rule_id }`,
+/// and the rule catalogue `[{ id, description, references }]` the
+/// `tool.driver.rules` descriptors are drawn from (see the module docs).
 ///
 /// Pulled out of the `Reporter::report` impl so unit tests can exercise the
 /// shape conversion without going through a `&mut dyn Write`.
 #[must_use]
-pub fn build_sarif(diagnostics: &[serde_json::Value]) -> serde_json::Value {
-    let results: Vec<serde_json::Value> = diagnostics.iter().map(diagnostic_to_result).collect();
+pub fn build_sarif(
+    diagnostics: &[serde_json::Value],
+    catalog: &[serde_json::Value],
+) -> serde_json::Value {
+    // The rule ids the results name, in order of first use; a rule's
+    // position here is its `ruleIndex`.
+    let mut rule_ids: IndexSet<&str> = IndexSet::new();
+    let results: Vec<serde_json::Value> = diagnostics
+        .iter()
+        .map(|d| {
+            let mut result = serde_json::Map::new();
+            if let Some(id) = d.get("rule_id").and_then(|s| s.as_str()) {
+                let (index, _) = rule_ids.insert_full(id);
+                result.insert("ruleId".to_owned(), serde_json::Value::from(id));
+                result.insert("ruleIndex".to_owned(), serde_json::Value::from(index));
+            }
+            result.extend(diagnostic_to_result(d));
+            serde_json::Value::Object(result)
+        })
+        .collect();
+    let rules: Vec<serde_json::Value> = rule_ids
+        .iter()
+        .map(|id| rule_descriptor(id, catalog))
+        .collect();
     serde_json::json!({
         "$schema": "https://schemastore.azurewebsites.net/schemas/json/sarif-2.1.0-rtm.5.json",
         "version": "2.1.0",
@@ -83,6 +149,7 @@ pub fn build_sarif(diagnostics: &[serde_json::Value]) -> serde_json::Value {
                     "name": "dq",
                     "version": env!("CARGO_PKG_VERSION"),
                     "informationUri": "https://github.com/mazuninky/dq",
+                    "rules": rules,
                 }
             },
             "results": results,
@@ -90,7 +157,80 @@ pub fn build_sarif(diagnostics: &[serde_json::Value]) -> serde_json::Value {
     })
 }
 
-fn diagnostic_to_result(d: &serde_json::Value) -> serde_json::Value {
+/// The `reportingDescriptor` of rule `id`, described from the first
+/// catalogue entry with that id; by `id` alone when there is none.
+fn rule_descriptor(id: &str, catalog: &[serde_json::Value]) -> serde_json::Value {
+    let mut descriptor = serde_json::Map::new();
+    descriptor.insert("id".to_owned(), serde_json::Value::from(id));
+    let Some(entry) = catalog
+        .iter()
+        .find(|e| e.get("id").and_then(|v| v.as_str()) == Some(id))
+    else {
+        return serde_json::Value::Object(descriptor);
+    };
+    let description = entry
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim();
+    let short = first_sentence(description);
+    if !short.is_empty() {
+        descriptor.insert("shortDescription".to_owned(), text_message(&short));
+        if short != collapse_whitespace(description) {
+            descriptor.insert("fullDescription".to_owned(), text_message(description));
+        }
+    }
+    let help_uri = entry
+        .get("references")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|r| r.as_str())
+        .find(|r| r.starts_with("https://") || r.starts_with("http://"));
+    if let Some(uri) = help_uri {
+        descriptor.insert("helpUri".to_owned(), serde_json::Value::from(uri));
+    }
+    serde_json::Value::Object(descriptor)
+}
+
+/// A SARIF `multiformatMessageString` holding plain `text`.
+fn text_message(text: &str) -> serde_json::Value {
+    serde_json::json!({ "text": text })
+}
+
+/// The first sentence of the first paragraph of `description`, its lines
+/// joined with single spaces.
+///
+/// A sentence ends at `.`, `!` or `?` followed by whitespace and an
+/// upper-case letter, so `e.g. via` and `1.22+` do not end one; without
+/// such an end the whole paragraph is the sentence.
+fn first_sentence(description: &str) -> String {
+    let paragraph = description
+        .split("\n\n")
+        .map(str::trim)
+        .find(|p| !p.is_empty())
+        .unwrap_or_default();
+    let joined = collapse_whitespace(paragraph);
+    let chars: Vec<(usize, char)> = joined.char_indices().collect();
+    for window in chars.windows(3) {
+        let [(at, end), (_, space), (_, next)] = window else {
+            continue;
+        };
+        if matches!(end, '.' | '!' | '?') && *space == ' ' && next.is_uppercase() {
+            return joined[..at + end.len_utf8()].to_owned();
+        }
+    }
+    joined
+}
+
+/// `text` with every run of whitespace, line breaks included, made one
+/// space.
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The `level`, `message` and `locations` of the result for `d`.
+fn diagnostic_to_result(d: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
     let level = map_severity(d.get("severity").and_then(|s| s.as_str()));
     let message = d
         .get("message")
@@ -116,10 +256,12 @@ fn diagnostic_to_result(d: &serde_json::Value) -> serde_json::Value {
         .filter(|n| *n > 0)
         .unwrap_or(1);
 
-    serde_json::json!({
-        "level": level,
-        "message": { "text": message },
-        "locations": [{
+    let mut result = serde_json::Map::new();
+    result.insert("level".to_owned(), serde_json::Value::from(level));
+    result.insert("message".to_owned(), text_message(&message));
+    result.insert(
+        "locations".to_owned(),
+        serde_json::json!([{
             "physicalLocation": {
                 "artifactLocation": { "uri": path },
                 "region": {
@@ -127,8 +269,9 @@ fn diagnostic_to_result(d: &serde_json::Value) -> serde_json::Value {
                     "startColumn": start_column,
                 }
             }
-        }]
-    })
+        }]),
+    );
+    result
 }
 
 /// Map a producer-level severity string onto the SARIF `level` enum.
@@ -346,7 +489,13 @@ mod tests {
                 "col": 12,
                 "message": "expected mapping value",
                 "severity": "error",
-            }]
+                "rule_id": "validate.parse",
+            }],
+            "rules": [{
+                "id": "validate.parse",
+                "description": "The file does not parse in its format.",
+                "references": [],
+            }],
         }));
         insta::with_settings!({
             filters => vec![
@@ -357,5 +506,83 @@ mod tests {
         }, {
             insta::assert_snapshot!("sarif_known_good_document", out);
         });
+    }
+
+    // -----------------------------------------------------------------
+    // Rule ids and `tool.driver.rules`.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn reporter_asks_for_the_rule_catalog() {
+        assert!(SarifReporter.wants_rule_catalog());
+    }
+
+    #[test]
+    fn rule_without_catalog_entry_is_described_by_id_alone() {
+        let out = sarif_for(serde_json::json!({
+            "diagnostics": [
+                { "path": "a", "message": "x", "rule_id": "plugin.p" },
+                { "path": "a", "message": "y", "rule_id": "plugin.p" },
+            ]
+        }));
+        assert_eq!(
+            out["runs"][0]["tool"]["driver"]["rules"],
+            serde_json::json!([{ "id": "plugin.p" }])
+        );
+        for result in out["runs"][0]["results"].as_array().unwrap() {
+            assert_eq!(result["ruleId"], "plugin.p");
+            assert_eq!(result["ruleIndex"], 0);
+        }
+    }
+
+    #[test]
+    fn diagnostic_without_rule_id_gets_no_rule_fields() {
+        let out = sarif_for(serde_json::json!({
+            "diagnostics": [{ "path": "a", "message": "x" }]
+        }));
+        let result = out["runs"][0]["results"][0].as_object().unwrap();
+        assert!(!result.contains_key("ruleId"), "{result:?}");
+        assert!(!result.contains_key("ruleIndex"), "{result:?}");
+        assert_eq!(
+            out["runs"][0]["tool"]["driver"]["rules"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn rule_descriptor_takes_the_first_http_reference_as_help_uri() {
+        let catalog = [serde_json::json!({
+            "id": "r", "description": "",
+            "references": ["RFC 6901", "ftp://x", "http://a.example/r", "https://b.example"],
+        })];
+        assert_eq!(
+            rule_descriptor("r", &catalog),
+            serde_json::json!({ "id": "r", "helpUri": "http://a.example/r" })
+        );
+    }
+
+    #[test]
+    fn first_sentence_ends_at_a_full_stop_before_a_capital() {
+        let cases = [
+            ("One. Two.", "One."),
+            ("Set it (e.g. via env). Then go.", "Set it (e.g. via env)."),
+            (
+                "Kubernetes 1.22+ removed it.\nSee docs.",
+                "Kubernetes 1.22+ removed it.",
+            ),
+            (
+                "Wrapped\n  over lines\n\nNext paragraph.",
+                "Wrapped over lines",
+            ),
+            ("Really? Yes.", "Really?"),
+            (
+                "\n\n  Leading blank paragraph.  ",
+                "Leading blank paragraph.",
+            ),
+            ("", ""),
+        ];
+        for (description, expected) in cases {
+            assert_eq!(first_sentence(description), expected, "{description:?}");
+        }
     }
 }

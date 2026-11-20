@@ -61,8 +61,8 @@ pub fn diff(a: &Value, b: &Value) -> Vec<PatchOp> {
     // The recursive worker walks via `&mut Pointer` (push/pop) instead of
     // building owned child pointers for each step — that keeps the per-walk
     // cost O(N × depth) rather than O(N × depth²). See the
-    // `perf-pointer-recursive-walks` change for the bench numbers behind
-    // this choice.
+    // `docs/plans/perf-pointer-recursive-walks.md` for the bench numbers
+    // behind this choice.
     let mut path = Pointer::default();
     diff_into(&mut path, a, b, &mut ops);
     ops
@@ -76,7 +76,7 @@ pub fn diff(a: &Value, b: &Value) -> Vec<PatchOp> {
 /// it was in on entry. Internal helpers preserve this by pairing each
 /// `push_segment` with a matching `pop_segment`.
 fn diff_into(path: &mut Pointer, a: &Value, b: &Value, ops: &mut Vec<PatchOp>) {
-    if a == b {
+    if a == b || a.same_big_number(b) {
         return;
     }
     match (a, b) {

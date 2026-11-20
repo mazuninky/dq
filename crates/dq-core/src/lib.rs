@@ -14,15 +14,19 @@ pub mod textual_edit;
 pub mod transform;
 pub mod write_options;
 
-pub use document::{Document, FormatTag, FrontmatterKind, FrontmatterPayload, Value};
+pub use document::{
+    Document, FormatTag, FrontmatterKind, FrontmatterPayload, Value, plain_float, shortest_float,
+};
 pub use edit_ops::{EditOp, EditScript};
 pub use enumerate::enumerate_pointers;
-pub use error::{Error, PathErrorKind};
+pub use error::{Error, PathErrorKind, one_line};
 pub use format::{Format, by_name, detect};
-pub use ir::{InlineBaseline, Ir, OwnedIr, Provenance, ProvenanceMap, SyntheticReason};
-pub use parsers::{parse_json_with_spans, parse_yaml_with_spans};
+pub use ir::{
+    InlineBaseline, Ir, OwnedIr, Provenance, ProvenanceMap, StreamDocument, SyntheticReason,
+};
+pub use parsers::{parse_json_with_spans, parse_yaml_stream_with_spans, parse_yaml_with_spans};
 pub use pointer::{Pointer, Segment};
-pub use transform::{PatchOp, apply_merge, apply_patch, diff};
+pub use transform::{PatchOp, apply_merge, apply_patch, apply_patch_edits, diff};
 pub use write_options::{WriteOptions, canonicalize_keys};
 
 /// Convenience alias used throughout `dq-core`.

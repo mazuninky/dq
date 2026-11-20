@@ -8,9 +8,9 @@
 pub mod args;
 
 pub use args::{
-    CheckArgs, Cli, Command, CompletionsArgs, ConvertArgs, DelArgs, DiffArgs, ExistsArgs,
-    ExplainArgs, FixArgs, FmtArgs, GenerateDocsArgs, GetArgs, KeysArgs, LenArgs, LintArgs, ManArgs,
-    MergeArgs, PatchArgs, PathsArgs, QueryArgs, RulesAddArgs, RulesArgs, RulesCommand,
-    RulesListArgs, SelectArgs, SelfArgs, SelfCommand, SelfUpdateArgs, SetArgs, TestArgs, TypeArgs,
-    ValidateArgs, ValuesArgs,
+    CheckArgs, Cli, Command, CompletionsArgs, ConvertArgs, DelArgs, DiffArgs, DocSelector,
+    ExistsArgs, ExplainArgs, FixArgs, FmtArgs, GenerateDocsArgs, GetArgs, InputFormat, KeysArgs,
+    LenArgs, LintArgs, ManArgs, MergeArgs, PatchArgs, PathsArgs, QueryArgs, RulesAddArgs,
+    RulesArgs, RulesCommand, RulesListArgs, SelectArgs, SelfArgs, SelfCommand, SelfUpdateArgs,
+    SetArgs, TestArgs, TypeArgs, ValidateArgs, ValuesArgs, stdin_read_twice_error, usage_error,
 };

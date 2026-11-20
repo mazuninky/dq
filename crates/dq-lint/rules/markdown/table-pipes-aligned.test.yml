@@ -14,3 +14,9 @@ tests:
       | 1 | 2 |
     expected:
       violations: []
+  - name: header-only table passes
+    input: |
+      | a | b |
+      |---|---|
+    expected:
+      violations: []

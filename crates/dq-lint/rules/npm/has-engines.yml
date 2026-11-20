@@ -6,9 +6,9 @@ description: |
 severity: info
 match:
   format: json
-  filter: 'has("name") and has("version")'
+  filter: 'type == "object" and has("name") and has("version")'
 check:
-  jq: 'select((.private // false) != true and (.engines.node // null) == null)'
+  jq: 'select((.private // false) != true and (.engines.node? // null) == null)'
   message: "package.json is missing engines.node"
 references:
   - https://docs.npmjs.com/cli/v10/configuring-npm/package-json#engines

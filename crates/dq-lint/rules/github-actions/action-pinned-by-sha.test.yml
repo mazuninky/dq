@@ -2,6 +2,7 @@ tests:
   - name: third-party action pinned by version fires
     input: |
       name: ci
+      on: [push]
       jobs:
         build:
           runs-on: ubuntu-latest
@@ -14,6 +15,7 @@ tests:
   - name: third-party action pinned by full SHA passes
     input: |
       name: ci
+      on: [push]
       jobs:
         build:
           runs-on: ubuntu-latest
@@ -24,10 +26,70 @@ tests:
   - name: official actions/* are exempt
     input: |
       name: ci
+      on: [push]
       jobs:
         build:
           runs-on: ubuntu-latest
           steps:
             - uses: actions/checkout@v4
+    expected:
+      violations: []
+  - name: list root produces no violations
+    input: |
+      - a
+      - b
+    expected:
+      violations: []
+  - name: scalar root produces no violations
+    input: |
+      just a string
+    expected:
+      violations: []
+  - name: empty document produces no violations
+    input: ""
+    expected:
+      violations: []
+  - name: jobs as a list is not a workflow
+    input: |
+      on: [push]
+      jobs: [build, test]
+    expected:
+      violations: []
+  - name: jobs as a string is not a workflow
+    input: |
+      on: [push]
+      jobs: build
+    expected:
+      violations: []
+  - name: scalar job, scalar steps and scalar step are skipped
+    input: |
+      on: [push]
+      permissions: {}
+      jobs:
+        a: x
+        b: {timeout-minutes: 5, steps: x}
+        c:
+          timeout-minutes: 5
+          steps:
+            - checkout
+            - uses: owner/repo@v1
+    expected:
+      violations:
+        - rule: github-actions.action-pinned-by-sha
+          message_contains: "owner/repo@v1"
+  - name: CircleCI config (version + jobs, no on) is not a workflow
+    input: |
+      version: 2.1
+      jobs:
+        build:
+          docker:
+            - image: cimg/base:stable
+          steps:
+            - checkout
+            - uses: owner/repo@v1
+            - run: echo hi
+      workflows:
+        main:
+          jobs: [build]
     expected:
       violations: []

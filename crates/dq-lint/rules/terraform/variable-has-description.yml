@@ -10,11 +10,14 @@ match:
   format: hcl
 check:
   jq: |
-    [.variable // {} | to_entries[]
-      | select(.value.description == null
-              or (.value.description | type != "string")
-              or (.value.description | length == 0))
-      | {name: .key}][]
+    # A root that is not a map yields nothing instead of raising.
+    objects | [.variable // {} | objects | to_entries[]
+      | .key as $name
+      | .value | (if type == "array" then .[] else . end)
+      | select(.description? == null
+              or (.description | type != "string")
+              or (.description | length == 0))
+      | {name: $name}][]
   message: "Variable '{{ .name }}' has no description"
 references:
   - https://developer.hashicorp.com/terraform/language/values/variables#input-variable-documentation

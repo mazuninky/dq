@@ -12,7 +12,10 @@
 //! single-quoted (literal — no escape processing), comment lines (`#`), and
 //! blank lines. Variable interpolation (`${...}`) is NOT performed; the raw
 //! string is stored verbatim. Comments and the original quote style are NOT
-//! preserved through round-trip (per spec D4).
+//! preserved through round-trip (per spec D4); which keys had `export` is
+//! ([`DotEnvLayout`]), and the writer writes them with it.
+
+use std::collections::HashSet;
 
 use std::io::Write;
 
@@ -20,7 +23,7 @@ use camino::Utf8PathBuf;
 use indexmap::IndexMap;
 
 use crate::Result;
-use crate::document::{Document, FormatTag, Value};
+use crate::document::{Document, FormatTag, Layout, Value};
 use crate::error::Error;
 use crate::format::Format;
 
@@ -47,6 +50,7 @@ impl Format for DotEnv {
             message: format!("invalid UTF-8 in .env input: {e}"),
         })?;
         let mut out: IndexMap<String, Value> = IndexMap::new();
+        let mut layout = DotEnvLayout::default();
         for (lineno_0, raw) in text.split('\n').enumerate() {
             let line_no = (lineno_0 + 1) as u32;
             // Trim trailing CR for CRLF-terminated lines; leading whitespace
@@ -57,11 +61,8 @@ impl Format for DotEnv {
                 continue;
             }
             // Strip leading `export ` prefix if present.
-            let body = if let Some(rest) = trimmed.strip_prefix("export ") {
-                rest.trim_start()
-            } else {
-                trimmed
-            };
+            let exported = trimmed.strip_prefix("export ");
+            let body = exported.map_or(trimmed, str::trim_start);
             let Some(eq_idx) = body.find('=') else {
                 return Err(Error::Parse {
                     file: None,
@@ -85,9 +86,17 @@ impl Format for DotEnv {
             }
             let raw_val = &body[eq_idx + 1..];
             let value = parse_value(raw_val, line_no, line)?;
+            // The last assignment of a key wins, with or without `export`.
+            if exported.is_some() {
+                layout.exported.insert(key.clone());
+            } else {
+                layout.exported.remove(&key);
+            }
             out.insert(key, Value::String(value));
         }
-        Ok(Document::value_only(Value::Map(out), FormatTag::DotEnv))
+        Ok(Document::value_only(Value::Map(out), FormatTag::DotEnv)
+            .with_layout(Layout::DotEnv(layout))
+            .with_source_bytes(bytes))
     }
 
     fn write(&self, doc: &Document, w: &mut dyn Write) -> Result<()> {
@@ -100,12 +109,16 @@ impl Format for DotEnv {
                 ),
             });
         };
+        let exported = match doc.layout() {
+            Layout::DotEnv(layout) => Some(&layout.exported),
+            _ => None,
+        };
         for (key, val) in map {
             let s = match val {
                 Value::String(s) => s.clone(),
                 Value::Bool(b) => b.to_string(),
                 Value::Int(n) => n.to_string(),
-                Value::Float(n) => n.to_string(),
+                Value::Float(n) => crate::document::shortest_float(*n),
                 Value::BigInt(s) | Value::BigFloat(s) => s.clone(),
                 Value::Null => String::new(),
                 Value::Array(_) | Value::Map(_) => {
@@ -118,7 +131,12 @@ impl Format for DotEnv {
                     });
                 }
             };
-            let line = format!("{key}={}\n", quote_for_env(&s));
+            let export = if exported.is_some_and(|keys| keys.contains(key)) {
+                "export "
+            } else {
+                ""
+            };
+            let line = format!("{export}{key}={}\n", quote_for_env(&s));
             w.write_all(line.as_bytes()).map_err(|source| Error::Io {
                 path: Utf8PathBuf::from("<dotenv-writer>"),
                 source,
@@ -126,6 +144,14 @@ impl Format for DotEnv {
         }
         Ok(())
     }
+}
+
+/// What the dotenv reader saw of a file beyond its value tree
+/// ([`Layout::DotEnv`]): the keys assigned with `export`, which the writer
+/// writes with it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct DotEnvLayout {
+    exported: HashSet<String>,
 }
 
 /// Parse the value side of a single `.env` line.
@@ -273,5 +299,28 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         DotEnv.write(&doc, &mut buf).expect("write");
         assert_eq!(String::from_utf8(buf).unwrap(), "M=\"hello world\"\n");
+    }
+
+    #[test]
+    fn a_rewrite_keeps_export_on_the_keys_that_had_it() {
+        let pointer = |p: &str| crate::pointer::Pointer::parse(p).unwrap();
+        let mut doc = DotEnv
+            .parse(b"export A=\"hello world\"\nB=2\n  export   C=x\n")
+            .expect("parse");
+        // A point edit, and a transform written with the file's layout.
+        let transformed =
+            Document::value_only(doc.value().clone(), FormatTag::DotEnv).with_layout_of(&doc);
+        doc.set_at(&pointer("/B"), Value::Int(3)).expect("set");
+        doc.set_at(&pointer("/D"), Value::Int(4)).expect("set");
+        assert_eq!(
+            String::from_utf8(doc.original_bytes().to_vec()).unwrap(),
+            "export A=\"hello world\"\nB=3\nexport C=x\nD=4\n"
+        );
+        let mut buf = Vec::new();
+        DotEnv.write(&transformed, &mut buf).expect("write");
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "export A=\"hello world\"\nB=2\nexport C=x\n"
+        );
     }
 }

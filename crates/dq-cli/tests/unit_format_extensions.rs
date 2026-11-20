@@ -231,7 +231,8 @@ fn get_frontmatter_title_returns_yaml_header_value() {
     // (M5) to `Markdown` (M9). The frontmatter header is now folded into
     // the AST's top-level `frontmatter.value.<key>` shape, so the M5
     // pointer `/title` becomes `/frontmatter/value/title`. The migration
-    // plan in the M9 OpenSpec change documents both alternatives — the
+    // plan in the markdown-tree section of `docs/decisions.md` documents both
+    // alternatives — the
     // longer pointer (here) and the explicit `-F frontmatter` opt-in
     // (covered by the M5 frontmatter parser's own tests).
     let tmp = write_with_extension(
@@ -385,9 +386,9 @@ fn set_dockerfile_returns_write_unavailable_mapped_to_exit_seven() {
     let domain = e
         .downcast_ref::<dq_core::Error>()
         .expect("error must downcast to dq_core::Error");
-    // The handler-emitted variant: WriteUnavailable from the read-only
-    // value-only document. The reason names the format "dockerfile" so
-    // the user-visible message explains why the rejection happened.
+    // The handler-emitted variant: WriteUnavailable, as the format has no
+    // textual edits. The reason names the format "dockerfile" so the
+    // user-visible message explains why the rejection happened.
     let dq_core::Error::WriteUnavailable { reason } = domain else {
         panic!("expected WriteUnavailable, got: {domain:?}");
     };
@@ -396,8 +397,8 @@ fn set_dockerfile_returns_write_unavailable_mapped_to_exit_seven() {
         "WriteUnavailable reason must name the format `dockerfile`, got: {reason}",
     );
     assert!(
-        reason.contains("read-only"),
-        "WriteUnavailable reason must still flag the document as read-only, got: {reason}",
+        reason.contains("has no textual edits"),
+        "WriteUnavailable reason must say the format has no textual edits, got: {reason}",
     );
 }
 

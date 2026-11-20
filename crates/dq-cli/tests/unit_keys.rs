@@ -1,7 +1,7 @@
 //! Unit tests for `dq keys` driven through `dq::run`.
 //!
-//! Spec contract: lists keys of an object, returns TypeMismatch when the
-//! pointer addresses a non-object node.
+//! Spec contract: lists the keys of an object or the indices of an array,
+//! returns `WrongType` (exit 1) when the pointer addresses a scalar.
 
 use std::io::Write as _;
 
@@ -36,25 +36,21 @@ fn keys_lists_object_keys_one_per_line_in_source_order() {
 
 #[test]
 fn keys_against_scalar_returns_type_mismatch_error() {
-    // Pointer addresses a scalar — keys must report a Path/TypeMismatch error
-    // so the CLI can show "kind=type" diagnostic.
+    // Pointer addresses a scalar — keys reports a wrong-type error, exit 1:
+    // the node is there, so not "not found" (exit 2).
     let tmp = write_yaml("a: 1\n");
     let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "keys", path, "/a", "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
     let e = dq::run(&cli, false, &mut out, &mut err).expect_err("keys on scalar must error");
-    let domain = e
-        .downcast_ref::<dq_core::Error>()
-        .expect("expected dq_core::Error");
-    assert_eq!(domain.kind_name(), "path");
-    match domain {
-        dq_core::Error::Path { kind, .. } => assert!(
-            matches!(kind, dq_core::PathErrorKind::TypeMismatch { .. }),
-            "expected TypeMismatch kind, got {kind:?}",
-        ),
-        other => panic!("unexpected variant: {other:?}"),
-    }
+    let wrong = e.downcast_ref::<dq::WrongType>().expect("WrongType");
+    assert_eq!(wrong.found, "int");
+    assert_eq!(
+        e.to_string(),
+        "cannot list the keys of '/a': it is int, not an object or an array"
+    );
+    assert_eq!(dq::exit_code::exit_code_for_error(&e), 1);
 }
 
 #[test]
@@ -77,26 +73,13 @@ fn keys_with_json_format_writes_json_array() {
 }
 
 #[test]
-fn keys_against_array_returns_type_mismatch_error() {
-    // Arrays are not objects — `keys` must reject them too. The error kind is
-    // `TypeMismatch { expected: "object", found: "array" }`.
+fn keys_against_array_lists_its_indices() {
+    // The keys of an array are the indices a pointer takes into it.
     let tmp = write_yaml("- a\n- b\n");
     let path = tmp.to_str().unwrap();
     let cli = Cli::parse_from(["dq", "keys", path, "", "--no-color"]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
-    let e = dq::run(&cli, false, &mut out, &mut err).expect_err("keys on array must error");
-    let domain = e
-        .downcast_ref::<dq_core::Error>()
-        .expect("expected dq_core::Error");
-    match domain {
-        dq_core::Error::Path {
-            kind: dq_core::PathErrorKind::TypeMismatch { expected, found },
-            ..
-        } => {
-            assert_eq!(*expected, "object");
-            assert_eq!(*found, "array");
-        }
-        other => panic!("expected TypeMismatch on array, got {other:?}"),
-    }
+    dq::run(&cli, false, &mut out, &mut err).expect("keys on an array lists its indices");
+    assert_eq!(String::from_utf8(out).unwrap(), "0\n1\n");
 }

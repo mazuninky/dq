@@ -46,3 +46,26 @@ tests:
       }
     expected:
       violations: []
+  - name: top-level attributes in place of blocks are skipped
+    input: |
+      resource = "x"
+      variable = 1
+      module = "m"
+      terraform = "x"
+      output = 1
+      provider = "x"
+    expected:
+      violations: []
+  - name: the unpinned one of two repeated module blocks fires
+    input: |
+      module "vpc" {
+        source = "terraform-aws-modules/vpc/aws"
+      }
+      module "vpc" {
+        source  = "terraform-aws-modules/vpc/aws"
+        version = "5.0.0"
+      }
+    expected:
+      violations:
+        - rule: terraform.module-pin-version
+          message_contains: "vpc"

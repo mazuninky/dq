@@ -23,3 +23,34 @@ tests:
       spec: {}
     expected:
       violations: []
+  - name: list root produces no violations
+    input: |
+      - a
+      - b
+    expected:
+      violations: []
+  - name: scalar root produces no violations
+    input: |
+      just a string
+    expected:
+      violations: []
+  - name: empty document produces no violations
+    input: ""
+    expected:
+      violations: []
+  - name: string metadata produces no violations
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata: x
+    expected:
+      violations: []
+  - name: string labels produce no violations
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: app
+        labels: x
+    expected:
+      violations: []

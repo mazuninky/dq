@@ -21,7 +21,8 @@ pub struct SelfArgs {
 pub enum SelfCommand {
     /// Check whether a newer release is available on GitHub.
     Check,
-    /// Download and atomically replace the running binary.
+    /// Download a release, verify its SHA-256 and atomically replace the
+    /// running binary.
     Update(SelfUpdateArgs),
 }
 
@@ -34,4 +35,10 @@ pub struct SelfUpdateArgs {
     /// current binary just installs that older release.
     #[arg(long, value_name = "VER")]
     pub to: Option<String>,
+
+    /// Download the release and verify its SHA-256 against the release's
+    /// `dq-checksums.txt`, then report what would be installed; replace
+    /// nothing.
+    #[arg(long)]
+    pub dry_run: bool,
 }

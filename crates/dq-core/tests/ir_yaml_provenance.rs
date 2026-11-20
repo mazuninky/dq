@@ -1,7 +1,7 @@
 //! Integration test: YAML provenance via `Document::as_ir()`.
 //!
 //! Spec scenario covered: "YAML parse produces provenance for every leaf"
-//! ([`openspec/changes/add-ir-foundation/specs/data-query-ir/spec.md`]).
+//! (see [`docs/reference/ir-and-edit-ops.md`]).
 //!
 //! Pinned against the public, write-aware YAML entrypoint
 //! `parse_yaml_with_spans`: a small YAML fixture with comments and nested

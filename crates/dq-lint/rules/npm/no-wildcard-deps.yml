@@ -6,9 +6,9 @@ description: |
 severity: error
 match:
   format: json
-  filter: 'has("name") and has("version")'
+  filter: 'type == "object" and has("name") and has("version")'
 check:
-  jq: '((.dependencies // {}) + (.devDependencies // {}) + (.peerDependencies // {})) | to_entries[] | select(.value == "*" or .value == "latest")'
+  jq: '([.dependencies, .devDependencies, .peerDependencies] | map(objects) | add // {}) | to_entries[] | select(.value == "*" or .value == "latest")'
   message: "Dependency '{{ .key }}' is pinned to '{{ .value }}' (use a specific version)"
 references:
   - https://docs.npmjs.com/cli/v10/configuring-npm/package-json#dependencies

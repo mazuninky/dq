@@ -1,38 +1,71 @@
 tests:
   - name: dockerfile without HEALTHCHECK fires
     input: |
-      - { instruction: FROM, arguments: "nginx:1.25", line: 1 }
-      - { instruction: COPY, arguments: ["./site","/usr/share/nginx/html"], line: 2 }
-      - { instruction: CMD, arguments: ["nginx","-g","daemon off;"], line: 3 }
-    format: yaml
+      FROM nginx:1.25
+      COPY ./site /usr/share/nginx/html
+      CMD ["nginx", "-g", "daemon off;"]
+    format: dockerfile
     expected:
       violations:
         - rule: dockerfile.has-healthcheck
   - name: dockerfile with HEALTHCHECK passes
     input: |
-      - { instruction: FROM, arguments: "nginx:1.25", line: 1 }
-      - { instruction: HEALTHCHECK, arguments: "--interval=30s CMD curl -f http://localhost", line: 2 }
-      - { instruction: CMD, arguments: ["nginx","-g","daemon off;"], line: 3 }
-    format: yaml
+      FROM nginx:1.25
+      HEALTHCHECK --interval=30s CMD curl -f http://localhost/ || exit 1
+      CMD ["nginx", "-g", "daemon off;"]
+    format: dockerfile
     expected:
       violations: []
-  - name: an ordinary YAML mapping is not a Dockerfile
+  - name: a lower-case healthcheck passes
+    input: |
+      FROM nginx:1.25
+      healthcheck CMD true
+    format: dockerfile
+    expected:
+      violations: []
+  - name: HEALTHCHECK NONE passes (an explicit decision)
+    input: |
+      FROM nginx:1.25
+      HEALTHCHECK NONE
+    format: dockerfile
+    expected:
+      violations: []
+  - name: an ONBUILD HEALTHCHECK does not count
+    input: |
+      FROM nginx:1.25
+      ONBUILD HEALTHCHECK CMD true
+    format: dockerfile
+    expected:
+      violations:
+        - rule: dockerfile.has-healthcheck
+  - name: an empty Dockerfile is not judged
+    input: |
+
+    format: dockerfile
+    expected:
+      violations: []
+  - name: a comments-only Dockerfile is not judged
+    input: |
+      # syntax=docker/dockerfile:1
+      # nothing here yet
+    format: dockerfile
+    expected:
+      violations: []
+  - name: an ordinary YAML file is not linted by this rule
     input: |
       name: web
       image: nginx
     format: yaml
     expected:
       violations: []
-  - name: a YAML list of strings is not a Dockerfile
+  - name: a YAML instruction list is not linted by this rule
     input: |
-      - FROM
-      - ADD
+      - { instruction: FROM, arguments: alpine, line: 1 }
     format: yaml
     expected:
       violations: []
-  - name: an empty YAML list is not a Dockerfile
+  - name: a comment-only Dockerfile produces no violations
     input: |
-      []
-    format: yaml
+      # nothing here
     expected:
       violations: []

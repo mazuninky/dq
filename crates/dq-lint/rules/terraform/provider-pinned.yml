@@ -15,23 +15,24 @@ check:
   # whose name is also missing from terraform.required_providers (or has
   # no `version` field there). Either location satisfies the rule.
   #
-  # Known limitation: dq's HCL parser merges multiple `provider "<name>"`
-  # blocks (e.g. aliased providers) into a single map keyed by name,
-  # last-wins per field. This means the rule cannot inspect each aliased
-  # block individually — if any aliased block sets `version`, the merged
-  # `version` field is non-null and the rule passes. For aliased
-  # providers, declare the version constraint in `terraform {
-  # required_providers { ... } }` (the modern Terraform >= 0.13 path)
-  # so the constraint applies to every alias uniformly.
+  # Blocks repeated with the same type and labels read as a list of their
+  # bodies: two `provider "aws"` blocks (an alias next to the default) are
+  # `provider.aws: [{...}, {...}]`, two `terraform {}` blocks are
+  # `terraform: [{...}, {...}]`. `bodies` turns either shape into a stream
+  # of bodies, so every aliased provider block is checked on its own, and
+  # a `required_providers` in any `terraform` block counts.
   jq: |
-    . as $root |
-    [.provider // {} | to_entries[]
-      | select(.value.version == null)
-      | select(
-          (($root.terraform // {}).required_providers // {}) as $req
-          | ($req[.key]? | type) != "object"
-            or (($req[.key]?.version // null) == null))
-      | {name: .key}][]
+    # A root that is not a map yields nothing instead of raising.
+    def bodies: if type == "array" then .[] else . end;
+    objects | ([.terraform | bodies | objects | .required_providers? | bodies | objects]
+      | add // {}) as $req
+    | [.provider // {} | objects | to_entries[]
+      | .key as $name
+      | .value | bodies | objects
+      | select(.version? == null)
+      | select(($req[$name]? | type) != "object"
+               or (($req[$name]?.version // null) == null))
+      | {name: $name}][]
   message: "Provider '{{ .name }}' has no version constraint (set it on the provider block or in terraform.required_providers)"
 references:
   - https://developer.hashicorp.com/terraform/language/providers/requirements

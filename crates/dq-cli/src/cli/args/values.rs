@@ -10,6 +10,6 @@ pub struct ValuesArgs {
     #[arg(value_parser = clap::value_parser!(Utf8PathBuf))]
     pub file: Utf8PathBuf,
 
-    /// JSON Pointer to an object node.
+    /// JSON Pointer to an object or array node.
     pub pointer: String,
 }

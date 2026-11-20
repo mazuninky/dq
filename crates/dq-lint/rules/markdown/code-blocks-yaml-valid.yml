@@ -9,13 +9,10 @@ description: |
   `markdown.code-blocks-yaml-valid.parse-failed` diagnostic anchored at
   the block's position in the markdown source.
 
-  Known limitation: markdown AST nodes carry block-level `position`
-  but no per-character `ValueSpan`, so `Ir::line_col_for(<anchor>)`
-  resolves to the default `(1, 1)` for the projected diagnostic. The
-  composite runtime emits a `tracing::warn!` per missing anchor span
-  and degrades gracefully (the diagnostic still fires, just without
-  precise inner-coordinate projection). Sub-line precision lands when
-  the markdown parser populates `ValueSpan` for code-block leaves.
+  The anchor is the block's `value` leaf, which the markdown parser
+  gives the byte span of the block's content and the column its lines
+  start at, so a parse error lands on its own line and column in the
+  markdown file.
 severity: error
 match:
   format: markdown
@@ -23,7 +20,7 @@ check:
   extract: |
     [paths(objects | select(.type == "code_block" and .fenced == true and .lang == "yaml")) as $p |
      getpath($p) as $node |
-     {value: $node.value, format: "yaml", anchor: ($p | map("/" + tostring) | add // "")}]
+     {value: $node.value, format: "yaml", anchor: (($p + ["value"]) | map("/" + tostring) | add)}]
   nested:
     id: markdown.code-blocks-yaml-valid.inner
     description: |

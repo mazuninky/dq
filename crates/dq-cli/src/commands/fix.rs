@@ -1,4 +1,4 @@
-//! `dq fix FILE...` — apply every applicable rule's `fix.jq` to the
+//! `dq fix FILE...` — apply every applicable rule's fix (`fix.ops` / `fix.jq`) to the
 //! given files.
 //!
 //! Pipeline mirrors [`crate::commands::lint_core::run_with_rulesets`] up
@@ -50,12 +50,16 @@ use std::io::Write;
 use std::sync::Arc;
 
 use camino::{Utf8Path, Utf8PathBuf};
+use dq_core::template_guard::TemplateMode;
+use dq_core::{Document, Pointer, Segment};
 use dq_exec::{Evaluator, FixOutcome, Fixer, LoaderArgs, RuleLoader};
 use indexmap::IndexSet;
 
 use crate::bulk::{self, FileOp, FileOpResult};
-use crate::cli::{Cli, FixArgs};
-use crate::commands::io_helpers::{load_document_for_lint, pick_format, read_bytes};
+use crate::cli::{Cli, DocSelector, FixArgs};
+use crate::commands::io_helpers::{
+    checked_index, parse_for_lint, pick_format, read_bytes, skip_out_of_range,
+};
 use crate::commands::lint_core::expand_lint_inputs;
 use crate::commands::plugin_loader::{self, LoadedPlugins};
 use crate::error::InvalidInput;
@@ -105,6 +109,7 @@ pub fn run(
         // No files to process — nothing to do.
         return Ok(());
     }
+    super::io_helpers::check_write_targets(cli, "fix", &expanded, input_format)?;
 
     // Detect formats up front so the loader can pick which `@std/*`
     // namespaces to auto-bind. Same approach as `dq lint`.
@@ -155,6 +160,7 @@ pub fn run(
         use_color,
         fixer,
         plugins,
+        several: expanded.len() > 1,
     };
 
     bulk::run_per_file(expanded, &op, cli, out)
@@ -172,22 +178,37 @@ struct FixFileOp<'a> {
     /// workers via the outer `Arc`. `None` when the flag is absent or the
     /// directory contains no `*.wasm` files.
     plugins: Option<Arc<LoadedPlugins>>,
+    /// The run covers several files: one without document `--doc N` is
+    /// skipped.
+    several: bool,
 }
 
 impl<'a> FileOp for FixFileOp<'a> {
     fn apply(&self, path: &Utf8Path) -> anyhow::Result<FileOpResult> {
-        // Read the bytes once for the diff renderer below; route the
-        // parse through the lint helper so YAML / JSON pick up the
-        // span-aware parsers (otherwise `EditScript::apply` would fail
-        // with `WriteUnavailable` against a value-only `Document`).
-        // The helper re-reads the file internally — accept the 2× I/O
-        // for the simpler call site.
+        // Read the bytes once — for the diff renderer below too, and
+        // stdin cannot be read twice; parse them as the lint path does so
+        // YAML / JSON pick up the span-aware parsers (otherwise
+        // `EditScript::apply` would fail with `WriteUnavailable` against a
+        // value-only `Document`).
+        let format = pick_format(path, self.input_format)?;
         let original_bytes = read_bytes(path)?;
-        let (format, mut document) = load_document_for_lint(path, self.input_format)?;
+        let mut document = parse_for_lint(path, format, &original_bytes, TemplateMode::Guard)?;
+        // A multi-document stream is fixed one document at a time, and
+        // written back with every document; `--doc N` fixes document N
+        // alone.
+        let only = match self.cli.doc {
+            Some(DocSelector::Index(index)) => {
+                match skip_out_of_range(checked_index(&document, index, path), self.several)? {
+                    Ok(index) => Some(index),
+                    Err(reason) => return Ok(FileOpResult::Skipped(reason)),
+                }
+            }
+            Some(DocSelector::All) | None => None,
+        };
 
         let outcome = self
             .fixer
-            .apply(path, &mut document, format.name())
+            .apply_to(path, &mut document, format.name(), only)
             .map_err(anyhow::Error::new)?;
 
         // Audit log — visible at `-v` (info) verbosity. The check path
@@ -208,28 +229,68 @@ impl<'a> FileOp for FixFileOp<'a> {
             && let Some(runtime) = loaded.runtime.as_ref()
         {
             for handle in &loaded.handles {
-                let ir = document.as_ir();
-                let script = runtime
-                    .invoke_fix(handle, &ir)
-                    .map_err(anyhow::Error::new)?;
-                if script.is_noop() {
-                    continue;
-                }
-                match script.apply(&mut document) {
-                    Ok(()) => {
-                        plugin_fixed = true;
+                let mut slots = document_slots(&document, only);
+                let mut at = 0;
+                while let Some(&slot) = slots.get(at) {
+                    at += 1;
+                    // The plugin sees one document of a stream as a document
+                    // of its own; its script then applies below that
+                    // document's `/N`.
+                    let script = match slot {
+                        None => runtime
+                            .invoke_fix(handle, &document.as_ir())
+                            .map_err(anyhow::Error::new)?,
+                        Some(index) => {
+                            let Some(part) = document
+                                .stream_documents()
+                                .and_then(|parts| parts.into_iter().nth(index))
+                            else {
+                                continue;
+                            };
+                            runtime
+                                .invoke_fix(handle, &part.as_ir())
+                                .map_err(anyhow::Error::new)?
+                                .under(&Pointer::new(vec![Segment::Key(index.to_string())]))
+                        }
+                    };
+                    if script.is_noop() {
+                        continue;
                     }
-                    Err(e) => {
-                        // The feature-disabled `PluginHandle` stub does not
-                        // expose `rule_id()`, so we keep the warning
-                        // log path-keyed. The path uniquely identifies the
-                        // file under fix; per-plugin attribution is
-                        // recoverable from the load order printed at -vv.
-                        tracing::warn!(
-                            path = %path,
-                            error = %e,
-                            "plugin EditScript failed to apply; skipping",
-                        );
+                    if let Some(why) = unappliable_removal(&script, slot) {
+                        tracing::warn!(path = %path, "plugin EditScript {why}; skipping");
+                        continue;
+                    }
+                    let documents = document.values().map_or(1, <[_]>::len);
+                    match script.apply(&mut document) {
+                        Ok(()) => {
+                            plugin_fixed = true;
+                        }
+                        Err(e) => {
+                            // The feature-disabled `PluginHandle` stub does not
+                            // expose `rule_id()`, so we keep the warning
+                            // log path-keyed. The path uniquely identifies the
+                            // file under fix; per-plugin attribution is
+                            // recoverable from the load order printed at -vv.
+                            tracing::warn!(
+                                path = %path,
+                                error = %e,
+                                "plugin EditScript failed to apply; skipping",
+                            );
+                        }
+                    }
+                    // `remove ""` took the document out of its stream: the
+                    // next one moved into its place, and a stream down to
+                    // one document is a document of its own.
+                    if only.is_none()
+                        && let Some(index) = slot
+                        && document.values().map_or(1, <[_]>::len) != documents
+                    {
+                        slots = match document.values() {
+                            Some(left) => (index..left.len()).map(Some).collect(),
+                            None if index == 0 => vec![None],
+                            None => Vec::new(),
+                        };
+                        at = 0;
                     }
                 }
             }
@@ -244,11 +305,12 @@ impl<'a> FileOp for FixFileOp<'a> {
         // - Only `fix.ops` (rule-engine) and/or plugin EditScripts ran →
         //   `document.original_bytes()` is the canonical post-fix byte
         //   buffer; comments are preserved.
-        // - Any `fix.jq` ran → the document was replaced with a
-        //   value-only one (no spans, no `original_bytes`); re-emit
-        //   through the format writer, same trade-off as
-        //   `dq set --jq`.
-        let final_bytes = if outcome.legacy_jq_applied {
+        // - A `fix.jq` ran and left a value-only document (no spans, no
+        //   `original_bytes`) → re-emit through the format writer, same
+        //   trade-off as `dq set --jq`. In a YAML stream a `fix.jq`
+        //   normally rewrites only its own document inside
+        //   `original_bytes`, which then stay canonical.
+        let final_bytes = if outcome.legacy_jq_applied && document.original_bytes().is_empty() {
             let mut buf = Vec::new();
             format
                 .write_with_options(&document, &mut buf, &self.cli.write_options())
@@ -257,6 +319,22 @@ impl<'a> FileOp for FixFileOp<'a> {
         } else {
             document.original_bytes().to_vec()
         };
+
+        // The guard let the file's templates through: what is written must
+        // hold every template of the fixed data as the same string, and
+        // still read the same with its templates as placeholders — a
+        // `fix.jq` re-emit or a rewritten format goes through the writer.
+        if dq_core::template_guard::detect_templates(&original_bytes).is_some() {
+            dq_core::template_guard::check_templates_kept(
+                document.value(),
+                &[],
+                &original_bytes,
+                false,
+                &final_bytes,
+                |b| super::io_helpers::parse_for_edit(format, b),
+            )
+            .map_err(anyhow::Error::new)?;
+        }
 
         let diff = if self.cli.diff {
             let original_str = String::from_utf8_lossy(&original_bytes);
@@ -275,6 +353,39 @@ impl<'a> FileOp for FixFileOp<'a> {
             output_bytes: final_bytes,
             diff,
         })
+    }
+}
+
+/// The documents a plugin fixes in `document`: `[None]` (the whole file)
+/// for a file that is not a stream, otherwise `Some(index)` for every
+/// document of the stream, or for `only` alone.
+fn document_slots(document: &Document, only: Option<usize>) -> Vec<Option<usize>> {
+    match (document.values(), only) {
+        (Some(_), Some(index)) => vec![Some(index)],
+        (Some(values), None) => (0..values.len()).map(Some).collect(),
+        (None, _) => vec![None],
+    }
+}
+
+/// Why a plugin's `script` that removes its document (`remove ""`, below
+/// `/N` in a stream) cannot be applied to the document in `slot`: a file
+/// that is no stream would be emptied, and ops after the removal would
+/// edit the document that moves into its place. `None` when it can be.
+fn unappliable_removal(script: &dq_core::EditScript, slot: Option<usize>) -> Option<&'static str> {
+    let document = match slot {
+        None => Pointer::new(Vec::new()),
+        Some(index) => Pointer::new(vec![Segment::Key(index.to_string())]),
+    };
+    let ops = script.ops();
+    let at = ops
+        .iter()
+        .position(|op| matches!(op, dq_core::EditOp::Remove { path } if *path == document))?;
+    if slot.is_none() {
+        Some("would remove the whole file")
+    } else if at + 1 < ops.len() {
+        Some("removes its document and then runs more ops")
+    } else {
+        None
     }
 }
 

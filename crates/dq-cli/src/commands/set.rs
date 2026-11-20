@@ -19,7 +19,7 @@
 //!
 //! Per-file work executed inside [`SetFileOp::apply`]:
 //!
-//! 1. Resolve the format (extension or `-F`).
+//! 1. Resolve the format (extension or `--input-format`).
 //! 2. Read the original bytes.
 //! 3. Run the Helm/Argo/GitHub Actions template guard
 //!    ([`dq_core::template_guard`]) according to the global
@@ -33,17 +33,19 @@
 //!    `--diff`, and `-i` are all driver concerns.
 
 use std::io::{Read, Write};
-use std::str::FromStr;
 use std::sync::Arc;
 
 use camino::Utf8Path;
+use dq_core::template_guard::TemplateMode;
 use dq_core::{Document, Pointer, Value};
-use indexmap::IndexMap;
 
-use super::io_helpers::{load_document_with_path, pick_format, read_bytes};
+use super::io_helpers::{
+    checked_index, finish_edit, load_document_with_path, parse_file_for_edit, parse_for_edit,
+    pick_format, pointer_in_document, read_bytes, skip_out_of_range,
+};
 use super::query::jq_compile_to_parse;
 use crate::bulk::{self, FileOp, FileOpResult};
-use crate::cli::{Cli, SetArgs};
+use crate::cli::{Cli, DocSelector, SetArgs};
 use crate::error::InvalidInput;
 
 /// Run `dq set`.
@@ -55,11 +57,10 @@ use crate::error::InvalidInput;
 /// - [`dq_core::Error::TemplatedFile`] (exit 3) when the file contains Go
 ///   template syntax and neither escape-hatch flag is set.
 /// - [`dq_core::Error::Path`] (exit 2) when the pointer addresses a missing
-///   node and one of the following holds: `--no-create` is set (blocks every
-///   mkdir-p variant); multiple intermediate keys are missing (multi-level
-///   mkdir-p is deferred); or the immediate parent is an empty container
-///   (`{}` / `[]`, also deferred). The single-level case — parent exists,
-///   one leaf key missing — is created automatically via [`Document::set_at`].
+///   node and `--no-create` is set, or the node it would hang from is no
+///   mapping (a scalar, or an array the pointer runs past). Otherwise the
+///   missing key is created with the mappings missing above it via
+///   [`Document::set_at`].
 /// - [`dq_core::Error::WriteIo`] / [`dq_core::Error::WriteUnavailable`]
 ///   (exit 7) on write failure.
 /// - [`crate::error::CheckPending`] (exit 1) when `--check` finds at least
@@ -74,6 +75,16 @@ pub fn run(
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
     cli.ensure_write_flags_consistent()?;
+    let doc_index = match cli.doc {
+        Some(DocSelector::All) => {
+            return Err(cli.doc_usage_error(
+                "set",
+                "it edits one document; pass --doc N, or address the stream as /N/...",
+            ));
+        }
+        Some(DocSelector::Index(index)) => Some(index),
+        None => None,
+    };
 
     // M4 §4 / design D5: `--sort-keys` and `--indent` are no-ops on the
     // textual-edit splice path. The set handler reads `doc.original_bytes()`
@@ -104,7 +115,15 @@ pub fn run(
                 "--jq applies to the document root; positional POINTER is not accepted (got '{p}')",
             ))));
         }
-        return run_jq_transform(cli, args, expression, input_format, use_color, out);
+        return run_jq_transform(
+            cli,
+            args,
+            expression,
+            input_format,
+            doc_index,
+            use_color,
+            out,
+        );
     }
 
     // The non-jq path requires a pointer. Surface a structured InvalidInput
@@ -120,7 +139,7 @@ pub fn run(
     // sees the same value. (The inline JSON literal heuristic, stdin
     // capture, and `--value-from` file read all happen here, before the
     // per-file loop.)
-    let value = resolve_value(args)?;
+    let value = resolve_value(args, cli.template_mode())?;
 
     // Parse the pointer ONCE — every file uses the same pointer.
     let pointer = Pointer::parse(pointer_str).map_err(anyhow::Error::new)?;
@@ -130,16 +149,18 @@ pub fn run(
     // return `Path { MissingKey }` if it doesn't exist, so mkdir-p (the
     // Bug #1 fix in `Document::set_at`) does NOT silently create new keys
     // when the user explicitly asked to keep the document shape unchanged.
+    let files = bulk::expand_glob(&args.file)?;
     let op = SetFileOp {
         cli,
         input_format,
         use_color,
         pointer: &pointer,
+        doc_index,
+        several: files.len() > 1,
         value: &value,
         no_create: args.no_create,
     };
-
-    let files = bulk::expand_glob(&args.file)?;
+    super::io_helpers::check_write_targets(cli, "set", &files, input_format)?;
     bulk::run_per_file(files, &op, cli, out)
 }
 
@@ -151,6 +172,10 @@ struct SetFileOp<'a> {
     input_format: Option<&'a str>,
     use_color: bool,
     pointer: &'a Pointer,
+    /// `--doc N`: `pointer` is relative to document `N` of a stream.
+    doc_index: Option<usize>,
+    /// The run covers several files: one without document `N` is skipped.
+    several: bool,
     value: &'a Value,
     /// When `true`, fail (exit 2) instead of creating missing keys via
     /// the mkdir-p path in `Document::set_at`. Mirrors `--no-create` on
@@ -169,28 +194,19 @@ impl<'a> FileOp for SetFileOp<'a> {
         //    sake before being handed to the parser.
         let original_bytes = read_bytes(path)?;
 
-        // 3. Template guard: detect / substitute / pass-through depending
-        //    on which escape-hatch flag is active. Stored as
-        //    `Option<HashMap>` because we only need the restoration map
-        //    when substitution ran.
-        let (parse_input, placeholder_map) = if self.cli.raw_template_strings {
-            let (substituted, map) =
-                dq_core::template_guard::substitute_placeholders(&original_bytes);
-            (substituted, Some(map))
-        } else if self.cli.allow_templates {
-            (original_bytes.clone(), None)
-        } else if let Some(marker) = dq_core::template_guard::detect_templates(&original_bytes) {
-            return Err(anyhow::Error::new(dq_core::Error::templated_file(marker)));
-        } else {
-            (original_bytes.clone(), None)
+        // Template guard, then parse: a file whose templates change what
+        // the parser reads is refused; `guard` checks below that the edit
+        // keeps the templates of one whose templates do not (or puts the
+        // `--raw-template-strings` placeholders back).
+        let (mut document, guard) = parse_file_for_edit(self.cli, format, &original_bytes, path)?;
+        let textual = document.is_write_aware();
+        let pointer = match skip_out_of_range(
+            pointer_in_document(&document, self.doc_index, self.pointer, path),
+            self.several,
+        )? {
+            Ok(pointer) => pointer,
+            Err(reason) => return Ok(FileOpResult::Skipped(reason)),
         };
-
-        // 4. Parse to a write-aware Document. YAML and JSON have dedicated
-        //    span-collecting entry points; TOML and JSONL go through the
-        //    `Format::parse` trait method (TOML produces a write-aware doc
-        //    via `Toml::parse`; JSONL is read-only, so `set_at` will return
-        //    `WriteUnavailable` and the exit-code mapper picks 7).
-        let mut document = parse_to_document(format, &parse_input, path)?;
 
         // 5. Apply the write. Cloning the value is unavoidable because
         //    `set_at` consumes a `Value` (the engine takes ownership of the
@@ -203,21 +219,24 @@ impl<'a> FileOp for SetFileOp<'a> {
         //    by the Bug #1 mkdir-p path.
         // Skip pre-resolve on the read-only sentinel so `set_at` returns the
         // more accurate `WriteUnavailable` instead of `MissingKey`.
-        if self.no_create && !document.original_bytes().is_empty() {
-            self.pointer
+        if self.no_create && document.is_editable() {
+            pointer
                 .resolve(document.value())
                 .map_err(anyhow::Error::new)?;
         }
         document
-            .set_at(self.pointer, self.value.clone())
+            .set_at(&pointer, self.value.clone())
             .map_err(anyhow::Error::new)?;
 
         // 6. Compute the final output bytes, restoring template
         //    placeholders if the substitution pass ran.
-        let mut final_bytes = document.original_bytes().to_vec();
-        if let Some(map) = &placeholder_map {
-            final_bytes = dq_core::template_guard::restore_placeholders(&final_bytes, map);
-        }
+        let final_bytes = finish_edit(
+            &guard,
+            format,
+            &document,
+            std::slice::from_ref(&pointer),
+            textual,
+        )?;
 
         // 7. The bulk driver handles `-i` and `--check` uniformly — we
         //    only need to compute the diff string when `--diff` mode is
@@ -250,6 +269,10 @@ impl<'a> FileOp for SetFileOp<'a> {
 struct JqFileOp<'a> {
     cli: &'a Cli,
     input_format: Option<&'a str>,
+    /// `--doc N`: the filter transforms document `N` of a stream alone.
+    doc_index: Option<usize>,
+    /// The run covers several files: one without document `N` is skipped.
+    several: bool,
     use_color: bool,
     engine: Arc<dq_transform::JqEngine>,
 }
@@ -263,42 +286,66 @@ impl<'a> FileOp for JqFileOp<'a> {
         // Read the original bytes — we need them for the diff comparison and
         // for re-parsing through the value-only path.
         let original_bytes = read_bytes(path)?;
-        let document = format.parse(&original_bytes).map_err(anyhow::Error::new)?;
-
-        // Convert the document's top-level value into serde_json so the jq
-        // engine can consume it.
-        let serde_value = document.value().to_serde_json();
+        // Both escape hatches are refused up front, so the guard always
+        // runs: re-emitting a file whose templates changed the reading
+        // would write that misreading back.
+        let document =
+            dq_core::template_guard::guarded_parse(&original_bytes, TemplateMode::Guard, |b| {
+                format.parse(b)
+            })
+            .map_err(anyhow::Error::new)?;
 
         // Evaluate the filter. Runtime / Conversion errors stay as plain
         // anyhow (exit 1) — they aren't compile failures and aren't IO
         // failures. The compile error is handled at the engine-construction
         // site in `run_jq_transform`, before we get here.
+        //
+        // The value goes to jq as a `dq_core::Value`, not through
+        // `serde_json::Value`: that one has no NaN or infinity, and an
+        // untouched `.nan` would come back as the string `'.nan'`.
+        //
+        // `--doc N` hands the filter one document of a stream; without it
+        // a stream reaches the filter as the array of its documents.
+        let target = match self.doc_index {
+            Some(index) => {
+                match skip_out_of_range(checked_index(&document, index, path), self.several)? {
+                    Ok(index) => Some(index),
+                    Err(reason) => return Ok(FileOpResult::Skipped(reason)),
+                }
+            }
+            None => None,
+        };
+        let input = match (target, document.values()) {
+            (Some(index), Some(values)) => &values[index],
+            _ => document.value(),
+        };
         let outputs = self
             .engine
-            .run(&serde_value)
+            .run_value(input)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         // The single-output rule (design D5): collect outputs, require
         // exactly one. The error message names the count so users know to
         // wrap iterating filters in `[.[]]`.
-        let single = match outputs.as_slice() {
-            [v] => v,
-            [] => {
+        let mut outputs = outputs.into_iter();
+        let single = match (outputs.next(), outputs.len()) {
+            (Some(v), 0) => v,
+            (None, _) => {
                 return Err(anyhow::Error::new(InvalidInput::new(
                     "--jq filter produced 0 outputs (document would become empty); use `[...]` to collect or pick a non-empty filter",
                 )));
             }
-            many => {
+            (Some(_), rest) => {
                 return Err(anyhow::Error::new(InvalidInput::new(format!(
                     "--jq filter produced {} outputs (expected exactly 1); wrap iteration in `[...]` to collect into an array",
-                    many.len(),
+                    rest + 1,
                 ))));
             }
         };
 
-        // Build a value-only document for the re-emit path.
-        let new_value = serde_json_to_dq_value(single);
-        let new_doc = Document::value_only(new_value, document.format());
+        // Build a value-only document for the re-emit path. A NaN or an
+        // infinity is a float here: YAML / TOML write it, JSON fails.
+        let new_doc = rebuild_document(&document, target, single, path)?;
 
         // Re-emit through `write_with_options` so global `--sort-keys` /
         // `--indent` are honoured (this is one of the differences vs the
@@ -307,6 +354,21 @@ impl<'a> FileOp for JqFileOp<'a> {
         format
             .write_with_options(&new_doc, &mut final_bytes, &self.cli.write_options())
             .map_err(anyhow::Error::new)?;
+
+        // The guard let the file's templates through: the writer must
+        // write every template the filter's output holds so that it reads
+        // back as the same string, and still does not change the reading.
+        if dq_core::template_guard::detect_templates(&original_bytes).is_some() {
+            dq_core::template_guard::check_templates_kept(
+                new_doc.value(),
+                &[],
+                &original_bytes,
+                false,
+                &final_bytes,
+                |b| parse_for_edit(format, b),
+            )
+            .map_err(anyhow::Error::new)?;
+        }
 
         // Diff handling mirrors the splice path's `SetFileOp::apply`: only
         // compute the diff when `--diff` is set.
@@ -330,6 +392,51 @@ impl<'a> FileOp for JqFileOp<'a> {
     }
 }
 
+/// The document `set --jq` writes back, given the filter's single output.
+///
+/// A multi-document stream stays one, so the writer emits every document
+/// with its `---` instead of one document holding a sequence: with
+/// `--doc N` (`target`) the output replaces document `N` alone; without it
+/// the filter saw the array of the documents and must return such an
+/// array — a non-empty one, each item becoming a document.
+///
+/// # Errors
+///
+/// [`InvalidInput`] (exit 6) when a filter over a whole stream returns
+/// anything but an array, or an empty one — that would write a file with
+/// no document at all. With `--doc N` any value is that document's.
+fn rebuild_document(
+    document: &Document,
+    target: Option<usize>,
+    output: Value,
+    path: &Utf8Path,
+) -> anyhow::Result<Document> {
+    let Some(values) = document.values() else {
+        return Ok(Document::value_only(output, document.format()).with_layout_of(document));
+    };
+    match (target, output) {
+        (Some(index), output) => {
+            let mut documents = values.to_vec();
+            documents[index] = output;
+            Ok(Document::multi_value_only(documents, document.format()))
+        }
+        (None, Value::Array(documents)) if documents.is_empty() => {
+            Err(anyhow::Error::new(InvalidInput::new(format!(
+                "{path} is a stream of {} documents: --jq returned an empty array, which would leave the file with no document; pass --doc N to transform one document",
+                values.len(),
+            ))))
+        }
+        (None, Value::Array(documents)) => {
+            Ok(Document::multi_value_only(documents, document.format()))
+        }
+        (None, other) => Err(anyhow::Error::new(InvalidInput::new(format!(
+            "{path} is a stream of {} documents: --jq sees them as an array and must return an array of documents (got {}); pass --doc N to transform one document",
+            values.len(),
+            other.type_name(),
+        )))),
+    }
+}
+
 /// Compile the jq expression once and dispatch the bulk driver against the
 /// resulting [`JqFileOp`]. The engine is wrapped in an [`Arc`] so each rayon
 /// worker shares the same compiled filter (the engine is `Send + Sync` but
@@ -339,6 +446,7 @@ fn run_jq_transform(
     args: &SetArgs,
     expression: &str,
     input_format: Option<&str>,
+    doc_index: Option<usize>,
     use_color: bool,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
@@ -368,44 +476,17 @@ fn run_jq_transform(
     let engine = dq_transform::JqEngine::compile(expression)
         .map_err(|e| anyhow::Error::new(jq_compile_to_parse(e, &args.file, expression)))?;
 
+    let files = bulk::expand_glob(&args.file)?;
     let op = JqFileOp {
         cli,
         input_format,
+        doc_index,
+        several: files.len() > 1,
         use_color,
         engine: Arc::new(engine),
     };
-
-    let files = bulk::expand_glob(&args.file)?;
+    super::io_helpers::check_write_targets(cli, "set", &files, input_format)?;
     bulk::run_per_file(files, &op, cli, out)
-}
-
-/// Parse `parse_input` as `format` into a write-aware [`Document`].
-///
-/// YAML and JSON are routed through the dedicated span-collecting parsers
-/// (`parse_yaml_with_spans` / `parse_json_with_spans`); every other format
-/// falls through to the generic `Format::parse` trait method (which is
-/// write-aware for TOML and read-only for JSONL).
-fn parse_to_document(
-    format: &'static dyn dq_core::Format,
-    parse_input: &[u8],
-    file: &Utf8Path,
-) -> anyhow::Result<Document> {
-    let path_label = camino::Utf8PathBuf::from(file);
-    let doc_result: dq_core::Result<Document> = match format.name() {
-        "yaml" => dq_core::parse_yaml_with_spans(parse_input),
-        "json" => dq_core::parse_json_with_spans(parse_input),
-        _ => format.parse(parse_input),
-    };
-    doc_result
-        .map_err(|mut e| {
-            if let dq_core::Error::Parse { ref mut file, .. } = e
-                && file.is_none()
-            {
-                *file = Some(path_label.clone());
-            }
-            e
-        })
-        .map_err(anyhow::Error::new)
 }
 
 /// Resolve the value-source flags into a [`Value`].
@@ -413,30 +494,38 @@ fn parse_to_document(
 /// Priority is the spec's: `--value-from <path>` wins over the inline
 /// argument; the inline argument's leading `-` reads stdin; a `@`-prefix
 /// treats the rest as a file path; otherwise the inline string is passed
-/// through the JSON-literal heuristic.
-fn resolve_value(args: &SetArgs) -> anyhow::Result<Value> {
+/// through the JSON-literal heuristic. A value file goes through the
+/// template guard as `templates` says, as every file dq reads does.
+///
+/// Stdin — `-`, `@-` or `--value-from -` — has no name to detect a format
+/// from, so it is read as the inline argument is: through the JSON-literal
+/// heuristic, honouring `--value-string`.
+fn resolve_value(args: &SetArgs, templates: TemplateMode) -> anyhow::Result<Value> {
     if let Some(path) = &args.value_from {
-        return value_from_file(path);
+        if path == "-" {
+            return value_from_stdin(args.value_string);
+        }
+        return value_from_file(path, templates);
     }
     let Some(inline) = &args.value else {
         return Err(anyhow::Error::new(InvalidInput::new(
             "missing value: provide an inline arg, --value-from, or '-' for stdin",
         )));
     };
-    if inline == "-" {
+    if inline == "-" || inline == "@-" {
         return value_from_stdin(args.value_string);
     }
     if let Some(path_str) = inline.strip_prefix('@') {
         let path = camino::Utf8PathBuf::from(path_str);
-        return value_from_file(&path);
+        return value_from_file(&path, templates);
     }
     Ok(parse_inline_value(inline, args.value_string))
 }
 
 /// Parse a file at `path` as a structured document and return its top-level
 /// value. Used by both `--value-from` and the `@<path>` shorthand.
-fn value_from_file(path: &Utf8Path) -> anyhow::Result<Value> {
-    let (_fmt, doc) = load_document_with_path(path, None)?;
+fn value_from_file(path: &Utf8Path, templates: TemplateMode) -> anyhow::Result<Value> {
+    let (_fmt, doc) = load_document_with_path(path, None, templates)?;
     Ok(doc.value().clone())
 }
 
@@ -474,73 +563,14 @@ fn parse_inline_value(s: &str, force_string: bool) -> Value {
         return Value::String(s.to_owned());
     }
     match serde_json::from_str::<serde_json::Value>(trimmed) {
-        Ok(json) => serde_json_to_dq_value(&json),
+        // A number keeps its literal as written: serde_json respells an
+        // exponent (`1e400` as `1e+400`).
+        Ok(serde_json::Value::Number(_)) => {
+            Value::from_number_literal(trimmed).unwrap_or_else(|| Value::String(s.to_owned()))
+        }
+        Ok(json) => Value::from_serde_json(&json),
         Err(_) => Value::String(s.to_owned()),
     }
-}
-
-/// Convert a [`serde_json::Value`] into a [`Value`].
-///
-/// This is the inverse of `io_helpers::value_to_serde_json`. Numbers that
-/// don't fit `i64` / `f64` are preserved as `BigInt` / `BigFloat` literals
-/// using the original textual representation so a `set` of a 22-digit
-/// integer round-trips byte-for-byte through `get`.
-fn serde_json_to_dq_value(v: &serde_json::Value) -> Value {
-    match v {
-        serde_json::Value::Null => Value::Null,
-        serde_json::Value::Bool(b) => Value::Bool(*b),
-        serde_json::Value::Number(n) => number_to_value(n),
-        serde_json::Value::String(s) => Value::String(s.clone()),
-        serde_json::Value::Array(items) => {
-            Value::Array(items.iter().map(serde_json_to_dq_value).collect())
-        }
-        serde_json::Value::Object(map) => {
-            let mut out = IndexMap::with_capacity(map.len());
-            for (k, child) in map {
-                out.insert(k.clone(), serde_json_to_dq_value(child));
-            }
-            Value::Map(out)
-        }
-    }
-}
-
-fn number_to_value(n: &serde_json::Number) -> Value {
-    // With the workspace's `arbitrary_precision` feature on `serde_json`,
-    // `Number::to_string()` returns the original textual literal verbatim —
-    // `as_i64()` / `as_f64()` lossily parse from that string and would
-    // collapse a 22-digit integer to a `Float(4.7e21)`. Mirror the parsing
-    // heuristic `dq-core::parsers::json::json_number_to_value` uses on the
-    // read side: try `i64` first, then float-with-round-trip, falling back
-    // to `BigInt` / `BigFloat` literals.
-    let literal = n.to_string();
-    if let Ok(i) = literal.parse::<i64>() {
-        return Value::Int(i);
-    }
-    if literal.contains('.') || literal.contains('e') || literal.contains('E') {
-        if let Ok(f) = f64::from_str(&literal)
-            && f.is_finite()
-            && f64_matches_literal(f, &literal)
-        {
-            return Value::Float(f);
-        }
-        return Value::BigFloat(literal);
-    }
-    Value::BigInt(literal)
-}
-
-/// Lossless-round-trip check for a parsed `f64` against its source literal.
-///
-/// Mirrors `dq_core::parsers::json::f64_matches_literal`: re-parse the
-/// shortest float formatting and compare for exact equality so cosmetic
-/// reformatting (e.g. `1e2` vs `100`) doesn't trigger the BigFloat branch.
-fn f64_matches_literal(f: f64, literal: &str) -> bool {
-    let formatted = format!("{f}");
-    f64::from_str(&formatted).is_ok_and(|round_trip| round_trip.to_bits() == f.to_bits())
-        && literal_round_trips_to(literal, f)
-}
-
-fn literal_round_trips_to(literal: &str, f: f64) -> bool {
-    f64::from_str(literal).is_ok_and(|parsed| parsed.to_bits() == f.to_bits())
 }
 
 #[cfg(test)]
@@ -837,6 +867,47 @@ mod tests {
         );
     }
 
+    /// `dq -i set <file> --jq <expression>` on a temp file holding `src`.
+    fn set_jq_in_place(suffix: &str, src: &str, expression: &str) -> (anyhow::Result<()>, String) {
+        let mut tmp = NamedTempFile::with_suffix(suffix).unwrap();
+        tmp.write_all(src.as_bytes()).unwrap();
+        let tmp = tmp.into_temp_path();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
+        let cli =
+            Cli::try_parse_from(["dq", "-i", "set", path.as_str(), "--jq", expression]).unwrap();
+        let args = SetArgs {
+            file: path.clone(),
+            pointer: None,
+            value: None,
+            value_from: None,
+            value_string: false,
+            no_create: false,
+            jq: Some(expression.to_owned()),
+        };
+        let mut out: Vec<u8> = Vec::new();
+        let result = run(&cli, &args, None, false, &mut out);
+        (result, std::fs::read_to_string(&path).unwrap())
+    }
+
+    #[test]
+    fn set_jq_leaves_an_untouched_nan_a_float() {
+        let (result, on_disk) = set_jq_in_place(".yaml", "x: .nan\ny: 1\n", ".y = 2");
+        result.expect("--jq succeeds");
+        // The writer quotes the key `y`, a bool to a YAML 1.1 reader.
+        assert_eq!(on_disk, "x: .nan\n'y': 2\n");
+        let (result, on_disk) = set_jq_in_place(".toml", "x = nan\ny = 1\n", ".y = 2");
+        result.expect("--jq succeeds");
+        assert_eq!(on_disk, "x = nan\ny = 2\n");
+    }
+
+    #[test]
+    fn set_jq_writing_a_nan_into_json_fails_and_leaves_the_file() {
+        let (result, on_disk) = set_jq_in_place(".json", "{\"y\": 1}\n", ".x = nan");
+        let err = result.expect_err("JSON has no NaN");
+        assert!(err.to_string().contains("non-finite float"), "{err:?}");
+        assert_eq!(on_disk, "{\"y\": 1}\n");
+    }
+
     #[test]
     fn set_jq_multi_output_filter_is_rejected() {
         // `.[]` yields each item separately — when applied to an array
@@ -1001,6 +1072,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_inline_value_keeps_a_number_literal_as_written() {
+        assert_eq!(
+            parse_inline_value("1e400", false),
+            Value::BigFloat("1e400".into())
+        );
+        assert_eq!(
+            parse_inline_value("0.10000000000000001", false),
+            Value::Float(0.1)
+        );
+        assert_eq!(
+            parse_inline_value("-.5", false),
+            Value::String("-.5".into())
+        );
+    }
+
+    #[test]
     fn parse_inline_value_force_string() {
         match parse_inline_value("42", true) {
             Value::String(s) if s == "42" => {}
@@ -1036,12 +1123,12 @@ mod tests {
     }
 
     #[test]
-    fn serde_json_to_dq_value_preserves_big_int() {
+    fn value_from_serde_json_preserves_big_int() {
         // 22-digit integer is outside `i64::MAX` range — must round-trip as
         // a `BigInt` literal so the bytes survive a set→get pair byte-for-byte.
         let raw = "4722366482869645213696";
         let json: serde_json::Value = serde_json::from_str(raw).unwrap();
-        match serde_json_to_dq_value(&json) {
+        match Value::from_serde_json(&json) {
             Value::BigInt(s) => assert_eq!(s, raw),
             other => panic!("expected BigInt, got: {other:?}"),
         }

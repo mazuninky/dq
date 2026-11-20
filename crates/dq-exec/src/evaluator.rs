@@ -35,13 +35,17 @@
 //! ## Robustness
 //!
 //! Compile-time failures (jq parse errors, glob parse errors) surface as
-//! [`crate::error::ExecError`] from [`Evaluator::new`]. Runtime failures
-//! during [`Evaluator::evaluate_file`] (a `check.jq` that crashes on a
-//! particular input shape, a `loc.line` expression that returns a
-//! non-integer, a `loc.pointer` expression that fails to parse) are
-//! logged via `tracing::warn!` / `tracing::trace!` and the offending
-//! rule falls through to the next step in the chain — the principle is
-//! that one badly-written rule must not crash the entire run.
+//! [`crate::error::ExecError`] from [`Evaluator::new`]. A rule that raises
+//! at run time does not crash the run: a `match.filter` or `check.jq` that
+//! raises on a particular input shape skips the rule for that document,
+//! and a `loc.file` / `loc.line` that raises falls back to the file under
+//! check / the document start. Each of these is a [`RuleError`], returned
+//! beside the diagnostics by [`Evaluator::evaluate`] so a caller can act
+//! on it: the fixture runner fails the case, while
+//! [`Evaluator::evaluate_file`] (what `dq lint` runs) logs each one as a
+//! `tracing::warn!` and keeps going. Fall-through cases that are normal
+//! (a `loc.pointer` with no span, a `loc.line` that returns a
+//! non-integer) are `tracing::trace!` only and not rule errors.
 
 use std::sync::Arc;
 
@@ -78,6 +82,135 @@ pub struct Evaluator {
     max_extract_depth: usize,
 }
 
+/// The jq expression of a rule that raised at run time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RuleErrorStage {
+    /// `match.filter` raised; the rule was skipped for the document.
+    MatchFilter,
+    /// `check.jq` raised; the rule was skipped for the document.
+    CheckJq,
+    /// `loc.file` raised; the diagnostic names the file under check.
+    LocFile,
+    /// `loc.line` raised; the diagnostic points at the document start.
+    LocLine,
+}
+
+impl RuleErrorStage {
+    /// The rule field that raised, as a rule author writes it
+    /// (`"check.jq"`).
+    #[must_use]
+    pub fn field(self) -> &'static str {
+        match self {
+            Self::MatchFilter => "match.filter",
+            Self::CheckJq => "check.jq",
+            Self::LocFile => "loc.file",
+            Self::LocLine => "loc.line",
+        }
+    }
+
+    /// What the evaluator did about it, worded for the `dq lint` warning.
+    fn consequence(self) -> &'static str {
+        match self {
+            Self::MatchFilter | Self::CheckJq => "skipping rule for this file",
+            Self::LocFile => "falling back to file under check",
+            Self::LocLine => "defaulting to line 1",
+        }
+    }
+}
+
+impl std::fmt::Display for RuleErrorStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.field())
+    }
+}
+
+/// A rule's jq expression raised a runtime error on a document — a bug
+/// in the rule (it indexes a field of a type it did not expect), not in
+/// the document. The evaluator recovers (see [`RuleErrorStage`]) and
+/// reports it here instead of failing the run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleError {
+    /// Id of the rule that raised (for a composite rule's `nested` rule,
+    /// the nested rule's id).
+    pub rule_id: String,
+    /// Which of the rule's expressions raised.
+    pub stage: RuleErrorStage,
+    /// The jq error, as `jq runtime error: …`.
+    pub error: String,
+}
+
+impl RuleError {
+    fn new(rule: &CompiledRule, stage: RuleErrorStage, error: &dq_transform::JqError) -> Self {
+        Self {
+            rule_id: rule.rule.id.clone(),
+            stage,
+            error: error.to_string(),
+        }
+    }
+
+    /// Log the error as `dq lint` reports it: a `tracing::warn!` naming
+    /// the field, what the evaluator did, the rule id and the jq error.
+    pub fn warn(&self) {
+        tracing::warn!(
+            rule_id = %self.rule_id,
+            error = %self.error,
+            "{} raised a runtime error; {}",
+            self.stage.field(),
+            self.stage.consequence(),
+        );
+    }
+}
+
+impl std::fmt::Display for RuleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "rule={} {}: {}", self.rule_id, self.stage, self.error)
+    }
+}
+
+/// What [`Evaluator::evaluate`] found in one document: the diagnostics,
+/// and the rules that raised on the way (in rule order).
+#[derive(Debug, Clone, Default)]
+pub struct Evaluation {
+    /// One per violation, in rule order.
+    pub diagnostics: Vec<Diagnostic>,
+    /// One per rule expression that raised. Non-empty means some rule
+    /// did not (fully) run on this document.
+    pub rule_errors: Vec<RuleError>,
+    /// Log each [`RuleError`] as it is recorded (see
+    /// [`Evaluator::evaluate_file`]); [`Evaluator::evaluate`] stays quiet.
+    log_rule_errors: bool,
+}
+
+impl Evaluation {
+    /// An empty evaluation that logs every [`RuleError`] with
+    /// [`RuleError::warn`] the moment it is recorded, so the warnings
+    /// interleave with the ones other stages log immediately.
+    fn logging() -> Self {
+        Self {
+            log_rule_errors: true,
+            ..Self::default()
+        }
+    }
+
+    /// An empty evaluation that reports errors the way `self` does —
+    /// for a nested rule's run, whose errors are then appended to
+    /// `self` already logged.
+    pub(crate) fn empty_like(&self) -> Self {
+        Self {
+            log_rule_errors: self.log_rule_errors,
+            ..Self::default()
+        }
+    }
+
+    /// Record a rule error, logging it first when this evaluation logs.
+    fn record_rule_error(&mut self, error: RuleError) {
+        if self.log_rule_errors {
+            error.warn();
+        }
+        self.rule_errors.push(error);
+    }
+}
+
 /// Per-[`Evaluator::new`] cache for compiled jq filters.
 ///
 /// `Evaluator::new` walks every rule's six potential jq-bearing fields
@@ -99,8 +232,8 @@ pub struct Evaluator {
 ///   intentional: a global cache would leak in long-lived processes and
 ///   would have to thread test isolation through every fixture that
 ///   pokes at a bad expression on purpose. See
-///   [`openspec/changes/perf-jq-compile-cache/design.md`] §3 for the
-///   full rationale.
+///   `docs/plans/perf-jq-compile-cache.md` ("Why not a process-wide cache")
+///   for the full rationale.
 /// - **Exact-string cache key.** No hashing, no whitespace
 ///   normalisation — `". + 1"` and ".+1" are different keys. The miss
 ///   cost is one compile; the hit cost is an `Arc::clone` (refcount
@@ -318,11 +451,16 @@ impl Evaluator {
     /// Phase 2 of `add-ir-foundation` switched the input from
     /// `&serde_json::Value` to a borrowed [`dq_core::Ir<'_>`] so the
     /// evaluator can resolve `loc.pointer` against the input's provenance
-    /// map / source bytes via [`dq_core::Ir::line_col_for`]. Internally
-    /// the evaluator still feeds jq through `serde_json::Value` (jaq's
-    /// native shape), but the borrowed `Ir` carries the metadata needed
-    /// for span-aware diagnostic positions without forcing every caller
-    /// onto a span-preserving jaq fork.
+    /// map / source bytes via [`dq_core::Ir::line_col_for`]. The
+    /// document-level jq engines run over `ir.value()` (a NaN in the file
+    /// is a jq number there); the borrowed `Ir` also carries the metadata
+    /// needed for span-aware diagnostic positions without forcing every
+    /// caller onto a span-preserving jaq fork.
+    ///
+    /// A rule that raises is logged as a `tracing::warn!` (see
+    /// [`RuleError::warn`]) at the moment it raises, in step with the
+    /// composite-rule warnings, and otherwise ignored; [`Evaluator::evaluate`]
+    /// returns those errors instead.
     #[must_use]
     pub fn evaluate_file(
         &self,
@@ -330,26 +468,43 @@ impl Evaluator {
         ir: &dq_core::Ir<'_>,
         format_name: &str,
     ) -> Vec<Diagnostic> {
-        // Convert once at the boundary: jaq still consumes
-        // `serde_json::Value` (the native shape), so we materialise it
-        // here and pass it to every per-rule jq engine. The `Ir` itself
-        // is forwarded into per-rule helpers so they retain access to
-        // [`dq_core::Ir::line_col_for`] for `loc.pointer` resolution.
-        let value = ir.value().to_serde_json();
-        let mut diagnostics = Vec::new();
+        self.evaluate_into(Evaluation::logging(), path, ir, format_name)
+            .diagnostics
+    }
+
+    /// Run every applicable rule against `ir`, as
+    /// [`Evaluator::evaluate_file`] does, and return the diagnostics
+    /// together with every [`RuleError`] — a rule expression that raised
+    /// on this document. Nothing is logged.
+    #[must_use]
+    pub fn evaluate(&self, path: &Utf8Path, ir: &dq_core::Ir<'_>, format_name: &str) -> Evaluation {
+        self.evaluate_into(Evaluation::default(), path, ir, format_name)
+    }
+
+    fn evaluate_into(
+        &self,
+        mut evaluation: Evaluation,
+        path: &Utf8Path,
+        ir: &dq_core::Ir<'_>,
+        format_name: &str,
+    ) -> Evaluation {
+        // The jq engines and the JSON Schema validator both run over
+        // `ir.value()` itself (see [`run_on_document`] and
+        // [`crate::schema_value`]); the `Ir` also gives the per-rule
+        // helpers [`dq_core::Ir::line_col_for`] for `loc.pointer`
+        // resolution.
         for rule in &self.rules {
             evaluate_one_rule_at_depth(
                 rule,
                 path,
                 ir,
-                &value,
                 format_name,
                 0,
                 self.max_extract_depth,
-                &mut diagnostics,
+                &mut evaluation,
             );
         }
-        diagnostics
+        evaluation
     }
 
     /// Iterate over the rules compiled into this evaluator.
@@ -481,8 +636,12 @@ fn compile_check(
                 message: message.clone(),
             })
         }
-        Check::Schema { schema, message } => {
-            let compiled = compile_inline(&rule.id, schema, message.clone())?;
+        Check::Schema {
+            schema,
+            message,
+            notes,
+        } => {
+            let compiled = compile_inline(&rule.id, schema, notes, message.clone())?;
             Ok(CompiledCheck::Schema(compiled))
         }
         Check::SchemaFile {
@@ -538,15 +697,11 @@ fn compile_check(
     }
 }
 
-/// Run the per-rule pipeline against `(path, ir, value, format_name)` and
-/// push any resulting diagnostics into `out`. `current_depth` /
+/// Run the per-rule pipeline against `(path, ir, format_name)` and
+/// push any resulting diagnostics and rule errors into `out`. `current_depth` /
 /// `max_depth` carry the composite-recursion budget so a `Composite`
 /// dispatch can recurse into its `nested` rule and trip the bound
-/// without crashing.
-///
-/// `value` is the result of `ir.value().to_serde_json()` — pre-computed
-/// once per file by the caller so each rule's jq engines can reuse it
-/// without paying for the conversion N times.
+/// without crashing. Every check runs over `ir.value()` itself.
 ///
 /// Crate-internal: [`crate::composite::run_composite`] re-enters this
 /// helper on the `nested` rule with `current_depth + 1`, so the composite
@@ -557,11 +712,10 @@ pub(crate) fn evaluate_one_rule_at_depth(
     rule: &CompiledRule,
     path: &Utf8Path,
     ir: &dq_core::Ir<'_>,
-    value: &serde_json::Value,
     format_name: &str,
     current_depth: usize,
     max_depth: usize,
-    out: &mut Vec<Diagnostic>,
+    out: &mut Evaluation,
 ) {
     // 1. Format match.
     if !rule.rule.match_.format.iter().any(|f| f == format_name) {
@@ -577,24 +731,17 @@ pub(crate) fn evaluate_one_rule_at_depth(
 
     // 3. Filter match.
     if let Some(filter) = rule.filter_engine.as_ref() {
-        match filter.run(value) {
+        match run_on_document(filter, ir.value()) {
             Ok(out) => {
                 let Some(first) = out.first() else {
                     return;
                 };
-                if matches!(
-                    first,
-                    serde_json::Value::Bool(false) | serde_json::Value::Null
-                ) {
+                if !is_truthy(first) {
                     return;
                 }
             }
             Err(err) => {
-                tracing::warn!(
-                    rule_id = %rule.rule.id,
-                    error = %err,
-                    "match.filter raised a runtime error; skipping rule for this file",
-                );
+                out.record_rule_error(RuleError::new(rule, RuleErrorStage::MatchFilter, &err));
                 return;
             }
         }
@@ -603,37 +750,49 @@ pub(crate) fn evaluate_one_rule_at_depth(
     // 4. Check eval — dispatch on the compiled check variant.
     match &rule.check {
         CompiledCheck::Jq { engine, message } => {
-            let violations = match engine.run(value) {
+            let violations = match run_on_document(engine, ir.value()) {
                 Ok(v) => v,
                 Err(err) => {
-                    tracing::warn!(
-                        rule_id = %rule.rule.id,
-                        error = %err,
-                        "check.jq raised a runtime error; skipping rule for this file",
-                    );
+                    out.record_rule_error(RuleError::new(rule, RuleErrorStage::CheckJq, &err));
                     return;
                 }
             };
             for violation in &violations {
-                out.push(build_jq_diagnostic(rule, path, ir, violation, message));
+                let diagnostic = build_jq_diagnostic(rule, path, ir, violation, message, out);
+                out.diagnostics.push(diagnostic);
             }
         }
         CompiledCheck::Schema(compiled) => {
-            run_schema_check(rule, compiled, path, ir, value, out);
+            run_schema_check(rule, compiled, path, ir, out);
         }
         CompiledCheck::Composite(compiled) => {
-            run_composite(
-                rule,
-                compiled,
-                path,
-                ir,
-                value,
-                current_depth,
-                max_depth,
-                out,
-            );
+            run_composite(rule, compiled, path, ir, current_depth, max_depth, out);
         }
     }
+}
+
+/// Run a document-level jq engine (`match.filter`, `check.jq`, a
+/// composite `extract`, a fix) over the document's own value.
+///
+/// The document goes to jq as a [`dq_core::Value`], so a NaN or an
+/// infinity in the file is a jq number there (`type == "number"`,
+/// `isnan`), not the string `serde_json::Value` would make of it, and a
+/// big number keeps its exact literal. The outputs stay
+/// [`dq_core::Value`]s for the same reason: they feed `loc.*`
+/// expressions, messages, `extract:` items and truthiness checks, and a
+/// NaN a check returns is a number for `loc.*` too.
+pub(crate) fn run_on_document(
+    engine: &JqEngine,
+    value: &dq_core::Value,
+) -> std::result::Result<Vec<dq_core::Value>, dq_transform::JqError> {
+    engine.run_value(value)
+}
+
+/// jq truthiness: everything but `false` and `null` holds. The first
+/// output of a `match.filter` (or a fix's gate) must hold for the rule to
+/// run.
+pub(crate) fn is_truthy(value: &dq_core::Value) -> bool {
+    !matches!(value, dq_core::Value::Bool(false) | dq_core::Value::Null)
 }
 
 /// Render a diagnostic for one jq-driven violation value.
@@ -641,12 +800,13 @@ fn build_jq_diagnostic(
     rule: &CompiledRule,
     path: &Utf8Path,
     ir: &dq_core::Ir<'_>,
-    violation: &serde_json::Value,
+    violation: &dq_core::Value,
     message_template: &str,
+    out: &mut Evaluation,
 ) -> Diagnostic {
     let message = template::render(message_template, violation);
-    let file = resolve_loc_file(rule, path, violation);
-    let (line, col) = resolve_loc_position(rule, ir, violation);
+    let file = resolve_loc_file(rule, path, violation, out);
+    let (line, col) = resolve_loc_position(rule, ir, violation, out);
     Diagnostic {
         rule_id: rule.rule.id.clone(),
         severity: rule.rule.severity,
@@ -665,24 +825,29 @@ fn build_jq_diagnostic(
 ///
 /// Each error's `instance_path` is parsed as an RFC 6901 [`Pointer`];
 /// when the IR has a span for that pointer, the diagnostic's
-/// `(line, col)` come from `Ir::line_col_for`. The message format is
-/// `<message_prefix><keyword_location>: <error>` so reporters can show
-/// both the schema location and the human-readable explanation.
+/// `(line, col)` come from `Ir::line_col_for`. The message is
+/// `[<message_prefix>: ]<keyword_location>: <error>` (see
+/// [`schema_message`]) so reporters can show both the schema location and
+/// the human-readable explanation.
 ///
 /// `loc.file`, `loc.pointer`, and `loc.line` overrides on the rule are
 /// honored via the same [`resolve_loc_file`] / [`resolve_loc_position`]
 /// helpers that the jq path uses. The `violation` argument passed to
-/// those helpers is the JSON value at the schema error's
+/// those helpers is the document's value at the schema error's
 /// `instance_path` (or `Null` when the pointer is unresolvable), so any
 /// jq expressions in the `loc.*` fields run against meaningful context.
+///
+/// The validator reads `ir.value()` through [`crate::schema_value`]: a
+/// NaN, an infinity and a big number are numbers to it, and its messages
+/// spell them `.nan` / `.inf` / `-.inf` / the exact literal.
 fn run_schema_check(
     rule: &CompiledRule,
     compiled: &CompiledSchemaCheck,
     path: &Utf8Path,
     ir: &dq_core::Ir<'_>,
-    value: &serde_json::Value,
-    out: &mut Vec<Diagnostic>,
+    out: &mut Evaluation,
 ) {
+    let value = ir.value();
     // Dedup key per `run_schema_check` invocation. JSON Schemas may
     // declare the same constraint at multiple schema locations
     // (e.g. a top-level `required` plus an `allOf`/`oneOf` subschema
@@ -695,14 +860,20 @@ fn run_schema_check(
     // because two legitimately-distinct rules can produce the same
     // `(instance_path, error_text)` against the same file.
     let mut seen: IndexSet<(String, String, String)> = IndexSet::new();
-    for error in compiled.validator.iter_errors(value) {
+    let mut evaluation_paths =
+        crate::schema_value::EvaluationPaths::new(&compiled.validator, value);
+    for error in compiled
+        .validator
+        .iter_errors(crate::schema_value::DqNode(value))
+    {
+        let evaluation_path = evaluation_paths.of(&error);
         let pointer_str = error.instance_path().as_str();
         // The validator's error text (without the schema_path prefix)
         // is what the user sees as the actual violation. Use it for
         // dedup so duplicates at different `schema_path` locations
         // collapse, while distinct violations at the same path
         // (different `error_text`) are preserved.
-        let error_text = error.to_string();
+        let error_text = crate::schema_value::error_text(&error);
         let dedup_key = (
             rule.rule.id.clone(),
             pointer_str.to_owned(),
@@ -714,44 +885,45 @@ fn run_schema_check(
 
         // Lift the offending sub-value out of the document so any
         // `loc.*` jq expressions run against the same shape an
-        // equivalent jq check would have produced. `serde_json::Value::pointer`
-        // accepts the same RFC 6901 string the validator produced.
-        let violation = value
-            .pointer(pointer_str)
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        let file = resolve_loc_file(rule, path, &violation);
+        // equivalent jq check would have produced.
+        let violation = Pointer::parse(pointer_str)
+            .ok()
+            .and_then(|pointer| pointer.resolve(value).ok().cloned())
+            .unwrap_or(dq_core::Value::Null);
+        let file = resolve_loc_file(rule, path, &violation, out);
         let (line, col) = if rule.has_position_override() {
             // The user opted into overrides; trust whatever the chain
             // returned, including the (1, 1) default that signals an
             // override miss.
-            resolve_loc_position(rule, ir, &violation)
+            resolve_loc_position(rule, ir, &violation, out)
         } else {
             // No override set — fall back to the intrinsic
             // `instance_path → span` lookup the schema check used
             // before Phase 2.
             match Pointer::parse(pointer_str) {
-                Ok(pointer) => ir.line_col_for(&pointer).unwrap_or((1, 1)),
+                Ok(pointer) => ir
+                    .line_col_for(&pointer)
+                    .unwrap_or_else(|| ir.origin_line_col()),
                 Err(parse_err) => {
                     tracing::trace!(
                         rule_id = %rule.rule.id,
                         pointer = %pointer_str,
                         error = %parse_err,
-                        "schema instance_path failed to parse as RFC 6901; defaulting to (1, 1)",
+                        "schema instance_path failed to parse as RFC 6901; defaulting to the document start",
                     );
-                    (1, 1)
+                    ir.origin_line_col()
                 }
             }
         };
-        let prefix = compiled.message_prefix.as_deref().unwrap_or("");
         // `evaluation_path()` is the dynamic path *including* `$ref`
         // traversals (`/properties/x/$ref/enum`) — what jsonschema
         // ≤ 0.38 exposed as `schema_path`. Since 0.39 `schema_path()` is
         // the canonical location without `$ref` (`/$defs/codes/enum`);
         // using it would silently change every diagnostic under a `$ref`.
-        let keyword = error.evaluation_path().as_str();
-        let message = format!("{prefix}{keyword}: {error_text}");
-        out.push(Diagnostic {
+        // dq's own keywords get theirs from `EvaluationPaths`.
+        let keyword = evaluation_path.as_str();
+        let message = schema_message(compiled.message_prefix.as_deref(), keyword, &error_text);
+        out.diagnostics.push(Diagnostic {
             rule_id: rule.rule.id.clone(),
             severity: rule.rule.severity,
             message,
@@ -765,29 +937,56 @@ fn run_schema_check(
     }
 }
 
+/// The message of one schema validation error: `<keyword>: <error_text>`,
+/// behind the rule's `message` prefix and `: ` when the rule has one — the
+/// separator a composite puts between its `message` and a nested
+/// diagnostic. Trailing whitespace and one trailing `:` of the prefix are
+/// dropped first, so `shape`, `shape:` and `shape: ` all give
+/// `shape: /required: …`; a blank prefix is no prefix.
+fn schema_message(prefix: Option<&str>, keyword: &str, error_text: &str) -> String {
+    prefixed(
+        prefix.unwrap_or_default(),
+        &format!("{keyword}: {error_text}"),
+    )
+}
+
+/// `rest` behind a rule's `message` prefix and `: ` — how a schema rule
+/// puts its prefix ahead of each error and a composite rule ahead of each
+/// nested diagnostic and parse failure. Trailing whitespace and one
+/// trailing `:` of the prefix are dropped first, so `shape`, `shape:` and
+/// `shape: ` read alike; a blank prefix is no prefix and `rest` stands
+/// alone.
+pub(crate) fn prefixed(prefix: &str, rest: &str) -> String {
+    let prefix = prefix.trim_end();
+    let prefix = prefix.strip_suffix(':').unwrap_or(prefix).trim_end();
+    if prefix.is_empty() {
+        rest.to_owned()
+    } else {
+        format!("{prefix}: {rest}")
+    }
+}
+
 /// Resolve the `file` field for the diagnostic. When `loc.file` is set
 /// and produces a non-empty string, use that; otherwise default to the
-/// file under check.
+/// file under check. A `loc.file` that raises is a [`RuleError`] recorded
+/// on the [`Evaluation`].
 fn resolve_loc_file(
     rule: &CompiledRule,
     path: &Utf8Path,
-    violation: &serde_json::Value,
+    violation: &dq_core::Value,
+    errors: &mut Evaluation,
 ) -> Option<Utf8PathBuf> {
     if let Some(engine) = rule.loc_file_engine.as_ref() {
-        match engine.run(violation) {
+        match engine.run_value(violation) {
             Ok(out) => {
-                if let Some(serde_json::Value::String(s)) = out.first()
+                if let Some(dq_core::Value::String(s)) = out.first()
                     && !s.is_empty()
                 {
                     return Some(Utf8PathBuf::from(s));
                 }
             }
             Err(err) => {
-                tracing::warn!(
-                    rule_id = %rule.rule.id,
-                    error = %err,
-                    "loc.file raised a runtime error; falling back to file under check",
-                );
+                errors.record_rule_error(RuleError::new(rule, RuleErrorStage::LocFile, &err));
             }
         }
     }
@@ -820,14 +1019,15 @@ fn resolve_loc_file(
 fn resolve_loc_position(
     rule: &CompiledRule,
     ir: &dq_core::Ir<'_>,
-    violation: &serde_json::Value,
+    violation: &dq_core::Value,
+    errors: &mut Evaluation,
 ) -> (u32, u32) {
     // Step 1: loc.pointer.
     if let Some(engine) = rule.loc_pointer_engine.as_ref() {
-        match engine.run(violation) {
+        match engine.run_value(violation) {
             Ok(out) => {
                 if let Some(first) = out.first() {
-                    if let serde_json::Value::String(s) = first
+                    if let dq_core::Value::String(s) = first
                         && !s.is_empty()
                     {
                         match Pointer::parse(s) {
@@ -889,46 +1089,29 @@ fn resolve_loc_position(
 
     // Step 2: loc.line (M8 legacy path).
     if let Some(engine) = rule.loc_line_engine.as_ref() {
-        match engine.run(violation) {
+        match engine.run_value(violation) {
             Ok(out) => {
-                if let Some(first) = out.first() {
-                    if let Some(n) = first.as_u64()
-                        && n >= 1
-                        && n <= u64::from(u32::MAX)
-                    {
-                        let line = u32::try_from(n).unwrap_or(1);
-                        tracing::trace!(
-                            rule_id = %rule.rule.id,
-                            line,
-                            "loc.line legacy path resolved",
-                        );
-                        return (line, 1);
-                    } else if let Some(n) = first.as_i64()
-                        && n >= 1
-                        && n <= i64::from(u32::MAX)
-                    {
-                        let line = u32::try_from(n).unwrap_or(1);
-                        tracing::trace!(
-                            rule_id = %rule.rule.id,
-                            line,
-                            "loc.line legacy path resolved",
-                        );
-                        return (line, 1);
-                    }
+                if let Some(dq_core::Value::Int(n)) = out.first()
+                    && let Ok(line) = u32::try_from(*n)
+                    && line >= 1
+                {
+                    tracing::trace!(
+                        rule_id = %rule.rule.id,
+                        line,
+                        "loc.line legacy path resolved",
+                    );
+                    return (line, 1);
                 }
             }
             Err(err) => {
-                tracing::warn!(
-                    rule_id = %rule.rule.id,
-                    error = %err,
-                    "loc.line raised a runtime error; defaulting to line 1",
-                );
+                errors.record_rule_error(RuleError::new(rule, RuleErrorStage::LocLine, &err));
             }
         }
     }
 
-    // Step 3: default.
-    (1, 1)
+    // Step 3: default — the top of the file, or of the document for one
+    // document of a stream.
+    ir.origin_line_col()
 }
 
 #[cfg(test)]
@@ -938,6 +1121,17 @@ mod tests {
     use crate::ruleset::RuleSource;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+
+    #[test]
+    fn prefixed_trims_one_colon_and_blanks_and_drops_a_blank_prefix() {
+        for prefix in ["cfg", "cfg:", "cfg: ", "cfg :  "] {
+            assert_eq!(prefixed(prefix, "rest"), "cfg: rest", "{prefix:?}");
+        }
+        assert_eq!(prefixed("cfg::", "rest"), "cfg:: rest");
+        for blank in ["", "  ", " : "] {
+            assert_eq!(prefixed(blank, "rest"), "rest", "{blank:?}");
+        }
+    }
 
     /// Build a minimal ruleset by parsing one or more YAML rule documents.
     fn ruleset_from_yaml(yaml: &str) -> RuleSet {
@@ -991,6 +1185,80 @@ check:
         assert_eq!(diags[0].file.as_ref().unwrap(), &path);
         assert_eq!(diags[0].line, 1);
         assert_eq!(diags[0].col, 1);
+    }
+
+    #[test]
+    fn evaluator_runs_jq_over_a_yaml_nan_as_a_number() {
+        let rule = r#"
+id: test.x-is-nan
+description: x must not be NaN
+severity: error
+match:
+  format: yaml
+  filter: '.x | type == "number"'
+check:
+  jq: 'select(.x | isnan) | {t: (.x | type)}'
+  message: 'x is a NaN {{ .t }}'
+"#;
+        let eval = evaluator_from_yaml(rule);
+        let doc = dq_core::parse_yaml_with_spans(b"x: .nan\n").expect("parse yaml");
+        let diags = eval.evaluate_file(&Utf8PathBuf::from("doc.yaml"), &doc.as_ir(), "yaml");
+        let messages: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(messages, ["x is a NaN number"]);
+    }
+
+    #[test]
+    fn loc_runs_over_a_violation_nan_as_a_number() {
+        // The violation is the NaN itself; `loc.pointer` / `loc.file` /
+        // `loc.line` see a jq number, so `isnan` holds instead of raising
+        // on the string a serde_json copy made of it.
+        let rule = r#"
+id: test.loc-nan
+description: x
+severity: error
+match:
+  format: yaml
+check:
+  jq: '.x | select(isnan)'
+  message: 'x is {{ . }}'
+loc:
+  pointer: 'if isnan then "/x" else "/nope" end'
+  file: 'if isnan then "nan.yaml" else "other.yaml" end'
+"#;
+        let eval = evaluator_from_yaml(rule);
+        let doc = dq_core::parse_yaml_with_spans(b"a: 1\nx: .nan\n").expect("parse yaml");
+        let diags = eval.evaluate_file(&Utf8PathBuf::from("doc.yaml"), &doc.as_ir(), "yaml");
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].message, "x is .nan");
+        assert_eq!((diags[0].line, diags[0].col), (2, 4));
+        assert_eq!(diags[0].file.as_deref(), Some(Utf8Path::new("nan.yaml")));
+    }
+
+    #[test]
+    fn schema_check_reads_a_yaml_nan_as_a_number() {
+        let rule = r#"
+id: test.schema-nan
+description: x
+severity: error
+match:
+  format: yaml
+check:
+  schema:
+    properties:
+      n: { type: number }
+      s: { type: string }
+loc:
+  line: 'if isnan then 7 else 9 end'
+"#;
+        let eval = evaluator_from_yaml(rule);
+        let doc = dq_core::parse_yaml_with_spans(b"n: .nan\ns: -.inf\n").expect("parse yaml");
+        let diags = eval.evaluate_file(&Utf8PathBuf::from("doc.yaml"), &doc.as_ir(), "yaml");
+        let messages: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            [r#"/properties/s/type: -.inf is not of type "string""#]
+        );
+        assert_eq!(diags[0].line, 9, "loc.line ran over the -.inf: not a NaN");
     }
 
     #[test]
@@ -1864,5 +2132,86 @@ check:
             !Arc::ptr_eq(a, b),
             "cache must not persist across two `Evaluator::new` invocations",
         );
+    }
+
+    /// A rule expression that raises comes back as a [`RuleError`] per
+    /// stage — the rule id, the field, the jq error — beside whatever
+    /// diagnostics the other rules produced.
+    #[test]
+    fn evaluate_returns_a_rule_error_per_raising_expression() {
+        let eval = evaluator_from_yaml(
+            r#"
+id: t.filter
+description: d
+severity: error
+match:
+  format: yaml
+  filter: '.spec.x'
+check:
+  jq: '.'
+  message: m
+---
+id: t.check
+description: d
+severity: error
+match:
+  format: yaml
+check:
+  jq: '.spec.x'
+  message: m
+---
+id: t.loc
+description: d
+severity: error
+match:
+  format: yaml
+check:
+  jq: '.'
+  message: fired
+loc:
+  file: '.spec.x'
+  line: '.spec.y'
+"#,
+        );
+        let owned = ir_for_test(&json!({"spec": "s"}), "yaml");
+        let path = Utf8PathBuf::from("doc.yaml");
+        let evaluation = eval.evaluate(&path, &owned.to_borrowed(), "yaml");
+        let error = |rule: &str, stage, field: &str| RuleError {
+            rule_id: rule.to_owned(),
+            stage,
+            error: format!("jq runtime error: cannot index \"s\" with \"{field}\""),
+        };
+        assert_eq!(
+            evaluation.rule_errors,
+            vec![
+                error("t.filter", RuleErrorStage::MatchFilter, "x"),
+                error("t.check", RuleErrorStage::CheckJq, "x"),
+                error("t.loc", RuleErrorStage::LocFile, "x"),
+                error("t.loc", RuleErrorStage::LocLine, "y"),
+            ]
+        );
+        // `loc.*` raising degrades the position; the diagnostic stays.
+        assert_eq!(evaluation.diagnostics.len(), 1);
+        assert_eq!(evaluation.diagnostics[0].rule_id, "t.loc");
+        assert_eq!(evaluation.diagnostics[0].file, Some(path.clone()));
+        assert_eq!(
+            evaluation.rule_errors[1].to_string(),
+            "rule=t.check check.jq: jq runtime error: cannot index \"s\" with \"x\""
+        );
+        // `evaluate_file` logs the same errors and returns the same
+        // diagnostics.
+        let logged = eval.evaluate_file(&path, &owned.to_borrowed(), "yaml");
+        assert_eq!(logged.len(), 1);
+        assert_eq!(logged[0].message, evaluation.diagnostics[0].message);
+    }
+
+    #[test]
+    fn evaluate_reports_no_rule_error_for_a_clean_run() {
+        let eval = evaluator_from_yaml(RULE_NAME_NOT_EMPTY);
+        let owned = ir_for_test(&json!({"name": ""}), "yaml");
+        let evaluation =
+            eval.evaluate(&Utf8PathBuf::from("doc.yaml"), &owned.to_borrowed(), "yaml");
+        assert_eq!(evaluation.diagnostics.len(), 1);
+        assert!(evaluation.rule_errors.is_empty());
     }
 }

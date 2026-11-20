@@ -1,8 +1,8 @@
 //! Component tests for the Dockerfile parser (read-only).
 //!
-//! The Dockerfile format is read-only by design (D6). Stage 2's inline
-//! tests cover one happy path + the read-only write rejection. These tests
-//! pin extension/filename detection, the COPY argument shape, and the
+//! The Dockerfile format is read-only by design (D6). These tests pin
+//! extension/filename detection, the source-line `line` field, the COPY
+//! argument shape (shell form → string, JSON form → array), and the
 //! read-only write contract.
 
 use camino::Utf8Path;
@@ -42,9 +42,7 @@ fn parse_two_instructions_emits_array_of_two_maps() {
         Some(&Value::String("alpine:latest".into())),
         "FROM with no alias must use the String shape, not Array",
     );
-    // `line` is the 1-based instruction index in the M5 baseline (no real
-    // line numbers from the upstream crate). Pinning it as Int(1) anchors the
-    // contract so the field cannot quietly become `Null`.
+    // `line` is the 1-based source line where the instruction starts.
     assert_eq!(from_row.get("line"), Some(&Value::Int(1)));
 
     let Value::Map(run_row) = &items[1] else {
@@ -58,27 +56,32 @@ fn parse_two_instructions_emits_array_of_two_maps() {
 }
 
 #[test]
-fn parse_copy_with_two_args_emits_array_arguments() {
-    // `COPY src dst` parses as two strings (sources + destination). The
-    // implementation pushes destination onto the sources vec and runs the
-    // result through `string_or_array`, which yields an Array when len > 1.
+fn parse_copy_shell_form_is_a_string_and_json_form_an_array() {
+    // Shell form keeps the argument text as written; the JSON form keeps the
+    // exact array elements.
     let doc = dockerfile()
-        .parse(b"COPY src dst\n")
+        .parse(b"COPY src dst\nCOPY [\"a b\", \"dst\"]\n")
         .expect("COPY must parse");
     let Value::Array(items) = doc.value() else {
         panic!()
     };
     let Value::Map(row) = &items[0] else { panic!() };
     assert_eq!(row.get("instruction"), Some(&Value::String("COPY".into())));
-    let Some(Value::Array(args)) = row.get("arguments") else {
-        panic!(
-            "COPY with two args must produce Array<String>, got: {:?}",
-            row.get("arguments"),
-        );
-    };
-    assert_eq!(args.len(), 2);
-    assert_eq!(args[0], Value::String("src".into()));
-    assert_eq!(args[1], Value::String("dst".into()));
+    assert_eq!(
+        row.get("arguments"),
+        Some(&Value::String("src dst".into())),
+        "shell-form COPY must produce the argument text as a String",
+    );
+    let Value::Map(row) = &items[1] else { panic!() };
+    assert_eq!(
+        row.get("arguments"),
+        Some(&Value::Array(vec![
+            Value::String("a b".into()),
+            Value::String("dst".into()),
+        ])),
+        "JSON-form COPY must produce Array<String>",
+    );
+    assert_eq!(row.get("line"), Some(&Value::Int(2)));
 }
 
 #[test]

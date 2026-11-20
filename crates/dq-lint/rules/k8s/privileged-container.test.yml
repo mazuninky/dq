@@ -41,3 +41,68 @@ tests:
                 image: app:v1
     expected:
       violations: []
+  - name: list root produces no violations
+    input: |
+      - a
+      - b
+    expected:
+      violations: []
+  - name: scalar root produces no violations
+    input: |
+      just a string
+    expected:
+      violations: []
+  - name: empty document produces no violations
+    input: ""
+    expected:
+      violations: []
+  - name: a string spec produces no violations
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+      spec: x
+    expected:
+      violations: []
+  - name: a string template produces no violations
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+      spec:
+        template: x
+    expected:
+      violations: []
+  - name: a number template spec produces no violations
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+      spec:
+        template:
+          spec: 1
+    expected:
+      violations: []
+  - name: a string containers field produces no violations
+    input: |
+      apiVersion: v1
+      kind: Pod
+      spec:
+        containers: x
+    expected:
+      violations: []
+  - name: containers that are not maps produce no violations
+    input: |
+      apiVersion: v1
+      kind: Pod
+      spec:
+        containers: [x, 1, null, [a]]
+    expected:
+      violations: []
+  - name: a string securityContext produces no violations
+    input: |
+      apiVersion: v1
+      kind: Pod
+      spec:
+        containers:
+          - name: app
+            securityContext: 1
+    expected:
+      violations: []

@@ -123,11 +123,12 @@ fn json_indent_0_emits_compact_single_line() {
     let out = write_with("json", &doc, &opts);
     let s = String::from_utf8(out).expect("UTF-8 output");
     assert!(
-        !s.contains('\n'),
+        !s.trim_end_matches('\n').contains('\n'),
         "indent=0 must produce single-line output; got: {s}",
     );
-    // Compact shape: `{"a":1,"b":[1,2,3]}`.
-    assert_eq!(s, r#"{"a":1,"b":[1,2,3]}"#);
+    // Compact shape: `{"a":1,"b":[1,2,3]}`, ending the file with a line
+    // break as every re-emit does.
+    assert_eq!(s, "{\"a\":1,\"b\":[1,2,3]}\n");
 }
 
 #[test]

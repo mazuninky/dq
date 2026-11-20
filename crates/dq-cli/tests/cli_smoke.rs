@@ -278,7 +278,7 @@ fn smoke_unknown_subcommand_exits_with_clap_error() {
 //
 // These exercise the binary contract for write commands end-to-end:
 // fixture → `assert_cmd` invocation → on-disk side effects + exit code.
-// They mirror the M2 DoD scenarios from `dq-plan.md`. Each test seeds a
+// They mirror the M2 DoD scenarios from `docs/archive/dq-plan-2026-05.md`. Each test seeds a
 // tempfile so the source fixtures are not mutated.
 // ---------------------------------------------------------------------------
 
@@ -706,6 +706,23 @@ fn smoke_convert_hcl_to_json_emits_valid_json() {
 }
 
 #[test]
+fn smoke_hcl_syntax_error_names_its_line_and_column() {
+    // An HCL syntax error exits 3, and its message carries the line and
+    // column the parser stopped at.
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(dir.path().join("bad.tf"), "a = 1\nb = {\n").expect("write bad.tf");
+    dq().current_dir(dir.path())
+        .args(["--no-color", "-q", "convert", "bad.tf", "-F", "json"])
+        .assert()
+        .code(3)
+        .stdout("")
+        .stderr(
+            "parse error in bad.tf:  --> HCL parse error in line 2, column 1\n  |\n2 | b = {\n  \
+             | ^---\n  |\n  = unexpected token\n",
+        );
+}
+
+#[test]
 fn smoke_fmt_frontmatter_in_place_preserves_body_bytes() {
     // M5 contract: `dq fmt hugo_post.md -i` re-emits the document; the
     // BODY portion must be byte-identical to the source even if the header
@@ -831,6 +848,52 @@ fn smoke_fmt_ini_in_place_with_sort_keys_completes() {
 // (api.github.com) and the M6 plan explicitly defers them to the per-handler
 // `#[ignore]` test in `commands::self_cmd::tests`.
 // ---------------------------------------------------------------------------
+
+#[test]
+fn self_update_dry_run_flag_parses() {
+    // `--dry-run` reaches the handler next to `--to`; without it the flag is
+    // off. The gate itself is covered in `commands::self_cmd::tests`.
+    use clap::Parser;
+    let parse = |argv: &[&str]| -> dq::cli::SelfUpdateArgs {
+        let cli = dq::Cli::try_parse_from(argv).expect("clap parse");
+        match cli.command {
+            dq::Command::Self_(dq::cli::SelfArgs {
+                command: dq::cli::SelfCommand::Update(args),
+            }) => args,
+            other => panic!("expected `self update`, got {other:?}"),
+        }
+    };
+    let args = parse(&["dq", "self", "update", "--dry-run", "--to", "v2026.20.1"]);
+    assert!(args.dry_run);
+    assert_eq!(args.to.as_deref(), Some("v2026.20.1"));
+    assert!(!parse(&["dq", "self", "update"]).dry_run);
+}
+
+#[test]
+fn self_update_dry_run_rejects_a_value() {
+    // A boolean flag: `--dry-run=yes` is a usage error (exit 2), not a
+    // silently ignored value.
+    dq().args(["self", "update", "--dry-run=yes"])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn self_update_help_documents_dry_run_and_checksum() {
+    let out = dq()
+        .args(["self", "update", "--help"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let help = String::from_utf8(out).expect("help is UTF-8");
+    assert!(help.contains("--dry-run"), "help lacks --dry-run:\n{help}");
+    assert!(
+        help.contains("dq-checksums.txt"),
+        "help must say what the SHA-256 is checked against:\n{help}"
+    );
+}
 
 #[test]
 fn smoke_completions_bash_writes_complete_directive() {
@@ -1036,4 +1099,167 @@ fn smoke_set_jq_diff_renders_unified_diff_for_replicas_bump() {
     // Diff mode must NOT touch the file.
     let after = std::fs::read_to_string(&path).unwrap();
     assert_eq!(after, original, "--diff must NOT modify the fixture");
+}
+
+/// The console escapes a control character in a string and copies every
+/// other character whole. It used to write every other byte as a char of
+/// its own, so a non-ASCII character next to the escape came out as
+/// Latin-1 mojibake: `é\u0001` printed `Ã©\x01`, though `é` alone printed
+/// `é`.
+#[test]
+fn console_keeps_non_ascii_next_to_an_escaped_control_character() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(dir.path().join("m.json"), r#"{"a": "é\u0001", "b": "é"}"#).expect("write");
+    dq().current_dir(dir.path())
+        .args(["--no-color", "query", ".", "m.json"])
+        .assert()
+        .success()
+        .stdout("{a: \"é\\x01\", b: é}\n");
+}
+
+/// A `validate` snippet goes through the same escaping: a raw control
+/// character in a JSON string is a parse error, and the snippet line keeps
+/// the `é` beside it whole (it printed `Ã©\x01`).
+#[test]
+fn validate_snippet_keeps_non_ascii_next_to_an_escaped_control_character() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(dir.path().join("bad.json"), "{\"a\": \"é\u{1}\"}\n").expect("write");
+    let out = dq()
+        .current_dir(dir.path())
+        .args(["--no-color", "validate", "bad.json"])
+        .assert()
+        .code(4);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("snippet: {\"a\": \"é\\x01\"}\n"),
+        "expected the snippet with `é` intact, got:\n{stderr}",
+    );
+}
+
+#[test]
+fn smoke_fmt_writes_an_empty_frontmatter_header_back_empty() {
+    // Was: `---\nnull\n---\nbody\n`; `+++\n+++\n` and `---\n{}\n---\n`
+    // were dropped, the body written alone. `set` takes no edit on a
+    // frontmatter file, empty header or not (exit 7), and leaves it alone.
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    for src in [
+        "---\n---\nbody\n",
+        "\u{feff}---\n---\nbody\n",
+        "+++\n+++\nbody\n",
+        "---\n{}\n---\nbody\n",
+    ] {
+        std::fs::write(dir.path().join("p.md"), src).expect("write p.md");
+        dq().current_dir(dir.path())
+            .args(["--no-color", "--input-format", "frontmatter", "fmt", "p.md"])
+            .assert()
+            .success()
+            .stdout(src.to_owned());
+        dq().current_dir(dir.path())
+            .args([
+                "--no-color",
+                "--input-format",
+                "frontmatter",
+                "-i",
+                "set",
+                "p.md",
+                "/t",
+                "x",
+            ])
+            .assert()
+            .code(7);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("p.md")).unwrap(),
+            src
+        );
+    }
+}
+
+/// `set --jq` rewrites a frontmatter file's header and keeps its body, its
+/// delimiters and its BOM. Was: "frontmatter format error: document is not
+/// a frontmatter document (no payload)", exit 1. A point edit (`set`,
+/// `del`, `patch`, `merge` with a pointer or patch) stays refused, exit 7:
+/// frontmatter has no textual edits.
+#[test]
+fn smoke_frontmatter_takes_filters_and_refuses_point_edits() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let fm = |args: &[&str]| {
+        let mut argv = vec!["--no-color", "--input-format", "frontmatter"];
+        argv.extend_from_slice(args);
+        let out = dq()
+            .current_dir(dir.path())
+            .args(&argv)
+            .output()
+            .expect("run dq");
+        (
+            out.status.code().expect("exit code"),
+            String::from_utf8(out.stdout).expect("utf-8"),
+            String::from_utf8(out.stderr).expect("utf-8"),
+            std::fs::read_to_string(dir.path().join("p.md")).expect("read p.md"),
+        )
+    };
+    let seed = |src: &str| std::fs::write(dir.path().join("p.md"), src).expect("seed");
+    for (src, want) in [
+        (
+            "---\ntitle: Hi\n---\nbody\n",
+            "---\ntitle: Hi\nt: 1\n---\nbody\n",
+        ),
+        (
+            "\u{feff}---\ntitle: Hi\n---\nbody\n",
+            "\u{feff}---\ntitle: Hi\nt: 1\n---\nbody\n",
+        ),
+        (
+            "+++\ntitle = \"Hi\"\n+++\nbody\n",
+            "+++\ntitle = \"Hi\"\nt = 1\n+++\nbody\n",
+        ),
+        ("---\n---\nbody\n", "---\nt: 1\n---\nbody\n"),
+        ("+++\n+++\nbody\n", "+++\nt = 1\n+++\nbody\n"),
+        // No header: one is written once the value holds something.
+        ("body\n", "---\nt: 1\n---\nbody\n"),
+        // The BOM stays at byte 0, before the new header. Was:
+        // `---\nt: 1\n---\n<BOM>body`.
+        ("\u{feff}body\n", "\u{feff}---\nt: 1\n---\nbody\n"),
+    ] {
+        seed(src);
+        assert_eq!(
+            fm(&["-i", "set", "p.md", "--jq", ".t = 1"]),
+            (0, String::new(), String::new(), want.to_owned()),
+            "{src:?}"
+        );
+        seed(src);
+        assert_eq!(
+            fm(&["--check", "set", "p.md", "--jq", ".t = 1"]).0,
+            1,
+            "{src:?}"
+        );
+        seed(src);
+        let (code, diff, ..) = fm(&["--diff", "set", "p.md", "--jq", ".t = 1"]);
+        assert_eq!(code, 0, "{src:?}");
+        assert!(diff.contains("+t"), "{src:?}: {diff:?}");
+    }
+
+    let src = "---\ntitle: Hi\n---\nbody\n";
+    for args in [
+        &["-i", "set", "p.md", "/t", "1"][..],
+        &["-i", "del", "p.md", "/title"],
+        &[
+            "-i",
+            "patch",
+            "p.md",
+            r#"[{"op":"add","path":"/t","value":1}]"#,
+        ],
+        &["-i", "merge", "p.md", r#"{"t":1}"#],
+    ] {
+        seed(src);
+        let (code, _, stderr, file) = fm(args);
+        assert_eq!((code, file.as_str()), (7, src), "{args:?}: {stderr}");
+        assert!(
+            stderr.starts_with("write operation unavailable: frontmatter has no textual edits"),
+            "{args:?}: {stderr}"
+        );
+    }
+    seed(src);
+    assert_eq!(
+        fm(&["-i", "fmt", "p.md"]),
+        (0, String::new(), String::new(), src.to_owned())
+    );
 }

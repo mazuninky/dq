@@ -7,7 +7,8 @@
 //! 2. Load + parse the file (or stdin) through the same shared helpers the
 //!    other read commands use.
 //! 3. Resolve `--doc <idx|all>` against the parsed [`Document`].
-//! 4. Convert the selected view into a [`serde_json::Value`].
+//! 4. Hand the selected view to jq as a [`dq_core::Value`] — not through
+//!    `serde_json::Value`, which has no NaN or infinity.
 //! 5. Compile the jq expression once via [`dq_transform::JqEngine::compile`].
 //!    A compile failure becomes a [`dq_core::Error::Parse`] so the exit-code
 //!    mapper picks `PARSE_ERROR` (3) — same family as file-parse failures.
@@ -15,9 +16,11 @@
 //!    plain `anyhow::anyhow!` so the exit-code mapper picks `GENERIC` (1) —
 //!    the file and the expression were both fine, only the evaluation failed.
 //! 7. Materialise the output stream and hand it to the configured reporter as
-//!    a `serde_json::Value::Array`. The console reporter's "array → one
-//!    element per line" rendering matches the M1 contract for `select`, so we
-//!    reuse it without a special case.
+//!    a `dq_core::Value::Array` through [`Reporter::report_value`]. The
+//!    console reporter's "array → one element per line" rendering matches the
+//!    M1 contract for `select`, so we reuse it without a special case. A NaN
+//!    or an infinity in the results is `.nan` / `nan` in YAML / TOML output
+//!    and an error (exit 1) in JSON / JSONL output.
 
 use std::io::Write;
 
@@ -41,40 +44,20 @@ use crate::output::Reporter;
 ///   [`dq_transform::JqError::Compile`].
 /// - `anyhow::Error` (exit 1) when the compiled filter raises a runtime
 ///   exception during evaluation.
+/// - [`dq_core::Error::Format`] (exit 1) when a JSON-family reporter is
+///   handed a NaN or an infinity.
 pub fn run(
     cli: &Cli,
     args: &QueryArgs,
-    _input_format: Option<&str>,
-    doc_arg: Option<&str>,
+    input_format: Option<&str>,
+    doc_arg: Option<crate::cli::DocSelector>,
     reporter: &dyn Reporter,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
     cli.ensure_no_write_flags()?;
 
-    // For `query`, `-F` is the **output** format (the reporter format), not
-    // the input parser. The input format is detected from the file extension
-    // so that `dq query '.spec.containers[].image' deployment.yaml -F json`
-    // does the obvious thing (parse YAML, render JSON).
-    //
-    // The single exception is stdin (`file == "-"`): there is no extension to
-    // fall back on, so we honour `cli.format` as a last resort. Without this,
-    // `dq query '.foo' - -F yaml` would hit the "stdin requires -F" guard in
-    // `pick_format` even though the user *did* supply `-F`.
-    //
-    // The dispatcher in `lib.rs` still passes `input_format` for symmetry with
-    // the other handler signatures, but we deliberately ignore it (note the
-    // leading underscore in the parameter name) so the override only ever
-    // applies to stdin.
-    let input_format = if args.file == "-" {
-        cli.format.as_input_format_name()
-    } else {
-        None
-    };
-
-    let (_fmt, doc) = load_document_with_path(&args.file, input_format)?;
-    let view = select_document(&doc, doc_arg)?;
-    let serde_value = view.to_serde_json();
-
+    let (_fmt, doc) = load_document_with_path(&args.file, input_format, cli.template_mode())?;
+    let view = select_document(&doc, doc_arg, &args.file)?;
     // Compile errors → dq_core::Error::Parse → exit 3 (PARSE_ERROR).
     let engine = dq_transform::JqEngine::compile(&args.expression)
         .map_err(|e| anyhow::Error::new(jq_compile_to_parse(e, &args.file, &args.expression)))?;
@@ -84,11 +67,10 @@ pub fn run(
     // evaluation against this specific input failed, which doesn't fit any
     // of the structured exit-code categories.
     let outputs = engine
-        .run(&serde_value)
+        .run_value(&view)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let arr = serde_json::Value::Array(outputs);
-    reporter.report(&arr, out)?;
+    reporter.report_value(&dq_core::Value::Array(outputs), out)?;
     Ok(())
 }
 
@@ -197,6 +179,46 @@ mod tests {
         assert_eq!(parsed, serde_json::json!([42]));
     }
 
+    /// Run `expression` over a YAML file holding `src` through `reporter`.
+    fn query_yaml(
+        src: &str,
+        expression: &str,
+        reporter: &dyn Reporter,
+    ) -> (anyhow::Result<()>, String) {
+        let tmp = write_yaml(src);
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
+        let cli = cli_for(&[], path.as_str());
+        let args = QueryArgs {
+            expression: expression.to_owned(),
+            file: path,
+        };
+        let mut out: Vec<u8> = Vec::new();
+        let result = run(&cli, &args, None, None, reporter, &mut out);
+        (result, String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn query_sees_a_yaml_nan_as_a_number_and_writes_it_back_as_yaml_nan() {
+        let reporter = crate::output::YamlReporter;
+        let (result, out) = query_yaml("x: .nan\ny: 1\n", "[(.x | type), .x, .x + 1]", &reporter);
+        result.expect("query succeeds");
+        assert_eq!(out, "- - number\n  - .nan\n  - .nan\n");
+    }
+
+    #[test]
+    fn query_json_output_of_a_nan_fails_with_the_json_format_error() {
+        let (result, out) = query_yaml("x: .nan\n", ".x", &JsonReporter);
+        let err = result.expect_err("JSON has no NaN");
+        assert!(
+            matches!(
+                err.downcast_ref::<dq_core::Error>(),
+                Some(dq_core::Error::Format { format: "json", .. })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(out, "");
+    }
+
     #[test]
     fn query_rejects_in_place_with_invalid_input_marker() {
         // The write-flag gate must reject `-i` before any I/O happens — the
@@ -245,21 +267,9 @@ mod tests {
 
     #[test]
     fn query_with_format_override_still_uses_extension_for_input_parsing() {
-        // Regression: passing `-F json` is an OUTPUT-format hint for `query`.
-        // It must NOT be forwarded to the input parser — otherwise a YAML file
-        // gets parsed as JSON and fails with PARSE_ERROR (exit 3).
-        //
-        // Before the fix, the dispatcher in `lib.rs` forwarded
-        // `cli.format.as_input_format_name()` (Some("json") under `-F json`)
-        // straight into `load_document_with_path`, overriding the `.yaml`
-        // extension. The smoke test
-        //   dq query '.spec.containers[].image' deployment.yaml -F json
-        // would error instead of returning ["a","b"].
-        //
-        // This test pins the new contract: even if the dispatcher passes
-        // `Some("json")` (we mimic that here by hand), the handler must
-        // ignore it for non-stdin inputs and detect the format from the
-        // file extension. Only the stdin branch consults `cli.format`.
+        // `-F json` is the output format: the YAML file is still read as
+        // YAML (the dispatcher derives the parser from `--input-format`,
+        // never from `-F` — pinned end to end in `tests/cli_input_format.rs`).
         let tmp = write_yaml("spec:\n  containers:\n    - image: a\n    - image: b\n");
         let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = Cli::try_parse_from([
@@ -277,8 +287,7 @@ mod tests {
         };
         let reporter = JsonReporter;
         let mut out: Vec<u8> = Vec::new();
-        // Pass `Some("json")` deliberately — the handler must ignore it.
-        run(&cli, &args, Some("json"), None, &reporter, &mut out)
+        run(&cli, &args, None, None, &reporter, &mut out)
             .expect("YAML file with -F json should parse via extension, render JSON");
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed, serde_json::json!(["a", "b"]));

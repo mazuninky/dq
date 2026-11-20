@@ -121,7 +121,7 @@ pub enum SyntheticReason {
 /// formats with non-zero offsets (e.g. JSON strings consumed by a composite
 /// extract) can populate them without changing the type shape.
 ///
-/// [`data-query-composite-rules`]: ../../../openspec/specs/data-query-composite-rules/spec.md
+/// [`data-query-composite-rules`]: ../../../../docs/reference/rule-checks.md
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InlineBaseline {
     /// Byte offset within the parent scalar's content where this node's
@@ -140,8 +140,8 @@ pub struct InlineBaseline {
 /// `Original` carries the source pointer (always present so callers can
 /// route back into the document) plus an optional [`ValueSpan`]. The span
 /// is `None` for read-only formats whose parser does not record byte
-/// ranges (jsonl, hcl, ini, dotenv, csv, tsv, dockerfile, ignore-list,
-/// markdown body) — the pointer is still meaningful for navigation, only
+/// ranges (jsonl, hcl, ini, dotenv, csv, tsv, ignore-list, markdown
+/// body) — the pointer is still meaningful for navigation, only
 /// position-aware lookup is unavailable.
 ///
 /// `Original` also carries an optional [`InlineBaseline`] for nodes whose
@@ -229,6 +229,10 @@ pub struct Ir<'a> {
     /// Borrowed source bytes — the parser's `original_bytes` for write-aware
     /// documents, an empty slice otherwise. See [`Ir::line_col_for`].
     bytes: &'a [u8],
+    /// Byte offset in `bytes` where the document this IR views begins —
+    /// `Some` only for one document of a multi-document stream (see
+    /// [`crate::Document::stream_documents`]). See [`Ir::origin_line_col`].
+    origin: Option<usize>,
 }
 
 impl<'a> Ir<'a> {
@@ -268,6 +272,19 @@ impl<'a> Ir<'a> {
             provenance,
             format,
             bytes,
+            origin: None,
+        }
+    }
+
+    /// The same IR, viewing a document that begins at byte `origin` of
+    /// [`Ir::bytes`] — one document of a multi-document stream, whose
+    /// position-less diagnostics must point into that document rather than
+    /// at the top of the file. See [`Ir::origin_line_col`].
+    #[must_use]
+    pub fn with_origin(self, origin: usize) -> Self {
+        Self {
+            origin: Some(origin),
+            ..self
         }
     }
 
@@ -354,6 +371,36 @@ impl<'a> Ir<'a> {
         }
     }
 
+    /// The column in the source each line of the content at `pointer`
+    /// starts at — `[n]` for content line `n + 1` — when a line may start
+    /// left of the [`InlineBaseline::col`]: a Markdown fence indented by
+    /// `col - 1` blanks takes at most that many from each content line, so
+    /// a line indented less starts at its first non-blank. Empty when every
+    /// line starts at the baseline's column (a baseline at column 1, or no
+    /// span or source bytes to look the lines up in); `None` without a
+    /// baseline.
+    #[must_use]
+    pub fn inline_line_cols_for(&self, pointer: &Pointer) -> Option<Vec<u32>> {
+        let baseline = self.inline_offset_for(pointer)?;
+        let Some(span) = self.span_for(pointer) else {
+            return Some(Vec::new());
+        };
+        if baseline.col <= 1 || self.bytes.is_empty() {
+            return Some(Vec::new());
+        }
+        let end = span.value_range.end.min(self.bytes.len());
+        let start = span.line_range.start.min(end);
+        let strip = baseline.col - 1;
+        let cols = self.bytes[start..end]
+            .split(|&b| b == b'\n')
+            .map(|line| {
+                let blanks = line.iter().take_while(|&&b| b == b' ').count();
+                1 + u32::try_from(blanks).unwrap_or(u32::MAX).min(strip)
+            })
+            .collect();
+        Some(cols)
+    }
+
     /// Resolve `pointer` to a 1-indexed `(line, col)` position in the
     /// source bytes.
     ///
@@ -377,6 +424,21 @@ impl<'a> Ir<'a> {
             return None;
         }
         Some(derive_line_col(self.bytes, span.value_range.start))
+    }
+
+    /// The `(line, col)` a diagnostic falls back to when nothing about it
+    /// resolves to a position: `(1, 1)` — the top of the file — unless this
+    /// IR views one document of a stream ([`Ir::with_origin`]), where it is
+    /// the start of the document's first line that holds a spanned value
+    /// (spans cover scalars and empty containers, so for `b:\n  c: 2` that
+    /// is the `c: 2` line) — or its `---` line, for an empty document — so
+    /// the finding still lands in the document it is about.
+    #[must_use]
+    pub fn origin_line_col(&self) -> (u32, u32) {
+        match self.origin {
+            Some(origin) if !self.bytes.is_empty() => derive_line_col(self.bytes, origin),
+            _ => (1, 1),
+        }
     }
 }
 
@@ -457,6 +519,126 @@ impl From<OwnedIr> for (Value, ProvenanceMap, FormatTag) {
     fn from(owned: OwnedIr) -> Self {
         owned.into_parts()
     }
+}
+
+/// One document of a multi-document stream, viewed as a document of its
+/// own — the unit the lint pipeline and `dq fix` work on.
+///
+/// The stream's provenance is keyed `/{doc_idx}/...`; here it is rebased
+/// so the document's root is `""`, and a rule's `loc.pointer`, a composite
+/// `anchor` or a plugin's pointer addresses the document the way it would
+/// address a single-document file. The source bytes stay the whole file's,
+/// so a resolved `(line, col)` is a position in the file, inside this
+/// document. Build them with [`crate::Document::stream_documents`].
+#[derive(Debug, Clone)]
+pub struct StreamDocument<'a> {
+    index: usize,
+    value: &'a Value,
+    provenance: ProvenanceMap,
+    format: FormatTag,
+    bytes: &'a [u8],
+    /// Start of the first line holding a node of this document, or of its
+    /// `---` line when no node lies inside it (an empty document); `None`
+    /// for a read-only parse.
+    origin: Option<usize>,
+}
+
+impl<'a> StreamDocument<'a> {
+    /// Position of this document in the stream (0-based) — the `N` of the
+    /// stream's `/N/...` pointers and of `--doc N`.
+    #[must_use]
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    /// The document's value.
+    #[must_use]
+    pub fn value(&self) -> &'a Value {
+        self.value
+    }
+
+    /// The document as an [`Ir`]: its own value and rebased provenance, the
+    /// file's bytes, and — via [`Ir::with_origin`] — the document's start
+    /// as the fallback position of a diagnostic.
+    #[must_use]
+    pub fn as_ir(&self) -> Ir<'_> {
+        let ir = Ir::with_bytes(self.value, &self.provenance, self.format, self.bytes);
+        match self.origin {
+            Some(origin) => ir.with_origin(origin),
+            None => ir,
+        }
+    }
+}
+
+/// Split a stream's `documents` and its `/{doc_idx}/...`-keyed
+/// `provenance` into one [`StreamDocument`] per document.
+///
+/// `bounds`, when known, is each document's byte range in `bytes` — from
+/// the start of its `---` line (its first line, for an implicit document)
+/// to where the next document begins. A document's origin is the first
+/// line holding one of its spans, but only when that line lies inside the
+/// document: the empty node of an empty document is spanned at the next
+/// event — the next `---`, or the end of the file — so such a document
+/// starts at its own `---` line instead.
+pub(crate) fn split_stream<'a>(
+    documents: &'a [Value],
+    provenance: &ProvenanceMap,
+    format: FormatTag,
+    bytes: &'a [u8],
+    bounds: Option<&[std::ops::Range<usize>]>,
+) -> Vec<StreamDocument<'a>> {
+    let mut parts: Vec<StreamDocument<'a>> = documents
+        .iter()
+        .enumerate()
+        .map(|(index, value)| StreamDocument {
+            index,
+            value,
+            provenance: ProvenanceMap::new(),
+            format,
+            bytes,
+            origin: None,
+        })
+        .collect();
+    for (key, entry) in provenance {
+        let Some(rest) = key.strip_prefix('/') else {
+            continue;
+        };
+        let (head, below) = match rest.split_once('/') {
+            Some((head, below)) => (head, Some(below)),
+            None => (rest, None),
+        };
+        let Some(part) = head.parse::<usize>().ok().and_then(|i| parts.get_mut(i)) else {
+            continue;
+        };
+        let rebased_key = below.map(|below| format!("/{below}")).unwrap_or_default();
+        let rebased = match entry {
+            Provenance::Original {
+                pointer,
+                span,
+                inline_offset,
+            } => {
+                if let Some(span) = span {
+                    let line_start = span.line_range.start;
+                    part.origin = Some(part.origin.map_or(line_start, |o| o.min(line_start)));
+                }
+                Provenance::Original {
+                    pointer: Pointer::new(pointer.segments().get(1..).unwrap_or(&[]).to_vec()),
+                    span: span.clone(),
+                    inline_offset: *inline_offset,
+                }
+            }
+            Provenance::Synthetic { reason } => Provenance::Synthetic { reason: *reason },
+        };
+        part.provenance.insert(rebased_key, rebased);
+    }
+    if let Some(bounds) = bounds {
+        for (part, bound) in parts.iter_mut().zip(bounds) {
+            if !part.origin.is_some_and(|origin| bound.contains(&origin)) {
+                part.origin = Some(bound.start);
+            }
+        }
+    }
+    parts
 }
 
 #[cfg(test)]

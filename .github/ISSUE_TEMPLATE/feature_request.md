@@ -41,7 +41,7 @@ Examples:
 
 <!--
 Links to a spec, a similar feature in another tool, an Atlassian/Kubernetes/
-schema document, or an existing OpenSpec change describing related work. Helpful
+schema document, or an existing plan in docs/plans/ describing related work. Helpful
 even for rough proposals.
 -->
 

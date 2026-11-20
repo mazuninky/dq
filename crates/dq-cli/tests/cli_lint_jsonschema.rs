@@ -145,3 +145,32 @@ spec:
         String::from_utf8_lossy(&err),
     );
 }
+
+/// A schema rule's `message` prefix is separated from the keyword
+/// location by `: `, as a composite's is from its nested message:
+/// `shape: /required: …`, not `shape/required: …`.
+#[test]
+fn lint_schema_message_prefix_is_separated_from_the_keyword_location() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let rule = dir.path().join("shape.yml");
+    std::fs::write(
+        &rule,
+        "id: t.shape\ndescription: x\nseverity: error\nmatch: { format: yaml }\n\
+         check:\n  schema: { type: object, required: [name] }\n  message: shape\n",
+    )
+    .unwrap();
+    let doc = dir.path().join("doc.yaml");
+    std::fs::write(&doc, "a: 1\n").unwrap();
+    let out = assert_cmd::Command::cargo_bin("dq")
+        .expect("dq binary built")
+        .args(["--no-color", "lint", "--rules"])
+        .arg(&rule)
+        .arg(&doc)
+        .assert()
+        .code(4);
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).expect("UTF-8");
+    assert!(
+        stdout.contains(r#"message: 'shape: /required: "name" is a required property',"#),
+        "expected the separated prefix, got: {stdout}"
+    );
+}

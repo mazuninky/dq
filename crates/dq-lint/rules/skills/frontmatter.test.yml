@@ -122,3 +122,36 @@ tests:
       violations:
         - rule: skills.frontmatter
           message_contains: "exceeds 1,536"
+  - name: list frontmatter is skipped
+    input: |
+      ---
+      - a
+      ---
+      # T
+    expected:
+      violations: []
+  - name: scalar frontmatter is skipped
+    input: |
+      ---
+      just text
+      ---
+      # T
+    expected:
+      violations: []
+  - name: empty frontmatter block is skipped
+    input: |
+      ---
+      ---
+      # T
+    expected:
+      violations: []
+  - name: non-string name and description are skipped
+    input: |
+      ---
+      name: [a, b]
+      description: 42
+      when_to_use: {k: v}
+      ---
+      # T
+    expected:
+      violations: []

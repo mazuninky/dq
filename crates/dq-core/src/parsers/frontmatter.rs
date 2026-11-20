@@ -9,23 +9,25 @@
 //!
 //! If no opening delimiter is recognised within the first byte OR no matching
 //! closing delimiter is found within the first 64 KiB of the file, the
-//! parser returns `Document::frontmatter(empty_map, whole_file_bytes,
-//! FrontmatterKind::Yaml)` — the value is an empty map and the body equals
-//! the entire input.
+//! parser returns `Document::frontmatter_absent(bytes, bom)` — the value is
+//! an empty map and the body the entire input past a UTF-8 byte order
+//! mark, which the writer puts back at byte 0.
 //!
 //! Round-trip contract (`Format::write`):
 //! 1. Re-serialize the value through the inner format (YAML / TOML / JSON).
 //! 2. Emit the opening delimiter, header, closing delimiter.
 //! 3. Concatenate the stored body bytes verbatim.
 //!
-//! Empty-map fallback (no frontmatter): the writer emits just the body bytes
-//! — no synthetic `---\n---\n` markers — so a file with no frontmatter
-//! round-trips verbatim.
+//! No frontmatter ([`crate::document::FrontmatterPayload::header`] false):
+//! the writer emits just the body bytes — no synthetic `---\n---\n`
+//! markers — so such a file round-trips verbatim, until its value holds
+//! something. A file with a header keeps its delimiters whatever the header
+//! holds: a YAML header with nothing in it (`---\n---\n`) reads as null and
+//! is written back empty, `+++\n+++\n` and `---\n{}\n---\n` as they are.
 
 use std::io::Write;
 
 use camino::Utf8PathBuf;
-use indexmap::IndexMap;
 
 use crate::Result;
 use crate::document::{Document, FormatTag, FrontmatterKind, Value};
@@ -41,6 +43,9 @@ use crate::parsers::{Json, Toml, Yaml};
 /// same scan-limit constant.
 pub(crate) const FRONTMATTER_SCAN_LIMIT: usize = 64 * 1024;
 
+/// The UTF-8 byte order mark.
+const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
+
 /// Markdown frontmatter format implementation.
 #[derive(Debug, Clone, Copy)]
 pub struct Frontmatter;
@@ -55,41 +60,52 @@ impl Format for Frontmatter {
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<Document> {
+        // A UTF-8 byte order mark before the opening delimiter does not
+        // hide the header (as in the Markdown parser); the writer puts it
+        // back. Without a header too: a header the value gets later goes
+        // after it.
+        let (header_start, after_bom) = match bytes.strip_prefix(UTF8_BOM) {
+            Some(rest) => (rest, true),
+            None => (bytes, false),
+        };
+        let document = if after_bom {
+            Document::frontmatter_after_bom
+        } else {
+            Document::frontmatter
+        };
         // Detect leading delimiter. Each branch returns either a parsed
         // (header_value, body_bytes, kind) triple or `None` — in which case
         // we fall through to the no-frontmatter empty-map default.
-        if let Some((header_bytes, body_bytes)) = detect_yaml_frontmatter(bytes) {
+        if let Some((header_bytes, body_bytes)) = detect_yaml_frontmatter(header_start) {
             let header_doc = Yaml.parse(header_bytes)?;
-            return Ok(Document::frontmatter(
+            return Ok(document(
                 header_doc.value().clone(),
                 body_bytes.to_vec(),
                 FrontmatterKind::Yaml,
             ));
         }
-        if let Some((header_bytes, body_bytes)) = detect_toml_frontmatter(bytes) {
+        if let Some((header_bytes, body_bytes)) = detect_toml_frontmatter(header_start) {
             let header_doc = Toml.parse(header_bytes)?;
-            return Ok(Document::frontmatter(
+            return Ok(document(
                 header_doc.value().clone(),
                 body_bytes.to_vec(),
                 FrontmatterKind::Toml,
             ));
         }
-        if let Some((header_bytes, body_bytes)) = detect_json_frontmatter(bytes) {
+        if let Some((header_bytes, body_bytes)) = detect_json_frontmatter(header_start) {
             let header_doc = Json.parse(header_bytes)?;
-            return Ok(Document::frontmatter(
+            return Ok(document(
                 header_doc.value().clone(),
                 body_bytes.to_vec(),
                 FrontmatterKind::Json,
             ));
         }
         // No recognised frontmatter — preserve the whole file as the body
-        // and pin the value to an empty map. Kind is `Yaml` as a benign
-        // placeholder; the writer's empty-map shortcut emits only the body
-        // so the placeholder is never observable on round-trip.
-        Ok(Document::frontmatter(
-            Value::Map(IndexMap::new()),
-            bytes.to_vec(),
-            FrontmatterKind::Yaml,
+        // and pin the value to an empty map; the writer emits only the body
+        // until the value holds something.
+        Ok(Document::frontmatter_absent(
+            header_start.to_vec(),
+            after_bom,
         ))
     }
 
@@ -99,20 +115,29 @@ impl Format for Frontmatter {
             message: "document is not a frontmatter document (no payload)".to_owned(),
         })?;
 
-        // Empty-map shortcut: a frontmatter doc whose value is an empty map
-        // came from the no-frontmatter fallback — emit just the body so the
-        // round-trip is byte-identical.
-        if let Value::Map(m) = doc.value()
-            && m.is_empty()
-        {
+        // A file with no frontmatter: just the body, so the round-trip is
+        // byte-identical, while the value holds nothing. A header the file
+        // had keeps its delimiters whatever it holds.
+        let holds_nothing = match doc.value() {
+            Value::Map(m) => m.is_empty(),
+            Value::Null => true,
+            _ => false,
+        };
+        if payload.bom {
+            write_io(w, UTF8_BOM)?;
+        }
+        if !payload.header && holds_nothing {
             return write_io(w, &payload.body);
         }
-
         match payload.kind {
             FrontmatterKind::Yaml => {
                 write_io(w, b"---\n")?;
-                let inner = Document::value_only(doc.value().clone(), FormatTag::Yaml);
-                Yaml.write(&inner, w)?;
+                // A header with nothing in it reads as null: written back
+                // empty, not as the scalar `null`.
+                if *doc.value() != Value::Null {
+                    let inner = Document::value_only(doc.value().clone(), FormatTag::Yaml);
+                    Yaml.write(&inner, w)?;
+                }
                 write_io(w, b"---\n")?;
                 write_io(w, &payload.body)?;
             }
@@ -126,7 +151,7 @@ impl Format for Frontmatter {
             FrontmatterKind::Json => {
                 let inner = Document::value_only(doc.value().clone(), FormatTag::Json);
                 Json.write(&inner, w)?;
-                write_io(w, b"\n\n")?;
+                write_io(w, b"\n")?;
                 write_io(w, &payload.body)?;
             }
         }

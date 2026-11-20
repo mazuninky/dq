@@ -10,10 +10,13 @@ match:
   format: hcl
 check:
   jq: |
-    [.output // {} | to_entries[]
+    # A root that is not a map yields nothing instead of raising.
+    objects | [.output // {} | objects | to_entries[]
       | select(.key | tostring | test("(?i)(secret|password|token|key|credential)"))
-      | select(.value.sensitive != true)
-      | {name: .key}][]
+      | .key as $name
+      | .value | (if type == "array" then .[] else . end)
+      | select(.sensitive? != true)
+      | {name: $name}][]
   message: "Output '{{ .name }}' looks credential-like but is not marked sensitive = true"
 references:
   - https://developer.hashicorp.com/terraform/language/values/outputs#sensitive-suppressing-values-in-cli-output

@@ -16,7 +16,7 @@
 //!
 //! Per-file work executed inside [`DelFileOp::apply`]:
 //!
-//! 1. Resolve the format (extension or `-F`).
+//! 1. Resolve the format (extension or `--input-format`).
 //! 2. Read the original bytes.
 //! 3. Apply the same template guard as `set`.
 //! 4. Parse to a write-aware [`Document`].
@@ -29,11 +29,14 @@
 use std::io::Write;
 
 use camino::Utf8Path;
-use dq_core::{Document, Pointer};
+use dq_core::Pointer;
 
-use super::io_helpers::{pick_format, read_bytes};
+use super::io_helpers::{
+    finish_edit, parse_file_for_edit, pick_format, pointer_in_document, read_bytes,
+    skip_out_of_range,
+};
 use crate::bulk::{self, FileOp, FileOpResult};
-use crate::cli::{Cli, DelArgs};
+use crate::cli::{Cli, DelArgs, DocSelector};
 
 /// Run `dq del`.
 ///
@@ -67,17 +70,30 @@ pub fn run(
         );
     }
 
+    let doc_index = match cli.doc {
+        Some(DocSelector::All) => {
+            return Err(cli.doc_usage_error(
+                "del",
+                "it edits one document; pass --doc N, or address the stream as /N/...",
+            ));
+        }
+        Some(DocSelector::Index(index)) => Some(index),
+        None => None,
+    };
+
     // Parse the pointer ONCE — every file uses the same pointer.
     let pointer = Pointer::parse(&args.pointer).map_err(anyhow::Error::new)?;
 
+    let files = bulk::expand_glob(&args.file)?;
     let op = DelFileOp {
         cli,
         input_format,
         use_color,
         pointer: &pointer,
+        doc_index,
+        several: files.len() > 1,
     };
-
-    let files = bulk::expand_glob(&args.file)?;
+    super::io_helpers::check_write_targets(cli, "del", &files, input_format)?;
     bulk::run_per_file(files, &op, cli, out)
 }
 
@@ -88,6 +104,10 @@ struct DelFileOp<'a> {
     input_format: Option<&'a str>,
     use_color: bool,
     pointer: &'a Pointer,
+    /// `--doc N`: `pointer` is relative to document `N` of a stream.
+    doc_index: Option<usize>,
+    /// The run covers several files: one without document `N` is skipped.
+    several: bool,
 }
 
 impl<'a> FileOp for DelFileOp<'a> {
@@ -97,28 +117,28 @@ impl<'a> FileOp for DelFileOp<'a> {
         let format = pick_format(path, self.input_format)?;
         let original_bytes = read_bytes(path)?;
 
-        // Template guard: detect / substitute / pass-through. Same shape as
-        // `commands::set` — kept inline rather than factored to keep each
-        // handler readable end-to-end.
-        let (parse_input, placeholder_map) = if self.cli.raw_template_strings {
-            let (substituted, map) =
-                dq_core::template_guard::substitute_placeholders(&original_bytes);
-            (substituted, Some(map))
-        } else if self.cli.allow_templates {
-            (original_bytes.clone(), None)
-        } else if let Some(marker) = dq_core::template_guard::detect_templates(&original_bytes) {
-            return Err(anyhow::Error::new(dq_core::Error::templated_file(marker)));
-        } else {
-            (original_bytes.clone(), None)
+        // Template guard, then parse: a file whose templates change what
+        // the parser reads is refused; `guard` checks below that the edit
+        // keeps the templates of one whose templates do not (or puts the
+        // `--raw-template-strings` placeholders back).
+        let (mut document, guard) = parse_file_for_edit(self.cli, format, &original_bytes, path)?;
+        let textual = document.is_write_aware();
+        let pointer = match skip_out_of_range(
+            pointer_in_document(&document, self.doc_index, self.pointer, path),
+            self.several,
+        )? {
+            Ok(pointer) => pointer,
+            Err(reason) => return Ok(FileOpResult::Skipped(reason)),
         };
+        document.del_at(&pointer).map_err(anyhow::Error::new)?;
 
-        let mut document = parse_to_document(format, &parse_input, path)?;
-        document.del_at(self.pointer).map_err(anyhow::Error::new)?;
-
-        let mut final_bytes = document.original_bytes().to_vec();
-        if let Some(map) = &placeholder_map {
-            final_bytes = dq_core::template_guard::restore_placeholders(&final_bytes, map);
-        }
+        let final_bytes = finish_edit(
+            &guard,
+            format,
+            &document,
+            std::slice::from_ref(&pointer),
+            textual,
+        )?;
 
         // The bulk driver handles `-i` and `--check` uniformly — we only
         // need to compute the diff string when `--diff` mode is active so
@@ -141,34 +161,6 @@ impl<'a> FileOp for DelFileOp<'a> {
             diff,
         })
     }
-}
-
-/// Parse `parse_input` as `format` into a write-aware [`Document`].
-///
-/// Same shape as [`super::set::parse_to_document`]; kept duplicated so the
-/// two handlers can evolve their parse strategies independently in M3
-/// (e.g. when `del` gains a `--format-fallback` flag).
-fn parse_to_document(
-    format: &'static dyn dq_core::Format,
-    parse_input: &[u8],
-    file: &Utf8Path,
-) -> anyhow::Result<Document> {
-    let path_label = camino::Utf8PathBuf::from(file);
-    let doc_result: dq_core::Result<Document> = match format.name() {
-        "yaml" => dq_core::parse_yaml_with_spans(parse_input),
-        "json" => dq_core::parse_json_with_spans(parse_input),
-        _ => format.parse(parse_input),
-    };
-    doc_result
-        .map_err(|mut e| {
-            if let dq_core::Error::Parse { ref mut file, .. } = e
-                && file.is_none()
-            {
-                *file = Some(path_label.clone());
-            }
-            e
-        })
-        .map_err(anyhow::Error::new)
 }
 
 #[cfg(test)]
@@ -240,17 +232,15 @@ mod tests {
         let err = run(&cli, &args, None, false, &mut out).unwrap_err();
         let domain = err.downcast_ref::<dq_core::Error>().unwrap();
         assert_eq!(domain.kind_name(), "path");
-        // The Path error's kind is TypeMismatch with `found = "root"` —
-        // pin it via the Display message, which `dq-core` already exposes.
+        // The Path error's kind is `DeleteRoot`.
         let dq_core::Error::Path { kind, .. } = domain else {
             panic!("expected Path error variant, got: {domain:?}");
         };
-        match kind {
-            dq_core::PathErrorKind::TypeMismatch { found, .. } => {
-                assert_eq!(*found, "root", "expected root rejection");
-            }
-            other => panic!("expected TypeMismatch, got: {other:?}"),
-        }
+        assert_eq!(
+            *kind,
+            dq_core::PathErrorKind::DeleteRoot,
+            "expected root rejection"
+        );
     }
 
     #[test]

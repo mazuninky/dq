@@ -134,3 +134,59 @@ fn default_when_piped_is_no_color() {
         "default piped output must be uncoloured, got: {stdout:?}",
     );
 }
+
+/// Two documents that differ, for `diff --unified`.
+fn differing_pair() -> (tempfile::TempDir, String, String) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let a = dir.path().join("a.yaml");
+    let b = dir.path().join("b.yaml");
+    std::fs::write(&a, "x: 1\n").unwrap();
+    std::fs::write(&b, "x: 2\n").unwrap();
+    let path = |p: PathBuf| p.to_str().expect("UTF-8 path").to_owned();
+    (dir, path(a), path(b))
+}
+
+/// `diff --unified` follows the colour rule of every other command: piped
+/// stdout, no flag, no env var → plain text. Before, only `--no-color`
+/// turned its colour off.
+#[test]
+fn diff_unified_when_piped_is_no_color() {
+    let (_dir, a, b) = differing_pair();
+    let out = dq().args(["diff", &a, &b, "--unified"]).assert().success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).expect("UTF-8");
+    assert_eq!(
+        stdout,
+        format!("--- {a}\n+++ {b}\n@@ -1,3 +1,3 @@\n {{\n-  \"x\": 1\n+  \"x\": 2\n }}\n"),
+    );
+}
+
+#[test]
+fn diff_unified_honours_no_color_env() {
+    let (_dir, a, b) = differing_pair();
+    let out = dq()
+        .env("NO_COLOR", "1")
+        .env("CLICOLOR_FORCE", "1")
+        .args(["diff", &a, &b, "--unified"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert!(
+        !stdout.contains('\x1b'),
+        "NO_COLOR must win, got: {stdout:?}"
+    );
+}
+
+#[test]
+fn diff_unified_colours_under_clicolor_force() {
+    let (_dir, a, b) = differing_pair();
+    let out = dq()
+        .env("CLICOLOR_FORCE", "1")
+        .args(["diff", &a, &b, "--unified"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert!(
+        stdout.contains("\x1b[31m-  \"x\": 1\x1b[0m"),
+        "CLICOLOR_FORCE must colour the diff, got: {stdout:?}",
+    );
+}

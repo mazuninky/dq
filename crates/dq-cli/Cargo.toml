@@ -61,6 +61,8 @@ walkdir = { workspace = true }
 # entry is for unit tests; this runtime entry is a separate consumer).
 self_update = { workspace = true }
 ureq = { workspace = true }
+# SHA-256 of the downloaded release archive (`self update` checksum gate).
+ring = { workspace = true }
 tempfile = { workspace = true }
 # Unified-diff rendering for `dq set --diff` / `dq del --diff` (M2 §11).
 # Default features cover the line-based unified-diff use case; `inline` /

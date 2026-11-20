@@ -7,8 +7,8 @@
 //! exact byte ranges that `Document::set_at` and `Document::del_at` splice.
 //!
 //! The architecture follows the saphyr spike at
-//! `spikes/saphyr/src/main.rs` — see also OpenSpec change
-//! `add-safe-writes/design.md` D1 / D4 / D11 for the rationale on why we
+//! `spikes/saphyr/src/main.rs` — see also the safe-writes section of
+//! `docs/decisions.md` for the rationale on why we
 //! splice raw bytes instead of round-tripping through an emitter.
 //!
 //! # Public surface
@@ -52,6 +52,8 @@ use crate::ir::{InlineBaseline, Provenance, ProvenanceMap};
 use crate::pointer::Pointer;
 use crate::textual_edit::{InsertionRenderer, ScalarRenderer};
 
+use super::yaml_emit::{single_quotable, typed_by_another_schema};
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -74,8 +76,22 @@ use crate::textual_edit::{InsertionRenderer, ScalarRenderer};
 ///   short snippet matching the failing line, so the CLI's diagnostic
 ///   formatting works without further introspection.
 pub fn parse_with_spans(bytes: &[u8]) -> Result<(Value, SpanMap)> {
-    let (value, spans, _block_scalars) = parse_with_spans_and_block_scalars(bytes)?;
-    Ok((value, spans))
+    let parsed = parse_with_spans_and_block_scalars(bytes)?;
+    Ok((parsed.value, parsed.spans))
+}
+
+/// What [`parse_with_spans_and_block_scalars`] learns about a YAML source.
+struct SpanParse {
+    /// The value tree — a `Value::Array` of the documents for a stream.
+    value: Value,
+    /// Spans, keyed `/{doc_idx}/...` for a stream.
+    spans: SpanMap,
+    /// Canonical pointers of the block-scalar leaves.
+    block_scalars: HashSet<String>,
+    /// Whether the source is a stream of more than one document — the one
+    /// thing `value` cannot tell apart from a single document holding a
+    /// sequence.
+    stream: bool,
 }
 
 /// Parse `bytes` as YAML and additionally surface the canonical pointer set of
@@ -93,7 +109,7 @@ pub fn parse_with_spans(bytes: &[u8]) -> Result<(Value, SpanMap)> {
 /// # Errors
 ///
 /// Same as [`parse_with_spans`].
-fn parse_with_spans_and_block_scalars(bytes: &[u8]) -> Result<(Value, SpanMap, HashSet<String>)> {
+fn parse_with_spans_and_block_scalars(bytes: &[u8]) -> Result<SpanParse> {
     // Reuse the M1 read path verbatim for the value tree. Any divergence
     // between this parser's view and the spike-validated spans would cause
     // `Document::set_at` to splice into bytes that the in-memory tree does
@@ -108,8 +124,28 @@ fn parse_with_spans_and_block_scalars(bytes: &[u8]) -> Result<(Value, SpanMap, H
     } else {
         read_doc.value().clone()
     };
-    let (spans, block_scalars) = build_span_map_and_block_scalars(bytes)?;
-    Ok((value, spans, block_scalars))
+    // The span builder finds lines by their `\n`. A file whose lines all
+    // end in a lone `\r` has none: its spans come from the same bytes with
+    // each `\r` a `\n` — the same length, so every offset holds, and the
+    // same lines to saphyr-parser — or each line lookup would scan to the
+    // end of the file.
+    let lf;
+    let span_bytes = if !bytes.contains(&b'\n') && bytes.contains(&b'\r') {
+        lf = bytes
+            .iter()
+            .map(|&b| if b == b'\r' { b'\n' } else { b })
+            .collect::<Vec<u8>>();
+        lf.as_slice()
+    } else {
+        bytes
+    };
+    let (spans, block_scalars) = build_span_map_and_block_scalars(span_bytes)?;
+    Ok(SpanParse {
+        value,
+        spans,
+        block_scalars,
+        stream: read_doc.is_multi(),
+    })
 }
 
 /// Parse `bytes` as YAML and assemble a [`Document`] carrying the value tree,
@@ -136,15 +172,240 @@ fn parse_with_spans_and_block_scalars(bytes: &[u8]) -> Result<(Value, SpanMap, H
 ///
 /// Forwards [`parse_with_spans`] errors verbatim.
 pub fn parse_yaml_with_spans(bytes: &[u8]) -> Result<Document> {
-    let (value, spans, block_scalars) = parse_with_spans_and_block_scalars(bytes)?;
-    let provenance = build_provenance_with_inline_offsets(&spans, &block_scalars);
-    Ok(Document::with_spans_and_provenance(
-        value,
+    parse_with_spans_and_block_scalars(bytes).map(|parsed| span_document(parsed, bytes))
+}
+
+/// [`parse_yaml_with_spans`], except that a stream of more than one
+/// document comes back as one: [`Document::is_multi`] is `true` and
+/// [`Document::values`] / [`Document::stream_documents`] hand out the
+/// documents.
+///
+/// The value tree, spans, and bytes are those [`parse_yaml_with_spans`]
+/// returns — the textual edits behave the same on either; only the
+/// stream-aware callers (the lint pipeline, `dq fix`, `--doc` on `set` /
+/// `del`) need to know a sequence of documents from a document holding a
+/// sequence.
+///
+/// # Errors
+///
+/// Forwards [`parse_with_spans`] errors verbatim.
+pub fn parse_yaml_stream_with_spans(bytes: &[u8]) -> Result<Document> {
+    let parsed = parse_with_spans_and_block_scalars(bytes)?;
+    let stream = parsed.stream;
+    let mut doc = span_document(parsed, bytes);
+    if stream {
+        doc.mark_stream();
+    }
+    Ok(doc)
+}
+
+/// Where one document of a YAML stream sits in its source bytes, as
+/// [`document_extents`] finds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DocumentExtent {
+    /// Start of the line the document begins on: the line of its `---`
+    /// marker, or — for an implicit document — of its first content.
+    pub(crate) line_start: usize,
+    /// The document's body: from just after the marker line (from just
+    /// after `---` when content shares that line) to where the next
+    /// document's marker, an explicit `...`, or the end of the source
+    /// begins. Comments in between belong to the body.
+    pub(crate) body: Range<usize>,
+    /// Whether text replacing `body` must start with a line break: the
+    /// body begins on the marker line (`--- {a: 1}`), or the marker is the
+    /// last line and has no newline.
+    pub(crate) needs_line_break: bool,
+    /// End of the body's last content line (`body.start` for a document
+    /// with no content): from here to `body.end` the body holds only
+    /// comment lines and blank lines — the lead-in of whatever follows.
+    pub(crate) content_end: usize,
+    /// Where text replacing the body may begin to keep the node
+    /// properties (`!tag`, `&anchor`) written on the marker line
+    /// (`--- !!map`), with whether it must then start with a line break;
+    /// `None` when the marker line carries none.
+    pub(crate) after_properties: Option<(usize, bool)>,
+}
+
+/// One [`DocumentExtent`] per document of the YAML source `bytes`, in
+/// stream order; `None` when `bytes` do not parse (the callers only ask
+/// about sources that already did).
+///
+/// The document spans the span builder records cannot say this: a
+/// document's empty node (`---` followed by nothing) is spanned at the
+/// *next* event — the next `---`, or the end of the source — and a
+/// non-empty container carries no span at all.
+pub(crate) fn document_extents(bytes: &[u8]) -> Option<Vec<DocumentExtent>> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let char_to_byte = build_char_to_byte_map(text);
+    let mut extents: Vec<DocumentExtent> = Vec::new();
+    // Byte spans of the scalars and aliases of the current document.
+    let mut content: Vec<Range<usize>> = Vec::new();
+    let mut parser = YamlParser::new_from_str(text);
+    while let Some(item) = parser.next_event() {
+        let (event, span) = item.ok()?;
+        match event {
+            Event::DocumentStart(explicit) => {
+                let range = span_to_range(span, &char_to_byte);
+                let line_start = line_start_before(bytes, range.start);
+                let (body_start, needs_line_break, after_properties) = if explicit {
+                    marker_line_body(bytes, range.end)
+                } else {
+                    (range.start, false, None)
+                };
+                content.clear();
+                extents.push(DocumentExtent {
+                    line_start,
+                    body: body_start..body_start,
+                    needs_line_break,
+                    content_end: body_start,
+                    after_properties,
+                });
+            }
+            Event::Scalar(value, ScalarStyle::Literal | ScalarStyle::Folded, ..) => {
+                let range = span_to_range(span, &char_to_byte);
+                content.push(block_scalar_content(bytes, range, &value));
+            }
+            Event::Scalar(..) | Event::Alias(_) => {
+                content.push(span_to_range(span, &char_to_byte));
+            }
+            Event::DocumentEnd => {
+                let end = char_index_to_byte(&char_to_byte, span.start.index());
+                if let Some(extent) = extents.last_mut() {
+                    extent.body.end = end.max(extent.body.start);
+                    extent.content_end = content_end(bytes, &extent.body, &content);
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(extents)
+}
+
+/// Start of the line `at` sits on.
+fn line_start_before(bytes: &[u8], at: usize) -> usize {
+    bytes[..at]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |newline| newline + 1)
+}
+
+/// Where the body of an explicit document whose `---` ends at
+/// `marker_end` begins, whether text replacing it must start with a line
+/// break, and the same pair for keeping the node properties written on
+/// the marker line (see [`DocumentExtent::after_properties`]).
+fn marker_line_body(bytes: &[u8], marker_end: usize) -> (usize, bool, Option<(usize, bool)>) {
+    let line_end = bytes[marker_end..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|offset| marker_end + offset);
+    let next_line = |line_end: Option<usize>| match line_end {
+        Some(line_end) => (line_end + 1, false),
+        None => (bytes.len(), true),
+    };
+    let only_a_comment = |rest: &[u8]| {
+        let rest = rest.trim_ascii();
+        rest.is_empty() || rest.starts_with(b"#")
+    };
+    let line = &bytes[marker_end..line_end.unwrap_or(bytes.len())];
+    if only_a_comment(line) {
+        let (start, needs_line_break) = next_line(line_end);
+        return (start, needs_line_break, None);
+    }
+    // `!tag` and `&anchor` — at most one of each — before any content.
+    let mut properties_end = 0;
+    let mut at = 0;
+    for _ in 0..2 {
+        while line.get(at).is_some_and(|b| matches!(b, b' ' | b'\t')) {
+            at += 1;
+        }
+        if !line.get(at).is_some_and(|b| matches!(b, b'!' | b'&')) {
+            break;
+        }
+        while line.get(at).is_some_and(|b| !b.is_ascii_whitespace()) {
+            at += 1;
+        }
+        properties_end = at;
+    }
+    let after_properties = (properties_end > 0).then(|| {
+        if only_a_comment(&line[properties_end..]) {
+            next_line(line_end)
+        } else {
+            (marker_end + properties_end, true)
+        }
+    });
+    (marker_end, true, after_properties)
+}
+
+/// The part of a block scalar's span `range` that is its content: a
+/// clip (`|`, `>`) or strip (`|-`, `>-`) scalar's span runs over the blank
+/// lines after it, which are not part of its `value`, so the span ends
+/// after its last non-blank line. A keep (`|+`, `>+`) scalar's trailing
+/// blank lines are in its value — two or more final line breaks — and
+/// stay content.
+fn block_scalar_content(bytes: &[u8], range: Range<usize>, value: &str) -> Range<usize> {
+    if value.ends_with("\n\n") {
+        return range;
+    }
+    let span = &bytes[range.clone()];
+    let Some(last) = span.iter().rposition(|b| !b.is_ascii_whitespace()) else {
+        return range;
+    };
+    let end = span[last..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(range.end, |newline| range.start + last + newline + 1);
+    range.start..end
+}
+
+/// End of the last content line of `body`, whose scalars and aliases are
+/// spanned at `content`: trailing comment lines and blank lines are left
+/// out. A span at or past `body.end` (an empty document's null, spanned at
+/// the next event) is not content of this body.
+fn content_end(bytes: &[u8], body: &Range<usize>, content: &[Range<usize>]) -> usize {
+    let mut floor = content
+        .iter()
+        .filter(|span| span.start < body.end)
+        .map(|span| span.end.min(body.end))
+        .fold(body.start, usize::max);
+    // A block scalar's span may end inside the next line's indentation;
+    // that line is not part of the scalar.
+    let line_start = line_start_before(bytes, floor);
+    if bytes[line_start..floor]
+        .iter()
+        .all(|b| matches!(b, b' ' | b'\t'))
+    {
+        floor = line_start.max(body.start);
+    }
+    let mut end = body.end;
+    while end > floor {
+        let last = if bytes[end - 1] == b'\n' {
+            end - 1
+        } else {
+            end
+        };
+        let line_start = line_start_before(bytes, last);
+        if line_start < floor {
+            break;
+        }
+        let line = bytes[line_start..end].trim_ascii();
+        if !(line.is_empty() || line.starts_with(b"#")) {
+            break;
+        }
+        end = line_start;
+    }
+    end
+}
+
+/// The write-aware [`Document`] for a [`SpanParse`] of `bytes`.
+fn span_document(parsed: SpanParse, bytes: &[u8]) -> Document {
+    let provenance = build_provenance_with_inline_offsets(&parsed.spans, &parsed.block_scalars);
+    Document::with_spans_and_provenance(
+        parsed.value,
         bytes.to_vec(),
-        spans,
+        parsed.spans,
         FormatTag::Yaml,
         provenance,
-    ))
+    )
 }
 
 /// Build a [`ProvenanceMap`] from `spans`, populating `inline_offset` for every
@@ -742,6 +1003,9 @@ enum Frame {
         /// frame, so `MappingEnd` can tell empty from non-empty without
         /// re-walking the SpanMap.
         saw_child: bool,
+        /// Number of keys seen so far: the index of the next key among
+        /// the mapping's keys in the value tree.
+        keys: usize,
         /// Where this container sits in its parent; see [`ContainerFrame`].
         container: ContainerFrame,
     },
@@ -776,6 +1040,9 @@ struct ContainerFrame {
     /// Where the first child's entry begins (its line start), once a child
     /// was seen: `Some(None)` when that entry could not be located.
     first_entry: Option<Option<usize>>,
+    /// Where the container's entry begins when its parent is a flow
+    /// collection; see [`EditLayout::flow_entries`].
+    flow_entry_start: Option<usize>,
 }
 
 impl Frame {
@@ -823,10 +1090,27 @@ pub(crate) struct EditLayout {
     /// Every alias, in document order.
     pub(crate) aliases: Vec<AliasRef>,
     /// For every empty node of a block collection (`key:`, `-`, `key: &a`,
-    /// `key: !!str`), keyed by canonical pointer: the bytes a value set
-    /// there replaces — its node properties, or without any the empty range
-    /// just past the key's `:` / the item's `-`.
+    /// `key: !!str`) and every empty value of a flow mapping (`{n}`,
+    /// `{n: &a}`), keyed by canonical pointer: the bytes a value set there
+    /// replaces — its node properties, or without any the empty range just
+    /// past the key's `:` / the item's `-` (in a flow mapping: where the
+    /// value goes, see [`EditLayout::flow_value_prefixes`]).
     pub(crate) empty_values: HashMap<String, Range<usize>>,
+    /// For an empty value of a flow mapping without node properties, keyed
+    /// by canonical pointer: what a value set there needs before it — `": "`
+    /// after a key with no `:` (`{n}`), `" "` right after a `:` (`{"n":}`),
+    /// nothing right after a blank (`{n: }`). Its range in
+    /// [`EditLayout::empty_values`] is empty, where the value goes.
+    pub(crate) flow_value_prefixes: HashMap<String, &'static [u8]>,
+    /// Every empty plain node with a tag inside a flow collection
+    /// (`{n: !!null }`, `[!!str , 1]`), by canonical pointer. YAML 1.1
+    /// readers take a flow indicator right after the tag for part of it
+    /// (`!!null,`), so an edit keeps a blank there.
+    pub(crate) bare_flow_tags: HashSet<String>,
+    /// The bytes of every entry of a flow collection, keyed by the
+    /// canonical pointer of its value: from its key (node properties and a
+    /// `?` included) or its item's node through the end of its value.
+    pub(crate) flow_entries: HashMap<String, Range<usize>>,
     /// Where the entry of every value of a block collection begins, keyed
     /// by canonical pointer.
     pub(crate) entries: HashMap<String, EntryStart>,
@@ -898,6 +1182,10 @@ pub(crate) struct ContainerLayout {
     /// collection or one in a block parent, past its closing bracket in a
     /// flow parent.
     pub(crate) end: usize,
+    /// `true` for a single-pair mapping written in a flow sequence without
+    /// braces (`[a: 1]`, `[? a]`): its bytes are its entry in
+    /// [`EditLayout::flow_entries`], and it has no brackets to keep.
+    pub(crate) implicit_pair: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -936,6 +1224,14 @@ struct State<'src> {
     /// with `layout`. saphyr-parser gives each definition its own id, a
     /// redefinition included.
     anchor_defs: HashMap<usize, AnchorDef>,
+    /// The collection used as a mapping key being walked: its start byte
+    /// and how many collections deep the walk is in it. Nothing inside
+    /// such a key has a pointer.
+    collection_key: Option<(usize, usize)>,
+    /// The value tree, read the first time a collection is a key: the
+    /// value tree keys its entry by the collection's text, which only the
+    /// reader makes ([`State::tree_key`]). `Some(None)` when it fails.
+    tree: Option<Option<Value>>,
 }
 
 impl<'src> State<'src> {
@@ -960,6 +1256,82 @@ impl<'src> State<'src> {
             flow_depth: 0,
             layout: None,
             anchor_defs: HashMap::new(),
+            collection_key: None,
+            tree: None,
+        }
+    }
+
+    /// The key the value tree holds for the key about to be set in the
+    /// innermost mapping — its keys come in the order of the key events,
+    /// one per event — escaped as a pointer segment.
+    ///
+    /// `~` when the tree cannot tell: no pointer escapes to a lone `~`,
+    /// so the entry stays unaddressable and clashes with no other.
+    fn tree_key(&mut self) -> String {
+        let Some(Frame::Mapping { keys, .. }) = self.stack.last() else {
+            return "~".to_owned();
+        };
+        let index = *keys;
+        let bytes = self.bytes;
+        let tree = self.tree.get_or_insert_with(|| {
+            crate::parsers::Yaml
+                .parse(bytes)
+                .ok()
+                .map(|doc| match doc.values() {
+                    Some(values) => Value::Array(values.to_vec()),
+                    None => doc.value().clone(),
+                })
+        });
+        let mut node = tree.as_ref();
+        for segment in &self.path {
+            node = node.and_then(|node| match node {
+                Value::Map(map) => map.get(&pointer_unescape(segment)),
+                Value::Array(items) => segment.parse::<usize>().ok().and_then(|i| items.get(i)),
+                _ => None,
+            });
+        }
+        match node {
+            Some(Value::Map(map)) => map
+                .get_index(index)
+                .map_or_else(|| "~".to_owned(), |(key, _)| pointer_escape(key)),
+            _ => "~".to_owned(),
+        }
+    }
+
+    /// One event inside a collection used as a mapping key: anchors and
+    /// aliases are noted as a key's are (no pointer); the key's end sets
+    /// the pending key, as the value tree names the collection.
+    fn observe_in_key(&mut self, event: &Event<'_>, span: Span) {
+        let Some((start, depth)) = self.collection_key.as_mut() else {
+            return;
+        };
+        match event {
+            Event::SequenceStart(anchor, _) | Event::MappingStart(anchor, _) => {
+                *depth += 1;
+                let anchor = *anchor;
+                self.note_anchor(anchor, span, None);
+            }
+            Event::SequenceEnd | Event::MappingEnd => {
+                *depth -= 1;
+                if *depth == 0 {
+                    let start = *start;
+                    self.collection_key = None;
+                    let end = char_index_to_byte(self.char_to_byte, span.end.index());
+                    let key = self.tree_key();
+                    self.set_pending_key(key, start..end);
+                }
+            }
+            Event::Scalar(value, _, anchor, _) => {
+                if *anchor != 0 {
+                    self.anchored_scalars.insert(*anchor, value.to_string());
+                }
+                self.note_anchor(*anchor, span, None);
+            }
+            Event::Alias(anchor) => {
+                let at = char_index_to_byte(self.char_to_byte, span.start.index());
+                self.note_alias(*anchor, at, None);
+            }
+            _ => {}
         }
     }
 
@@ -981,11 +1353,13 @@ impl<'src> State<'src> {
             pending_key,
             pending_key_range,
             saw_child,
+            keys,
             ..
         }) = self.stack.last_mut()
         {
             *pending_key = Some(key);
             *pending_key_range = Some(range);
+            *keys += 1;
             // A key event proves the mapping is non-empty, so `MappingEnd`
             // should NOT record an empty-container span. Setting `saw_child`
             // here keeps the bookkeeping consistent even if the matching
@@ -1092,6 +1466,7 @@ impl<'src> State<'src> {
                 })
             )
             && !starts_line(self.bytes, start_byte);
+        let flow_entry_start = self.flow_entry_start(event_start);
         let entry = self.entry_anchor(event_start);
         let props_end = (n_properties > 0)
             .then(|| skip_node_properties(self.bytes, event_start, n_properties).0);
@@ -1107,6 +1482,7 @@ impl<'src> State<'src> {
             props_end,
             content_end: 0,
             first_entry: None,
+            flow_entry_start,
         };
         if style == ContextStyle::Flow {
             self.flow_depth += 1;
@@ -1118,6 +1494,7 @@ impl<'src> State<'src> {
                 style,
                 start_byte,
                 saw_child: false,
+                keys: 0,
                 container,
             }
         } else {
@@ -1140,6 +1517,32 @@ impl<'src> State<'src> {
     ) -> std::result::Result<(), Error> {
         let ordinal = self.next_ordinal;
         self.next_ordinal += 1;
+        if self.collection_key.is_some() {
+            self.observe_in_key(&event, span);
+            return Ok(());
+        }
+        if matches!(event, Event::SequenceStart(..) | Event::MappingStart(..)) && self.expects_key()
+        {
+            // A collection used as a key (`[1, 2]: a`, `? {k: v}`): its
+            // nodes are no values, and the value tree keys the entry by
+            // its text.
+            let start = char_index_to_byte(self.char_to_byte, span.start.index());
+            // A block mapping whose first key is a flow collection starts
+            // at that key's `[` / `{`, which `open_container` took for a
+            // flow mapping's; nothing was walked inside it since.
+            if let Some(Frame::Mapping {
+                style, start_byte, ..
+            }) = self.stack.last_mut()
+                && *style == ContextStyle::Flow
+                && *start_byte == start
+            {
+                *style = ContextStyle::Block;
+                self.flow_depth -= 1;
+            }
+            self.collection_key = Some((start, 0));
+            self.observe_in_key(&event, span);
+            return Ok(());
+        }
         match event {
             Event::StreamStart | Event::StreamEnd | Event::Nothing => {}
             Event::DocumentStart(_) => {
@@ -1167,17 +1570,70 @@ impl<'src> State<'src> {
                     self.note_anchor(anchor, span, None);
                     self.set_pending_key(key_str, span_to_range(span, self.char_to_byte));
                 } else {
-                    let entry = self
-                        .entry_anchor(char_index_to_byte(self.char_to_byte, span.start.index()));
+                    // The key of an empty value in a flow mapping (`{n}`,
+                    // `{n: }`, `{? n}`, `[n: ]`), which `entry_anchor` takes.
+                    let flow_key =
+                        (self.flow_depth > 0 && style == ScalarStyle::Plain && value.is_empty())
+                            .then(|| match self.stack.last() {
+                                Some(Frame::Mapping {
+                                    pending_key_range, ..
+                                }) => pending_key_range.clone(),
+                                _ => None,
+                            })
+                            .flatten();
+                    let node_start = char_index_to_byte(self.char_to_byte, span.start.index());
+                    let flow_entry_start = self.flow_entry_start(node_start);
+                    let entry = self.entry_anchor(node_start);
                     let pointer = self.value_pointer();
                     self.note_entry(&pointer, entry);
                     self.note_anchor(anchor, span, Some(pointer.clone()));
-                    let (value_range, col) = if n_properties == 0 {
+                    let (mut value_range, col) = if n_properties == 0 {
                         (span_to_range(span, self.char_to_byte), span.start.col())
                     } else {
                         let is_empty_node = style == ScalarStyle::Plain && value.is_empty();
                         self.legacy_scalar_span(span, style, is_empty_node, n_properties, ordinal)
                     };
+                    // An empty item of a flow sequence has properties
+                    // (`[!!str , 1]`); saphyr spans it at the token after
+                    // it. A value set there replaces them.
+                    let flow_item = matches!(
+                        self.stack.last(),
+                        Some(Frame::Sequence {
+                            style: ContextStyle::Flow,
+                            ..
+                        })
+                    ) && style == ScalarStyle::Plain
+                        && value.is_empty()
+                        && n_properties > 0;
+                    if flow_item && let Some(start) = flow_entry_start {
+                        let end = empty_node_end(self.bytes, start, value_range.start.max(start));
+                        value_range = end..end;
+                        if let Some(layout) = self.layout.as_mut() {
+                            layout.empty_values.insert(pointer.clone(), start..end);
+                        }
+                    }
+                    if let Some(key) = flow_key {
+                        // saphyr spans an empty flow value at the token
+                        // after it (`}`); it is empty where a value goes.
+                        let empty = flow_empty_value(self.bytes, &key);
+                        value_range = empty.at.end..empty.at.end;
+                        if let Some(layout) = self.layout.as_mut() {
+                            if empty.at.is_empty() {
+                                layout
+                                    .flow_value_prefixes
+                                    .insert(pointer.clone(), empty.prefix);
+                            }
+                            layout.empty_values.insert(pointer.clone(), empty.at);
+                        }
+                    }
+                    if self.flow_depth > 0
+                        && style == ScalarStyle::Plain
+                        && value.is_empty()
+                        && tag.is_some()
+                        && let Some(layout) = self.layout.as_mut()
+                    {
+                        layout.bare_flow_tags.insert(pointer.clone());
+                    }
                     let context = self.value_context();
                     let node_end = char_index_to_byte(self.char_to_byte, span.end.index());
                     if style == ScalarStyle::Plain
@@ -1193,8 +1649,18 @@ impl<'src> State<'src> {
                         };
                         layout.empty_values.insert(pointer.clone(), start..end);
                     }
+                    // An empty plain node without properties after an
+                    // explicit key with no `:` (`? k` + `? j`) gets the
+                    // span of the next `? ` token: its entry is an empty
+                    // node's, not that token's line.
+                    let line_basis = if style == ScalarStyle::Plain && value.is_empty() {
+                        value_range.start..value_range.start
+                    } else {
+                        value_range.clone()
+                    };
+                    self.note_flow_entry(&pointer, flow_entry_start, value_range.end);
                     let line_range =
-                        self.compute_line_range(&value_range, context, style, entry, node_end);
+                        self.compute_line_range(&line_basis, context, style, entry, node_end);
                     let indent = u32::try_from(col).unwrap_or(u32::MAX);
                     if matches!(style, ScalarStyle::Literal | ScalarStyle::Folded) {
                         // Record the canonical pointer alongside the span
@@ -1228,18 +1694,19 @@ impl<'src> State<'src> {
                 let range = span_to_range(span, self.char_to_byte);
                 if self.expects_key() {
                     self.note_alias(anchor, range.start, None);
-                    // An alias of a collection keys the value tree by its
-                    // debug rendering, which no pointer can spell; the
-                    // empty segment keeps the entry unaddressable.
-                    let key = self
-                        .anchored_scalars
-                        .get(&anchor)
-                        .map_or_else(String::new, |text| pointer_escape(text));
+                    // An alias of a collection keys the value tree by the
+                    // collection's text, which the tree tells.
+                    let key = match self.anchored_scalars.get(&anchor) {
+                        Some(text) => pointer_escape(text),
+                        None => self.tree_key(),
+                    };
                     self.set_pending_key(key, range);
                 } else {
+                    let flow_entry_start = self.flow_entry_start(range.start);
                     let entry = self.entry_anchor(range.start);
                     let pointer = self.value_pointer();
                     self.note_entry(&pointer, entry);
+                    self.note_flow_entry(&pointer, flow_entry_start, range.end);
                     self.note_alias(anchor, range.start, Some(pointer.clone()));
                     let context = self.value_context();
                     let line_range = self.compute_line_range(
@@ -1282,6 +1749,52 @@ impl<'src> State<'src> {
             }
         }
         Ok(())
+    }
+
+    /// Where the entry of the value about to be recorded begins when its
+    /// parent is a flow collection: its key — node properties and a `?`
+    /// included — or, in a sequence, the item's node at `item_start`. Call
+    /// it before [`State::entry_anchor`], which takes the pending key.
+    fn flow_entry_start(&self, item_start: usize) -> Option<usize> {
+        let in_flow = self.flow_depth > 0;
+        match self.stack.last()? {
+            // A mapping in a flow collection is a flow mapping, braces or
+            // not (`[a: 1]`).
+            Frame::Mapping {
+                style,
+                pending_key_range,
+                ..
+            } if *style == ContextStyle::Flow || in_flow => {
+                let key = pending_key_range.as_ref()?;
+                let mut before = key.start;
+                while before > 0 && matches!(self.bytes[before - 1], b' ' | b'\t' | b'\n' | b'\r') {
+                    before -= 1;
+                }
+                Some(if before > 0 && self.bytes[before - 1] == b'?' {
+                    before - 1
+                } else {
+                    key.start
+                })
+            }
+            Frame::Sequence {
+                style: ContextStyle::Flow,
+                ..
+            } => Some(item_start),
+            _ => None,
+        }
+    }
+
+    /// Record the entry `start..end` of the value at `pointer` in a flow
+    /// collection, when collecting the [`EditLayout`]; `end` is moved back
+    /// over the blanks a single-quoted scalar's span takes after it.
+    fn note_flow_entry(&mut self, pointer: &str, start: Option<usize>, end: usize) {
+        if let (Some(layout), Some(start)) = (self.layout.as_mut(), start) {
+            let mut end = end;
+            while end > start && matches!(self.bytes[end - 1], b' ' | b'\t') {
+                end -= 1;
+            }
+            layout.flow_entries.insert(pointer.to_owned(), start..end);
+        }
     }
 
     /// Record where the entry of the value at `pointer` begins, when
@@ -1562,7 +2075,11 @@ impl<'src> State<'src> {
         };
         let style = frame.style();
         let in_flow_parent = self.flow_depth > usize::from(style == ContextStyle::Flow);
-        let (entry, props_end, content_end, first_entry, start_byte) = match frame {
+        let implicit_pair = style == ContextStyle::Block
+            && self.flow_depth > 0
+            && matches!(frame, Frame::Mapping { .. });
+        let (entry, props_end, content_end, first_entry, start_byte, flow_entry_start) = match frame
+        {
             Frame::Mapping {
                 container,
                 start_byte,
@@ -1578,6 +2095,7 @@ impl<'src> State<'src> {
                 container.content_end,
                 container.first_entry,
                 *start_byte,
+                container.flow_entry_start,
             ),
         };
         let end = match style {
@@ -1593,6 +2111,32 @@ impl<'src> State<'src> {
         {
             let container = parent.container_mut();
             container.content_end = container.content_end.max(end);
+        }
+        // A mapping in a flow collection without braces (`[a: 1]`): its
+        // event ends at the token after it, its entry with its value's.
+        if let Some(layout) = self.layout.as_ref() {
+            let pointer = if self.path.is_empty() {
+                String::new()
+            } else {
+                format!("/{}", self.path.join("/"))
+            };
+            let entry_end = if implicit_pair {
+                let prefix = format!("{pointer}/");
+                layout
+                    .flow_entries
+                    .iter()
+                    .filter(|(child, _)| {
+                        child
+                            .strip_prefix(&prefix)
+                            .is_some_and(|tail| !tail.contains('/'))
+                    })
+                    .map(|(_, range)| range.end)
+                    .max()
+                    .unwrap_or(end_byte)
+            } else {
+                end_byte
+            };
+            self.note_flow_entry(&pointer, flow_entry_start, entry_end);
         }
         if let Some(layout) = self.layout.as_mut().map(|layout| &mut layout.containers) {
             let top_level = self.stack.len() == 1;
@@ -1620,6 +2164,7 @@ impl<'src> State<'src> {
                     flow_value: (style == ContextStyle::Flow && in_flow_parent)
                         .then_some(start_byte..end_byte),
                     brackets: (style == ContextStyle::Flow).then_some(start_byte..end_byte),
+                    implicit_pair,
                 },
             );
         }
@@ -1833,6 +2378,11 @@ fn pointer_escape(segment: &str) -> String {
     segment.replace('~', "~0").replace('/', "~1")
 }
 
+/// The key a pointer segment [`pointer_escape`] made spells.
+fn pointer_unescape(segment: &str) -> String {
+    segment.replace("~1", "/").replace("~0", "~")
+}
+
 /// Convert a `saphyr_parser::Span` (char-indexed) into a byte-indexed
 /// [`Range<usize>`] suitable for slicing the original source bytes.
 ///
@@ -1942,6 +2492,51 @@ fn empty_node_end(bytes: &[u8], from: usize, limit: usize) -> usize {
             return last;
         }
         last = end;
+    }
+}
+
+/// Where the empty value of the flow-mapping key spanning `key` is.
+struct FlowEmptyValue {
+    /// Its node properties (`{n: &a }`), or the empty range a value goes
+    /// at without any.
+    at: Range<usize>,
+    /// What a value set there needs before it; see
+    /// [`EditLayout::flow_value_prefixes`].
+    prefix: &'static [u8],
+}
+
+/// [`FlowEmptyValue`] of the key spanning `key`: past its `:` and node
+/// properties, or right past the key when it has no `:` (`{n}`, `{? n}`).
+fn flow_empty_value(bytes: &[u8], key: &Range<usize>) -> FlowEmptyValue {
+    let colon = skip_separation(bytes, key.end);
+    if bytes.get(colon) != Some(&b':') {
+        // A single-quoted key's span takes the blanks after it.
+        let mut end = key.end;
+        while end > key.start && matches!(bytes[end - 1], b' ' | b'\t') {
+            end -= 1;
+        }
+        return FlowEmptyValue {
+            at: end..end,
+            prefix: b": ",
+        };
+    }
+    let value_from = colon + 1;
+    let props_end = empty_node_end(bytes, value_from, bytes.len());
+    if props_end > value_from {
+        return FlowEmptyValue {
+            at: skip_separation(bytes, value_from)..props_end,
+            prefix: b"",
+        };
+    }
+    match bytes.get(value_from) {
+        Some(b' ' | b'\t') => FlowEmptyValue {
+            at: value_from + 1..value_from + 1,
+            prefix: b"",
+        },
+        _ => FlowEmptyValue {
+            at: value_from..value_from,
+            prefix: b" ",
+        },
     }
 }
 
@@ -2167,7 +2762,7 @@ impl ScalarRenderer for YamlScalarRenderer {
             Value::Int(i) => i.to_string().into_bytes(),
             Value::BigInt(s) => s.clone().into_bytes(),
             Value::Float(f) => render_float(*f),
-            Value::BigFloat(s) => s.clone().into_bytes(),
+            Value::BigFloat(s) => render_big_float(s),
             Value::String(s) => render_string_in_style(s, original_style, context),
             // A collection at a scalar's position is written in flow style
             // on the scalar's line.
@@ -2282,7 +2877,11 @@ fn render_double_quoted_if(s: &str, quote: bool) -> Vec<u8> {
 /// Whether `s` written plain inside a flow collection would not read
 /// back as the string `s`.
 fn needs_quoting_in_flow(s: &str) -> bool {
-    needs_quoting_for_plain(s) || needs_flow_quoting(s) || s.contains(['[', '{'])
+    // A `:` that ends it would be read as the value indicator.
+    needs_quoting_for_plain(s)
+        || needs_flow_quoting(s)
+        || s.contains(['[', '{'])
+        || s.ends_with(':')
 }
 
 /// `value` as an entry of a flow collection: a scalar plain where it
@@ -2295,9 +2894,9 @@ fn render_flow_item(value: &Value) -> Vec<u8> {
     }
 }
 
-/// A collection in flow style, JSON-shaped with spaces after the
-/// separators — `{"x": [1, {"y": null}]}` — which YAML reads as the same
-/// tree. Floats JSON cannot spell (`.nan`, `.inf`) use YAML's form.
+/// A collection in YAML flow style with spaces after the separators —
+/// `{x: [1, {y: null}]}` — each key and string plain where it reads back
+/// as itself, else double-quoted (`{"y": "1", "a, b": "on"}`).
 fn render_flow(value: &Value) -> Vec<u8> {
     let mut out = Vec::new();
     push_flow(&mut out, value);
@@ -2322,13 +2921,15 @@ fn push_flow(out: &mut Vec<u8>, value: &Value) {
                 if i > 0 {
                     out.extend_from_slice(b", ");
                 }
-                out.extend_from_slice(&render_double_quoted(key));
+                out.extend_from_slice(&render_double_quoted_if(key, needs_quoting_in_flow(key)));
                 out.extend_from_slice(b": ");
                 push_flow(out, item);
             }
             out.push(b'}');
         }
-        Value::String(s) => out.extend_from_slice(&render_double_quoted(s)),
+        Value::String(s) => {
+            out.extend_from_slice(&render_double_quoted_if(s, needs_quoting_in_flow(s)));
+        }
         scalar => out.extend_from_slice(&render_scalar_inline(scalar)),
     }
 }
@@ -2348,7 +2949,7 @@ fn render_scalar_inline(value: &Value) -> Vec<u8> {
         Value::Int(i) => i.to_string().into_bytes(),
         Value::BigInt(s) => s.clone().into_bytes(),
         Value::Float(f) => render_float(*f),
-        Value::BigFloat(s) => s.clone().into_bytes(),
+        Value::BigFloat(s) => render_big_float(s),
         Value::String(s) => {
             render_string_in_style(s, ScalarStyle::Plain, SpanContext::BlockMapValue)
         }
@@ -2383,6 +2984,15 @@ fn render_null(original_style: ScalarStyle) -> Vec<u8> {
     }
 }
 
+/// A big-float literal as a float to every YAML reader: with a `.` and a
+/// signed exponent (`1e400` → `1.0e+400`), which a YAML 1.1 reader (PyYAML)
+/// needs; any other literal (`.nan`) as it is.
+fn render_big_float(literal: &str) -> Vec<u8> {
+    super::yaml_emit::yaml11_float(literal)
+        .unwrap_or_else(|| literal.to_owned())
+        .into_bytes()
+}
+
 /// Render an `f64`. NaN/Inf are emitted as YAML's `.nan` / `.inf` (with sign),
 /// finite values use the standard `Display` form which already matches what
 /// YAML accepts as a `Float` token.
@@ -2396,14 +3006,13 @@ fn render_float(f: f64) -> Vec<u8> {
             b".inf".to_vec()
         }
     } else {
-        // `1.0_f64.to_string()` returns `"1"` — that loses the float-ness in
-        // YAML round-trip. Force a fractional component when it's missing.
-        let s = f.to_string();
-        if s.contains('.') || s.contains('e') || s.contains('E') {
-            s.into_bytes()
-        } else {
-            format!("{s}.0").into_bytes()
-        }
+        // As the YAML emitter spells it: the shortest round-trip digits, a
+        // whole float with its `.0`, an exponent past the plain-decimal
+        // range in the YAML 1.1 shape (`1e300` -> `1.0e+300`, not 301
+        // digits).
+        super::yaml_emit::yaml_float_text(&Value::Float(f))
+            .unwrap_or_else(|| crate::document::shortest_float(f))
+            .into_bytes()
     }
 }
 
@@ -2431,6 +3040,9 @@ fn detect_scalar_style(bytes: &[u8]) -> ScalarStyle {
 ///   `context` is flow (flow context promotes any bare scalar containing `,`,
 ///   `]`, `}` to double-quoted).
 /// - `SingleQuoted`: wrap in single quotes; embedded `'` is doubled.
+///   A string holding a character a single-quoted scalar cannot hold as
+///   it is — a line break (NEL, LS and PS included), a control — is
+///   double-quoted instead.
 /// - `DoubleQuoted`: wrap in double quotes; control chars escape per YAML
 ///   1.2 §5.7.
 /// - `Literal` / `Folded`: downgrade to double-quoted (lose multi-line
@@ -2448,8 +3060,12 @@ fn render_string_in_style(s: &str, style: ScalarStyle, context: SpanContext) -> 
                 s.as_bytes().to_vec()
             }
         }
-        ScalarStyle::SingleQuoted => render_single_quoted(s),
-        ScalarStyle::DoubleQuoted => render_double_quoted(s),
+        // A single-quoted scalar holds no escape: a line break in it folds,
+        // and LS / PS are line breaks to a YAML 1.1 reader only.
+        ScalarStyle::SingleQuoted if s.chars().all(|c| c == '\t' || single_quotable(c)) => {
+            render_single_quoted(s)
+        }
+        ScalarStyle::SingleQuoted | ScalarStyle::DoubleQuoted => render_double_quoted(s),
         ScalarStyle::Literal | ScalarStyle::Folded => render_double_quoted(s),
     }
 }
@@ -2494,12 +3110,27 @@ fn push_double_quoted_char(out: &mut String, ch: char) {
         '\x0b' => out.push_str(r"\v"),
         '\x0c' => out.push_str(r"\f"),
         '\x1b' => out.push_str(r"\e"),
-        c if (c as u32) < 0x20 => {
-            // Other ASCII control chars: \xNN form.
+        // Line breaks to a YAML 1.1 reader, content to a 1.2 one; escaped,
+        // every reader reads them alike.
+        '\u{85}' => out.push_str(r"\N"),
+        '\u{2028}' => out.push_str(r"\L"),
+        '\u{2029}' => out.push_str(r"\P"),
+        c if single_quotable(c) => out.push(c),
+        // Every other character YAML does not take raw: the other C0
+        // controls, DEL, the C1 controls, U+FFFE and U+FFFF (no printable
+        // characters, YAML 1.2 §5.1), and U+FEFF (a byte order mark, which
+        // may not stand inside a document, §5.2).
+        c => {
             use std::fmt::Write as _;
-            let _ = write!(out, "\\x{:02x}", c as u32);
+            let code = u32::from(c);
+            let _ = if code <= 0xFF {
+                write!(out, "\\x{code:02x}")
+            } else if code <= 0xFFFF {
+                write!(out, "\\u{code:04x}")
+            } else {
+                write!(out, "\\U{code:08x}")
+            };
         }
-        c => out.push(c),
     }
 }
 
@@ -2572,7 +3203,10 @@ fn needs_quoting_for_plain(s: &str) -> bool {
         // but the safe choice is to quote.
         return true;
     }
-    if s.contains('\n') || s.contains('\r') || s.contains('\t') {
+    // A line break (NEL, LS and PS are line breaks to a YAML 1.1 reader),
+    // a tab, or a character YAML does not allow raw — a control, U+FEFF —
+    // goes double-quoted, escaped.
+    if !s.chars().all(single_quotable) {
         return true;
     }
     if contains_unsafe_colon_or_hash(s) {
@@ -2591,37 +3225,6 @@ fn needs_quoting_for_plain(s: &str) -> bool {
         serde_norway::from_str::<serde_norway::Value>(s),
         Ok(serde_norway::Value::String(read)) if read == s
     )
-}
-
-/// Whether a YAML 1.1 reader (go-yaml, as in Kubernetes and GitHub
-/// Actions; PyYAML) or a YAML 1.2 core / JSON schema one would take the
-/// plain scalar `s` for something other than a string — a bool, null,
-/// int (`1_000`, `0b1`, `017`, `1:20`), float (`1.`, `1e3`), timestamp
-/// (`2001-12-14`), or the `<<` / `=` keys — though dq's own reader may
-/// not.
-fn typed_by_another_schema(s: &str) -> bool {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| {
-        regex::Regex::new(concat!(
-            r"^(?:",
-            r"~|null|Null|NULL",
-            r"|y|Y|yes|Yes|YES|n|N|no|No|NO|true|True|TRUE|false|False|FALSE",
-            r"|on|On|ON|off|Off|OFF",
-            r"|[-+]?0b[01_]+|[-+]?0o?[0-7_]+|[-+]?0x[0-9a-fA-F_]+",
-            r"|[-+]?(?:0|[1-9][0-9_]*)(?::[0-5]?[0-9])*",
-            r"|[-+]?(?:[0-9][0-9_]*)?\.[0-9_]*(?:[eE][-+]?[0-9]+)?",
-            r"|[-+]?[0-9][0-9_]*[eE][-+]?[0-9]+",
-            r"|[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+\.[0-9_]*",
-            r"|[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN)",
-            r"|[0-9]{4}-[0-9]{2}-[0-9]{2}",
-            r"|[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}(?:[Tt]|[ \t]+)[0-9]{1,2}:[0-9]{2}:[0-9]{2}",
-            r"(?:\.[0-9]*)?(?:[ \t]*(?:Z|[-+][0-9]{1,2}(?::[0-9]{2})?))?",
-            r"|<<|=",
-            r")$",
-        ))
-        .expect("the YAML type regex compiles")
-    })
-    .is_match(s)
 }
 
 /// `: ` and ` #` cause YAML key/comment confusion in plain scalars.
@@ -2652,6 +3255,43 @@ mod tests {
     use super::*;
     use crate::Pointer;
     use indexmap::IndexMap;
+
+    #[test]
+    fn a_string_with_line_and_paragraph_separators_is_rendered_escaped() {
+        let ctx = SpanContext::BlockMapValue;
+        let ls = "a\u{2028}b";
+        for style in [
+            ScalarStyle::Plain,
+            ScalarStyle::SingleQuoted,
+            ScalarStyle::Literal,
+        ] {
+            assert_eq!(render_string_in_style(ls, style, ctx), b"\"a\\Lb\"");
+        }
+        assert_eq!(yaml_key_token("\u{2029}"), "\"\\P\"");
+        assert_eq!(
+            render_string_in_style("a\tb", ScalarStyle::SingleQuoted, ctx),
+            b"'a\tb'"
+        );
+    }
+
+    #[test]
+    fn a_string_with_a_character_yaml_does_not_take_raw_is_rendered_escaped() {
+        let ctx = SpanContext::FlowSeqItem;
+        let s = "\u{7f}\u{80}\u{feff}\u{ffff}\u{a0}";
+        for style in [
+            ScalarStyle::Plain,
+            ScalarStyle::SingleQuoted,
+            ScalarStyle::DoubleQuoted,
+            ScalarStyle::Folded,
+        ] {
+            assert_eq!(
+                render_string_in_style(s, style, ctx),
+                "\"\\x7f\\x80\\ufeff\\uffff\u{a0}\"".as_bytes()
+            );
+        }
+        assert_eq!(yaml_key_token("k\u{9f}"), "\"k\\x9f\"");
+        assert_eq!(yaml_key_token("k\u{a0}"), "k\u{a0}");
+    }
 
     fn assert_span(spans: &SpanMap, pointer: &str, bytes: &[u8], expected_value: &[u8]) {
         let span = spans.get(pointer).unwrap_or_else(|| {
@@ -3383,5 +4023,159 @@ mod tests {
             .expect("ranges are disjoint");
         assert_eq!(blanked, "k:     |\n  é\nr: xxx\n");
         assert_eq!(blanked.chars().count(), text.chars().count());
+    }
+
+    #[test]
+    fn stream_parse_marks_only_a_real_stream() {
+        let stream = parse_yaml_stream_with_spans(b"a: 1\n---\nb: 2\n").unwrap();
+        assert!(stream.is_multi());
+        assert_eq!(stream.values().map(<[Value]>::len), Some(2));
+
+        // A single document holding a sequence is not a stream.
+        let sequence = parse_yaml_stream_with_spans(b"- 1\n- 2\n").unwrap();
+        assert!(!sequence.is_multi());
+        assert!(sequence.stream_documents().is_none());
+
+        // The plain span parser still returns one array document.
+        assert!(
+            !parse_yaml_with_spans(b"a: 1\n---\nb: 2\n")
+                .unwrap()
+                .is_multi()
+        );
+    }
+
+    #[test]
+    fn stream_documents_rebase_provenance_and_keep_file_lines() {
+        let bytes = b"a: 1\n---\n\nb:\n  c: 2\n";
+        let doc = parse_yaml_stream_with_spans(bytes).unwrap();
+        let parts = doc.stream_documents().expect("a stream");
+        assert_eq!(parts.len(), 2);
+
+        let second = &parts[1];
+        assert_eq!(second.index(), 1);
+        let ir = second.as_ir();
+        // `/b/c` of document 1 is `/1/b/c` of the stream, on line 5.
+        let pointer = Pointer::parse("/b/c").unwrap();
+        assert_eq!(ir.line_col_for(&pointer).map(|(line, _)| line), Some(5));
+        assert!(ir.line_col_for(&Pointer::parse("/a").unwrap()).is_none());
+        // A position no pointer resolves falls back into the document —
+        // its first line holding a spanned value (`c: 2`; the non-empty
+        // map `b` has no span of its own) — not to line 1 of the file.
+        assert_eq!(ir.origin_line_col().0, 5);
+        assert_eq!(parts[0].as_ir().origin_line_col(), (1, 1));
+    }
+
+    #[test]
+    fn an_empty_document_starts_at_its_own_marker_line() {
+        // (source, the fallback line of each document)
+        let cases: [(&[u8], &[u32]); 5] = [
+            (b"name: a\n---\n", &[1, 2]),
+            (b"---\n---\n", &[1, 2]),
+            (b"name: a\n--- # c\n# tail\n", &[1, 2]),
+            (b"name: a\n---\n---\nname: c\n", &[1, 2, 4]),
+            (b"name: a\n---", &[1, 2]),
+        ];
+        for (bytes, lines) in cases {
+            let doc = parse_yaml_stream_with_spans(bytes).unwrap();
+            let found: Vec<u32> = doc
+                .stream_documents()
+                .expect("a stream")
+                .iter()
+                .map(|part| part.as_ir().origin_line_col().0)
+                .collect();
+            assert_eq!(found, lines, "{:?}", String::from_utf8_lossy(bytes));
+        }
+    }
+
+    #[test]
+    fn document_extents_locate_marker_lines_and_bodies() {
+        let bytes = b"# h\na: 1\n--- # c\nb: 2\n--- {c: 3}\n...\n";
+        let extents = document_extents(bytes).expect("parses");
+        let body = |extent: &DocumentExtent| &bytes[extent.body.clone()];
+        assert_eq!(extents.len(), 3);
+        assert_eq!(
+            (extents[0].line_start, body(&extents[0])),
+            (4, &b"a: 1\n"[..])
+        );
+        assert_eq!(
+            (extents[1].line_start, body(&extents[1])),
+            (9, &b"b: 2\n"[..])
+        );
+        assert!(!extents[1].needs_line_break);
+        assert_eq!(
+            (extents[2].line_start, body(&extents[2])),
+            (22, &b" {c: 3}\n"[..])
+        );
+        assert!(extents[2].needs_line_break, "content on the marker line");
+    }
+
+    #[test]
+    fn document_extents_end_content_before_trailing_comments() {
+        let cases: [(&[u8], &[&[u8]]); 10] = [
+            (
+                b"a: 1\n---\nfixme: 1 # k\n\n# next\n---\nb: 2\n# tail\n",
+                &[b"a: 1\n", b"fixme: 1 # k\n", b"b: 2\n"],
+            ),
+            (
+                b"a: 1\r\n# c\r\n---\r\nb: 2\r\n",
+                &[b"a: 1\r\n", b"b: 2\r\n"],
+            ),
+            (b"a: 1\n---\n# only\n---\nb: 2", &[b"a: 1\n", b"", b"b: 2"]),
+            // `#` lines inside a block scalar are content.
+            (
+                b"k: |\n  x\n  # in\n# out\n---\nb: 2\n",
+                &[b"k: |\n  x\n  # in\n", b"b: 2\n"],
+            ),
+            (
+                b"a:\n  k: |\n    x\n  # out\n---\nb: 2\n",
+                &[b"a:\n  k: |\n    x\n", b"b: 2\n"],
+            ),
+            (b"a: [1,\n  2\n]\n# c\n...\n", &[b"a: [1,\n  2\n]\n"]),
+            // Clip and strip: the blank lines after the scalar are not
+            // content; keep: they are.
+            (
+                b"k: |\n  x\n\n# c\n---\nb: 2\n",
+                &[b"k: |\n  x\n", b"b: 2\n"],
+            ),
+            (b"k: >-\n  x\n  y\n\n# c\n", &[b"k: >-\n  x\n  y\n"]),
+            (b"k: |\r\n  x\r\n\r\n# c\r\n", &[b"k: |\r\n  x\r\n"]),
+            (
+                b"k: |+\n  x\n\n# c\n---\nb: 2\n",
+                &[b"k: |+\n  x\n\n", b"b: 2\n"],
+            ),
+        ];
+        for (bytes, contents) in cases {
+            let extents = document_extents(bytes).expect("parses");
+            let found: Vec<&[u8]> = extents
+                .iter()
+                .map(|extent| &bytes[extent.body.start..extent.content_end])
+                .collect();
+            assert_eq!(found, contents, "{:?}", String::from_utf8_lossy(bytes));
+        }
+    }
+
+    #[test]
+    fn document_extents_find_node_properties_on_the_marker_line() {
+        let bytes =
+            b"--- !!map\na: 1\n--- &x # c\nb: 2\n--- !t &y {c: 3}\n--- # c\nd: 4\n--- {e: 5}\n";
+        let extents = document_extents(bytes).expect("parses");
+        let kept: Vec<Option<(&[u8], bool)>> = extents
+            .iter()
+            .map(|extent| {
+                extent
+                    .after_properties
+                    .map(|(start, needs)| (&bytes[extent.line_start..start], needs))
+            })
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                Some((&b"--- !!map\n"[..], false)),
+                Some((&b"--- &x # c\n"[..], false)),
+                Some((&b"--- !t &y"[..], true)),
+                None,
+                None,
+            ]
+        );
     }
 }

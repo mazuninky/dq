@@ -63,3 +63,30 @@ tests:
       violations:
         - rule: openapi.security-defined
           message_contains: "GET /b"
+  - name: list root produces no violations
+    input: |
+      - a
+      - b
+    expected:
+      violations: []
+  - name: scalar root produces no violations
+    input: |
+      just a string
+    expected:
+      violations: []
+  - name: empty document produces no violations
+    input: ""
+    expected:
+      violations: []
+  - name: scalar path item and scalar operation are skipped
+    input: |
+      openapi: "3.0.0"
+      info: {title: t, version: "1"}
+      paths:
+        /a: x
+        /b: {get: x}
+        /c: {get: {responses: {"200": {}}}}
+    expected:
+      violations:
+        - rule: openapi.security-defined
+          message_contains: "GET /c"

@@ -10,12 +10,15 @@ check:
   jq: |
     [.. | objects | select(.type? == "table")][]
     | . as $t
-    | ($t.children[0].children | length) as $expected
-    | $t.children[1:][]
-    | select((.children | length) != $expected)
-    | { expected: $expected, actual: (.children | length), position: .position }
+    | ($t.children? | arrays) as $rows
+    | ($rows[0] | objects | .children? | arrays | length) as $expected
+    | $rows[1:][]
+    | objects
+    | (.children? | arrays | length) as $actual
+    | select($actual != $expected)
+    | { expected: $expected, actual: $actual, position: .position }
   message: "Table row has {{ .actual }} cells but header row has {{ .expected }}"
 references:
   - https://github.github.com/gfm/#tables-extension-
 loc:
-  line: '.position.start.line // 1'
+  line: '(objects | .position | objects | .start | objects | .line) // 1'

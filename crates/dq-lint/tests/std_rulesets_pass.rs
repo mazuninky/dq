@@ -113,3 +113,25 @@ fn std_openapi_fixtures_pass() {
 fn std_skills_fixtures_pass() {
     assert_all_fixtures_pass("skills");
 }
+
+/// `dq test @std/<ns>` runs the embedded fixtures against the embedded
+/// rules (`RuleTester::run_std`), not a staged copy on disk: every
+/// namespace passes there too, with as many cases as the staged run.
+#[test]
+fn std_fixtures_pass_from_the_embedded_library() {
+    for ns in dq_lint::list_std_rulesets() {
+        let outcomes = RuleTester::run_std(ns).expect("known namespace");
+        let failures: Vec<&TestOutcome> = outcomes
+            .iter()
+            .filter(|o| !matches!(o, TestOutcome::Pass { .. }))
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "@std/{ns} fixtures failed:\n{failures:#?}"
+        );
+        let tmp = stage_namespace_to_tempdir(ns);
+        let dir = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).expect("UTF-8 tempdir");
+        let staged = RuleTester::run_dir(&dir).expect("test runner ok");
+        assert_eq!(outcomes.len(), staged.len(), "@std/{ns} case count");
+    }
+}

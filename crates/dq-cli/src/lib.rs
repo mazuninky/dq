@@ -11,13 +11,18 @@ pub mod commands;
 pub mod diff;
 pub mod error;
 pub mod exit_code;
+mod glob;
 pub mod output;
 
 pub use cli::{Cli, Command};
-pub use error::{LintFail, SilentError, ValidateFail};
+pub use error::{
+    DocOutOfRange, DocOutOfRangeEverywhere, LintFail, SilentError, ValidateFail, WrongType,
+};
 
 use std::io::Write;
 
+use cli::InputFormat;
+use dq_core::one_line;
 use output::{
     ConsoleReporter, JsonReporter, JsonlReporter, JunitReporter, OutputFormat, Reporter,
     SarifReporter, TapReporter, TomlReporter, ToonReporter, YamlReporter,
@@ -58,8 +63,33 @@ fn dispatch(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> anyhow::Result<()> {
-    let input_format = cli.format.as_input_format_name();
-    let doc_arg = cli.doc.as_deref();
+    // `-F` is the output format only (the reporter above, or `convert`'s
+    // target); the parser comes from `--input-format`, else detection.
+    let input_format = cli.input_format.map(InputFormat::parser_name);
+    // `--doc` is global, so clap accepts it on every command; refuse it
+    // where the command would otherwise ignore it.
+    if cli.doc.is_some()
+        && let Some(why) = cli.command.doc_unsupported_reason()
+    {
+        return Err(cli.doc_usage_error(cli.command.name(), why));
+    }
+    // `--input-format` is global too: refused where there is no data file
+    // for it to name the format of.
+    if cli.input_format.is_some()
+        && let Some(why) = cli.command.input_format_unsupported_reason()
+    {
+        return Err(cli.input_format_usage_error(cli.command.name(), why));
+    }
+    // Stdin can be read once: a command given `-` for two inputs would
+    // find it empty for the second.
+    let stdin_inputs = cli.command.stdin_inputs();
+    if stdin_inputs.len() > 1 {
+        return Err(cli::stdin_read_twice_error(
+            cli.command.name(),
+            &stdin_inputs,
+        ));
+    }
+    let doc_arg = cli.doc;
     // M4 §3: snapshot the global re-emit flags into a `WriteOptions` so
     // every handler that touches `Format::write_with_options` shares the
     // same view. Read commands ignore it; `set`/`del`/`patch`/`merge`
@@ -79,26 +109,18 @@ fn dispatch(
         }
         Command::Paths(args) => commands::paths::run(cli, args, input_format, reporter, out),
         Command::Select(args) => commands::select::run(cli, args, input_format, reporter, out),
-        // For `convert`, `-F` is the OUTPUT format. Input format always
-        // comes from the file extension; passing `cli.format` as the input
-        // override would force `dq convert deployment.yaml -F json` to parse
-        // the YAML file as JSON (and fail). The convert handler needs the
-        // raw `cli.format` for output routing, plus `use_color` for the
-        // console-output branch which constructs its own `ConsoleReporter`
-        // (the dispatcher's reporter is for non-convert commands).
+        // `convert` renders `-F` itself (writers, not reporters), plus
+        // `use_color` for its console branch.
         Command::Convert(args) => {
-            commands::convert::run(cli, args, None, cli.format, use_color, &opts, out)
+            commands::convert::run(cli, args, input_format, cli.format, use_color, &opts, out)
         }
         // M4 §3: `dq fmt FILE` — re-emit through the format's native
         // writer with the global `--sort-keys` / `--indent` knobs applied.
         Command::Fmt(args) => commands::fmt::run(cli, args, input_format, use_color, &opts, out),
         Command::Validate(args) => commands::validate::run(cli, args, input_format, reporter, err),
-        // For `diff`, `-F` controls the OUTPUT format (how the resulting
-        // `Vec<PatchOp>` is rendered). Input formats for both files come from
-        // their extensions — same special-case as `convert`. Passing
-        // `cli.format` as the input override would force `dq diff a.yaml
-        // b.yaml -F json` to parse the YAML files as JSON and fail.
-        Command::Diff(args) => commands::diff::run(cli, args, None, reporter, out),
+        Command::Diff(args) => {
+            commands::diff::run(cli, args, input_format, use_color, reporter, out)
+        }
         Command::Set(args) => commands::set::run(cli, args, input_format, use_color, out),
         Command::Del(args) => commands::del::run(cli, args, input_format, use_color, out),
         Command::Patch(args) => commands::patch::run(cli, args, input_format, use_color, out),
@@ -121,7 +143,7 @@ fn dispatch(
             cli.ensure_no_write_flags()?;
             match &args.command {
                 cli::SelfCommand::Check => commands::self_cmd::run_check(out),
-                cli::SelfCommand::Update(u) => commands::self_cmd::run_update(u),
+                cli::SelfCommand::Update(u) => commands::self_cmd::run_update(u, out),
             }
         }
         // M8 Stage 6: lint engine. The `lint` and `check` handlers route
@@ -130,14 +152,8 @@ fn dispatch(
         // → reporter); the other three (`test`, `explain`, `rules`) drive
         // their own logic but reuse the same write-flag rejection and
         // exit-code markers.
-        //
-        // `-F` is the OUTPUT format (renderer selection). Input formats come
-        // from each file's extension via `pick_format` inside the lint
-        // pipeline — same special-case as `convert` / `diff`. Passing
-        // `cli.format` as the input override would force `dq lint -F json
-        // file.yaml` to parse every file as JSON and fail.
-        Command::Lint(args) => commands::lint::run(cli, args, None, reporter, out),
-        Command::Check(args) => commands::check::run(cli, args, None, reporter, out),
+        Command::Lint(args) => commands::lint::run(cli, args, input_format, reporter, out),
+        Command::Check(args) => commands::check::run(cli, args, input_format, reporter, out),
         Command::Test(args) => {
             cli.ensure_no_write_flags()?;
             commands::test_cmd::run(cli, args, out)
@@ -167,8 +183,8 @@ fn dispatch(
 /// Reporter factory — wires an [`OutputFormat`] selection to a concrete reporter.
 ///
 /// Lives in `lib.rs` (the wiring layer) so command handlers stay
-/// dependency-injected per design D1
-/// (`openspec/changes/add-exec-engine/design.md`): they receive a
+/// dependency-injected (see the add-exec-engine section of
+/// `docs/decisions.md`): they receive a
 /// `&dyn Reporter` and never decide which concrete implementation to
 /// instantiate.
 ///
@@ -261,13 +277,38 @@ impl Reporter for BannedReporter {
 ///   reporter; printing again would duplicate the message.
 /// - For all other errors, the standard anyhow chain (`{:?}`) is written.
 ///
+/// Every line is written escaped as the console reporter escapes text
+/// ([`output::console`]): a message echoes what the user typed and what
+/// the file holds — a pointer, a `did_you_mean` key, a path — and a
+/// control character or a bidi override in it must not reach the terminal
+/// raw. The message's own line breaks stay.
+///
 /// Called from `main.rs` after `run` returns an error; tests can call it
 /// directly with a `Vec<u8>` writer to assert on the rendered shape.
 pub fn render_error(err: &anyhow::Error, w: &mut dyn Write) -> std::io::Result<()> {
+    let mut raw = Vec::new();
+    render_error_raw(err, &mut raw)?;
+    let text = String::from_utf8_lossy(&raw);
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            w.write_all(b"\n")?;
+        }
+        w.write_all(output::console::escape_control(line).as_bytes())?;
+    }
+    Ok(())
+}
+
+/// [`render_error`] before the escaping.
+fn render_error_raw(err: &anyhow::Error, w: &mut dyn Write) -> std::io::Result<()> {
     if err.downcast_ref::<ValidateFail>().is_some() {
         // The validate handler already wrote a structured error through its
         // reporter to the caller-supplied stderr writer. Don't print again.
         return Ok(());
+    }
+    if let Some(usage) = err.downcast_ref::<clap::Error>() {
+        // Rendered the way clap renders its own usage errors: `error: …`,
+        // the usage line, the `--help` hint.
+        return write!(w, "{usage}");
     }
     if let Some(dq_core::Error::Path {
         pointer,
@@ -276,24 +317,194 @@ pub fn render_error(err: &anyhow::Error, w: &mut dyn Write) -> std::io::Result<(
         ..
     }) = err.downcast_ref::<dq_core::Error>()
     {
-        writeln!(w, "{err}")?;
+        // What the user or the file put here goes on one line
+        // ([`dq_core::one_line`]), so it cannot pass for a line of its own.
+        writeln!(w, "{}", one_line(&err.to_string()))?;
         if !matched_prefix.is_empty() {
-            writeln!(w, "  matched prefix: {matched_prefix}")?;
+            writeln!(w, "  matched prefix: {}", one_line(matched_prefix))?;
         }
         if !did_you_mean.is_empty() {
-            writeln!(w, "  did_you_mean: {}", did_you_mean.join(", "))?;
+            let keys: Vec<_> = did_you_mean.iter().map(|key| one_line(key)).collect();
+            writeln!(w, "  did_you_mean: {}", keys.join(", "))?;
         }
         // Echo the original pointer for copy-paste convenience.
-        writeln!(w, "  pointer: {pointer}")?;
+        writeln!(w, "  pointer: {}", one_line(pointer))?;
         return Ok(());
     }
-    writeln!(w, "{err:?}")
+    write_chain(err, w)
+}
+
+/// `err` and the errors that caused it, as anyhow's `{:?}` writes them —
+/// the message, then `Caused by:` and each cause indented, numbered when
+/// there are several, then the backtrace when one was captured — each
+/// message as [`terminal_message`] gives it.
+fn write_chain(err: &anyhow::Error, w: &mut dyn Write) -> std::io::Result<()> {
+    let mut chain = err.chain();
+    if let Some(top) = chain.next() {
+        write!(w, "{}", terminal_message(top))?;
+    }
+    let causes: Vec<_> = chain.collect();
+    if !causes.is_empty() {
+        write!(w, "\n\nCaused by:")?;
+        let numbered = causes.len() > 1;
+        for (n, cause) in causes.into_iter().enumerate() {
+            writeln!(w)?;
+            for (i, line) in terminal_message(cause).split('\n').enumerate() {
+                match (numbered, i) {
+                    (true, 0) => write!(w, "{n:>5}: ")?,
+                    (true, _) => write!(w, "\n       ")?,
+                    (false, 0) => write!(w, "    ")?,
+                    (false, _) => write!(w, "\n    ")?,
+                }
+                write!(w, "{line}")?;
+            }
+        }
+    }
+    // The backtrace anyhow captured (`RUST_BACKTRACE`), as its `{:?}`
+    // writes it.
+    let backtrace = err.backtrace();
+    if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
+        let mut backtrace = backtrace.to_string();
+        write!(w, "\n\n")?;
+        if backtrace.starts_with("stack backtrace:") {
+            backtrace.replace_range(0..1, "S");
+        } else {
+            writeln!(w, "Stack backtrace:")?;
+        }
+        write!(w, "{}", backtrace.trim_end())?;
+    }
+    writeln!(w)
+}
+
+/// The message of `err` for the terminal. A `dq_core` error dq knows to be
+/// one line — a writer's refusal, a rejected edit, a path or I/O error —
+/// and the CLI's own are put on one line ([`dq_core::one_line`]), so a key,
+/// a pointer or a path they quote cannot break them. In the others only
+/// what the user or a file put there goes on one line — a parse error's
+/// file name, a template refusal's line, a rule's id and paths, a plugin's
+/// rule id and path — and the rest keeps its line breaks: a parse error's
+/// snippet, a wasm backtrace in a plugin's error. Any other error's
+/// message stays as it is. [`render_error`] escapes the controls of every
+/// line. The messages themselves keep the text as it is, for the
+/// machine-readable outputs that carry them.
+fn terminal_message(err: &(dyn std::error::Error + 'static)) -> String {
+    use dq_exec::ExecError as X;
+    use dq_plugin::PluginError as P;
+    let text = err.to_string();
+    if let Some(err) = err.downcast_ref::<dq_core::Error>() {
+        return match err {
+            dq_core::Error::Parse {
+                file: Some(file), ..
+            } => one_line_fields(text, &[file.as_str()]),
+            dq_core::Error::Parse { .. } => text,
+            dq_core::Error::TemplatedFile { snippet, .. } => one_line_fields(text, &[snippet]),
+            _ => one_line(&text).into_owned(),
+        };
+    }
+    if let Some(err) = err.downcast_ref::<X>() {
+        let fields: Vec<&str> = match err {
+            X::Parse { .. } => Vec::new(),
+            X::UnknownRule { id, .. } => vec![id],
+            X::Io { path, .. } | X::TestFixture { path, .. } => vec![path.as_str()],
+            X::CompositeExtractUnknownFormat {
+                rule_id, format, ..
+            } => vec![rule_id, format],
+            X::SchemaFileAbsolutePath { rule_id, path, .. }
+            | X::SchemaFileEscapesRuleDir { rule_id, path, .. } => vec![rule_id, path.as_str()],
+            X::RuleCompile { rule_id, .. }
+            | X::GlobCompile { rule_id, .. }
+            | X::FixApply { rule_id, .. }
+            | X::CheckMutuallyExclusive { rule_id, .. }
+            | X::CheckMissing { rule_id, .. }
+            | X::CompositeIncomplete { rule_id, .. }
+            | X::CompositeExtractNotArray { rule_id, .. }
+            | X::CompositeExtractMalformed { rule_id, .. }
+            | X::CompositeDepthExceeded { rule_id, .. }
+            | X::SchemaCompile { rule_id, .. } => vec![rule_id],
+        };
+        return one_line_fields(text, &fields);
+    }
+    if let Some(err) = err.downcast_ref::<P>() {
+        let fields: Vec<&str> = match err {
+            P::FeatureDisabled { .. } => Vec::new(),
+            P::SchemaVersion { plugin_version, .. } => vec![plugin_version],
+            P::DisallowedImport { interface, .. } => vec![interface],
+            P::Load { path, .. } => vec![path.as_str()],
+            P::Exhausted { rule_id, .. }
+            | P::Memory { rule_id, .. }
+            | P::MalformedFix { rule_id, .. }
+            | P::Invoke { rule_id, .. } => vec![rule_id],
+        };
+        return one_line_fields(text, &fields);
+    }
+    if err.is::<error::InvalidInput>()
+        || err.is::<error::DocOutOfRange>()
+        || err.is::<error::WrongType>()
+    {
+        return one_line(&text).into_owned();
+    }
+    text
+}
+
+/// `text` with the first spelling of each of `fields` in it put on one
+/// line ([`dq_core::one_line`]); the rest of `text` as it is.
+fn one_line_fields(mut text: String, fields: &[&str]) -> String {
+    for field in fields {
+        if field.contains(['\n', '\r']) {
+            text = text.replacen(field, &one_line(field), 1);
+        }
+    }
+    text
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
+
+    /// `render_error`'s text without the backtrace section: whether anyhow
+    /// captures one depends on `RUST_BACKTRACE`, which CI sets. The CLI test
+    /// pins the backtrace itself.
+    fn rendered(err: impl std::error::Error + Send + Sync + 'static) -> String {
+        let mut out = Vec::new();
+        render_error(&anyhow::Error::new(err), &mut out).expect("render");
+        let text = String::from_utf8(out).expect("utf-8");
+        match text.find("\n\nStack backtrace:") {
+            Some(at) => format!("{}\n", &text[..at]),
+            None => text,
+        }
+    }
+
+    #[test]
+    fn a_plugin_error_keeps_its_line_breaks_but_the_rule_ids() {
+        // Was: one line, every line break of wasmtime's backtrace `\x0a`.
+        let err = dq_plugin::PluginError::Invoke {
+            rule_id: "x.a\nb".into(),
+            message: "error while executing at wasm backtrace:\n    0: 0x1 - f\u{1b}".into(),
+        };
+        assert_eq!(
+            rendered(err),
+            "plugin rule x.a\\x0ab invocation failed: error while executing at wasm \
+             backtrace:\n    0: 0x1 - f\\x1b\n"
+        );
+        let err = dq_plugin::PluginError::Load {
+            path: "p\nq.wasm".into(),
+            message: "bad\nmodule".into(),
+        };
+        assert_eq!(
+            rendered(err),
+            "failed to load plugin p\\x0aq.wasm: bad\nmodule\n"
+        );
+    }
+
+    #[test]
+    fn a_rule_error_puts_its_rule_id_on_one_line() {
+        let err = dq_exec::ExecError::FixApply {
+            rule_id: "r\nx".into(),
+            message: "two\nlines".into(),
+        };
+        assert_eq!(rendered(err), "rule r\\x0ax fix failed: two\nlines\n");
+    }
 
     #[test]
     fn run_dispatches_to_get_against_missing_file() {

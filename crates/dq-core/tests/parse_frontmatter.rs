@@ -149,3 +149,151 @@ fn parse_unterminated_open_delim_falls_back_to_empty_header_and_full_body() {
         "body must equal the whole file in the unterminated-fallback path",
     );
 }
+
+#[test]
+fn every_frontmatter_kind_writes_a_float_in_its_shortest_form() {
+    // The JSON and TOML writers printed `1e300` as 301 digits and `-1e-300`
+    // as `-0.` and 299 zeros and a 1; the YAML writer has its own
+    // spelling. A whole float keeps its `.0` in each.
+    let cases = [
+        (
+            "{\n  \"x\": 1e300,\n  \"w\": [3.0, -1e-300]\n}\n\n# Body\n",
+            "{\n  \"x\": 1e300,\n  \"w\": [\n    3.0,\n    -1e-300\n  ]\n}\n\n# Body\n",
+        ),
+        (
+            "+++\nx = 1e300\nw = [3.0, -1e-300]\n+++\n# Body\n",
+            "+++\nx = 1e300\nw = [\n    3.0,\n    -1e-300,\n]\n+++\n# Body\n",
+        ),
+        (
+            "---\nx: 1e300\nw: [3.0, -1e-300]\n---\n# Body\n",
+            "---\nx: 1.0e+300\nw:\n- 3.0\n- -1.0e-300\n---\n# Body\n",
+        ),
+    ];
+    for (input, expected) in cases {
+        let mut out = Vec::new();
+        frontmatter()
+            .write(&parse_md(input), &mut out)
+            .expect("frontmatter writes");
+        assert_eq!(String::from_utf8(out).expect("UTF-8"), expected, "{input}");
+    }
+}
+
+#[test]
+fn frontmatter_after_a_bom_is_read_and_the_bom_written_back() {
+    for input in [
+        "\u{feff}---\ntitle: Hello\n---\n# Body\n",
+        "\u{feff}+++\ntitle = \"Hello\"\n+++\n# Body\n",
+        "\u{feff}{\"title\": \"Hello\"}\n\n# Body\n",
+    ] {
+        let doc = parse_md(input);
+        let Value::Map(m) = doc.value() else {
+            panic!("{input:?}: expected a map, got {:?}", doc.value());
+        };
+        assert_eq!(
+            m.get("title"),
+            Some(&Value::String("Hello".into())),
+            "{input:?}"
+        );
+        let payload = doc.frontmatter_payload().expect("payload must exist");
+        assert_eq!(payload.body, b"# Body\n", "{input:?}");
+
+        let mut out = Vec::new();
+        frontmatter().write(&doc, &mut out).expect("write");
+        assert!(out.starts_with("\u{feff}".as_bytes()), "{input:?}: {out:?}");
+        assert_eq!(
+            parse_md(std::str::from_utf8(&out).expect("utf-8")).value(),
+            doc.value(),
+            "{input:?}"
+        );
+    }
+    // The YAML header is written as it was read.
+    let input = "\u{feff}---\ntitle: Hello\n---\n# Body\n";
+    let mut out = Vec::new();
+    frontmatter()
+        .write(&parse_md(input), &mut out)
+        .expect("write");
+    assert_eq!(String::from_utf8(out).expect("utf-8"), input);
+}
+
+#[test]
+fn a_bom_without_frontmatter_stays_in_the_body() {
+    let input = "\u{feff}# Title\n";
+    let doc = parse_md(input);
+    assert_eq!(doc.value(), &Value::Map(indexmap::IndexMap::new()));
+    let mut out = Vec::new();
+    frontmatter().write(&doc, &mut out).expect("write");
+    assert_eq!(out, input.as_bytes());
+}
+
+/// A YAML header with nothing in it reads as null and is written back
+/// empty. Was: `---\nnull\n---\n`, a header that reads as the scalar null
+/// a reader of the file never wrote.
+#[test]
+fn an_empty_yaml_header_is_written_back_empty() {
+    for (input, want) in [
+        ("---\n---\nbody\n", "---\n---\nbody\n"),
+        ("\u{feff}---\n---\nbody\n", "\u{feff}---\n---\nbody\n"),
+        ("---\n---\n", "---\n---\n"),
+        // A header of comments alone holds nothing either; the writer
+        // drops comments, as it does in every header.
+        ("---\n# note\n---\nbody\n", "---\n---\nbody\n"),
+        // So is one that spells the null: it reads the same.
+        ("---\nnull\n---\nbody\n", "---\n---\nbody\n"),
+    ] {
+        let doc = parse_md(input);
+        assert_eq!(doc.value(), &Value::Null, "{input:?}");
+        let mut out = Vec::new();
+        frontmatter().write(&doc, &mut out).expect("write");
+        assert_eq!(String::from_utf8(out).expect("utf-8"), want, "{input:?}");
+    }
+}
+
+/// Every header keeps its delimiters through a rewrite, whatever it holds:
+/// each delimiter × an empty header, `{}` and one with a key, after a BOM
+/// or not. Was: `+++` / `+++` and `---` / `{}` / `---` read as `{}`, taken
+/// for a file with no frontmatter, and written as the body alone; `---` /
+/// `---` read as null and written `---\nnull\n---` (until 654a742).
+#[test]
+fn every_header_keeps_its_delimiters_through_a_rewrite() {
+    let cases = [
+        ("---\n---\n", "---\n---\n"),
+        ("---\n{}\n---\n", "---\n{}\n---\n"),
+        ("---\ntitle: Hello\n---\n", "---\ntitle: Hello\n---\n"),
+        ("+++\n+++\n", "+++\n+++\n"),
+        (
+            "+++\ntitle = \"Hello\"\n+++\n",
+            "+++\ntitle = \"Hello\"\n+++\n",
+        ),
+        ("{}\n\n", "{}\n\n"),
+        (
+            "{\"title\": \"Hello\"}\n\n",
+            "{\n  \"title\": \"Hello\"\n}\n\n",
+        ),
+    ];
+    for (header, want) in cases {
+        for bom in ["", "\u{feff}"] {
+            let input = format!("{bom}{header}# Body\n");
+            let doc = parse_md(&input);
+            assert!(
+                doc.frontmatter_payload().expect("payload").header,
+                "{input:?}: read as no header"
+            );
+            let mut out = Vec::new();
+            frontmatter().write(&doc, &mut out).expect("write");
+            assert_eq!(
+                String::from_utf8(out).expect("utf-8"),
+                format!("{bom}{want}# Body\n"),
+                "{input:?}"
+            );
+        }
+    }
+    // No header: the body alone, the BOM in it; a value given to it later
+    // gets a YAML header.
+    for input in ["# Body\n", "\u{feff}# Body\n"] {
+        let doc = parse_md(input);
+        assert!(!doc.frontmatter_payload().expect("payload").header);
+        let mut out = Vec::new();
+        frontmatter().write(&doc, &mut out).expect("write");
+        assert_eq!(out, input.as_bytes());
+    }
+}

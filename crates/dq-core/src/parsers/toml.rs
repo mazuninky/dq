@@ -54,7 +54,7 @@ use toml_edit::{
 use crate::Result;
 use crate::WriteOptions;
 use crate::document::spans::{SpanContext, SpanMap, ValueSpan};
-use crate::document::{Document, FormatTag, Value};
+use crate::document::{Document, FormatTag, Value, bom_end, line_start};
 use crate::error::Error;
 use crate::format::Format;
 use crate::textual_edit::{InsertionRenderer, ScalarRenderer};
@@ -144,11 +144,13 @@ impl Format for Toml {
         // does not carry formatting metadata, but the input doesn't
         // either, so there's nothing to preserve.
         let v = doc.value();
-        let toml_value = value_to_toml(v)?;
-        let s = toml::to_string_pretty(&toml_value).map_err(|e| Error::Format {
-            format: "toml",
-            message: e.to_string(),
-        })?;
+        if let Some(message) = crate::document::toml_root_refusal(v) {
+            return Err(Error::Format {
+                format: "toml",
+                message,
+            });
+        }
+        let s = emit_toml(v)?;
         w.write_all(s.as_bytes()).map_err(|source| Error::Io {
             path: camino::Utf8PathBuf::from("<toml-writer>"),
             source,
@@ -183,12 +185,14 @@ impl Format for Toml {
         // and the round-trip through `toml::to_string_pretty` produces a
         // canonical TOML document with no comments preserved (which is the
         // expected tradeoff: `--sort-keys` is a re-emit knob, not a splice).
+        if let Some(message) = crate::document::toml_root_refusal(doc.value()) {
+            return Err(Error::Format {
+                format: "toml",
+                message,
+            });
+        }
         let canon = canonicalize_keys(doc.value());
-        let toml_value = value_to_toml(&canon)?;
-        let s = toml::to_string_pretty(&toml_value).map_err(|e| Error::Format {
-            format: "toml",
-            message: e.to_string(),
-        })?;
+        let s = emit_toml(&canon)?;
         w.write_all(s.as_bytes()).map_err(|source| Error::Io {
             path: camino::Utf8PathBuf::from("<toml-writer>"),
             source,
@@ -431,10 +435,7 @@ fn collect_dotted_lines(
         match item {
             Item::Value(value) => {
                 if let Some(span) = value.span() {
-                    let start = bytes[..span.start]
-                        .iter()
-                        .rposition(|&b| b == b'\n')
-                        .map_or(0, |i| i + 1);
+                    let start = line_start(bytes, span.start);
                     out.push((pointer_for(path), start..past_line_break(bytes, span.end)));
                 }
             }
@@ -450,15 +451,9 @@ fn collect_dotted_lines(
 /// Start of the line holding `header`, or of the comment lines right
 /// above it.
 fn section_start(bytes: &[u8], header: usize) -> usize {
-    let mut at = bytes[..header]
-        .iter()
-        .rposition(|&b| b == b'\n')
-        .map_or(0, |i| i + 1);
-    while at > 0 {
-        let prev = bytes[..at - 1]
-            .iter()
-            .rposition(|&b| b == b'\n')
-            .map_or(0, |i| i + 1);
+    let mut at = line_start(bytes, header);
+    while at > bom_end(bytes) {
+        let prev = line_start(bytes, at - 1);
         if bytes[prev..at].trim_ascii_start().starts_with(b"#") {
             at = prev;
         } else {
@@ -791,10 +786,7 @@ fn compute_line_range(
     ) {
         return value_range.clone();
     }
-    let mut start = value_range.start.min(bytes.len());
-    while start > 0 && bytes[start - 1] != b'\n' {
-        start -= 1;
-    }
+    let start = line_start(bytes, value_range.start);
     let mut end = value_range.end.min(bytes.len());
     while end < bytes.len() && bytes[end] != b'\n' {
         end += 1;
@@ -810,12 +802,8 @@ fn compute_line_range(
 /// inserted siblings at the same column.
 fn compute_indent(bytes: &[u8], index: usize) -> u32 {
     let cap = bytes.len();
-    let mut line_start = index.min(cap);
-    while line_start > 0 && bytes[line_start - 1] != b'\n' {
-        line_start -= 1;
-    }
     let mut indent = 0_u32;
-    for &b in &bytes[line_start..cap.min(index)] {
+    for &b in &bytes[line_start(bytes, index)..cap.min(index)] {
         if b == b' ' || b == b'\t' {
             indent = indent.saturating_add(1);
         } else {
@@ -862,6 +850,99 @@ fn extract_line_snippet(bytes: &[u8], idx: usize) -> String {
 // ---------------------------------------------------------------------------
 // `value_only` write fallback (toml crate)
 // ---------------------------------------------------------------------------
+
+/// `v` as the `value_only` fallback writes it: the `toml` crate's pretty
+/// printer, then every float it spelled otherwise respelled as
+/// [`shortest_float`](crate::document::shortest_float) does (`1e300`, not
+/// 301 digits; `1.5e20`, not `150000000000000000000.0`;
+/// `1658206780088562.2`, not `…562.3`). The `toml` crate prints a float
+/// with Rust's `Display`, which never writes an exponent and breaks a
+/// 17th-digit tie to the odd digit; every other byte stays as it printed
+/// it.
+fn emit_toml(v: &Value) -> Result<String> {
+    let toml_value = value_to_toml(v)?;
+    let text = toml::to_string_pretty(&toml_value).map_err(|e| Error::Format {
+        format: "toml",
+        message: e.to_string(),
+    })?;
+    if !has_respelled_float(v) {
+        return Ok(text);
+    }
+    let mut doc: toml_edit::DocumentMut =
+        text.parse()
+            .map_err(|e: toml_edit::TomlError| Error::Format {
+                format: "toml",
+                message: e.to_string(),
+            })?;
+    respell_floats_in_table(doc.as_table_mut());
+    Ok(doc.to_string())
+}
+
+/// Whether `v` holds a finite float the `toml` crate spells otherwise than
+/// [`shortest_float`](crate::document::shortest_float): one with an
+/// exponent spelling, or one on a tie in its 17th digit, where Rust's
+/// `Display` picks the odd digit and `shortest_float` the even one
+/// (`1658206780088562.2`, not `…562.3`).
+fn has_respelled_float(v: &Value) -> bool {
+    match v {
+        Value::Float(f) => {
+            f.is_finite() && crate::document::shortest_float(*f) != display_float(*f)
+        }
+        Value::Array(items) => items.iter().any(has_respelled_float),
+        Value::Map(map) => map.values().any(has_respelled_float),
+        Value::Null
+        | Value::Bool(_)
+        | Value::Int(_)
+        | Value::BigInt(_)
+        | Value::BigFloat(_)
+        | Value::String(_) => false,
+    }
+}
+
+/// A finite float as the `toml` crate prints it: Rust's `Display`, `.0`
+/// added to a whole number.
+fn display_float(f: f64) -> String {
+    let display = f.to_string();
+    if display.contains('.') {
+        display
+    } else {
+        format!("{display}.0")
+    }
+}
+
+fn respell_floats_in_table(table: &mut toml_edit::Table) {
+    for (_, item) in table.iter_mut() {
+        match item {
+            toml_edit::Item::Value(value) => respell_floats_in_value(value),
+            toml_edit::Item::Table(inner) => respell_floats_in_table(inner),
+            toml_edit::Item::ArrayOfTables(tables) => {
+                tables.iter_mut().for_each(respell_floats_in_table);
+            }
+            toml_edit::Item::None => {}
+        }
+    }
+}
+
+fn respell_floats_in_value(value: &mut toml_edit::Value) {
+    match value {
+        toml_edit::Value::Float(f) if f.value().is_finite() => {
+            let spelled = crate::document::shortest_float(*f.value());
+            if spelled != display_float(*f.value())
+                && let Ok(mut respelled) = spelled.parse::<toml_edit::Value>()
+            {
+                *respelled.decor_mut() = f.decor().clone();
+                *value = respelled;
+            }
+        }
+        toml_edit::Value::Array(items) => items.iter_mut().for_each(respell_floats_in_value),
+        toml_edit::Value::InlineTable(table) => {
+            for (_, inner) in table.iter_mut() {
+                respell_floats_in_value(inner);
+            }
+        }
+        _ => {}
+    }
+}
 
 /// Map `dq_core::Value` → `toml::Value` for the `value_only` write fallback.
 fn value_to_toml(v: &Value) -> Result<toml::Value> {
@@ -984,7 +1065,7 @@ impl InsertionRenderer for TomlInsertionRenderer {
 
 /// Render a TOML key. Bare keys are `[A-Za-z0-9_-]+`; anything else is
 /// quoted as a basic string.
-fn toml_key_token(key: &str) -> String {
+pub(crate) fn toml_key_token(key: &str) -> String {
     if key.is_empty()
         || !key
             .chars()
@@ -1071,9 +1152,6 @@ fn detect_string_style(bytes: &[u8]) -> StringStyle {
     }
 }
 
-/// Render an `f64` as a TOML float literal. NaN / infinity use TOML's
-/// canonical forms; finite values use `Display` and add `.0` when the
-/// printed form would otherwise look like an integer.
 /// A big-float literal as TOML: a YAML `.nan` / `.inf` as `nan` / `inf`,
 /// any other as written.
 fn render_big_float(literal: &str) -> Vec<u8> {
@@ -1083,6 +1161,10 @@ fn render_big_float(literal: &str) -> Vec<u8> {
     }
 }
 
+/// Render an `f64` as a TOML float literal. NaN / infinity use TOML's
+/// canonical forms; a finite value its [shortest round-trip
+/// spelling](crate::document::shortest_float) — `3.0`, `1e300` — which
+/// TOML reads as a float either way.
 fn render_float(f: f64) -> Vec<u8> {
     if f.is_nan() {
         return b"nan".to_vec();
@@ -1094,12 +1176,7 @@ fn render_float(f: f64) -> Vec<u8> {
             b"inf".to_vec()
         };
     }
-    let s = f.to_string();
-    if s.contains('.') || s.contains('e') || s.contains('E') {
-        s.into_bytes()
-    } else {
-        format!("{s}.0").into_bytes()
-    }
+    crate::document::shortest_float(f).into_bytes()
 }
 
 /// Render a string scalar matching the original quote style. Falls back to
@@ -1291,6 +1368,29 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         Toml.write(&doc, &mut buf).expect("write");
         assert_eq!(buf, bytes);
+    }
+
+    #[test]
+    fn write_refuses_a_root_that_is_no_table() {
+        for (value, kind) in [
+            (Value::Int(5), "an integer"),
+            (Value::Null, "null"),
+            (Value::Array(vec![Value::Int(1)]), "an array"),
+        ] {
+            let doc = Document::single(value);
+            let mut buf: Vec<u8> = Vec::new();
+            let err = Toml.write(&doc, &mut buf).expect_err("no table");
+            assert!(
+                matches!(&err, Error::Format { message, .. }
+                    if message == &format!("a TOML document is a table, so its root is one, not {kind}")),
+                "{err}"
+            );
+            let sorted = WriteOptions {
+                sort_keys: true,
+                ..WriteOptions::default()
+            };
+            assert!(Toml.write_with_options(&doc, &mut buf, &sorted).is_err());
+        }
     }
 
     #[test]

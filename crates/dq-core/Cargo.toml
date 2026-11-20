@@ -49,12 +49,11 @@ regex = { workspace = true }
 
 # M5 format extensions — see `parsers/{hcl,ini,dotenv,csv,dockerfile,...}.rs`
 # for usage. License audit: hcl-rs (MIT OR Apache-2.0), rust-ini (MIT), dotenvy (MIT),
-# csv (Unlicense/MIT), dockerfile-parser-rs (MIT). All cleared by
+# csv (Unlicense/MIT). All cleared by
 # `cargo deny check licenses`.
 hcl-rs = { workspace = true }
 rust-ini = { workspace = true }
 csv = { workspace = true }
-dockerfile-parser-rs = { workspace = true }
 
 # M9 markdown — `comrak` is the CommonMark + GFM parser consumed by
 # `parsers/markdown.rs`. License: BSD-2-Clause (cleared by the workspace
@@ -64,8 +63,12 @@ comrak = { workspace = true }
 
 # M11 XML — `quick-xml` powers the read+write XmlFormat in `parsers/xml.rs`.
 # Event-based parser; `serialize` feature is enabled for `BytesDecl::new`
-# (used to re-emit the XML declaration on round-trip). License: MIT.
+# (used to re-emit the XML declaration on round-trip), `encoding` decodes
+# non-UTF-8 input. License: MIT.
 quick-xml = { workspace = true }
+# XML output in the encoding `#xml` declares. License: (Apache-2.0 OR MIT)
+# AND BSD-3-Clause.
+encoding_rs = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true, features = ["redactions"] }

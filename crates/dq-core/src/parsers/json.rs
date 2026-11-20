@@ -43,7 +43,7 @@ use serde_json::value::Number as JsonNumber;
 use crate::Result;
 use crate::WriteOptions;
 use crate::document::spans::{SpanContext, SpanMap, ValueSpan};
-use crate::document::{Document, FormatTag, Value};
+use crate::document::{Document, FormatTag, Value, bom_end};
 use crate::error::Error;
 use crate::format::Format;
 use crate::textual_edit::{InsertionRenderer, ScalarRenderer};
@@ -69,7 +69,7 @@ impl Format for Json {
         // contract (it rejects JSONC before serde_json would reject the
         // comment as unexpected token), giving a clearer diagnostic.
         let spans = build_span_map(bytes)?;
-        let json: JsonValue = serde_json::from_slice(bytes).map_err(|e| {
+        let json: JsonValue = serde_json::from_slice(&bytes[bom_end(bytes)..]).map_err(|e| {
             let line = e.line() as u32;
             let col = e.column() as u32;
             let (span, snippet) = compute_parse_anchor(bytes, e.line());
@@ -111,7 +111,7 @@ impl Format for Json {
         } else {
             write_value_pretty(doc.value(), w, 0)?;
         }
-        Ok(())
+        end_line(w)
     }
 
     fn write_with_options(
@@ -149,15 +149,25 @@ impl Format for Json {
             // shape `serde_json::to_writer` would emit with the default
             // `CompactFormatter`. We use the local helper so big-numeric
             // literals stay byte-perfect.
-            Some(0) => write_value_compact(&value, w),
+            Some(0) => write_value_compact(&value, w)?,
             // `Some(n)` (n >= 1) → pretty-print with `n` spaces per level.
-            Some(n) => write_value_pretty_with_step(&value, w, 0, n as usize),
+            Some(n) => write_value_pretty_with_step(&value, w, 0, n as usize)?,
             // `None` → preserve the M2 default whitespace shape (2-space
             // indent, surrounding newlines). This is the shape `dq fmt`
             // produces when only `--sort-keys` was passed.
-            None => write_value_pretty(&value, w, 0),
+            None => write_value_pretty(&value, w, 0)?,
         }
+        end_line(w)
     }
+}
+
+/// The line break a re-emitted JSON file ends with, as the YAML and TOML
+/// writers end theirs.
+fn end_line(w: &mut dyn Write) -> Result<()> {
+    w.write_all(b"\n").map_err(|source| Error::Io {
+        path: camino::Utf8PathBuf::from("<json-writer>"),
+        source,
+    })
 }
 
 /// Parse `bytes` as JSON, returning the read-pat [`Value`] tree alongside the
@@ -176,7 +186,7 @@ impl Format for Json {
 ///   comments, or fails strict JSON parsing.
 pub fn parse_with_spans(bytes: &[u8]) -> Result<(Value, SpanMap)> {
     let spans = build_span_map(bytes)?;
-    let json: JsonValue = serde_json::from_slice(bytes).map_err(|e| {
+    let json: JsonValue = serde_json::from_slice(&bytes[bom_end(bytes)..]).map_err(|e| {
         let line = e.line() as u32;
         let col = e.column() as u32;
         let (span, snippet) = compute_parse_anchor(bytes, e.line());
@@ -262,6 +272,8 @@ fn scan(bytes: &[u8], containers: bool) -> Result<(SpanMap, Option<ContainerRang
     }
     let lines = LineIndex::new(bytes);
     let mut scanner = Scanner::new(bytes, lines);
+    // RFC 8259 §8.1: a byte order mark may open the text; it is no value.
+    scanner.pos = bom_end(bytes);
     scanner.containers = containers.then(HashMap::new);
     let mut spans = SpanMap::new();
     scanner.skip_ws_and_check_jsonc()?;
@@ -681,8 +693,8 @@ impl<'a> Scanner<'a> {
 ///
 /// This type is module-local on purpose: only the JSON parser needs it,
 /// and exposing it as a public utility would require a wider refactor of
-/// the other parsers' span builders. See the perf-json-parse-linear
-/// OpenSpec change for the full design rationale.
+/// the other parsers' span builders. See
+/// `docs/plans/perf-json-parse-linear.md` for the full design rationale.
 struct LineIndex {
     /// Sorted byte offsets of every `\n` in the source. Line 0 starts at
     /// offset 0; line `i` (`i ≥ 1`) starts at `newline_offsets[i-1] + 1`.
@@ -697,7 +709,7 @@ impl LineIndex {
     /// Build the line table for `bytes` in a single forward pass.
     ///
     /// Intentionally does **not** depend on the `memchr` crate as a direct
-    /// dependency — see the OpenSpec design doc §2.1 — even though it is
+    /// dependency — see `docs/plans/perf-json-parse-linear.md` — even though it is
     /// already pulled in transitively by `serde_json` / `regex`. On top of
     /// the unavoidable `serde_json::from_slice` cost the linear scan here
     /// is negligible.
@@ -914,38 +926,14 @@ fn json_value_to_value(v: JsonValue) -> Value {
     }
 }
 
+/// The number a JSON literal spells, with its exact value
+/// ([`Value::from_number_literal`]): a float literal with more digits than
+/// an `f64` holds stays a [`Value::BigFloat`] instead of rounding.
 fn json_number_to_value(n: &JsonNumber) -> Value {
     // With `arbitrary_precision` enabled, the underlying representation is the
     // original textual literal; `as_str()` gives it back to us verbatim.
     let literal = n.as_str();
-    if let Ok(i) = literal.parse::<i64>() {
-        return Value::Int(i);
-    }
-    if literal.contains('.') || literal.contains('e') || literal.contains('E') {
-        // Float branch: only use `f64` when round-trip is lossless.
-        if let Ok(f) = f64::from_str(literal) {
-            // The shortest-round-trip formatting (Rust's `f64::Display`) is
-            // compared against the original literal. If they match we keep
-            // the parsed `f64`; otherwise the literal is preserved verbatim.
-            if f.is_finite() && f64_matches_literal(f, literal) {
-                return Value::Float(f);
-            }
-        }
-        return Value::BigFloat(literal.to_owned());
-    }
-    // Integer that overflowed `i64` — keep the literal verbatim.
-    Value::BigInt(literal.to_owned())
-}
-
-fn f64_matches_literal(f: f64, literal: &str) -> bool {
-    // Re-parse the shortest representation and check exact equality. This is
-    // enough to detect precision loss without relying on string equality
-    // (which would fail innocuous reformatting like `1e2` vs `100`).
-    let formatted = f.to_string();
-    f64::from_str(&formatted)
-        .ok()
-        .zip(f64::from_str(literal).ok())
-        .is_some_and(|(a, b)| a.to_bits() == b.to_bits())
+    Value::from_number_literal(literal).unwrap_or_else(|| Value::BigFloat(literal.to_owned()))
 }
 
 /// Write a `Value` as pretty-printed JSON with the M2 default 2-space indent
@@ -957,6 +945,20 @@ pub(crate) fn write_value_pretty(v: &Value, w: &mut dyn Write, indent: usize) ->
 /// Write a `Value` as compact JSON (no extra whitespace, no trailing newline).
 pub(crate) fn write_value_compact(v: &Value, w: &mut dyn Write) -> Result<()> {
     write_value_with(v, w, 0, false, 2)
+}
+
+/// Fail the way the JSON writer does when `value` is or holds a NaN or
+/// infinite float — for an output path that renders JSON without going
+/// through this writer.
+///
+/// # Errors
+///
+/// [`Error::Format`] naming the non-finite float when `value` holds one.
+pub fn ensure_finite(value: &Value) -> Result<()> {
+    if value.holds_non_finite() {
+        return Err(non_finite_error());
+    }
+    Ok(())
 }
 
 /// JSON has no token for NaN or ±Infinity.
@@ -1003,6 +1005,12 @@ fn write_value_with(
                 return Err(non_finite_error());
             }
             write_io(w, s.as_bytes())?;
+            // A float spelled as an integer (`!!float 18446744073709551617`)
+            // stays a float to a JSON reader.
+            if matches!(v, Value::BigFloat(_)) && s.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+            {
+                write_io(w, b".0")?;
+            }
         }
         Value::Float(n) => {
             // NaN and ±Infinity are not valid JSON (RFC 8259 § 6) — fail
@@ -1011,13 +1019,10 @@ fn write_value_with(
             if !n.is_finite() {
                 return Err(non_finite_error());
             }
-            // Use the shortest-round-trip representation. If the value is
-            // integral, append `.0` to keep it parseable as float.
-            let mut s = n.to_string();
-            if !s.contains('.') && !s.contains('e') && !s.contains('E') {
-                s.push_str(".0");
-            }
-            write_io(w, s.as_bytes())?;
+            // The shortest round-trip spelling, an exponent past the
+            // plain-decimal range (`1e300`, not 301 digits); a whole float
+            // keeps its `.0`.
+            write_io(w, crate::document::shortest_float(*n).as_bytes())?;
         }
         Value::String(s) => {
             write_io(w, b"\"")?;
@@ -1273,6 +1278,16 @@ mod tests {
         Json.parse(s.as_bytes()).unwrap()
     }
 
+    #[test]
+    fn a_byte_order_mark_before_the_text_is_read_past() {
+        let src = "\u{feff}{\"a\": [1]}\n";
+        let doc = parse(src);
+        assert_eq!(doc.value().to_serde_json(), serde_json::json!({"a": [1]}));
+        let spanned = parse_json_with_spans(src.as_bytes()).unwrap();
+        assert_eq!(spanned.value(), doc.value());
+        assert_eq!(write(&doc), src, "the bytes are written as they came");
+    }
+
     fn write(doc: &Document) -> String {
         let mut buf: Vec<u8> = Vec::new();
         Json.write(doc, &mut buf).unwrap();
@@ -1311,6 +1326,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_keeps_a_float_literal_longer_than_f64() {
+        let doc = parse(r#"{"b": 0.1000000000000000000000000001, "c": 0.5, "d": 1e400}"#);
+        let Value::Map(m) = doc.value() else { panic!() };
+        assert_eq!(
+            m.get("b"),
+            Some(&Value::BigFloat("0.1000000000000000000000000001".into()))
+        );
+        assert_eq!(m.get("c"), Some(&Value::Float(0.5)));
+        // serde_json's `arbitrary_precision` spells it `1e+400`.
+        assert!(m["d"].same_data(&Value::BigFloat("1e400".into())));
+    }
+
+    #[test]
     fn write_pretty_is_two_space_indent() {
         // After §5 the writer is byte-preserving when `original_bytes` is
         // populated. Build a value-only doc to exercise the pretty path.
@@ -1319,7 +1347,7 @@ mod tests {
         map.insert("a".into(), arr);
         let doc = Document::single(Value::Map(map));
         let out = write(&doc);
-        assert_eq!(out, "{\n  \"a\": [\n    1,\n    2\n  ]\n}");
+        assert_eq!(out, "{\n  \"a\": [\n    1,\n    2\n  ]\n}\n");
     }
 
     #[test]
@@ -1354,6 +1382,19 @@ mod tests {
                 other => panic!("expected Format error, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn ensure_finite_fails_like_the_writer_on_a_nested_nan_or_infinity() {
+        let nested = Value::Array(vec![Value::Int(1), Value::BigFloat("-.inf".into())]);
+        for bad in [Value::Float(f64::NAN), nested] {
+            let err = ensure_finite(&bad).expect_err("non-finite float must error");
+            let mut buf: Vec<u8> = Vec::new();
+            let written = write_value_compact(&bad, &mut buf).expect_err("writer errors too");
+            assert_eq!(err.to_string(), written.to_string());
+        }
+        assert!(ensure_finite(&Value::BigFloat("1e400".into())).is_ok());
+        assert!(ensure_finite(&Value::Float(1.5)).is_ok());
     }
 
     #[test]

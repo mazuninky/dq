@@ -166,7 +166,7 @@ fn json_value_only_writer_uses_two_space_indent() {
     let doc = Document::value_only(Value::Map(map), FormatTag::Json);
     let out = write_to_string("json", &doc);
 
-    let expected = "{\n  \"a\": [\n    1,\n    2\n  ]\n}";
+    let expected = "{\n  \"a\": [\n    1,\n    2\n  ]\n}\n";
     assert_eq!(
         out, expected,
         "value-only writer must produce two-space indent"

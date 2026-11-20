@@ -13,6 +13,10 @@
 //! Other formats produce an `InvalidInput` rejection so the user gets a
 //! clear error rather than malformed output.
 //!
+//! A failed case lists its `missing` and `extra` violations and the rule
+//! expressions that `raised` a jq runtime error on the input — a rule
+//! that raises fails its case even when no violation is expected.
+//!
 //! Exit-code policy:
 //! - Zero failures → exit 0.
 //! - Any fail/error → exit 4 via [`crate::error::LintFail`].
@@ -24,7 +28,8 @@ use dq_exec::{RuleTester, TestOutcome};
 
 use crate::cli::{Cli, TestArgs};
 use crate::error::{InvalidInput, LintFail};
-use crate::output::OutputFormat;
+use crate::output::tap::yaml_escape_double_quoted;
+use crate::output::{OutputFormat, terminal_text};
 
 /// Run the `test` command.
 ///
@@ -34,16 +39,10 @@ use crate::output::OutputFormat;
 ///   contains no fixtures, or when an unsupported output format is set.
 /// - [`LintFail`] (exit 4) when at least one test outcome is `Fail` or
 ///   `Error`.
-/// - `dq_exec::ExecError` when the directory walk itself fails.
+/// - `dq_exec::ExecError` when the directory walk itself fails, or
+///   `UnknownRule` (exit 6) for an `@std/<ns>` that does not exist.
 pub fn run(cli: &Cli, args: &TestArgs, out: &mut dyn Write) -> anyhow::Result<()> {
-    if !args.rules_dir.as_std_path().is_dir() {
-        return Err(anyhow::Error::new(InvalidInput::new(format!(
-            "rules directory does not exist or is not a directory: {dir}",
-            dir = args.rules_dir,
-        ))));
-    }
-
-    let outcomes = RuleTester::run_dir(&args.rules_dir).map_err(anyhow::Error::new)?;
+    let outcomes = collect_outcomes(args)?;
 
     if outcomes.is_empty() {
         return Err(anyhow::Error::new(InvalidInput::new(format!(
@@ -73,6 +72,37 @@ pub fn run(cli: &Cli, args: &TestArgs, out: &mut dyn Write) -> anyhow::Result<()
     Ok(())
 }
 
+/// Run the fixtures `args.rules_dir` names: `@std` (every standard
+/// namespace, in order), `@std/<ns>` (one), or a directory on disk. The
+/// `@std` prefix wins over a directory of that name, as in `--rules`.
+fn collect_outcomes(args: &TestArgs) -> anyhow::Result<Vec<TestOutcome>> {
+    let arg = args.rules_dir.as_str();
+    if arg == "@std" {
+        let mut outcomes = Vec::new();
+        for ns in dq_lint::list_std_rulesets() {
+            outcomes.extend(RuleTester::run_std(ns).map_err(anyhow::Error::new)?);
+        }
+        return Ok(outcomes);
+    }
+    if let Some(ns) = arg.strip_prefix("@std/") {
+        return RuleTester::run_std(ns).map_err(anyhow::Error::new);
+    }
+    if !args.rules_dir.as_std_path().is_dir() {
+        return Err(anyhow::Error::new(InvalidInput::new(format!(
+            "rules directory does not exist or is not a directory: {dir}",
+            dir = args.rules_dir,
+        ))));
+    }
+    RuleTester::run_dir(&args.rules_dir).map_err(anyhow::Error::new)
+}
+
+/// A fixture's path, a case's name or an expected or actual diagnostic as
+/// the console and TAP lines print it: one line, its controls escaped
+/// ([`terminal_text`]) — they come from the fixture files.
+fn shown<S: AsRef<str> + ?Sized>(text: &S) -> std::borrow::Cow<'_, str> {
+    terminal_text(text.as_ref())
+}
+
 fn render_console(outcomes: &[TestOutcome], out: &mut dyn Write) -> std::io::Result<()> {
     let total = outcomes.len();
     let mut pass = 0;
@@ -82,21 +112,25 @@ fn render_console(outcomes: &[TestOutcome], out: &mut dyn Write) -> std::io::Res
         match outcome {
             TestOutcome::Pass { fixture, name } => {
                 pass += 1;
-                writeln!(out, "ok {fixture}: {name}")?;
+                writeln!(out, "ok {}: {}", shown(fixture), shown(name))?;
             }
             TestOutcome::Fail {
                 fixture,
                 name,
                 missing,
                 extra,
+                raised,
             } => {
                 fail += 1;
-                writeln!(out, "FAIL {fixture}: {name}")?;
+                writeln!(out, "FAIL {}: {}", shown(fixture), shown(name))?;
                 for m in missing {
-                    writeln!(out, "  missing: {m}")?;
+                    writeln!(out, "  missing: {}", shown(m))?;
                 }
                 for e in extra {
-                    writeln!(out, "  extra: {e}")?;
+                    writeln!(out, "  extra: {}", shown(e))?;
+                }
+                for r in raised {
+                    writeln!(out, "  raised: {}", shown(r))?;
                 }
             }
             TestOutcome::Error {
@@ -105,7 +139,13 @@ fn render_console(outcomes: &[TestOutcome], out: &mut dyn Write) -> std::io::Res
                 error,
             } => {
                 errors += 1;
-                writeln!(out, "ERROR {fixture}: {name} ({error})")?;
+                writeln!(
+                    out,
+                    "ERROR {}: {} ({})",
+                    shown(fixture),
+                    shown(name),
+                    shown(error)
+                )?;
             }
         }
     }
@@ -136,12 +176,14 @@ fn outcome_to_json(outcome: &TestOutcome) -> serde_json::Value {
             name,
             missing,
             extra,
+            raised,
         } => serde_json::json!({
             "fixture": fixture.as_str(),
             "name": name,
             "outcome": "fail",
             "missing": missing,
             "extra": extra,
+            "raised": raised,
         }),
         TestOutcome::Error {
             fixture,
@@ -163,26 +205,33 @@ fn render_tap(outcomes: &[TestOutcome], out: &mut dyn Write) -> std::io::Result<
         let n = i + 1;
         match outcome {
             TestOutcome::Pass { fixture, name } => {
-                writeln!(out, "ok {n} - {fixture}: {name}")?;
+                writeln!(out, "ok {n} - {}: {}", shown(fixture), shown(name))?;
             }
             TestOutcome::Fail {
                 fixture,
                 name,
                 missing,
                 extra,
+                raised,
             } => {
-                writeln!(out, "not ok {n} - {fixture}: {name}")?;
+                writeln!(out, "not ok {n} - {}: {}", shown(fixture), shown(name))?;
                 writeln!(out, "  ---")?;
                 if !missing.is_empty() {
                     writeln!(out, "  missing:")?;
                     for m in missing {
-                        writeln!(out, "    - {m}")?;
+                        writeln!(out, "    - \"{}\"", yaml_escape_double_quoted(m))?;
                     }
                 }
                 if !extra.is_empty() {
                     writeln!(out, "  extra:")?;
                     for e in extra {
-                        writeln!(out, "    - {e}")?;
+                        writeln!(out, "    - \"{}\"", yaml_escape_double_quoted(e))?;
+                    }
+                }
+                if !raised.is_empty() {
+                    writeln!(out, "  raised:")?;
+                    for r in raised {
+                        writeln!(out, "    - \"{}\"", yaml_escape_double_quoted(r))?;
                     }
                 }
                 writeln!(out, "  ...")?;
@@ -192,9 +241,14 @@ fn render_tap(outcomes: &[TestOutcome], out: &mut dyn Write) -> std::io::Result<
                 name,
                 error,
             } => {
-                writeln!(out, "not ok {n} - {fixture}: {name} # ERROR")?;
+                writeln!(
+                    out,
+                    "not ok {n} - {}: {} # ERROR",
+                    shown(fixture),
+                    shown(name)
+                )?;
                 writeln!(out, "  ---")?;
-                writeln!(out, "  error: {error}")?;
+                writeln!(out, "  error: \"{}\"", yaml_escape_double_quoted(error))?;
                 writeln!(out, "  ...")?;
             }
         }

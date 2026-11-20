@@ -12,6 +12,8 @@
 
 use similar::TextDiff;
 
+use crate::output::terminal_text;
+
 // ANSI escape codes for colored output. `git diff` uses red on removals,
 // green on additions, and cyan on hunk headers; we mirror that to keep the
 // output familiar.
@@ -20,10 +22,11 @@ const ANSI_RED: &str = "\x1b[31m";
 const ANSI_GREEN: &str = "\x1b[32m";
 const ANSI_CYAN: &str = "\x1b[36m";
 
-/// Render a unified diff between `source` and `modified`.
+/// Render a unified diff between `source` and `modified`, two versions of
+/// one file — what a write command's `--diff` shows.
 ///
 /// `file_label` is used in the diff header (`--- a/<label>` / `+++ b/<label>`),
-/// matching the convention `git diff` and `diff -u` emit.
+/// the convention `git diff` emits, so `git apply` / `patch -p1` take it.
 ///
 /// `use_color` toggles ANSI escape colors (red `-`, green `+`, cyan `@@`,
 /// default for headers and context).
@@ -34,23 +37,49 @@ const ANSI_CYAN: &str = "\x1b[36m";
 /// `git diff` convention).
 #[must_use]
 pub fn render_unified(source: &str, modified: &str, file_label: &str, use_color: bool) -> String {
+    render_unified_files(
+        source,
+        modified,
+        &format!("a/{file_label}"),
+        &format!("b/{file_label}"),
+        use_color,
+    )
+}
+
+/// Render a unified diff between `source` and `modified` under the header
+/// labels `label_a` (`--- `) and `label_b` (`+++ `), taken as they are —
+/// `dq diff --unified` passes the two paths as given on the command line,
+/// the way `diff -u` labels two files (without its timestamps).
+///
+/// A line without a line break at the end of its text gets the
+/// `\ No newline at end of file` marker after it whenever it is shown —
+/// context, removal or addition — as GNU diff and git print it.
+#[must_use]
+pub fn render_unified_files(
+    source: &str,
+    modified: &str,
+    header_a: &str,
+    header_b: &str,
+    use_color: bool,
+) -> String {
     if source == modified {
         return String::new();
     }
 
     let diff = TextDiff::from_lines(source, modified);
-    let header_a = format!("a/{file_label}");
-    let header_b = format!("b/{file_label}");
 
     // `similar` only emits the `--- / +++` header when there is at least one
     // hunk, so an empty raw output here means "the inputs differ in some way
     // similar's line splitter normalises away" (e.g. trailing-newline-only
     // delta). Treat that as "no displayable diff" rather than synthesizing a
     // header for an empty body.
+    // The labels are file names: a line break or a control character in
+    // one prints escaped, so the header stays one line each. The lines
+    // below are the files' text, the diff itself, and stay as they are.
     let raw = diff
         .unified_diff()
         .context_radius(3)
-        .header(&header_a, &header_b)
+        .header(&terminal_text(header_a), &terminal_text(header_b))
         .to_string();
 
     if raw.is_empty() {
@@ -157,6 +186,35 @@ mod tests {
             "expected `b/` header, got:\n{out}"
         );
         assert!(out.ends_with('\n'), "expected trailing newline in:\n{out}");
+    }
+
+    #[test]
+    fn two_files_are_labelled_as_given() {
+        let out = render_unified_files("x\n", "y\n", "dir/a.json", "/abs/b.yaml", false);
+        assert_eq!(
+            out,
+            "--- dir/a.json\n+++ /abs/b.yaml\n@@ -1 +1 @@\n-x\n+y\n"
+        );
+    }
+
+    #[test]
+    fn missing_newline_marker_follows_each_shown_line_without_one() {
+        // Byte for byte what `diff -u` and `git diff` print for these texts.
+        assert_eq!(
+            render_unified("a\nb", "a\nB", "f", false),
+            "--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n a\n-b\n\\ No newline at end of file\n\
+             +B\n\\ No newline at end of file\n"
+        );
+        // Only the old text lacks it: only the removal is marked.
+        assert_eq!(
+            render_unified("a\nb", "a\nb\n", "f", false),
+            "--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n a\n-b\n\\ No newline at end of file\n+b\n"
+        );
+        // The unterminated last line is not in the hunk: no marker.
+        assert_eq!(
+            render_unified("a\nb\nc\nd\ne\nf\ng", "A\nb\nc\nd\ne\nf\ng", "f", false),
+            "--- a/f\n+++ b/f\n@@ -1,4 +1,4 @@\n-a\n+A\n b\n c\n d\n"
+        );
     }
 
     #[test]

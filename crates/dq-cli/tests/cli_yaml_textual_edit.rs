@@ -173,3 +173,122 @@ fn del_in_place_on_single_line_json_keeps_the_other_members() {
         r#"{"b": 2}"#
     );
 }
+
+/// `set` writes a string holding LS, PS or NEL (U+2028, U+2029, U+0085) —
+/// line breaks to a YAML 1.1 reader, content to a YAML 1.2 one —
+/// double-quoted with `\L` / `\P` / `\N`, over a plain, a single-quoted,
+/// a double-quoted or a block scalar, in a flow collection, and as a new
+/// key. Before, every such `set` was refused: the value was written raw,
+/// and the edited document did not read back as the value set.
+#[test]
+fn set_writes_line_and_paragraph_separators_escaped() {
+    let src = "a: x\nb: 'y'\nc: \"z\"\nd: |\n  w\ne: [x, 'y']\nf: {g: h}\n";
+    let value = "l\u{2028}m\u{2029}n\u{85}o";
+    let quoted = "\"l\\Lm\\Pn\\No\"";
+    for (pointer, expected) in [
+        (
+            "/a",
+            format!("a: {quoted}\nb: 'y'\nc: \"z\"\nd: |\n  w\ne: [x, 'y']\nf: {{g: h}}\n"),
+        ),
+        (
+            "/b",
+            format!("a: x\nb: {quoted}\nc: \"z\"\nd: |\n  w\ne: [x, 'y']\nf: {{g: h}}\n"),
+        ),
+        (
+            "/c",
+            format!("a: x\nb: 'y'\nc: {quoted}\nd: |\n  w\ne: [x, 'y']\nf: {{g: h}}\n"),
+        ),
+        (
+            "/d",
+            format!("a: x\nb: 'y'\nc: \"z\"\nd: {quoted}\ne: [x, 'y']\nf: {{g: h}}\n"),
+        ),
+        (
+            "/e/1",
+            format!("a: x\nb: 'y'\nc: \"z\"\nd: |\n  w\ne: [x, {quoted}]\nf: {{g: h}}\n"),
+        ),
+        (
+            "/f/g",
+            format!("a: x\nb: 'y'\nc: \"z\"\nd: |\n  w\ne: [x, 'y']\nf: {{g: {quoted}}}\n"),
+        ),
+    ] {
+        assert_eq!(edit(src, &["set", pointer, value]), expected, "{pointer}");
+    }
+    assert_eq!(
+        edit("a: x\n", &["set", "/k\u{2028}", "1"]),
+        "a: x\n\"k\\L\": 1\n"
+    );
+    // A multi-line value over a single-quoted scalar, which would fold.
+    assert_eq!(edit("b: 'y'\n", &["set", "/b", "p\nq"]), "b: \"p\\nq\"\n");
+}
+
+/// `set` of a JSON array or object holding LS or PS writes each string in
+/// it escaped, as a block sequence item and as a new block map value.
+/// Before (1c5da56), an item was written raw in a plain flow scalar,
+/// `- [l<LS>m]`, and the new map value was refused.
+#[test]
+fn set_of_a_collection_writes_its_line_and_paragraph_separators_escaped() {
+    let src = "c:\n- 1\n- 2\nd:\n  e: 1\n";
+    assert_eq!(
+        edit(src, &["set", "/c/0", "[\"l\\u2028m\"]"]),
+        "c:\n- [\"l\\Lm\"]\n- 2\nd:\n  e: 1\n"
+    );
+    assert_eq!(
+        edit(src, &["set", "/d/f", "{\"k\\u2029\": [\"v\\u2028\"]}"]),
+        "c:\n- 1\n- 2\nd:\n  e: 1\n  f:\n    \"k\\P\": [\"v\\L\"]\n"
+    );
+    assert_eq!(
+        edit(src, &["set", "/c/1", "[\"plain\", {\"k\": \"v\"}]"]),
+        "c:\n- 1\n- [plain, {k: v}]\nd:\n  e: 1\n"
+    );
+}
+
+/// `src` as `dq -F json convert` reads it.
+fn read_back(src: &str) -> serde_json::Value {
+    let file = write_yaml(src);
+    let out = dq()
+        .args(["--no-color", "-F", "json", "convert"])
+        .arg(file.to_str().expect("UTF-8 path"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    serde_json::from_slice(&out).expect("stdout is JSON")
+}
+
+/// `set` writes a string holding a character YAML does not take raw — a
+/// C0 control, DEL, a C1 control, U+FEFF, U+FFFE, U+FFFF — double-quoted
+/// with escapes, over a plain, a single-quoted, a double-quoted or a block
+/// scalar, in a flow sequence and a flow mapping, as a sequence item, and
+/// as a new key. Before, a C1 control, DEL, U+FFFE or U+FFFF was written
+/// raw and every such `set` was refused (exit 7); U+FEFF went raw into a
+/// double-quoted scalar, and over a plain or a block scalar was refused.
+#[test]
+fn set_writes_characters_yaml_does_not_take_raw_escaped() {
+    let src = "a: x\nb: 'y'\nc: \"z\"\nd: |\n  w\ne: [x, 'y']\nf: {g: h}\nl:\n- i\n";
+    let value = "\u{1}\u{7f}\u{80}\u{9f}\u{feff}\u{fffe}\u{ffff}";
+    let quoted = r#""\x01\x7f\x80\x9f\ufeff\ufffe\uffff""#;
+    for (pointer, from, to) in [
+        ("/a", "a: x\n", format!("a: {quoted}\n")),
+        ("/b", "b: 'y'\n", format!("b: {quoted}\n")),
+        ("/c", "c: \"z\"\n", format!("c: {quoted}\n")),
+        ("/d", "d: |\n  w\n", format!("d: {quoted}\n")),
+        ("/e/1", "e: [x, 'y']\n", format!("e: [x, {quoted}]\n")),
+        ("/f/g", "f: {g: h}\n", format!("f: {{g: {quoted}}}\n")),
+        ("/l/0", "l:\n- i\n", format!("l:\n- {quoted}\n")),
+    ] {
+        let out = edit(src, &["set", pointer, value]);
+        assert_eq!(out, src.replacen(from, &to, 1), "{pointer}");
+        assert_eq!(
+            read_back(&out).pointer(pointer),
+            Some(&serde_json::Value::from(value)),
+            "{pointer}"
+        );
+    }
+    let out = edit("a: x\n", &["set", "/k\u{80}\u{feff}", "v\u{9f}"]);
+    assert_eq!(out, "a: x\n\"k\\x80\\ufeff\": \"v\\x9f\"\n");
+    assert_eq!(
+        read_back(&out),
+        serde_json::json!({"a": "x", "k\u{80}\u{feff}": "v\u{9f}"})
+    );
+}

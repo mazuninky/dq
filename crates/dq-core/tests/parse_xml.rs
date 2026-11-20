@@ -354,13 +354,20 @@ fn write_top_level_non_map_is_format_error() {
 // quick-xml 0.40 build.
 
 #[test]
-fn parse_utf8_bom_is_skipped_and_dropped_on_write() {
+fn parse_utf8_bom_is_kept_as_xml_bom_and_written_back() {
     let with_bom = parse(b"\xEF\xBB\xBF<a b=\"1\">x</a>");
     let without_bom = parse(b"<a b=\"1\">x</a>");
-    assert_eq!(with_bom.value(), without_bom.value());
+    let (Value::Map(with), Value::Map(without)) = (with_bom.value(), without_bom.value()) else {
+        panic!("expected map roots");
+    };
+    let Some(Value::Map(decl)) = with.get("#xml") else {
+        panic!("expected #xml holding the BOM, got {with:?}");
+    };
+    assert_eq!(decl.get("bom"), Some(&Value::String("UTF-8".into())));
+    assert_eq!(with.get("a"), without.get("a"));
     let mut buf: Vec<u8> = Vec::new();
     xml().write(&with_bom, &mut buf).expect("write");
-    assert_eq!(buf, b"<a b=\"1\">x</a>");
+    assert_eq!(buf, b"\xEF\xBB\xBF<a b=\"1\">x</a>\n");
 }
 
 #[test]
@@ -381,9 +388,9 @@ fn parse_declared_non_utf8_encoding_with_ascii_body_is_accepted() {
 #[test]
 fn parse_non_utf8_input_is_a_parse_error_naming_the_offset() {
     for (bytes, offset) in [
-        (&b"<a>caf\xE9</a>"[..], 6),               // Latin-1 é
-        (&b"\xFF\xFE<\x00a\x00/\x00>\x00"[..], 0), // UTF-16LE with BOM
-        (&b"<a>\xC3\x28</a>"[..], 3),              // truncated UTF-8 sequence
+        // Latin-1 é with no declaration naming Latin-1: read as UTF-8.
+        (&b"<a>caf\xE9</a>"[..], 6),
+        (&b"<a>\xC3\x28</a>"[..], 3), // truncated UTF-8 sequence
     ] {
         let err = xml().parse(bytes).expect_err("non-UTF-8 must be rejected");
         let dq_core::Error::Parse { message, .. } = &err else {

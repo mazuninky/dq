@@ -56,7 +56,7 @@ use dq_transform::JqEngine;
 
 use crate::diagnostic::{Diagnostic, Severity};
 use crate::error::{ExecError, Result};
-use crate::evaluator::{CompiledRule, JqCache, compile_rule_to_depth};
+use crate::evaluator::{CompiledRule, Evaluation, JqCache, compile_rule_to_depth, run_on_document};
 use crate::rule::Rule;
 use crate::ruleset::RuleSource;
 
@@ -181,8 +181,8 @@ pub(crate) fn compile_composite(
 /// diagnostic and return immediately — this branch should only fire when
 /// the test override drops `max_depth` below the compile-time bound.
 // Crate-internal entry point with the same plural-context surface as
-// the existing `evaluate_one_rule_at_depth` (rule, path, ir, value,
-// depth budget, output buffer). Bundling the arguments into a struct
+// the existing `evaluate_one_rule_at_depth` (rule, path, ir, depth
+// budget, output buffer). Bundling the arguments into a struct
 // adds indirection without removing any of them; the alternative would
 // force every caller to assemble a tagged context type per evaluation.
 #[allow(clippy::too_many_arguments)]
@@ -191,16 +191,16 @@ pub(crate) fn run_composite(
     composite: &CompiledCompositeCheck,
     path: &Utf8Path,
     ir: &dq_core::Ir<'_>,
-    value: &serde_json::Value,
     current_depth: usize,
     max_depth: usize,
-    out: &mut Vec<Diagnostic>,
+    out: &mut Evaluation,
 ) {
     let outer_id = outer_rule.rule.id.as_str();
     if current_depth >= max_depth {
-        out.push(error_diagnostic(
+        out.diagnostics.push(error_diagnostic(
             outer_rule,
             path,
+            ir,
             format!(
                 "composite recursion exceeded depth bound (depth={current_depth}, max={max_depth})"
             ),
@@ -209,7 +209,7 @@ pub(crate) fn run_composite(
         return;
     }
 
-    let extract_outputs = match composite.extract.run(value) {
+    let extract_outputs = match run_on_document(&composite.extract, ir.value()) {
         Ok(o) => o,
         Err(err) => {
             tracing::warn!(
@@ -217,9 +217,10 @@ pub(crate) fn run_composite(
                 error = %err,
                 "composite extract jq raised a runtime error; emitting composite-error diagnostic",
             );
-            out.push(error_diagnostic(
+            out.diagnostics.push(error_diagnostic(
                 outer_rule,
                 path,
+                ir,
                 format!("composite extract jq runtime error: {err}"),
                 "composite-error",
             ));
@@ -227,16 +228,17 @@ pub(crate) fn run_composite(
         }
     };
     let array = match extract_outputs.as_slice() {
-        [serde_json::Value::Array(items)] => items,
+        [dq_core::Value::Array(items)] => items,
         [other] => {
             tracing::warn!(
                 rule_id = %outer_id,
                 shape = %describe_value_shape(other),
                 "composite extract did not return an array",
             );
-            out.push(error_diagnostic(
+            out.diagnostics.push(error_diagnostic(
                 outer_rule,
                 path,
+                ir,
                 "composite extract did not return an array".to_owned(),
                 "composite-extract-not-array",
             ));
@@ -247,9 +249,10 @@ pub(crate) fn run_composite(
                 rule_id = %outer_id,
                 "composite extract produced empty stream; expected one array",
             );
-            out.push(error_diagnostic(
+            out.diagnostics.push(error_diagnostic(
                 outer_rule,
                 path,
+                ir,
                 "composite extract produced no outputs (expected exactly one array)".to_owned(),
                 "composite-extract-not-array",
             ));
@@ -262,9 +265,10 @@ pub(crate) fn run_composite(
                 count,
                 "composite extract produced multiple outputs; expected exactly one array",
             );
-            out.push(error_diagnostic(
+            out.diagnostics.push(error_diagnostic(
                 outer_rule,
                 path,
+                ir,
                 format!("composite extract produced {count} outputs (expected exactly one array)"),
                 "composite-extract-not-array",
             ));
@@ -295,60 +299,43 @@ fn process_extract_item(
     composite: &CompiledCompositeCheck,
     path: &Utf8Path,
     outer_ir: &dq_core::Ir<'_>,
-    item: &serde_json::Value,
+    item: &dq_core::Value,
     current_depth: usize,
     max_depth: usize,
-    out: &mut Vec<Diagnostic>,
+    out: &mut Evaluation,
 ) {
     let outer_id = outer_rule.rule.id.as_str();
-    let map = match item.as_object() {
-        Some(m) => m,
-        None => {
+    let map = match item {
+        dq_core::Value::Map(m) => m,
+        _ => {
             tracing::warn!(
                 rule_id = %outer_id,
                 shape = %describe_value_shape(item),
                 "composite extract item is not an object",
             );
-            out.push(error_diagnostic(
+            out.diagnostics.push(error_diagnostic(
                 outer_rule,
                 path,
+                outer_ir,
                 "composite extract item is not an object".to_owned(),
                 "composite-extract-malformed",
             ));
             return;
         }
     };
-    let value_str = match map.get("value").and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => {
-            out.push(error_diagnostic(
+    let fields = ["value", "format", "anchor"].map(|field| string_field(map, field));
+    let [value_str, format_str, anchor_str] = match fields {
+        [Ok(value), Ok(format), Ok(anchor)] => [value, format, anchor],
+        fields => {
+            let message = fields
+                .into_iter()
+                .find_map(std::result::Result::err)
+                .unwrap_or_default();
+            out.diagnostics.push(error_diagnostic(
                 outer_rule,
                 path,
-                "composite extract item missing field `value`".to_owned(),
-                "composite-extract-malformed",
-            ));
-            return;
-        }
-    };
-    let format_str = match map.get("format").and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => {
-            out.push(error_diagnostic(
-                outer_rule,
-                path,
-                "composite extract item missing field `format`".to_owned(),
-                "composite-extract-malformed",
-            ));
-            return;
-        }
-    };
-    let anchor_str = match map.get("anchor").and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => {
-            out.push(error_diagnostic(
-                outer_rule,
-                path,
-                "composite extract item missing field `anchor`".to_owned(),
+                outer_ir,
+                message,
                 "composite-extract-malformed",
             ));
             return;
@@ -356,9 +343,10 @@ fn process_extract_item(
     };
 
     if FormatTag::from_name(format_str).is_none() {
-        out.push(error_diagnostic(
+        out.diagnostics.push(error_diagnostic(
             outer_rule,
             path,
+            outer_ir,
             format!("composite extract item names unknown format `{format_str}`"),
             "composite-extract-unknown-format",
         ));
@@ -371,9 +359,10 @@ fn process_extract_item(
             // registered — defensive catch (e.g. feature-gated format
             // disabled at build time). Surfaced as an unknown-format
             // diagnostic so the user gets the same actionable message.
-            out.push(error_diagnostic(
+            out.diagnostics.push(error_diagnostic(
                 outer_rule,
                 path,
+                outer_ir,
                 format!(
                     "composite extract item names format `{format_str}` with no registered parser"
                 ),
@@ -394,20 +383,26 @@ fn process_extract_item(
             // anchored at the outer coordinates. Per spec scenario
             // "Inner-format parse failure becomes outer-rule diagnostic"
             // we do NOT recurse into `nested` for this item.
-            let prefix = &composite.message_prefix;
-            let raw_message = format!("{format_str} parse failed: {err}");
-            let message = if prefix.is_empty() {
-                raw_message
-            } else {
-                format!("{prefix}: {raw_message}")
+            let message = crate::evaluator::prefixed(
+                &composite.message_prefix,
+                &format!("{format_str} parse failed: {err}"),
+            );
+            // A parse error that knows where it is lands there, projected
+            // onto the outer file the way a nested diagnostic is; one that
+            // does not lands on the anchor.
+            let (line, col) = match &err {
+                dq_core::Error::Parse { line, col, .. } if *line > 0 && *col > 0 => {
+                    anchor_position.project(*line, *col)
+                }
+                _ => (anchor_position.line, anchor_position.col),
             };
-            out.push(Diagnostic {
+            out.diagnostics.push(Diagnostic {
                 rule_id: format!("{outer_id}.parse-failed"),
                 severity: Severity::Error,
                 message,
                 file: Some(path.to_path_buf()),
-                line: anchor_position.line,
-                col: anchor_position.col,
+                line,
+                col,
                 span: None,
                 references: outer_rule.rule.references.clone(),
                 fix: None,
@@ -419,52 +414,29 @@ fn process_extract_item(
     // Build the inner IR from the parsed Document and run the nested
     // rule's evaluation. The nested rule is bounded by depth+1.
     let inner_ir = inner_doc.as_ir();
-    let inner_value = inner_ir.value().to_serde_json();
     let inner_format = parser.name();
 
-    let mut inner_diags: Vec<Diagnostic> = Vec::new();
+    let mut inner_evaluation = out.empty_like();
     crate::evaluator::evaluate_one_rule_at_depth(
         &composite.nested,
         path,
         &inner_ir,
-        &inner_value,
         inner_format,
         current_depth + 1,
         max_depth,
-        &mut inner_diags,
+        &mut inner_evaluation,
     );
+    // A nested rule that raised is reported under its own id, as a
+    // top-level rule would be.
+    out.rule_errors.append(&mut inner_evaluation.rule_errors);
 
     // Project every inner diagnostic onto outer-file coordinates and
     // prepend the outer message prefix.
-    for inner in inner_diags {
-        let projected_line = match anchor_position.span_line {
-            Some(span_line) => span_line.saturating_add(inner.line).saturating_sub(1),
-            None => inner.line,
-        };
-        let projected_col = if inner.line == 1 {
-            // First line of the inner document: stack the inline-offset
-            // column on top of the inner column. The inline-offset is
-            // 0-based per `InlineBaseline` but the formula needs 1-based
-            // coordinates; the markdown / YAML parsers populate
-            // `InlineBaseline { col: 1 }` for the leftmost position so
-            // the formula `inline.col + inner.col - 1` reduces to
-            // `inner.col` in the common case. When no inline-offset is
-            // present we fall back to the anchor span's column.
-            let base_col = anchor_position
-                .inline_col
-                .or(anchor_position.span_col)
-                .unwrap_or(1);
-            base_col.saturating_add(inner.col).saturating_sub(1)
-        } else {
-            inner.col
-        };
-        let prefix = &composite.message_prefix;
-        let projected_message = if prefix.is_empty() {
-            inner.message
-        } else {
-            format!("{prefix}: {}", inner.message)
-        };
-        out.push(Diagnostic {
+    for inner in inner_evaluation.diagnostics {
+        let (projected_line, projected_col) = anchor_position.project(inner.line, inner.col);
+        let projected_message =
+            crate::evaluator::prefixed(&composite.message_prefix, &inner.message);
+        out.diagnostics.push(Diagnostic {
             rule_id: inner.rule_id,
             severity: inner.severity,
             message: projected_message,
@@ -505,6 +477,41 @@ struct AnchorPosition {
     /// [`dq_core::InlineBaseline`] — used as the column-projection base
     /// for inner_line == 1.
     inline_col: Option<u32>,
+    /// The column each content line starts at, where a line may start left
+    /// of `inline_col` ([`dq_core::Ir::inline_line_cols_for`]); `[n]` is
+    /// inner line `n + 1`. Empty when every line starts at `inline_col`.
+    inline_line_cols: Vec<u32>,
+}
+
+impl AnchorPosition {
+    /// Project an inner-document `(line, col)` onto the outer file.
+    ///
+    /// The line counts from the anchor's span line when there is one. The
+    /// column of every line starts at the inline-offset column when the
+    /// anchor has one (the markdown parser gives a fenced code block's
+    /// content the column its lines start at; YAML block scalars give 1,
+    /// which leaves the column as it is) — or, on a line indented less
+    /// than the fence, at its own first non-blank; without one, only the
+    /// first line starts at the anchor span's column.
+    fn project(&self, line: u32, col: u32) -> (u32, u32) {
+        let projected_line = match self.span_line {
+            Some(span_line) => span_line.saturating_add(line).saturating_sub(1),
+            None => line,
+        };
+        let base_col = match (self.inline_col, line) {
+            (Some(inline_col), _) => line
+                .checked_sub(1)
+                .and_then(|i| self.inline_line_cols.get(i as usize))
+                .copied()
+                .unwrap_or(inline_col),
+            (None, 1) => self.span_col.unwrap_or(1),
+            (None, _) => 1,
+        };
+        (
+            projected_line,
+            base_col.saturating_add(col).saturating_sub(1),
+        )
+    }
 }
 
 /// Resolve `anchor_str` against the outer IR. Logs a `tracing::warn!` on
@@ -524,12 +531,14 @@ fn resolve_anchor_position(
                 error = %err,
                 "composite rule: anchor pointer failed to parse; retaining inner coordinates",
             );
+            let (line, col) = outer_ir.origin_line_col();
             return AnchorPosition {
-                line: 1,
-                col: 1,
+                line,
+                col,
                 span_line: None,
                 span_col: None,
                 inline_col: None,
+                inline_line_cols: Vec::new(),
             };
         }
     };
@@ -542,13 +551,14 @@ fn resolve_anchor_position(
         );
     }
     let inline = outer_ir.inline_offset_for(&pointer);
-    let (line, col) = span.unwrap_or((1, 1));
+    let (line, col) = span.unwrap_or_else(|| outer_ir.origin_line_col());
     AnchorPosition {
         line,
         col,
         span_line: span.map(|(l, _)| l),
         span_col: span.map(|(_, c)| c),
         inline_col: inline.map(|b| b.col),
+        inline_line_cols: outer_ir.inline_line_cols_for(&pointer).unwrap_or_default(),
     }
 }
 
@@ -562,16 +572,18 @@ fn resolve_anchor_position(
 fn error_diagnostic(
     outer_rule: &CompiledRule,
     path: &Utf8Path,
+    ir: &dq_core::Ir<'_>,
     message: String,
     kind: &str,
 ) -> Diagnostic {
+    let (line, col) = ir.origin_line_col();
     Diagnostic {
         rule_id: format!("{}.{}", outer_rule.rule.id, kind),
         severity: Severity::Error,
         message,
         file: Some(path.to_path_buf()),
-        line: 1,
-        col: 1,
+        line,
+        col,
         span: None,
         references: outer_rule.rule.references.clone(),
         fix: None,
@@ -579,16 +591,45 @@ fn error_diagnostic(
 }
 
 /// Short type-name string for `tracing::warn!` payloads. Uses a closed set
-/// of names so log lines stay grep-friendly; defaults to `"unknown"`
-/// for serde-json variants we never expect in this code path.
-fn describe_value_shape(v: &serde_json::Value) -> &'static str {
+/// of names (the JSON types) so log lines stay grep-friendly.
+fn describe_value_shape(v: &dq_core::Value) -> &'static str {
     match v {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "bool",
-        serde_json::Value::Number(_) => "number",
-        serde_json::Value::String(_) => "string",
-        serde_json::Value::Array(_) => "array",
-        serde_json::Value::Object(_) => "object",
+        dq_core::Value::Null => "null",
+        dq_core::Value::Bool(_) => "bool",
+        dq_core::Value::Int(_)
+        | dq_core::Value::BigInt(_)
+        | dq_core::Value::Float(_)
+        | dq_core::Value::BigFloat(_) => "number",
+        dq_core::Value::String(_) => "string",
+        dq_core::Value::Array(_) => "array",
+        dq_core::Value::Map(_) => "object",
+    }
+}
+
+/// The string an extract item holds under `field`, or what is wrong with
+/// it: missing, or present but not a string (`.nan` is a number).
+fn string_field<'v>(
+    item: &'v indexmap::IndexMap<String, dq_core::Value>,
+    field: &str,
+) -> std::result::Result<&'v str, String> {
+    match item.get(field) {
+        None => Err(format!("composite extract item missing field `{field}`")),
+        Some(value) => as_str(value).ok_or_else(|| {
+            let got = match describe_value_shape(value) {
+                "null" => "null".to_owned(),
+                shape @ ("array" | "object") => format!("an {shape}"),
+                shape => format!("a {shape}"),
+            };
+            format!("composite extract item field `{field}` must be a string, got {got}")
+        }),
+    }
+}
+
+/// The text of a string value; `None` for any other.
+fn as_str(v: &dq_core::Value) -> Option<&str> {
+    match v {
+        dq_core::Value::String(s) => Some(s),
+        _ => None,
     }
 }
 
@@ -787,6 +828,31 @@ check:
             eval.evaluate_file(&Utf8PathBuf::from("doc.yaml"), &owned.to_borrowed(), "yaml");
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("`format`"));
+    }
+
+    #[test]
+    fn extract_item_field_of_another_type_says_what_it_got() {
+        let eval = evaluator(PASSTHROUGH_COMPOSITE_RULE);
+        for (item, message) in [
+            (
+                json!({"value": 1.5, "format": "yaml", "anchor": ""}),
+                "composite extract item field `value` must be a string, got a number",
+            ),
+            (
+                json!({"value": "x", "format": ["yaml"], "anchor": ""}),
+                "composite extract item field `format` must be a string, got an array",
+            ),
+            (
+                json!({"value": "x", "format": "yaml", "anchor": null}),
+                "composite extract item field `anchor` must be a string, got null",
+            ),
+        ] {
+            let owned = ir_for_test(&json!({ "items": [item] }));
+            let diags =
+                eval.evaluate_file(&Utf8PathBuf::from("doc.yaml"), &owned.to_borrowed(), "yaml");
+            assert_eq!(diags.len(), 1, "{diags:?}");
+            assert!(diags[0].message.contains(message), "{}", diags[0].message);
+        }
     }
 
     #[test]
@@ -1025,5 +1091,45 @@ check:
         // which is the default for IRs without source bytes.
         assert_eq!(diags[0].line, 1);
         assert_eq!(diags[0].col, 1);
+    }
+
+    /// A nested rule that raises is a rule error under the nested
+    /// rule's id, as it would be at the top level.
+    #[test]
+    fn nested_rule_that_raises_reports_a_rule_error() {
+        let yaml = r#"
+id: test.outer
+description: x
+severity: error
+match:
+  format: yaml
+check:
+  extract: '[{value: "spec: x", format: "yaml", anchor: ""}]'
+  nested:
+    id: test.outer.inner
+    description: i
+    severity: error
+    match:
+      format: yaml
+    check:
+      jq: '.spec.template'
+      message: m
+  message: 'outer'
+"#;
+        let eval = evaluator(yaml);
+        let owned = ir_for_test(&json!({}));
+        let evaluation =
+            eval.evaluate(&Utf8PathBuf::from("doc.yaml"), &owned.to_borrowed(), "yaml");
+        assert!(evaluation.diagnostics.is_empty());
+        assert_eq!(
+            evaluation
+                .rule_errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec![
+                "rule=test.outer.inner check.jq: jq runtime error: cannot index \"x\" with \"template\""
+            ]
+        );
     }
 }

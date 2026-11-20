@@ -12,13 +12,16 @@ match:
   format: hcl
 check:
   jq: |
-    [.module // {} | to_entries[]
-      | select(.value.source != null)
-      | select(.value.source | type == "string")
-      | select(.value.source | startswith("./") or startswith("../") | not)
-      | select(.value.source | contains("?ref=") | not)
-      | select(.value.version == null)
-      | {name: .key, source: .value.source}][]
+    # A root that is not a map yields nothing instead of raising.
+    objects | [.module // {} | objects | to_entries[]
+      | .key as $name
+      | .value | (if type == "array" then .[] else . end) | objects
+      | select(.source != null)
+      | select(.source | type == "string")
+      | select(.source | startswith("./") or startswith("../") | not)
+      | select(.source | contains("?ref=") | not)
+      | select(.version == null)
+      | {name: $name, source: .source}][]
   message: "Module '{{ .name }}' (source: {{ .source }}) has no version pin"
 references:
   - https://developer.hashicorp.com/terraform/language/modules/sources

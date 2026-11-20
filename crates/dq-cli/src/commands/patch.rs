@@ -6,7 +6,7 @@
 //!
 //! Pipeline (per file, executed inside [`PatchFileOp::apply`]):
 //!
-//! 1. Resolve the format (extension or `-F`).
+//! 1. Resolve the format (extension or `--input-format`).
 //! 2. Read the original bytes.
 //! 3. Run the template guard (mirrors `commands::set`).
 //! 4. Parse to a write-aware [`Document`].
@@ -18,16 +18,14 @@
 //!    bulk driver can dispatch it; never write to disk here — `--check`,
 //!    `--diff`, and `-i` are all driver concerns.
 
-use std::io::{Read, Write};
-use std::str::FromStr;
+use std::io::Write;
 
-use camino::{Utf8Path, Utf8PathBuf};
-use dq_core::{Document, PatchOp, Pointer, Value};
-use indexmap::IndexMap;
+use camino::Utf8Path;
+use dq_core::{PatchOp, Pointer, Value};
 
 use crate::bulk::{self, FileOp, FileOpResult};
 use crate::cli::{Cli, PatchArgs};
-use crate::commands::io_helpers::{pick_format, read_bytes};
+use crate::commands::io_helpers::{finish_edit, parse_file_for_edit, pick_format, read_bytes};
 use crate::error::InvalidInput;
 
 /// Run `dq patch`.
@@ -39,6 +37,8 @@ use crate::error::InvalidInput;
 /// - [`dq_core::Error::TemplatedFile`] (exit 3) when a file contains Go
 ///   template syntax and neither `--allow-templates` nor
 ///   `--raw-template-strings` is set.
+/// - [`dq_core::Error::Path`] (exit 2) when the parent of an `add` /
+///   `copy` / `move` target is missing: RFC 6902 creates none.
 /// - [`dq_core::Error::PatchTestFailed`] when an RFC 6902 `test` op
 ///   observes a mismatched value. The on-disk file is untouched (atomic
 ///   rollback in [`dq_core::apply_patch`]).
@@ -75,6 +75,7 @@ pub fn run(
     };
 
     let files = bulk::expand_glob(&args.file)?;
+    super::io_helpers::check_write_targets(cli, "patch", &files, input_format)?;
     bulk::run_per_file(files, &op, cli, out)
 }
 
@@ -95,32 +96,24 @@ impl<'a> FileOp for PatchFileOp<'a> {
         let format = pick_format(path, self.input_format)?;
         let original_bytes = read_bytes(path)?;
 
-        // Template guard: detect / substitute / pass-through depending on
-        // which escape-hatch flag is active.
-        let (parse_input, placeholder_map) = if self.cli.raw_template_strings {
-            let (substituted, map) =
-                dq_core::template_guard::substitute_placeholders(&original_bytes);
-            (substituted, Some(map))
-        } else if self.cli.allow_templates {
-            (original_bytes.clone(), None)
-        } else if let Some(marker) = dq_core::template_guard::detect_templates(&original_bytes) {
-            return Err(anyhow::Error::new(dq_core::Error::templated_file(marker)));
-        } else {
-            (original_bytes.clone(), None)
-        };
-
-        let mut document = parse_to_document(format, &parse_input, path)?;
+        // Template guard, then parse: a file whose templates change what
+        // the parser reads is refused; `guard` checks below that the edit
+        // keeps the templates of one whose templates do not (or puts the
+        // `--raw-template-strings` placeholders back).
+        let (mut document, guard) = parse_file_for_edit(self.cli, format, &original_bytes, path)?;
+        let textual = document.is_write_aware();
 
         // Apply the patch atomically — on any failure (including a failing
         // `test`), the engine leaves `document` untouched (clone-on-apply).
-        dq_core::apply_patch(&mut document, self.ops).map_err(anyhow::Error::new)?;
+        // `edited` are the nodes of the file as read that the ops replaced
+        // or removed, each op's path carried back through the index shifts
+        // of the ops before it.
+        let edited =
+            dq_core::apply_patch_edits(&mut document, self.ops).map_err(anyhow::Error::new)?;
 
-        // Compute final bytes, restoring template placeholders when the
-        // substitution pass ran.
-        let mut final_bytes = document.original_bytes().to_vec();
-        if let Some(map) = &placeholder_map {
-            final_bytes = dq_core::template_guard::restore_placeholders(&final_bytes, map);
-        }
+        // Compute final bytes: placeholders put back, or the templates
+        // checked as kept outside the nodes the ops replaced or removed.
+        let final_bytes = finish_edit(&guard, format, &document, &edited, textual)?;
 
         // The bulk driver handles `-i` and `--check` uniformly — we only
         // need to compute the diff string when `--diff` mode is active so
@@ -145,37 +138,6 @@ impl<'a> FileOp for PatchFileOp<'a> {
     }
 }
 
-/// Parse `parse_input` as `format` into a write-aware [`Document`].
-///
-/// TODO(M3 §10): this is a near-verbatim copy of
-/// [`crate::commands::set::parse_to_document`]. The merge / diff handlers in
-/// §5 / §6 will produce a third copy; once three call sites exist, extract
-/// to a shared helper module under `commands/io_helpers` (the abstraction
-/// is not yet load-bearing — each handler still owns its own template-guard
-/// dance, so a half-shared helper would obscure rather than simplify).
-fn parse_to_document(
-    format: &'static dyn dq_core::Format,
-    parse_input: &[u8],
-    file: &Utf8Path,
-) -> anyhow::Result<Document> {
-    let path_label = Utf8PathBuf::from(file);
-    let doc_result: dq_core::Result<Document> = match format.name() {
-        "yaml" => dq_core::parse_yaml_with_spans(parse_input),
-        "json" => dq_core::parse_json_with_spans(parse_input),
-        _ => format.parse(parse_input),
-    };
-    doc_result
-        .map_err(|mut e| {
-            if let dq_core::Error::Parse { ref mut file, .. } = e
-                && file.is_none()
-            {
-                *file = Some(path_label.clone());
-            }
-            e
-        })
-        .map_err(anyhow::Error::new)
-}
-
 /// Resolve the patch source (inline / stdin / `@<path>` / `--ops-from`) into
 /// a parsed [`Vec<PatchOp>`].
 ///
@@ -183,26 +145,14 @@ fn parse_to_document(
 /// `--ops-from` wins; then the inline arg's leading `-` reads stdin, leading
 /// `@` reads a file path, and anything else is the inline JSON literal.
 fn resolve_ops(args: &PatchArgs) -> anyhow::Result<Vec<PatchOp>> {
+    // `-` is stdin wherever a source is named: `-`, `@-` and `--ops-from -`.
     let bytes = if let Some(path) = &args.ops_from {
-        std::fs::read(path.as_std_path()).map_err(|source| {
-            anyhow::Error::new(dq_core::Error::Io {
-                path: path.clone(),
-                source,
-            })
-        })?
+        read_bytes(path)?
     } else if let Some(s) = &args.ops {
         if s == "-" {
-            let mut buf = Vec::new();
-            std::io::stdin().lock().read_to_end(&mut buf)?;
-            buf
+            read_bytes(Utf8Path::new("-"))?
         } else if let Some(path_str) = s.strip_prefix('@') {
-            let path = Utf8PathBuf::from(path_str);
-            std::fs::read(path.as_std_path()).map_err(|source| {
-                anyhow::Error::new(dq_core::Error::Io {
-                    path: path.clone(),
-                    source,
-                })
-            })?
+            read_bytes(Utf8Path::new(path_str))?
         } else {
             s.as_bytes().to_vec()
         }
@@ -346,72 +296,13 @@ fn parse_json_value(rest: &str, line_no: usize) -> anyhow::Result<Value> {
             "line {line_no}: invalid JSON value: {e}"
         )))
     })?;
-    Ok(serde_json_to_dq_value(&json))
-}
-
-/// Convert a [`serde_json::Value`] into a [`Value`].
-///
-/// TODO(M3 §10): this is a third copy of
-/// [`crate::commands::set::serde_json_to_dq_value`] (the second copy lives
-/// in `dq-core::transform::patch` for serde plumbing). Extract to a shared
-/// helper once §5 (merge) lands its own copy — three call sites makes the
-/// case for a `commands::value_convert` module. The same extraction batch
-/// also covers `f64_matches_literal`, `literal_round_trips_to`, and
-/// `number_to_value`, which are duplicated alongside this helper.
-fn serde_json_to_dq_value(v: &serde_json::Value) -> Value {
-    match v {
-        serde_json::Value::Null => Value::Null,
-        serde_json::Value::Bool(b) => Value::Bool(*b),
-        serde_json::Value::Number(n) => number_to_value(n),
-        serde_json::Value::String(s) => Value::String(s.clone()),
-        serde_json::Value::Array(items) => {
-            Value::Array(items.iter().map(serde_json_to_dq_value).collect())
-        }
-        serde_json::Value::Object(map) => {
-            let mut out = IndexMap::with_capacity(map.len());
-            for (k, child) in map {
-                out.insert(k.clone(), serde_json_to_dq_value(child));
-            }
-            Value::Map(out)
-        }
-    }
-}
-
-fn number_to_value(n: &serde_json::Number) -> Value {
-    let literal = n.to_string();
-    if let Ok(i) = literal.parse::<i64>() {
-        return Value::Int(i);
-    }
-    if literal.contains('.') || literal.contains('e') || literal.contains('E') {
-        if let Ok(f) = f64::from_str(&literal)
-            && f.is_finite()
-            && f64_matches_literal(f, &literal)
-        {
-            return Value::Float(f);
-        }
-        return Value::BigFloat(literal);
-    }
-    Value::BigInt(literal)
-}
-
-/// Lossless-round-trip check for a parsed `f64` against its source literal.
-///
-/// Mirrors `dq_core::parsers::json::f64_matches_literal`: re-parse the
-/// shortest float formatting and compare for exact equality so cosmetic
-/// reformatting (e.g. `1e2` vs `100`) doesn't trigger the BigFloat branch.
-fn f64_matches_literal(f: f64, literal: &str) -> bool {
-    let formatted = format!("{f}");
-    f64::from_str(&formatted).is_ok_and(|round_trip| round_trip.to_bits() == f.to_bits())
-        && literal_round_trips_to(literal, f)
-}
-
-fn literal_round_trips_to(literal: &str, f: f64) -> bool {
-    f64::from_str(literal).is_ok_and(|parsed| parsed.to_bits() == f.to_bits())
+    Ok(Value::from_serde_json(&json))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use camino::Utf8PathBuf;
     use clap::Parser;
     use tempfile::NamedTempFile;
 

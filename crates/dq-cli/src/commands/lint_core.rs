@@ -3,12 +3,14 @@
 //! Pipeline:
 //!
 //! 1. Expand input glob patterns into a flat list of file paths.
-//! 2. For each file, detect the format (extension or `-F` override) and
+//! 2. For each file, detect the format (extension or `--input-format`) and
 //!    record it in an `IndexSet` of discovered formats.
 //! 3. Resolve `--rules` (or auto-bind on empty) into a `Vec<RuleSet>`.
 //! 4. Compile every rule via [`Evaluator::new`].
 //! 5. Per-file: load + parse the document, evaluate each rule, collect
-//!    diagnostics.
+//!    diagnostics; a file that does not parse is a `lint.parse` diagnostic
+//!    of its own (structured reporters only — the console prints the error)
+//!    and the run goes on to the next file.
 //! 6. Hand the canonical `{ "diagnostics": [...] }` shape to the configured
 //!    reporter.
 //! 7. Compute the lint exit code:
@@ -24,15 +26,16 @@
 use std::io::Write;
 
 use camino::{Utf8Path, Utf8PathBuf};
-use dq_exec::{Diagnostic, Evaluator, LoaderArgs, RuleLoader, RuleSet, Severity};
+use dq_exec::{Diagnostic, Evaluator, LoaderArgs, Rule, RuleLoader, RuleSet, Severity};
 use indexmap::IndexSet;
-use walkdir::WalkDir;
 
-use crate::cli::Cli;
-use crate::commands::io_helpers::{load_document_for_lint, pick_format};
+use crate::cli::{Cli, DocSelector};
+use crate::commands::io_helpers::{
+    checked_index, every_file_lacks, load_document_for_lint, pick_format, skip_out_of_range,
+};
 use crate::commands::plugin_loader::{self, LoadedPlugins};
 use crate::error::{InvalidInput, LintFail, LintWarnStrict};
-use crate::output::Reporter;
+use crate::output::{OutputFormat, Reporter};
 
 /// Run the lint pipeline once a caller has produced the input rulesets.
 ///
@@ -59,7 +62,10 @@ use crate::output::Reporter;
 ///
 /// - [`InvalidInput`] (exit 6) when `--rules` references an unknown
 ///   `@std/<ns>` or a non-existent path.
-/// - `dq_core::Error::*` for the usual file-load failures.
+/// - `dq_core::Error::*` for the usual file-load failures; a file that does
+///   not parse (or is templated) is reported as a `lint.parse`
+///   (`lint.templated_file`) result with the others, every other file still
+///   linted, and its error is returned once the report is written (exit 3).
 /// - [`LintFail`] (exit 4) when any error-severity diagnostic is emitted.
 /// - [`LintWarnStrict`] (exit 1) when warnings are emitted under `--strict`.
 // 8 args is one over clippy's default `too_many_arguments` threshold. The
@@ -131,6 +137,13 @@ pub(crate) fn run_with_rulesets(
     };
 
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
+    // Files that do not parse: each is a `lint.<kind>` result of its own
+    // in a structured report (the console prints the error itself), and
+    // the run still lints every other file before it fails with exit 3.
+    let console = matches!(cli.format, OutputFormat::Console);
+    let mut unparsed: Vec<anyhow::Error> = Vec::new();
+    let several = expanded.len() > 1;
+    let mut missing = Vec::new();
     for file in &expanded {
         let fmt = pick_format(file, input_format)?;
         let format_name = fmt.name().to_owned();
@@ -139,45 +152,196 @@ pub(crate) fn run_with_rulesets(
         // populated provenance map, which `Ir::line_col_for(&Pointer)` (used
         // by the evaluator's `loc.pointer` chain) needs to resolve to a
         // real `(line, col)`. See `load_document_for_lint` for the rationale.
-        let (_doc_fmt, doc) = load_document_for_lint(file, input_format)?;
-        let ir = doc.as_ir();
-        let mut file_diags = evaluator.evaluate_file(file, &ir, &format_name);
-        diagnostics.append(&mut file_diags);
-        // After the rule engine runs every `@std/*` and `--rules`-loaded
-        // rule, give every plugin loaded from `--plugins <DIR>` a chance to
-        // contribute its own diagnostics. Plugin invocation errors
-        // propagate up — they bubble through `exit_code_for_error` and
-        // route via `PluginError::kind_name()`. We do NOT swallow them
-        // here, mirroring the rule-engine semantics for buggy rules.
-        if let Some(loaded) = plugins.as_ref()
-            && let Some(runtime) = loaded.runtime.as_ref()
+        let (_doc_fmt, doc) = match load_document_for_lint(file, input_format, cli.template_mode())
         {
-            for handle in &loaded.handles {
-                let mut plugin_diags = runtime
-                    .invoke_lint(handle, &ir, Some(file.as_path()))
-                    .map_err(anyhow::Error::new)?;
-                diagnostics.append(&mut plugin_diags);
+            Ok(loaded) => loaded,
+            Err(err) => match unparsed_diagnostic(file, &err) {
+                Some(diagnostic) => {
+                    if !console {
+                        diagnostics.push(diagnostic);
+                    }
+                    unparsed.push(err);
+                    continue;
+                }
+                None => return Err(err),
+            },
+        };
+        // Each document of a multi-document stream is linted as a document
+        // of its own — `match.filter`, `check`, `loc.*`, composite
+        // `extract` and plugins all see one document, as they would in a
+        // file of its own. `--doc N` keeps only document N.
+        // Over several files, one without document N is skipped with a
+        // note on stderr; a single file without it — or a run where no
+        // file holds it — is exit 2.
+        let only = match cli.doc {
+            Some(DocSelector::Index(index)) => {
+                match skip_out_of_range(checked_index(&doc, index, file), several)? {
+                    Ok(index) => Some(index),
+                    Err(reason) => {
+                        missing.push((file, reason));
+                        continue;
+                    }
+                }
             }
+            Some(DocSelector::All) | None => None,
+        };
+        match doc.stream_documents() {
+            Some(parts) => {
+                for part in parts.iter().filter(|p| only.is_none_or(|i| p.index() == i)) {
+                    lint_document(
+                        &evaluator,
+                        plugins.as_ref(),
+                        file,
+                        &part.as_ir(),
+                        &format_name,
+                        &mut diagnostics,
+                    )?;
+                }
+            }
+            None => lint_document(
+                &evaluator,
+                plugins.as_ref(),
+                file,
+                &doc.as_ir(),
+                &format_name,
+                &mut diagnostics,
+            )?,
         }
     }
 
-    let envelope = build_envelope(&diagnostics);
-    reporter.report(&envelope, out)?;
+    if let Some(err) = every_file_lacks(&missing, expanded.len()) {
+        return Err(anyhow::Error::new(err));
+    }
+    for (file, reason) in &missing {
+        tracing::warn!("skipped {file}: {reason}");
+    }
 
+    let mut envelope = build_envelope(&diagnostics);
+    if reporter.wants_rule_catalog() {
+        let mut catalog = rule_catalog(evaluator.rules());
+        if let Some(rules) = catalog.as_array_mut() {
+            rules.extend(unparsed_catalog(&diagnostics));
+        }
+        envelope["rules"] = catalog;
+    }
+    // The console with nothing but parse errors prints them alone, as it
+    // did before the other files were linted on.
+    if !(console && diagnostics.is_empty() && !unparsed.is_empty()) {
+        reporter.report(&envelope, out)?;
+    }
+
+    let mut unparsed = unparsed.into_iter();
+    if let Some(first) = unparsed.next() {
+        // The first is printed as the run's error; the console names the
+        // others here, as it names a file skipped.
+        for err in unparsed {
+            tracing::warn!("{err}");
+        }
+        return Err(first);
+    }
     classify_exit(&diagnostics, cli.strict)
 }
 
-/// Expand each input path: if it contains glob metacharacters (`*`/`?`/`[`)
-/// walk the matching files; otherwise pass through unchanged. Returns a
+/// The diagnostic for `file`, which did not load with `err`, when that is
+/// a parse error or a templated file (exit 3): `lint.<kind>` — `lint.parse`,
+/// `lint.templated_file` — as `validate` reports under `validate.<kind>`,
+/// at the error's line and column. `None` for any other error.
+fn unparsed_diagnostic(file: &Utf8Path, err: &anyhow::Error) -> Option<Diagnostic> {
+    let core = err.downcast_ref::<dq_core::Error>()?;
+    let (line, col, message) = match core {
+        dq_core::Error::Parse {
+            line, col, message, ..
+        } => (*line, *col, message.clone()),
+        dq_core::Error::TemplatedFile { line, .. } => (*line, 0, core.to_string()),
+        _ => return None,
+    };
+    Some(Diagnostic {
+        rule_id: format!("lint.{}", core.kind_name()),
+        severity: Severity::Error,
+        message,
+        file: Some(file.to_path_buf()),
+        line,
+        col,
+        span: None,
+        references: Vec::new(),
+        fix: None,
+    })
+}
+
+/// The rule catalogue entries of the `lint.<kind>` ids
+/// [`unparsed_diagnostic`] reports under, one per id `diagnostics` holds.
+fn unparsed_catalog(diagnostics: &[Diagnostic]) -> Vec<serde_json::Value> {
+    let mut ids: IndexSet<&str> = IndexSet::new();
+    for diagnostic in diagnostics {
+        if let Some(kind) = diagnostic.rule_id.strip_prefix("lint.")
+            && matches!(kind, "parse" | "templated_file")
+        {
+            ids.insert(&diagnostic.rule_id);
+        }
+    }
+    ids.into_iter()
+        .map(|id| {
+            let description = if id == "lint.parse" {
+                "The file does not parse in its format."
+            } else {
+                "The file holds template syntax dq reads only with --allow-templates or \
+                 --raw-template-strings."
+            };
+            serde_json::json!({ "id": id, "description": description, "references": [] })
+        })
+        .collect()
+}
+
+/// Lint one document — a whole file, or one document of a stream — with
+/// the rule engine and then every loaded plugin, appending to
+/// `diagnostics`.
+///
+/// After the rule engine runs every `@std/*` and `--rules`-loaded rule,
+/// every plugin loaded from `--plugins <DIR>` gets a chance to contribute
+/// its own diagnostics. Plugin invocation errors propagate — they bubble
+/// through `exit_code_for_error` and route via `PluginError::kind_name()`;
+/// they are not swallowed, mirroring the rule-engine semantics for buggy
+/// rules.
+fn lint_document(
+    evaluator: &Evaluator,
+    plugins: Option<&LoadedPlugins>,
+    file: &Utf8Path,
+    ir: &dq_core::Ir<'_>,
+    format_name: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> anyhow::Result<()> {
+    let mut found = evaluator.evaluate_file(file, ir, format_name);
+    diagnostics.append(&mut found);
+    if let Some(loaded) = plugins
+        && let Some(runtime) = loaded.runtime.as_ref()
+    {
+        for handle in &loaded.handles {
+            let mut plugin_diags = runtime
+                .invoke_lint(handle, ir, Some(file))
+                .map_err(anyhow::Error::new)?;
+            diagnostics.append(&mut plugin_diags);
+        }
+    }
+    Ok(())
+}
+
+/// Expand each input path: a glob ([`crate::glob::is_glob`]) becomes the
+/// files it matches; anything else passes through unchanged. Returns a
 /// flat, deterministically-ordered list of files.
+///
+/// A glob failure (invalid pattern, missing walk root, zero matches) is an
+/// `InvalidInput` so the exit-code mapper picks 6 — distinct from
+/// `bulk::expand_glob`'s "I/O error" mapping because lint is read-only and
+/// "no files matched" is a caller-side mistake, not a write failure.
 ///
 /// Visibility: `pub(crate)` so the M10 `dq fix` handler can reuse the
 /// same read-mode glob expansion semantics (zero-match → InvalidInput).
 pub(crate) fn expand_lint_inputs(paths: &[Utf8PathBuf]) -> anyhow::Result<Vec<Utf8PathBuf>> {
     let mut out = Vec::new();
     for p in paths {
-        if has_glob_chars(p.as_str()) {
-            let matched = expand_glob(p)?;
+        if crate::glob::is_glob(p) {
+            let matched = crate::glob::expand(p)
+                .map_err(|err| anyhow::Error::new(InvalidInput::new(err.to_string())))?;
             out.extend(matched);
         } else {
             out.push(p.clone());
@@ -186,81 +350,30 @@ pub(crate) fn expand_lint_inputs(paths: &[Utf8PathBuf]) -> anyhow::Result<Vec<Ut
     Ok(out)
 }
 
-fn has_glob_chars(s: &str) -> bool {
-    s.chars().any(|c| matches!(c, '*' | '?' | '[' | '{'))
-}
-
-/// Read-mode glob expansion. Walks from the longest non-meta prefix and
-/// filters via a compiled `globset::GlobMatcher`. Zero matches is an
-/// `InvalidInput` so the exit-code mapper picks 6 — distinct from
-/// `bulk::expand_glob`'s "I/O error" mapping because lint is read-only and
-/// "no files matched" is a caller-side mistake, not a write failure.
-fn expand_glob(pattern: &Utf8Path) -> anyhow::Result<Vec<Utf8PathBuf>> {
-    let glob = globset::Glob::new(pattern.as_str()).map_err(|e| {
-        anyhow::Error::new(InvalidInput::new(format!(
-            "invalid glob pattern '{pattern}': {e}"
-        )))
-    })?;
-    let matcher = glob.compile_matcher();
-
-    let prefix = longest_non_meta_prefix(pattern);
-    let walk_root = if prefix.as_str().is_empty() {
-        Utf8PathBuf::from(".")
-    } else {
-        prefix
-    };
-    if !walk_root.as_std_path().exists() {
-        return Err(anyhow::Error::new(InvalidInput::new(format!(
-            "glob root {walk_root} does not exist"
-        ))));
-    }
-
-    let mut matches: Vec<Utf8PathBuf> = WalkDir::new(walk_root.as_std_path())
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-        .filter(|entry| matcher.is_match(entry.path()))
-        .filter_map(|entry| Utf8PathBuf::from_path_buf(entry.into_path()).ok())
-        .collect();
-
-    if matches.is_empty() {
-        return Err(anyhow::Error::new(InvalidInput::new(format!(
-            "glob {pattern} matched zero files"
-        ))));
-    }
-
-    matches.sort();
-    Ok(matches)
-}
-
-fn longest_non_meta_prefix(pattern: &Utf8Path) -> Utf8PathBuf {
-    let s = pattern.as_str();
-    let mut prefix_components: Vec<&str> = Vec::new();
-    for component in s.split('/') {
-        if component
-            .chars()
-            .any(|c| matches!(c, '*' | '?' | '[' | '{'))
-        {
-            break;
-        }
-        prefix_components.push(component);
-    }
-    if prefix_components.is_empty() {
-        return Utf8PathBuf::from(".");
-    }
-    let joined = prefix_components.join("/");
-    if joined.is_empty() {
-        Utf8PathBuf::from("/")
-    } else {
-        Utf8PathBuf::from(joined)
-    }
-}
-
 /// Build the canonical `{ "diagnostics": [...] }` envelope every lint
 /// reporter consumes.
 pub(crate) fn build_envelope(diagnostics: &[Diagnostic]) -> serde_json::Value {
     let arr: Vec<serde_json::Value> = diagnostics.iter().map(Diagnostic::to_serde_json).collect();
     serde_json::json!({ "diagnostics": arr })
+}
+
+/// The rule catalogue a reporter asks for through
+/// [`Reporter::wants_rule_catalog`]: `[{ "id", "description",
+/// "references" }]`, one entry per loaded rule, in load order.
+///
+/// A diagnostic whose id is not here — a plugin's, a composite's
+/// `<outer>.parse-failed`, a nested rule's — is still reported; the
+/// reporter describes it by id alone.
+pub(crate) fn rule_catalog<'a>(rules: impl Iterator<Item = &'a Rule>) -> serde_json::Value {
+    rules
+        .map(|rule| {
+            serde_json::json!({
+                "id": rule.id,
+                "description": rule.description,
+                "references": rule.references,
+            })
+        })
+        .collect()
 }
 
 /// Compute the exit-code marker for a finished run.
@@ -364,33 +477,5 @@ mod tests {
             .expect("diagnostics must be an array");
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["severity"], "error");
-    }
-
-    #[test]
-    fn has_glob_chars_detects_metacharacters() {
-        assert!(has_glob_chars("foo/*.yaml"));
-        assert!(has_glob_chars("a?b"));
-        assert!(has_glob_chars("a[bc]d"));
-        assert!(!has_glob_chars("plain.yaml"));
-        assert!(!has_glob_chars("a/b/c.json"));
-    }
-
-    #[test]
-    fn has_glob_chars_detects_brace_expansion() {
-        // Must agree with `longest_non_meta_prefix`'s metachar set so brace
-        // patterns don't slip through `expand_lint_inputs` as literal paths.
-        assert!(has_glob_chars("dir/{a,b}/file.yaml"));
-    }
-
-    #[test]
-    fn longest_non_meta_prefix_walks_until_first_meta() {
-        assert_eq!(
-            longest_non_meta_prefix(Utf8Path::new("dir/sub/*.yaml")),
-            Utf8PathBuf::from("dir/sub")
-        );
-        assert_eq!(
-            longest_non_meta_prefix(Utf8Path::new("*.yaml")),
-            Utf8PathBuf::from(".")
-        );
     }
 }

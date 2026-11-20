@@ -20,12 +20,14 @@ mod completions;
 mod convert;
 mod del;
 mod diff;
+mod doc;
 mod exists;
 mod explain;
 mod fix;
 mod fmt;
 mod generate_docs;
 mod get;
+mod input_format;
 mod keys;
 mod len;
 mod lint;
@@ -48,12 +50,14 @@ pub use completions::CompletionsArgs;
 pub use convert::ConvertArgs;
 pub use del::DelArgs;
 pub use diff::DiffArgs;
+pub use doc::DocSelector;
 pub use exists::ExistsArgs;
 pub use explain::ExplainArgs;
 pub use fix::FixArgs;
 pub use fmt::FmtArgs;
 pub use generate_docs::GenerateDocsArgs;
 pub use get::GetArgs;
+pub use input_format::InputFormat;
 pub use keys::KeysArgs;
 pub use len::LenArgs;
 pub use lint::LintArgs;
@@ -77,9 +81,25 @@ pub use values::ValuesArgs;
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]
 pub struct Cli {
-    /// Output format.
+    /// Output format; never the format a file is read in (see
+    /// --input-format).
+    ///
+    /// convert: the format to convert to. set, del, patch, merge, fmt, fix:
+    /// the file keeps its own format, so a -F naming another one is refused
+    /// (exit 2) and the same one is accepted. test: console, json or tap.
+    /// exists, completions, man, self and rules add print no formatted
+    /// value and do not use it.
     #[arg(short = 'F', long, global = true, value_enum, default_value_t = OutputFormat::Console)]
     pub format: OutputFormat,
+
+    /// The format to read files, globs and stdin (`-`) in, instead of the
+    /// one their extension or name implies.
+    ///
+    /// Stdin has no extension: a command reading `-` needs this flag (exit
+    /// 2 without it). test, explain, rules, completions, man and self read
+    /// no data file and refuse it (exit 2).
+    #[arg(long, global = true, value_enum, value_name = "FORMAT")]
+    pub input_format: Option<InputFormat>,
 
     /// Increase logging verbosity (`-v`, `-vv`, `-vvv`).
     #[arg(short, long, action = clap::ArgAction::Count, global = true, conflicts_with = "quiet")]
@@ -93,16 +113,36 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_color: bool,
 
-    /// Disable automatic paging of long output.
-    #[arg(long, global = true)]
+    /// Accepted for compatibility; does nothing — dq has no pager.
+    ///
+    /// Hidden from `--help` so nobody reaches for it, kept so scripts that
+    /// pass it do not break.
+    #[arg(long, global = true, hide = true)]
     pub no_pager: bool,
 
-    /// Document index for multi-document streams ("0", "1", ...) or "all".
+    /// Which document of a multi-document YAML stream (`---`-separated) to
+    /// work on: an index counting from 0, or `all`.
     ///
-    /// Parsed in M1 but not yet wired into command handlers; semantics arrive
-    /// in M2.
-    #[arg(long, value_name = "IDX", global = true)]
-    pub doc: Option<String>,
+    /// A file that is not a stream is document 0; any other index is out of
+    /// range (exit 2).
+    ///
+    /// get, exists, keys, values, len, type, paths, select, query: read
+    /// document 0 unless told otherwise; `--doc all` reads the stream as an
+    /// array of its documents (`/1/...` is the second one).
+    ///
+    /// convert: writes only the chosen document (`--doc all`: every
+    /// document); not with -i, which would delete the other documents
+    /// along with the source.
+    ///
+    /// set, del: the pointer is relative to the chosen document. Without
+    /// `--doc` a stream is addressed as `/N/...`. `--doc all` is refused.
+    ///
+    /// lint, check, fix: every document of a stream is linted and fixed as
+    /// a document of its own; `--doc N` limits them to one.
+    ///
+    /// Every other command refuses `--doc` (exit 2).
+    #[arg(long, value_name = "N|all", global = true)]
+    pub doc: Option<DocSelector>,
 
     /// Edit the file in place. Only meaningful for write subcommands
     /// (`set`, `del`); read subcommands reject this flag.
@@ -181,6 +221,21 @@ pub struct Cli {
 }
 
 impl Cli {
+    /// How a command that reads a file treats its templates: the guard,
+    /// unless `--allow-templates` or `--raw-template-strings` picks an
+    /// escape hatch (clap keeps the two flags exclusive).
+    #[must_use]
+    pub fn template_mode(&self) -> dq_core::template_guard::TemplateMode {
+        use dq_core::template_guard::TemplateMode;
+        if self.raw_template_strings {
+            TemplateMode::RawStrings
+        } else if self.allow_templates {
+            TemplateMode::Allow
+        } else {
+            TemplateMode::Guard
+        }
+    }
+
     /// Reject any of the write-mode flags (`-i`/`--in-place`, `--diff`,
     /// `--backup`) — used by **read** subcommands to signal "this verb does
     /// not write, please drop the flag".
@@ -229,10 +284,11 @@ impl Cli {
 
     /// Validate write-mode flag combinations for `set`/`del` handlers.
     ///
-    /// Rejects: `-i` together with `--diff`, `--backup` without `-i`, and
-    /// `-i` together with `-F` (in-place format change is deferred to M3).
-    /// All rejections carry the [`InvalidInput`] marker so the exit-code
-    /// mapper produces 6.
+    /// Rejects: `-i` together with `--diff` or `--check`, `--diff` with
+    /// `--check`, and `--backup` with `--check` or without `-i`. All
+    /// rejections carry the [`InvalidInput`] marker so the exit-code mapper
+    /// produces 6. A `-F` naming another format than the file's is refused
+    /// per file by [`Cli::ensure_format_kept`].
     ///
     /// # Errors
     ///
@@ -267,18 +323,8 @@ impl Cli {
                 "--backup requires -i/--in-place",
             )));
         }
-        // M2 baseline: -i + -F is rejected for `set`/`del`. The format is
-        // implied by the file extension when writing back. The M3 `convert`
-        // handler (§8) needs `-i + -F` to express in-place format conversion;
-        // its handler will perform its own targeted validation rather than
-        // calling this method, so this rule stays as-is for set/del.
-        // `OutputFormat::default() == Console`, so anything else means the
-        // user explicitly passed `-F`.
-        if self.in_place && self.format != OutputFormat::Console {
-            return Err(anyhow::Error::new(InvalidInput::new(
-                "-i/--in-place cannot be combined with -F (format is implied by file extension)",
-            )));
-        }
+        // `-F` is checked per file, once its format is known: see
+        // `Cli::ensure_format_kept`.
         // NOTE: `--parallel > 1` without a glob (single-file invocation) is
         // a runtime decision in `bulk::run_per_file` — the validator does
         // not have access to the matched-file count at this point. The
@@ -327,6 +373,73 @@ impl Cli {
         ))))
     }
 
+    /// The usage error (exit 2) for a `--doc` value `command` cannot
+    /// honour, built by clap so it reads like every other usage error.
+    ///
+    /// Returned instead of ignoring the flag: a command that silently reads
+    /// document 0, or the whole stream, when asked for document 3 answers a
+    /// question nobody asked.
+    #[must_use]
+    pub fn doc_usage_error(&self, command: &str, why: &str) -> anyhow::Error {
+        let shown = self.doc.map_or_else(String::new, |doc| format!(" {doc}"));
+        let message = format!("`--doc{shown}` is not supported by `dq {command}`: {why}");
+        usage_error(clap::error::ErrorKind::ArgumentConflict, message)
+    }
+
+    /// The usage error (exit 2) for `--input-format` on a command that
+    /// cannot honour it, worded as [`Cli::doc_usage_error`] words `--doc`'s.
+    ///
+    /// Returned instead of ignoring the flag, as `--doc` is: a format named
+    /// for nothing to read is a mistake worth saying so.
+    #[must_use]
+    pub fn input_format_usage_error(&self, command: &str, why: &str) -> anyhow::Error {
+        let shown = self
+            .input_format
+            .map_or_else(String::new, |f| format!(" {}", f.parser_name()));
+        let message = format!("`--input-format{shown}` is not supported by `dq {command}`: {why}");
+        usage_error(clap::error::ErrorKind::ArgumentConflict, message)
+    }
+
+    /// Refuse a `-F` that names another format than the one `dq {command}`
+    /// writes `file` in — its own, `format`.
+    ///
+    /// `set`, `del`, `patch`, `merge`, `fmt` and `fix` put a file back in
+    /// the format it was read in, whether to the file (`-i`), to stdout or
+    /// as a diff; `-F` can only ever be the output format, so one that
+    /// differs cannot be honoured, and reading it as the input format —
+    /// what it once did — is `--input-format`'s job. The same format, and
+    /// `-F` left at its `console` default, are accepted: scripts that
+    /// passed `-F yaml -i` on a YAML file keep working.
+    ///
+    /// # Errors
+    ///
+    /// A usage error (exit 2) naming `--input-format` when `-F` names a
+    /// format other than `format`.
+    pub fn ensure_format_kept(
+        &self,
+        command: &str,
+        file: &camino::Utf8Path,
+        format: &dyn dq_core::Format,
+    ) -> anyhow::Result<()> {
+        if self.format == OutputFormat::Console
+            || self.format.file_format_name() == Some(format.name())
+        {
+            return Ok(());
+        }
+        let shown = clap::ValueEnum::to_possible_value(&self.format)
+            .map_or_else(String::new, |v| v.get_name().to_owned());
+        let file = if file == "-" { "stdin" } else { file.as_str() };
+        Err(usage_error(
+            clap::error::ErrorKind::ArgumentConflict,
+            format!(
+                "-F {shown} is the output format, but `dq {command}` keeps {file} in its own \
+                 format, {name}: drop -F (to read a file as another format, use \
+                 --input-format; to change its format, use `dq convert`)",
+                name = format.name(),
+            ),
+        ))
+    }
+
     /// Build a [`dq_core::WriteOptions`] snapshot from the current global
     /// flags.
     ///
@@ -343,6 +456,43 @@ impl Cli {
     }
 }
 
+/// A usage error (exit 2) raised after parsing, built by clap so it reads
+/// like the ones clap raises itself: `error: …`, the usage line, the
+/// `--help` hint.
+#[must_use]
+pub fn usage_error(kind: clap::error::ErrorKind, message: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::Error::new(<Cli as clap::CommandFactory>::command().error(kind, message))
+}
+
+/// Why a command that reads no data file refuses `--doc` and
+/// `--input-format`.
+const NO_DATA_FILE: &str = "it reads no data file";
+
+/// The usage error (exit 2) for `dq {command}` given stdin (`-`) for each
+/// of `inputs` ([`Command::stdin_inputs`], more than one): the first read
+/// would drain it, and every other input would read nothing.
+#[must_use]
+pub fn stdin_read_twice_error(command: &str, inputs: &[&str]) -> anyhow::Error {
+    let named = match inputs {
+        [first, rest @ ..] if rest.iter().all(|name| name == first) => {
+            if inputs.len() == 2 {
+                format!("{first} twice")
+            } else {
+                format!("{first} {} times", inputs.len())
+            }
+        }
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+        [] => String::new(),
+    };
+    usage_error(
+        clap::error::ErrorKind::ArgumentConflict,
+        format!(
+            "stdin (`-`) can be read only once, but `dq {command}` is given it for {named}: \
+             pass all but one of them as a file"
+        ),
+    )
+}
+
 /// Subcommand surface for M1.
 ///
 /// Variants beyond M1 (e.g. `set`, `del`, `lint`) are deliberately omitted —
@@ -354,9 +504,9 @@ pub enum Command {
     Get(GetArgs),
     /// Test whether a JSON Pointer addresses an existing node (silent on success).
     Exists(ExistsArgs),
-    /// List the keys of an object.
+    /// List the keys of an object, or the indices of an array.
     Keys(KeysArgs),
-    /// List the values of an object.
+    /// List the values of an object, or the items of an array.
     Values(ValuesArgs),
     /// Print the length of an array, string, or object.
     Len(LenArgs),
@@ -368,25 +518,43 @@ pub enum Command {
     Select(SelectArgs),
     /// Convert between formats.
     Convert(ConvertArgs),
-    /// Re-emit FILE through its native writer. Without --sort-keys or
-    /// --indent this is a no-op pass — only structural normalisation runs.
-    /// Pass --indent N to canonicalise JSON whitespace.
+    /// Re-emit FILE through its native writer, dropping comments. JSON gets
+    /// a two-space indent (--indent N to change it); TOML is kept as it is
+    /// unless --sort-keys.
     Fmt(FmtArgs),
     /// Parse the file and report parse errors.
     Validate(ValidateArgs),
     /// Emit a structural diff between two documents.
     Diff(DiffArgs),
-    /// Set a value at a JSON Pointer. Intermediate map/array nodes are created
-    /// by default; `--no-create` rejects missing intermediates with exit 2.
+    /// Set a value at a JSON Pointer. Missing intermediate nodes are created
+    /// as mappings by default; `--no-create` rejects them with exit 2.
+    ///
+    /// YAML, JSON and TOML files are edited in place: comments and
+    /// formatting stay. XML, HCL, INI, dotenv, CSV/TSV and JSON Lines files are written
+    /// whole anew through the format's writer, as `--jq` does: formatting
+    /// is not kept, and neither are comments, except XML's.
     Set(SetArgs),
     /// Remove the value at a JSON Pointer. Missing pointer is not silent —
     /// produces a structured Path error and exit 2.
+    ///
+    /// YAML, JSON and TOML files are edited in place: comments and
+    /// formatting stay. XML, HCL, INI, dotenv, CSV/TSV and JSON Lines files are written
+    /// whole anew through the format's writer: formatting is not kept,
+    /// and neither are comments, except XML's.
     Del(DelArgs),
     /// Apply an RFC 6902 JSON Patch.
+    ///
+    /// Edits YAML, JSON and TOML in place, comments kept; writes XML, HCL,
+    /// INI, dotenv, CSV/TSV and JSON Lines whole anew, formatting and
+    /// comments (but XML's) dropped.
     Patch(PatchArgs),
     /// Evaluate a jq expression over the document and emit the result stream.
     Query(QueryArgs),
     /// Apply an RFC 7396 JSON Merge Patch.
+    ///
+    /// Edits YAML, JSON and TOML in place, comments kept; writes XML, HCL,
+    /// INI, dotenv, CSV/TSV and JSON Lines whole anew, formatting and
+    /// comments (but XML's) dropped.
     Merge(MergeArgs),
     /// Emit a shell completion script to stdout.
     Completions(CompletionsArgs),
@@ -403,17 +571,211 @@ pub enum Command {
     Lint(LintArgs),
     /// Run a single rule against files (or `--inline` an ad-hoc rule) (M8).
     Check(CheckArgs),
-    /// Run rule fixture tests under a directory (M8).
+    /// Run rule fixture tests under a directory or of `@std/<ns>` (M8).
     Test(TestArgs),
     /// Print a rule's description, severity, and references (M8).
     Explain(ExplainArgs),
     /// Manage rule sources — `list`, `add` (M8).
     Rules(RulesArgs),
-    /// Apply every applicable rule's `fix.jq` to the given files (M10).
+    /// Apply every applicable rule's fix (`fix.ops` or `fix.jq`) to the given files.
     Fix(FixArgs),
     /// Generate man pages and shell completions (hidden).
     #[command(hide = true)]
     GenerateDocs(GenerateDocsArgs),
+}
+
+impl Command {
+    /// Why this command cannot take `--doc` at all, or `None` when it
+    /// honours the flag (see [`Cli::doc`] for what each of them does with
+    /// it). The dispatcher turns a `Some` into [`Cli::doc_usage_error`].
+    #[must_use]
+    pub fn doc_unsupported_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Get(_)
+            | Self::Exists(_)
+            | Self::Keys(_)
+            | Self::Values(_)
+            | Self::Len(_)
+            | Self::Type(_)
+            | Self::Paths(_)
+            | Self::Select(_)
+            | Self::Query(_)
+            | Self::Convert(_)
+            | Self::Set(_)
+            | Self::Del(_)
+            | Self::Lint(_)
+            | Self::Check(_)
+            | Self::Fix(_) => None,
+            Self::Fmt(_) => Some("it re-emits the whole file"),
+            Self::Validate(_) => Some("it checks that the whole file parses"),
+            Self::Diff(_) => Some("it compares two whole files"),
+            Self::Patch(_) => Some("address a document in the patch paths as /N/..."),
+            Self::Merge(_) => Some("it merges into the whole file"),
+            Self::Completions(_)
+            | Self::Man(_)
+            | Self::Self_(_)
+            | Self::Test(_)
+            | Self::Explain(_)
+            | Self::Rules(_)
+            | Self::GenerateDocs(_) => Some(NO_DATA_FILE),
+        }
+    }
+
+    /// Why this command cannot take `--input-format`, or `None` when it
+    /// reads a data file the flag names the format of. The dispatcher turns
+    /// a `Some` into [`Cli::input_format_usage_error`].
+    ///
+    /// `test` reads the inputs of rule fixtures, but each fixture case
+    /// names its own format (or takes the rule's): one flag for every case
+    /// of every fixture would override what they say.
+    #[must_use]
+    pub fn input_format_unsupported_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Completions(_)
+            | Self::Man(_)
+            | Self::Self_(_)
+            | Self::Test(_)
+            | Self::Explain(_)
+            | Self::Rules(_)
+            | Self::GenerateDocs(_) => Some(NO_DATA_FILE),
+            Self::Get(_)
+            | Self::Exists(_)
+            | Self::Keys(_)
+            | Self::Values(_)
+            | Self::Len(_)
+            | Self::Type(_)
+            | Self::Paths(_)
+            | Self::Select(_)
+            | Self::Convert(_)
+            | Self::Fmt(_)
+            | Self::Validate(_)
+            | Self::Diff(_)
+            | Self::Set(_)
+            | Self::Del(_)
+            | Self::Patch(_)
+            | Self::Query(_)
+            | Self::Merge(_)
+            | Self::Lint(_)
+            | Self::Check(_)
+            | Self::Fix(_) => None,
+        }
+    }
+
+    /// The inputs this command is asked to read from stdin, named as its
+    /// usage line names them — one entry per `-` (`FILES` once for every
+    /// `-` among them). The dispatcher refuses more than one
+    /// ([`stdin_read_twice_error`]): stdin can be read only once.
+    ///
+    /// Only an argument that is `-` itself (or `@-`) names stdin: a glob
+    /// never expands to it ([`crate::glob::expand`] yields a file named
+    /// `-` as `./-`), so the arguments as given are the inputs that read
+    /// it.
+    #[must_use]
+    pub fn stdin_inputs(&self) -> Vec<&'static str> {
+        let dash = |p: &camino::Utf8Path| p == "-";
+        let mut inputs = Vec::new();
+        let mut file = |p: &camino::Utf8Path, name: &'static str| {
+            if dash(p) {
+                inputs.push(name);
+            }
+        };
+        match self {
+            Self::Get(GetArgs { file: f, .. })
+            | Self::Exists(ExistsArgs { file: f, .. })
+            | Self::Keys(KeysArgs { file: f, .. })
+            | Self::Values(ValuesArgs { file: f, .. })
+            | Self::Len(LenArgs { file: f, .. })
+            | Self::Type(TypeArgs { file: f, .. })
+            | Self::Paths(PathsArgs { file: f, .. })
+            | Self::Select(SelectArgs { file: f, .. })
+            | Self::Query(QueryArgs { file: f, .. })
+            | Self::Convert(ConvertArgs { file: f, .. })
+            | Self::Fmt(FmtArgs { file: f, .. })
+            | Self::Validate(ValidateArgs { file: f, .. })
+            | Self::Del(DelArgs { file: f, .. }) => file(f, "FILE"),
+            Self::Diff(args) => {
+                file(&args.a, "A");
+                file(&args.b, "B");
+            }
+            Self::Set(args) => {
+                file(&args.file, "FILE");
+                // `@-` names the file `-`, which is stdin.
+                if matches!(args.value.as_deref(), Some("-" | "@-")) {
+                    inputs.push("VALUE");
+                }
+                if args.value_from.as_deref().is_some_and(dash) {
+                    inputs.push("--value-from");
+                }
+            }
+            Self::Patch(args) => {
+                file(&args.file, "FILE");
+                if matches!(args.ops.as_deref(), Some("-" | "@-")) {
+                    inputs.push("OPS");
+                }
+                if args.ops_from.as_deref().is_some_and(dash) {
+                    inputs.push("--ops-from");
+                }
+            }
+            Self::Merge(args) => {
+                file(&args.file, "FILE");
+                if matches!(args.patch.as_deref(), Some("-" | "@-")) {
+                    inputs.push("PATCH");
+                }
+                if args.patch_from.as_deref().is_some_and(dash) {
+                    inputs.push("--patch-from");
+                }
+            }
+            Self::Lint(LintArgs { files, .. })
+            | Self::Check(CheckArgs { files, .. })
+            | Self::Fix(FixArgs { files, .. }) => {
+                for f in files {
+                    file(f, "FILES");
+                }
+            }
+            Self::Completions(_)
+            | Self::Man(_)
+            | Self::Self_(_)
+            | Self::Test(_)
+            | Self::Explain(_)
+            | Self::Rules(_)
+            | Self::GenerateDocs(_) => {}
+        }
+        inputs
+    }
+
+    /// The command's name as typed on the command line.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Get(_) => "get",
+            Self::Exists(_) => "exists",
+            Self::Keys(_) => "keys",
+            Self::Values(_) => "values",
+            Self::Len(_) => "len",
+            Self::Type(_) => "type",
+            Self::Paths(_) => "paths",
+            Self::Select(_) => "select",
+            Self::Convert(_) => "convert",
+            Self::Fmt(_) => "fmt",
+            Self::Validate(_) => "validate",
+            Self::Diff(_) => "diff",
+            Self::Set(_) => "set",
+            Self::Del(_) => "del",
+            Self::Patch(_) => "patch",
+            Self::Query(_) => "query",
+            Self::Merge(_) => "merge",
+            Self::Completions(_) => "completions",
+            Self::Man(_) => "man",
+            Self::Self_(_) => "self",
+            Self::Lint(_) => "lint",
+            Self::Check(_) => "check",
+            Self::Test(_) => "test",
+            Self::Explain(_) => "explain",
+            Self::Rules(_) => "rules",
+            Self::Fix(_) => "fix",
+            Self::GenerateDocs(_) => "generate-docs",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -530,18 +892,29 @@ mod tests {
     }
 
     #[test]
-    fn ensure_write_flags_consistent_rejects_in_place_with_format_override() {
-        // The M2 baseline writes back in the source format (extension-driven).
-        // Combining `-i` with `-F` would imply an in-place format conversion,
-        // which is M3 territory.
+    fn ensure_write_flags_consistent_leaves_dash_f_to_the_per_file_check() {
+        // `-F` with `-i` is no flag conflict: whether it is refused depends
+        // on the file's format, which `ensure_format_kept` sees.
         let cli =
             Cli::try_parse_from(["dq", "-i", "-F", "json", "set", "f.yaml", "/x", "1"]).unwrap();
-        let err = cli.ensure_write_flags_consistent().unwrap_err();
-        assert!(
-            err.to_string().contains("-F") || err.to_string().contains("format"),
-            "error should mention -F, got: {err}",
-        );
-        assert!(err.downcast_ref::<InvalidInput>().is_some());
+        cli.ensure_write_flags_consistent().unwrap();
+    }
+
+    #[test]
+    fn ensure_format_kept_refuses_another_format_and_accepts_the_same() {
+        let yaml = dq_core::by_name("yaml").unwrap();
+        let file = camino::Utf8Path::new("f.yaml");
+        let cli =
+            Cli::try_parse_from(["dq", "-i", "-F", "json", "set", "f.yaml", "/x", "1"]).unwrap();
+        let err = cli.ensure_format_kept("set", file, yaml).unwrap_err();
+        assert_eq!(crate::exit_code::exit_code_for_error(&err), 2, "{err}");
+        assert!(err.to_string().contains("--input-format"), "{err}");
+
+        let same =
+            Cli::try_parse_from(["dq", "-i", "-F", "yaml", "set", "f.yaml", "/x", "1"]).unwrap();
+        same.ensure_format_kept("set", file, yaml).unwrap();
+        let unset = Cli::try_parse_from(["dq", "-i", "set", "f.yaml", "/x", "1"]).unwrap();
+        unset.ensure_format_kept("set", file, yaml).unwrap();
     }
 
     #[test]
@@ -674,5 +1047,22 @@ mod tests {
         let opts = cli.write_options();
         assert!(!opts.sort_keys);
         assert!(opts.indent.is_none());
+    }
+
+    #[test]
+    fn stdin_inputs_name_every_input_given_dash() {
+        let cli = Cli::try_parse_from(["dq", "lint", "-", "a.json", "-", "-"]).unwrap();
+        assert_eq!(cli.command.stdin_inputs(), ["FILES"; 3]);
+        let err = stdin_read_twice_error("lint", &cli.command.stdin_inputs());
+        assert!(err.to_string().contains("for FILES 3 times"), "{err}");
+
+        let cli = Cli::try_parse_from(["dq", "set", "-", "/a", "@-"]).unwrap();
+        assert_eq!(cli.command.stdin_inputs(), ["FILE", "VALUE"]);
+        let err = stdin_read_twice_error("x", &["A", "B", "C"]);
+        assert!(err.to_string().contains("for A, B and C"), "{err}");
+        assert_eq!(crate::exit_code::exit_code_for_error(&err), 2);
+
+        let cli = Cli::try_parse_from(["dq", "get", "x.json", "/a"]).unwrap();
+        assert!(cli.command.stdin_inputs().is_empty());
     }
 }

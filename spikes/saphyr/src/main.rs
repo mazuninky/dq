@@ -1,8 +1,8 @@
 //! saphyr-parser textual-edit spike (Option B).
 //!
-//! Throwaway probe for M2 Tasks 1.2–1.4 of `openspec/changes/add-safe-writes`.
-//! See [`design.md`](../../../openspec/changes/add-safe-writes/design.md) D1,
-//! D4, D11 for the rationale: we use `saphyr-parser`'s low-level event API to
+//! Throwaway probe for M2 tasks 1.2–1.4 of the add-safe-writes change.
+//! See the safe-writes section of `docs/decisions.md` (design D1,
+//! D4, D11) for the rationale: we use `saphyr-parser`'s low-level event API to
 //! collect a `Pointer → ByteRange` span map, then mutate the original byte
 //! buffer by splicing the value range. **No emitter** is involved; surrounding
 //! comments / blank lines / quote styles are preserved by construction
@@ -116,7 +116,7 @@ struct ValueSpan {
     /// `3` (1 byte). For `title: "Hello"`, this is `"Hello"` (7 bytes).
     value_range: Range<usize>,
     /// Bytes covering the entire logical line(s) holding key + value +
-    /// trailing comment. Used by `del_at` (D4 in design.md). Best-effort
+    /// trailing comment. Used by `del_at` (safe-writes design D4). Best-effort
     /// in this spike — line scan is naive (newline-bounded).
     line_range: Range<usize>,
     /// 1-indexed column of the value start (used as proxy for indent in

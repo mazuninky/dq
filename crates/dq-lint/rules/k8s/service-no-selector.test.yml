@@ -29,3 +29,37 @@ tests:
         externalName: example.com
     expected:
       violations: []
+  - name: list root produces no violations
+    input: |
+      - a
+      - b
+    expected:
+      violations: []
+  - name: scalar root produces no violations
+    input: |
+      just a string
+    expected:
+      violations: []
+  - name: empty document produces no violations
+    input: ""
+    expected:
+      violations: []
+  - name: scalar spec reads as a Service without a selector
+    input: |
+      apiVersion: v1
+      kind: Service
+      metadata: {name: web}
+      spec: x
+    expected:
+      violations:
+        - rule: k8s.service-no-selector
+          message_contains: "web"
+  - name: string metadata produces no violations
+    input: |
+      apiVersion: v1
+      kind: Service
+      metadata: x
+      spec:
+        selector: { app: api }
+    expected:
+      violations: []

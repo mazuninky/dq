@@ -280,6 +280,44 @@ fn alias_key_and_merge_key_keep_later_pointers_in_place() {
     );
 }
 
+#[test]
+fn a_collection_key_keeps_its_siblings_addressable_and_is_one_itself() {
+    let src = "# top\n[1, 2]: a  # one\n? {k: v}\n: b\nz: 1  # keep\n";
+    assert_eq!(
+        set(src, "/z", Value::Int(2)),
+        "# top\n[1, 2]: a  # one\n? {k: v}\n: b\nz: 2  # keep\n"
+    );
+    assert_eq!(del(src, "/z"), "# top\n[1, 2]: a  # one\n? {k: v}\n: b\n");
+    assert_eq!(
+        set(src, "/[1, 2]", Value::String("x".into())),
+        "# top\n[1, 2]: x  # one\n? {k: v}\n: b\nz: 1  # keep\n"
+    );
+    assert_eq!(
+        del(src, "/{k: v}"),
+        "# top\n[1, 2]: a  # one\nz: 1  # keep\n"
+    );
+    // A block mapping that starts with a flow key is a block mapping.
+    assert_eq!(
+        set("{k: v}: b\nz: 1\n", "/z", Value::Int(2)),
+        "{k: v}: b\nz: 2\n"
+    );
+    assert_eq!(del("[1]: a\nz: 1\n", "/z"), "[1]: a\n");
+    // Nested, in a flow mapping, and through an alias of the collection.
+    assert_eq!(del("x:\n  [1]: a\n  b: 2\n", "/x/b"), "x:\n  [1]: a\n");
+    assert_eq!(
+        set("{[1]: a, b: 2}\n", "/b", Value::Int(3)),
+        "{[1]: a, b: 3}\n"
+    );
+    assert_eq!(
+        set(
+            "? &k [1]\n: a\nc:\n  *k : d\n  e: 1\n",
+            "/c/[1]",
+            Value::Int(5)
+        ),
+        "? &k [1]\n: a\nc:\n  *k : 5\n  e: 1\n"
+    );
+}
+
 // --- a tagged scalar -------------------------------------------------------------
 
 #[test]
@@ -312,7 +350,7 @@ fn set_of_a_collection_over_a_scalar_writes_it_in_flow_style() {
     let nested = Value::from_serde_json(&serde_json::json!({"nested": 1, "l": ["x"]}));
     assert_eq!(
         set("a: 3\nb: 4\n", "/a", nested.clone()),
-        "a: {\"nested\": 1, \"l\": [\"x\"]}\nb: 4\n"
+        "a: {nested: 1, l: [x]}\nb: 4\n"
     );
     let mut doc = doc("a: 3\nb: 4\n");
     doc.set_at(&ptr("/a"), nested.clone()).expect("set_at /a");
@@ -324,11 +362,11 @@ fn set_of_a_new_key_writes_nested_collections_in_flow_style() {
     let json = |v| Value::from_serde_json(&v);
     assert_eq!(
         set("a: 1\n", "/b", json(serde_json::json!([{"x": 1}]))),
-        "a: 1\nb:\n  - {\"x\": 1}\n"
+        "a: 1\nb:\n  - {x: 1}\n"
     );
     assert_eq!(
         set("a: 1\n", "/b", json(serde_json::json!({"c": {"d": 1}}))),
-        "a: 1\nb:\n  c: {\"d\": 1}\n"
+        "a: 1\nb:\n  c: {d: 1}\n"
     );
     assert_eq!(
         set(
@@ -336,7 +374,7 @@ fn set_of_a_new_key_writes_nested_collections_in_flow_style() {
             "/l/0/resources",
             json(serde_json::json!({"limits": {"cpu": "1"}}))
         ),
-        "l:\n  - containerPort: 80\n    resources:\n      limits: {\"cpu\": \"1\"}\n"
+        "l:\n  - containerPort: 80\n    resources:\n      limits: {cpu: \"1\"}\n"
     );
 }
 
@@ -349,7 +387,7 @@ fn set_of_a_new_key_in_a_flow_mapping_stays_on_its_line() {
     );
     assert_eq!(
         set("a: {}\n", "/a/z", json(serde_json::json!({"q": [1]}))),
-        "a: {z: {\"q\": [1]}}\n"
+        "a: {z: {q: [1]}}\n"
     );
     assert_eq!(
         set("a: {x: 1}\n", "/a/z", Value::String("a, b".into())),

@@ -6,14 +6,14 @@ Thanks for your interest in improving `dq`. This document covers everything you 
 
 Before you open a pull request:
 
-- **Open an OpenSpec change for non-trivial work.** Bug fixes and small improvements can go straight to a PR. New formats, new subcommands, new rule semantics, or any change to the public CLI surface go through [`openspec/changes/<name>/`](../openspec/) first (`spec.md` + `design.md` + `tasks.md`). See [`CLAUDE.md`](../CLAUDE.md) for the workflow.
+- **Write a plan for non-trivial work.** Bug fixes and small improvements can go straight to a PR. New formats, new subcommands, new rule semantics, or any change to the public CLI surface start with a plan in [`docs/plans/<name>.md`](../docs/plans/) (goal, design, remaining work). When the change ships, add a dated entry to [`docs/decisions.md`](../docs/decisions.md) and update [`docs/reference/`](../docs/reference/). See [`docs/README.md`](../docs/README.md) for the documentation map.
 - **Keep changes focused.** One logical change per PR. A bug fix should not also refactor unrelated code; a new rule should not also bump unrelated dependencies.
 - **Do not expand scope unprompted.** Don't add features that were not requested. Don't rewrite code you didn't need to touch. Don't add backwards-compat shims for code paths that don't exist yet.
-- **No breaking CLI changes without discussion.** `dq` is a tool people script against and run in CI. Flag renames, removed commands, and changes to default output shape need an issue or spec change first.
+- **No breaking CLI changes without discussion.** `dq` is a tool people script against and run in CI. Flag renames, removed commands, and changes to default output shape need an issue or a plan first.
 
 ## Prerequisites
 
-- **Rust stable, MSRV 1.94** (see `rust-version` in [`Cargo.toml`](../Cargo.toml); the exact toolchain is pinned in [`rust-toolchain.toml`](../rust-toolchain.toml) and installed automatically by `rustup`). Install via [rustup](https://rustup.rs/).
+- **Rust stable, MSRV 1.100** (see `rust-version` in [`Cargo.toml`](../Cargo.toml); the exact toolchain is pinned in [`rust-toolchain.toml`](../rust-toolchain.toml) and installed automatically by `rustup`). Install via [rustup](https://rustup.rs/).
 - A POSIX-like shell for the release helper script ([`scripts/bump-version.sh`](../scripts/bump-version.sh)). On Windows, WSL or Git Bash is fine; the CLI itself builds and runs on native Windows after `cargo build`.
 - Optional: [lefthook](https://github.com/evilmartians/lefthook) for pre-commit hooks. Install with `brew install lefthook` (or equivalent), then run `lefthook install` once inside the repo.
 - Optional: [cargo-nextest](https://nexte.st/) — `lefthook.yml` uses it for the pre-commit test run; `cargo test` works just as well in CI and from the command line.
@@ -50,9 +50,9 @@ cargo test -p dq-plugin --features plugins
 End-to-end smoke for the example plugin:
 
 ```sh
-cd examples/plugin-rust && cargo component build --release
+cd examples/plugin-rust && cargo component build --release --target wasm32-unknown-unknown
 cd ../.. && cargo run --features plugins -- lint \
-    --plugins examples/plugin-rust/target/wasm32-wasip2/release config.yaml
+    --plugins examples/plugin-rust/target/wasm32-unknown-unknown/release config.yaml
 ```
 
 ## Project layout
@@ -84,7 +84,7 @@ crates/
    - `chore:` – maintenance, dependency bumps
    - `release:` – version bumps (produced by [`scripts/bump-version.sh`](../scripts/bump-version.sh))
    Optional scope in parentheses (e.g. `feat(lint):`, `fix(core):`) is encouraged.
-5. **Open the PR.** Fill out the template: summary, linked issue or OpenSpec change (`Fixes #NN` / `Refs openspec/changes/<name>`), and how you tested. Keep the title short — use the description for detail.
+5. **Open the PR.** Fill out the template: summary, linked issue or plan (`Fixes #NN` / `Refs docs/plans/<name>.md`), and how you tested. Keep the title short — use the description for detail.
 6. **Respond to review.** Push follow-up commits rather than force-pushing, unless a reviewer explicitly asks for a rebase. Mark conversations resolved as you address them.
 7. **CI must be green.** All required checks (`lint`, `test`, `cargo deny`, `cargo audit`) gate the PR; if any fails, fix the underlying issue rather than retrying.
 

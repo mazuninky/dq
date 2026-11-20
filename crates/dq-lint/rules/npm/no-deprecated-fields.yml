@@ -6,7 +6,7 @@ description: |
 severity: warn
 match:
   format: json
-  filter: 'has("name") and has("version")'
+  filter: 'type == "object" and has("name") and has("version")'
 check:
   jq: '. | (if has("preferGlobal") then {field: "preferGlobal"} else empty end), (if has("engineStrict") then {field: "engineStrict"} else empty end)'
   message: "package.json declares deprecated field '{{ .field }}'"

@@ -17,10 +17,9 @@ pub mod toml;
 pub mod toon;
 pub mod yaml;
 
+use std::borrow::Cow;
 use std::io::IsTerminal;
 use std::io::Write;
-
-use indexmap::IndexMap;
 
 pub use console::ConsoleReporter;
 pub use json::JsonReporter;
@@ -32,17 +31,100 @@ pub use toml::TomlReporter;
 pub use toon::ToonReporter;
 pub use yaml::YamlReporter;
 
+/// `text` — a file name, a key, a rule id, a test case's name: what the
+/// user or a file put in a line dq prints outside a reporter (the bulk
+/// summary, a `--diff` header, the `test` runner, a log line) — on one
+/// line a terminal shows as it is: a line break and every other control
+/// character as `\xNN`, the direction controls and separators as
+/// `\uNNNN`, as the console reporter prints them
+/// ([`console::escape_control`]). It cannot start a line of its own, nor
+/// send the terminal a control sequence.
+#[must_use]
+pub fn terminal_text(text: &str) -> Cow<'_, str> {
+    console::escape_control(text)
+}
+
+/// The field formatter of the log lines `tracing` writes on stderr: each
+/// field as it prints, through [`terminal_text`] — a path, a key or a rule
+/// id a warning quotes cannot break the line or reach the terminal raw —
+/// the message alone, any other field as `name=value`, separated by a
+/// space, as `tracing_subscriber`'s default formatter writes them. The
+/// fields a line logged through the `log` crate carries (`log.target`,
+/// `log.module_path`, `log.file`, `log.line`: jaq's `stderr`, globset,
+/// ureq) are left out, as the default formatter leaves them: `log.file`
+/// is a path on the machine dq was built on. With colour on, a field's
+/// name is in italics and its `=` dimmed, as the default formatter writes
+/// them; the level's colour is the event formatter's, outside the fields.
+#[must_use]
+pub fn log_fields() -> LogFields {
+    LogFields
+}
+
+/// See [`log_fields`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LogFields;
+
+impl<'writer> tracing_subscriber::fmt::FormatFields<'writer> for LogFields {
+    fn format_fields<R: tracing_subscriber::field::RecordFields>(
+        &self,
+        writer: tracing_subscriber::fmt::format::Writer<'writer>,
+        fields: R,
+    ) -> std::fmt::Result {
+        let mut visitor = LogVisitor {
+            writer,
+            first: true,
+            result: Ok(()),
+        };
+        fields.record(&mut visitor);
+        visitor.result
+    }
+}
+
+/// Writes the fields of one log line for [`LogFields`].
+struct LogVisitor<'writer> {
+    writer: tracing_subscriber::fmt::format::Writer<'writer>,
+    first: bool,
+    result: std::fmt::Result,
+}
+
+impl tracing::field::Visit for LogVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        let name = field.name();
+        if self.result.is_err() || name.starts_with("log.") {
+            return;
+        }
+        let text = format!("{value:?}");
+        let text = terminal_text(&text);
+        let sep = if self.first { "" } else { " " };
+        self.first = false;
+        let name = name.strip_prefix("r#").unwrap_or(name);
+        self.result = if name == "message" {
+            write!(self.writer, "{sep}{text}")
+        } else if self.writer.has_ansi_escapes() {
+            // With colour, as tracing-subscriber's own formatter writes a
+            // field: the name in italics, the `=` dimmed.
+            write!(
+                self.writer,
+                "{sep}\x1b[3m{name}\x1b[0m\x1b[2m=\x1b[0m{text}"
+            )
+        } else {
+            write!(self.writer, "{sep}{name}={text}")
+        };
+    }
+}
+
 /// Output format selectable via the global `-F/--format` flag.
 ///
 /// M5 deliberately does NOT include `dockerfile` or `ignore-list`: both are
-/// read-only formats per design D9 (`openspec/changes/add-format-extensions/design.md`).
+/// read-only formats (see the add-format-extensions section of
+/// `docs/decisions.md`).
 /// Because `clap::ValueEnum` only accepts variants present in this enum, the
 /// `-F dockerfile` / `-F ignore-list` invocations are rejected at the clap
 /// parse step with the standard "invalid value" error — no runtime guard
 /// needed in the convert handler.
 ///
-/// M6 adds the [`OutputFormat::Sarif`] variant — see design D4 in
-/// `openspec/changes/add-distribution/design.md`. SARIF is **output-only**
+/// M6 adds the [`OutputFormat::Sarif`] variant — see the add-distribution
+/// section of `docs/decisions.md`. SARIF is **output-only**
 /// (it is a diagnostic report format, not a parseable source format) and is
 /// only valid for diagnostic-shaped commands like `validate` and the future
 /// M8 lint engine. Selecting `-F sarif` for a query verb produces the same
@@ -53,8 +135,8 @@ pub use yaml::YamlReporter;
 /// Anything Protocol 13, consumed by `prove` and CI dashboards). Both follow
 /// the same discipline as `Sarif`: they are output-only, expect the canonical
 /// `{ "diagnostics": [...] }` shape, and surface `InvalidInput` (exit 6) when
-/// fed any other value. See design D8 / D9 in
-/// `openspec/changes/add-exec-engine/design.md`.
+/// fed any other value. See the add-exec-engine section of
+/// `docs/decisions.md` and `docs/reference/cli.md`.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default, clap::ValueEnum)]
 pub enum OutputFormat {
     /// Human-readable colored output (default).
@@ -102,7 +184,7 @@ pub enum OutputFormat {
     /// JUnit XML — diagnostic-only output format consumed by GitLab CI,
     /// Jenkins, and other test-result aggregators.
     ///
-    /// Per design D8 in `openspec/changes/add-exec-engine/design.md`, M8's
+    /// Per the add-exec-engine section of `docs/decisions.md`, M8's
     /// lint engine populates the `{ "diagnostics": [...] }` shape and the
     /// reporter renders one `<testcase>` per diagnostic. Selecting
     /// `-F junit` for a non-diagnostic command surfaces an `InvalidInput`
@@ -112,7 +194,7 @@ pub enum OutputFormat {
     /// TAP version 13 — diagnostic-only output format consumed by `prove`,
     /// GitLab CI, and other TAP-aware harnesses.
     ///
-    /// Per design D9 in `openspec/changes/add-exec-engine/design.md`, M8's
+    /// Per the add-exec-engine section of `docs/decisions.md`, M8's
     /// lint engine populates the `{ "diagnostics": [...] }` shape and the
     /// reporter renders each diagnostic as `not ok` with a YAML detail
     /// block. Selecting `-F tap` for a non-diagnostic command surfaces an
@@ -121,14 +203,15 @@ pub enum OutputFormat {
 }
 
 impl OutputFormat {
-    /// Map this format to a `dq-core` parser name when one applies.
+    /// The `dq-core` file format this output format writes, when it is one.
     ///
-    /// `-F` is overloaded: it picks both the renderer and the *input* parser
-    /// when the file's extension does not match. Console and Toon are
-    /// output-only — they map to `None` so input detection falls back to the
-    /// file's extension.
+    /// `-F` never picks the parser (that is `--input-format`); this name is
+    /// only compared with a file's own format by
+    /// [`crate::cli::Cli::ensure_format_kept`], so `-F yaml` on a YAML file
+    /// a write command keeps in place is accepted. Console, TOON and the
+    /// diagnostic reports are no file format and map to `None`.
     #[must_use]
-    pub fn as_input_format_name(&self) -> Option<&'static str> {
+    pub fn file_format_name(&self) -> Option<&'static str> {
         match self {
             Self::Json => Some("json"),
             Self::Yaml => Some("yaml"),
@@ -142,10 +225,8 @@ impl OutputFormat {
             Self::Frontmatter => Some("frontmatter"),
             Self::Markdown => Some("markdown"),
             Self::Xml => Some("xml"),
-            // M6: SARIF is a diagnostic *output* format with no source-side
-            // parser. M8: Junit and Tap follow the same discipline.
-            // Falling through to `None` keeps input detection on the
-            // file-extension path, matching `Console` / `Toon`.
+            // SARIF, JUnit and TAP are diagnostic reports; console and TOON
+            // have no file writer in dq-core.
             Self::Console | Self::Toon | Self::Sarif | Self::Junit | Self::Tap => None,
         }
     }
@@ -164,6 +245,35 @@ pub trait Reporter {
     /// Returns any I/O error from `w`, plus any format-specific encoding
     /// error (e.g. TOML cannot represent a top-level scalar).
     fn report(&self, value: &serde_json::Value, w: &mut dyn Write) -> anyhow::Result<()>;
+
+    /// Write a [`dq_core::Value`] to `w` — the shape the values `get`,
+    /// `values`, `select` and `query` print come in, which may hold a NaN
+    /// or an infinity no `serde_json::Value` can.
+    ///
+    /// The default renders [`dq_core::Value::to_serde_json`], which spells
+    /// a non-finite float `.nan` / `.inf` / `-.inf` (console, TOON); a
+    /// reporter whose format has (YAML, TOML) or forbids (JSON, JSONL) such
+    /// a number overrides it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Reporter::report`].
+    fn report_value(&self, value: &dq_core::Value, w: &mut dyn Write) -> anyhow::Result<()> {
+        self.report(&value.to_serde_json(), w)
+    }
+
+    /// Whether the diagnostics envelope handed to [`Reporter::report`]
+    /// should carry a rule catalogue next to `diagnostics`:
+    /// `"rules": [{ "id", "description", "references" }]`, one entry per
+    /// rule the producer knows of.
+    ///
+    /// Only SARIF describes its rules (`tool.driver.rules`); every other
+    /// reporter prints the envelope as is or ignores the extra key, so the
+    /// default is `false` and the producers (`lint`, `check`, `validate`)
+    /// leave the key out.
+    fn wants_rule_catalog(&self) -> bool {
+        false
+    }
 }
 
 /// Resolve whether output should be coloured.
@@ -219,44 +329,61 @@ fn color_decision(
 /// Convert a `serde_json::Value` into a `dq_core::Value` so the reporter can
 /// reuse `dq-core`'s format implementations for YAML / TOML / JSONL output.
 ///
-/// The conversion is lossy in the same direction `dq-core::parsers::json` is
-/// lossy when *reading* user JSON: numeric precision beyond `i64`/`f64` is
-/// preserved as `BigInt`/`BigFloat` if the input came from `arbitrary_precision`
-/// `serde_json`, otherwise it falls back to whichever variant fits.
+/// A number keeps its exact value, as [`dq_core::Value::from_serde_json`]
+/// reads it: with `serde_json`'s `arbitrary_precision`, a literal no `i64`
+/// or `f64` holds stays a `BigInt` / `BigFloat`.
 #[must_use]
 pub fn from_serde_value(v: &serde_json::Value) -> dq_core::Value {
-    match v {
-        serde_json::Value::Null => dq_core::Value::Null,
-        serde_json::Value::Bool(b) => dq_core::Value::Bool(*b),
-        serde_json::Value::Number(n) => number_to_value(n),
-        serde_json::Value::String(s) => dq_core::Value::String(s.clone()),
-        serde_json::Value::Array(items) => {
-            dq_core::Value::Array(items.iter().map(from_serde_value).collect())
-        }
-        serde_json::Value::Object(map) => {
-            let mut out = IndexMap::with_capacity(map.len());
-            for (k, child) in map {
-                out.insert(k.clone(), from_serde_value(child));
-            }
-            dq_core::Value::Map(out)
-        }
-    }
-}
-
-fn number_to_value(n: &serde_json::Number) -> dq_core::Value {
-    if let Some(i) = n.as_i64() {
-        return dq_core::Value::Int(i);
-    }
-    if let Some(f) = n.as_f64() {
-        return dq_core::Value::Float(f);
-    }
-    // `arbitrary_precision` / u64 > i64::MAX path: keep the original literal.
-    dq_core::Value::BigInt(n.to_string())
+    dq_core::Value::from_serde_json(v)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fields of one `warn!` with a field, as the log line writes them
+    /// with colour (`ansi`) or not.
+    fn log_line(ansi: bool) -> String {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let sink = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(ansi)
+            .without_time()
+            .with_target(false)
+            .with_level(false)
+            .fmt_fields(log_fields())
+            .with_writer(move || SharedSink(sink.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(path = "a\nb", r#type = 1, "skipped");
+        });
+        let out = buf.lock().expect("lock").clone();
+        String::from_utf8(out).expect("utf-8")
+    }
+
+    struct SharedSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for SharedSink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("lock").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn log_fields_are_styled_with_colour_and_plain_without() {
+        assert_eq!(log_line(false), "skipped path=\"a\\nb\" type=1\n");
+        // Was, with colour: the same plain text. Field names are italic and
+        // the `=` dimmed, as tracing-subscriber's own formatter writes them.
+        assert_eq!(
+            log_line(true),
+            "skipped \u{1b}[3mpath\u{1b}[0m\u{1b}[2m=\u{1b}[0m\"a\\nb\" \
+             \u{1b}[3mtype\u{1b}[0m\u{1b}[2m=\u{1b}[0m1\n"
+        );
+    }
 
     #[test]
     fn output_format_default_is_console() {

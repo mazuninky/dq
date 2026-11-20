@@ -1,7 +1,7 @@
 //! Unit tests for `dq len` driven through `dq::run`.
 //!
 //! Spec contract: returns array length, string char count, or object key
-//! count. Scalars (null/bool/int/float) trigger Path/TypeMismatch.
+//! count. Scalars (null/bool/int/float) are a `WrongType` error (exit 1).
 
 use std::io::Write as _;
 
@@ -64,12 +64,11 @@ fn len_against_scalar_bool_returns_type_mismatch_error() {
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
     let e = dq::run(&cli, false, &mut out, &mut err).expect_err("len on scalar must error");
-    let domain = e.downcast_ref::<dq_core::Error>().unwrap();
-    assert_eq!(domain.kind_name(), "path");
-    match domain {
-        dq_core::Error::Path { kind, .. } => {
-            assert!(matches!(kind, dq_core::PathErrorKind::TypeMismatch { .. }))
-        }
-        _ => panic!("expected Path/TypeMismatch"),
-    }
+    let wrong = e.downcast_ref::<dq::WrongType>().expect("WrongType");
+    assert_eq!(wrong.found, "bool");
+    assert_eq!(
+        e.to_string(),
+        "cannot take the length of '/flag': it is bool, not an array, a string or an object"
+    );
+    assert_eq!(dq::exit_code::exit_code_for_error(&e), 1);
 }

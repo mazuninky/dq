@@ -1,9 +1,11 @@
-//! `dq values FILE POINTER` — list the values of the addressed object.
+//! `dq values FILE POINTER` — list the values of the addressed object, or
+//! the items of the addressed array.
 //!
 //! Output shape mirrors `keys` but with the values themselves: console emits
-//! one element per line, JSON emits a JSON array. The handler returns
-//! `dq_core::Error::Path { kind: TypeMismatch, .. }` when the pointer
-//! addresses a non-object node.
+//! one element per line, JSON emits a JSON array. The values are printed as
+//! `get` prints them, so a NaN, an infinity or a big number reads the same
+//! in every output format. The handler returns [`WrongType`] (exit 1) when
+//! the pointer addresses a scalar.
 
 use std::io::Write;
 
@@ -11,6 +13,7 @@ use dq_core::{Pointer, Value};
 
 use super::io_helpers::{load_document_with_path, select_document};
 use crate::cli::{Cli, ValuesArgs};
+use crate::error::WrongType;
 use crate::output::Reporter;
 
 /// Run the `values` command.
@@ -19,34 +22,35 @@ use crate::output::Reporter;
 ///
 /// - [`crate::error::InvalidInput`] (exit 6) when any write-mode flag
 ///   (`-i`, `--diff`, `--backup`) is set — `values` is a read subcommand.
-/// - Same shape as `keys` otherwise: path/type errors map to exit 2/1 per
-///   the exit-code mapper, I/O and parse errors map to their respective codes.
+/// - [`WrongType`] (exit 1) when the pointer addresses a scalar.
+/// - Same shape as `keys` otherwise: path errors map to exit 2, I/O and
+///   parse errors map to their respective codes.
 pub fn run(
     cli: &Cli,
     args: &ValuesArgs,
     input_format: Option<&str>,
-    doc_arg: Option<&str>,
+    doc_arg: Option<crate::cli::DocSelector>,
     reporter: &dyn Reporter,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
     cli.ensure_no_write_flags()?;
-    let (_fmt, doc) = load_document_with_path(&args.file, input_format)?;
-    let view = select_document(&doc, doc_arg)?;
+    let (_fmt, doc) = load_document_with_path(&args.file, input_format, cli.template_mode())?;
+    let view = select_document(&doc, doc_arg, &args.file)?;
     let pointer = Pointer::parse(&args.pointer).map_err(anyhow::Error::new)?;
     let value = pointer.resolve(view.as_ref()).map_err(anyhow::Error::new)?;
-    let Value::Map(map) = value else {
-        return Err(anyhow::Error::new(dq_core::Error::Path {
-            pointer: pointer.as_canonical(),
-            matched_prefix: pointer.as_canonical(),
-            kind: dq_core::PathErrorKind::TypeMismatch {
-                expected: "object",
-                found: value.type_name(),
-            },
-            did_you_mean: Vec::new(),
-        }));
+    let items = match value {
+        Value::Map(map) => map.values().cloned().collect(),
+        Value::Array(items) => items.clone(),
+        scalar => {
+            return Err(anyhow::Error::new(WrongType {
+                action: "list the values of",
+                pointer: pointer.as_canonical(),
+                found: scalar.type_name(),
+                expected: "an object or an array",
+            }));
+        }
     };
-    let items: Vec<serde_json::Value> = map.values().map(Value::to_serde_json).collect();
-    reporter.report(&serde_json::Value::Array(items), out)?;
+    reporter.report_value(&Value::Array(items), out)?;
     Ok(())
 }
 
@@ -88,8 +92,23 @@ mod tests {
     }
 
     #[test]
-    fn values_rejects_array_pointer() {
-        let tmp = write_yaml("a:\n  - 1\n  - 2\n");
+    fn values_lists_array_items() {
+        let tmp = write_yaml("a:\n  - 1\n  - x\n");
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
+        let cli = cli_no_flags(path.as_str());
+        let args = ValuesArgs {
+            file: path,
+            pointer: "/a".to_owned(),
+        };
+        let reporter = ConsoleReporter::new(false);
+        let mut out: Vec<u8> = Vec::new();
+        run(&cli, &args, None, None, &reporter, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "1\nx\n");
+    }
+
+    #[test]
+    fn values_rejects_a_scalar() {
+        let tmp = write_yaml("a: 1\n");
         let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = cli_no_flags(path.as_str());
         let args = ValuesArgs {
@@ -99,8 +118,8 @@ mod tests {
         let reporter = ConsoleReporter::new(false);
         let mut out: Vec<u8> = Vec::new();
         let err = run(&cli, &args, None, None, &reporter, &mut out).unwrap_err();
-        let domain = err.downcast_ref::<dq_core::Error>().unwrap();
-        assert_eq!(domain.kind_name(), "path");
+        let wrong = err.downcast_ref::<WrongType>().expect("WrongType");
+        assert_eq!((wrong.pointer.as_str(), wrong.found), ("/a", "int"));
     }
 
     #[test]

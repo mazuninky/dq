@@ -8,11 +8,12 @@ match:
   format: markdown
 check:
   jq: |
-    [.children[]? | select(.type == "heading" and .level == 1)] as $h1s
+    def kids: .children? | arrays | .[] | objects;
+    [kids | select(.type == "heading" and .level == 1)] as $h1s
     | select(($h1s | length) > 1)
     | $h1s[1:][] | { position: .position }
   message: "Document contains more than one H1 heading; use H2 for subsequent sections"
 references:
   - https://www.w3.org/WAI/tutorials/page-structure/headings/
 loc:
-  line: '.position.start.line // 1'
+  line: '(objects | .position | objects | .start | objects | .line) // 1'

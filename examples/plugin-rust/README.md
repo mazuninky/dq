@@ -2,7 +2,7 @@
 
 Minimal Rust reference plugin for the `dq` v0.1.0 plugin ABI. Demonstrates
 the smallest possible implementation of the WIT contract documented in
-[`openspec/changes/add-ir-foundation/specs/data-query-plugin-abi/spec.md`](../../openspec/changes/add-ir-foundation/specs/data-query-plugin-abi/spec.md).
+[`docs/plugin-abi.md`](../../docs/plugin-abi.md).
 
 ## What it does
 
@@ -47,19 +47,24 @@ matches the tooling on your machine.
 
 ```sh
 # Install once.
-rustup target add wasm32-wasip2
+rustup target add wasm32-unknown-unknown
 cargo install --locked cargo-component
 
 # From this directory.
-cargo component build --release
+cargo component build --release --target wasm32-unknown-unknown
 
 # Artifact lands at:
-#   target/wasm32-wasip2/release/dq_plugin_example_noop.wasm
+#   target/wasm32-unknown-unknown/release/dq_plugin_example_noop.wasm
 ```
 
 `cargo-component` understands the `wit-bindgen::generate!` macro emitted
 in `src/lib.rs` and produces a fully-wrapped Component-Model artifact
 straight out of `cargo build`.
+
+Pass `--target wasm32-unknown-unknown`. Without it `cargo component build`
+targets `wasm32-wasip1` and wraps the module with the WASI adapter: the
+artifact then imports `wasi:cli/*` and `wasi:filesystem/*`, and dq refuses
+to load it (exit 6), because plugins run without WASI.
 
 ### Path B — `wasm-tools component new` (manual wrap)
 
@@ -78,9 +83,8 @@ wasm-tools component new \
 The wrapped artifact at
 `target/dq_plugin_example_noop.component.wasm` is what the dq host loads.
 
-> **Compatibility note.** As of `wasmtime 50.x` the host accepts both the
-> `wasm32-wasip2` (Component-Model) and the manually-wrapped
-> `wasm32-unknown-unknown` artifact shapes. If `cargo component build`
+> **Compatibility note.** Both paths produce the same kind of artifact: a
+> component with no imports besides `dq:plugin`. If `cargo component build`
 > fails because `cargo-component` is not yet on a release that matches
 > wit-bindgen 0.63, fall back to Path B.
 
@@ -98,7 +102,7 @@ Then drop the built `*.wasm` into any directory and pass it via the
 
 ```sh
 mkdir -p ./plugins
-cp target/wasm32-wasip2/release/dq_plugin_example_noop.wasm ./plugins/
+cp target/wasm32-unknown-unknown/release/dq_plugin_example_noop.wasm ./plugins/
 
 # Lint — every file produces one `example.demo-lint` warn diagnostic.
 dq lint --plugins ./plugins config.yaml
@@ -119,7 +123,8 @@ The single source of truth for the export surface is `wit/world.wit`. To
 change what the plugin emits:
 
 1. Edit `src/lib.rs::Component::lint` / `Component::fix`.
-2. Run `cargo component build --release` (or the Path B equivalent).
+2. Run `cargo component build --release --target wasm32-unknown-unknown`
+   (or the Path B equivalent).
 3. Drop the new artifact into your `--plugins` directory and re-invoke
    `dq`.
 

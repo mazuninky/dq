@@ -19,14 +19,15 @@ use camino::Utf8PathBuf;
 use serde::{Deserialize, Deserializer};
 
 use crate::diagnostic::Severity;
+pub use crate::schema_value::SchemaNotes;
 
 /// One rule, parsed from a YAML document.
 ///
-/// See `openspec/changes/add-exec-engine/proposal.md` "What Changes" for
+/// See `docs/reference/lint-engine.md` for
 /// the full schema. The fields below mirror that document one-for-one.
 ///
 /// M10 typed the `fix` field as [`RuleFix`] — a whole-document jq
-/// transformation. See `openspec/changes/add-autofix/`.
+/// transformation. See `docs/reference/lint-engine.md`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
@@ -167,7 +168,7 @@ pub struct RuleMatch {
 /// id in hand.
 ///
 /// `PartialEq` is intentionally NOT derived: `Rule` itself has no
-/// `PartialEq` impl, and the `serde_norway::Value` carried by `Schema`
+/// `PartialEq` impl, and the `serde_json::Value` carried by `Schema`
 /// already provides one if a caller ever needs structural comparison.
 #[derive(Debug, Clone)]
 pub enum Check {
@@ -185,11 +186,24 @@ pub enum Check {
     /// arbitrary YAML/JSON value that compiles into a
     /// `jsonschema::Validator` at `Evaluator::new`.
     Schema {
-        /// Inline JSON Schema 2020-12 document.
-        schema: serde_norway::Value,
+        /// Inline JSON Schema 2020-12 document, as JSON. A rule loaded
+        /// through [`crate::RuleSet::from_str`] holds the schema dq's own
+        /// YAML reader read: every number keeps its exact literal
+        /// (`18446744073709551616`, `1e400`, `0.10000000000000000001`), and
+        /// a NaN or an infinity, which JSON has no number for, stands as
+        /// its spelling (`".inf"`), told from that string by `notes`. A
+        /// `Rule` deserialized on its own holds what `serde_norway` read,
+        /// which rounds a float to an `f64` and reads `1e400` as a string.
+        schema: serde_json::Value,
         /// Optional message prefix — when set, prepended to the
         /// auto-generated `keywordLocation`-based message.
         message: Option<String>,
+        /// What `schema`'s JSON cannot hold, by place in it: where a NaN or
+        /// an infinity stands, and the source text of a limit serde_json
+        /// spells otherwise (`1e2`, read as `1e+2`), which a message
+        /// quotes. Empty for a `Rule` deserialized on its own; filled by
+        /// [`crate::RuleSet::from_str`].
+        notes: SchemaNotes,
     },
     /// Variant 3: schema document loaded from a file sibling of the
     /// rule's `.yml` source. The path is resolved relative to the
@@ -305,7 +319,7 @@ struct RawCheck {
     #[serde(default)]
     jq: Option<String>,
     #[serde(default)]
-    schema: Option<serde_norway::Value>,
+    schema: Option<serde_json::Value>,
     #[serde(default)]
     schema_file: Option<Utf8PathBuf>,
     #[serde(default)]
@@ -383,6 +397,7 @@ fn build_one_variant<E: serde::de::Error>(raw: RawCheck) -> Result<Check, E> {
         return Ok(Check::Schema {
             schema,
             message: raw.message,
+            notes: SchemaNotes::default(),
         });
     }
     if let Some(schema_file) = raw.schema_file {
@@ -691,9 +706,11 @@ check:
 "#;
         let rule = parse(yaml);
         match rule.check {
-            Check::Schema { schema, message } => {
+            Check::Schema {
+                schema, message, ..
+            } => {
                 assert!(message.is_none());
-                let mapping = schema.as_mapping().expect("schema is a mapping");
+                let mapping = schema.as_object().expect("schema is a mapping");
                 assert!(mapping.contains_key("type"));
                 assert!(mapping.contains_key("required"));
             }

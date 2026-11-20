@@ -10,21 +10,20 @@
 //! # WIT contract
 //!
 //! See `wit/world.wit` (a mirror of `crates/dq-plugin/wit/dq-plugin.wit`).
-//! Authoritative spec: `openspec/changes/add-ir-foundation/specs/
-//! data-query-plugin-abi/spec.md`.
+//! Authoritative spec: `docs/plugin-abi.md`.
 //!
 //! # Build recipe
 //!
 //! See `README.md` in this directory. The short form:
 //!
 //! ```sh
-//! rustup target add wasm32-wasip2
+//! rustup target add wasm32-unknown-unknown
 //! cargo install cargo-component
-//! cargo component build --release
+//! cargo component build --release --target wasm32-unknown-unknown
 //! ```
 //!
 //! The artifact lands at
-//! `target/wasm32-wasip2/release/dq_plugin_example_noop.wasm` and can be
+//! `target/wasm32-unknown-unknown/release/dq_plugin_example_noop.wasm` and can be
 //! dropped into any directory passed to `dq lint --plugins <DIR>` or
 //! `dq fix --plugins <DIR>`.
 

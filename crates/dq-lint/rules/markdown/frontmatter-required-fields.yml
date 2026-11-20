@@ -7,11 +7,10 @@ description: |
 severity: error
 match:
   format: markdown
-  filter: '.frontmatter != null'
+  filter: 'if type == "object" then .frontmatter != null else false end'
 check:
   jq: |
-    . as $doc
-    | ($doc.frontmatter.value // {}) as $fm
+    (objects | .frontmatter | objects | .value | if type == "object" then . else {} end) as $fm
     | (["title", "date"] - ($fm | keys))[]
     | { field: . }
   message: "Frontmatter is missing required field '{{ .field }}'"

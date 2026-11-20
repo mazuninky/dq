@@ -53,15 +53,6 @@ const REFUSALS: &[Refusal] = &[
         message: "cannot set '/a/0': the edit would change other parts of the document; ",
     },
     Refusal {
-        // A comment between the entry and `}`: removing the entry would
-        // leave the comment swallowing the bracket.
-        name: "doc.yaml",
-        src: "a: {x: 1, y: 2 # c\n}\n",
-        command: "del",
-        args: &["/a/y"],
-        message: "cannot delete '/a/y': dq cannot remove it as a textual edit; ",
-    },
-    Refusal {
         // A duplicate member: removing one leaves the other, so `a` is
         // still there.
         name: "doc.json",
@@ -188,14 +179,13 @@ const REFUSALS: &[Refusal] = &[
         message: "cannot set '/l/0': it holds an anchor that the alias on line 4 refers to; ",
     },
     Refusal {
-        // `a.b` and `a.d` share `a`, which has no header to write
-        // `b = …` under.
+        // An `[[t]]` item is a table by its header: a scalar cannot take
+        // its place in the array.
         name: "doc.toml",
-        src: "[a.b]\nc = 1\n[a.d]\ne = 1\n",
+        src: "[[t]]\nx = 1\n",
         command: "set",
-        args: &["/a/b", "5"],
-        message: "cannot set '/a/b': dq cannot write the key anew in a table with no header \
-                  of its own; ",
+        args: &["/t/0", "5"],
+        message: "cannot set '/t/0': dq cannot write this value here as a textual edit; ",
     },
 ];
 
@@ -300,7 +290,15 @@ fn the_same_edits_are_made_where_they_read_back() {
             "a: {x: 1, y: 2, # c\n}\n",
             "del",
             &["/a/y"],
-            "a: {x: 1,  # c\n}\n",
+            "a: {x: 1 # c\n}\n",
+        ),
+        // A comment between the entry and `}` stays, on its line.
+        (
+            "doc.yaml",
+            "a: {x: 1, y: 2 # c\n}\n",
+            "del",
+            &["/a/y"],
+            "a: {x: 1 # c\n}\n",
         ),
         (
             "doc.json",
