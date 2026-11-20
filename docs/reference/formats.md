@@ -374,9 +374,15 @@ array of `{instruction, arguments, line}` records in source order:
 - Unknown keywords, missing arguments, unterminated heredocs and malformed
   directives are parse errors carrying the instruction's line.
 
-Read-only: writing returns a format error. Dockerfile diagnostics currently
-report line 1 because the format has no spans yet, even though every record
-knows its `line` (see [../roadmap.md](../roadmap.md)).
+Read-only: writing returns a format error. Diagnostics carry positions: a
+pointer to an instruction (`/N`, `/N/instruction`, `/N/line`) resolves to
+its keyword on the line where the instruction starts — not a comment above
+it, a continuation line or a heredoc body below it; a pointer to
+`/N/arguments` or anything inside it (an `ENV` name, an exec-form element)
+resolves to the first argument on that line (the keyword when the arguments
+begin on a continuation line). Columns count bytes, a leading BOM not
+included. The document root has no position: a finding about the whole
+file, such as a missing `HEALTHCHECK`, reports `1:1`.
 
 ### ignore-list
 

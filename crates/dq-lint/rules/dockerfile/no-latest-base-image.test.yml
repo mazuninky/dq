@@ -8,6 +8,20 @@ tests:
       violations:
         - rule: dockerfile.no-latest-base-image
           message_contains: ":latest"
+  - name: each finding is on its FROM line
+    input: |
+      ARG BASE=alpine:3.20
+      FROM golang:1.22 AS build
+      FROM alpine
+      FROM build
+      FROM ubuntu:latest
+    format: dockerfile
+    expected:
+      violations:
+        - rule: dockerfile.no-latest-base-image
+          line: 3
+        - rule: dockerfile.no-latest-base-image
+          line: 5
   - name: FROM with pinned tag passes
     input: |
       FROM alpine:3.19

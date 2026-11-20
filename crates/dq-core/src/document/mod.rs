@@ -215,8 +215,10 @@ pub struct Document {
     /// One [`Provenance::Original`] entry per pointer in `spans`, sharing
     /// the same canonical RFC 6901 keys. Empty for read-only formats whose
     /// parsers do not record byte ranges (jsonl, hcl, ini, dotenv, csv,
-    /// tsv, dockerfile, ignore-list, markdown body) — see
-    /// [`Document::as_ir`] for how this surfaces to callers.
+    /// tsv, ignore-list, markdown body) — see [`Document::as_ir`] for how
+    /// this surfaces to callers. The read-only Markdown and Dockerfile
+    /// parsers supply theirs through
+    /// [`Document::with_value_bytes_and_provenance`] with no `spans`.
     ///
     /// Eagerly built in the [`Document::with_spans`] constructor (Phase 1
     /// `add-ir-foundation`): the cost is one ordered iteration over an
@@ -764,6 +766,10 @@ impl Document {
     /// `add-validation-and-extended-formats`) is the first such caller.
     /// The resulting document still has `original_bytes` populated for
     /// round-trip detection in `Format::write`.
+    ///
+    /// The Dockerfile parser records `span: Some(_)` entries here: the
+    /// spans let [`crate::ir::Ir::line_col_for`] place a diagnostic, and with no
+    /// `SpanMap` and `write_aware` false the document stays read-only.
     #[must_use]
     pub fn with_value_bytes_and_provenance(
         value: Value,
@@ -966,7 +972,7 @@ impl Document {
     /// # Empty provenance
     ///
     /// Documents produced by read-only parsers (jsonl, hcl, ini, dotenv,
-    /// csv, tsv, dockerfile, ignore-list, frontmatter body, markdown body)
+    /// csv, tsv, ignore-list, frontmatter body, markdown body)
     /// carry an empty [`ProvenanceMap`] — the parsers route through
     /// [`Document::value_only`] / [`Document::multi_value_only`] /
     /// [`Document::frontmatter`], none of which emit provenance entries.

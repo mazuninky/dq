@@ -140,8 +140,8 @@ pub struct InlineBaseline {
 /// `Original` carries the source pointer (always present so callers can
 /// route back into the document) plus an optional [`ValueSpan`]. The span
 /// is `None` for read-only formats whose parser does not record byte
-/// ranges (jsonl, hcl, ini, dotenv, csv, tsv, dockerfile, ignore-list,
-/// markdown body) — the pointer is still meaningful for navigation, only
+/// ranges (jsonl, hcl, ini, dotenv, csv, tsv, ignore-list, markdown
+/// body) — the pointer is still meaningful for navigation, only
 /// position-aware lookup is unavailable.
 ///
 /// `Original` also carries an optional [`InlineBaseline`] for nodes whose

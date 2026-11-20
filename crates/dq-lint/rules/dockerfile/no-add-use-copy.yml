@@ -21,7 +21,8 @@ check:
         sub("^(--\\S+\\s+)*"; "") | select(startswith("[")) | (try fromjson catch null)
         | select(type == "array" and all(.[]; type == "string"))
       else empty end;
-    .[] | select(.instruction == "ADD")
+    range(0; length) as $i | .[$i]
+    | select(.instruction == "ADD")
     | select(
         ([.arguments | exec_args] | .[0]) as $exec
         | (if $exec != null then $exec
@@ -33,6 +34,10 @@ check:
             or (gsub("[\"']"; "")
                 | test("^((https?|git|ssh)://|git@)|\\.(tar(\\.(gz|bz2|xz|zst))?|tgz|tbz2?|txz|tzst)$"; "i")))
         | not)
-  message: "ADD used for local copy (line {{ .line }}); prefer COPY"
+    | . + {pointer: "/\($i)"}
+  message: "ADD used for local copy; prefer COPY"
+loc:
+  # The ADD instruction (its line and keyword).
+  pointer: '.pointer'
 references:
   - https://docs.docker.com/develop/develop-images/dockerfile_best-practices/#add-or-copy

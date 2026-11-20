@@ -62,10 +62,14 @@ entry with a span for every node. Markdown block nodes carry positions in the
 tree itself (`position`), and the Markdown parser adds a provenance entry
 without span but with an inline offset for the `value` leaf of every fenced
 code block, so composite rules can project into it (the anchor position then
-comes from the node's `position`). Every other format (JSONL, HCL, INI, dotenv, CSV/TSV,
-Dockerfile, ignore-list, XML, frontmatter body) has an empty provenance map:
-diagnostics on them fall back to line 1. That is why Terraform and
-Dockerfile findings report line 1 today.
+comes from the node's `position`). The Dockerfile parser, read-only, populates
+an `Original` entry with a span for every node of every instruction: the
+record, `instruction` and `line` at the keyword on the line the instruction
+starts on, `arguments` and everything inside it at the first argument on that
+line; the root has none. Every other format (JSONL, HCL, INI, dotenv,
+CSV/TSV, ignore-list, XML, frontmatter body) has an empty provenance map:
+diagnostics on them fall back to line 1. That is why Terraform findings
+report line 1 today.
 
 ### Inline offsets
 

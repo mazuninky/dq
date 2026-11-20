@@ -34,13 +34,18 @@ check:
                and any($stages[$i + 1:][];
                    test("^\\s*(sudo(\\s+-\\S+)*\\s+)?([A-Za-z_][A-Za-z0-9_]*=(\"[^\"]*\"|'[^']*'|\\S*)\\s+)*((\\S*/)?env(\\s+-\\S+)*\\s+([A-Za-z_][A-Za-z0-9_]*=(\"[^\"]*\"|'[^']*'|\\S*)\\s+)*)?(\\S*/)?(ba|da|z|k|a)?sh(\\s|\\)|$)"))]
           | any);
-    .[] | select(.instruction == "RUN")
+    range(0; length) as $i | .[$i]
+    | select(.instruction == "RUN")
     | select(
         ([.arguments | exec_args] | .[0]) as $exec
         | (if $exec == null then .arguments | tostring
            elif ($exec[0] // "" | test("(^|/)(ba|da|z|k|a)?sh$")) then $exec[1:] | join(" ")
            else "" end)
         | pipes_into_shell)
-  message: "RUN line {{ .line }} pipes curl/wget into a shell"
+    | . + {pointer: "/\($i)"}
+  message: "RUN pipes curl/wget into a shell"
+loc:
+  # The RUN instruction (its line and keyword).
+  pointer: '.pointer'
 references:
   - https://www.idontplaydarts.com/2016/04/detecting-curl-pipe-bash-server-side/

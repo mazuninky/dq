@@ -286,8 +286,8 @@ fn run_case(
         .format
         .clone()
         .unwrap_or_else(|| default_format.to_owned());
-    let value = match parse_input(&case.input, &format) {
-        Ok(v) => v,
+    let doc = match parse_input(&case.input, &format) {
+        Ok(doc) => doc,
         Err(msg) => {
             return TestOutcome::Error {
                 fixture: fixture.to_path_buf(),
@@ -296,14 +296,12 @@ fn run_case(
             };
         }
     };
-    // The fixture path doesn't carry spans — `parse_input` gives a bare
-    // value with no provenance metadata. Build a fresh `OwnedIr` with an
-    // empty provenance map so the evaluator sees the new IR signature;
-    // rules that use `loc.pointer` simply fall through to the default
-    // (1, 1) position in the fixture context.
-    let format_tag = dq_core::FormatTag::from_name(&format).unwrap_or(dq_core::FormatTag::Yaml);
-    let owned = dq_core::OwnedIr::new(value, dq_core::ProvenanceMap::new(), format_tag);
-    let actual = evaluator.evaluate_file(fixture, &owned.to_borrowed(), &format);
+    // The document as the format's reader produced it, positions included:
+    // where the reader records them (Dockerfile), a `loc.pointer` resolves
+    // to the `line:col` `dq lint` reports, so a fixture's `line:` holds;
+    // elsewhere (the span-less YAML and JSON readers) it falls through to
+    // `(1, 1)`.
+    let actual = evaluator.evaluate_file(fixture, &doc.as_ir(), &format);
     compare(
         fixture.to_path_buf(),
         case.name,
@@ -317,11 +315,11 @@ fn run_case(
 /// `dq check` sees in a file: a YAML `.nan` is a number, not `null`, and
 /// `18446744073709551617` keeps its digits. `markdown` gives the AST
 /// (CommonMark and GFM) the `@std/markdown` rules check; `hcl` and
-/// `dockerfile` give their parsers' shapes (no spans: diagnostics fall
-/// back to `(1, 1)`). A YAML stream of more than one document, and a
-/// format the runner does not read, yield an `Err(message)` for the
-/// caller to surface as a [`TestOutcome::Error`].
-fn parse_input(input: &str, format: &str) -> std::result::Result<dq_core::Value, String> {
+/// `dockerfile` give their parsers' shapes, a Dockerfile with the
+/// positions its instructions start at. A YAML stream of more than one
+/// document, and a format the runner does not read, yield an
+/// `Err(message)` for the caller to surface as a [`TestOutcome::Error`].
+fn parse_input(input: &str, format: &str) -> std::result::Result<dq_core::Document, String> {
     const SUPPORTED: [&str; 5] = ["yaml", "json", "markdown", "hcl", "dockerfile"];
     if !SUPPORTED.contains(&format) {
         return Err(format!(
@@ -339,7 +337,7 @@ fn parse_input(input: &str, format: &str) -> std::result::Result<dq_core::Value,
             documents.len()
         ));
     }
-    Ok(doc.value().clone())
+    Ok(doc)
 }
 
 fn compare(
@@ -617,7 +615,8 @@ tests:
 
     #[test]
     fn dockerfile_input_goes_through_the_dockerfile_parser() {
-        let value = parse_input("FROM alpine\nRUN [\"sh\"]\n", "dockerfile").expect("parse");
+        let doc = parse_input("FROM alpine\nRUN [\"sh\"]\n", "dockerfile").expect("parse");
+        let value = doc.value();
         assert_eq!(
             value.to_serde_json(),
             serde_json::json!([
@@ -660,8 +659,9 @@ tests:
 
     #[test]
     fn yaml_and_json_inputs_read_as_check_reads_them() {
-        let value = parse_input("x: .nan\ny: 18446744073709551617\n", "yaml").expect("yaml");
-        let dq_core::Value::Map(map) = &value else {
+        let doc = parse_input("x: .nan\ny: 18446744073709551617\n", "yaml").expect("yaml");
+        let value = doc.value();
+        let dq_core::Value::Map(map) = value else {
             panic!("expected a map: {value:?}");
         };
         let x = map.get("x").and_then(dq_core::Value::non_finite_float);
@@ -670,8 +670,8 @@ tests:
             map.get("y"),
             Some(&dq_core::Value::BigInt("18446744073709551617".into()))
         );
-        let value = parse_input(r#"{"y": 18446744073709551617}"#, "json").expect("json");
-        assert!(matches!(&value, dq_core::Value::Map(map)
+        let doc = parse_input(r#"{"y": 18446744073709551617}"#, "json").expect("json");
+        assert!(matches!(doc.value(), dq_core::Value::Map(map)
             if map.get("y") == Some(&dq_core::Value::BigInt("18446744073709551617".into()))));
         let err = parse_input("a: 1\n---\nb: 2\n", "yaml").expect_err("stream");
         assert!(

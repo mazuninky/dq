@@ -14,7 +14,8 @@ check:
   # variable (`${BASE}`). A tag is a `:` after the last `/`, so a registry
   # port (`localhost:5000/img`) is not one.
   jq: |-
-    [.[] | select(.instruction == "FROM" and (.arguments | type) == "string")]
+    [range(0; length) as $at | .[$at]
+     | select(.instruction == "FROM" and (.arguments | type) == "string") | . + {pointer: "/\($at)"}]
     | . as $froms
     | range(0; length) as $i
     | $froms[$i]
@@ -27,5 +28,8 @@ check:
     | select($image | contains("@") | not)
     | select(($image | split("/") | last) as $name | ($name | contains(":") | not) or ($name | endswith(":latest")))
   message: "FROM line uses :latest (or no tag): {{ .arguments }}"
+loc:
+  # The FROM instruction (its line and keyword).
+  pointer: '.pointer'
 references:
   - https://docs.docker.com/develop/develop-images/dockerfile_best-practices/

@@ -53,7 +53,9 @@ non-`:latest` images].
 
 **`dockerfile`** (4, Dockerfile): `no-latest-base-image` [error],
 `no-add-use-copy` [warn], `no-curl-pipe-bash` [warn], `has-healthcheck`
-[info]. They run on Dockerfiles only.
+[info]. They run on Dockerfiles only. A finding points at its instruction
+(the line it starts on, the keyword's column); `has-healthcheck` is about the
+whole file and reports `1:1`.
 
 **`github-actions`** (4, YAML workflows): `no-pull-request-target-with-checkout`
 [error], `action-pinned-by-sha` [warn], `has-permissions` [warn],
@@ -113,7 +115,7 @@ Tracked in [../roadmap.md](../roadmap.md):
   violations, so a fixture cannot catch it.
 - `github-actions.no-pull-request-target-with-checkout` does not recognise a
   checkout of `${{ github.head_ref }}`.
-- Dockerfile and Terraform findings report line 1.
+- Terraform findings report line 1.
 - The rule counts originally targeted for the first release (k8s 18,
   dockerfile 8, npm 8, github-actions 6) were not reached. Named but never
   written: k8s `missing-security-context`, `default-capabilities`,

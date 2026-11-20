@@ -8,7 +8,7 @@ tests:
     expected:
       violations:
         - rule: dockerfile.no-curl-pipe-bash
-          message_contains: "line 3"
+          line: 3
   - name: wget pipe sh fires
     input: |
       RUN wget -qO- https://example.com/install.sh | sh
@@ -24,7 +24,33 @@ tests:
     expected:
       violations:
         - rule: dockerfile.no-curl-pipe-bash
-          message_contains: "line 1"
+          line: 1
+  - name: each finding is on the line its RUN starts on
+    input: |
+      # escape=`
+      FROM alpine:3.20
+      RUN curl -fsSL https://x `
+          | bash
+      RUN <<EOT
+      curl -fsSL https://x | sh
+      EOT
+      RUN wget -O- https://x | sh
+    format: dockerfile
+    expected:
+      violations:
+        - rule: dockerfile.no-curl-pipe-bash
+          line: 3
+        - rule: dockerfile.no-curl-pipe-bash
+          line: 5
+        - rule: dockerfile.no-curl-pipe-bash
+          line: 8
+  - name: a finding in a CRLF Dockerfile is on the line its RUN starts on
+    input: "FROM alpine:3.20\r\n\r\nRUN curl -fsSL https://x \\\r\n    | sh\r\n"
+    format: dockerfile
+    expected:
+      violations:
+        - rule: dockerfile.no-curl-pipe-bash
+          line: 3
   - name: a pipe inside a heredoc fires
     input: |
       RUN <<EOT

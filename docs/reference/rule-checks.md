@@ -30,8 +30,8 @@ dq's own value of the document, not on a JSON rendering of it; each
 validation error becomes one diagnostic:
 
 - the error's `instancePath` is the diagnostic's pointer, and its position
-  comes from the IR's spans (`line:col` on YAML / JSON / TOML, line 1
-  elsewhere);
+  comes from the IR's spans (`line:col` on YAML / JSON / TOML /
+  Dockerfile, line 1 elsewhere);
 - the message is the optional `message` prefix, the `keywordLocation`, and the
   validator's text: `/properties/age/type: "twelve" is not of type
   "integer"`. Values are spelled as the document spells them

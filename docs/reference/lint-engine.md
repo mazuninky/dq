@@ -114,7 +114,7 @@ expressions evaluated against the violation value:
 
 1. `loc.pointer` (preferred) must produce a JSON Pointer string; it is looked
    up in the input IR's provenance and gives an exact `line:col` when the
-   format has spans (YAML, JSON, TOML).
+   format has spans (YAML, JSON, TOML, Dockerfile).
 2. `loc.line` (deprecated, kept for older rules) produces a positive integer
    line; used when `loc.pointer` is unset or does not resolve.
 3. Otherwise the document's origin, as above.
@@ -124,8 +124,7 @@ generated file but want to point at its source); an empty or non-string
 result keeps the file under check. Schema and composite checks compute their
 positions themselves ([rule-checks.md](rule-checks.md)).
 
-Formats without spans (HCL, Dockerfile, INI, …) report line 1 even with
-`loc.pointer`.
+Formats without spans (HCL, INI, …) report line 1 even with `loc.pointer`.
 
 ## Where rules come from
 
@@ -173,8 +172,12 @@ tests:
 parses `input`, evaluates, and compares order-insensitively: a case passes
 when every expected violation matches an actual diagnostic (same rule id,
 and `message_contains` / `message_equals` / `line` when given) and no actual
-diagnostic is left unmatched. Failures print the missing and the extra
-diagnostics. The summary line reads `summary: N passed, F failed, E errored,
+diagnostic is left unmatched. `input` is read by the format's reader as a
+file would be, so a `line` resolved through `loc.pointer` is the one
+`dq lint` reports where that reader records positions (Dockerfile); the
+YAML and JSON readers it uses do not, and such a line stays 1 in a fixture
+even though `dq lint` reports the real one. Failures print the missing and
+the extra diagnostics. The summary line reads `summary: N passed, F failed, E errored,
 T total`. `dq test` takes a directory; to test the built-in rules run it on
 `crates/dq-lint/rules/` (the `cargo test -p dq-lint` suite does the same).
 

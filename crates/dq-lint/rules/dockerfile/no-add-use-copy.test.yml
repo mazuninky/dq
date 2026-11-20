@@ -8,7 +8,18 @@ tests:
     expected:
       violations:
         - rule: dockerfile.no-add-use-copy
-          message_contains: "line 3"
+          line: 3
+  - name: an ADD continued over lines is reported on its first line
+    input: |
+      FROM alpine:3.20
+
+      ADD --chown=1:1 \
+          ./app /app
+    format: dockerfile
+    expected:
+      violations:
+        - rule: dockerfile.no-add-use-copy
+          line: 3
   - name: ADD with flags and a local path fires
     input: |
       ADD --chown=1:1 ./app /app

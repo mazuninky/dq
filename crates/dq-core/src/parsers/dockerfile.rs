@@ -47,6 +47,21 @@
 //! The 1-based source line where the instruction starts (the first line of a
 //! continuation, not a comment above it).
 //!
+//! ## Positions
+//!
+//! The document keeps the source text (a UTF-8 BOM removed) and a provenance
+//! entry with a span for every node of every instruction, so a diagnostic's
+//! pointer resolves to a `line:col`:
+//!
+//! - `/N`, `/N/instruction` and `/N/line` resolve to the instruction keyword
+//!   on the line where the instruction starts.
+//! - `/N/arguments` and every node under it (an `ENV` name, an exec-form
+//!   element) resolve to the first argument character on that line, or to
+//!   the keyword when the arguments begin on a continuation line.
+//!
+//! The document root has no entry: a finding about the whole file stays at
+//! the top of the file.
+//!
 //! ## Errors
 //!
 //! An unknown keyword, a keyword that requires arguments given none, an
@@ -65,9 +80,12 @@ use std::ops::Range;
 use indexmap::IndexMap;
 
 use crate::Result;
+use crate::document::spans::{SpanContext, ValueSpan};
 use crate::document::{Document, FormatTag, Value};
 use crate::error::Error;
 use crate::format::Format;
+use crate::ir::{Provenance, ProvenanceMap};
+use crate::pointer::{Pointer, Segment};
 
 /// Dockerfile format implementation (read-only).
 #[derive(Debug, Clone, Copy)]
@@ -91,19 +109,26 @@ impl Format for Dockerfile {
             snippet: String::new(),
             message: format!("invalid UTF-8 in Dockerfile input: {e}"),
         })?;
-        let rows = parse_instructions(text)?
-            .into_iter()
-            .map(|instr| {
-                let mut row: IndexMap<String, Value> = IndexMap::with_capacity(3);
-                row.insert("instruction".into(), Value::String(instr.keyword));
-                row.insert("arguments".into(), instr.arguments);
-                row.insert("line".into(), Value::Int(i64::from(instr.line)));
-                Value::Map(row)
-            })
-            .collect();
-        Ok(Document::value_only(
+        let instructions = parse_instructions(text)?;
+        // The document keeps the text without a BOM, so a column on the
+        // first line counts from the character after it; the instruction
+        // offsets (and the parse errors' spans) count from the file start.
+        let bom = if text.starts_with('\u{feff}') { 3 } else { 0 };
+        let mut provenance = ProvenanceMap::new();
+        let mut rows = Vec::with_capacity(instructions.len());
+        for (index, instr) in instructions.into_iter().enumerate() {
+            record_provenance(&mut provenance, index, &instr, bom);
+            let mut row: IndexMap<String, Value> = IndexMap::with_capacity(3);
+            row.insert("instruction".into(), Value::String(instr.keyword));
+            row.insert("arguments".into(), instr.arguments);
+            row.insert("line".into(), Value::Int(i64::from(instr.line)));
+            rows.push(Value::Map(row));
+        }
+        Ok(Document::with_value_bytes_and_provenance(
             Value::Array(rows),
+            text.as_bytes()[bom..].to_vec(),
             FormatTag::Dockerfile,
+            provenance,
         ))
     }
 
@@ -147,12 +172,83 @@ const HEREDOC_KEYWORDS: &[&str] = &["RUN", "COPY", "ADD"];
 const JSON_KEYWORDS: &[&str] = &["RUN", "CMD", "ENTRYPOINT", "SHELL", "COPY", "ADD", "VOLUME"];
 
 /// One parsed instruction: the upper-cased keyword, its arguments in the IR
-/// shape described in the module docs, and the 1-based start line.
+/// shape described in the module docs, the 1-based start line and where in
+/// the source text it sits.
 #[derive(Debug, Clone, PartialEq)]
 struct Instruction {
     keyword: String,
     arguments: Value,
     line: u32,
+    position: Position,
+}
+
+/// Byte offsets of one instruction in the source text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Position {
+    /// The keyword's first byte.
+    keyword: usize,
+    /// The first argument byte on the start line; the keyword when the
+    /// arguments begin on a continuation line or there are none.
+    arguments: usize,
+    /// Every physical line of the instruction (continuations and heredoc
+    /// bodies included), with the last line's terminator.
+    lines: Range<usize>,
+    /// Leading blanks before the keyword.
+    indent: u32,
+}
+
+/// Record a provenance entry with a span for `/index` and every node under
+/// it: the row and its `instruction` / `line` at the keyword, `arguments`
+/// and everything inside it at the first argument. `bom` is the length of
+/// the BOM the document's bytes no longer carry.
+fn record_provenance(
+    provenance: &mut ProvenanceMap,
+    index: usize,
+    instr: &Instruction,
+    bom: usize,
+) {
+    let pos = &instr.position;
+    let lines = pos.lines.start - bom..pos.lines.end - bom;
+    let span = |at: usize, context: SpanContext| ValueSpan {
+        value_range: at - bom..at - bom,
+        line_range: lines.clone(),
+        indent: pos.indent,
+        context,
+    };
+    let row = Pointer::new(vec![Segment::Index(index)]);
+    let mut insert = |pointer: Pointer, span: ValueSpan| {
+        provenance.insert(
+            pointer.as_canonical(),
+            Provenance::original(pointer, Some(span)),
+        );
+    };
+    insert(row.clone(), span(pos.keyword, SpanContext::BlockSeqItem));
+    for field in ["instruction", "line"] {
+        insert(
+            row.with_segment(Segment::Key(field.to_owned())),
+            span(pos.keyword, SpanContext::BlockMapValue),
+        );
+    }
+    let mut stack = vec![(
+        row.with_segment(Segment::Key("arguments".to_owned())),
+        &instr.arguments,
+    )];
+    while let Some((pointer, value)) = stack.pop() {
+        match value {
+            Value::Map(map) => stack.extend(
+                map.iter()
+                    .map(|(key, v)| (pointer.with_segment(Segment::Key(key.clone())), v)),
+            ),
+            Value::Array(items) => stack.extend(
+                items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (pointer.with_segment(Segment::Index(i)), v)),
+            ),
+            _ => {}
+        }
+        insert(pointer, span(pos.arguments, SpanContext::BlockMapValue));
+    }
 }
 
 /// A source line without its line terminator, with its byte range.
@@ -207,7 +303,10 @@ fn parse_instructions(text: &str) -> Result<Vec<Instruction>> {
         if head.starts_with('#') {
             continue;
         }
+        let indent = first.text.len() - head.len();
+        let keyword_at = first.start + indent;
         let (joined, mut done) = trim_continuation(head, escape);
+        let arguments_at = keyword_at + arguments_offset(joined);
         let mut joined = joined.to_owned();
         while !done && i < lines.len() {
             let next = lines[i].text;
@@ -271,13 +370,34 @@ fn parse_instructions(text: &str) -> Result<Vec<Instruction>> {
             }
         }
 
+        let end = lines.get(i).map_or(text.len(), |next| next.start);
         out.push(Instruction {
             keyword,
             arguments,
             line: start_line,
+            position: Position {
+                keyword: keyword_at,
+                arguments: arguments_at,
+                lines: first.start..end,
+                indent: u32::try_from(indent).unwrap_or(u32::MAX),
+            },
         });
     }
     Ok(out)
+}
+
+/// Byte offset of the first argument in `head` — the start line from the
+/// keyword on, without a trailing continuation — or `0` (the keyword) when
+/// nothing follows the keyword on that line.
+fn arguments_offset(head: &str) -> usize {
+    let (word, _) = split_keyword(head);
+    let after = &head[word.len()..];
+    let blanks = after.len() - after.trim_start().len();
+    if after.trim().is_empty() {
+        0
+    } else {
+        word.len() + blanks
+    }
 }
 
 /// 1-based line number for the 0-based index `i`, saturating at `u32::MAX`.
@@ -947,6 +1067,85 @@ mod tests {
             assert_eq!(got_line, *line, "line for {src:?}: {message}");
             assert!(message.contains(needle), "{src:?}: {message}");
         }
+    }
+
+    /// `line:col` of every pointer in `pointers` for the Dockerfile `src`.
+    fn positions(src: &str, pointers: &[&str]) -> Vec<Option<(u32, u32)>> {
+        let doc = Dockerfile.parse(src.as_bytes()).expect("parse");
+        let ir = doc.as_ir();
+        pointers
+            .iter()
+            .map(|p| ir.line_col_for(&Pointer::parse(p).expect("pointer")))
+            .collect()
+    }
+
+    #[test]
+    fn pointers_resolve_to_the_instruction_start_line() {
+        let src = "# syntax=docker/dockerfile:1\nFROM alpine\n\n  run apk add curl \\\n    # dropped\n    && curl x | sh\nRUN <<EOT\necho hi\nEOT\nENV A=1 B=2\nCMD\nRUN \\\n  echo late\nCOPY [\"a\", \"b\"]\n";
+        assert_eq!(
+            positions(
+                src,
+                &[
+                    "/0",
+                    "/0/instruction",
+                    "/0/arguments",
+                    "/0/line",
+                    "/1",
+                    "/1/arguments",
+                    "/2",
+                    "/2/arguments",
+                    "/3/arguments/B",
+                    "/4",
+                    "/4/arguments",
+                    "/5",
+                    "/5/arguments",
+                    "/6/arguments/1",
+                ]
+            ),
+            [
+                Some((2, 1)),
+                Some((2, 1)),
+                Some((2, 6)),
+                Some((2, 1)),
+                Some((4, 3)),
+                Some((4, 7)),
+                Some((7, 1)),
+                Some((7, 5)),
+                Some((10, 5)),
+                Some((11, 1)),
+                Some((11, 1)),
+                Some((12, 1)),
+                Some((12, 1)),
+                Some((14, 6)),
+            ]
+        );
+    }
+
+    #[test]
+    fn pointers_resolve_under_escape_crlf_and_a_bom() {
+        let src = "\u{feff}# escape=`\r\nFROM alpine\r\nRUN echo a `\r\n  && b\r\nADD a /a\r\n";
+        assert_eq!(
+            positions(src, &["/0", "/1", "/1/arguments", "/2", "/2/arguments"]),
+            [
+                Some((2, 1)),
+                Some((3, 1)),
+                Some((3, 5)),
+                Some((5, 1)),
+                Some((5, 5)),
+            ]
+        );
+        assert_eq!(
+            positions("\u{feff}FROM alpine\n", &["/0/arguments"]),
+            [Some((1, 6))]
+        );
+    }
+
+    #[test]
+    fn the_root_and_missing_pointers_have_no_position() {
+        assert_eq!(
+            positions("FROM alpine\n", &["", "/1", "/0/nope"]),
+            [None, None, None]
+        );
     }
 
     #[test]

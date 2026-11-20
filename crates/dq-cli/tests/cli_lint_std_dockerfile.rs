@@ -191,7 +191,7 @@ fn no_curl_pipe_bash_fires_on_a_pipe_and_across_a_continuation() {
     ] {
         assert_eq!(
             messages_of(src, CURL_PIPE),
-            ["RUN line 3 pipes curl/wget into a shell"],
+            ["RUN pipes curl/wget into a shell"],
             "{src:?}"
         );
     }
@@ -221,7 +221,7 @@ fn no_add_use_copy_allows_a_url_with_or_without_a_checksum() {
 fn no_add_use_copy_fires_on_a_local_source() {
     assert_eq!(
         messages_of("FROM alpine:3.20\nRUN echo hi\nADD ./app /app\n", ADD),
-        ["ADD used for local copy (line 3); prefer COPY"]
+        ["ADD used for local copy; prefer COPY"]
     );
 }
 
@@ -251,5 +251,179 @@ fn no_latest_base_image_fires_on_an_untagged_image_behind_a_registry_port() {
                 "FROM line uses :latest (or no tag): alpine".to_owned()
             ),
         ]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Positions: a Dockerfile finding points at the instruction it is about —
+// the line the instruction starts on (not a comment above it, not a
+// continuation or heredoc line below it) and the column of its keyword.
+// Every finding used to report line 1, column 1.
+// ---------------------------------------------------------------------------
+
+/// A directive, a blank line, an indented `ADD`, a `RUN` continued over two
+/// lines and a `RUN` with a heredoc body.
+const POSITIONED: &str = "# syntax=docker/dockerfile:1\n\
+                          FROM ubuntu:latest\n\
+                          \n  ADD ./app /app\n\
+                          RUN apk add curl && \\\n    curl -sSL https://x | bash\n\
+                          RUN <<EOT\ncurl -fsSL https://x | sh\nEOT\n";
+
+/// `dq lint --no-color [-F <format>] Dockerfile` over `src`.
+fn lint_output(src: &str, format: Option<&str>) -> std::process::Output {
+    let dir = TempDir::new().expect("tempdir");
+    std::fs::write(dir.path().join("Dockerfile"), src).expect("write Dockerfile");
+    let mut args = vec!["--no-color", "lint"];
+    if let Some(format) = format {
+        args.extend(["-F", format]);
+    }
+    args.push("Dockerfile");
+    dq().current_dir(dir.path())
+        .args(&args)
+        .output()
+        .expect("run dq lint")
+}
+
+#[test]
+fn console_output_reports_each_finding_at_its_instruction() {
+    let out = lint_output(POSITIONED, None);
+    assert_eq!(out.status.code(), Some(4), "an error-severity finding");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "diagnostics: [\
+         {path: Dockerfile, line: 1, col: 1, message: Dockerfile has no HEALTHCHECK directive, severity: info, rule_id: dockerfile.has-healthcheck, references: [https://docs.docker.com/engine/reference/builder/#healthcheck]}, \
+         {path: Dockerfile, line: 4, col: 3, message: ADD used for local copy; prefer COPY, severity: warn, rule_id: dockerfile.no-add-use-copy, references: [https://docs.docker.com/develop/develop-images/dockerfile_best-practices/#add-or-copy]}, \
+         {path: Dockerfile, line: 5, col: 1, message: RUN pipes curl/wget into a shell, severity: warn, rule_id: dockerfile.no-curl-pipe-bash, references: [https://www.idontplaydarts.com/2016/04/detecting-curl-pipe-bash-server-side/]}, \
+         {path: Dockerfile, line: 7, col: 1, message: RUN pipes curl/wget into a shell, severity: warn, rule_id: dockerfile.no-curl-pipe-bash, references: [https://www.idontplaydarts.com/2016/04/detecting-curl-pipe-bash-server-side/]}, \
+         {path: Dockerfile, line: 2, col: 1, message: FROM line uses :latest (or no tag): ubuntu:latest, severity: error, rule_id: dockerfile.no-latest-base-image, references: [https://docs.docker.com/develop/develop-images/dockerfile_best-practices/]}\
+         ]\n"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "lint reported 1 error-severity diagnostic(s)\n"
+    );
+}
+
+/// `(rule_id, line, col, message)` of every diagnostic in a `-F json` report.
+fn json_positions(stdout: &[u8]) -> Vec<(String, u64, u64, String)> {
+    let report: serde_json::Value = serde_json::from_slice(stdout).expect("lint -F json is JSON");
+    report["diagnostics"]
+        .as_array()
+        .expect("diagnostics array")
+        .iter()
+        .map(|d| {
+            (
+                d["rule_id"].as_str().expect("rule_id").to_owned(),
+                d["line"].as_u64().expect("line"),
+                d["col"].as_u64().expect("col"),
+                d["message"].as_str().expect("message").to_owned(),
+            )
+        })
+        .collect()
+}
+
+fn found(rule: &str, line: u64, col: u64, message: &str) -> (String, u64, u64, String) {
+    (rule.to_owned(), line, col, message.to_owned())
+}
+
+#[test]
+fn json_output_reports_each_finding_at_its_instruction() {
+    let out = lint_output(POSITIONED, Some("json"));
+    assert_eq!(out.status.code(), Some(4));
+    assert_eq!(
+        json_positions(&out.stdout),
+        [
+            found(HEALTHCHECK, 1, 1, "Dockerfile has no HEALTHCHECK directive"),
+            found(ADD, 4, 3, "ADD used for local copy; prefer COPY"),
+            found(CURL_PIPE, 5, 1, "RUN pipes curl/wget into a shell"),
+            found(CURL_PIPE, 7, 1, "RUN pipes curl/wget into a shell"),
+            found(
+                LATEST,
+                2,
+                1,
+                "FROM line uses :latest (or no tag): ubuntu:latest"
+            ),
+        ]
+    );
+}
+
+#[test]
+fn sarif_output_reports_each_finding_at_its_instruction() {
+    let out = lint_output(POSITIONED, Some("sarif"));
+    assert_eq!(out.status.code(), Some(4));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("SARIF is JSON");
+    let regions: Vec<(String, u64, u64)> = report["runs"][0]["results"]
+        .as_array()
+        .expect("results array")
+        .iter()
+        .map(|r| {
+            let region = &r["locations"][0]["physicalLocation"]["region"];
+            (
+                r["message"]["text"].as_str().expect("text").to_owned(),
+                region["startLine"].as_u64().expect("startLine"),
+                region["startColumn"].as_u64().expect("startColumn"),
+            )
+        })
+        .collect();
+    let region = |text: &str, line, col| (text.to_owned(), line, col);
+    assert_eq!(
+        regions,
+        [
+            region("Dockerfile has no HEALTHCHECK directive", 1, 1),
+            region("ADD used for local copy; prefer COPY", 4, 3),
+            region("RUN pipes curl/wget into a shell", 5, 1),
+            region("RUN pipes curl/wget into a shell", 7, 1),
+            region("FROM line uses :latest (or no tag): ubuntu:latest", 2, 1),
+        ]
+    );
+}
+
+#[test]
+fn positions_hold_under_escape_crlf_and_a_bom() {
+    // A BOM, `# escape=` with a backtick continuation, CRLF line ends.
+    let src = "\u{feff}# escape=`\r\nFROM alpine\r\nRUN echo a `\r\n  && curl x | sh\r\n\r\nADD a.txt /a\r\nHEALTHCHECK NONE\r\n";
+    let out = lint_output(src, Some("json"));
+    assert_eq!(out.status.code(), Some(4));
+    assert_eq!(
+        json_positions(&out.stdout),
+        [
+            found(ADD, 6, 1, "ADD used for local copy; prefer COPY"),
+            found(CURL_PIPE, 3, 1, "RUN pipes curl/wget into a shell"),
+            found(LATEST, 2, 1, "FROM line uses :latest (or no tag): alpine"),
+        ]
+    );
+}
+
+#[test]
+fn a_schema_finding_inside_an_instruction_points_at_its_arguments() {
+    let dir = TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join(".dq/rules")).expect("rules dir");
+    std::fs::write(
+        dir.path().join(".dq/rules/short-env.yml"),
+        "id: user.short-env\n\
+         description: ENV values stay short\n\
+         severity: warn\n\
+         match:\n  format: [dockerfile]\n\
+         check:\n  schema:\n    type: array\n    items:\n      properties:\n        arguments:\n          additionalProperties:\n            maxLength: 3\n",
+    )
+    .expect("write rule");
+    std::fs::write(
+        dir.path().join("Dockerfile"),
+        "FROM alpine:3.20\nHEALTHCHECK NONE\n  ENV A=1 LONG=abcdef\n",
+    )
+    .expect("write Dockerfile");
+    let out = dq()
+        .current_dir(dir.path())
+        .args(["--no-color", "lint", "-F", "json", "Dockerfile"])
+        .output()
+        .expect("run dq lint");
+    assert_eq!(
+        json_positions(&out.stdout),
+        [found(
+            "user.short-env",
+            3,
+            7,
+            "/items/properties/arguments/additionalProperties/maxLength: \"abcdef\" is longer than 3 characters"
+        )]
     );
 }
