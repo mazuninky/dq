@@ -141,6 +141,13 @@ parameter; nothing mutates the environment.
 
 There is no `text` value; the default human format is `console`.
 
+`console` never writes a control character raw: every C0 control (tab and
+line feed included), DEL and every C1 control (U+0080–U+009F, among them
+U+009B CSI, which starts a terminal escape sequence on its own, and U+0085
+NEL) in a key, a value or a `validate` snippet prints as `\xNN`, `NN` being
+the code point in lowercase hex — `\x1b`, `\x0a`, `\x9b` — as YAML spells
+it. Other non-ASCII text (`é`, NBSP, emoji) prints as is.
+
 `sarif`, `junit` and `tap` only render the diagnostics shape produced by
 `lint`, `check`, `fix` and `validate`:
 

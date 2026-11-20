@@ -37,29 +37,39 @@ impl Reporter for ConsoleReporter {
     }
 }
 
-/// Escape every control character (`< 0x20`, `0x7f`, including
-/// `\n`/`\t`/`\r`/`\x1b`) in `s` using a Rust-style `\xNN` form.
+/// Escape every control character in `s` — C0 (`< 0x20`, including
+/// `\n`/`\t`/`\r`/`\x1b`), DEL (`0x7f`) and C1 (U+0080–U+009F, including
+/// U+009B CSI and U+0085 NEL) — as `\xNN`.
 ///
-/// Returns the borrowed input when no escaping is needed (no control
-/// characters). Otherwise allocates a new `String`. Every other character,
-/// non-ASCII included, is copied whole: the walk is over chars, not bytes,
+/// `NN` is the character's code point in two lowercase hex digits, the way
+/// YAML and Python read `\xNN` and the way dq's YAML writer spells these
+/// characters: U+009B prints as `\x9b`, although its UTF-8 bytes are
+/// `c2 9b`. A C1 control is escaped for the same reason as ESC: U+009B
+/// starts a terminal control sequence on its own.
+///
+/// Returns the borrowed input when no escaping is needed. Otherwise
+/// allocates a new `String`. Every other character, non-ASCII included
+/// (é, NBSP, emoji), is copied whole: the walk is over chars, not bytes,
 /// so a multi-byte character next to an escaped control stays intact.
 fn escape_control(s: &str) -> Cow<'_, str> {
-    // A C0 control or DEL is always a single byte in UTF-8, and no byte of a
-    // multi-byte sequence is below 0x80, so a byte scan finds them all.
-    let needs_escape = s.bytes().any(|b| b < 0x20 || b == 0x7f);
-    if !needs_escape {
+    if !s.chars().any(is_escaped_control) {
         return Cow::Borrowed(s);
     }
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if c < '\u{20}' || c == '\u{7f}' {
+        if is_escaped_control(c) {
             out.push_str(&format!("\\x{:02x}", u32::from(c)));
         } else {
             out.push(c);
         }
     }
     Cow::Owned(out)
+}
+
+/// A C0 control, DEL or a C1 control: Unicode's `Cc` category, the set
+/// `char::is_control` tests, spelled out so the ranges are visible.
+fn is_escaped_control(c: char) -> bool {
+    matches!(c, '\u{0}'..='\u{1f}' | '\u{7f}'..='\u{9f}')
 }
 
 /// A number as the console prints it: an integer as its literal, a float
@@ -262,6 +272,28 @@ mod tests {
             escape_control("é\u{1}ж\u{7f}🦀").into_owned(),
             "é\\x01ж\\x7f🦀"
         );
+    }
+
+    #[test]
+    fn escape_control_escapes_c1_controls_by_code_point() {
+        assert_eq!(
+            escape_control("\u{80}a\u{85}\u{9b}31m\u{9f}").into_owned(),
+            "\\x80a\\x85\\x9b31m\\x9f"
+        );
+    }
+
+    #[test]
+    fn escape_control_borrows_non_control_non_ascii() {
+        // U+00A0 (NBSP) is the first character after the C1 block.
+        let s = "é\u{a0}ж🦀";
+        assert!(matches!(escape_control(s), Cow::Borrowed(b) if b == s));
+    }
+
+    #[test]
+    fn is_escaped_control_matches_char_is_control() {
+        for c in ('\u{0}'..='\u{2ff}').chain(['\u{feff}', '\u{2028}']) {
+            assert_eq!(is_escaped_control(c), c.is_control(), "{c:?}");
+        }
     }
 
     #[test]
