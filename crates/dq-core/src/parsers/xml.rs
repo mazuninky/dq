@@ -74,6 +74,14 @@
 //! element (`<a:b/>`) or an attribute (`<r a:x="1"/>`), and a declaration
 //! the writer would refuse.
 //!
+//! The XML declaration is read by its grammar (XML 1.0 §2.8), as libxml2
+//! reads it: `version`, then an optional `encoding`, then an optional
+//! `standalone`, each once and after white space, `version` `1.` and
+//! digits, `encoding` an encoding name, `standalone` `yes` or `no`. A
+//! declaration anywhere but the very start of the document is a parse
+//! error, and so is a processing instruction named `xml` in any case
+//! (`<?XML …?>`), which the writer refuses too.
+//!
 //! ## Encodings
 //!
 //! The reader decodes a file per its byte order mark, else per the
@@ -280,8 +288,9 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
     // its declaration, ahead of every other character, gives.
     // Its line ends, and its namespaces (Namespaces in XML 1.1 for a 1.1
     // document only), too.
-    let xml11 = declared_pseudo_attribute(text.as_bytes(), "version")
-        .is_some_and(|(version, _)| version == "1.1");
+    let declaration =
+        read_declaration(text.as_bytes()).map_err(|e| declaration_error(text.as_bytes(), e))?;
+    let xml11 = declaration.is_some_and(|decl| decl.version == "1.1");
     check_raw_chars(text, xml11)?;
     let mut reader = Reader::from_str(text);
     let cfg = reader.config_mut();
@@ -319,22 +328,29 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                 });
             }
             Ok(Event::Eof) => break,
-            Ok(Event::Decl(decl)) => {
-                if !stack.is_empty() {
-                    // Inner declarations are not standard XML; treat as PI.
-                    let raw = normalize_line_ends(&decl, xml11);
-                    push_pi(&mut stack, &mut top_pi, raw);
-                    continue;
-                }
+            Ok(Event::Decl(_)) => {
+                // The declaration `read_declaration` read, the document's
+                // first characters. One anywhere else — after white space,
+                // a comment or the root, a second one, one inside an
+                // element — is not well-formed (XML 1.0 §2.8).
+                let Some(decl) = declaration.filter(|_| event_start == 0) else {
+                    return Err(parse_error_at(
+                        text,
+                        event_start,
+                        "an XML declaration may stand only at the very start of the document"
+                            .to_owned(),
+                    ));
+                };
                 let mut decl_map: IndexMap<String, Value> = IndexMap::new();
-                if let Ok(v) = decl.version() {
-                    decl_map.insert("version".to_owned(), Value::String(v.into_owned()));
-                }
-                if let Some(Ok(enc)) = decl.encoding() {
-                    decl_map.insert("encoding".to_owned(), Value::String(enc.into_owned()));
-                }
-                if let Some(Ok(sa)) = decl.standalone() {
-                    decl_map.insert("standalone".to_owned(), Value::String(sa.into_owned()));
+                let fields = [
+                    ("version", Some(decl.version)),
+                    ("encoding", decl.encoding),
+                    ("standalone", decl.standalone),
+                ];
+                for (key, value) in fields {
+                    if let Some(value) = value {
+                        decl_map.insert(key.to_owned(), Value::String(value.to_owned()));
+                    }
                 }
                 top.insert(KEY_XML_DECL.to_owned(), Value::Map(decl_map));
             }
@@ -347,6 +363,19 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                 );
             }
             Ok(Event::PI(pi)) => {
+                // `<?XML …?>` and the like: XML reserves the target, in any
+                // case, for the declaration (§2.6), and the writer refuses it.
+                if pi.target().eq_ignore_ascii_case("xml") {
+                    return Err(parse_error_at(
+                        text,
+                        event_start + "<?".len(),
+                        format!(
+                            "'{}' cannot be a processing-instruction target, XML reserves it \
+                             for the declaration",
+                            pi.target()
+                        ),
+                    ));
+                }
                 let raw = normalize_line_ends(&pi, xml11);
                 push_pi(&mut stack, &mut top_pi, raw);
             }
@@ -627,34 +656,16 @@ fn decode_input(bytes: &[u8]) -> Result<(Cow<'_, str>, Option<Bom>, Option<Bom>)
         snippet: String::new(),
         message,
     };
-    // A refusal of the label, placed at it: `head` is the text it stands
-    // in, from the start of the file (past a BOM) to the declaration's end.
-    let check_label = |head: &[u8], label: &str| {
-        let message = label_refusal(label, bom, detected);
-        message.map_or(Ok(()), |message| {
-            let pos = (label.as_ptr() as usize).saturating_sub(head.as_ptr() as usize);
-            let head = std::str::from_utf8(head).unwrap_or_default();
-            Err(parse_error_at(head, pos, message))
-        })
-    };
     if let Some(encoding) = utf16 {
         let text = quick_xml::encoding::decode(body, encoding)
             .map_err(|_| invalid(format!("invalid {} in XML input", encoding.name())))?;
-        let label = declared_label(text.as_bytes());
-        if let Some((label, head)) = label {
-            check_label(head, label)?;
-        }
-        let label = label.map(|(label, _)| label);
+        let label = declared_label(text.as_bytes(), bom, detected)?;
         // `UTF-16LE` / `UTF-16BE` keep the byte order themselves.
         let detected = detected.filter(|_| !label.is_some_and(names_utf16_byte_order));
         return Ok((text, bom, detected));
     }
     // Every 8-bit encoding read here spells the declaration in ASCII.
-    let label = declared_label(body);
-    if let Some((label, head)) = label {
-        check_label(head, label)?;
-    }
-    let label = label.map(|(label, _)| label);
+    let label = declared_label(body, bom, detected)?;
     // A UTF-16 label over 8-bit bytes reads as UTF-8, by the bytes, and
     // says so in `detected`. ISO-2022-JP is not ASCII-compatible to
     // encoding_rs, but it starts in ASCII, so its declaration reads as
@@ -688,6 +699,34 @@ fn decode_input(bytes: &[u8]) -> Result<(Cow<'_, str>, Option<Bom>, Option<Bom>)
             .map_err(|_| invalid(format!("invalid {} in XML input", encoding.name())))?,
     };
     Ok((text, bom, detected))
+}
+
+/// The `encoding` label of the XML declaration `head` begins with, if any,
+/// once the declaration reads whole by [`read_declaration`] and
+/// [`label_refusal`] takes the label in a file that begins with `bom`, or
+/// in the UTF-16 byte order `detected` with no BOM. A refusal is placed in
+/// `head`, at the declaration's fault or at the label.
+fn declared_label(head: &[u8], bom: Option<Bom>, detected: Option<Bom>) -> Result<Option<&str>> {
+    // The declaration, through its `?>`: what a refusal shows around it.
+    let shown = head
+        .windows(2)
+        .position(|pair| pair == b"?>")
+        .map_or(head, |end| &head[..end + b"?>".len()]);
+    let decl = read_declaration(head).map_err(|e| declaration_error(shown, e))?;
+    let Some(XmlDecl {
+        encoding: Some(label),
+        ..
+    }) = decl
+    else {
+        return Ok(None);
+    };
+    match label_refusal(label, bom, detected) {
+        None => Ok(Some(label)),
+        Some(message) => {
+            let pos = (label.as_ptr() as usize).saturating_sub(head.as_ptr() as usize);
+            Err(declaration_error(shown, (pos, message)))
+        }
+    }
 }
 
 /// The character set an `encoding` label names. US-ASCII and ISO-8859-1
@@ -793,27 +832,181 @@ impl Charset {
     }
 }
 
-/// The `encoding` value of an XML declaration at the very start of `bytes`,
-/// read as ASCII — every encoding this applies to spells the declaration
-/// the same. `None` without a declaration or without an `encoding`.
-fn declared_label(bytes: &[u8]) -> Option<(&str, &[u8])> {
-    declared_pseudo_attribute(bytes, "encoding")
+/// The XML declaration a document begins with, as [`read_declaration`]
+/// reads it. Each value is a slice of the input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct XmlDecl<'b> {
+    version: &'b str,
+    encoding: Option<&'b str>,
+    standalone: Option<&'b str>,
 }
 
-/// The value of the pseudo-attribute `name` (`version`, `encoding`) in the
-/// XML declaration `bytes` begin with, if any, and the declaration.
-fn declared_pseudo_attribute<'b>(bytes: &'b [u8], name: &str) -> Option<(&'b str, &'b [u8])> {
-    let rest = bytes.strip_prefix(b"<?xml")?;
-    if !rest.first().is_some_and(u8::is_ascii_whitespace) {
-        return None;
+/// The pseudo-attributes of an XML declaration, in the order XML 1.0 §2.8
+/// fixes: `XMLDecl ::= '<?xml' VersionInfo EncodingDecl? SDDecl? S? '?>'`.
+const DECL_PSEUDO_ATTRIBUTES: [&str; 3] = ["version", "encoding", "standalone"];
+
+/// XML's white space: space, tab, CR and LF.
+fn is_xml_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\r' | b'\n')
+}
+
+/// The XML declaration `bytes` begin with, read by XML 1.0 §2.8 (XML 1.1's
+/// is the same): `<?xml`, then `version`, an optional `encoding` and an
+/// optional `standalone`, in that order, each once, each after white space,
+/// each `name = 'value'` (either quote), then `?>`. `version` is `1.` and
+/// digits, `encoding` an encoding name (`EncName`), `standalone` `yes` or
+/// `no`. Every encoding dq reads spells the declaration in ASCII, so the
+/// bytes are read as such.
+///
+/// `Ok(None)` when `bytes` do not begin with a declaration — `<?xml`
+/// followed by white space or `?`, as quick-xml tells one (a
+/// `<?xml-stylesheet …?>` is a processing instruction). `Err` names where
+/// in `bytes` the declaration goes wrong, and how.
+fn read_declaration(bytes: &[u8]) -> std::result::Result<Option<XmlDecl<'_>>, (usize, String)> {
+    let Some(rest) = bytes.strip_prefix(b"<?xml") else {
+        return Ok(None);
+    };
+    if !rest.first().is_some_and(|&b| is_xml_space(b) || b == b'?') {
+        return Ok(None);
     }
-    let end = rest.windows(2).position(|pair| pair == b"?>")?;
-    let decl = std::str::from_utf8(&rest[..end]).ok()?;
-    let value = decl.split_once(name)?.1.trim_start();
-    let value = value.strip_prefix('=')?.trim_start();
-    let quote = value.chars().next().filter(|c| matches!(c, '"' | '\''))?;
-    let label = value[1..].split(quote).next()?;
-    Some((label, &bytes[..b"<?xml".len() + end + b"?>".len()]))
+    let Some(end) = bytes.windows(2).position(|pair| pair == b"?>") else {
+        return Err((0, "the XML declaration has no closing '?>'".to_owned()));
+    };
+    let mut values: [Option<&str>; 3] = [None; 3];
+    let mut last: Option<usize> = None;
+    let mut i = b"<?xml".len();
+    loop {
+        let space_start = i;
+        while i < end && is_xml_space(bytes[i]) {
+            i += 1;
+        }
+        if i == end {
+            break;
+        }
+        let name_start = i;
+        while i < end && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'-')) {
+            i += 1;
+        }
+        if i == name_start {
+            let what = match bytes[i] {
+                b if b.is_ascii_graphic() => format!("'{}'", char::from(b)),
+                _ => "a character".to_owned(),
+            };
+            return Err((
+                i,
+                format!("the XML declaration holds {what} where a pseudo-attribute belongs"),
+            ));
+        }
+        // ASCII alphanumerics, so UTF-8.
+        let name = std::str::from_utf8(&bytes[name_start..i]).unwrap_or_default();
+        let Some(rank) = DECL_PSEUDO_ATTRIBUTES.iter().position(|&n| n == name) else {
+            return Err((
+                name_start,
+                format!(
+                    "the XML declaration has no pseudo-attribute '{name}': it takes version, \
+                     encoding and standalone, in that order"
+                ),
+            ));
+        };
+        if values[rank].is_some() {
+            return Err((
+                name_start,
+                format!("the XML declaration gives '{name}' twice"),
+            ));
+        }
+        if values[0].is_none() && rank != 0 {
+            return Err((
+                name_start,
+                "the XML declaration must begin with its version (version=\"1.0\")".to_owned(),
+            ));
+        }
+        if let Some(last) = last.filter(|&last| last > rank) {
+            return Err((
+                name_start,
+                format!(
+                    "the XML declaration gives '{name}' after '{}': the order is version, \
+                     encoding, standalone",
+                    DECL_PSEUDO_ATTRIBUTES[last]
+                ),
+            ));
+        }
+        if space_start == name_start {
+            return Err((
+                name_start,
+                format!("the XML declaration needs white space before '{name}'"),
+            ));
+        }
+        while i < end && is_xml_space(bytes[i]) {
+            i += 1;
+        }
+        if i == end || bytes[i] != b'=' {
+            return Err((
+                i,
+                format!("the XML declaration's '{name}' has no '=' and value"),
+            ));
+        }
+        i += 1;
+        while i < end && is_xml_space(bytes[i]) {
+            i += 1;
+        }
+        let quote = bytes[i];
+        if i == end || !matches!(quote, b'"' | b'\'') {
+            return Err((
+                i,
+                format!("the XML declaration's {name} must be quoted, with \" or '"),
+            ));
+        }
+        let value_start = i + 1;
+        let Some(len) = bytes[value_start..end].iter().position(|&b| b == quote) else {
+            return Err((
+                i,
+                format!(
+                    "the XML declaration's {name} has no closing quote ({})",
+                    char::from(quote)
+                ),
+            ));
+        };
+        let raw = &bytes[value_start..value_start + len];
+        let shown = String::from_utf8_lossy(raw);
+        let refusal = match rank {
+            0 if !std::str::from_utf8(raw).is_ok_and(is_version_num) => Some(format!(
+                "the XML declaration's version {shown:?} is not a version number (1. and digits, \
+                 such as 1.0)"
+            )),
+            1 if !std::str::from_utf8(raw).is_ok_and(is_enc_name) => Some(format!(
+                "the XML declaration's encoding {shown:?} is not an encoding name"
+            )),
+            2 if raw != b"yes" && raw != b"no" => Some(format!(
+                "the XML declaration's standalone {shown:?} is neither \"yes\" nor \"no\""
+            )),
+            _ => None,
+        };
+        if let Some(message) = refusal {
+            return Err((value_start, message));
+        }
+        // Checked: every accepted value is ASCII.
+        values[rank] = Some(std::str::from_utf8(raw).unwrap_or_default());
+        last = Some(rank);
+        i = value_start + len + 1;
+    }
+    let [Some(version), encoding, standalone] = values else {
+        return Err((
+            end,
+            "the XML declaration must begin with its version (version=\"1.0\")".to_owned(),
+        ));
+    };
+    Ok(Some(XmlDecl {
+        version,
+        encoding,
+        standalone,
+    }))
+}
+
+/// [`read_declaration`]'s refusal as a parse error, placed in `bytes`.
+/// Every byte before the place is ASCII (a non-ASCII value is refused at
+/// its start), so it counts the same in the text `bytes` decode to.
+fn declaration_error(bytes: &[u8], (pos, message): (usize, String)) -> Error {
+    parse_error_at(&String::from_utf8_lossy(bytes), pos, message)
 }
 
 /// Why the reader refuses `label`, the declaration's `encoding`, in a file
@@ -2881,16 +3074,94 @@ mod tests {
                 )
             );
         }
-        let decl = b"<?xml version='1.0' encoding = \"x\"?><r/>";
+        fn label(bytes: &[u8]) -> Option<&str> {
+            read_declaration(bytes)
+                .expect("a well-formed declaration")
+                .and_then(|decl| decl.encoding)
+        }
         assert_eq!(
-            declared_label(decl),
-            Some(("x", &decl[..decl.len() - "<r/>".len()]))
+            label(b"<?xml version='1.0' encoding = \"x\"?><r/>"),
+            Some("x")
         );
+        assert_eq!(label(b"<?xml version='1.0'?><r encoding='x'/>"), None);
+        assert_eq!(label(b"<?xml-stylesheet encoding='x'?>"), None);
+    }
+
+    #[test]
+    fn the_declaration_is_read_by_its_grammar() {
         assert_eq!(
-            declared_label(b"<?xml version='1.0'?><r encoding='x'/>"),
-            None
+            read_declaration(b"<?xml\tversion = '1.1'\nencoding=\"UTF-8\" standalone='no' ?><r/>"),
+            Ok(Some(XmlDecl {
+                version: "1.1",
+                encoding: Some("UTF-8"),
+                standalone: Some("no"),
+            }))
         );
-        assert_eq!(declared_label(b"<?xml-stylesheet encoding='x'?>"), None);
+        assert_eq!(read_declaration(b"<r/>"), Ok(None));
+        assert_eq!(read_declaration(b"<?xml-stylesheet a='b'?><r/>"), Ok(None));
+        // Each refusal, and the byte it is placed at.
+        for (decl, pos, message) in [
+            ("<?xml?>", 5, "must begin with its version"),
+            (
+                "<?xml encoding='UTF-8' version='1.0'?>",
+                6,
+                "must begin with its version",
+            ),
+            (
+                "<?xml version='1.0' standalone='yes' encoding='UTF-8'?>",
+                37,
+                "after 'standalone'",
+            ),
+            (
+                "<?xml version='1.0' version='1.0'?>",
+                20,
+                "gives 'version' twice",
+            ),
+            (
+                "<?xml version='1.0' foo='1'?>",
+                20,
+                "no pseudo-attribute 'foo'",
+            ),
+            (
+                "<?xml version='1.0'encoding='UTF-8'?>",
+                19,
+                "white space before 'encoding'",
+            ),
+            ("<?xml version?>", 13, "'version' has no '=' and value"),
+            ("<?xml version=1.0?>", 14, "version must be quoted"),
+            (
+                "<?xml version='1.0\"?>",
+                14,
+                "version has no closing quote (')",
+            ),
+            (
+                "<?xml version='2.0'?>",
+                15,
+                "\"2.0\" is not a version number",
+            ),
+            (
+                "<?xml version='1.0' encoding='8bit'?>",
+                30,
+                "\"8bit\" is not an encoding name",
+            ),
+            (
+                "<?xml version='1.0' standalone='YES'?>",
+                32,
+                "\"YES\" is neither",
+            ),
+            (
+                "<?xml version='1.0' 'x'?>",
+                20,
+                "holds ''' where a pseudo-attribute",
+            ),
+            ("<?xml version='1.0'", 0, "has no closing '?>'"),
+        ] {
+            let Err((at, refusal)) = read_declaration(decl.as_bytes()) else {
+                panic!("{decl} is accepted");
+            };
+            assert_eq!(at, pos, "{decl}: {refusal}");
+            assert!(refusal.contains(message), "{decl}: {refusal}");
+        }
     }
 
     #[test]

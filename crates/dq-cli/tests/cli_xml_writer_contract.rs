@@ -2154,7 +2154,7 @@ fn a_malformed_reference_or_attribute_is_placed() {
 }
 
 /// A refused encoding label is placed at its first character however the
-/// declaration is written: single-quoted, after `standalone`, on the
+/// declaration is written: single-quoted, spaced around its `=`, on the
 /// second line of a UTF-16 file with a BOM (counted in characters, the
 /// BOM left out). Before (aa41529), none had a position.
 #[test]
@@ -2162,8 +2162,8 @@ fn a_refused_label_is_placed_however_the_declaration_is_written() {
     let dir = dir_with(&[
         ("single.xml", b"<?xml version='1.0' encoding='UTF-32'?><r/>"),
         (
-            "standalone_first.xml",
-            b"<?xml version=\"1.0\" standalone=\"yes\" encoding=\"UTF-32\"?><r/>",
+            "spaced.xml",
+            b"<?xml version=\"1.0\"  encoding = \"UTF-32\" standalone=\"yes\"?><r/>",
         ),
         (
             "utf16_second_line.xml",
@@ -2183,8 +2183,8 @@ fn a_refused_label_is_placed_however_the_declaration_is_written() {
                 unreadable_at("single.xml", 1, 31, unknown),
             ),
             (
-                convert("standalone_first.xml", "json"),
-                unreadable_at("standalone_first.xml", 1, 48, unknown),
+                convert("spaced.xml", "json"),
+                unreadable_at("spaced.xml", 1, 34, unknown),
             ),
             (
                 convert("utf16_second_line.xml", "json"),
@@ -2316,5 +2316,138 @@ fn every_line_end_reads_as_a_line_feed_and_set_writes_what_it_read() {
     assert_eq!(
         String::from_utf8(read(&dir, "crlf.xml")).expect("UTF-8"),
         "<r><![CDATA[a\nb]]>\n  <c>y</c>\n</r>"
+    );
+}
+
+/// The XML declaration is read by its grammar (XML 1.0 §2.8): `version`,
+/// then an optional `encoding`, then an optional `standalone`, each once,
+/// `version` `1.` and digits, `standalone` `yes` or `no`, and only at the
+/// very start of the document; a processing instruction may not take the
+/// declaration's target, in any case. Each refusal is exit 3, placed.
+/// Before, every one of these read (`standalone` before `encoding`, a
+/// missing or repeated pseudo-attribute, `standalone="maybe"`,
+/// `version="2.0"`, a second declaration), while libxml2 refuses them.
+/// Valid declarations, XML 1.1's included, still read.
+#[test]
+fn a_declaration_its_grammar_rules_out_is_a_parse_error() {
+    let files: &[(&str, &[u8])] = &[
+        (
+            "order.xml",
+            b"<?xml version=\"1.0\" standalone=\"yes\" encoding=\"UTF-8\"?><r/>",
+        ),
+        ("no_version.xml", b"<?xml encoding=\"UTF-8\"?><r/>"),
+        ("unknown.xml", b"<?xml version=\"1.0\" foo=\"bar\"?><r/>"),
+        (
+            "twice.xml",
+            b"<?xml version=\"1.0\"\n  standalone=\"no\" standalone=\"no\"?><r/>",
+        ),
+        (
+            "maybe.xml",
+            b"<?xml version=\"1.0\" standalone=\"maybe\"?><r/>",
+        ),
+        ("v2.xml", b"<?xml version=\"2.0\"?><r/>"),
+        (
+            "second.xml",
+            b"<?xml version=\"1.0\"?>\n<?xml version=\"1.0\"?><r/>",
+        ),
+        ("upper_pi.xml", b"<r><?XML a?></r>"),
+        (
+            "ok.xml",
+            b"<?xml version = '1.0' encoding = 'UTF-8' standalone = 'no' ?><r/>",
+        ),
+        (
+            "ok_11.xml",
+            b"<?xml version=\"1.1\" standalone=\"yes\"?><r/>",
+        ),
+    ];
+    let dir = dir_with(files);
+    assert_cases(
+        &dir,
+        &[
+            (
+                convert("order.xml", "json"),
+                unreadable_at(
+                    "order.xml",
+                    1,
+                    38,
+                    "the XML declaration gives 'encoding' after 'standalone': the order is \
+                     version, encoding, standalone",
+                ),
+            ),
+            (
+                convert("no_version.xml", "json"),
+                unreadable_at(
+                    "no_version.xml",
+                    1,
+                    7,
+                    "the XML declaration must begin with its version (version=\"1.0\")",
+                ),
+            ),
+            (
+                convert("unknown.xml", "json"),
+                unreadable_at(
+                    "unknown.xml",
+                    1,
+                    21,
+                    "the XML declaration has no pseudo-attribute 'foo': it takes version, \
+                     encoding and standalone, in that order",
+                ),
+            ),
+            (
+                convert("twice.xml", "json"),
+                unreadable_at(
+                    "twice.xml",
+                    2,
+                    19,
+                    "the XML declaration gives 'standalone' twice",
+                ),
+            ),
+            (
+                convert("maybe.xml", "json"),
+                unreadable_at(
+                    "maybe.xml",
+                    1,
+                    33,
+                    "the XML declaration's standalone \"maybe\" is neither \"yes\" nor \"no\"",
+                ),
+            ),
+            (
+                convert("v2.xml", "json"),
+                unreadable_at(
+                    "v2.xml",
+                    1,
+                    16,
+                    "the XML declaration's version \"2.0\" is not a version number (1. and \
+                     digits, such as 1.0)",
+                ),
+            ),
+            (
+                convert("second.xml", "json"),
+                unreadable_at(
+                    "second.xml",
+                    2,
+                    1,
+                    "an XML declaration may stand only at the very start of the document",
+                ),
+            ),
+            (
+                convert("upper_pi.xml", "json"),
+                unreadable_at(
+                    "upper_pi.xml",
+                    1,
+                    6,
+                    "'XML' cannot be a processing-instruction target, XML reserves it for the \
+                     declaration",
+                ),
+            ),
+            (
+                convert("ok.xml", "xml"),
+                ok("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?><r/>"),
+            ),
+            (
+                convert("ok_11.xml", "xml"),
+                ok("<?xml version=\"1.1\" standalone=\"yes\"?><r/>"),
+            ),
+        ],
     );
 }

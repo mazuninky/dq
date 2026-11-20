@@ -320,6 +320,13 @@ in `<?xml version="1.0" encoding="UTF-32"?>`, a BOM not counted), as
 `dq validate` does in its `line` / `col` fields. Bytes the encoding
 cannot read name their byte index instead:
 
+- an XML declaration its grammar (XML 1.0 §2.8) rules out, at the
+  pseudo-attribute or value at fault: `version` missing or not first,
+  `standalone` before `encoding`, a pseudo-attribute given twice or one
+  the declaration does not take, a `version` other than `1.` and digits,
+  a `standalone` other than `yes` / `no`, and a declaration anywhere but
+  the very start of the document. A processing instruction named `xml`
+  in any case (`<?XML …?>`) is refused too;
 - an encoding dq does not know (`UTF-32`) or cannot read (`ISO-2022-KR`),
   and an `encoding` that is not an encoding name;
 - a declaration that the BOM, or the UTF-16 a BOM-less file begins in,
