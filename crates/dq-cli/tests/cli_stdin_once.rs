@@ -149,3 +149,42 @@ fn two_stdin_inputs_are_refused() {
         assert_eq!(stdout, "", "dq {args:?}");
     }
 }
+
+/// A value read from stdin (`-`, `@-`, `--value-from -`) is parsed as the
+/// inline value argument is: no format, the JSON-literal heuristic, and
+/// `--value-string` to keep it a string. `@-` and `--value-from -` once
+/// went through the file reader, which has no format for stdin, so they
+/// always failed with exit 2.
+#[test]
+fn set_reads_its_value_from_stdin_as_an_inline_value() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(dir.path().join("f.json"), PACKAGE).expect("write");
+    let set = |value_args: &[&str], stdin: &str| {
+        let out = dq()
+            .current_dir(dir.path())
+            .args(["--no-color", "set", "f.json", "/v"])
+            .args(value_args)
+            .write_stdin(stdin)
+            .output()
+            .expect("run dq");
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{value_args:?} <<< {stdin:?}: {stderr}"
+        );
+        let doc: serde_json::Value = serde_json::from_slice(&out.stdout).expect("JSON on stdout");
+        doc["v"].clone()
+    };
+    for value_args in [&["-"][..], &["@-"][..], &["--value-from", "-"][..]] {
+        assert_eq!(
+            set(value_args, "{\"k\": [1, 2]}"),
+            serde_json::json!({"k": [1, 2]})
+        );
+        assert_eq!(set(value_args, "42"), serde_json::json!(42));
+        assert_eq!(set(value_args, "plain"), serde_json::json!("plain"));
+        let mut forced = value_args.to_vec();
+        forced.push("--value-string");
+        assert_eq!(set(&forced, "42"), serde_json::json!("42"));
+    }
+}

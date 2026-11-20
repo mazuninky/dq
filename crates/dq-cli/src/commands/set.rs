@@ -495,8 +495,15 @@ fn run_jq_transform(
 /// treats the rest as a file path; otherwise the inline string is passed
 /// through the JSON-literal heuristic. A value file goes through the
 /// template guard as `templates` says, as every file dq reads does.
+///
+/// Stdin — `-`, `@-` or `--value-from -` — has no name to detect a format
+/// from, so it is read as the inline argument is: through the JSON-literal
+/// heuristic, honouring `--value-string`.
 fn resolve_value(args: &SetArgs, templates: TemplateMode) -> anyhow::Result<Value> {
     if let Some(path) = &args.value_from {
+        if path == "-" {
+            return value_from_stdin(args.value_string);
+        }
         return value_from_file(path, templates);
     }
     let Some(inline) = &args.value else {
@@ -504,7 +511,7 @@ fn resolve_value(args: &SetArgs, templates: TemplateMode) -> anyhow::Result<Valu
             "missing value: provide an inline arg, --value-from, or '-' for stdin",
         )));
     };
-    if inline == "-" {
+    if inline == "-" || inline == "@-" {
         return value_from_stdin(args.value_string);
     }
     if let Some(path_str) = inline.strip_prefix('@') {

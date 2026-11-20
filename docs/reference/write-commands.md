@@ -96,8 +96,11 @@ remain. Read-side failures (the source cannot be opened) exit 5.
 
 Writes a value at a pointer.
 
-- **Value source**, in priority order: the inline argument; `-` for stdin;
-  `@path` to read a file (its format from its name); `--value-from <path>`.
+- **Value source**: the inline argument; `-` for stdin; `@path` to read a
+  file (its format from its name); `--value-from <path>`, the same. A value
+  read from stdin (`-`, `@-`, `--value-from -`) has no name to take a format
+  from, so it is parsed as an inline value is (below), `--value-string`
+  included; `--input-format` names the format of the file, not of the value.
 - **Inline parsing**: an inline value is parsed as a JSON literal when it
   starts with `{`, `[`, a digit or `-`, or is `true` / `false` / `null`, and
   is valid JSON; anything else is a string (`abc`, `08`, `"q"` with its
