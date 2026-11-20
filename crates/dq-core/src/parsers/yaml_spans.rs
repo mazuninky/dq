@@ -3115,12 +3115,22 @@ fn push_double_quoted_char(out: &mut String, ch: char) {
         '\u{85}' => out.push_str(r"\N"),
         '\u{2028}' => out.push_str(r"\L"),
         '\u{2029}' => out.push_str(r"\P"),
-        c if (c as u32) < 0x20 => {
-            // Other ASCII control chars: \xNN form.
+        c if single_quotable(c) => out.push(c),
+        // Every other character YAML does not take raw: the other C0
+        // controls, DEL, the C1 controls, U+FFFE and U+FFFF (no printable
+        // characters, YAML 1.2 §5.1), and U+FEFF (a byte order mark, which
+        // may not stand inside a document, §5.2).
+        c => {
             use std::fmt::Write as _;
-            let _ = write!(out, "\\x{:02x}", c as u32);
+            let code = u32::from(c);
+            let _ = if code <= 0xFF {
+                write!(out, "\\x{code:02x}")
+            } else if code <= 0xFFFF {
+                write!(out, "\\u{code:04x}")
+            } else {
+                write!(out, "\\U{code:08x}")
+            };
         }
-        c => out.push(c),
     }
 }
 
@@ -3193,8 +3203,10 @@ fn needs_quoting_for_plain(s: &str) -> bool {
         // but the safe choice is to quote.
         return true;
     }
-    // NEL, LS and PS are line breaks to a YAML 1.1 reader.
-    if s.contains(['\n', '\r', '\t', '\u{85}', '\u{2028}', '\u{2029}']) {
+    // A line break (NEL, LS and PS are line breaks to a YAML 1.1 reader),
+    // a tab, or a character YAML does not allow raw — a control, U+FEFF —
+    // goes double-quoted, escaped.
+    if !s.chars().all(single_quotable) {
         return true;
     }
     if contains_unsafe_colon_or_hash(s) {
@@ -3260,6 +3272,25 @@ mod tests {
             render_string_in_style("a\tb", ScalarStyle::SingleQuoted, ctx),
             b"'a\tb'"
         );
+    }
+
+    #[test]
+    fn a_string_with_a_character_yaml_does_not_take_raw_is_rendered_escaped() {
+        let ctx = SpanContext::FlowSeqItem;
+        let s = "\u{7f}\u{80}\u{feff}\u{ffff}\u{a0}";
+        for style in [
+            ScalarStyle::Plain,
+            ScalarStyle::SingleQuoted,
+            ScalarStyle::DoubleQuoted,
+            ScalarStyle::Folded,
+        ] {
+            assert_eq!(
+                render_string_in_style(s, style, ctx),
+                "\"\\x7f\\x80\\ufeff\\uffff\u{a0}\"".as_bytes()
+            );
+        }
+        assert_eq!(yaml_key_token("k\u{9f}"), "\"k\\x9f\"");
+        assert_eq!(yaml_key_token("k\u{a0}"), "k\u{a0}");
     }
 
     fn assert_span(spans: &SpanMap, pointer: &str, bytes: &[u8], expected_value: &[u8]) {

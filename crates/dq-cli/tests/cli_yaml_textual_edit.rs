@@ -242,32 +242,53 @@ fn set_of_a_collection_writes_its_line_and_paragraph_separators_escaped() {
     );
 }
 
-/// A raw U+FEFF is written over a double-quoted scalar as it is, and over a
-/// single-quoted one double-quoted, as single quotes cannot keep it
-/// (before 1c5da56: `'a<BOM>b'`). A C1 control other than NEL has no
-/// escape in a textual edit: `set` refuses it, exit 7, file untouched,
-/// pointing at `set --jq`.
-#[test]
-fn set_of_a_bom_or_a_c1_control_over_a_quoted_scalar() {
-    let src = "a: x\nb: \"z\"\nc: 'y'\n";
-    assert_eq!(
-        edit(src, &["set", "/b", "a\u{feff}b"]),
-        "a: x\nb: \"a\u{feff}b\"\nc: 'y'\n"
-    );
-    assert_eq!(
-        edit(src, &["set", "/c", "a\u{feff}b"]),
-        "a: x\nb: \"z\"\nc: \"a\u{feff}b\"\n"
-    );
+/// `src` as `dq -F json convert` reads it.
+fn read_back(src: &str) -> serde_json::Value {
     let file = write_yaml(src);
-    let path = file.to_str().expect("UTF-8 path");
-    for (pointer, value) in [("/b", "a\u{80}b"), ("/c", "a\u{9f}b")] {
-        dq().args(["--no-color", "set", "-i", path, pointer, value])
-            .assert()
-            .code(7)
-            .stdout("")
-            .stderr(predicates::str::contains(format!(
-                "cannot set '{pointer}': the edited document would not parse; `dq set --jq`"
-            )));
-        assert_eq!(std::fs::read_to_string(path).expect("read back"), src);
+    let out = dq()
+        .args(["--no-color", "-F", "json", "convert"])
+        .arg(file.to_str().expect("UTF-8 path"))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    serde_json::from_slice(&out).expect("stdout is JSON")
+}
+
+/// `set` writes a string holding a character YAML does not take raw — a
+/// C0 control, DEL, a C1 control, U+FEFF, U+FFFE, U+FFFF — double-quoted
+/// with escapes, over a plain, a single-quoted, a double-quoted or a block
+/// scalar, in a flow sequence and a flow mapping, as a sequence item, and
+/// as a new key. Before, a C1 control, DEL, U+FFFE or U+FFFF was written
+/// raw and every such `set` was refused (exit 7); U+FEFF went raw into a
+/// double-quoted scalar, and over a plain or a block scalar was refused.
+#[test]
+fn set_writes_characters_yaml_does_not_take_raw_escaped() {
+    let src = "a: x\nb: 'y'\nc: \"z\"\nd: |\n  w\ne: [x, 'y']\nf: {g: h}\nl:\n- i\n";
+    let value = "\u{1}\u{7f}\u{80}\u{9f}\u{feff}\u{fffe}\u{ffff}";
+    let quoted = r#""\x01\x7f\x80\x9f\ufeff\ufffe\uffff""#;
+    for (pointer, from, to) in [
+        ("/a", "a: x\n", format!("a: {quoted}\n")),
+        ("/b", "b: 'y'\n", format!("b: {quoted}\n")),
+        ("/c", "c: \"z\"\n", format!("c: {quoted}\n")),
+        ("/d", "d: |\n  w\n", format!("d: {quoted}\n")),
+        ("/e/1", "e: [x, 'y']\n", format!("e: [x, {quoted}]\n")),
+        ("/f/g", "f: {g: h}\n", format!("f: {{g: {quoted}}}\n")),
+        ("/l/0", "l:\n- i\n", format!("l:\n- {quoted}\n")),
+    ] {
+        let out = edit(src, &["set", pointer, value]);
+        assert_eq!(out, src.replacen(from, &to, 1), "{pointer}");
+        assert_eq!(
+            read_back(&out).pointer(pointer),
+            Some(&serde_json::Value::from(value)),
+            "{pointer}"
+        );
     }
+    let out = edit("a: x\n", &["set", "/k\u{80}\u{feff}", "v\u{9f}"]);
+    assert_eq!(out, "a: x\n\"k\\x80\\ufeff\": \"v\\x9f\"\n");
+    assert_eq!(
+        read_back(&out),
+        serde_json::json!({"a": "x", "k\u{80}\u{feff}": "v\u{9f}"})
+    );
 }

@@ -127,6 +127,12 @@ The YAML writer (used by `convert -F yaml`, `set --jq` / `fix.jq` on YAML,
   double-quoted with `\N` / `\L` / `\P`, never raw nor in a block
   scalar, so both read it alike; textual-edit `set` writes such a value
   the same way;
+- writes a string holding a character YAML does not take raw — a C0
+  control other than tab and line feed, DEL, a C1 control (U+0080–U+009F),
+  U+FEFF, U+FFFE, U+FFFF — double-quoted with escapes (`\x80`, `﻿`),
+  as a value, a key or an item; textual-edit `set` writes such a value or
+  key the same way (spelled `\x80`, `﻿`), whatever scalar it
+  replaces;
 - ignores `--indent` (two spaces always).
 
 Known limit shared by every YAML reader (saphyr, libyaml, PyYAML): `{n:

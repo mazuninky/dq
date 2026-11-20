@@ -499,3 +499,32 @@ fn a_long_key_or_a_collection_key_holding_a_separator() {
     );
     assert_eq!(to_yaml(&dir, "ck.yaml"), "'[\"a\\Lb\"]': 1\n");
 }
+
+/// A string holding a character YAML does not take raw — a C0 control,
+/// DEL, a C1 control, U+FEFF, U+FFFE, U+FFFF — is written double-quoted
+/// with escapes: a value, a key, an item, a multi-line string (no block
+/// scalar), alone or next to LS. `set --jq` and a YAML `get` write it the
+/// same way. A pin: the writer did so before this was checked.
+#[test]
+fn characters_yaml_does_not_take_raw_are_written_escaped() {
+    let json = r#"{"v": "\u0001\u007f\u0080\u009f\ufeff\ufffe\uffff", "k\u0080\ufeff": 1, "l": ["\u009f"], "m": "x\ufeff\ny\n", "s": "\u2028\u0080\ufeff"}"#;
+    let dir = dir_with(&[("s.json", json), ("s.yaml", "a: x\n")]);
+    let yaml = to_yaml(&dir, "s.json");
+    assert_eq!(
+        yaml,
+        "v: \"\\x01\\x7F\\x80\\x9F\\uFEFF\\uFFFE\\uFFFF\"\n\"k\\x80\\uFEFF\": 1\nl:\n- \"\\x9F\"\n\
+         m: \"x\\uFEFF\\ny\\n\"\ns: \"\\L\\x80\\uFEFF\"\n"
+    );
+    assert_eq!(
+        read_back(&yaml),
+        serde_json::from_str::<serde_json::Value>(json).expect("JSON")
+    );
+    assert_eq!(
+        stdout_of(&dir, &["set", "--jq", ".a = \"\\u0080\\ufeff\"", "s.yaml"]),
+        "a: \"\\x80\\uFEFF\"\n"
+    );
+    assert_eq!(
+        stdout_of(&dir, &["-F", "yaml", "get", "s.json", "/l/0"]),
+        "\"\\x9F\"\n"
+    );
+}
