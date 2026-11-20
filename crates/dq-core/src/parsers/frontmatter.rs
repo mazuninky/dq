@@ -9,8 +9,9 @@
 //!
 //! If no opening delimiter is recognised within the first byte OR no matching
 //! closing delimiter is found within the first 64 KiB of the file, the
-//! parser returns `Document::frontmatter_absent(whole_file_bytes)` — the
-//! value is an empty map and the body equals the entire input.
+//! parser returns `Document::frontmatter_absent(bytes, bom)` — the value is
+//! an empty map and the body the entire input past a UTF-8 byte order
+//! mark, which the writer puts back at byte 0.
 //!
 //! Round-trip contract (`Format::write`):
 //! 1. Re-serialize the value through the inner format (YAML / TOML / JSON).
@@ -61,7 +62,8 @@ impl Format for Frontmatter {
     fn parse(&self, bytes: &[u8]) -> Result<Document> {
         // A UTF-8 byte order mark before the opening delimiter does not
         // hide the header (as in the Markdown parser); the writer puts it
-        // back. Without a header the mark stays in the body.
+        // back. Without a header too: a header the value gets later goes
+        // after it.
         let (header_start, after_bom) = match bytes.strip_prefix(UTF8_BOM) {
             Some(rest) => (rest, true),
             None => (bytes, false),
@@ -101,7 +103,10 @@ impl Format for Frontmatter {
         // No recognised frontmatter — preserve the whole file as the body
         // and pin the value to an empty map; the writer emits only the body
         // until the value holds something.
-        Ok(Document::frontmatter_absent(bytes.to_vec()))
+        Ok(Document::frontmatter_absent(
+            header_start.to_vec(),
+            after_bom,
+        ))
     }
 
     fn write(&self, doc: &Document, w: &mut dyn Write) -> Result<()> {
@@ -118,12 +123,11 @@ impl Format for Frontmatter {
             Value::Null => true,
             _ => false,
         };
-        if !payload.header && holds_nothing {
-            return write_io(w, &payload.body);
-        }
-
         if payload.bom {
             write_io(w, UTF8_BOM)?;
+        }
+        if !payload.header && holds_nothing {
+            return write_io(w, &payload.body);
         }
         match payload.kind {
             FrontmatterKind::Yaml => {

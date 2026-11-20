@@ -176,9 +176,9 @@ pub struct FrontmatterPayload {
     pub kind: FrontmatterKind,
     /// Body bytes following the closing delimiter, preserved verbatim.
     pub body: Vec<u8>,
-    /// Whether a UTF-8 byte order mark stood before the opening
-    /// delimiter: the writer puts it back. (Without a header the mark
-    /// stays in [`Self::body`].)
+    /// Whether a UTF-8 byte order mark stood at the start of the file,
+    /// before the opening delimiter or, with no header, before the body:
+    /// the writer puts it back at the start of what it writes.
     pub bom: bool,
     /// Whether the file had a header — delimiters, whatever stands between
     /// them: the writer writes them back even around nothing (`+++` /
@@ -917,13 +917,16 @@ impl Document {
     }
 
     /// A frontmatter `Document` for a file with no frontmatter: an empty
-    /// map as the value, the whole file as `body`. Written back as `body`
-    /// alone until the value holds something, then with a YAML header.
+    /// map as the value, the file as `body` — past the UTF-8 byte order
+    /// mark it began with, when `bom`. Written back as the mark and `body`
+    /// alone until the value holds something, then with a YAML header
+    /// between the two.
     #[must_use]
-    pub fn frontmatter_absent(body: Vec<u8>) -> Self {
+    pub fn frontmatter_absent(body: Vec<u8>, bom: bool) -> Self {
         let mut doc = Self::frontmatter(Value::Map(IndexMap::new()), body, FrontmatterKind::Yaml);
         if let Some(payload) = doc.frontmatter_payload.as_mut() {
             payload.header = false;
+            payload.bom = bom;
         }
         doc
     }

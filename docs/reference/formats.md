@@ -379,7 +379,8 @@ holds: a YAML header with nothing in it (`---` / `---`, or comments alone)
 reads as `null` and is written back empty, `---\n---\n`, not as
 `---\nnull\n---`; an empty TOML header (`+++` / `+++`) and a YAML `{}` are
 written back as they are. A file with no frontmatter is written as its body
-alone until its value holds something; then it gets a YAML header.
+alone until its value holds something; then it gets a YAML header, after
+the byte order mark the file began with, if any.
 
 ### XML
 

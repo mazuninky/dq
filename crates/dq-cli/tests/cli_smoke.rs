@@ -1215,6 +1215,9 @@ fn smoke_frontmatter_takes_filters_and_refuses_point_edits() {
         ("+++\n+++\nbody\n", "+++\nt = 1\n+++\nbody\n"),
         // No header: one is written once the value holds something.
         ("body\n", "---\nt: 1\n---\nbody\n"),
+        // The BOM stays at byte 0, before the new header. Was:
+        // `---\nt: 1\n---\n<BOM>body`.
+        ("\u{feff}body\n", "\u{feff}---\nt: 1\n---\nbody\n"),
     ] {
         seed(src);
         assert_eq!(
