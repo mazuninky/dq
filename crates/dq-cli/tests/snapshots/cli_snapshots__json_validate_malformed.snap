@@ -13,7 +13,8 @@ expression: stderr
       "col": "[NUM]",
       "severity": "error",
       "message": "[serde_json message]",
-      "snippet": "{ \"x\": 1, }"
+      "snippet": "{ \"x\": 1, }",
+      "rule_id": "validate.parse"
     }
   ]
 }

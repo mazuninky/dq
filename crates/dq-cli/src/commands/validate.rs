@@ -67,7 +67,11 @@ pub fn run(
             let json = if matches!(cli.format, OutputFormat::Console) {
                 render_parse_error(&e, &args.file)
             } else {
-                render_parse_error_diagnostics(&e, &args.file)
+                let mut json = render_parse_error_diagnostics(&e, &args.file);
+                if reporter.wants_rule_catalog() {
+                    json["rules"] = rule_catalog(&e);
+                }
+                json
             };
             reporter.report(&json, err).ok(); // best-effort — stderr is allowed to fail.
             // Wrap with the file path if the parser left it unset.
@@ -167,14 +171,36 @@ fn render_parse_error(err: &dq_core::Error, file: &Utf8Path) -> serde_json::Valu
     }
 }
 
+/// The id `validate` reports a failure under, as a lint rule's `rule_id`:
+/// `validate.<kind>` with the error's [`dq_core::Error::kind_name`] —
+/// `validate.parse` for a file that does not parse. Stable: SARIF
+/// consumers such as GitHub Code Scanning group results by it.
+fn rule_id(err: &dq_core::Error) -> String {
+    format!("validate.{}", err.kind_name())
+}
+
+/// The one-entry rule catalogue for [`Reporter::wants_rule_catalog`],
+/// describing [`rule_id`] of `err`.
+fn rule_catalog(err: &dq_core::Error) -> serde_json::Value {
+    let description = match err {
+        dq_core::Error::Parse { .. } => "The file does not parse in its format.",
+        _ => "The file could not be validated.",
+    };
+    serde_json::json!([{
+        "id": rule_id(err),
+        "description": description,
+        "references": [],
+    }])
+}
+
 /// Build the structured-reporter shape that wraps a parse error in the
 /// canonical `{ "diagnostics": [...] }` envelope. The diagnostic object
-/// adds `path` and `severity` aliases so the SARIF reporter (and the
-/// future M8 lint reporters) can consume it without a per-format shim;
-/// the legacy `file` / `kind` / `message` fields are preserved so the
-/// existing JSON-output tests still observe them.
+/// adds `path`, `severity` and `rule_id` (see [`rule_id`]) so the SARIF
+/// reporter can consume it as it does a lint diagnostic; the legacy
+/// `file` / `kind` / `message` fields are preserved so the existing
+/// JSON-output tests still observe them.
 fn render_parse_error_diagnostics(err: &dq_core::Error, file: &Utf8Path) -> serde_json::Value {
-    let diagnostic = if let dq_core::Error::Parse {
+    let mut diagnostic = if let dq_core::Error::Parse {
         line,
         col,
         snippet,
@@ -200,6 +226,7 @@ fn render_parse_error_diagnostics(err: &dq_core::Error, file: &Utf8Path) -> serd
             "message": err.to_string(),
         })
     };
+    diagnostic["rule_id"] = serde_json::Value::String(rule_id(err));
     serde_json::json!({ "diagnostics": [diagnostic] })
 }
 

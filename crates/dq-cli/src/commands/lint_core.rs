@@ -24,7 +24,7 @@
 use std::io::Write;
 
 use camino::{Utf8Path, Utf8PathBuf};
-use dq_exec::{Diagnostic, Evaluator, LoaderArgs, RuleLoader, RuleSet, Severity};
+use dq_exec::{Diagnostic, Evaluator, LoaderArgs, Rule, RuleLoader, RuleSet, Severity};
 use indexmap::IndexSet;
 
 use crate::cli::{Cli, DocSelector};
@@ -193,7 +193,10 @@ pub(crate) fn run_with_rulesets(
         tracing::warn!("skipped {file}: {reason}");
     }
 
-    let envelope = build_envelope(&diagnostics);
+    let mut envelope = build_envelope(&diagnostics);
+    if reporter.wants_rule_catalog() {
+        envelope["rules"] = rule_catalog(evaluator.rules());
+    }
     reporter.report(&envelope, out)?;
 
     classify_exit(&diagnostics, cli.strict)
@@ -262,6 +265,25 @@ pub(crate) fn expand_lint_inputs(paths: &[Utf8PathBuf]) -> anyhow::Result<Vec<Ut
 pub(crate) fn build_envelope(diagnostics: &[Diagnostic]) -> serde_json::Value {
     let arr: Vec<serde_json::Value> = diagnostics.iter().map(Diagnostic::to_serde_json).collect();
     serde_json::json!({ "diagnostics": arr })
+}
+
+/// The rule catalogue a reporter asks for through
+/// [`Reporter::wants_rule_catalog`]: `[{ "id", "description",
+/// "references" }]`, one entry per loaded rule, in load order.
+///
+/// A diagnostic whose id is not here — a plugin's, a composite's
+/// `<outer>.parse-failed`, a nested rule's — is still reported; the
+/// reporter describes it by id alone.
+pub(crate) fn rule_catalog<'a>(rules: impl Iterator<Item = &'a Rule>) -> serde_json::Value {
+    rules
+        .map(|rule| {
+            serde_json::json!({
+                "id": rule.id,
+                "description": rule.description,
+                "references": rule.references,
+            })
+        })
+        .collect()
 }
 
 /// Compute the exit-code marker for a finished run.

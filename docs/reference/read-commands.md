@@ -105,6 +105,9 @@ not, with the parse error rendered as a diagnostic — on **stderr**, in
 whatever reporter `-F` selects (console, `json` → `{"diagnostics": [...]}`,
 `sarif`, …). Note that `-F json` also makes the file be parsed as JSON; use
 `-F sarif` / `junit` / `tap` for machine-readable output of non-JSON files.
+The diagnostic's `rule_id` (SARIF's `ruleId`) is `validate.parse`; the id is
+`validate.<kind>` with the error's `kind`, and `parse` is the kind a file
+that does not parse reports.
 
 ## Multi-document YAML and `--doc`
 

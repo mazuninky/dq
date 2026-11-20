@@ -179,6 +179,19 @@ pub trait Reporter {
     fn report_value(&self, value: &dq_core::Value, w: &mut dyn Write) -> anyhow::Result<()> {
         self.report(&value.to_serde_json(), w)
     }
+
+    /// Whether the diagnostics envelope handed to [`Reporter::report`]
+    /// should carry a rule catalogue next to `diagnostics`:
+    /// `"rules": [{ "id", "description", "references" }]`, one entry per
+    /// rule the producer knows of.
+    ///
+    /// Only SARIF describes its rules (`tool.driver.rules`); every other
+    /// reporter prints the envelope as is or ignores the extra key, so the
+    /// default is `false` and the producers (`lint`, `check`, `validate`)
+    /// leave the key out.
+    fn wants_rule_catalog(&self) -> bool {
+        false
+    }
 }
 
 /// Resolve whether output should be coloured.

@@ -160,8 +160,28 @@ it. Other non-ASCII text (`é`, NBSP, emoji) prints as is.
 Selecting one of them for any other command is refused with exit 6 ("SARIF
 reporter expects an object with a `diagnostics` array…"). SARIF maps severity
 `error → error`, `warn → warning`, `info → note` and fills
-`physicalLocation` from `path` / `line` / `col`. Known gap: results carry no
-`ruleId` yet (see [../roadmap.md](../roadmap.md)).
+`physicalLocation` from `path` / `line` / `col`.
+
+Every SARIF result names its rule: `ruleId` is the diagnostic's `rule_id`
+and `ruleIndex` its position in `tool.driver.rules`. GitHub Code Scanning
+groups alerts by `ruleId`, so the ids are stable: a rule's `id:`
+(`k8s.no-latest-tag`, a `.dq/rules/` rule's own id), a plugin's id, a
+composite's `<outer-id>.parse-failed`, and `validate.parse` for a file
+`validate` cannot parse. `tool.driver.rules` describes each rule the results
+name, once, in order of first appearance (empty when there are no results):
+
+```json
+{ "id": "dockerfile.has-healthcheck",
+  "shortDescription": { "text": "Long-running Docker images benefit from a HEALTHCHECK directive so Docker / Kubernetes can detect frozen processes." },
+  "fullDescription": { "text": "Long-running Docker images benefit …\n… worth confirming intent." },
+  "helpUri": "https://docs.docker.com/engine/reference/builder/#healthcheck" }
+```
+
+`shortDescription` is the first sentence of the rule's `description` (its
+first paragraph, lines joined); `fullDescription` is the whole description,
+present when it says more; `helpUri` is the first `http(s)://` entry of
+`references`. A rule dq has no description for — a plugin's, a composite's
+`parse-failed`, a composite's nested rule — is described by `id` alone.
 
 `dq validate` writes its diagnostics (in whichever format `-F` selects) to
 **stderr**, not stdout, which is why CI examples redirect `2>`.

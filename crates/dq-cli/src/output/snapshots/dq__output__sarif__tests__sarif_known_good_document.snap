@@ -1,6 +1,5 @@
 ---
 source: crates/dq-cli/src/output/sarif.rs
-assertion_line: 360
 expression: out
 ---
 {
@@ -12,11 +11,21 @@ expression: out
         "driver": {
           "name": "dq",
           "version": "[VERSION]",
-          "informationUri": "https://github.com/mazuninky/dq"
+          "informationUri": "https://github.com/mazuninky/dq",
+          "rules": [
+            {
+              "id": "validate.parse",
+              "shortDescription": {
+                "text": "The file does not parse in its format."
+              }
+            }
+          ]
         }
       },
       "results": [
         {
+          "ruleId": "validate.parse",
+          "ruleIndex": 0,
           "level": "error",
           "message": {
             "text": "expected mapping value"
