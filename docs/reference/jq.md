@@ -13,9 +13,47 @@ lives in `crates/dq-transform/src/jq.rs` and is used by `dq query`,
 are `Send + Sync`). The standard definitions are loaded: `map`, `select`,
 `length`, `sort_by`, `group_by`, `keys`, `values`, `del`, `to_entries` /
 `from_entries`, regex (`test`, `sub`, …), formats, math, time, `tojson` /
-`fromjson`. Differences from jq 1.7 are jaq's; dq adds no functions of its
-own. Command-line variables (`--arg`, `--argjson`, `--slurpfile`) are not
+`fromjson`. Differences from jq 1.7 are jaq's, except path assignment, which
+dq makes behave as in jq (below); dq adds no functions of its own beyond
+the internal `_dq_*` helpers this relies on.
+Command-line variables (`--arg`, `--argjson`, `--slurpfile`) are not
 available.
+
+## Path assignment
+
+jq creates what a path assignment walks through and does not find; jaq 3
+fails there with "cannot use null as iterable". dq follows jq, for `=`, `|=`,
+`+=` `-=` `*=` `/=` `%=`, `//=`, `setpath`, `delpaths` and `del`:
+
+| Program | Input | Output |
+|---|---|---|
+| `.a.b = 1` (and `\|=`, `+=`, `//=`) | `{}`, `null`, `{"a": null}` | `{"a":{"b":1}}` |
+| `.a[2] = 1` | `{}` | `{"a":[null,null,1]}` |
+| `.[3] \|= .` | `[1]` | `[1,null,null,null]` |
+| `setpath(["a",0,"b"]; 1)` | `{}` | `{"a":[{"b":1}]}` |
+| `del(.a.b)`, `del(.a[0])` | `{}` | `{}` |
+| `del(.[0], .[1])` | `[1,2,3]` | `[3]` (paths deleted together) |
+| `del(.[5])`, `del(.[-5])` | `[1,2,3]` | unchanged |
+
+A null becomes `{}` before a string key and `[]` before an index; an array is
+padded with nulls up to an index past its end. What jq refuses stays refused
+(exit 1): a key into a string or a number (`.a.b = 1` on `{"a":"x"}`), a
+negative index past the start, iterating null (`.a[] = 1` on `{}`), and
+`null - 1` for `.a.b -= 1` on `{}`. The right-hand side of `=` and `op=` sees
+the input as it was (`.a.b = .a` on `{}` gives `{"a":{"b":null}}`).
+
+How: `JqEngine::compile` parses the program and, when it holds an assignment
+operator, prints it back with each `L op R` turned into
+`(R) as $__dq_rhs | _dq_vivify(L) | L op $__dq_rhs` (`L |= F` into
+`_dq_vivify(L) | L |= F`); `_dq_vivify` creates the containers every path of
+`L` needs, then jaq's own update runs. `setpath`, `delpaths` and `del` are
+redefined as jq defines them, on two natives (`_dq_ensure`, `_dq_delpaths`).
+Compile errors still point into the program as written. The code is in
+`crates/dq-transform/src/jq/paths.rs`.
+
+Left as jaq has it: a slice of null on the path (`.a[1:2] = [1]` on `{}`,
+jq gives `{"a":[1]}`) and a fractional index fail; `.a.b |= empty` on `{}`
+gives `{"a":{}}` where jq gives `{}`.
 
 ## API
 

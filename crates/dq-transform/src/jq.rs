@@ -192,8 +192,12 @@ pub use stub::{JqEngine, ir_to_val, serde_to_val, val_to_owned_ir, val_to_serde}
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "embedded-jq")]
+mod paths;
+
+#[cfg(feature = "embedded-jq")]
 mod imp {
     use super::JqError;
+    use super::paths;
     use core::str::FromStr;
     use jaq_core::load::{Arena, File, Loader};
     use jaq_core::{Compiler, Ctx, Vars, data, unwrap_valr};
@@ -239,30 +243,24 @@ mod imp {
         pub fn compile(expression: &str) -> Result<Self, JqError> {
             tracing::trace!(expression, "compiling jq expression");
 
-            let defs = jaq_core::defs()
-                .chain(jaq_std::defs())
-                .chain(jaq_json::defs());
-            let funs = jaq_core::funs::<data::JustLut<Val>>()
-                .chain(jaq_std::funs())
-                .chain(jaq_json::funs());
-
-            let loader = Loader::new(defs);
-            let arena = Arena::default();
-            let program = File {
-                code: expression,
-                path: (),
+            // The program as written is compiled first, so a compile error
+            // points into the expression the user wrote.
+            let filter = compile_filter(expression)?;
+            let Some(rewritten) = paths::rewrite(expression) else {
+                return Ok(Self { filter });
             };
-
-            let modules = loader
-                .load(&arena, program)
-                .map_err(|errs| compile_error_from_load_errors(&errs, expression))?;
-
-            let filter = Compiler::default()
-                .with_funs(funs)
-                .compile(modules)
-                .map_err(|errs| compile_error_from_compile_errors(&errs, expression))?;
-
-            Ok(Self { filter })
+            tracing::trace!(
+                rewritten,
+                "jq assignments rewritten to create missing paths"
+            );
+            match compile_filter(&rewritten) {
+                Ok(filter) => Ok(Self { filter }),
+                Err(err) => {
+                    // A printer bug, not the user's: keep jaq's own semantics.
+                    tracing::warn!(%err, expression, "jq assignment rewrite failed to compile; running the expression as written");
+                    Ok(Self { filter })
+                }
+            }
         }
 
         /// Evaluate the compiled filter against one input value.
@@ -339,6 +337,36 @@ mod imp {
             }
             Ok(out)
         }
+    }
+
+    /// Load and compile `expression` with jaq's definitions and natives,
+    /// then dq's (see [`paths`]), which shadow jaq's `setpath`,
+    /// `delpaths` and `del`.
+    fn compile_filter(expression: &str) -> Result<jaq_core::Filter<data::JustLut<Val>>, JqError> {
+        let defs = jaq_core::defs()
+            .chain(jaq_std::defs())
+            .chain(jaq_json::defs())
+            .chain(paths::defs());
+        let funs = jaq_core::funs::<data::JustLut<Val>>()
+            .chain(jaq_std::funs())
+            .chain(jaq_json::funs())
+            .chain(paths::funs());
+
+        let loader = Loader::new(defs);
+        let arena = Arena::default();
+        let program = File {
+            code: expression,
+            path: (),
+        };
+
+        let modules = loader
+            .load(&arena, program)
+            .map_err(|errs| compile_error_from_load_errors(&errs, expression))?;
+
+        Compiler::default()
+            .with_funs(funs)
+            .compile(modules)
+            .map_err(|errs| compile_error_from_compile_errors(&errs, expression))
     }
 
     /// Convert a [`serde_json::Value`] into a [`jaq_json::Val`].

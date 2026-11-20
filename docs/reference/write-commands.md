@@ -107,9 +107,11 @@ Transform mode: the jq expression gets the whole document and must produce
 - On a YAML stream without `--doc`, the filter sees an array of documents and
   must return a non-empty array; the result is written as a stream.
 
-Known issue: a path assignment through a missing key on a null document
-(`.metadata.labels.team = "core"` with no `labels`) fails with "cannot use
-null as iterable" (see [../roadmap.md](../roadmap.md)).
+A path assignment creates what it walks through, as jq does:
+`.metadata.labels.team = "core"` on a manifest with no `labels` (or no
+`metadata`, or on an empty document) writes the missing mappings, and
+`del` of a missing path changes nothing. See
+[jq.md](jq.md#path-assignment).
 
 ## `dq patch <file> <ops>`
 
