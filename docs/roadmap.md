@@ -13,13 +13,6 @@ Status words: **done** (in the code, only bookkeeping left), **partly done**,
 
 Each has its own page with the design and the remaining steps.
 
-- **[Fix everything found on `fix/after-deps-update`](plans/after-deps-update-fixes.md)
-  — in progress.** Streams, big numbers, textual edits, non-finite numbers,
-  the numbers/HCL/XML/YAML round and the last round on schema notes, console
-  escaping, XML declarations and YAML controls are done. Next come the
-  `@std` rules and the fixture runner, positions and schemas, formats and
-  reporters, and the README checked against the code, in that order.
-
 - **[Linear-cost pointers in recursive walks](plans/perf-pointer-recursive-walks.md)
   — done.** `Pointer::with_segment` copied the whole path on every call, so
   recursive walks paid O(depth²) per leaf (65 ns at depth 1, 115 µs at depth
@@ -46,61 +39,15 @@ Each has its own page with the design and the remaining steps.
   standard definitions, which may be most of the 350 µs.
 - **[`@std/skills`: rules for `SKILL.md` and `evals.json`](plans/add-std-skills-rules.md)
   — partly done.** `skills.frontmatter` and `skills.evals-schema` ship with
-  fixtures. Left: the evals schema rejects this repository's own
-  `skills/dq/evals/evals.json` (seven errors: every eval has a `name` key);
-  both rules have drifted from the upstream skill contracts and need a
-  decision on which one to follow; the downstream copies of these rules in
-  another repository still need removing; fixtures cannot carry a `path`, so
-  `match.glob` cannot be tested; the changelog never announced the namespace.
+  fixtures, and the changelog announces the namespace. `skills.evals-schema`
+  follows skill-creator's contract: an eval's `name` / `eval_name` label,
+  and `assertions` or `expectations`. This repository's own `evals.json`
+  passes. Left: check `skills.frontmatter` against the upstream skill
+  contract; remove the downstream copies of these rules in another
+  repository; fixtures cannot carry a `path`, so `match.glob` cannot be
+  tested.
 
-## Bug queue of the current branch
-
-Found while fixing the YAML-stream, big-number and textual-edit work on this
-branch; the items below are still open.
-
-**jq**
-
-- jq path assignment through a missing key fails: `.metadata.labels.team =
-  "core"` with no `labels` gives "cannot use null as iterable" (exit 3) in
-  `fix.jq` and in `set --jq` on a null document.
-
-(Fixed since this list was drawn up: NaN, infinities and big numbers in JSON
-Schema checks, `loc.*`, composite `extract` and plugin `jq.eval`; `keys` /
-`values` on arrays; wrong-node-type errors now exit 1.)
-
-**`@std` rules**
-
-- Rules raise jq runtime errors on nested fields of an unexpected type
-  (`kind: Pod` with `spec: x`); the engine logs and skips them, so the file
-  silently passes.
-- The fixture runner counts a rule that raised as zero violations, so a
-  fixture cannot catch the above.
-- `github-actions.no-pull-request-target-with-checkout` misses a checkout of
-  `${{ github.head_ref }}`.
-
-**Positions and schemas**
-
-- Dockerfile diagnostics all report line 1: the format has no spans, although
-  every instruction record knows its `line`.
-- JSON Schema: a relative `$ref` to an embedded `$id`, and an absolute
-  reference to the schema's own `$id`, are rejected as external.
-
-**Formats, reporters, globs**
-
-- HCL: repeated blocks with the same type and labels (`x { a = 1 }` twice)
-  keep only the last one, silently. Data must never be lost; check how
-  `hcl-rs` represents them and what the `@std/terraform` rules expect.
-- SARIF results carry no `ruleId` (`crates/dq-cli/src/output/sarif.rs`).
-- An unquoted-prefix glob without a directory part (`2-*.yaml`) matches zero
-  files because the walk from `.` yields `./2-x.yaml`; `./2-*.yaml` works.
-- JSON writer output: `dq -F json convert f.json` on `{"a": 1}\n` prints an
-  extra blank line; the re-emit writer (`set --jq`, `fmt --indent 2 -i`)
-  leaves no trailing newline; `patch` `move /ab → /a/b` on
-  `{"ab": 1, "a": {}}` writes a multi-line object inside a one-line one.
-- `dq lint -` from stdin cannot work: `-F` picks the reporter, so stdin has
-  no input format (exit 6). Needs a separate input-format flag or a rule.
-
-**Known limits, not dq bugs**
+## Known limits, not dq bugs
 
 - `{n: !!str}` with no space before `}` is rejected by every YAML reader
   (saphyr, libyaml, PyYAML).
@@ -108,51 +55,21 @@ Schema checks, `loc.*`, composite `extract` and plugin `jq.eval`; `keys` /
 
 ## Found while writing these docs
 
-Behaviour that disagrees with the original design or the README, verified
-against the binary on this branch:
+The reference pass turned up behaviour that disagreed with the original
+design or the README. All of it was fixed on `fix/after-deps-update`; see
+[decisions.md](decisions.md#2026-11-20--fix-everything-found-after-the-dependency-update-after-deps-update-fixes).
+What is left is a feature, not a bug, plus a few known limits of that work:
 
-- **`-F` is both output and input**: on `get`, `paths`, `keys`, `validate`,
-  `set` and most other commands `-F json` also forces the JSON parser, so
-  `dq paths config.yaml -F json` fails with a parse error; only `convert`,
-  `diff` and `query` (on a file) treat `-F` as output only. Decide on one
-  rule (for example: `-F` overrides the parser only when detection fails, as
-  a code comment already claims), or add a separate input-format flag.
-- **Structured errors are incomplete**: no caret under the offending byte,
-  and no JSON error object on stderr under `-F json` (only `validate` emits
-  structured output). Agent-first error output was a founding goal.
-- **Template guard** runs only in `set`, `del`, `patch`, `merge`; `get`,
-  `convert`, `validate` parse templated files silently (a Helm `{{ .x }}`
-  reads as a flow mapping).
-- **Bulk `-i` counts unchanged files as Modified**; the summary's Skipped
-  only counts files without the requested `--doc`.
-- **Globs**: `*` matches across directories (globset's default), so
-  `k8s/*.yaml` also picks up `k8s/sub/x.yaml`; `convert` to stdout does not
-  take globs.
-- **`diff --unified` emits ANSI colour when stdout is not a terminal** (only
-  `--no-color` turns it off).
-- **`dq self update` verifies no checksum** (the `self_update` checksums
-  feature is off); README says it verifies SHA256. No `--dry-run` either.
-- **Markdown positions** are counted from the end of the frontmatter, so lint
-  findings in a file with frontmatter are off by its length;
-  `markdown.code-blocks-yaml-valid` reports at 1:1 because code-block nodes
-  carry no byte span.
-- **Schema check messages** glue the rule's `message` prefix to the keyword
-  location without a separator.
-- **`--no-pager`** is accepted, but dq has no pager; implement one or drop the
-  flag.
-- **Structural `set` on formats without textual edits**: `dq set f.xml /a 2`
-  is refused with exit 7 ("cannot set a value in it") for XML, HCL, INI,
-  dotenv and CSV. The README lists them as writable, and `set --jq '.a = 2'`
-  works on the same files.
-- **README drift**: `-F text` does not exist (`console`); `dq check
-  k8s.no-latest-tag f.yaml` needs `--rule`; `dq query post.md '…'` has the
-  arguments reversed; the `check --inline` and `.dq/rules/` examples lack the
-  required `description` and fail with exit 3; a `check.jq` "returning a
-  boolean" fires on every file (every emitted value is a violation); the XML
-  row lists `.pom` / `.xsd` and the dotenv row `.env.*`, none of which are
-  detected; the `@std/jsonschema` rules are schema rules, not composite;
-  autofix is described only as `fix.jq`, while `fix.ops` (comment-preserving)
-  is the preferred form.
+- **Structured errors**: no caret under the offending byte, and no JSON
+  error object on stderr under `-F json` (only `validate` and `lint` emit
+  structured output for a file that does not parse). Agent-first error
+  output was a founding goal.
+- **Textual edits for XML, HCL, INI, dotenv and CSV.** Point edits on these
+  formats rewrite the file through its writer, so comments and layout are
+  lost (XML keeps its comments). Comment-keeping edits, as YAML and TOML
+  have, are not built.
+- **XML comments and processing instructions inside an element** are
+  written before its child elements. Top-level ones keep their order.
 
 ## Left from the original roadmap
 

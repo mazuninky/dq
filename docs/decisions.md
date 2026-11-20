@@ -24,6 +24,7 @@ The change also fixed a set of engineering conventions in the code and in the pl
 - **TOON output through the `toon-format` crate, not an own encoder.** The TOON spec was still moving; tracking it by hand was not worth it. Since then: `toon-format` 0.7 (TOON spec v4).
 - **`Reporter` trait with the factory in the wiring layer.** Handlers receive `&dyn Reporter` and a writer, so they are tested against a `Vec<u8>` without spawning the binary. A factory inside the output module would have made handlers build their own reporters. Only `main.rs` may call `process::exit`, and `main.rs` stays thin: restore SIGPIPE, parse args, init tracing, dispatch.
 - **Arguments split per command, global flags only on the top-level `Cli`** (`-F`, `-v`, `-q`, `--no-color`, `--no-pager`, `--doc`).
+  Since then (2026-11-20): `-F` is the output format only, a global `--input-format` names the input (and stdin needs it), and `--no-pager` is a hidden no-op.
 - **`Value` is a plain recursive enum with `IndexMap` maps** and `BigInt(String)` / `BigFloat(String)` variants from day one. `BTreeMap` would sort keys (bad for round-trip and for agents expecting source order), `HashMap` would lose order. Keeping big numbers as text was the hedge against M2 needing exact numbers.
 - **Write flags declared but refused.** `-i`, `--diff`, `--backup` existed in M1 and returned an error, so their parsing was tested before M2 gave them behaviour.
 - **SIGPIPE reset to default on Unix**, so `dq paths big.yaml | head` ends quietly instead of panicking. **`tracing` initialised with `try_init`**, because integration tests call the entry point more than once per process.
@@ -303,3 +304,70 @@ Milestone M11, the last before the community registry (M12).
 Since then: `jsonschema` 0.61, built with default features off and validators run offline. It now also validates schemas whose root `$schema` names draft-04, -06 or -07, applying 2020-12 semantics (0.34 silently skipped their root keywords); "only 2020-12" holds for semantics, not for the declared draft. `quick-xml` 0.42.
 
 **Deferred or left out.** XSD, RelaxNG and Schematron validation (a separate `@std/xml-xsd` change never happened), OpenAPI runtime request/response validation, a combined XML/key-value document model, CUE and the other on-demand formats, inline offsets for plugins (the WIT contract is unchanged), typed OpenAPI validation, a strict XML writer that refuses mixed content, an `expected_error` key for composite test fixtures. Rules are addressed by namespace (`@std/jsonschema`); the `@std/<namespace>/<rule>` form in the spec is not supported by the loader. Still open: `markdown.code-blocks-yaml-valid` reports at 1:1, because Markdown code-block nodes carry block positions but no byte span for the projection to start from; HCL has no spans, so Terraform diagnostics report at line 1.
+
+Since then: fenced code blocks carry a span, and `markdown.code-blocks-yaml-valid` reports at the YAML error inside the block (2026-11-20). Structural `set`, `del`, `patch` and `merge` work on XML by rewriting the file through the writer. HCL diagnostics still report at line 1.
+
+## 2026-11-20 — Fix everything found after the dependency update (after-deps-update-fixes)
+
+PR #40, on top of the dependency update (#39).
+
+**What it did.** Updating every dependency brought a long list of bugs to light. A few were regressions; most were old. Behaviour that disagreed with the README turned up as well. The rule for this branch was to fix all of it here and leave no "not fixed here" list behind. The [CHANGELOG](../CHANGELOG.md) lists every user-visible change. In outline:
+- **YAML.** Multi-document streams work everywhere.
+- **Numbers.** Big numbers are exact in every reader and in the jq bridge.
+- **XML.** The reader and the writer are strict about well-formedness.
+- **HCL.** Repeated blocks keep their data.
+- **`@std` rules.** They tolerate wrong-type fields, and a rule that raises fails `dq test`.
+- **Positions.** Dockerfile and Markdown diagnostics have real positions.
+- **CLI flags.** `-F` became output-only and `--input-format` was added.
+- **Template guard.** It works by meaning on every command.
+- **Rewrite formats.** Structural edits work on XML, HCL, INI, dotenv, CSV and JSON Lines.
+- **jq.** Assignment creates missing paths, as jq does.
+- **Self-update.** `dq self update` verifies its download.
+- **Docs.** Every README and skill example was run against the binary.
+
+**Decisions and reasons**
+
+- **`-F` is the output format, and `--input-format` names the input.**
+  - Before, `-F` did both jobs on most commands, so `dq paths config.yaml -F json` failed to parse.
+  - "Let `-F` pick the parser only when detection fails" was turned down: one flag would still have two meanings, depending on the file name.
+  - stdin needs `--input-format`. Sniffing the content was turned down for the same reason unknown extensions are an error: dq does not guess formats.
+  - Write commands keep a file in its own format and refuse a `-F` that names another (exit 2). They neither ignore it silently nor convert. The file's own format is accepted, so old `-F yaml -i` scripts keep working.
+  - `--input-format` on a command that reads no data is refused, the way `--doc` is.
+- **stdin is read once, and only a literal `-` means stdin.** A glob that expands to a file named `-` reads that file. Two `-` inputs are a usage error, not a parse error halfway through.
+- **`--no-pager` stays as a hidden no-op.** Removing it would break scripts that pass it, and a pager is not worth building for a tool whose output is usually piped.
+- **Rule errors have a channel of their own.** `Evaluator::evaluate` returns the diagnostics and the rule errors separately. `dq lint` keeps logging a raising rule and does not fail on it, because one bad rule should not block linting. `dq test` and the fixture runner fail the case, so a fixture can catch a raising rule. Every `@std` rule guards its field reads with jq type filters (`objects`, `arrays`, `numbers`), and a sweep test enforces that across all rules and fixture inputs.
+- **The template guard decides by meaning, not by marker.**
+  - When a file has template markers, it is parsed twice: as written, and with placeholders. It passes if both readings agree once the templates are put back.
+  - So GitHub Actions `${{ }}` passes, while a Helm `{{ .x }}` that turns a value into a flow mapping is refused.
+  - The guard runs on reads and on writes.
+  - An edit must keep every template it does not target. For textual edits that means byte for byte; for rewrites it means as the same data.
+  - Refusing every marker, the old rule, made GitHub Actions workflows uneditable.
+- **Formats without textual edits are edited by rewrite.**
+  - XML, HCL, INI, dotenv, CSV/TSV and JSON Lines point edits change the value tree and re-emit the file through the format's writer.
+  - A `Layout` on the document carries what the value tree cannot hold: HCL expression sources, expression keys and block shape; dotenv `export`; the CSV header; the XML top-level order.
+  - The written file must read back as the edited data, after a per-format normalisation (scalars as text for INI, dotenv, CSV and XML). A mismatch is exit 7, like the textual read-back check.
+  - An edit that changes no data leaves the bytes alone.
+  - `patch`, `merge` and `fix.ops` stage every op and write once.
+  - Textual edits for these formats, which would keep their comments, were left for later. Rewriting works for every format today, and the docs say what it loses.
+- **HCL expressions are kept as source.** hcl-rs reads every expression as a `"${…}"` string, so the writer would turn `var.a` into a literal. The reader records each expression's source by pointer, and the writer emits it while the value is unchanged. What cannot be kept is refused, never written as a string.
+- **Repeated HCL blocks read as a list of their bodies.** They are not merged, because merging loses data. Writers turn the list back into blocks.
+- **jq assignment creates missing paths by rewriting the program, not by patching jaq.**
+  - jaq-core's assignment operators fail on null.
+  - dq rewrites `L op R` so that the paths of `L` exist first, and redefines `setpath`, `delpaths` and `del` as jq defines them.
+  - Indices are capped as in jq, at 536870911.
+  - The rewrite is found on jaq's AST, never by searching the text.
+- **`dq self update` verifies `dq-checksums.txt` with `ring`.** The release already publishes the checksums. A refusal is exit 4, the validation-failure class; a download failure is exit 5.
+- **Globs:** `*` and `?` stay inside one directory, and `**` crosses directories, as in shells and `.gitignore`. A rule's `match.glob` keeps globset's default, where `*` crosses `/`, so existing rules keep matching.
+- **Lint reports survive files that do not parse.** Such a file becomes a `lint.parse` result, the run still exits 3, and SARIF is still written, so CI uploads it.
+- **Output escaping.** Control characters (C0, DEL, C1) print as `\xNN`. Bidi controls and U+2028/U+2029 print as `\uNNNN`. This applies on the console and in error messages, so a file cannot rewrite the terminal or forge a line.
+- **XML.** The owner decided that the writer never emits XML that is not well-formed. The reader refuses what is not well-formed instead of reading part of it. A `<?a:b x?>` target is refused on purpose.
+- **TOON keeps the documented `.nan` / `.inf` strings,** as its spec has no non-finite numbers.
+
+**Deferred or left out.**
+- Kept as features in the [roadmap](roadmap.md), not treated as bugs: structured errors (a caret under the offending byte, a JSON error object on stderr) and the `DQ_*` environment overrides.
+- Not built: textual (comment-keeping) edits for XML, HCL, INI, dotenv and CSV.
+- XML: comments and PIs inside an element are written before its children.
+- `fmt` copies TOML byte for byte, comments included.
+- `set --jq .` rewrites unchanged data, because people use it to reformat.
+- HCL diagnostics still report at line 1.
+- jq differences that remain are listed in [reference/jq.md](reference/jq.md).

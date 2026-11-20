@@ -170,6 +170,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   working Rust reference plugin and the full build recipe.
 - A JSON Schema written in YAML may list `.inf` and `-.inf` in `enum`
   and `const`.
+- `--input-format <FORMAT>`, a global flag, names the input format.
+  It overrides detection for files, globs and stdin, and stdin (`-`)
+  needs it: `dq lint - --input-format yaml -F sarif < deploy.yaml`.
+  `-F` is the output format only (see Changed).
+- `dq self update --dry-run` downloads and verifies the release and
+  reports what it would install, without replacing anything.
+- `@std/skills` checks Claude Code skills. `skills.frontmatter` checks
+  a `SKILL.md` frontmatter. `skills.evals-schema` checks an
+  `evals.json` against skill-creator's contract: an eval's `name` /
+  `eval_name` label, and `assertions` or `expectations`.
 
 ### Changed
 
@@ -334,6 +344,74 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`UTF-32`, `ISO-2022-KR`) with exit 3, as the writer does.
   ISO-2022-JP files now read correctly; they used to read as UTF-8 with
   the escape bytes in the text.
+- **Breaking: `-F/--format` is the output format on every command** and
+  no longer picks the parser. On `get`, `paths`, `keys`, `values`,
+  `validate`, `set` and most other commands, `-F json` used to force the
+  JSON parser, so `dq paths config.yaml -F json` failed to parse. Use
+  `--input-format` to override detection.
+- **Breaking: stdin (`-`) needs `--input-format`.** Without it every
+  command exits 2. It used to exit 6, and `query` took the format from
+  `-F`.
+- **Breaking: `set`, `del`, `patch`, `merge`, `fmt` and `fix` keep a file
+  in its own format.**
+  - A `-F` that names another format is a usage error (exit 2).
+  - The file's own format is accepted, so `-i -F yaml` on a YAML file
+    now works (it was exit 6).
+  - `convert` is how a file changes format.
+- **stdin can be read only once.** A command given `-` for more than one
+  input is refused with exit 2: `diff - -`, `patch - -`, `merge - -`,
+  `set - /a @-`, and `-` twice in the files of `lint`, `check` or `fix`.
+  - Only a literal `-` argument means stdin. A glob or a directory
+    yields a file named `-` as `./-`.
+  - `set … @-`, `--value-from -`, `patch … @-`, `--ops-from -`,
+    `merge … @-` and `--patch-from -` read stdin. The last four used to
+    read a file named `-`.
+  - A value read from stdin is parsed like an inline value.
+- `--input-format` on `test`, `explain`, `rules`, `completions`, `man`,
+  `self` and `generate-docs` is a usage error (exit 2), as `--doc` already
+  was. It used to be ignored.
+- `--no-pager` is hidden from `--help`. It is still accepted and does
+  nothing; dq has no pager.
+- `set`, `del`, `patch` and `merge` edit files with Go-template or GitHub
+  Actions markers whose templates do not change what the file reads
+  as, e.g. a workflow's `run: echo ${{ github.sha }}`. Any marker used to
+  be exit 3. Helm-style templates (`port: {{ .x }}`) are still refused. An
+  edit that would not keep a template is refused (exit 3) and the file is
+  left alone. See [docs/reference/template-guard.md](docs/reference/template-guard.md).
+- `fmt` refuses `--allow-templates` and `--raw-template-strings` (exit
+  6), as `fix` and `set --jq` already did.
+- `dq lint` and `dq check` report a file that does not parse as a
+  `lint.parse` result (`lint.templated_file` for a refused template),
+  lint the other files and still exit 3. SARIF and the other structured
+  reports are written, so a CI upload step gets them. The run used to
+  stop at the first such file and write no report.
+- `dq fmt` canonicalises JSON with no options: two-space indent and one
+  final line break. It used to copy a JSON file unchanged, so
+  `{"a":   1}` counted as formatted. Stdout mode always prints the
+  document, even an unchanged one. A JSON file's BOM is dropped, as
+  every other rewrite drops it.
+- XML output always ends with exactly one line break, `\r\n` if the
+  file used it. The declaration and every top-level comment and
+  processing instruction stand on their own lines, in document order,
+  before and after the root.
+- JSON Lines takes point edits (`set`, `del`, `patch`, `merge`), with
+  records addressed by index (`/0/a`, `/-`). They were exit 7. A root
+  that is not an array of records is refused with exit 1.
+- Schema-check messages separate the rule's `message` prefix from the
+  keyword location with `: ` (`shape: /required: …`, was
+  `shape/required: …`). Composite rules trim their prefix the same way:
+  `message: "cfg:"` no longer gives `cfg:: …`.
+- `validate -F json` diagnostics carry a `rule_id` (`validate.parse`, …).
+- `dq test -F json`: a failed result has a `raised` list.
+- `convert` to stdout takes a glob that matches exactly one file; more
+  matches are exit 6. Glob matches in the current directory print
+  without `./`.
+- `diff --unified` labels files with the paths as given (`--- a.yaml`),
+  not `a/` joined with an absolute path.
+- Console output quotes strings inside a collection as YAML flow
+  (`{name: '{{ .p }}'}`), so such a line reads back as the same value.
+  This includes the console lint, check and validate diagnostics, so a
+  message with `: ` in it is quoted.
 
 ### Deprecated
 
@@ -1007,8 +1085,209 @@ XML:
   attribute or the tag, in every command and not only in `validate`.
   A refused `encoding` label names its line and column too, in
   messages and in `dq validate`.
+- The XML reader refuses ill-formed input with exit 3 at line and
+  column. That covers:
+  - an element left open at the end of input (`<r/><c>` used to read,
+    with `<c>` dropped);
+  - a second root;
+  - text, CDATA or a reference outside the root element;
+  - a DOCTYPE after the root, inside it, or given twice;
+  - `]]>` in text;
+  - a raw `<` in an attribute value;
+  - element, attribute or PI-target names that are not XML names
+    (`<1r/>`, `<a 1b="x"/>`, `<?1p x?>`).
+- **`@std` rules no longer fail silently.** A rule that raised a jq
+  runtime error was logged and skipped, so `dq lint` reported nothing
+  and exited 0; on `kind: Pod` with `spec: x`, 11 `@std/k8s` rules did
+  this.
+  - Every `@std` rule now tolerates a field of the wrong type and skips
+    what it cannot read. This covers `k8s`, `dockerfile`, `terraform`,
+    `markdown` and `skills`.
+  - A test substitutes a string, a number, null, an array and a map at
+    every pointer of every fixture input, and asserts that no rule
+    raises.
+  - `dq test` fails a case whose rule raises, even when no violation is
+    expected, and names it: `raised: rule=k8s.run-as-root check.jq: …`.
+  - `dq lint` keeps the warning.
+- `dq test @std/k8s` runs the fixtures built into the binary, and
+  `dq test @std` runs every namespace. Both used to exit 6.
+- `github-actions.no-pull-request-target-with-checkout` catches every
+  spelling of the PR head in a checkout's `ref:` and `repository:`. It
+  missed:
+  - `github.head_ref`;
+  - `github.event.pull_request.head.ref`;
+  - `head.repo.full_name`;
+  - `refs/pull/<n>/merge|head`, whether written out, built from
+    `github.event.number`, or built with `format()`;
+  - bracket access.
+
+  It no longer fires on `github.event.pull_request.base.*`.
+- Dockerfile diagnostics point at the instruction they are about,
+  instead of line 1, column 1. That is the line it starts on (not a
+  comment above it, nor a continuation or heredoc line below it), at the
+  keyword, or at the first argument for a pointer into `arguments`.
+  `@std/dockerfile` messages no longer repeat the line. `has-healthcheck`
+  is a whole-file finding and still reports 1:1.
+- Markdown positions count from the start of the file. Before, lint
+  findings in a file with frontmatter were off by the frontmatter's
+  length.
+  - `markdown.code-blocks-yaml-valid` reports at the YAML error inside
+    the block, not at 1:1.
+  - Columns are right on fence lines that are indented less than the
+    fence.
+  - Frontmatter after a UTF-8 BOM is read.
+  - A composite rule's parse failure lands on the parse error.
+- JSON Schema:
+  - A relative `$ref` to an embedded `$id`, and an absolute `$ref` to
+    the schema's own `$id`, resolve. They used to fail with
+    `external $ref is not supported`. Nothing is fetched.
+  - A limit reached through a `$ref` outside the schema keywords
+    (`#/x-limits/a`) or through a YAML alias (`*lim`) is quoted as
+    written (`1E2`), not as `1e+2` or `100.0`.
+- jq path assignment through a missing or null key creates the path, as
+  jq does. This covers `=`, `|=`, `+=`…, `//=` and `setpath`, in
+  `set --jq`, `query` and `fix.jq`. It used to fail with "cannot use
+  null as iterable".
+  - `del` of a missing path is a no-op, and `del(.[0], .[1])` deletes
+    both original items.
+  - An integral float index (`.[2.0]`, `.[1e3]`, `setpath([2.0]; 1)`) is
+    taken as the integer.
+  - An index past 536870911 is the jq error "Array index too large"
+    (exit 1). It used to panic (exit 101), or try to allocate gigabytes.
+  - Building an array by index in a loop takes linear time, not
+    quadratic.
+  - An object takes only a string key, as in jq. `.[1]`, `.[1] = 1`,
+    `setpath`, `getpath`, `del`, `has`, `{(1): 2}` and `from_entries`
+    with a number key are runtime errors (exit 1). Before, they read
+    `null` or wrote the key `"1"`, and `.[1e300] = 1` on an object wrote
+    the key `9223372036854775807`. An error quotes the index as it was
+    written.
+  - Reads and `has()` truncate a number index toward zero, and a NaN or
+    out-of-range index reads `null`, as in jq 1.8.2. `null | .[true]` is
+    an error.
+- Structural `set`, `del`, `patch`, `merge` and `fix.ops` work on XML,
+  HCL, INI, dotenv and CSV/TSV. They exited 7 ("cannot set a value in
+  it"), although the README lists these formats as writable.
+  - They rewrite the file through the format's writer, so formatting
+    and comments are lost; XML keeps its comments.
+  - A value the format cannot hold exits 1 and leaves the file
+    untouched.
+  - `--no-create` on a missing path is exit 2, not 7.
+- Rewrites through a format's writer, by point edits or by jq (`set
+  --jq`, `fix.jq`), keep the data:
+  - HCL writes expressions, templates, heredocs and expression keys back
+    as their source. `ami = var.ami` used to become
+    `ami = "$${var.ami}"`, which Terraform reads as a literal string. A
+    string the user sets stays a literal, even `'${var.a}'` set over
+    `var.a`. An edit that would have to change an expression, or a
+    string that two expressions read as, is refused with exit 1.
+  - HCL keeps every repeated block with the same type and labels, as a
+    list of bodies in source order. They used to silently merge into
+    the last one.
+    - Blocks are written back as blocks, also with one body left.
+    - An attribute and a block of one name, or blocks of one type with
+      different label counts, are exit 3.
+    - `@std/terraform` checks every repeated block.
+  - dotenv keeps `export`.
+  - INI keeps an emptied section; only deleting the section removes it.
+  - On a point edit, the CSV/TSV header keeps the file's columns in
+    their order, followed by any new keys in first-seen order. The
+    header is also kept when no rows are left, and a deleted cell is
+    left empty. A write that replaces the whole file (`set ''`, a
+    `patch` at `""`, `merge` of an array) and a rewrite through jq
+    (`set --jq`, `fix.jq`) build the header from the rows' keys.
+  - XML keeps top-level comments and processing instructions on their
+    side of the root when a point edit deletes or inserts one. An `#xml`
+    set below the root is refused (exit 7); before, it was silently
+    dropped.
+  - An edit that changes no data leaves the file alone: `--check` exits
+    0, a bulk run counts the file as Skipped, and comments survive.
+  - The file must read back as the edited data, or the edit is refused
+    with exit 7. Before, a JSON Lines root set to an object dropped
+    every record with exit 0.
+  - On these formats, `patch`, `merge` and `fix.ops` apply every op to
+    the tree and write once, so ops on repeated HCL blocks follow RFC
+    6902. A failed op leaves the file untouched.
+- The template guard runs on every command that reads a file: read
+  commands, `convert`, `validate`, `diff`, `lint`, `check`, `fmt`,
+  `fix` and `set --jq`.
+  - A Helm `{{ .x }}` used to read silently as a YAML flow mapping. A
+    file whose templates change what it reads as is now refused (exit
+    3).
+  - `--allow-templates` and `--raw-template-strings` are honoured.
+  - The guard also catches `{{- if … }}` and `{{ $v }}`.
+  - GitHub Actions files pass, escaped quotes inside `${{ }}`
+    included, and so do Markdown and JSON that mention `{{ }}` in text.
+  - A refused file names the template that changes the reading. It
+    used to name the first template in the file.
+  - `--raw-template-strings` keeps templates as text in Markdown and in
+    bare HCL values. In Markdown the placeholder used to read as bold
+    text. Text in the file that looks like a placeholder is no longer
+    turned into a template; a file that spells every placeholder dq
+    tries is refused (exit 3). It is much faster on files with many
+    templates.
+- `--input-format frontmatter` reads a header after a UTF-8 BOM and
+  writes the BOM back. A header keeps its delimiters whatever it holds:
+  an empty YAML header is written back empty (`---\n---`), not as
+  `null`, and an empty TOML header or a `{}` header no longer loses its
+  delimiters on `fmt`. `set --jq` and `fix.jq` work on frontmatter
+  input; they failed with "no payload".
+- Globs:
+  - A glob with no directory part (`2-*.yaml`) matches files in the
+    current directory. It used to match nothing.
+  - `*` and `?` no longer match `/`; only `**` crosses directories.
+  - An existing path containing `[` is no longer read as a glob.
+- Bulk `-i` leaves alone a file whose bytes would not change. Such a
+  file keeps its mtime, gets no `.bak`, and counts as Skipped instead of
+  Modified.
+- `.pom` and `.xsd` read as XML, and `.env.*` files (`.env.local`,
+  `.env.production`, …) as dotenv. A known extension still wins:
+  `.env.json` is JSON.
+- `dq fix -`, which failed on every input with "EOF while parsing", reads
+  stdin once. `dq lint -`, `check -` and `fix -` work with
+  `--input-format`. `-i` and `--check` on stdin are refused, instead of
+  writing a file named `-`.
+- SARIF results carry `ruleId` and `ruleIndex`, and `tool.driver.rules`
+  describes each rule.
+- `diff --unified` no longer colours piped output; it follows
+  `--no-color`, `NO_COLOR`, `CLICOLOR_FORCE` and TTY detection. It no
+  longer ends every diff with a false `\ No newline at end of file`.
+- Escaping of control characters in output:
+  - Console output escapes C1 controls (U+0080–U+009F, e.g. U+009B
+    CSI) as `\xNN`, like C0 controls.
+  - It escapes the bidi controls U+200E, U+200F, U+202A–U+202E and
+    U+2066–U+2069, and U+2028/U+2029, as `\uNNNN`.
+  - Error messages on stderr are escaped the same way.
+  - A line break inside user data quoted in an error (a pointer, a
+    key, a path) prints as `\x0a`, so input cannot forge an error line.
+  - File names, keys, rule ids and test case names are escaped wherever
+    dq prints them: bulk summaries, `--diff` headers, log lines, writer
+    errors, and `test` console and TAP output. A newline or ESC in a
+    file name can no longer break or forge a line.
+- `convert -F json` of a JSON file that ends with blank lines prints
+  exactly one final line break. `set --jq` and `fmt --indent` end JSON
+  with one line break too. A `patch` `move` lays the moved value out as
+  `add` does.
+- `dq fmt --diff` compares with the file. On YAML, INI, HCL, dotenv and
+  XML it compared with empty bytes.
+- The README and the skill were checked against the binary, and these
+  are fixed:
+  - `-F console`, not `text`;
+  - `check --rule`;
+  - `query EXPR FILE`;
+  - rule examples carry their required `description`;
+  - every value a `check.jq` emits is one violation;
+  - `fix.ops` is documented;
+  - lint reports go to stdout;
+  - `validate` takes one file.
 
 ### Security
+
+- `dq self update` verifies the downloaded archive's SHA-256 against the
+  release's `dq-checksums.txt` before extracting it, as the README said
+  it did. A mismatch or a missing or malformed checksum file is refused
+  with exit 4, and a checksum file that cannot be downloaded is exit 5.
+  Before, nothing was verified.
 
 - `cargo audit` reports no advisories; it reported 37 vulnerabilities
   and 3 unsound warnings before these updates.
