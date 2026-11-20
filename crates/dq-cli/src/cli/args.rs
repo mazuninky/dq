@@ -86,8 +86,9 @@ pub struct Cli {
     ///
     /// convert: the format to convert to. set, del, patch, merge, fmt, fix:
     /// the file keeps its own format, so a -F naming another one is refused
-    /// (exit 2) and the same one is accepted. exists, test, completions,
-    /// man, self and rules add print no formatted value and do not use it.
+    /// (exit 2) and the same one is accepted. test: console, json or tap.
+    /// exists, completions, man, self and rules add print no formatted
+    /// value and do not use it.
     #[arg(short = 'F', long, global = true, value_enum, default_value_t = OutputFormat::Console)]
     pub format: OutputFormat,
 
@@ -576,7 +577,7 @@ pub enum Command {
     Explain(ExplainArgs),
     /// Manage rule sources — `list`, `add` (M8).
     Rules(RulesArgs),
-    /// Apply every applicable rule's `fix.jq` to the given files (M10).
+    /// Apply every applicable rule's fix (`fix.ops` or `fix.jq`) to the given files.
     Fix(FixArgs),
     /// Generate man pages and shell completions (hidden).
     #[command(hide = true)]

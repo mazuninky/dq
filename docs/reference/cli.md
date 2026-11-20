@@ -139,8 +139,9 @@ print a diff. A `-F` naming another format is refused with a usage error
 accepted, so `dq set -F yaml -i config.yaml /a 1` works as it always did.
 `convert -i` is the exception: it writes a sibling file in the `-F` format.
 
-`exists`, `test`, `completions`, `man`, `self` and `rules add` print no
-formatted value and do not use `-F`.
+`exists`, `completions`, `man`, `self` and `rules add` print no formatted
+value and do not use `-F`. `test` renders its report as `console`, `json`
+or `tap` from `-F`; any other value is refused (exit 6).
 
 ### Colour
 

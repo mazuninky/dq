@@ -8,14 +8,14 @@ Per-format details, write-mode semantics, and the contract behind every output f
 |-------------------|----------------------------------|------|-------|----------------------------------------------------------------------|----------------------------------------------------------------|
 | YAML              | `.yaml`, `.yml`                  | ✓    | ✓     | `/spec/replicas`, `/items/0/name`                                    | Textual-edit preserves comments, anchors, quote style, key order. Native writer drops them. |
 | JSON              | `.json`                          | ✓    | ✓     | `/users/0/email`                                                     | `preserve_order` keeps object key order on writes.            |
-| JSONL / NDJSON    | `.jsonl`, `.ndjson`              | ✓    | ✓     | line-addressable as `/0`, `/1`, …                                    | Line-oriented; no comment concept.                            |
+| JSONL / NDJSON    | `.jsonl`, `.ndjson`              | ✓    | ✓     | line-addressable as `/0`, `/1`, …                                    | Line-oriented; a point edit rewrites the file one compact record per line. |
 | TOML              | `.toml`                          | ✓    | ✓     | `/database/host`, `/dependencies/serde`                              | Textual-edit preserves comments and ordering.                 |
 | HCL / Terraform   | `.tf`, `.hcl`                    | ✓    | ✓     | `/resource/aws_s3_bucket/example/bucket`                              | Labels become nested keys. Spans report at line 1 only.       |
 | XML / Maven       | `.xml`, `.pom`, `.xsd`           | ✓    | ✓     | `/project/0/version/0/#text`, `/dependencies/0/dependency/0/groupId/0/#text` | Every element folds to an array (siblings repeat). Character data lives under `#text`. Mixed content collapses. |
 | INI / properties  | `.ini`, `.properties`            | ✓    | ✓     | `/server/host`, `/database/url`                                      | Two-level: `/section/key`. No comments after write.           |
-| dotenv            | `.env`, `.env.*`                 | ✓    | ✓     | `/DATABASE_URL`, `/PORT`                                             | Flat `KEY=VALUE`. Source order + quoting preserved on textual edit. |
+| dotenv            | `.env`, `.env.*`                 | ✓    | ✓     | `/DATABASE_URL`, `/PORT`                                             | Flat `KEY=VALUE`. A point edit rewrites the file: key order and `export` kept, comments and quoting not. |
 | CSV / TSV         | `.csv`, `.tsv`                   | ✓    | ✓     | `/0/name`, `/0/age` (array of records, header = keys)                | Tabular; no nested structure.                                 |
-| Markdown          | `.md`, `.markdown`               | ✓    | ✓ (frontmatter only) | `/frontmatter/value/title`, `/frontmatter/kind`, `/children/0/level` (CommonMark AST) | Frontmatter (`---` YAML / `+++` TOML / `{}` JSON) is parsed; body becomes a queryable AST. Writes touch frontmatter only — body stays verbatim. |
+| Markdown          | `.md`, `.markdown`               | ✓    | —     | `/frontmatter/value/title`, `/frontmatter/kind`, `/children/0/level` (CommonMark AST) | Frontmatter (`---` YAML / `+++` TOML / `{}` JSON) is parsed; body becomes a queryable AST. Read-only: `set` / `del` exit 7, `fmt` keeps the file verbatim. |
 | Dockerfile        | `Dockerfile`, `*.Dockerfile`     | ✓    | —     | `/0/arguments`                                                       | Read-only.                                                    |
 | ignore-lists      | `.gitignore`, `.dockerignore`    | ✓    | —     | `/0`, `/1`, …                                                        | Flat array. Read-only.                                        |
 | TOON              | n/a                              | —    | ✓     | n/a                                                                  | Output-only; agent-friendly compact token format.             |
@@ -28,12 +28,12 @@ Format is auto-detected from extension or filename. Force with `--input-format <
 
 ### 1. Textual-edit splice — comments PRESERVED
 
-Used by `set POINTER VALUE`, `del POINTER`, `patch FILE @ops.json`, `merge FILE @doc.json`. The engine parses the file, locates the byte range that backs the target node, and splices the new bytes in. Anything outside the spliced range (comments, ordering, quote style for YAML/TOML, blank lines) survives untouched.
+Used by `set POINTER VALUE`, `del POINTER`, `patch FILE @ops.json`, `merge FILE @doc.json` and a rule's `fix.ops` on YAML, JSON and TOML. The engine parses the file, locates the byte range that backs the target node, and splices the new bytes in. Anything outside the spliced range (comments, ordering, quote style for YAML/TOML, blank lines) survives untouched. On HCL, XML, INI, dotenv, CSV/TSV and JSON Lines the same commands change the value and rewrite the whole file through the format's writer (comments go, XML keeps its own); Markdown takes no edits (exit 7).
 
 ```bash
 # Pointer-edit — preserves all surrounding context
 dq set deploy.yaml /spec/replicas 5 -i
-dq del config.toml /[features]/legacy -i
+dq del config.toml /features/legacy -i
 dq patch deploy.yaml @ops.json -i
 dq merge package.json @overrides.json -i
 ```
@@ -42,13 +42,13 @@ dq merge package.json @overrides.json -i
 
 ### 2. jq-driven transform — comments DROPPED
 
-Used by `set --jq EXPR`, `fix`. The whole document goes through jq (jaq), then back through the format's native writer.
+Used by `set --jq EXPR` and a rule's `fix.jq`. The whole document goes through jq (jaq), then back through the format's native writer.
 
 ```bash
 # Conditional / structure-changing transform
 dq set 'k8s/**/*.yaml' --jq '.spec.template.spec.imagePullPolicy = "IfNotPresent"' -i
 dq set values.yaml --jq '.image |= sub(":latest"; ":v1")' -i
-dq fix -i 'k8s/**/*.yaml'                 # @std/* fix.jq blocks
+dq fix -i 'k8s/**/*.yaml'                 # fix.jq rules re-emit; fix.ops rules edit in place
 ```
 
 **Use this path** when you need conditional logic, walks, or structural rewrites — the kind of thing JSON Pointer alone cannot express. Accept that comments are gone.
@@ -64,7 +64,7 @@ dq fmt 'k8s/**/*.yaml' -i --sort-keys     # canonicalise + sort
 dq fmt --check 'k8s/**/*.yaml'            # CI idempotency gate
 ```
 
-Same trade-off as the jq-driven path — the entire document is re-emitted through the native writer. `fmt` exists precisely so the project can adopt a `gofmt` / `prettier` posture: one canonical form per file.
+Same trade-off as the jq-driven path — the entire document is re-emitted through the native writer (plain `fmt` keeps a TOML file as it is; `--sort-keys` re-emits it). `fmt` exists precisely so the project can adopt a `gofmt` / `prettier` posture: one canonical form per file.
 
 ### Write-mode flags
 
@@ -89,8 +89,8 @@ Same trade-off as the jq-driven path — the entire document is re-emitted throu
 
 When the input is a glob that matches multiple files (`'k8s/**/*.yaml'`, `'*.toml'`), `dq` switches to bulk:
 
-- Prints a summary on stderr: `Modified: N, Skipped: M, Failed: K`
-- Without `--continue-on-error`: aborts on the first failure, exits 7
+- Prints a summary on stdout: `Modified: N, Skipped: M, Failed: K`
+- Without `--continue-on-error`: stops at the first failing file with that file's error and exit code (files before it are already written)
 - With `--continue-on-error`: processes every file, exits 7 if any failed, 0 otherwise
 - Single-file invocation (glob matches one file) is byte-identical to non-glob mode
 
@@ -152,8 +152,8 @@ dq lint - --input-format yaml -F sarif < deploy.yaml > lint.sarif
 | `toml`    | Writing TOML output                                            | Same. |
 | `jsonl`   | One value per line; great for line-oriented pipelines          | `--indent` ignored. |
 | `toon`    | **Agent-friendly** — preserves all data in significantly fewer tokens than JSON | Use when the output goes back into your (the agent's) context. |
-| `sarif`   | SARIF 2.1.0 for GitHub Code Scanning                           | **Emitted to stderr.** Redirect with `2>`. |
-| `junit`   | JUnit XML for GitLab / Jenkins / etc.                          | Stderr. |
+| `sarif`   | SARIF 2.1.0 for GitHub Code Scanning                           | Stdout (`lint`, `check`, `fix`); `validate` writes it to stderr, on a parse error only. |
+| `junit`   | JUnit XML for GitLab / Jenkins / etc.                          | Stdout. |
 | `tap`     | TAP 13 for Bats, `prove`, other TAP consumers                  | Stdout. |
 
 ### Picking by reader
@@ -165,9 +165,9 @@ dq -F toon query '.spec.containers[].image' deploy.yaml
 # Script parses the output → json
 dq -F json query '.items[] | {kind, name}' k8s.yaml | jq -r '.name'
 
-# CI report ingest → sarif (stderr!) or junit
-dq lint -F sarif 'k8s/**/*.yaml' 2> dq-results.sarif
-dq lint -F junit 'src/**/*.yaml' 2> dq-junit.xml
+# CI report ingest → sarif or junit, both on stdout
+dq lint -F sarif 'k8s/**/*.yaml' > dq-results.sarif
+dq lint -F junit 'src/**/*.yaml' > dq-junit.xml
 ```
 
 ### Console-format gotcha
@@ -184,7 +184,7 @@ dq self update                 # download + SHA256 verify + atomic replace
 dq self update --to v2026.20.1 # pin to a specific YYYY.WW.BUILD release
 ```
 
-`self update` exits 5 on network failure, 7 on atomic-replace failure. The new binary is verified against the published `dq-checksums.txt` before the replace; mismatches abort with exit 7.
+`self update` exits 5 on network failure, 7 on atomic-replace failure. The archive is verified against the release's `dq-checksums.txt` before anything is extracted; a mismatch, or a release without a usable checksum line, refuses the update with exit 4. `--dry-run` downloads and verifies without replacing.
 
 ## Anti-examples
 
@@ -222,10 +222,10 @@ dq set values.yaml /image/tag v2 -i
 dq set values.yaml /image/tag v2 -i --raw-template-strings
 ```
 
-**Sending SARIF to stdout in CI**
+**Capturing lint SARIF from stderr in CI**
 ```bash
-# WRONG — SARIF goes to stderr; `>` captures empty stdout
-dq lint -F sarif 'k8s/**/*.yaml' > dq.sarif
-# RIGHT
+# WRONG — lint writes SARIF to stdout; `2>` captures only log lines
 dq lint -F sarif 'k8s/**/*.yaml' 2> dq.sarif
+# RIGHT
+dq lint -F sarif 'k8s/**/*.yaml' > dq.sarif
 ```

@@ -22,18 +22,18 @@
       "assertions": [
         {"text": "Escapes the '/' in 'app.kubernetes.io/name' as ~1 (not left as literal '/')", "type": "output"},
         {"text": "Uses JSON Pointer (dq get) not JSONPath or jq for this single-key read", "type": "output"},
-        {"text": "Uses -F toon (preferred — fewer tokens for agent context) or -F json (not -F json upstream that would override input)", "type": "output"},
-        {"text": "Does not put -F BEFORE the file path with a value that disagrees with the .yaml extension", "type": "output"}
+        {"text": "Uses -F toon (preferred — fewer tokens for agent context) or -F json", "type": "output"},
+        {"text": "Does not pass --input-format for a .yaml file (the extension already names the format; -F only picks the output)", "type": "output"}
       ],
       "files": []
     },
     {
       "id": 3,
-      "name": "ci-sarif-upload-stderr-redirect",
+      "name": "ci-sarif-upload-stdout-redirect",
       "prompt": "напиши шаг для GitHub Actions: пробежаться dq lint по всем k8s/**/*.yaml и залить SARIF в Code Scanning через github/codeql-action/upload-sarif. parse errors не должны проваливать сборку до upload-шага.",
-      "expected_output": "Uses `dq lint -F sarif 'k8s/**/*.yaml' 2> lint.sarif` (NOT `> lint.sarif`). Sets `continue-on-error: true` on the lint step so exit 4 doesn't skip upload. Uses `if: always()` on the upload step. Mentions the SARIF-to-stderr contract.",
+      "expected_output": "Uses `dq lint -F sarif 'k8s/**/*.yaml' > lint.sarif` (NOT `2> lint.sarif`: lint writes SARIF to stdout). Sets `continue-on-error: true` on the lint step so exit 4 doesn't skip upload. Uses `if: always()` on the upload step.",
       "assertions": [
-        {"text": "Redirects with 2> (stderr) to capture SARIF, NOT > (stdout)", "type": "output"},
+        {"text": "Redirects stdout with > to capture SARIF, NOT 2> (stderr)", "type": "output"},
         {"text": "Sets continue-on-error: true on the lint step", "type": "output"},
         {"text": "Uses if: always() on the upload-sarif step", "type": "output"},
         {"text": "Uses dq lint (not dq validate) — lint produces rule diagnostics; validate is parse-only", "type": "output"}

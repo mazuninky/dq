@@ -6,7 +6,7 @@
 |----------------|-------------------------|-------------------------------------------------------------|
 | `get`, `set`, `del`, `exists`, `keys`, `values`, `len`, `type` | JSON Pointer (RFC 6901) | A single addressable node. |
 | `select`       | JSONPath (RFC 9535)     | Multi-match queries with `[*]`, `[?(...)]`, recursive descent (`..`). |
-| `query`, `set --jq`, `fix` (`fix.jq`), rule `check.jq` | jq (jaq dialect)        | Transforms, conditionals, joins, programmable output shape.  |
+| `query`, `set --jq`, rule `check.jq`, `fix.ops`, `fix.jq` | jq (jaq dialect)        | Transforms, conditionals, joins, programmable output shape.  |
 
 `paths` lists every Pointer in a document; useful for "what can I address here?".
 
@@ -116,11 +116,10 @@ Document parses to:
 /children/1/type            → "paragraph"
 ```
 
-The frontmatter sits under `/frontmatter/value/<key>` — the `value` indirection is so `/frontmatter/kind` can tell you whether the frontmatter was YAML, TOML, or JSON. Body AST is queryable but **read-only**; writes only touch frontmatter.
+The frontmatter sits under `/frontmatter/value/<key>` — the `value` indirection is so `/frontmatter/kind` can tell you whether the frontmatter was YAML, TOML, or JSON. The whole document is queryable but **read-only**: `set` / `del` on a Markdown file exit 7, frontmatter included.
 
 ```bash
 dq get post.md /frontmatter/value/title
-dq set post.md /frontmatter/value/title "New Title" -i
 dq query '.children[] | select(.type == "heading") | .level' post.md
 ```
 
@@ -260,7 +259,7 @@ A filter compares numbers in `f64`: `.nan` / `.inf` are numbers (`[?@.n > 1]` ma
 
 ## jq (jaq dialect)
 
-Used by `dq query`, `dq set --jq`, rule `check.jq`, rule `fix.jq`.
+Used by `dq query`, `dq set --jq`, rule `check.jq`, rule `fix.ops` (which returns a JSON Patch) and rule `fix.jq`.
 
 The dialect is **jaq**, which implements `jq-core` + `jq-std` + `jq-json`. Standard `jq` filters work:
 

@@ -1,4 +1,4 @@
-//! `dq fix FILE...` — apply every applicable rule's `fix.jq` to the
+//! `dq fix FILE...` — apply every applicable rule's fix (`fix.ops` / `fix.jq`) to the
 //! given files.
 //!
 //! Pipeline mirrors [`crate::commands::lint_core::run_with_rulesets`] up

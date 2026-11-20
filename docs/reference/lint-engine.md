@@ -175,7 +175,9 @@ tests:
 ```
 
 `dq test <dir>` finds every `*.test.yml` recursively, loads the sibling rule,
-parses `input`, evaluates, and compares order-insensitively: a case passes
+parses `input`, evaluates it under the fixture file's own path (so a
+`match.glob` is matched against that path, and a rule it excludes reports
+nothing), and compares order-insensitively: a case passes
 when every expected violation matches an actual diagnostic (same rule id,
 and `message_contains` / `message_equals` / `line` when given) and no actual
 diagnostic is left unmatched and no rule raised a jq runtime error on the

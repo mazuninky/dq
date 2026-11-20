@@ -12,7 +12,7 @@ Agent-friendly Rust CLI for structured data files (YAML, JSON, TOML, HCL, INI, .
 - **Convert** between any pair of supported formats; `dq fmt` canonicalizes & sorts keys.
 - **Patch** with RFC 6902 JSON Patch and RFC 7396 Merge Patch.
 - **Lint** with 66 standard rules across `@std/{k8s, dockerfile, github-actions, markdown, npm, jsonschema, terraform, openapi, skills}`, plus user rules in `.dq/rules/`.
-- **Autofix** via `dq fix` — rules carry `fix.jq` whole-document transforms; idempotency enforced at runtime.
+- **Autofix** via `dq fix` — rules carry `fix.ops` edit scripts (comments kept) or `fix.jq` whole-document transforms; idempotency enforced at runtime.
 - **Schema validation** with JSON Schema 2020-12 (inline or file-based) as a first-class rule type.
 - **Composite rules** that extract one format embedded in another (e.g. YAML inside Markdown code blocks) and lint it with diagnostics projected back.
 - **Plugins** (experimental, behind `--features plugins`) — sandboxed WASM lint+fix via the WIT-described `dq:plugin@0.1.0` ABI.
@@ -46,7 +46,7 @@ A Homebrew tap is published at [`mazuninky/homebrew-tap`](https://github.com/maz
 brew install mazuninky/tap/dq
 ```
 
-The formula tracks the latest release and is bumped automatically by the release workflow.
+The formula is bumped to each new release in the tap repository, shortly after the release is published.
 
 ### Quick install via the install script
 
@@ -106,17 +106,17 @@ Before anything is extracted, `self update` checks the archive's SHA-256 against
 ```sh
 # Read — JSON Pointer (RFC 6901) on any supported format
 dq get deployment.yaml /spec/replicas
-dq get terraform.tf /backend/s3/region
+dq get terraform.tf /terraform/backend/s3/region
 dq get pom.xml /project/0/version/0/#text
 dq get post.md /frontmatter/value/title
 
 # Query — embedded jq via jaq, with output rendered into any format
-dq query '.spec.containers[].image' deploy.yaml -F json
-dq query post.md '.children[] | select(.type == "heading") | .level'
+dq query '.spec.template.spec.containers[].image' deploy.yaml -F json
+dq query '.children[] | select(.type == "heading") | .level' post.md
 
 # Edit — atomic in-place with comment / key-order preservation
 dq set deploy.yaml /spec/replicas 3 -i
-dq set 'k8s/**/*.yaml' --jq '.image |= sub(":latest"; ":v1")' -i --parallel 4
+dq set 'k8s/**/*.yaml' --jq '.spec.template.spec.containers[].image |= sub(":latest"; ":v1")' -i --parallel 4
 dq del config.toml /deprecated_key -i
 
 # Patch — RFC 6902 JSON Patch & RFC 7396 Merge Patch
@@ -136,7 +136,7 @@ dq lint k8s/**/*.yaml
 dq lint --rules @std/k8s deploy.yaml
 dq lint -F sarif file.yaml > lint.sarif
 
-# Fix — apply each matching rule's fix.jq transform
+# Fix — apply each matching rule's fix (fix.ops or fix.jq)
 dq fix --check k8s/**/*.yaml          # pre-commit gate
 dq fix --diff k8s/**/*.yaml           # preview only
 dq fix -i --rules @std/k8s deploy.yaml
@@ -155,7 +155,7 @@ dq fix -i --rules @std/k8s deploy.yaml
 | INI / properties | `.ini`, `.properties` | ✅ | ✅ | section/key pointers |
 | dotenv | `.env`, `.env.*` | ✅ | ✅ | flat KEY=VALUE map |
 | CSV / TSV | `.csv`, `.tsv` | ✅ | ✅ | array-of-records |
-| Markdown | `.md`, `.markdown` | ✅ | ✅ (frontmatter) | full CommonMark + GFM as queryable AST |
+| Markdown | `.md`, `.markdown` | ✅ | — | full CommonMark + GFM as queryable AST; no edits (`fmt` keeps it verbatim) |
 | Dockerfile | `Dockerfile`, `*.Dockerfile` | ✅ | — | read-only |
 | ignore-lists | `.gitignore`, `.dockerignore` | ✅ | — | flat array |
 
@@ -170,11 +170,12 @@ Point edits (`set` and `del` with a pointer, `patch`, `merge`) change YAML, JSON
 ```sh
 dq lint k8s/**/*.yaml                    # auto-bind @std/k8s + .dq/rules/
 dq lint --rules @std/k8s deploy.yaml     # explicit ruleset
-dq check k8s.no-latest-tag deploy.yaml   # single rule
+dq check --rule k8s.no-latest-tag deploy.yaml   # single rule
 dq check --inline 'id: my.rule
+description: A Deployment declares its replicas.
 severity: error
-match: { format: yaml }
-check: { jq: ".spec | has(\"replicas\")", message: "no replicas" }' f.yaml
+match: { format: yaml, filter: ".kind == \"Deployment\"" }
+check: { jq: "select(.spec | has(\"replicas\") | not)", message: "no replicas" }' f.yaml
 dq test crates/dq-lint/rules/            # run *.test.yml fixtures
 dq test @std/k8s                        # run the fixtures embedded for @std/k8s
 dq explain k8s.no-latest-tag             # rule description / severity / refs
@@ -184,30 +185,38 @@ dq rules add @std/k8s                    # materialise @std/k8s under .dq/rules/
 
 A rule's `check:` is a `oneOf` over four kinds:
 
-- `jq` — embedded jq expression returning a boolean or an array of failures.
+- `jq` — embedded jq expression; **every value it emits is one violation**, `true`, `false` and `null` included, so it emits only the failures (`select(...)`) and nothing when the file passes. An array is one violation; emit its items (`.[]`) for one each. The message template reads fields of the violation (`{{ .name }}`).
 - `schema` — inline JSON Schema 2020-12.
 - `schema_file` — path to a JSON Schema file (resolved relative to the rule directory; `..` escapes rejected, `$ref` restricted to internal references).
 
 A schema reads the document's own numbers. A NaN or an infinity (`.nan`, `-.inf`, TOML `nan`) is a `number`, never a `string` or an `integer`; an infinity is past every bound on its side, and a NaN fails every bound (`minimum`, `maximum`, the exclusive ones); neither is a multiple of anything. The bounds, `multipleOf`, `integer`, `enum` and `const` read a big number by its exact value, the schema's own as well as the document's, in a YAML rule as in a `schema_file`: `18446744073709551617` is past `maximum: 18446744073709551616`, `0.1` is not `const: 0.10000000000000000001`, `18446744073709551616` is an integer and `1e-400` is not; `x` is a `multipleOf` `d` when `x / d` is an integer, so `0.3` is a multiple of `0.1`, only `0` is one of `1e400`, and `multipleOf: 1e-400` compiles. A YAML schema may list `.inf` or `-.inf` in `enum` or `const`, where it matches the infinity of its sign; as a bound it does not compile. Two NaNs equal nothing — though `uniqueItems` counts them as one item. Messages spell these values as the document does: `.nan is not of type "string"`.
 - `extract` + `nested` — composite cross-format rule. The outer jq returns `[{value, format, anchor}]`; each item is reparsed as the inner format and run through a `nested:` rule. Recursion bounded at depth 4. Inner-format parse failures emit `<outer>.parse-failed`.
 
-Reference composite rules ship out of the box: `@std/markdown/code-blocks-yaml-valid`, `@std/jsonschema/{kubernetes-crd-shape, helm-values-against-schema, openapi-3.1-shape}`.
+A reference composite rule ships out of the box: `@std/markdown/code-blocks-yaml-valid`. The `@std/jsonschema/{kubernetes-crd-shape, helm-values-against-schema, openapi-3.1-shape}` rules are schema rules (`schema` / `schema_file`). Every rule field is in [docs/reference/lint-engine.md](docs/reference/lint-engine.md), the check kinds in [docs/reference/rule-checks.md](docs/reference/rule-checks.md).
 
 ### Output formats
 
 | Format | Flag | Use case |
 |---|---|---|
-| Text | `-F text` (default) | terminal; one line per diagnostic |
+| Console | `-F console` (default) | terminal |
 | SARIF 2.1.0 | `-F sarif` | GitHub Code Scanning |
 | JUnit XML | `-F junit` | GitLab CI, Jenkins |
 | TAP 13 | `-F tap` | TAP consumers |
 | JSON | `-F json` | scripting, jq pipelines |
 
-`--strict` promotes warning-severity violations to failures (exit 1).
+All of them go to stdout. `--strict` promotes warning-severity violations to failures (exit 1); an error-severity one is exit 4 either way.
 
 ## Autofix
 
-Rules can carry an optional `fix.jq` — a whole-document transform that the engine applies to every matching file. `dq fix` honours the same write-mode discipline as `dq set` / `dq del`:
+Rules can carry an optional `fix:` that `dq fix` applies to every file the rule reports on, with the same write modes as `dq set` / `dq del`. Two forms:
+
+- `fix.ops` (preferred) — a jq expression that returns a JSON Patch array (`add`, `replace`, `remove`). It is applied as a textual edit, so comments and layout survive on YAML, JSON and TOML; on the other writable formats the file is rewritten through its writer.
+- `fix.jq` — a whole-document transform whose result replaces the document, re-emitted through the format's writer, so comments in it are dropped (same trade-off as `dq set --jq`).
+
+```yaml
+fix:
+  ops: 'if has("license") then [] else [{op: "add", path: "/license", value: "UNLICENSED"}] end'
+```
 
 ```sh
 dq fix --check k8s/**/*.yaml             # pre-commit gate (exit 1 if changes pending)
@@ -216,9 +225,7 @@ dq fix -i --rules @std/k8s deploy.yaml   # atomic in-place
 dq fix -i --backup --parallel 4 'src/**/*.yaml'
 ```
 
-`Fixer` enforces idempotency at runtime — applying `fix.jq` twice must yield the same value or the rule is skipped with a `tracing::warn!`. Two reference rules ship with `fix:` blocks: `@std/k8s/image-pull-policy-always` and `@std/npm/has-license`.
-
-**Caveat**: re-emit goes through the format's native writer, so YAML/TOML comments are dropped on fix (same trade-off as `dq set --jq`).
+Idempotency is enforced at runtime: a fix that would change the file again on a second run is skipped with a warning. Two reference rules ship with `fix:` blocks: `@std/npm/has-license` (`fix.ops`) and `@std/k8s/image-pull-policy-always` (`fix.jq`). The full contract is in [docs/reference/lint-engine.md](docs/reference/lint-engine.md#fixes).
 
 ## Configuration
 
@@ -227,11 +234,12 @@ User rules live under `./.dq/rules/` as `*.yml` files (one rule per file) and ar
 ```yaml
 # .dq/rules/no-debug-images.yml
 id: org.no-debug-images
+description: Debug and nightly images must not reach the cluster.
 severity: error
-match: { format: yaml, path: 'k8s/**/*.yaml' }
+match: { format: yaml, glob: 'k8s/**/*.yaml' }
 check:
-  jq: '.spec.containers[]?.image | test("debug|nightly") | not'
-  message: 'no debug/nightly images allowed in k8s manifests'
+  jq: '.spec.template.spec.containers[]? | select(.image | test("debug|nightly"))'
+  message: "container '{{ .name }}' uses {{ .image }}: no debug/nightly images in k8s manifests"
 ```
 
 `dq rules add @std/<ns>` materialises a standard ruleset into `./.dq/rules/<ns>/` for local override or vendoring.
@@ -279,7 +287,7 @@ Bulk multi-file mode prints `Modified: N, Skipped: M, Failed: K`; Skipped counts
 | Code | Meaning |
 |---|---|
 | 0 | success |
-| 1 | generic (`--check` changes pending, `PatchTestFailed`, a value a read command, `convert` or `set --jq` cannot write in the output format, such as NaN or Infinity in JSON; `keys` / `values` / `len` on a node of the wrong type) |
+| 1 | generic (`exists` answering no, `--check` changes pending, `PatchTestFailed`, a value a read command, `convert` or `set --jq` cannot write in the output format, such as NaN or Infinity in JSON; `keys` / `values` / `len` on a node of the wrong type) |
 | 2 | not found (a JSON Pointer or a `--doc N` the file does not have); usage error (incl. `--doc` on a command that cannot honour it, stdin without `--input-format`, a `-F` naming another format than the file a write command keeps, `-i` or `--check` on stdin) |
 | 3 | parse error (incl. templated file) |
 | 4 | validate fail; `self update` refused an archive at its SHA-256 check |
@@ -293,7 +301,7 @@ WASM lint+fix plugins via a WIT-described ABI and a `wasmtime` runtime (Componen
 
 ```sh
 # Build dq with plugin support enabled
-cargo install --locked --features plugins dq-cli
+cargo install --locked --features plugins --git https://github.com/mazuninky/dq dq-cli
 
 # Build the example plugin
 cd examples/plugin-rust && cargo component build --release --target wasm32-unknown-unknown
@@ -316,22 +324,24 @@ See [examples/plugin-rust/](examples/plugin-rust/) for a minimal Rust reference 
 
 ## CI integration
 
-`dq validate -F sarif` and `dq lint -F sarif` produce SARIF 2.1.0 documents that GitHub Code Scanning ingests directly:
+`dq lint -F sarif` writes a SARIF 2.1.0 document to stdout that GitHub Code Scanning ingests directly:
 
 ```yaml
 # .github/workflows/lint.yml
 - name: Install dq
   run: curl -sSfL https://raw.githubusercontent.com/mazuninky/dq/master/scripts/install.sh | sh
 
-- name: Validate manifests
-  continue-on-error: true   # exit 4 on parse errors must not skip upload-sarif below
-  run: dq validate -F sarif 'k8s/**/*.yaml' 2> dq-results.sarif
+- name: Lint manifests
+  continue-on-error: true   # exit 4 on an error-severity finding must not skip upload-sarif below
+  run: dq lint -F sarif 'k8s/**/*.yaml' > dq-results.sarif
 
 - uses: github/codeql-action/upload-sarif@v3
   if: always()
   with:
     sarif_file: dq-results.sarif
 ```
+
+A file that does not parse stops `dq lint` with exit 3 and no SARIF. `dq validate -F sarif FILE` checks one file and reports a parse error as SARIF on stderr (nothing when the file parses, exit 4 when it does not).
 
 Pre-commit hooks shipped at the repo root ([`.pre-commit-hooks.yaml`](.pre-commit-hooks.yaml)) cover `dq fmt --check` and `dq validate` for fast local feedback.
 
@@ -346,9 +356,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Lint manifests
-        uses: docker://ghcr.io/mazuninky/dq@sha256:<digest>
-        with:
-          args: lint 'k8s/**/*.yaml' -F sarif
+        continue-on-error: true
+        run: >
+          docker run --rm -v "$PWD:/work" ghcr.io/mazuninky/dq@sha256:<digest>
+          lint 'k8s/**/*.yaml' -F sarif > dq-results.sarif
       - uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
@@ -421,7 +432,8 @@ The push of a `vYYYY.WW.BUILD` tag triggers [.github/workflows/release.yml](.git
 1. `verify-version` — asserts the tag matches `cargo pkgid -p dq-cli`.
 2. `build` (matrix: `x86_64-linux-gnu`, `aarch64-linux-gnu`, `aarch64-apple-darwin`) — release binary + `dq generate-docs` man/completions, packaged as tar.gz with per-target `.sha256` sidecars.
 3. `release` — combined `dq-checksums.txt`, [build provenance attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations), optional cosign signing (only when `COSIGN_PRIVATE_KEY` is set), GitHub Release with auto-generated notes.
-4. `bump-homebrew-tap` — opens a PR against [mazuninky/homebrew-tap](https://github.com/mazuninky/homebrew-tap) updating `Formula/dq.rb` (skipped without `HOMEBREW_TAP_TOKEN`).
+
+The Homebrew formula (`Formula/dq.rb` in [mazuninky/homebrew-tap](https://github.com/mazuninky/homebrew-tap)) is bumped by a separate pull request there once the release is out; the release workflow does not touch the tap.
 
 ## License
 
