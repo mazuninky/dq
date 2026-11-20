@@ -111,8 +111,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_color: bool,
 
-    /// Disable automatic paging of long output.
-    #[arg(long, global = true)]
+    /// Accepted for compatibility; does nothing — dq has no pager.
+    ///
+    /// Hidden from `--help` so nobody reaches for it, kept so scripts that
+    /// pass it do not break.
+    #[arg(long, global = true, hide = true)]
     pub no_pager: bool,
 
     /// Which document of a multi-document YAML stream (`---`-separated) to

@@ -7,6 +7,8 @@
 //! `-F` picks the reporter). Write commands put a file back in its own
 //! format: a `-F` naming another one is a usage error (exit 2), the same
 //! one is accepted so scripts passing `-F yaml -i` keep working.
+//!
+//! `--no-pager` stays accepted as a hidden no-op: dq has no pager.
 
 use assert_cmd::Command;
 use pretty_assertions::assert_eq;
@@ -291,4 +293,17 @@ fn convert_in_place_still_takes_dash_f_as_the_target_format() {
     );
     assert_eq!(code, 0, "{stderr}");
     assert!(dir.path().join("config.json").exists());
+}
+
+#[test]
+fn no_pager_is_accepted_and_hidden_from_help() {
+    let dir = dir_with("config.yaml", CONFIG);
+    let (code, stdout, stderr) = run(&dir, &["--no-pager", "get", "config.yaml", "/a"], "");
+    assert_eq!((code, stdout.as_str(), stderr.as_str()), (0, "1\n", ""));
+    for args in [&["--help"][..], &["get", "--help"][..], &["-h"][..]] {
+        let (code, stdout, _) = run(&dir, args, "");
+        assert_eq!(code, 0);
+        assert!(!stdout.contains("--no-pager"), "{args:?}:\n{stdout}");
+        assert!(stdout.contains("--input-format"), "{args:?}:\n{stdout}");
+    }
 }
