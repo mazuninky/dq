@@ -206,7 +206,7 @@ A jq expression over the document that must produce **one** value: a JSON
 Patch array limited to `add`, `replace`, `remove` (an `EditScript`, see
 [ir-and-edit-ops.md](ir-and-edit-ops.md)).
 It is applied as a textual edit, so comments and layout survive. On HCL,
-XML, INI, dotenv and CSV/TSV, which have no textual edits, the script changes
+XML, INI, dotenv, CSV/TSV and JSON Lines, which have no textual edits, the script changes
 the value tree and the file is re-emitted through its writer, as `fix.jq`
 does: comments go (XML keeps its own), and an op whose result the writer
 cannot hold fails the rule with the writer's error (exit 3).

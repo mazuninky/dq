@@ -70,7 +70,7 @@ it).
 |---|---|---|---|---|
 | YAML (`yaml`) | `.yaml`, `.yml` | yes, incl. multi-document streams | yes, textual, comments kept | yes, comments dropped |
 | JSON (`json`) | `.json` | yes | yes, textual | yes |
-| JSON Lines (`jsonl`) | `.jsonl`, `.ndjson` | yes, as an array of records | no (exit 7) | yes, one record per line |
+| JSON Lines (`jsonl`) | `.jsonl`, `.ndjson` | yes, as an array of records | yes, rewritten | yes, one record per line |
 | TOML (`toml`) | `.toml` | yes | yes, textual, comments kept | yes, comments dropped |
 | HCL (`hcl`) | `.hcl`, `.tf`, `.tfvars` | yes | yes, rewritten, comments dropped | yes, best effort |
 | INI / properties (`ini`) | `.ini`, `.properties`, `.cfg` | yes | yes, rewritten, comments dropped | yes, comments dropped |
@@ -87,13 +87,14 @@ Notes on the table:
 
 - "Point edits" are the textual edits described in
   [write-commands.md](write-commands.md) on YAML, JSON and TOML. On HCL, INI,
-  dotenv, CSV/TSV and XML ("rewritten") they change the value tree and write
-  the whole file anew through the format's writer, as `set --jq` does: the
-  layout is the writer's, and comments go (XML keeps its comments, which are
-  in its tree). A value the writer cannot hold is refused with its error
-  (exit 1) and the file is left alone. On JSON Lines, Markdown and
-  frontmatter point edits fail with `write operation unavailable: <format>
-  has no textual edits` (exit 7); use `set --jq` on JSON Lines.
+  dotenv, CSV/TSV, XML and JSON Lines ("rewritten") they change the value
+  tree and write the whole file anew through the format's writer, as
+  `set --jq` does: the layout is the writer's, and comments go (XML keeps
+  its comments, which are in its tree). A JSON Lines record is addressed by
+  its index (`/0/level`), as `get` addresses it. A value the writer cannot
+  hold is refused with its error (exit 1) and the file is left alone. On
+  Markdown and frontmatter point edits fail with `write operation
+  unavailable: <format> has no textual edits` (exit 7).
 - `-F dockerfile` and `-F ignore-list` do not exist as output formats; clap
   rejects them (exit 2). `--input-format dockerfile` and `ignore-list` read
   them.

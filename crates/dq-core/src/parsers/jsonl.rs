@@ -70,10 +70,13 @@ impl Format for Jsonl {
             // into our accumulating array.
             items.push(doc.value().clone());
         }
-        Ok(Document::value_only(
-            Value::Array(items),
-            crate::document::FormatTag::Jsonl,
-        ))
+        // Point edits rewrite the file whole, records addressed by index
+        // (`Document::edits_by_rewrite`); its bytes stay for an edit that
+        // changes nothing.
+        Ok(
+            Document::value_only(Value::Array(items), crate::document::FormatTag::Jsonl)
+                .with_source_bytes(bytes),
+        )
     }
 
     fn write(&self, doc: &Document, w: &mut dyn Write) -> Result<()> {

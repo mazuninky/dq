@@ -529,7 +529,7 @@ pub enum Command {
     /// as mappings by default; `--no-create` rejects them with exit 2.
     ///
     /// YAML, JSON and TOML files are edited in place: comments and
-    /// formatting stay. XML, HCL, INI, dotenv and CSV/TSV files are written
+    /// formatting stay. XML, HCL, INI, dotenv, CSV/TSV and JSON Lines files are written
     /// whole anew through the format's writer, as `--jq` does: formatting
     /// is not kept, and neither are comments, except XML's.
     Set(SetArgs),
@@ -537,23 +537,23 @@ pub enum Command {
     /// produces a structured Path error and exit 2.
     ///
     /// YAML, JSON and TOML files are edited in place: comments and
-    /// formatting stay. XML, HCL, INI, dotenv and CSV/TSV files are written
+    /// formatting stay. XML, HCL, INI, dotenv, CSV/TSV and JSON Lines files are written
     /// whole anew through the format's writer: formatting is not kept,
     /// and neither are comments, except XML's.
     Del(DelArgs),
     /// Apply an RFC 6902 JSON Patch.
     ///
     /// Edits YAML, JSON and TOML in place, comments kept; writes XML, HCL,
-    /// INI, dotenv and CSV/TSV whole anew, formatting and comments (but
-    /// XML's) dropped.
+    /// INI, dotenv, CSV/TSV and JSON Lines whole anew, formatting and
+    /// comments (but XML's) dropped.
     Patch(PatchArgs),
     /// Evaluate a jq expression over the document and emit the result stream.
     Query(QueryArgs),
     /// Apply an RFC 7396 JSON Merge Patch.
     ///
     /// Edits YAML, JSON and TOML in place, comments kept; writes XML, HCL,
-    /// INI, dotenv and CSV/TSV whole anew, formatting and comments (but
-    /// XML's) dropped.
+    /// INI, dotenv, CSV/TSV and JSON Lines whole anew, formatting and
+    /// comments (but XML's) dropped.
     Merge(MergeArgs),
     /// Emit a shell completion script to stdout.
     Completions(CompletionsArgs),

@@ -12,7 +12,7 @@ whether comments survive:
 
 | | Textual edit | Re-emit |
 |---|---|---|
-| Used by | `set` / `del` with a pointer, `patch`, `merge`, rule `fix.ops`, plugin fixes — on YAML, JSON, TOML | `set --jq`, `fmt`, `convert`, rule `fix.jq`; the point edits on HCL, XML, INI, dotenv, CSV/TSV |
+| Used by | `set` / `del` with a pointer, `patch`, `merge`, rule `fix.ops`, plugin fixes — on YAML, JSON, TOML | `set --jq`, `fmt`, `convert`, rule `fix.jq`; the point edits on HCL, XML, INI, dotenv, CSV/TSV, JSON Lines |
 | Formats | YAML, JSON, TOML | every writable format |
 | How | splices only the bytes of the changed node, using the span map built at parse time | parses to a value, transforms it, writes the whole document with the format's writer |
 | Keeps | comments, blank lines, key order, quote style, anchors/aliases, flow vs. block style, indentation, line endings (LF, CRLF, lone CR), BOM | key order only |
@@ -21,7 +21,7 @@ whether comments survive:
 The trade-off is deliberate: textual edits are the round-trip guarantee,
 re-emit is for transforms that may change the structure arbitrarily.
 
-HCL, XML, INI, dotenv and CSV/TSV have no textual edits, so a point edit
+HCL, XML, INI, dotenv, CSV/TSV and JSON Lines have no textual edits, so a point edit
 (`set` / `del` with a pointer, `patch`, `merge`, `fix.ops`) on them is
 made to the value tree and the whole file is re-emitted, exactly as
 `set --jq` would: `dq set app.ini /server/port 8080` writes
@@ -39,9 +39,10 @@ to what is there, or to one that reads back as it (`80` in INI, whose
 `80` is a string) — leaves the file's bytes alone, comments included:
 `--check` exits 0, and a bulk run counts the file as `Skipped`. Textual
 edits behave the same. `--sort-keys` and `--indent` stay no-ops on point
-edits, as on the textual ones (`dq fmt` applies them). Point edits on JSON
-Lines and Markdown fail with exit 7 ("has no textual edits"); use
-`set --jq` to rewrite a JSON Lines file.
+edits, as on the textual ones (`dq fmt` applies them). A JSON Lines record
+is addressed by its index, as `get` addresses it: `dq set log.jsonl
+/0/level warn` rewrites the file one compact record per line. Point edits
+on Markdown fail with exit 7 ("has no textual edits").
 
 A textual edit is checked before it is written: dq re-reads the edited bytes
 and requires that they read back as exactly the requested change. If the
@@ -151,7 +152,7 @@ A path assignment creates what it walks through, as jq does:
 ## `dq patch <file> <ops>`
 
 Applies an RFC 6902 JSON Patch through textual edits (YAML, JSON, TOML), or
-through the writer on HCL, XML, INI, dotenv and CSV/TSV (see
+through the writer on HCL, XML, INI, dotenv, CSV/TSV and JSON Lines (see
 [Two ways to write a file](#two-ways-to-write-a-file)).
 
 - Ops from: inline JSON array, `-` (stdin), `@path`, or `--ops-from <path>`.
@@ -174,7 +175,7 @@ through the writer on HCL, XML, INI, dotenv and CSV/TSV (see
 ## `dq merge <file> <patch>`
 
 Applies an RFC 7396 Merge Patch through textual edits (through the writer on
-HCL, XML, INI, dotenv and CSV/TSV). Patch from inline
+HCL, XML, INI, dotenv, CSV/TSV and JSON Lines). Patch from inline
 JSON, `-`, `@path` or `--patch-from <path>`.
 
 - `null` removes a key; objects merge recursively; arrays and scalars

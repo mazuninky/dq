@@ -39,7 +39,7 @@ with a template changed:
 - Every string (value or key) holding a template must read back from the
   written text as the same string — through the textual edit, or through
   the writer when the file is rewritten whole (`set --jq`, a `fix.jq`, `fmt`, and
-  the formats edited by rewriting: XML, HCL, INI, dotenv, CSV/TSV). Strings
+  the formats edited by rewriting: XML, HCL, INI, dotenv, CSV/TSV, JSON Lines). Strings
   the edit targets are exempt: `set`, `del` and `patch` may replace or
   remove the node a template is in, `merge` the members its patch names, and
   a value set may bring a template of its own.

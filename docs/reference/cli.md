@@ -15,7 +15,7 @@ other reference pages (linked from the command table below).
 | `convert` | Re-emit in another format (`-F`), optionally in place | [read-commands.md](read-commands.md), [write-commands.md](write-commands.md) |
 | `validate` | Parse and report parse errors | [read-commands.md](read-commands.md) |
 | `diff` | Structural diff of two files (JSON Patch or unified) | [write-commands.md](write-commands.md) |
-| `set`, `del` | Point edits (textual and comment-preserving on YAML, JSON, TOML; a rewrite through the writer on HCL, XML, INI, dotenv, CSV/TSV) | [write-commands.md](write-commands.md) |
+| `set`, `del` | Point edits (textual and comment-preserving on YAML, JSON, TOML; a rewrite through the writer on HCL, XML, INI, dotenv, CSV/TSV, JSON Lines) | [write-commands.md](write-commands.md) |
 | `set --jq` | Whole-document jq transform (re-emit) | [write-commands.md](write-commands.md) |
 | `patch`, `merge` | RFC 6902 JSON Patch, RFC 7396 Merge Patch | [write-commands.md](write-commands.md) |
 | `fmt` | Canonicalise through the format's writer | [fmt.md](fmt.md) |
@@ -256,7 +256,7 @@ defined as named constants in `crates/dq-cli/src/exit_code.rs`.
 | 4 | `VALIDATE_FAIL` | `validate` found a parse error; `lint` / `check` found an error-severity diagnostic; a plugin trapped, ran out of fuel or memory, or failed to load; `self update` refused a downloaded archive at its SHA-256 check. |
 | 5 | `IO_ERROR` | Read-side I/O (missing file, unreadable file, a glob root that does not exist or a glob that matched nothing); network errors in `self check` / `self update` (incl. downloading `dq-checksums.txt`). |
 | 6 | `INVALID_INPUT` | A flag combination a handler refuses; write flags on a read command; unsupported format or file extension; a reporter that does not fit the command; unknown rule id or `@std` namespace; bad fixture file; `--plugins` without the `plugins` feature; `dq merge` on a stream; `self update` into a path the user cannot write. |
-| 7 | `WRITE_FAILED` | Writing failed (temp file, rename, backup); the format takes no point edits (`set` on JSON Lines, Markdown, Dockerfile, …); a textual edit refused because the file would not read back as the change (`edit_rejected`); a bulk run with `--continue-on-error` where any file failed; `self update` could not replace the binary. |
+| 7 | `WRITE_FAILED` | Writing failed (temp file, rename, backup); the format takes no point edits (`set` on Markdown, Dockerfile, …); a textual edit refused because the file would not read back as the change (`edit_rejected`); a bulk run with `--continue-on-error` where any file failed; `self update` could not replace the binary. |
 
 The split between 2 and 6 follows who raises the error: anything clap rejects
 while parsing (and the usage errors handlers build as clap errors: `--doc`

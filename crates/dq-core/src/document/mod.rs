@@ -1102,13 +1102,13 @@ impl Document {
     ///
     /// # Formats without textual edits
     ///
-    /// A document of XML, HCL, INI, dotenv, CSV or TSV
+    /// A document of XML, HCL, INI, dotenv, CSV, TSV or JSON Lines
     /// ([`Document::edits_by_rewrite`]) takes `value` into its tree, with
     /// the same mkdir-p, and is written whole anew through its format's
     /// writer: layout and comments (but XML's) go, and the tree becomes what the
     /// written bytes read back as. A tree the writer refuses is its error
     /// ([`Error::Format`]), and the document is left as it was. Any other
-    /// format with no textual edits (Markdown, JSONL, Dockerfile, …) is
+    /// format with no textual edits (Markdown, Dockerfile, …) is
     /// [`Error::WriteUnavailable`].
     ///
     /// # Read-back check
@@ -1245,7 +1245,7 @@ impl Document {
     /// Whether [`Document::set_at`], [`Document::del_at`] and
     /// [`Document::insert_at`] change this document by writing it whole
     /// anew through its format's writer, as `set --jq` does, rather than
-    /// by a textual edit: a document of XML, HCL, INI, dotenv, CSV or TSV,
+    /// by a textual edit: a document of XML, HCL, INI, dotenv, CSV, TSV or JSON Lines,
     /// formats dq writes but has no textual edits for. Layout is not kept,
     /// nor are comments but XML's, which its tree holds; an HCL document
     /// keeps writing its blocks as blocks.
@@ -1261,6 +1261,7 @@ impl Document {
                     | FormatTag::DotEnv
                     | FormatTag::Csv
                     | FormatTag::Tsv
+                    | FormatTag::Jsonl
             )
     }
 
@@ -2901,7 +2902,7 @@ impl Document {
     ///   to is refused: the alias would dangle, or resolve to an earlier
     ///   definition of the same name.
     ///
-    /// A document of XML, HCL, INI, dotenv, CSV or TSV
+    /// A document of XML, HCL, INI, dotenv, CSV, TSV or JSON Lines
     /// ([`Document::edits_by_rewrite`]) loses the node from its tree and is
     /// written whole anew, as [`Document::set_at`] describes.
     ///

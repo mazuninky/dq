@@ -341,7 +341,7 @@ fn set_and_del_help_say_which_formats_lose_their_comments() {
         let help = String::from_utf8(out.stdout).unwrap().replace('\n', " ");
         let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            help.contains("YAML, JSON and TOML files are edited in place: comments and formatting stay. XML, HCL, INI, dotenv and CSV/TSV files are written whole anew through the format's writer"),
+            help.contains("YAML, JSON and TOML files are edited in place: comments and formatting stay. XML, HCL, INI, dotenv, CSV/TSV and JSON Lines files are written whole anew through the format's writer"),
             "{command}: {help}"
         );
         assert!(

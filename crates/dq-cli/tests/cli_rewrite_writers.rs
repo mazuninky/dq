@@ -398,3 +398,43 @@ fn a_textual_edit_that_changes_nothing_already_left_the_file_alone() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// JSON Lines point edits
+// ---------------------------------------------------------------------------
+
+#[test]
+fn jsonl_point_edits_address_records_by_index_and_rewrite_the_file() {
+    let src = "{\"a\":1,\"b\":[1, 2]}\n{\"a\":2}\n";
+    // `get` addresses a record by its index; the edits do the same. Was:
+    // exit 7, "jsonl has no textual edits".
+    assert_eq!(
+        run("a.jsonl", src, &["get", "a.jsonl", "/1/a"]).stdout,
+        "2\n"
+    );
+    edits_to(
+        "a.jsonl",
+        src,
+        &["set", "a.jsonl", "/0/a", "5"],
+        "{\"a\":5,\"b\":[1,2]}\n{\"a\":2}\n",
+    );
+    edits_to(
+        "a.jsonl",
+        src,
+        &["set", "a.jsonl", "/-", r#"{"c": true}"#],
+        "{\"a\":1,\"b\":[1,2]}\n{\"a\":2}\n{\"c\":true}\n",
+    );
+    edits_to("a.jsonl", src, &["del", "a.jsonl", "/0"], "{\"a\":2}\n");
+    edits_to(
+        "a.jsonl",
+        src,
+        &[
+            "patch",
+            "a.jsonl",
+            r#"[{"op": "add", "path": "/1/c", "value": null}]"#,
+        ],
+        "{\"a\":1,\"b\":[1,2]}\n{\"a\":2,\"c\":null}\n",
+    );
+    // A value already there leaves the file as it is.
+    edits_to("a.jsonl", src, &["set", "a.jsonl", "/1/a", "2"], src);
+}
