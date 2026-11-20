@@ -1540,14 +1540,20 @@ impl Document {
     /// `action` (`set`, `delete`, `insert`) at `pointer`: in HCL, the
     /// expressions the edit replaces or removes go, and those it moves up
     /// or down an array move with their values
-    /// ([`crate::parsers::hcl::HclLayout::after_edit`]).
+    /// ([`crate::parsers::hcl::HclLayout::after_edit`]); in XML, the slots
+    /// of the top-level comments and PIs go and come with them
+    /// ([`crate::parsers::xml::XmlLayout::after_edit`]).
     ///
     /// # Errors
     ///
     /// [`Error::Format`] when `pointer` runs through an HCL expression.
     fn layout_after_edit(&self, action: &'static str, pointer: &Pointer) -> Result<Layout> {
-        let Layout::Hcl(layout) = &self.layout else {
-            return Ok(self.layout.clone());
+        let layout = match &self.layout {
+            Layout::Hcl(layout) => layout,
+            Layout::Xml(layout) => {
+                return Ok(Layout::Xml(layout.after_edit(action, pointer, &self.value)));
+            }
+            _ => return Ok(self.layout.clone()),
         };
         let segments = pointer.segments();
         let parent_len = match segments.split_last() {

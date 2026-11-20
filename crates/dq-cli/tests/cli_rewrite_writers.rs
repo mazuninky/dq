@@ -425,6 +425,85 @@ fn xml_comments_and_pis_outside_the_root_keep_their_order_and_lines() {
     );
 }
 
+/// A point edit of a top-level comment or PI moves the slots the file had
+/// them in with the items: every other one keeps its side of the root and
+/// its order.
+#[test]
+fn xml_point_edits_outside_the_root_keep_every_other_item_in_place() {
+    let src = "<!-- c1 -->\n<?pi a?>\n<r>\n  <c>1</c>\n</r>\n<!-- after -->\n<?tail b?>\n";
+    let root = "<r>\n  <c>1</c>\n</r>\n";
+    let cases: &[(&[&str], String)] = &[
+        // Was: `<!-- after -->` written before the root, in `c1`'s place.
+        (
+            &["del", "a.xml", "/#comments/0"],
+            format!("<?pi a?>\n{root}<!-- after -->\n<?tail b?>\n"),
+        ),
+        (
+            &["del", "a.xml", "/#comments/1"],
+            format!("<!-- c1 -->\n<?pi a?>\n{root}<?tail b?>\n"),
+        ),
+        // Was: `<?tail b?>` written before the root.
+        (
+            &["del", "a.xml", "/#pi/0"],
+            format!("<!-- c1 -->\n{root}<!-- after -->\n<?tail b?>\n"),
+        ),
+        (
+            &["del", "a.xml", "/#comments"],
+            format!("<?pi a?>\n{root}<?tail b?>\n"),
+        ),
+        (
+            &["set", "a.xml", "/#comments/1", "y"],
+            format!("<!-- c1 -->\n<?pi a?>\n{root}<!--y-->\n<?tail b?>\n"),
+        ),
+        (
+            &["set", "a.xml", "/#comments/-", "z"],
+            format!("<!-- c1 -->\n<?pi a?>\n{root}<!-- after -->\n<!--z-->\n<?tail b?>\n"),
+        ),
+        (
+            &["set", "a.xml", "/#pi/-", "z q"],
+            format!("<!-- c1 -->\n<?pi a?>\n{root}<!-- after -->\n<?tail b?>\n<?z q?>\n"),
+        ),
+        // Was: `c1` written after the root, in the slot of `after`.
+        (
+            &[
+                "patch",
+                "a.xml",
+                r#"[{"op":"add","path":"/#comments/0","value":"x"}]"#,
+            ],
+            format!("<!--x-->\n<!-- c1 -->\n<?pi a?>\n{root}<!-- after -->\n<?tail b?>\n"),
+        ),
+        (
+            &[
+                "patch",
+                "a.xml",
+                r#"[{"op":"add","path":"/#comments/1","value":"x"}]"#,
+            ],
+            format!("<!-- c1 -->\n<?pi a?>\n{root}<!--x-->\n<!-- after -->\n<?tail b?>\n"),
+        ),
+        (
+            &[
+                "patch",
+                "a.xml",
+                r#"[{"op":"add","path":"/#pi/1","value":"x"}]"#,
+            ],
+            format!("<!-- c1 -->\n<?pi a?>\n{root}<!-- after -->\n<?x?>\n<?tail b?>\n"),
+        ),
+        // A batch: each edit moves the slots the one before it left.
+        (
+            &[
+                "patch",
+                "a.xml",
+                r#"[{"op":"remove","path":"/#comments/0"},{"op":"remove","path":"/#pi/1"},
+                    {"op":"add","path":"/#comments/0","value":"x"}]"#,
+            ],
+            format!("<?pi a?>\n{root}<!--x-->\n<!-- after -->\n"),
+        ),
+    ];
+    for (args, want) in cases {
+        edits_to("a.xml", src, args, want);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // An edit that changes nothing leaves the bytes alone
 // ---------------------------------------------------------------------------

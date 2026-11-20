@@ -146,6 +146,7 @@ use crate::Result;
 use crate::document::{Document, FormatTag, Layout, Value};
 use crate::error::Error;
 use crate::format::Format;
+use crate::pointer::{Pointer, Segment};
 
 /// Conventional key for the XML declaration block at the top level.
 const KEY_XML_DECL: &str = "#xml";
@@ -216,6 +217,75 @@ impl Format for Xml {
 pub(crate) struct XmlLayout {
     crlf: bool,
     top: Vec<TopItem>,
+}
+
+impl XmlLayout {
+    /// This layout after the point edit `action` (`set`, `delete`,
+    /// `insert`) at `pointer` of `tree`, the tree before the edit: a
+    /// top-level comment or PI deleted takes its slot with it, and one
+    /// inserted or appended gets a slot of its own — before the one of the
+    /// item it goes in front of, after the last of its kind when appended,
+    /// before the root when the file had none — so every other item keeps
+    /// its side of the root and its order. Deleting the whole `#comments`
+    /// or `#pi` drops every slot of its kind; any other edit leaves the
+    /// slots as they are.
+    pub(crate) fn after_edit(&self, action: &str, pointer: &Pointer, tree: &Value) -> Self {
+        let segments = pointer.segments();
+        let (kind, key) = match segments.first() {
+            Some(Segment::Key(key)) if key == KEY_COMMENTS => (TopItem::Comment, KEY_COMMENTS),
+            Some(Segment::Key(key)) if key == KEY_PI => (TopItem::Pi, KEY_PI),
+            _ => return self.clone(),
+        };
+        let mut top = self.top.clone();
+        let slots: Vec<usize> = (0..top.len()).filter(|&at| top[at] == kind).collect();
+        let len = match tree {
+            Value::Map(top) => match top.get(key) {
+                Some(Value::Array(items)) => items.len(),
+                _ => 0,
+            },
+            _ => 0,
+        };
+        let index = match segments.get(1..) {
+            Some([]) => {
+                if action == "delete" {
+                    top.retain(|item| *item != kind);
+                }
+                return Self { top, ..*self };
+            }
+            Some([Segment::Index(index)]) => *index,
+            Some([Segment::Key(dash)]) if dash == "-" => len,
+            // A parsed pointer holds `/0` as a key, read as an index in an
+            // array ([`Pointer::resolve`]).
+            Some([Segment::Key(key)]) => match key.parse::<usize>() {
+                Ok(index) => index,
+                Err(_) => return self.clone(),
+            },
+            _ => return self.clone(),
+        };
+        let appends = index >= len;
+        match action {
+            "delete" => {
+                if let Some(&at) = slots.get(index) {
+                    top.remove(at);
+                }
+            }
+            "insert" | "set" if action == "insert" || appends => {
+                let at = match slots.get(index) {
+                    Some(&at) if !appends => at,
+                    _ => match slots.last() {
+                        Some(&last) => last + 1,
+                        None => top
+                            .iter()
+                            .position(|item| *item == TopItem::Root)
+                            .unwrap_or(top.len()),
+                    },
+                };
+                top.insert(at, kind);
+            }
+            _ => {}
+        }
+        Self { top, ..*self }
+    }
 }
 
 /// One item at the top level of an XML document, past its declaration.
@@ -3296,6 +3366,37 @@ mod tests {
 
     fn parse(s: &str) -> Value {
         parse_xml(s.as_bytes()).expect("parse xml")
+    }
+
+    #[test]
+    fn after_edit_moves_the_top_level_slots_with_their_items() {
+        use TopItem::{Comment as C, Pi as P, Root as R};
+        let src = b"<?p x?><r/><!--b-->";
+        let (tree, top) = parse_xml_with_order(src).unwrap();
+        let layout = XmlLayout { crlf: false, top };
+        let after = |action, pointer| {
+            layout
+                .after_edit(action, &Pointer::parse(pointer).unwrap(), &tree)
+                .top
+        };
+        assert_eq!(after("delete", "/#comments/0"), vec![P, R]);
+        assert_eq!(after("insert", "/#comments/0"), vec![P, R, C, C]);
+        assert_eq!(after("set", "/#comments/0"), vec![P, R, C]);
+        // Appended: after the last of its kind.
+        assert_eq!(after("set", "/#pi/-"), vec![P, P, R, C]);
+        // Anything else leaves the slots alone.
+        assert_eq!(after("delete", "/r"), vec![P, R, C]);
+        assert_eq!(after("delete", "/#comments/0/x"), vec![P, R, C]);
+        // No slot of a kind yet: the new one goes before the root.
+        let bare = XmlLayout {
+            crlf: false,
+            top: vec![R],
+        };
+        assert_eq!(
+            bare.after_edit("set", &Pointer::parse("/#comments/-").unwrap(), &tree)
+                .top,
+            vec![C, R]
+        );
     }
 
     #[test]

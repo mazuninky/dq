@@ -379,8 +379,12 @@ comments, CDATA, PIs, prefixes and the declaration survive; whitespace
 between elements is normalised, two-space indents. Outside the root, the
 declaration, the comments, the PIs and the root each stand on a line of
 their own, in the order the file had them: a comment after the root stays
-after it (`<r/>` then `<!-- end -->`). One a filter adds goes after the last
-of its kind, or before the root when the file had none; a tree from
+after it (`<r/>` then `<!-- end -->`). A point edit (`set`, `del`, `patch`)
+of one of them moves only it: `del /#comments/0` leaves every other comment
+and PI on its side of the root, and one inserted at `/#comments/1` goes
+right before the comment it pushes down. One appended (`/#comments/-`) or
+added by a filter goes after the last of its kind, or before the root when
+the file had none; a tree from
 another format writes its PIs, then its comments, then the root. Every output
 (`convert -F xml`, `fmt`, `set`, `del`, `set --jq`, `fix`) ends with exactly
 one line break, encoded as the rest of the output (after the BOM, in
