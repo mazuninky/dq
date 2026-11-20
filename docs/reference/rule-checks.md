@@ -155,6 +155,11 @@ original design made them errors with exit 1).
 3. Each nested diagnostic is projected onto the outer file and its message is
    prefixed with the outer `message`.
 
+The outer `message` is put ahead of a nested message and of a parse failure
+the way a schema rule's prefix is: trailing blanks and one trailing colon
+are dropped, then `: ` joins it to the rest, so `cfg`, `cfg:` and `"cfg: "`
+all give `cfg: debug is on`; a blank one is no prefix.
+
 ### Projection
 
 With the anchor's position (`line`, `col`) and the anchor's inline offset

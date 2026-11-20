@@ -383,13 +383,10 @@ fn process_extract_item(
             // anchored at the outer coordinates. Per spec scenario
             // "Inner-format parse failure becomes outer-rule diagnostic"
             // we do NOT recurse into `nested` for this item.
-            let prefix = &composite.message_prefix;
-            let raw_message = format!("{format_str} parse failed: {err}");
-            let message = if prefix.is_empty() {
-                raw_message
-            } else {
-                format!("{prefix}: {raw_message}")
-            };
+            let message = crate::evaluator::prefixed(
+                &composite.message_prefix,
+                &format!("{format_str} parse failed: {err}"),
+            );
             // A parse error that knows where it is lands there, projected
             // onto the outer file the way a nested diagnostic is; one that
             // does not lands on the anchor.
@@ -437,12 +434,8 @@ fn process_extract_item(
     // prepend the outer message prefix.
     for inner in inner_evaluation.diagnostics {
         let (projected_line, projected_col) = anchor_position.project(inner.line, inner.col);
-        let prefix = &composite.message_prefix;
-        let projected_message = if prefix.is_empty() {
-            inner.message
-        } else {
-            format!("{prefix}: {}", inner.message)
-        };
+        let projected_message =
+            crate::evaluator::prefixed(&composite.message_prefix, &inner.message);
         out.diagnostics.push(Diagnostic {
             rule_id: inner.rule_id,
             severity: inner.severity,

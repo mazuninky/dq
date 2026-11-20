@@ -944,12 +944,25 @@ fn run_schema_check(
 /// dropped first, so `shape`, `shape:` and `shape: ` all give
 /// `shape: /required: …`; a blank prefix is no prefix.
 fn schema_message(prefix: Option<&str>, keyword: &str, error_text: &str) -> String {
-    let prefix = prefix.unwrap_or_default().trim_end();
+    prefixed(
+        prefix.unwrap_or_default(),
+        &format!("{keyword}: {error_text}"),
+    )
+}
+
+/// `rest` behind a rule's `message` prefix and `: ` — how a schema rule
+/// puts its prefix ahead of each error and a composite rule ahead of each
+/// nested diagnostic and parse failure. Trailing whitespace and one
+/// trailing `:` of the prefix are dropped first, so `shape`, `shape:` and
+/// `shape: ` read alike; a blank prefix is no prefix and `rest` stands
+/// alone.
+pub(crate) fn prefixed(prefix: &str, rest: &str) -> String {
+    let prefix = prefix.trim_end();
     let prefix = prefix.strip_suffix(':').unwrap_or(prefix).trim_end();
     if prefix.is_empty() {
-        format!("{keyword}: {error_text}")
+        rest.to_owned()
     } else {
-        format!("{prefix}: {keyword}: {error_text}")
+        format!("{prefix}: {rest}")
     }
 }
 
@@ -1108,6 +1121,17 @@ mod tests {
     use crate::ruleset::RuleSource;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+
+    #[test]
+    fn prefixed_trims_one_colon_and_blanks_and_drops_a_blank_prefix() {
+        for prefix in ["cfg", "cfg:", "cfg: ", "cfg :  "] {
+            assert_eq!(prefixed(prefix, "rest"), "cfg: rest", "{prefix:?}");
+        }
+        assert_eq!(prefixed("cfg::", "rest"), "cfg:: rest");
+        for blank in ["", "  ", " : "] {
+            assert_eq!(prefixed(blank, "rest"), "rest", "{blank:?}");
+        }
+    }
 
     /// Build a minimal ruleset by parsing one or more YAML rule documents.
     fn ruleset_from_yaml(yaml: &str) -> RuleSet {
