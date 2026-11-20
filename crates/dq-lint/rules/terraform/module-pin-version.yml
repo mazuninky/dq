@@ -12,7 +12,8 @@ match:
   format: hcl
 check:
   jq: |
-    [.module // {} | objects | to_entries[]
+    # A root that is not a map yields nothing instead of raising.
+    objects | [.module // {} | objects | to_entries[]
       | .key as $name
       | .value | (if type == "array" then .[] else . end) | objects
       | select(.source != null)

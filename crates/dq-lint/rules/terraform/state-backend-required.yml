@@ -13,7 +13,8 @@ check:
   # Two `terraform {}` blocks (one with `required_providers`, one with the
   # backend) read as a list of their bodies; the backend may sit in any.
   jq: |
-    [.terraform | if type == "array" then .[] else . end | objects] as $blocks
+    # A root that is not a map yields nothing instead of raising.
+    objects | [.terraform | if type == "array" then .[] else . end | objects] as $blocks
     | select($blocks | length > 0)
     | select($blocks | all(.backend == null))
     | {summary: "no backend configured"}

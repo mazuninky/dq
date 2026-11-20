@@ -10,7 +10,8 @@ match:
   format: hcl
 check:
   jq: |
-    [.variable // {} | objects | to_entries[]
+    # A root that is not a map yields nothing instead of raising.
+    objects | [.variable // {} | objects | to_entries[]
       | .key as $name
       | .value | (if type == "array" then .[] else . end)
       | select(.description? == null

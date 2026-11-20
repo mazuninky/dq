@@ -22,8 +22,9 @@ check:
   # of bodies, so every aliased provider block is checked on its own, and
   # a `required_providers` in any `terraform` block counts.
   jq: |
+    # A root that is not a map yields nothing instead of raising.
     def bodies: if type == "array" then .[] else . end;
-    ([.terraform | bodies | objects | .required_providers? | bodies | objects]
+    objects | ([.terraform | bodies | objects | .required_providers? | bodies | objects]
       | add // {}) as $req
     | [.provider // {} | objects | to_entries[]
       | .key as $name
