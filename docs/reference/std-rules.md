@@ -107,7 +107,9 @@ jq and JSON Schema, no OpenAPI library): `info-required-fields` [error,
 or per operation, `security: []` opts out].
 
 **`skills`** (2): `frontmatter` [error, Markdown `SKILL.md` frontmatter] and
-`evals-schema` [error, JSON `evals.json` against `evals.schema.json`]. Being
+`evals-schema` [error, JSON `evals.json` against `evals.schema.json`; each
+eval's statements as skill-creator's `expectations` strings or as
+`assertions` objects or strings]. Being
 expanded; see [../plans/add-std-skills-rules.md](../plans/add-std-skills-rules.md).
 
 ## Known gaps

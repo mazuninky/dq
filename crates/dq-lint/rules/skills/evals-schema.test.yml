@@ -128,6 +128,90 @@ tests:
       violations:
         - rule: skills.evals-schema
 
+  - name: skill-creator's expectations strings pass
+    input: |
+      {
+        "skill_name": "example-skill",
+        "evals": [
+          {
+            "id": 1,
+            "prompt": "User's example prompt",
+            "expected_output": "Description of expected result",
+            "files": ["evals/files/sample1.pdf"],
+            "expectations": [
+              "The output includes X",
+              "The skill used script Y"
+            ]
+          }
+        ]
+      }
+    format: json
+    expected:
+      violations: []
+
+  - name: assertions as strings pass, as skill-creator reads them
+    input: |
+      {
+        "skill_name": "my-skill",
+        "evals": [
+          {
+            "id": 1,
+            "prompt": "x",
+            "expected_output": "y",
+            "assertions": ["The output includes X"]
+          }
+        ]
+      }
+    format: json
+    expected:
+      violations: []
+
+  - name: an eval with neither expectations nor assertions fires
+    input: |
+      {
+        "skill_name": "my-skill",
+        "evals": [
+          { "id": 1, "prompt": "x", "expected_output": "y" }
+        ]
+      }
+    format: json
+    expected:
+      violations:
+        - rule: skills.evals-schema
+
+  - name: empty expectations fire
+    input: |
+      {
+        "skill_name": "my-skill",
+        "evals": [
+          { "id": 1, "prompt": "x", "expected_output": "y", "expectations": [] }
+        ]
+      }
+    format: json
+    expected:
+      violations:
+        - rule: skills.evals-schema
+          message_contains: "less than 1 item"
+
+  - name: an expectation that is no string fires
+    input: |
+      {
+        "skill_name": "my-skill",
+        "evals": [
+          {
+            "id": 1,
+            "prompt": "x",
+            "expected_output": "y",
+            "expectations": [{ "text": "z", "type": "output" }]
+          }
+        ]
+      }
+    format: json
+    expected:
+      violations:
+        - rule: skills.evals-schema
+          message_contains: "not of type"
+
   - name: unrelated json file does not fire
     input: |
       { "name": "package", "version": "1.0.0" }
