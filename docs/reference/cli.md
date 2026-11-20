@@ -237,7 +237,10 @@ present when it says more; `helpUri` is the first `http(s)://` entry of
 Errors are printed on stderr, escaped as `console` escapes text (see
 above): a pointer, a key in `did_you_mean`, a path — what the user typed or
 the file holds — never reaches the terminal with a raw control or direction
-character; the message keeps its own line breaks. A path error names the
+character; the message keeps its own line breaks. A line break inside the
+pointer, the key, the path or the file name prints as `\x0a` (a carriage
+return as `\x0d`), so `dq get x.json $'/a\nY'` reports `path '/a\x0aY' not
+found` on one line rather than a line `Y' …` of its own. A path error names the
 pointer, the deepest prefix that exists and up to three close sibling keys:
 
 ```

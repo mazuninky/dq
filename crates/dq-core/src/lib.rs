@@ -19,7 +19,7 @@ pub use document::{
 };
 pub use edit_ops::{EditOp, EditScript};
 pub use enumerate::enumerate_pointers;
-pub use error::{Error, PathErrorKind};
+pub use error::{Error, PathErrorKind, one_line};
 pub use format::{Format, by_name, detect};
 pub use ir::{
     InlineBaseline, Ir, OwnedIr, Provenance, ProvenanceMap, StreamDocument, SyntheticReason,

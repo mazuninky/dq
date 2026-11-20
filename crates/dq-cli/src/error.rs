@@ -139,7 +139,7 @@ pub struct LintWarnStrict {
 /// (`NOT_FOUND`) — the same family as a JSON Pointer that addresses no
 /// node: the file is fine, the address is not in it.
 #[derive(Debug, thiserror::Error)]
-#[error("--doc {index} is out of range: {file} holds {count} document(s){}", index_hint(*.count))]
+#[error("--doc {index} is out of range: {} holds {count} document(s){}", dq_core::one_line(.file), index_hint(*.count))]
 pub struct DocOutOfRange {
     /// The requested index.
     pub index: usize,
@@ -185,7 +185,7 @@ fn node(pointer: &str) -> String {
     if pointer.is_empty() {
         "the document root".to_owned()
     } else {
-        format!("'{pointer}'")
+        format!("'{}'", dq_core::one_line(pointer))
     }
 }
 

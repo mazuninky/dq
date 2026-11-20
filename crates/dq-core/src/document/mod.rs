@@ -1483,29 +1483,30 @@ impl Document {
         // for, and is written.
         let keep = !self.original_bytes.is_empty() && !replaces_expression;
         let name = self.format.name();
-        let written =
-            match crate::format::by_name(name) {
-                _ if keep && self.value.same_data(&before) => Ok(None),
-                None => Err(self.no_textual_edits("write it")),
-                Some(format) => {
-                    let doc = Document::value_only(
-                        std::mem::replace(&mut self.value, Value::Null),
-                        self.format,
-                    )
-                    .with_layout(std::mem::take(&mut self.layout));
-                    let mut bytes = Vec::new();
-                    let written = format.write(&doc, &mut bytes);
-                    self.value = doc.value;
-                    self.layout = doc.layout;
-                    let rejected = |reason: String| Error::EditRejected {
-                        action,
-                        pointer: pointer.as_canonical(),
-                        reason,
-                    };
-                    written
+        let written = match crate::format::by_name(name) {
+            _ if keep && self.value.same_data(&before) => Ok(None),
+            None => Err(self.no_textual_edits("write it")),
+            Some(format) => {
+                let doc = Document::value_only(
+                    std::mem::replace(&mut self.value, Value::Null),
+                    self.format,
+                )
+                .with_layout(std::mem::take(&mut self.layout));
+                let mut bytes = Vec::new();
+                let written = format.write(&doc, &mut bytes);
+                self.value = doc.value;
+                self.layout = doc.layout;
+                let rejected = |reason: String| Error::EditRejected {
+                    action,
+                    pointer: pointer.as_canonical(),
+                    reason,
+                };
+                written
                     .and_then(|()| {
                         format.parse(&bytes).map_err(|err| {
-                            rejected(format!("the {name} dq would write does not read back: {err}"))
+                            rejected(format!(
+                                "the {name} dq would write does not read back: {err}"
+                            ))
                         })
                     })
                     .and_then(|fresh| {
@@ -1517,12 +1518,13 @@ impl Document {
                         match first_difference(&form(&self.value), &form(&fresh.value), "") {
                             None => Ok(Some((fresh, bytes))),
                             Some(at) => Err(rejected(format!(
-                                "the {name} dq would write reads back as another value at '{at}'"
+                                "the {name} dq would write reads back as another value at '{}'",
+                                crate::error::one_line(&at)
                             ))),
                         }
                     })
-                }
-            };
+            }
+        };
         match written {
             Ok(Some((fresh, bytes))) if !(keep && fresh.value.same_data(&before)) => {
                 self.value = fresh.value;

@@ -94,9 +94,10 @@ pub fn expand_glob(pattern: &Utf8Path) -> anyhow::Result<Vec<Utf8PathBuf>> {
         return Ok(vec![pattern.to_owned()]);
     }
     glob::expand(pattern).map_err(|err| match err {
-        GlobError::Invalid { pattern, source } => {
-            anyhow::Error::new(source).context(format!("invalid glob pattern: {pattern}"))
-        }
+        GlobError::Invalid { pattern, source } => anyhow::Error::new(source).context(format!(
+            "invalid glob pattern: {}",
+            dq_core::one_line(pattern.as_str())
+        )),
         GlobError::RootMissing { ref root } => anyhow::Error::new(dq_core::Error::Io {
             path: root.clone(),
             source: io::Error::new(io::ErrorKind::NotFound, err.to_string()),

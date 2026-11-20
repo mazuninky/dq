@@ -183,3 +183,42 @@ fn errors_escape_controls_in_any_message() {
     assert!(err.contains("no\\x1b]0;t\\x07.json"), "{err:?}");
     assert!(!err.contains(['\u{1b}', '\u{7}']), "{err:?}");
 }
+
+/// A line break in what the user or the file put in an error — a pointer,
+/// a key, a file name — prints as `\x0a` (`\x0d` for a carriage return),
+/// so it cannot start a line of its own that passes for one of dq's; the
+/// message's own line breaks stay. Was: `dq get x.json $'/a\nY'` printed
+/// `Y' not found …` as a line of its own.
+#[test]
+fn errors_escape_line_breaks_in_user_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = write(dir.path(), "x.json", "{\"a\\nb\": 1, \"a\": {\"x\": 1}}\n");
+
+    let err = stderr_of(&["--no-color", "get", &file, "/a\nY"]);
+    assert_eq!(
+        err,
+        "path '/a\\x0aY' not found (matched up to '')\n  \
+         did_you_mean: a\\x0ab, a\n  pointer: /a\\x0aY\n"
+    );
+    let err = stderr_of(&["--no-color", "get", &file, "/a/y\r\nZ"]);
+    assert_eq!(
+        err,
+        "path '/a/y\\x0d\\x0aZ' not found (matched up to '/a')\n  \
+         matched prefix: /a\n  pointer: /a/y\\x0d\\x0aZ\n"
+    );
+    let err = stderr_of(&["--no-color", "keys", &file, "/a\nb"]);
+    assert_eq!(
+        err,
+        "cannot list the keys of '/a\\x0ab': it is int, not an object or an array\n"
+    );
+    let missing = format!("{}/n\new.json", dir.path().to_str().unwrap());
+    let err = stderr_of(&["--no-color", "get", &missing, "/a"]);
+    assert!(
+        err.starts_with(&format!(
+            "I/O error reading '{}': ",
+            missing.replace('\n', "\\x0a")
+        )),
+        "{err:?}"
+    );
+    assert!(!err.contains("/n\new"), "{err:?}");
+}

@@ -22,6 +22,7 @@ pub use error::{
 use std::io::Write;
 
 use cli::InputFormat;
+use dq_core::one_line;
 use output::{
     ConsoleReporter, JsonReporter, JsonlReporter, JunitReporter, OutputFormat, Reporter,
     SarifReporter, TapReporter, TomlReporter, ToonReporter, YamlReporter,
@@ -316,15 +317,18 @@ fn render_error_raw(err: &anyhow::Error, w: &mut dyn Write) -> std::io::Result<(
         ..
     }) = err.downcast_ref::<dq_core::Error>()
     {
+        // What the user or the file put here goes on one line
+        // ([`dq_core::one_line`]), so it cannot pass for a line of its own.
         writeln!(w, "{err}")?;
         if !matched_prefix.is_empty() {
-            writeln!(w, "  matched prefix: {matched_prefix}")?;
+            writeln!(w, "  matched prefix: {}", one_line(matched_prefix))?;
         }
         if !did_you_mean.is_empty() {
-            writeln!(w, "  did_you_mean: {}", did_you_mean.join(", "))?;
+            let keys: Vec<_> = did_you_mean.iter().map(|key| one_line(key)).collect();
+            writeln!(w, "  did_you_mean: {}", keys.join(", "))?;
         }
         // Echo the original pointer for copy-paste convenience.
-        writeln!(w, "  pointer: {pointer}")?;
+        writeln!(w, "  pointer: {}", one_line(pointer))?;
         return Ok(());
     }
     writeln!(w, "{err:?}")

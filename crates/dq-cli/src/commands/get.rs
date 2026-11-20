@@ -38,8 +38,8 @@ pub fn run(
         anyhow::bail!(
             "`get` accepts RFC 6901 JSON Pointer; for JSONPath use `dq select`. \
              Suggested fix: dq get {file} {hint}",
-            file = args.file,
-            hint = jsonpath_to_pointer_hint(&args.pointer),
+            file = dq_core::one_line(args.file.as_str()),
+            hint = dq_core::one_line(&jsonpath_to_pointer_hint(&args.pointer)),
         );
     }
 
