@@ -176,6 +176,39 @@ pub struct Evaluation {
     /// One per rule expression that raised. Non-empty means some rule
     /// did not (fully) run on this document.
     pub rule_errors: Vec<RuleError>,
+    /// Log each [`RuleError`] as it is recorded (see
+    /// [`Evaluator::evaluate_file`]); [`Evaluator::evaluate`] stays quiet.
+    log_rule_errors: bool,
+}
+
+impl Evaluation {
+    /// An empty evaluation that logs every [`RuleError`] with
+    /// [`RuleError::warn`] the moment it is recorded, so the warnings
+    /// interleave with the ones other stages log immediately.
+    fn logging() -> Self {
+        Self {
+            log_rule_errors: true,
+            ..Self::default()
+        }
+    }
+
+    /// An empty evaluation that reports errors the way `self` does —
+    /// for a nested rule's run, whose errors are then appended to
+    /// `self` already logged.
+    pub(crate) fn empty_like(&self) -> Self {
+        Self {
+            log_rule_errors: self.log_rule_errors,
+            ..Self::default()
+        }
+    }
+
+    /// Record a rule error, logging it first when this evaluation logs.
+    fn record_rule_error(&mut self, error: RuleError) {
+        if self.log_rule_errors {
+            error.warn();
+        }
+        self.rule_errors.push(error);
+    }
 }
 
 /// Per-[`Evaluator::new`] cache for compiled jq filters.
@@ -425,7 +458,8 @@ impl Evaluator {
     /// caller onto a span-preserving jaq fork.
     ///
     /// A rule that raises is logged as a `tracing::warn!` (see
-    /// [`RuleError::warn`]) and otherwise ignored; [`Evaluator::evaluate`]
+    /// [`RuleError::warn`]) at the moment it raises, in step with the
+    /// composite-rule warnings, and otherwise ignored; [`Evaluator::evaluate`]
     /// returns those errors instead.
     #[must_use]
     pub fn evaluate_file(
@@ -434,11 +468,8 @@ impl Evaluator {
         ir: &dq_core::Ir<'_>,
         format_name: &str,
     ) -> Vec<Diagnostic> {
-        let evaluation = self.evaluate(path, ir, format_name);
-        for error in &evaluation.rule_errors {
-            error.warn();
-        }
-        evaluation.diagnostics
+        self.evaluate_into(Evaluation::logging(), path, ir, format_name)
+            .diagnostics
     }
 
     /// Run every applicable rule against `ir`, as
@@ -447,12 +478,21 @@ impl Evaluator {
     /// on this document. Nothing is logged.
     #[must_use]
     pub fn evaluate(&self, path: &Utf8Path, ir: &dq_core::Ir<'_>, format_name: &str) -> Evaluation {
+        self.evaluate_into(Evaluation::default(), path, ir, format_name)
+    }
+
+    fn evaluate_into(
+        &self,
+        mut evaluation: Evaluation,
+        path: &Utf8Path,
+        ir: &dq_core::Ir<'_>,
+        format_name: &str,
+    ) -> Evaluation {
         // The jq engines and the JSON Schema validator both run over
         // `ir.value()` itself (see [`run_on_document`] and
         // [`crate::schema_value`]); the `Ir` also gives the per-rule
         // helpers [`dq_core::Ir::line_col_for`] for `loc.pointer`
         // resolution.
-        let mut evaluation = Evaluation::default();
         for rule in &self.rules {
             evaluate_one_rule_at_depth(
                 rule,
@@ -701,8 +741,7 @@ pub(crate) fn evaluate_one_rule_at_depth(
                 }
             }
             Err(err) => {
-                out.rule_errors
-                    .push(RuleError::new(rule, RuleErrorStage::MatchFilter, &err));
+                out.record_rule_error(RuleError::new(rule, RuleErrorStage::MatchFilter, &err));
                 return;
             }
         }
@@ -714,14 +753,12 @@ pub(crate) fn evaluate_one_rule_at_depth(
             let violations = match run_on_document(engine, ir.value()) {
                 Ok(v) => v,
                 Err(err) => {
-                    out.rule_errors
-                        .push(RuleError::new(rule, RuleErrorStage::CheckJq, &err));
+                    out.record_rule_error(RuleError::new(rule, RuleErrorStage::CheckJq, &err));
                     return;
                 }
             };
             for violation in &violations {
-                let diagnostic =
-                    build_jq_diagnostic(rule, path, ir, violation, message, &mut out.rule_errors);
+                let diagnostic = build_jq_diagnostic(rule, path, ir, violation, message, out);
                 out.diagnostics.push(diagnostic);
             }
         }
@@ -765,11 +802,11 @@ fn build_jq_diagnostic(
     ir: &dq_core::Ir<'_>,
     violation: &dq_core::Value,
     message_template: &str,
-    rule_errors: &mut Vec<RuleError>,
+    out: &mut Evaluation,
 ) -> Diagnostic {
     let message = template::render(message_template, violation);
-    let file = resolve_loc_file(rule, path, violation, rule_errors);
-    let (line, col) = resolve_loc_position(rule, ir, violation, rule_errors);
+    let file = resolve_loc_file(rule, path, violation, out);
+    let (line, col) = resolve_loc_position(rule, ir, violation, out);
     Diagnostic {
         rule_id: rule.rule.id.clone(),
         severity: rule.rule.severity,
@@ -852,12 +889,12 @@ fn run_schema_check(
             .ok()
             .and_then(|pointer| pointer.resolve(value).ok().cloned())
             .unwrap_or(dq_core::Value::Null);
-        let file = resolve_loc_file(rule, path, &violation, &mut out.rule_errors);
+        let file = resolve_loc_file(rule, path, &violation, out);
         let (line, col) = if rule.has_position_override() {
             // The user opted into overrides; trust whatever the chain
             // returned, including the (1, 1) default that signals an
             // override miss.
-            resolve_loc_position(rule, ir, &violation, &mut out.rule_errors)
+            resolve_loc_position(rule, ir, &violation, out)
         } else {
             // No override set — fall back to the intrinsic
             // `instance_path → span` lookup the schema check used
@@ -902,13 +939,13 @@ fn run_schema_check(
 
 /// Resolve the `file` field for the diagnostic. When `loc.file` is set
 /// and produces a non-empty string, use that; otherwise default to the
-/// file under check. A `loc.file` that raises is a [`RuleError`] pushed
-/// to `rule_errors`.
+/// file under check. A `loc.file` that raises is a [`RuleError`] recorded
+/// on the [`Evaluation`].
 fn resolve_loc_file(
     rule: &CompiledRule,
     path: &Utf8Path,
     violation: &dq_core::Value,
-    rule_errors: &mut Vec<RuleError>,
+    errors: &mut Evaluation,
 ) -> Option<Utf8PathBuf> {
     if let Some(engine) = rule.loc_file_engine.as_ref() {
         match engine.run_value(violation) {
@@ -920,7 +957,7 @@ fn resolve_loc_file(
                 }
             }
             Err(err) => {
-                rule_errors.push(RuleError::new(rule, RuleErrorStage::LocFile, &err));
+                errors.record_rule_error(RuleError::new(rule, RuleErrorStage::LocFile, &err));
             }
         }
     }
@@ -954,7 +991,7 @@ fn resolve_loc_position(
     rule: &CompiledRule,
     ir: &dq_core::Ir<'_>,
     violation: &dq_core::Value,
-    rule_errors: &mut Vec<RuleError>,
+    errors: &mut Evaluation,
 ) -> (u32, u32) {
     // Step 1: loc.pointer.
     if let Some(engine) = rule.loc_pointer_engine.as_ref() {
@@ -1038,7 +1075,7 @@ fn resolve_loc_position(
                 }
             }
             Err(err) => {
-                rule_errors.push(RuleError::new(rule, RuleErrorStage::LocLine, &err));
+                errors.record_rule_error(RuleError::new(rule, RuleErrorStage::LocLine, &err));
             }
         }
     }

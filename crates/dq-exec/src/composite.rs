@@ -410,7 +410,7 @@ fn process_extract_item(
     let inner_ir = inner_doc.as_ir();
     let inner_format = parser.name();
 
-    let mut inner_evaluation = Evaluation::default();
+    let mut inner_evaluation = out.empty_like();
     crate::evaluator::evaluate_one_rule_at_depth(
         &composite.nested,
         path,

@@ -89,6 +89,15 @@ fn lint_keeps_warning_and_exit_code_when_a_rule_raises() {
     );
 }
 
+/// The `WARN` lines of stderr, timestamps dropped.
+fn warnings(stderr: &[u8]) -> String {
+    without_timestamps(stderr)
+        .lines()
+        .filter(|line| line.starts_with(" WARN "))
+        .map(|line| format!("{line}\n"))
+        .collect()
+}
+
 /// Stage one rule and a fixture whose single case expects no violation
 /// on `spec: x`.
 fn stage_raising_fixture(rule: &str) -> TempDir {
@@ -268,5 +277,56 @@ fn test_tap_yaml_blocks_parse_back_to_the_json_lists() {
             .count()
             >= 3,
         "the fixture must exercise `: ` in all three lists",
+    );
+}
+
+/// A composite rule whose `extract` yields a non-array.
+const COMPOSITE_EXTRACT_NOT_AN_ARRAY: &str = r#"id: local.comp
+description: composite whose extract is no array
+severity: error
+match:
+  format: yaml
+check:
+  extract: '1'
+  nested:
+    id: local.inner
+    description: inner
+    severity: error
+    match:
+      format: yaml
+    check:
+      jq: '.'
+      message: inner
+  message: composite outer
+"#;
+
+#[test]
+fn lint_warns_in_the_order_the_rules_run() {
+    let dir = TempDir::new().expect("tempdir");
+    std::fs::write(dir.path().join("a.yml"), RAISES_IN_CHECK).expect("write rule");
+    std::fs::write(dir.path().join("b.yml"), COMPOSITE_EXTRACT_NOT_AN_ARRAY).expect("write rule");
+    std::fs::write(dir.path().join("pod.yaml"), "spec: x\n").expect("write input");
+    let assert = dq()
+        .current_dir(dir.path())
+        .args([
+            "--no-color",
+            "lint",
+            "--rules",
+            "a.yml",
+            "--rules",
+            "b.yml",
+            "pod.yaml",
+        ])
+        .assert()
+        .code(4);
+    assert_eq!(
+        warnings(&assert.get_output().stderr),
+        concat!(
+            " WARN check.jq raised a runtime error; skipping rule for this file",
+            " rule_id=local.raises-in-check",
+            " error=jq runtime error: cannot index \"x\" with \"template\"\n",
+            " WARN composite extract did not return an array",
+            " rule_id=local.comp shape=number\n",
+        )
     );
 }
