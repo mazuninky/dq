@@ -462,10 +462,17 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    /// `render_error`'s text without the backtrace section: whether anyhow
+    /// captures one depends on `RUST_BACKTRACE`, which CI sets. The CLI test
+    /// pins the backtrace itself.
     fn rendered(err: impl std::error::Error + Send + Sync + 'static) -> String {
         let mut out = Vec::new();
         render_error(&anyhow::Error::new(err), &mut out).expect("render");
-        String::from_utf8(out).expect("utf-8")
+        let text = String::from_utf8(out).expect("utf-8");
+        match text.find("\n\nStack backtrace:") {
+            Some(at) => format!("{}\n", &text[..at]),
+            None => text,
+        }
     }
 
     #[test]
