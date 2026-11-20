@@ -183,19 +183,22 @@ impl Format for Xml {
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<Document> {
-        let value = parse_xml(bytes).map_err(with_position)?;
+        let (value, top) = parse_xml_with_order(bytes).map_err(with_position)?;
         // The line break the file uses, from its first: decoded, as the
         // file may be UTF-16.
         let crlf = decode_input(bytes)
             .is_ok_and(|(text, ..)| text.find('\n').is_some_and(|at| text[..at].ends_with('\r')));
         Ok(Document::value_only(value, FormatTag::Xml)
-            .with_layout(Layout::Xml(XmlLayout { crlf }))
+            .with_layout(Layout::Xml(XmlLayout { crlf, top }))
             .with_source_bytes(bytes))
     }
 
     fn write(&self, doc: &Document, w: &mut dyn Write) -> Result<()> {
-        let crlf = matches!(doc.layout(), Layout::Xml(XmlLayout { crlf: true }));
-        let buf = render_xml(doc.value(), crlf)?;
+        let (crlf, top) = match doc.layout() {
+            Layout::Xml(layout) => (layout.crlf, layout.top.as_slice()),
+            _ => (false, [].as_slice()),
+        };
+        let buf = render_xml_in_order(doc.value(), crlf, top)?;
         w.write_all(&buf).map_err(|source| Error::WriteIo {
             path: Utf8PathBuf::from("<xml-writer>"),
             source,
@@ -205,10 +208,25 @@ impl Format for Xml {
 
 /// What the XML reader saw of a file beyond its value tree
 /// ([`Layout::Xml`]): whether its lines end in `\r\n`, which the writer
-/// then ends the lines it writes with.
+/// then ends the lines it writes with; and the order of the comments, the
+/// processing instructions and the root element at the top level, which
+/// the tree, holding the comments and the PIs in lists of their own, does
+/// not keep.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct XmlLayout {
     crlf: bool,
+    top: Vec<TopItem>,
+}
+
+/// One item at the top level of an XML document, past its declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TopItem {
+    /// The next item of the top-level `#pi`.
+    Pi,
+    /// The next item of the top-level `#comments`.
+    Comment,
+    /// The root element.
+    Root,
 }
 
 // ---------------------------------------------------------------------------
@@ -310,7 +328,13 @@ impl Frame {
 }
 
 /// Stack-driven XML parser. Returns the top-level `Value::Map` shape.
+#[cfg(test)]
 fn parse_xml(bytes: &[u8]) -> Result<Value> {
+    parse_xml_with_order(bytes).map(|(value, _)| value)
+}
+
+/// [`parse_xml`], and the order of the items at the top level.
+fn parse_xml_with_order(bytes: &[u8]) -> Result<(Value, Vec<TopItem>)> {
     let (text, bom, detected) = decode_input(bytes)?;
     let text: &str = &text;
     // The characters a document may hold depend on its version, which
@@ -332,6 +356,7 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
     let mut top_children: IndexMap<String, Vec<Value>> = IndexMap::new();
     let mut top_pi: Vec<String> = Vec::new();
     let mut top_comments: Vec<String> = Vec::new();
+    let mut top_order: Vec<TopItem> = Vec::new();
     let mut stack: Vec<Frame> = Vec::new();
     // The root element's name, once its start tag is read: past it, only
     // comments, PIs and white space may stand at the top level (XML 1.0
@@ -448,16 +473,23 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                     ));
                 }
                 let raw = normalize_line_ends(&pi, xml11);
+                if stack.is_empty() {
+                    top_order.push(TopItem::Pi);
+                }
                 push_pi(&mut stack, &mut top_pi, raw);
             }
             Ok(Event::Comment(c)) => {
                 let txt = decode_text(&c, xml11);
+                if stack.is_empty() {
+                    top_order.push(TopItem::Comment);
+                }
                 push_comment(&mut stack, &mut top_comments, txt);
             }
             Ok(Event::Start(start)) => {
                 check_names(text, &start, event_start)?;
                 if stack.is_empty() {
                     take_root(&mut root, &start, text, event_start)?;
+                    top_order.push(TopItem::Root);
                 }
                 check_attribute_values(text, &start, xml11)?;
                 let mut frame = build_start_frame(&start, text, event_start, xml11)?;
@@ -477,6 +509,7 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                 check_names(text, &start, event_start)?;
                 if stack.is_empty() {
                     take_root(&mut root, &start, text, event_start)?;
+                    top_order.push(TopItem::Root);
                 }
                 check_attribute_values(text, &start, xml11)?;
                 let mut frame = build_start_frame(&start, text, event_start, xml11)?;
@@ -659,7 +692,7 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
             }
         }
     }
-    Ok(Value::Map(top))
+    Ok((Value::Map(top), top_order))
 }
 
 /// Refuse the name of `start`, a start or empty-element tag at
@@ -1786,7 +1819,75 @@ fn snippet_for_pos(text: &str, pos: usize) -> String {
 /// Top-level value MUST be a `Value::Map`. The map may carry `#xml` (decl),
 /// `#pi` and `#comments` entries plus exactly one element-shaped entry that
 /// becomes the root `<tag>...</tag>`. Other shapes return `Error::Format`.
+#[cfg(test)]
 fn render_xml(top: &Value, crlf: bool) -> Result<Vec<u8>> {
+    render_xml_in_order(top, crlf, &[])
+}
+
+/// One item to write at the top level: the PI or the comment of that
+/// index, or the root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TopOut {
+    Pi(usize),
+    Comment(usize),
+    Root,
+}
+
+/// The order to write `pis` PIs, `comments` comments and the root in: as
+/// `order`, the file's, has them — a PI or a comment the tree no longer
+/// holds is skipped, and one more than the file had goes right after the
+/// last of its kind, or before the root when the file had none. With no
+/// `order` (a tree read from another format), the PIs, then the comments,
+/// then the root.
+fn top_sequence(order: &[TopItem], pis: usize, comments: usize) -> Vec<TopOut> {
+    let last_pi = order.iter().rposition(|item| *item == TopItem::Pi);
+    let last_comment = order.iter().rposition(|item| *item == TopItem::Comment);
+    let mut out = Vec::with_capacity(pis + comments + 1);
+    let (mut pi, mut comment) = (0, 0);
+    let mut root_written = false;
+    for (at, item) in order.iter().enumerate() {
+        match item {
+            TopItem::Pi if pi < pis => {
+                let end = if Some(at) == last_pi { pis } else { pi + 1 };
+                out.extend((pi..end).map(TopOut::Pi));
+                pi = end;
+            }
+            TopItem::Comment if comment < comments => {
+                let end = if Some(at) == last_comment {
+                    comments
+                } else {
+                    comment + 1
+                };
+                out.extend((comment..end).map(TopOut::Comment));
+                comment = end;
+            }
+            TopItem::Root if !root_written => {
+                if last_pi.is_none() {
+                    out.extend((pi..pis).map(TopOut::Pi));
+                    pi = pis;
+                }
+                if last_comment.is_none() {
+                    out.extend((comment..comments).map(TopOut::Comment));
+                    comment = comments;
+                }
+                out.push(TopOut::Root);
+                root_written = true;
+            }
+            _ => {}
+        }
+    }
+    if !root_written {
+        out.extend((pi..pis).map(TopOut::Pi));
+        out.extend((comment..comments).map(TopOut::Comment));
+        out.push(TopOut::Root);
+    }
+    out
+}
+
+/// [`render_xml`], the PIs, the comments and the root at the top level in
+/// the order `order` gives ([`top_sequence`]), one line break after the
+/// declaration and after each.
+fn render_xml_in_order(top: &Value, crlf: bool, order: &[TopItem]) -> Result<Vec<u8>> {
     let Value::Map(top) = top else {
         return Err(Error::Format {
             format: "xml",
@@ -1827,25 +1928,20 @@ fn render_xml(top: &Value, crlf: bool) -> Result<Vec<u8>> {
                 decl.standalone.as_deref(),
             )))
             .map_err(map_write_err)?;
+        write_line_break(&mut writer, 0, crlf)?;
     }
 
-    // 2. Top-level processing instructions and comments (kept above root).
+    // 2. Top-level processing instructions and comments, written below in
+    // the order the file had them (`order`).
     const TOP: &str = "at the top level";
     let xml11 = decl
         .as_ref()
         .is_some_and(|decl| decl.written && decl.version == "1.1");
     let mut unencodable = Unencodable::new(&output);
-    for s in item_texts(KEY_PI, TOP, top.get(KEY_PI), xml11)? {
-        unencodable.note(&s, || TOP.to_owned());
-        writer
-            .write_event(Event::PI(BytesPI::new(s.as_str())))
-            .map_err(map_write_err)?;
-    }
-    for s in item_texts(KEY_COMMENTS, TOP, top.get(KEY_COMMENTS), xml11)? {
-        unencodable.note(&s, || TOP.to_owned());
-        writer
-            .write_event(Event::Comment(comment_event(&s)))
-            .map_err(map_write_err)?;
+    let pis = item_texts(KEY_PI, TOP, top.get(KEY_PI), xml11)?;
+    let comments = item_texts(KEY_COMMENTS, TOP, top.get(KEY_COMMENTS), xml11)?;
+    for s in pis.iter().chain(&comments) {
+        unencodable.note(s, || TOP.to_owned());
     }
 
     // 3. Root element: the one non-conventional key. An XML document has
@@ -1900,20 +1996,31 @@ fn render_xml(top: &Value, crlf: bool) -> Result<Vec<u8>> {
             ),
         });
     };
-    write_element(
-        &mut writer,
-        root_tag,
-        root_body,
-        0,
-        &mut unencodable,
-        &Scope {
-            xml11,
-            crlf,
-            ..Scope::default()
-        },
-    )?;
-    // The output ends with one line break, as every re-emit does.
-    write_line_break(&mut writer, 0, crlf)?;
+    // 4. Each item, the root among them, then one line break: the output
+    // ends with one, as every re-emit does.
+    for item in top_sequence(order, pis.len(), comments.len()) {
+        match item {
+            TopOut::Pi(at) => writer
+                .write_event(Event::PI(BytesPI::new(pis[at].as_str())))
+                .map_err(map_write_err)?,
+            TopOut::Comment(at) => writer
+                .write_event(Event::Comment(comment_event(&comments[at])))
+                .map_err(map_write_err)?,
+            TopOut::Root => write_element(
+                &mut writer,
+                root_tag,
+                root_body,
+                0,
+                &mut unencodable,
+                &Scope {
+                    xml11,
+                    crlf,
+                    ..Scope::default()
+                },
+            )?,
+        }
+        write_line_break(&mut writer, 0, crlf)?;
+    }
 
     if let Some((c, place)) = unencodable.first {
         let label = decl
@@ -3191,6 +3298,26 @@ mod tests {
         parse_xml(s.as_bytes()).expect("parse xml")
     }
 
+    #[test]
+    fn top_sequence_keeps_the_file_order_and_places_what_is_new() {
+        use TopItem::{Comment as C, Pi as P, Root as R};
+        use TopOut::{Comment, Pi, Root};
+        let (_, order) = parse_xml_with_order(b"<!--a--><?p x?><r/><!--b-->").unwrap();
+        assert_eq!(order, vec![C, P, R, C]);
+        assert_eq!(
+            top_sequence(&order, 1, 2),
+            vec![Comment(0), Pi(0), Root, Comment(1)]
+        );
+        // One more of a kind goes after the last of it; one fewer is skipped.
+        assert_eq!(
+            top_sequence(&order, 2, 1),
+            vec![Comment(0), Pi(0), Pi(1), Root]
+        );
+        // A kind the file had none of goes before the root.
+        assert_eq!(top_sequence(&[R, C], 1, 1), vec![Pi(0), Root, Comment(0)]);
+        assert_eq!(top_sequence(&[], 1, 1), vec![Pi(0), Comment(0), Root]);
+    }
+
     /// `v` written, without the line break every output ends with.
     fn render(v: &Value) -> String {
         let bytes = render_xml(v, false).expect("render xml");
@@ -3228,7 +3355,7 @@ mod tests {
             .expect("set");
         assert_eq!(
             doc.original_bytes(),
-            b"\xEF\xBB\xBF<?xml version=\"1.0\" encoding=\"UTF-8\"?><a>2</a>\n"
+            b"\xEF\xBB\xBF<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<a>2</a>\n"
         );
     }
 
@@ -3365,7 +3492,7 @@ mod tests {
         decl.insert("version".to_owned(), Value::Float(1.1));
         assert_eq!(
             render(&doc(Value::Map(decl.clone()))),
-            "<?xml version=\"1.1\"?><r/>"
+            "<?xml version=\"1.1\"?>\n<r/>"
         );
         assert_eq!(render(&doc(Value::Null)), "<r/>");
         decl.insert("doctype".to_owned(), Value::String("html".to_owned()));

@@ -236,7 +236,7 @@ fn null_content_is_left_out() {
             (convert("element.yaml", "xml"), ok("<r/>\n")),
             (
                 convert("fields.yaml", "xml"),
-                ok("<?xml version=\"1.0\"?><r/>\n"),
+                ok("<?xml version=\"1.0\"?>\n<r/>\n"),
             ),
             (convert("child.yaml", "xml"), ok("<r/>\n")),
             (convert("child_item.yaml", "xml"), ok("<r>\n  <k/>\n</r>\n")),
@@ -252,11 +252,11 @@ fn null_content_is_left_out() {
 #[test]
 fn utf16_reads_by_its_declaration_without_a_bom() {
     let le = utf16(
-        "<?xml version=\"1.0\" encoding=\"UTF-16\"?><r>\u{e9}</r>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n<r>\u{e9}</r>\n",
         false,
     );
     let be = utf16(
-        "<?xml version=\"1.0\" encoding=\"UTF-16BE\"?><r>\u{e9}</r>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-16BE\"?>\n<r>\u{e9}</r>\n",
         true,
     );
     let be_bom = with_bom(&[0xFE, 0xFF], utf16("<r>\u{e9}</r>\n", true));
@@ -460,7 +460,7 @@ fn encoding_labels_follow_their_iana_aliases() {
             .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
             .collect::<Vec<_>>(),
     );
-    let declaration = |label: &str| format!("<?xml version=\"1.0\" encoding=\"{label}\"?>");
+    let declaration = |label: &str| format!("<?xml version=\"1.0\" encoding=\"{label}\"?>\n");
     let mut expected = Vec::new();
     for label in latin {
         let mut bytes = declaration(label).into_bytes();
@@ -522,9 +522,9 @@ fn encoding_labels_follow_their_iana_aliases() {
     assert_cases(&dir, &cases);
 }
 
-const ASCII_XML: &[u8] = b"<?xml version=\"1.0\" encoding=\"US-ASCII\"?><r>a</r>";
+const ASCII_XML: &[u8] = b"<?xml version=\"1.0\" encoding=\"US-ASCII\"?>\n<r>a</r>";
 const PLAIN_XML: &[u8] = b"<r>b</r>";
-const LATIN_XML: &[u8] = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><r>c</r>";
+const LATIN_XML: &[u8] = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>\n<r>c</r>";
 
 /// `a.xml` (US-ASCII), `b.xml` (UTF-8) and `c.xml` (ISO-8859-1).
 fn three_xml_files() -> TempDir {
@@ -613,7 +613,7 @@ fn a_refused_xml_write_leaves_the_file_untouched() {
         [
             ASCII_XML.to_vec(),
             "<r>é</r>\n".as_bytes().to_vec(),
-            b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><r>\xe9</r>\n".to_vec()
+            b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>\n<r>\xe9</r>\n".to_vec()
         ]
     );
 }
@@ -731,12 +731,12 @@ fn whitespace_only_text_is_written_as_character_references() {
 /// read.
 #[test]
 fn utf16_without_a_bom_keeps_its_byte_order_and_refuses_a_contradiction() {
-    let decl = |encoding: &str| format!("<?xml version=\"1.0\"{encoding}?><r>\u{e9}</r>\n");
+    let decl = |encoding: &str| format!("<?xml version=\"1.0\"{encoding}?>\n<r>\u{e9}</r>\n");
     let le = utf16(&decl(""), false);
     let be = utf16(&decl(""), true);
     let be_generic = utf16(&decl(" encoding=\"UTF-16\""), true);
     let le_named = utf16(&decl(" encoding=\"UTF-16LE\""), false);
-    let pi = utf16("<?pi x?><r/>\n", true);
+    let pi = utf16("<?pi x?>\n<r/>\n", true);
     let contradicted = [
         ("latin.xml", " encoding=\"ISO-8859-1\"", false, "UTF-16LE"),
         ("utf8.xml", " encoding=\"UTF-8\"", true, "UTF-16BE"),
@@ -840,7 +840,7 @@ fn utf16_without_a_bom_keeps_its_byte_order_and_refuses_a_contradiction() {
 #[test]
 fn the_reader_refuses_what_the_writer_would() {
     let declared = "<r xmlns:a=\"u\"><a:b a:x=\"1\" xml:lang=\"en\"/></r>";
-    let jis = b"<?xml version=\"1.0\" encoding=\"ISO-2022-JP\"?><r>\x1b$B$\"\x1b(B</r>\n";
+    let jis = b"<?xml version=\"1.0\" encoding=\"ISO-2022-JP\"?>\n<r>\x1b$B$\"\x1b(B</r>\n";
     let encoding = |label: &str| format!("<?xml version=\"1.0\" encoding=\"{label}\"?><r/>");
     let (utf32, x_foo, kr) = (
         encoding("UTF-32"),
@@ -927,7 +927,7 @@ fn the_reader_refuses_what_the_writer_would() {
 /// the file was rewritten as UTF-16 with a BOM.
 #[test]
 fn utf8_under_a_utf16_label_is_written_back_as_utf8() {
-    let net = "<?xml version=\"1.0\" encoding=\"utf-16\"?><r>\u{e9}</r>\n";
+    let net = "<?xml version=\"1.0\" encoding=\"utf-16\"?>\n<r>\u{e9}</r>\n";
     let dir = dir_with(&[
         ("net.xml", net.as_bytes()),
         ("in_place.xml", net.as_bytes()),
@@ -956,7 +956,7 @@ fn utf8_under_a_utf16_label_is_written_back_as_utf8() {
             (vec!["fmt", "in_place.xml", "-i"], ok("")),
             (
                 convert("label.yaml", "xml"),
-                ok("<?xml version=\"1.0\" encoding=\"UTF-16BE\"?><r/>\n"),
+                ok("<?xml version=\"1.0\" encoding=\"UTF-16BE\"?>\n<r/>\n"),
             ),
             (
                 convert("no_label.yaml", "xml"),
@@ -1021,13 +1021,13 @@ fn undeclaring_a_prefix_needs_xml_1_1() {
             (
                 convert("v11.xml", "xml"),
                 ok(
-                    "<?xml version=\"1.1\"?><r xmlns:p=\"u\">\n  <k xmlns:p=\"\"/>\n  <p:k/>\n</r>\n",
+                    "<?xml version=\"1.1\"?>\n<r xmlns:p=\"u\">\n  <k xmlns:p=\"\"/>\n  <p:k/>\n</r>\n",
                 ),
             ),
             (
                 convert("v11_redeclared.xml", "xml"),
                 ok(
-                    "<?xml version=\"1.1\"?><r xmlns:p=\"u\">\n  <k xmlns:p=\"\">\n    <j \
+                    "<?xml version=\"1.1\"?>\n<r xmlns:p=\"u\">\n  <k xmlns:p=\"\">\n    <j \
                     xmlns:p=\"v\">\n      <p:i/>\n    </j>\n  </k>\n  <p:k/>\n</r>\n",
                 ),
             ),
@@ -1041,7 +1041,7 @@ fn undeclaring_a_prefix_needs_xml_1_1() {
             ),
             (
                 convert("v11.yaml", "xml"),
-                ok("<?xml version=\"1.1\"?><r xmlns:p=\"u\">\n  <k xmlns:p=\"\"/>\n</r>\n"),
+                ok("<?xml version=\"1.1\"?>\n<r xmlns:p=\"u\">\n  <k xmlns:p=\"\"/>\n</r>\n"),
             ),
             (convert("v10.yaml", "xml"), refused(empty_10)),
             (convert("v11_out.yaml", "xml"), refused(undeclared)),
@@ -1063,9 +1063,9 @@ const SET_ZHE: &str = ".r[0].\"#text\" = \"ж\"";
 /// as UTF-16 with a BOM.
 #[test]
 fn detected_survives_set_fmt_and_a_bulk_run() {
-    let decl = "<?xml version=\"1.0\"?>";
-    let pi = "<?xml-stylesheet type=\"text/xsl\" href=\"s.xsl\"?>";
-    let net = |text: &str| format!("<?xml version=\"1.0\" encoding=\"utf-16\"?><r>{text}</r>\n");
+    let decl = "<?xml version=\"1.0\"?>\n";
+    let pi = "<?xml-stylesheet type=\"text/xsl\" href=\"s.xsl\"?>\n";
+    let net = |text: &str| format!("<?xml version=\"1.0\" encoding=\"utf-16\"?>\n<r>{text}</r>\n");
     let le = utf16(&format!("{decl}<r>\u{e9}</r>\n"), false);
     let be = utf16(&format!("{decl}<r>\u{e9}</r>\n"), true);
     let pi_be = utf16(&format!("{pi}<r>\u{e9}</r>\n"), true);
@@ -1190,7 +1190,7 @@ fn a_utf16_label_writes_the_bom_its_bom_field_names() {
     ]);
     let written = |label: &str, big_endian: bool| {
         utf16(
-            &format!("<?xml version=\"1.0\" encoding=\"{label}\"?><r/>\n"),
+            &format!("<?xml version=\"1.0\" encoding=\"{label}\"?>\n<r/>\n"),
             big_endian,
         )
     };
@@ -1559,7 +1559,7 @@ fn xml_1_1_writes_its_restricted_characters_as_references() {
         .map(|(name, body)| (name.as_str(), body.as_bytes()))
         .collect();
     let dir = dir_with(&borrowed);
-    let written_11 = "<?xml version=\"1.1\"?><r a=\"&#1;&#127;&#x84;&#x85;&#x86;&#x9F;\u{a0}\">\
+    let written_11 = "<?xml version=\"1.1\"?>\n<r a=\"&#1;&#127;&#x84;&#x85;&#x86;&#x9F;\u{a0}\">\
                       t&#1;&#8;&#11;&#12;&#14;&#31;&#127;&#x80;&#x9F;\u{a0}</r>\n";
     let raw_but = "allows only as a character reference, and a comment, a processing \
                    instruction or CDATA holds none";
@@ -1569,7 +1569,7 @@ fn xml_1_1_writes_its_restricted_characters_as_references() {
             (convert("v11.json", "xml"), ok(written_11)),
             (
                 convert("v10.json", "xml"),
-                ok("<?xml version=\"1.0\"?><r a=\"\u{7f}\u{9f}\">\u{80}</r>\n"),
+                ok("<?xml version=\"1.0\"?>\n<r a=\"\u{7f}\u{9f}\">\u{80}</r>\n"),
             ),
             (
                 convert("v10_c0.json", "xml"),
@@ -1749,11 +1749,11 @@ fn the_reader_refuses_characters_the_version_does_not_allow() {
             (convert("ok_c1_10.xml", "xml"), ok("<r>\u{80}</r>\n")),
             (
                 convert("ok_nel_11.xml", "xml"),
-                ok(format!("{v11}<r>a\nb</r>\n")),
+                ok(format!("{v11}\n<r>a\nb</r>\n")),
             ),
             (
                 convert("ok_ref_11.xml", "xml"),
-                ok(format!("{v11}<r a=\"&#1;\">&#1;&#127;</r>\n")),
+                ok(format!("{v11}\n<r a=\"&#1;\">&#1;&#127;</r>\n")),
             ),
         ],
     );
@@ -1885,7 +1885,7 @@ fn the_writer_refuses_a_line_end_markup_would_read_back_as_a_line_feed() {
             ),
             (
                 convert("text.json", "xml"),
-                ok("<?xml version=\"1.1\"?><r a=\"&#13;&#x85;\">&#13;&#x2028;</r>\n"),
+                ok("<?xml version=\"1.1\"?>\n<r a=\"&#13;&#x85;\">&#13;&#x2028;</r>\n"),
             ),
         ],
     );
@@ -1933,7 +1933,7 @@ fn a_1_1_document_keeps_its_restricted_characters_through_fmt_and_yaml() {
         ("doc.xml", doc.as_bytes()),
         (
             "nel.xml",
-            "<?xml version=\"1.1\"?><r a=\"&#1;\u{85}b\"/>".as_bytes(),
+            "<?xml version=\"1.1\"?>\n<r a=\"&#1;\u{85}b\"/>".as_bytes(),
         ),
         (
             "float.yaml",
@@ -1946,7 +1946,7 @@ fn a_1_1_document_keeps_its_restricted_characters_through_fmt_and_yaml() {
             (vec!["fmt", "-i", "doc.xml"], ok("")),
             (
                 convert("nel.xml", "xml"),
-                ok("<?xml version=\"1.1\"?><r a=\"&#1; b\"/>\n"),
+                ok("<?xml version=\"1.1\"?>\n<r a=\"&#1; b\"/>\n"),
             ),
             (
                 convert("nel.xml", "json"),
@@ -1957,13 +1957,13 @@ fn a_1_1_document_keeps_its_restricted_characters_through_fmt_and_yaml() {
             ),
             (
                 convert("float.yaml", "xml"),
-                ok("<?xml version=\"1.1\"?><r>&#1;</r>\n"),
+                ok("<?xml version=\"1.1\"?>\n<r>&#1;</r>\n"),
             ),
         ],
     );
     assert_eq!(
         String::from_utf8(read(&dir, "doc.xml")).expect("UTF-8"),
-        "<?xml version=\"1.1\"?><r a=\"&#1;\">&#127;&#2;</r>\n"
+        "<?xml version=\"1.1\"?>\n<r a=\"&#1;\">&#127;&#2;</r>\n"
     );
 }
 
@@ -2199,7 +2199,7 @@ fn a_refused_label_is_placed_however_the_declaration_is_written() {
             ),
             (
                 convert("known.xml", "xml"),
-                ok("<?xml version=\"1.0\" encoding=\"UTF-8\"?><r/>\n"),
+                ok("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<r/>\n"),
             ),
         ],
     );
@@ -2444,11 +2444,11 @@ fn a_declaration_its_grammar_rules_out_is_a_parse_error() {
             ),
             (
                 convert("ok.xml", "xml"),
-                ok("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?><r/>\n"),
+                ok("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n<r/>\n"),
             ),
             (
                 convert("ok_11.xml", "xml"),
-                ok("<?xml version=\"1.1\" standalone=\"yes\"?><r/>\n"),
+                ok("<?xml version=\"1.1\" standalone=\"yes\"?>\n<r/>\n"),
             ),
         ],
     );
@@ -2697,21 +2697,21 @@ fn only_comments_pis_and_white_space_stand_outside_the_root() {
         &[
             (
                 convert("misc_after.xml", "xml"),
-                ok("<?p x?><!-- c --><r/>\n"),
+                ok("<r/>\n<!-- c -->\n<?p x?>\n"),
             ),
             (
                 convert("nel_11.xml", "xml"),
                 // The file's first line ends in `\r\n`.
-                ok("<?xml version=\"1.1\"?><r/>\r\n"),
+                ok("<?xml version=\"1.1\"?>\r\n<r/>\r\n"),
             ),
-            (convert("doctype.xml", "xml"), ok("<!-- c --><r/>\n")),
+            (convert("doctype.xml", "xml"), ok("<!-- c -->\n<r/>\n")),
             (
                 convert("bom.xml", "xml"),
                 ok(b"\xef\xbb\xbf<r/>\n".to_vec()),
             ),
             (
                 convert("utf16.xml", "xml"),
-                ok(with_bom(b"\xff\xfe", utf16("<!--c--><r/>\n", false))),
+                ok(with_bom(b"\xff\xfe", utf16("<r/>\n<!--c-->\n", false))),
             ),
         ],
     );
@@ -2833,7 +2833,7 @@ fn a_name_that_is_no_xml_name_is_refused_on_read() {
         &[(
             convert("names.xml", "xml"),
             ok(
-                "<?xml version=\"1.1\"?><?pi-x.1 d?><_r xmlns:p\u{e9}=\"u\" p\u{e9}:a\u{300}=\"1\" \
+                "<?xml version=\"1.1\"?>\n<?pi-x.1 d?>\n<_r xmlns:p\u{e9}=\"u\" p\u{e9}:a\u{300}=\"1\" \
                 x.y-z\u{b7}=\"2\">\n  <\u{4e2d}/>\n</_r>\n",
             ),
         )],

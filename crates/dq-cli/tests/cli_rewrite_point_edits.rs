@@ -101,7 +101,7 @@ fn set_rewrites_each_format_through_its_writer() {
         &["set", "pom.xml", "/project/0/version/0/#text", "2.0"],
         // The declaration and the comment are in the tree; the layout is the
         // writer's, ending with one line break.
-        "<?xml version=\"1.0\"?><!-- c --><project>\n  <version>2.0</version>\n  <name>app</name>\n</project>\n",
+        "<?xml version=\"1.0\"?>\n<!-- c -->\n<project>\n  <version>2.0</version>\n  <name>app</name>\n</project>\n",
     );
     edits_to(
         "main.tf",
@@ -175,7 +175,7 @@ fn del_rewrites_each_format_through_its_writer() {
         "pom.xml",
         XML,
         &["del", "pom.xml", "/project/0/name"],
-        "<?xml version=\"1.0\"?><!-- c --><project>\n  <version>1.0</version>\n</project>\n",
+        "<?xml version=\"1.0\"?>\n<!-- c -->\n<project>\n  <version>1.0</version>\n</project>\n",
     );
     edits_to(
         "main.tf",

@@ -400,6 +400,32 @@ fn hcl_a_patch_on_repeated_blocks_sees_every_op_on_the_tree_before_it() {
 }
 
 // ---------------------------------------------------------------------------
+// XML: what stands outside the root keeps its place
+// ---------------------------------------------------------------------------
+
+#[test]
+fn xml_comments_and_pis_outside_the_root_keep_their_order_and_lines() {
+    let src = "<?xml version=\"1.0\"?>\n<!-- top -->\n<?style a?>\n<r>\n  <a>1</a>\n</r>\n\
+               <!-- after -->\n<?tail b?>\n";
+    // Was: `<?xml version="1.0"?><?style a?><?tail b?><!-- top --><!-- after --><r>…`:
+    // no line break between the items, and those after the root before it.
+    edits_to(
+        "a.xml",
+        src,
+        &["set", "a.xml", "/r/0/a/0/#text", "2"],
+        &src.replace("<a>1</a>", "<a>2</a>"),
+    );
+    edits_to("a.xml", src, &["fmt", "a.xml"], src);
+    // One added by a filter goes after the last of its kind.
+    edits_to(
+        "a.xml",
+        src,
+        &["set", "a.xml", "--jq", ".\"#comments\" += [\"new\"]"],
+        &src.replace("<!-- after -->\n", "<!-- after -->\n<!--new-->\n"),
+    );
+}
+
+// ---------------------------------------------------------------------------
 // An edit that changes nothing leaves the bytes alone
 // ---------------------------------------------------------------------------
 

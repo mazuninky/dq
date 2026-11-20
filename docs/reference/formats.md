@@ -375,7 +375,12 @@ appends the body verbatim.
 So `<project><version>1</version></project>` is read as
 `/project/0/version/0/#text`. Round trip is partial: structure, attributes,
 comments, CDATA, PIs, prefixes and the declaration survive; whitespace
-between elements is normalised, two-space indents, and every output
+between elements is normalised, two-space indents. Outside the root, the
+declaration, the comments, the PIs and the root each stand on a line of
+their own, in the order the file had them: a comment after the root stays
+after it (`<r/>` then `<!-- end -->`). One a filter adds goes after the last
+of its kind, or before the root when the file had none; a tree from
+another format writes its PIs, then its comments, then the root. Every output
 (`convert -F xml`, `fmt`, `set`, `del`, `set --jq`, `fix`) ends with exactly
 one line break, encoded as the rest of the output (after the BOM, in
 UTF-16 when the file is). The line breaks the writer puts between elements
