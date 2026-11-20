@@ -319,7 +319,7 @@ fn render_error_raw(err: &anyhow::Error, w: &mut dyn Write) -> std::io::Result<(
     {
         // What the user or the file put here goes on one line
         // ([`dq_core::one_line`]), so it cannot pass for a line of its own.
-        writeln!(w, "{err}")?;
+        writeln!(w, "{}", one_line(&err.to_string()))?;
         if !matched_prefix.is_empty() {
             writeln!(w, "  matched prefix: {}", one_line(matched_prefix))?;
         }
@@ -331,7 +331,73 @@ fn render_error_raw(err: &anyhow::Error, w: &mut dyn Write) -> std::io::Result<(
         writeln!(w, "  pointer: {}", one_line(pointer))?;
         return Ok(());
     }
-    writeln!(w, "{err:?}")
+    write_chain(err, w)
+}
+
+/// `err` and the errors that caused it, as anyhow's `{:?}` writes them —
+/// the message, then `Caused by:` and each cause indented, numbered when
+/// there are several — each message as [`terminal_message`] gives it.
+fn write_chain(err: &anyhow::Error, w: &mut dyn Write) -> std::io::Result<()> {
+    let mut chain = err.chain();
+    if let Some(top) = chain.next() {
+        write!(w, "{}", terminal_message(top))?;
+    }
+    let causes: Vec<_> = chain.collect();
+    if !causes.is_empty() {
+        write!(w, "\n\nCaused by:")?;
+        let numbered = causes.len() > 1;
+        for (n, cause) in causes.into_iter().enumerate() {
+            writeln!(w)?;
+            for (i, line) in terminal_message(cause).split('\n').enumerate() {
+                match (numbered, i) {
+                    (true, 0) => write!(w, "{n:>5}: ")?,
+                    (true, _) => write!(w, "\n       ")?,
+                    (false, 0) => write!(w, "    ")?,
+                    (false, _) => write!(w, "\n    ")?,
+                }
+                write!(w, "{line}")?;
+            }
+        }
+    }
+    writeln!(w)
+}
+
+/// The message of `err` for the terminal. An error dq knows to be one line
+/// — a writer's refusal, a rejected edit, a path or I/O error, a rule's
+/// error but its parse error — is put on one line ([`dq_core::one_line`]),
+/// so a key, a pointer or a path it quotes cannot break it. A parse error
+/// and a template refusal span lines of their own: the file name and the
+/// template line they quote go on one line, the rest stays as it is, as
+/// does the message of any other error. The messages themselves keep the
+/// text as it is, for the machine-readable outputs that carry them.
+fn terminal_message(err: &(dyn std::error::Error + 'static)) -> String {
+    let text = err.to_string();
+    if let Some(err) = err.downcast_ref::<dq_core::Error>() {
+        return match err {
+            dq_core::Error::Parse {
+                file: Some(file), ..
+            } => text.replacen(file.as_str(), &one_line(file.as_str()), 1),
+            dq_core::Error::Parse { .. } => text,
+            dq_core::Error::TemplatedFile { snippet, .. } => {
+                text.replacen(snippet.as_str(), &one_line(snippet), 1)
+            }
+            _ => one_line(&text).into_owned(),
+        };
+    }
+    let one_lined = match err.downcast_ref::<dq_exec::ExecError>() {
+        Some(err) => !matches!(err, dq_exec::ExecError::Parse { .. }),
+        None => {
+            err.is::<dq_plugin::PluginError>()
+                || err.is::<error::InvalidInput>()
+                || err.is::<error::DocOutOfRange>()
+                || err.is::<error::WrongType>()
+        }
+    };
+    if one_lined {
+        one_line(&text).into_owned()
+    } else {
+        text
+    }
 }
 
 #[cfg(test)]

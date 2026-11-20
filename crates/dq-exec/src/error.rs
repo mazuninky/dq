@@ -38,7 +38,7 @@ pub enum ExecError {
     /// A rule's `match.filter` or `check.jq` could not be compiled by the
     /// jq engine. The `rule_id` lets the reporter point the user at the
     /// offending rule without re-parsing the source YAML.
-    #[error("rule {rule} failed to compile: {source}", rule = dq_core::one_line(rule_id.as_ref()))]
+    #[error("rule {rule_id} failed to compile: {source}")]
     RuleCompile {
         /// The `id:` field of the offending rule.
         rule_id: String,
@@ -50,7 +50,7 @@ pub enum ExecError {
     /// A `@std/<name>` identifier (or path / id) didn't resolve to any
     /// known ruleset. `did_you_mean` is the (possibly empty) list of
     /// Levenshtein-2 suggestions that the loader computed.
-    #[error("unknown rule {name}", name = dq_core::one_line(id.as_ref()))]
+    #[error("unknown rule {id}")]
     UnknownRule {
         /// The unresolved identifier as provided by the caller.
         id: String,
@@ -61,7 +61,7 @@ pub enum ExecError {
     /// I/O failure reading a rule file or directory entry. Distinct from
     /// `dq_core::Error::Io` because the failing artifact is a *rule*
     /// source — the exit-code mapper can route this differently.
-    #[error("io error reading {file}: {source}", file = dq_core::one_line(path.as_ref()))]
+    #[error("io error reading {path}: {source}")]
     Io {
         /// Path being read when the failure happened.
         path: Utf8PathBuf,
@@ -73,7 +73,7 @@ pub enum ExecError {
     /// A `*.test.yml` fixture had a structural problem (missing `tests:`
     /// array, malformed `expected.violations`, etc.). The `path` points at
     /// the fixture file; the `message` is a fixture-author-facing summary.
-    #[error("test fixture {file}: {message}", file = dq_core::one_line(path.as_ref()))]
+    #[error("test fixture {path}: {message}")]
     TestFixture {
         /// Fixture file path.
         path: Utf8PathBuf,
@@ -85,7 +85,7 @@ pub enum ExecError {
     /// crate. The `rule_id` lets the reporter point the user at the
     /// offending rule without re-parsing the source YAML; `source` carries
     /// the underlying parse error from `globset`.
-    #[error("rule {rule} has invalid glob pattern: {source}", rule = dq_core::one_line(rule_id.as_ref()))]
+    #[error("rule {rule_id} has invalid glob pattern: {source}")]
     GlobCompile {
         /// The `id:` field of the offending rule.
         rule_id: String,
@@ -105,7 +105,7 @@ pub enum ExecError {
     ///
     /// Non-idempotent fixes are NOT a hard error — the runtime
     /// [`crate::Fixer`] logs and skips them at `tracing::warn!`.
-    #[error("rule {rule} fix failed: {message}", rule = dq_core::one_line(rule_id.as_ref()))]
+    #[error("rule {rule_id} fix failed: {message}")]
     FixApply {
         /// The `id:` field of the offending rule.
         rule_id: String,
@@ -118,7 +118,7 @@ pub enum ExecError {
     /// mutually-exclusive variants (`jq`, `schema`, `schema_file`,
     /// `extract`+`nested`). `present_fields` lists the offending field
     /// names so the CLI can render an actionable error.
-    #[error("rule {rule} check has mutually exclusive fields: {}", present_fields.join(", "), rule = dq_core::one_line(rule_id.as_ref()))]
+    #[error("rule {rule_id} check has mutually exclusive fields: {}", present_fields.join(", "))]
     CheckMutuallyExclusive {
         /// The `id:` field of the offending rule.
         rule_id: String,
@@ -129,7 +129,7 @@ pub enum ExecError {
     /// M11 Phase 3: rule `check` block declares none of the four
     /// variants. The block must contain at least one of `jq`, `schema`,
     /// `schema_file`, or `extract`+`nested`.
-    #[error("rule {rule} check is empty (need one of jq, schema, schema_file, extract+nested)", rule = dq_core::one_line(rule_id.as_ref()))]
+    #[error("rule {rule_id} check is empty (need one of jq, schema, schema_file, extract+nested)")]
     CheckMissing {
         /// The `id:` field of the offending rule.
         rule_id: String,
@@ -137,7 +137,7 @@ pub enum ExecError {
 
     /// M11 Phase 3: composite check declares only one of `extract` /
     /// `nested`. Both must be set together (per design D3).
-    #[error("rule {rule} composite check is missing `{missing_field}`", rule = dq_core::one_line(rule_id.as_ref()))]
+    #[error("rule {rule_id} composite check is missing `{missing_field}`")]
     CompositeIncomplete {
         /// The `id:` field of the offending rule.
         rule_id: String,
@@ -147,7 +147,7 @@ pub enum ExecError {
 
     /// M11 Phase 4 (placeholder, runtime): composite `extract` jq did
     /// not return an array.
-    #[error("rule {rule} composite extract did not return an array", rule = dq_core::one_line(rule_id.as_ref()))]
+    #[error("rule {rule_id} composite extract did not return an array")]
     CompositeExtractNotArray {
         /// The `id:` field of the offending rule.
         rule_id: String,
@@ -155,7 +155,7 @@ pub enum ExecError {
 
     /// M11 Phase 4 (placeholder, runtime): composite extract item is
     /// missing one of the required fields (`value`, `format`, `anchor`).
-    #[error("rule {rule} composite extract item missing field `{missing_field}`", rule = dq_core::one_line(rule_id.as_ref()))]
+    #[error("rule {rule_id} composite extract item missing field `{missing_field}`")]
     CompositeExtractMalformed {
         /// The `id:` field of the offending rule.
         rule_id: String,
@@ -166,7 +166,7 @@ pub enum ExecError {
     /// M11 Phase 4 (placeholder, runtime): composite extract item
     /// declared a `format` name that doesn't resolve to a known
     /// [`dq_core::FormatTag`].
-    #[error("rule {rule} composite extract item names unknown format `{fmt_name}`", rule = dq_core::one_line(rule_id.as_ref()), fmt_name = dq_core::one_line(format.as_ref()))]
+    #[error("rule {rule_id} composite extract item names unknown format `{format}`")]
     CompositeExtractUnknownFormat {
         /// The `id:` field of the offending rule.
         rule_id: String,
@@ -176,7 +176,7 @@ pub enum ExecError {
 
     /// M11 Phase 4 (placeholder, runtime): composite recursion exceeded
     /// the configured depth bound (default `MAX_EXTRACT_DEPTH = 4`).
-    #[error("rule {rule} composite recursion exceeded depth bound (depth={depth}, max={max})", rule = dq_core::one_line(rule_id.as_ref()))]
+    #[error("rule {rule_id} composite recursion exceeded depth bound (depth={depth}, max={max})")]
     CompositeDepthExceeded {
         /// The `id:` field of the offending rule.
         rule_id: String,
@@ -191,7 +191,7 @@ pub enum ExecError {
     /// `jsonschema::Validator`. Common causes: malformed schema,
     /// unresolvable `$ref`, unsupported keyword. `message` carries the
     /// upstream error rendered to a string.
-    #[error("rule {rule} schema failed to compile: {message}", rule = dq_core::one_line(rule_id.as_ref()))]
+    #[error("rule {rule_id} schema failed to compile: {message}")]
     SchemaCompile {
         /// The `id:` field of the offending rule.
         rule_id: String,
@@ -206,7 +206,7 @@ pub enum ExecError {
     /// M11 Phase 3: `check.schema_file` resolved to an absolute path.
     /// Schema-file paths must stay inside the rule directory tree
     /// (per the spec scenario "Absolute path rejected").
-    #[error("rule {rule} schema_file path is absolute: {file}", rule = dq_core::one_line(rule_id.as_ref()), file = dq_core::one_line(path.as_ref()))]
+    #[error("rule {rule_id} schema_file path is absolute: {path}")]
     SchemaFileAbsolutePath {
         /// The `id:` field of the offending rule.
         rule_id: String,
@@ -218,7 +218,7 @@ pub enum ExecError {
     /// to a path outside the rule directory. Per design D2 the schema
     /// file must live as a sibling of the rule's `.yml` source — `..`
     /// escape attempts are rejected.
-    #[error("rule {rule} schema_file escapes rule directory: {file}", rule = dq_core::one_line(rule_id.as_ref()), file = dq_core::one_line(path.as_ref()))]
+    #[error("rule {rule_id} schema_file escapes rule directory: {path}")]
     SchemaFileEscapesRuleDir {
         /// The `id:` field of the offending rule.
         rule_id: String,

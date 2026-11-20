@@ -48,7 +48,7 @@ pub enum PathErrorKind {
 pub enum Error {
     /// I/O failure while reading a file. The CLI's adapter wraps `std::io::Error`s
     /// in this variant before they reach `dq-core` code paths.
-    #[error("I/O error reading '{}': {source}", one_line(path.as_str()))]
+    #[error("I/O error reading '{path}': {source}")]
     Io {
         /// File path being read.
         path: Utf8PathBuf,
@@ -61,7 +61,7 @@ pub enum Error {
     /// copy). Distinct from [`Error::Io`] because the CLI maps it to a
     /// different exit code (write-side failure vs. read-side) — see
     /// `add-safe-writes` D8.
-    #[error("I/O error writing '{}': {source}", one_line(path.as_str()))]
+    #[error("I/O error writing '{path}': {source}")]
     WriteIo {
         /// Target file path the writer was operating on.
         path: Utf8PathBuf,
@@ -71,7 +71,7 @@ pub enum Error {
     },
 
     /// Source could not be parsed.
-    #[error("parse error{at}: {message}", at = file.as_deref().map(|p| format!(" in {}", one_line(p.as_str()))).unwrap_or_default())]
+    #[error("parse error{at}: {message}", at = file.as_deref().map(|p| format!(" in {p}")).unwrap_or_default())]
     Parse {
         /// File path, if known. `None` when reading from stdin.
         file: Option<Utf8PathBuf>,
@@ -102,14 +102,14 @@ pub enum Error {
     },
 
     /// File extension or `--input-format` value did not match any known parser.
-    #[error("unsupported format '{}'", one_line(name))]
+    #[error("unsupported format '{name}'")]
     UnsupportedFormat {
         /// The format name or extension that was rejected.
         name: String,
     },
 
     /// A format-specific limitation (e.g. JSONL writer asked to emit multi-doc).
-    #[error("{format} format error: {}", one_line(message))]
+    #[error("{format} format error: {message}")]
     Format {
         /// Which format produced the error.
         format: &'static str,
@@ -124,7 +124,7 @@ pub enum Error {
     /// Carries a human-readable reason so the CLI can surface a clear
     /// "this read-only document cannot be written" diagnostic without
     /// having to introspect parser state.
-    #[error("write operation unavailable: {}", one_line(reason))]
+    #[error("write operation unavailable: {reason}")]
     WriteUnavailable {
         /// Why the write could not proceed.
         reason: String,
@@ -135,7 +135,7 @@ pub enum Error {
     /// node — deleting a YAML anchor an alias elsewhere refers to, or a
     /// textual edit whose result does not read back as the edited tree.
     /// The document is left as it was.
-    #[error("cannot {action} '{}': {}", one_line(pointer), one_line(reason))]
+    #[error("cannot {action} '{pointer}': {reason}")]
     EditRejected {
         /// The operation: `set` or `delete`.
         action: &'static str,
@@ -152,10 +152,7 @@ pub enum Error {
     /// match. The CLI maps this to `PARSE_ERROR` (exit 3) and surfaces both
     /// escape-hatch flags (`--allow-templates`, `--raw-template-strings`) in
     /// the diagnostic message.
-    #[error(
-        "file contains Go template syntax (line {line}): {}\n  hint: {hint}",
-        one_line(snippet)
-    )]
+    #[error("file contains Go template syntax (line {line}): {snippet}\n  hint: {hint}")]
     TemplatedFile {
         /// 1-based line of the first template marker.
         line: u32,
@@ -181,10 +178,7 @@ pub enum Error {
     /// variant compact — `Value` is ~80 bytes, so two inline fields would
     /// roughly double `Error`'s footprint and trigger
     /// `clippy::result_large_err` on every function returning `Result`.
-    #[error(
-        "RFC 6902 test op failed at {}: expected {expected}, got {actual}",
-        one_line(pointer)
-    )]
+    #[error("RFC 6902 test op failed at {pointer}: expected {expected}, got {actual}")]
     PatchTestFailed {
         /// Canonical RFC 6901 form of the pointer the `test` op targeted.
         pointer: String,
@@ -195,12 +189,13 @@ pub enum Error {
     },
 }
 
-/// `text`, user data quoted in an error message — a pointer, a key, a
-/// path, a value — on one line: a line feed as `\x0a` and a carriage
-/// return as `\x0d`, as the CLI prints every other control character of a
-/// message. A line break of its own could start a line that passes for one
-/// of the message's (`dq get x.json $'/a\nY'`). Borrowed when there is
-/// none.
+/// `text` on one line: a line feed as `\x0a` and a carriage return as
+/// `\x0d`, as the CLI prints every other control character of a message on
+/// the terminal. For a message, or user data quoted in one — a pointer, a
+/// key, a path — on its way to the terminal, where a line break of its own
+/// could start a line that passes for one of the message's (`dq get x.json
+/// $'/a\nY'`). The errors' messages themselves keep the text as it is:
+/// machine-readable output carries it. Borrowed when there is none.
 #[must_use]
 pub fn one_line(text: &str) -> Cow<'_, str> {
     if !text.contains(['\n', '\r']) {
@@ -211,7 +206,6 @@ pub fn one_line(text: &str) -> Cow<'_, str> {
 
 /// The message of an [`Error::Path`].
 fn path_message(pointer: &str, matched_prefix: &str, kind: &PathErrorKind) -> String {
-    let (pointer, matched_prefix) = (one_line(pointer), one_line(matched_prefix));
     match kind {
         PathErrorKind::DeleteRoot => format!(
             "cannot delete the root '{pointer}': it is the whole document; delete a value \
@@ -226,9 +220,8 @@ fn path_message(pointer: &str, matched_prefix: &str, kind: &PathErrorKind) -> St
              an array; name an index of an array, as /a/0"
         ),
         PathErrorKind::IntoItsOwnChild { from } => format!(
-            "cannot move '{}' to '{pointer}': a value cannot move into one of its own \
-             children",
-            one_line(from)
+            "cannot move '{from}' to '{pointer}': a value cannot move into one of its own \
+             children"
         ),
         _ => format!("path '{pointer}' not found (matched up to '{matched_prefix}')"),
     }
@@ -280,42 +273,17 @@ mod tests {
     }
 
     #[test]
-    fn user_data_in_a_message_stays_on_one_line() {
-        let messages = [
-            Error::Path {
-                pointer: "/a\nb".into(),
-                matched_prefix: "/a\r".into(),
-                kind: PathErrorKind::MissingKey,
-                did_you_mean: Vec::new(),
-            },
-            Error::Path {
-                pointer: "/a\nb".into(),
-                matched_prefix: String::new(),
-                kind: PathErrorKind::IntoItsOwnChild { from: "/\n".into() },
-                did_you_mean: Vec::new(),
-            },
-            Error::Io {
-                path: Utf8PathBuf::from("a\nb"),
-                source: std::io::Error::other("nope"),
-            },
-            Error::WriteIo {
-                path: Utf8PathBuf::from("a\nb"),
-                source: std::io::Error::other("nope"),
-            },
-            Error::UnsupportedFormat {
-                name: "x\ny".into(),
-            },
-            Error::EditRejected {
-                action: "set",
-                pointer: "/a\nb".into(),
-                reason: "why".into(),
-            },
-        ];
-        for err in messages {
-            let text = err.to_string();
-            assert!(!text.contains(['\n', '\r']), "{text:?}");
-            assert!(text.contains("\\x0a"), "{text:?}");
-        }
+    fn a_message_keeps_the_user_data_it_quotes_as_it_is() {
+        // Machine-readable output (`validate -F json`) carries the message
+        // as it is; the terminal escapes it (`dq::render_error`).
+        let err = Error::Format {
+            format: "csv",
+            message: "row 0 key 'k\nz': nested".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "csv format error: row 0 key 'k\nz': nested"
+        );
     }
 
     #[test]

@@ -251,7 +251,10 @@ diagnostics (console and TAP), and `explain`'s rule id, description and
 references. Each prints control characters as `\xNN` and the direction
 controls as `\uNNNN`, as `console` does. A parse error's snippet keeps its
 own line breaks, and the lines of a `--diff` are the file's text, as they
-are. A path error names the
+are. The escaping is the terminal's: machine-readable output (`-F json`,
+`yaml`, `sarif`, `junit`, TAP's YAML blocks) carries a message as it is, a
+line break as a line break in its string (`dq test -F json` on a rule whose
+id holds one). A path error names the
 pointer, the deepest prefix that exists and up to three close sibling keys:
 
 ```

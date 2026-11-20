@@ -1554,8 +1554,7 @@ impl Document {
                         match first_difference(&form(&self.value), &form(&fresh.value), "") {
                             None => Ok(Some((fresh, bytes))),
                             Some(at) => Err(rejected(format!(
-                                "the {name} dq would write reads back as another value at '{}'",
-                                crate::error::one_line(&at)
+                                "the {name} dq would write reads back as another value at '{at}'"
                             ))),
                         }
                     })

@@ -303,3 +303,39 @@ fn a_log_crate_line_prints_no_log_fields() {
         );
     }
 }
+
+/// Machine-readable output carries an error's message as it is; the
+/// terminal escapes it. A rule whose id holds a line break fails to load:
+/// `test -F json` reports the real line break in its JSON string, the
+/// console prints `\x0a`. Was: `\x0a` in the JSON too, the escaping done in
+/// the error's message itself.
+#[test]
+fn json_carries_the_raw_message_and_the_console_escapes_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = dir.path();
+    std::fs::write(
+        dir.join("r.yml"),
+        "id: \"t.a\\nb\"\ndescription: d\nseverity: error\nmatch:\n  format: yaml\ncheck: {}\n",
+    )
+    .expect("seed rule");
+    std::fs::write(
+        dir.join("r.test.yml"),
+        "tests:\n  - name: c\n    input: |\n      a: 1\n    expected:\n      violations: []\n",
+    )
+    .expect("seed fixture");
+    let message = "rule load error: rule t.a\nb check is empty (need one of jq, schema, \
+                   schema_file, extract+nested)";
+
+    let out = run(dir, &["--no-color", "-F", "json", "test", "."]);
+    assert_eq!(out.code, 4, "{:?}", out.stderr);
+    let json: serde_json::Value = serde_json::from_str(&out.stdout).expect("JSON");
+    assert_eq!(json["results"][0]["error"], message, "{:?}", out.stdout);
+
+    let out = run(dir, &["--no-color", "test", "."]);
+    assert_eq!(out.code, 4, "{:?}", out.stderr);
+    assert!(
+        out.stdout.contains(&message.replace('\n', "\\x0a")),
+        "{:?}",
+        out.stdout
+    );
+}
