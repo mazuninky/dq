@@ -23,18 +23,23 @@ the textual-edit commands (`set`, `del`, `patch`, `merge`), not of `fmt`.
 Sorts map keys at every depth, by byte order, through
 `dq_core::canonicalize_keys` (deterministic and idempotent; arrays keep their
 order, maps inside them are sorted). It applies to every re-emit path —
-`fmt`, `convert`, `set --jq` — for JSON, JSONL, YAML and TOML. On textual
-edits (`set`/`del`/`patch`/`merge`) it is accepted and does nothing: sorting
-would rewrite the file and break the comment-preserving contract. Run
-`dq fmt --sort-keys` after such edits if you want sorted keys. Read commands
-ignore it.
+`fmt`, `convert`, `set --jq` — for JSON, JSONL, YAML and TOML. On point
+edits (`set`/`del` with a pointer, `patch`, `merge`, `fix.ops`) it is accepted
+and does nothing, in every format: on YAML, JSON and TOML, which take textual
+edits, sorting would rewrite the file and break the comment-preserving
+contract, and XML, HCL, INI, dotenv, CSV/TSV and JSON Lines, which a point
+edit rewrites through the writer, follow the same rule, so a point edit
+behaves alike in every format. Run `dq fmt --sort-keys` after such edits if
+you want sorted keys. Read commands ignore it.
 
 ## `--indent <N>`
 
 Indent width for JSON (and JSONL per line) on re-emit paths; `--indent 0`
 gives compact JSON. YAML ignores it (the writer always uses two spaces; a
 YAML indent option needs a different emitter) and TOML ignores it (its layout
-is fixed by the grammar). Textual edits keep the file's own indentation.
+is fixed by the grammar). Point edits ignore it in every format: textual
+edits keep the file's own indentation, and a point edit rewritten through
+the writer (XML, HCL, INI, dotenv, CSV/TSV, JSON Lines) uses the writer's.
 
 ## Not offered
 

@@ -16,7 +16,7 @@ whether comments survive:
 | Formats | YAML, JSON, TOML | every writable format |
 | How | splices only the bytes of the changed node, using the span map built at parse time | parses to a value, transforms it, writes the whole document with the format's writer |
 | Keeps | comments, blank lines, key order, quote style, anchors/aliases, flow vs. block style, indentation, line endings (LF, CRLF, lone CR), BOM | key order only |
-| `--sort-keys` / `--indent` | no-op | applied |
+| `--sort-keys` / `--indent` | no-op | applied by `set --jq`, `fmt`, `convert`; no-op on the point edits |
 
 The trade-off is deliberate: textual edits are the round-trip guarantee,
 re-emit is for transforms that may change the structure arbitrarily.
@@ -38,8 +38,10 @@ counts as `Failed`. An edit that leaves the data as it was — a value set
 to what is there, or to one that reads back as it (`80` in INI, whose
 `80` is a string) — leaves the file's bytes alone, comments included:
 `--check` exits 0, and a bulk run counts the file as `Skipped`. Textual
-edits behave the same. `--sort-keys` and `--indent` stay no-ops on point
-edits, as on the textual ones (`dq fmt` applies them). A JSON Lines record
+edits behave the same. `--sort-keys` and `--indent` are accepted and do
+nothing on these point edits, as on the textual ones, so a point edit
+behaves alike in every format (`dq fmt` applies them; see
+[fmt.md](fmt.md)). A JSON Lines record
 is addressed by its index, as `get` addresses it: `dq set log.jsonl
 /0/level warn` rewrites the file one compact record per line. Point edits
 on Markdown fail with exit 7 ("has no textual edits").
