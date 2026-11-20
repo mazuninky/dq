@@ -194,6 +194,28 @@ fn del_rewrites_each_format_through_its_writer() {
 }
 
 #[test]
+fn a_csv_with_no_rows_left_keeps_its_header() {
+    // Was: an empty file, the header gone.
+    edits_to("t.csv", "n,a\nx,1\n", &["del", "t.csv", "/0"], "n,a\n");
+    edits_to("t.tsv", "n\ta\nx\t1\n", &["del", "t.tsv", "/0"], "n\ta\n");
+    edits_to(
+        "t.csv",
+        "n,a\nx,1\ny,2\n",
+        &["set", "t.csv", "--jq", "map(select(false))"],
+        "n,a\n",
+    );
+    // A file of its header alone is written back as it is.
+    edits_to("t.csv", "n,a\n", &["fmt", "t.csv"], "n,a\n");
+    // A row added to a header alone follows its columns.
+    edits_to(
+        "t.csv",
+        "n,a\n",
+        &["set", "t.csv", "/-", r#"{"a": "1"}"#],
+        "a\n1\n",
+    );
+}
+
+#[test]
 fn a_value_the_writer_cannot_hold_is_refused_and_the_file_left_alone() {
     refused(
         "pom.xml",

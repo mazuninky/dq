@@ -308,8 +308,11 @@ by the header; every cell is a string (no type inference). TSV is the same
 with a tab delimiter. Writing needs an array of maps; the header is the union
 of the keys of every row in first-seen order, and a row without one of them
 has an empty cell there (`dq set t.csv /- '{"a": "3", "c": "4"}'` on `a,b` /
-`1,2` writes `a,b,c` / `1,2,` / `3,,4`). Any other shape is an error naming
-the offending type, a nested value one naming its row.
+`1,2` writes `a,b,c` / `1,2,` / `3,,4`). With no rows left, the header the
+file was read with is written alone (`dq del t.csv /0` on `a,b` / `1,2`
+writes `a,b`), so a file of its header alone round-trips; a tree from
+another format with no rows writes an empty file. Any other shape is an
+error naming the offending type, a nested value one naming its row.
 
 ### Markdown
 

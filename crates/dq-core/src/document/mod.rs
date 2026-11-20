@@ -275,7 +275,7 @@ struct PendingRewrite {
 /// format dq rewrites whole ([`Document::edits_by_rewrite`]) writes it
 /// back: for HCL, which keys are blocks and the source of every
 /// expression; for dotenv, which keys had `export`; for XML, its line
-/// break.
+/// break; for CSV and TSV, the header.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) enum Layout {
     /// Nothing: every document no such reader built.
@@ -287,6 +287,8 @@ pub(crate) enum Layout {
     DotEnv(crate::parsers::dotenv::DotEnvLayout),
     /// What the XML reader saw: the line break the file uses.
     Xml(crate::parsers::xml::XmlLayout),
+    /// What the CSV or TSV reader saw: the header.
+    Csv(crate::parsers::csv::CsvLayout),
 }
 
 impl Layout {

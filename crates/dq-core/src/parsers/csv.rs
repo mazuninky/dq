@@ -13,7 +13,7 @@ use camino::Utf8PathBuf;
 use indexmap::IndexMap;
 
 use crate::Result;
-use crate::document::{Document, FormatTag, Value};
+use crate::document::{Document, FormatTag, Layout, Value};
 use crate::error::Error;
 use crate::format::Format;
 
@@ -35,8 +35,10 @@ impl Format for Csv {
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<Document> {
-        let value = parse_with_delimiter(bytes, b',', "csv")?;
-        Ok(Document::value_only(value, FormatTag::Csv).with_source_bytes(bytes))
+        let (value, layout) = parse_with_delimiter(bytes, b',', "csv")?;
+        Ok(Document::value_only(value, FormatTag::Csv)
+            .with_layout(layout)
+            .with_source_bytes(bytes))
     }
 
     fn write(&self, doc: &Document, w: &mut dyn Write) -> Result<()> {
@@ -54,8 +56,10 @@ impl Format for Tsv {
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<Document> {
-        let value = parse_with_delimiter(bytes, b'\t', "tsv")?;
-        Ok(Document::value_only(value, FormatTag::Tsv).with_source_bytes(bytes))
+        let (value, layout) = parse_with_delimiter(bytes, b'\t', "tsv")?;
+        Ok(Document::value_only(value, FormatTag::Tsv)
+            .with_layout(layout)
+            .with_source_bytes(bytes))
     }
 
     fn write(&self, doc: &Document, w: &mut dyn Write) -> Result<()> {
@@ -63,8 +67,21 @@ impl Format for Tsv {
     }
 }
 
-/// Parse `bytes` as delimited records into `Value::Array<Value::Map>`.
-fn parse_with_delimiter(bytes: &[u8], delimiter: u8, format_name: &'static str) -> Result<Value> {
+/// What the CSV / TSV reader saw of a file beyond its value tree
+/// ([`Layout::Csv`]): its header, which the writer writes for a document
+/// with no rows left — a header alone has nothing else to hold it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct CsvLayout {
+    header: Vec<String>,
+}
+
+/// Parse `bytes` as delimited records into `Value::Array<Value::Map>`, and
+/// the header they were read with.
+fn parse_with_delimiter(
+    bytes: &[u8],
+    delimiter: u8,
+    format_name: &'static str,
+) -> Result<(Value, Layout)> {
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(true)
         .delimiter(delimiter)
@@ -112,7 +129,10 @@ fn parse_with_delimiter(bytes: &[u8], delimiter: u8, format_name: &'static str) 
         }
         rows.push(Value::Map(row));
     }
-    Ok(Value::Array(rows))
+    Ok((
+        Value::Array(rows),
+        Layout::Csv(CsvLayout { header: headers }),
+    ))
 }
 
 /// Write a `Value::Array<Value::Map>` document as delimited records.
@@ -135,7 +155,14 @@ fn write_with_delimiter(
         .delimiter(delimiter)
         .from_writer(w);
 
+    // No rows: the header the file was read with, if any, alone.
     if items.is_empty() {
+        if let Layout::Csv(CsvLayout { header }) = doc.layout()
+            && !header.is_empty()
+        {
+            wtr.write_record(header)
+                .map_err(|e| map_delim_write_err(format_name, e))?;
+        }
         return wtr.flush().map_err(|source| Error::Io {
             path: Utf8PathBuf::from(format!("<{format_name}-writer>")),
             source,
@@ -230,6 +257,19 @@ mod tests {
         let Value::Map(row) = &items[0] else { panic!() };
         assert_eq!(row.get("name"), Some(&Value::String("alice".into())));
         assert_eq!(row.get("age"), Some(&Value::String("30".into())));
+    }
+
+    #[test]
+    fn a_document_with_no_rows_writes_the_header_it_was_read_with() {
+        let mut doc = Csv.parse(b"a,b\n1,2\n").expect("parse");
+        doc.del_at(&crate::pointer::Pointer::parse("/0").unwrap())
+            .expect("del");
+        assert_eq!(doc.original_bytes(), b"a,b\n");
+        // Read from no file: no header to write.
+        let mut buf: Vec<u8> = Vec::new();
+        Csv.write(&Document::single(Value::Array(Vec::new())), &mut buf)
+            .expect("write");
+        assert!(buf.is_empty());
     }
 
     #[test]
