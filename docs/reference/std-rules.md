@@ -78,7 +78,10 @@ composite: YAML code blocks must parse], `frontmatter-required-fields`
 `no-empty-paragraphs` [warn], `no-multiple-blank-lines` [warn],
 `no-trailing-spaces-in-headings` [warn], `table-header-required` [warn],
 `table-pipes-aligned` [warn], `code-block-fenced` [info],
-`link-text-not-here` [info], `no-inline-html` [info].
+`link-text-not-here` [info], `no-inline-html` [info]. A finding points at
+the line of the block it is about, counted from the start of the file
+(frontmatter included); `code-blocks-yaml-valid` points at the YAML error's
+line and column inside the block; the frontmatter rules report `1:1`.
 
 **`jsonschema`** (3, schema rules): `kubernetes-crd-shape` [error, YAML/JSON,
 basic `kind` / `apiVersion` / `metadata` shape], `openapi-3.1-shape` [error,

@@ -44,6 +44,7 @@ use comrak::{Arena, Options, parse_document};
 use indexmap::IndexMap;
 
 use crate::Result;
+use crate::document::spans::{SpanContext, ValueSpan};
 use crate::document::{Document, FormatTag, Value};
 use crate::error::Error;
 use crate::format::Format;
@@ -81,7 +82,7 @@ impl Format for Markdown {
         // back to the outer-file with sub-line precision. Indented code
         // blocks (CommonMark §4.4) get `None`; the spec is explicit that
         // only fenced blocks opt in.
-        let provenance = build_provenance_for_fenced_code_blocks(&value);
+        let provenance = build_provenance_for_fenced_code_blocks(&value, bytes);
         Ok(Document::with_value_bytes_and_provenance(
             value,
             original,
@@ -166,16 +167,73 @@ fn parse_to_value(bytes: &[u8]) -> Result<Value> {
     //    we want a `{ "type": "document", "frontmatter": …, "children": [...] }`
     //    shape so we synthesize the document map directly rather than letting
     //    `node_to_value` produce a generic shape for the root.
-    let children = root.children().map(node_to_value).collect::<Vec<Value>>();
+    let mut children = root.children().map(node_to_value).collect::<Vec<Value>>();
+    let pos = root.data.borrow().sourcepos;
+    let mut position = sourcepos_to_value(pos);
+
+    // 4. comrak counts lines from the start of the body; a position counts
+    //    from the start of the file. The body always starts at the start of
+    //    a line (every frontmatter form ends with a line break), so only
+    //    lines move — by the lines the frontmatter takes.
+    let header_lines = line_breaks(&bytes[..bytes.len() - body_bytes.len()]);
+    if header_lines > 0 {
+        shift_position(&mut position, header_lines);
+        for child in &mut children {
+            shift_node_lines(child, header_lines);
+        }
+    }
 
     let mut doc_map = IndexMap::new();
     doc_map.insert("type".to_owned(), Value::String("document".to_owned()));
     doc_map.insert("frontmatter".to_owned(), frontmatter_value);
     doc_map.insert("children".to_owned(), Value::Array(children));
-    let pos = root.data.borrow().sourcepos;
-    doc_map.insert("position".to_owned(), sourcepos_to_value(pos));
+    doc_map.insert("position".to_owned(), position);
 
     Ok(Value::Map(doc_map))
+}
+
+/// How many line breaks `bytes` holds — `\n`, `\r\n` and a lone `\r` each
+/// count once, as comrak counts them.
+fn line_breaks(bytes: &[u8]) -> i64 {
+    let mut count = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'\n' || (b == b'\r' && bytes.get(i + 1) != Some(&b'\n')) {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Move the `position` of the AST node `node`, and of every node under it,
+/// down by `lines` lines. Only node maps are walked — through `children`,
+/// the one field that holds nodes — so a frontmatter value that happens to
+/// hold a `position` key is never touched.
+fn shift_node_lines(node: &mut Value, lines: i64) {
+    let Value::Map(fields) = node else {
+        return;
+    };
+    if let Some(position) = fields.get_mut("position") {
+        shift_position(position, lines);
+    }
+    if let Some(Value::Array(children)) = fields.get_mut("children") {
+        for child in children {
+            shift_node_lines(child, lines);
+        }
+    }
+}
+
+/// Add `lines` to the `start.line` and `end.line` of a position map.
+fn shift_position(position: &mut Value, lines: i64) {
+    let Value::Map(ends) = position else {
+        return;
+    };
+    for key in ["start", "end"] {
+        if let Some(Value::Map(point)) = ends.get_mut(key)
+            && let Some(Value::Int(line)) = point.get_mut("line")
+        {
+            *line += lines;
+        }
+    }
 }
 
 /// Move the start of every paragraph / setext heading that was preceded by
@@ -814,9 +872,9 @@ fn null_position() -> Value {
     Value::Map(out)
 }
 
-/// Walk `value` and build a [`ProvenanceMap`] that carries
-/// `inline_offset = Some(InlineBaseline { 0, 1, 1 })` for every fenced code
-/// block leaf's `value` field.
+/// Walk `value` and build a [`ProvenanceMap`] entry for every fenced code
+/// block leaf's `value` field: the byte span of the block's content in
+/// `bytes`, and its inline-offset baseline.
 ///
 /// Phase 2 of `add-validation-and-extended-formats` requires the markdown
 /// parser to surface inline-offset metadata for fenced code blocks so
@@ -825,33 +883,106 @@ fn null_position() -> Value {
 /// holding the code body (`<parent>/value`) — that is where Phase 4's
 /// composite extract reads the inner content from.
 ///
-/// `span` is `None` for every entry: the markdown parser does not yet
-/// participate in the write path (M9 contract — see [`Markdown::write`]),
-/// so there is no [`crate::document::ValueSpan`] to attach. Composite-rule
-/// evaluation falls back to the markdown node's `position` field for the
-/// anchor coordinates, which is the source-of-truth for fenced-block
-/// positions in the M9 AST.
-fn build_provenance_for_fenced_code_blocks(value: &Value) -> ProvenanceMap {
+/// The span starts at the first content line (the line after the opening
+/// fence), at the fence's column, and ends where the block ends, so
+/// `Ir::line_col_for(<parent>/value)` is where the content starts in the
+/// file. The baseline's `col` is that column too: comrak takes the fence's
+/// indentation (and the container's, inside a list item or a block quote)
+/// off every content line, so every line of the content starts there.
+/// Neither is a write-path span — the markdown parser does not take part in
+/// the write path (M9 contract — see [`Markdown::write`]).
+fn build_provenance_for_fenced_code_blocks(value: &Value, bytes: &[u8]) -> ProvenanceMap {
     let mut map = ProvenanceMap::new();
     let mut path: Vec<String> = Vec::new();
-    collect_fenced_code_block_provenance(value, &mut path, &mut map);
+    let line_starts = line_starts(bytes);
+    collect_fenced_code_block_provenance(value, bytes, &line_starts, &mut path, &mut map);
     map
+}
+
+/// Byte offset of the start of every line of `bytes`, the first at 0.
+/// Lines break as comrak breaks them ([`line_breaks`]).
+fn line_starts(bytes: &[u8]) -> Vec<usize> {
+    let mut starts = vec![0];
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'\n' || (b == b'\r' && bytes.get(i + 1) != Some(&b'\n')) {
+            starts.push(i + 1);
+        }
+    }
+    starts
+}
+
+/// Byte offset of 1-based `line`, `column` in `bytes`, kept within that
+/// line (a column past its end is its end); `bytes.len()` past the last line.
+fn byte_at(bytes: &[u8], line_starts: &[usize], line: usize, column: usize) -> usize {
+    let Some(&start) = line.checked_sub(1).and_then(|i| line_starts.get(i)) else {
+        return bytes.len();
+    };
+    let end = line_starts.get(line).map_or(bytes.len(), |&next| next);
+    let mut content_end = end;
+    while content_end > start && matches!(bytes[content_end - 1], b'\n' | b'\r') {
+        content_end -= 1;
+    }
+    (start + column.saturating_sub(1)).min(content_end)
+}
+
+/// `(line, column)` of a node `position` map's `start` / `end` point.
+fn position_point(node: &IndexMap<String, Value>, which: &str) -> Option<(usize, usize)> {
+    let Some(Value::Map(position)) = node.get("position") else {
+        return None;
+    };
+    let Some(Value::Map(point)) = position.get(which) else {
+        return None;
+    };
+    match (point.get("line"), point.get("column")) {
+        (Some(Value::Int(line)), Some(Value::Int(column))) => {
+            Some((usize::try_from(*line).ok()?, usize::try_from(*column).ok()?))
+        }
+        _ => None,
+    }
+}
+
+/// The span of a fenced code block's content and the column its lines start
+/// at, from the block's `position`; `None` when it has no position.
+fn fenced_content_span(
+    node: &IndexMap<String, Value>,
+    bytes: &[u8],
+    line_starts: &[usize],
+) -> Option<(ValueSpan, u32)> {
+    let (fence_line, column) = position_point(node, "start")?;
+    let (end_line, end_column) = position_point(node, "end")?;
+    let start = byte_at(bytes, line_starts, fence_line + 1, column);
+    let end = byte_at(bytes, line_starts, end_line, end_column + 1).max(start);
+    let line_start = line_starts
+        .get(fence_line)
+        .copied()
+        .unwrap_or(bytes.len())
+        .min(start);
+    let span = ValueSpan {
+        value_range: start..end,
+        line_range: line_start..end,
+        indent: u32::try_from(column.saturating_sub(1)).unwrap_or(u32::MAX),
+        context: SpanContext::BlockMapValue,
+    };
+    Some((span, u32::try_from(column).unwrap_or(u32::MAX)))
 }
 
 /// Recursively walk the markdown AST `value` tree, looking for nodes whose
 /// shape matches `Map { "type": "code_block", "fenced": Bool(true), ... }`
-/// and emitting an inline-offset-aware [`Provenance::Original`] entry for
-/// the leaf at `<this-node-path>/value`.
+/// and emitting a span- and inline-offset-aware [`Provenance::Original`]
+/// entry for the leaf at `<this-node-path>/value`.
 fn collect_fenced_code_block_provenance(
     value: &Value,
+    bytes: &[u8],
+    line_starts: &[usize],
     path: &mut Vec<String>,
     map: &mut ProvenanceMap,
 ) {
     match value {
         Value::Map(m) => {
             if is_fenced_code_block(m) {
-                // Record the inline-offset entry for the `value` field —
-                // that is the body text the composite extract re-parses.
+                // Record the entry for the `value` field — that is the body
+                // text the composite extract re-parses.
+                let located = fenced_content_span(m, bytes, line_starts);
                 path.push("value".to_owned());
                 let pointer_canonical = canonical_pointer(path);
                 let pointer = Pointer::parse(&pointer_canonical)
@@ -860,11 +991,11 @@ fn collect_fenced_code_block_provenance(
                     pointer_canonical,
                     Provenance::Original {
                         pointer,
-                        span: None,
+                        span: located.as_ref().map(|(span, _)| span.clone()),
                         inline_offset: Some(InlineBaseline {
                             byte_start: 0,
                             line: 1,
-                            col: 1,
+                            col: located.map_or(1, |(_, col)| col),
                         }),
                     },
                 );
@@ -874,14 +1005,14 @@ fn collect_fenced_code_block_provenance(
             // list items, block quotes, table cells, etc.
             for (k, v) in m {
                 path.push(pointer_escape(k));
-                collect_fenced_code_block_provenance(v, path, map);
+                collect_fenced_code_block_provenance(v, bytes, line_starts, path, map);
                 path.pop();
             }
         }
         Value::Array(items) => {
             for (idx, item) in items.iter().enumerate() {
                 path.push(idx.to_string());
-                collect_fenced_code_block_provenance(item, path, map);
+                collect_fenced_code_block_provenance(item, bytes, line_starts, path, map);
                 path.pop();
             }
         }
@@ -1651,7 +1782,9 @@ mod tests {
         // The walker is recursive; a fenced block nested inside a list item
         // must also surface inline-offset. The exact pointer depends on the
         // markdown AST shape, so we walk the provenance map and assert at
-        // least one entry exists with the expected baseline.
+        // least one entry exists with the expected baseline: the fence is
+        // indented by the list item, and its content lines start at
+        // column 3.
         let src = "- item\n\n  ```yaml\n  foo: bar\n  ```\n";
         let doc = Markdown.parse(src.as_bytes()).expect("parse");
         let baseline_count = doc
@@ -1665,7 +1798,7 @@ mod tests {
                         inline_offset: Some(InlineBaseline {
                             byte_start: 0,
                             line: 1,
-                            col: 1,
+                            col: 3,
                         }),
                         ..
                     },
@@ -1677,6 +1810,24 @@ mod tests {
             "at least one fenced code block (nested or top-level) MUST surface \
              inline-offset metadata; got {baseline_count} entries",
         );
+    }
+
+    #[test]
+    fn fenced_code_block_value_spans_its_content_counted_from_the_file_start() {
+        // A three-line frontmatter header, then a fenced block on line 4:
+        // its content starts on line 5, and its node position says line 4.
+        let src = "---\na: 1\n---\n```yaml\nfoo: bar\n```\n";
+        let doc = Markdown.parse(src.as_bytes()).expect("parse");
+        let pointer = Pointer::parse("/children/0/value").expect("pointer");
+        assert_eq!(doc.as_ir().line_col_for(&pointer), Some((5, 1)));
+        let block = &doc_children(&doc)[0];
+        let Value::Map(position) = field(block, "position") else {
+            panic!("position map")
+        };
+        let Value::Map(start) = &position["start"] else {
+            panic!("start map")
+        };
+        assert_eq!(start["line"], Value::Int(4));
     }
 
     #[test]

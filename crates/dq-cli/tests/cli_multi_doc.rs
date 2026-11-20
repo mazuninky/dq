@@ -788,7 +788,10 @@ fn composite_rule_reports_inner_hits_and_parse_failures_in_their_document() {
             4,
             vec![
                 diag("test.inline-config.inner", 7, *inner_col),
-                diag("test.inline-config.parse-failed", 11, 11),
+                // The parse failure lands on the JSON error (inner 1:11,
+                // the end of the text), projected from the anchor the way
+                // the inner hit is: 11 + 11 - 1.
+                diag("test.inline-config.parse-failed", 11, 21),
             ]
         )
     );

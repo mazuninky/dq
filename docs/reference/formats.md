@@ -288,11 +288,9 @@ Every node is a map with a `type` discriminator and node-specific fields
 `children`. Block nodes carry `position`; inline nodes do not. Frontmatter
 (`---` YAML, `+++` TOML, or `{…}` JSON followed by a blank line) is parsed
 before comrak and folded into `frontmatter: {kind, value}`; without one,
-`frontmatter` is absent/null. Positions are counted in the body after the
-frontmatter block, not in the file (observed: a heading on file line 4 after
-a three-line frontmatter reports line 1), so Markdown lint findings in a file
-with frontmatter are off by the frontmatter's length — a known bug, see
-[../roadmap.md](../roadmap.md).
+`frontmatter` is absent/null. Positions count from the start of the file,
+frontmatter included: a heading on file line 4 after a three-line
+frontmatter reports line 4.
 
 There is no selector language for the tree: JSON Pointer and jq address it
 like any other document (`dq get post.md /frontmatter/value/title`,
@@ -300,8 +298,9 @@ like any other document (`dq get post.md /frontmatter/value/title`,
 
 Writing: an unmodified document is written back byte for byte; a modified
 one is refused, and `convert -F markdown` only accepts Markdown input.
-Fenced code blocks carry an inline offset so composite rules can place
-findings inside them (see [rule-checks.md](rule-checks.md)).
+The `value` of a fenced code block carries the byte span of the block's
+content and an inline offset, so composite rules can place findings inside
+it (see [rule-checks.md](rule-checks.md)).
 
 ### Markdown frontmatter (`--input-format frontmatter`)
 

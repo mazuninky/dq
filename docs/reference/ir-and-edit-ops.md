@@ -60,9 +60,10 @@ Lookups, all O(1):
 YAML, JSON and TOML (the formats with textual edits) populate an `Original`
 entry with a span for every node. Markdown block nodes carry positions in the
 tree itself (`position`), and the Markdown parser adds a provenance entry
-without span but with an inline offset for the `value` leaf of every fenced
-code block, so composite rules can project into it (the anchor position then
-comes from the node's `position`). The Dockerfile parser, read-only, populates
+for the `value` leaf of every fenced code block: a span from the first
+content line (the line after the opening fence, at the fence's column) to the
+end of the block, and an inline offset, so a composite rule anchored at that
+leaf projects into it. The Dockerfile parser, read-only, populates
 an `Original` entry with a span for every node of every instruction: the
 record, `instruction` and `line` at the keyword on the line the instruction
 starts on, `arguments` and everything inside it at the first argument on that
@@ -78,7 +79,10 @@ scalar's content starts so composite rules can project inner positions:
 
 - YAML block scalars (`|`, `>`, `|-`, `>-`, with or without an indentation
   indicator): always `Some({byte_start: 0, line: 1, col: 1})`.
-- Markdown fenced code blocks: always `Some(…)` as above.
+- Markdown fenced code blocks: `Some({byte_start: 0, line: 1, col})` with
+  `col` the file column the content lines start at — the fence's column, 1
+  for a top-level block, more inside a list item or a block quote (comrak
+  takes that indentation off every content line).
 - JSON strings with `\n` escapes: best effort, may be `None`.
 - Everything else: `None`; composite rules then fall back to the anchor's
   span.

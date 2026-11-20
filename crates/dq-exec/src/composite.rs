@@ -390,13 +390,22 @@ fn process_extract_item(
             } else {
                 format!("{prefix}: {raw_message}")
             };
+            // A parse error that knows where it is lands there, projected
+            // onto the outer file the way a nested diagnostic is; one that
+            // does not lands on the anchor.
+            let (line, col) = match &err {
+                dq_core::Error::Parse { line, col, .. } if *line > 0 && *col > 0 => {
+                    anchor_position.project(*line, *col)
+                }
+                _ => (anchor_position.line, anchor_position.col),
+            };
             out.diagnostics.push(Diagnostic {
                 rule_id: format!("{outer_id}.parse-failed"),
                 severity: Severity::Error,
                 message,
                 file: Some(path.to_path_buf()),
-                line: anchor_position.line,
-                col: anchor_position.col,
+                line,
+                col,
                 span: None,
                 references: outer_rule.rule.references.clone(),
                 fix: None,
@@ -427,27 +436,7 @@ fn process_extract_item(
     // Project every inner diagnostic onto outer-file coordinates and
     // prepend the outer message prefix.
     for inner in inner_evaluation.diagnostics {
-        let projected_line = match anchor_position.span_line {
-            Some(span_line) => span_line.saturating_add(inner.line).saturating_sub(1),
-            None => inner.line,
-        };
-        let projected_col = if inner.line == 1 {
-            // First line of the inner document: stack the inline-offset
-            // column on top of the inner column. The inline-offset is
-            // 0-based per `InlineBaseline` but the formula needs 1-based
-            // coordinates; the markdown / YAML parsers populate
-            // `InlineBaseline { col: 1 }` for the leftmost position so
-            // the formula `inline.col + inner.col - 1` reduces to
-            // `inner.col` in the common case. When no inline-offset is
-            // present we fall back to the anchor span's column.
-            let base_col = anchor_position
-                .inline_col
-                .or(anchor_position.span_col)
-                .unwrap_or(1);
-            base_col.saturating_add(inner.col).saturating_sub(1)
-        } else {
-            inner.col
-        };
+        let (projected_line, projected_col) = anchor_position.project(inner.line, inner.col);
         let prefix = &composite.message_prefix;
         let projected_message = if prefix.is_empty() {
             inner.message
@@ -495,6 +484,32 @@ struct AnchorPosition {
     /// [`dq_core::InlineBaseline`] — used as the column-projection base
     /// for inner_line == 1.
     inline_col: Option<u32>,
+}
+
+impl AnchorPosition {
+    /// Project an inner-document `(line, col)` onto the outer file.
+    ///
+    /// The line counts from the anchor's span line when there is one. The
+    /// column of every line starts at the inline-offset column when the
+    /// anchor has one (the markdown parser gives a fenced code block's
+    /// content the column its lines start at; YAML block scalars give 1,
+    /// which leaves the column as it is); without one, only the first
+    /// line starts at the anchor span's column.
+    fn project(&self, line: u32, col: u32) -> (u32, u32) {
+        let projected_line = match self.span_line {
+            Some(span_line) => span_line.saturating_add(line).saturating_sub(1),
+            None => line,
+        };
+        let base_col = match (self.inline_col, line) {
+            (Some(inline_col), _) => inline_col,
+            (None, 1) => self.span_col.unwrap_or(1),
+            (None, _) => 1,
+        };
+        (
+            projected_line,
+            base_col.saturating_add(col).saturating_sub(1),
+        )
+    }
 }
 
 /// Resolve `anchor_str` against the outer IR. Logs a `tracing::warn!` on

@@ -114,7 +114,7 @@ check:
   extract: |
     [paths(objects | select(.type == "code_block" and .fenced == true and .lang == "yaml")) as $p |
      getpath($p) as $node |
-     {value: $node.value, format: "yaml", anchor: ($p | map("/" + tostring) | add // "")}]
+     {value: $node.value, format: "yaml", anchor: (($p + ["value"]) | map("/" + tostring) | add)}]
   nested:
     id: markdown.code-blocks-yaml-valid.inner
     description: Parse-only; the outer rule's parse-failed branch is the finding.
@@ -147,7 +147,8 @@ original design made them errors with exit 1).
 
 1. The `value` is parsed with the named parser. If that fails, one
    diagnostic `<outer-id>.parse-failed` (severity error, message
-   `<format> parse failed: <error>`) is placed at the anchor, `nested` is not
+   `<format> parse failed: <error>`) is placed at the parse error, projected
+   as below (at the anchor when the error has no position), `nested` is not
    run for that item, and the remaining items are still processed.
 2. Otherwise the `nested` rule — a full rule with its own `match`, `check`,
    and possibly another composite — runs on the parsed value.
@@ -162,12 +163,16 @@ With the anchor's position (`line`, `col`) and the anchor's inline offset
 
 ```
 line = anchor.line + inner.line - 1
-col  = inner.line == 1 ? inline.col + inner.col - 1 : inner.col
+col  = inline.col + inner.col - 1                 (with an inline offset)
+col  = inner.line == 1 ? anchor.col + inner.col - 1 : inner.col   (without)
 ```
 
 So a YAML block starting at line 10 with an inner finding at 3:7 lands on
-12:7. Without an inline offset only the anchor position is used; without an
-anchor position the inner coordinates are kept and a warning is logged.
+12:7, and a Markdown YAML block inside a list item, whose content lines start
+at column 3, puts an error at its 1:4 on file column 6. Without an anchor
+position the inner line is kept and a warning is logged. The anchor of
+`markdown.code-blocks-yaml-valid` is the block's `value` leaf, which has
+both; the code-block node itself has no span.
 
 ### Depth bound
 
