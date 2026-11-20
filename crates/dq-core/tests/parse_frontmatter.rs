@@ -224,3 +224,26 @@ fn a_bom_without_frontmatter_stays_in_the_body() {
     frontmatter().write(&doc, &mut out).expect("write");
     assert_eq!(out, input.as_bytes());
 }
+
+/// A YAML header with nothing in it reads as null and is written back
+/// empty. Was: `---\nnull\n---\n`, a header that reads as the scalar null
+/// a reader of the file never wrote.
+#[test]
+fn an_empty_yaml_header_is_written_back_empty() {
+    for (input, want) in [
+        ("---\n---\nbody\n", "---\n---\nbody\n"),
+        ("\u{feff}---\n---\nbody\n", "\u{feff}---\n---\nbody\n"),
+        ("---\n---\n", "---\n---\n"),
+        // A header of comments alone holds nothing either; the writer
+        // drops comments, as it does in every header.
+        ("---\n# note\n---\nbody\n", "---\n---\nbody\n"),
+        // So is one that spells the null: it reads the same.
+        ("---\nnull\n---\nbody\n", "---\n---\nbody\n"),
+    ] {
+        let doc = parse_md(input);
+        assert_eq!(doc.value(), &Value::Null, "{input:?}");
+        let mut out = Vec::new();
+        frontmatter().write(&doc, &mut out).expect("write");
+        assert_eq!(String::from_utf8(out).expect("utf-8"), want, "{input:?}");
+    }
+}

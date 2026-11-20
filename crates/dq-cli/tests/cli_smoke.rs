@@ -1135,3 +1135,35 @@ fn validate_snippet_keeps_non_ascii_next_to_an_escaped_control_character() {
         "expected the snippet with `é` intact, got:\n{stderr}",
     );
 }
+
+#[test]
+fn smoke_fmt_writes_an_empty_frontmatter_header_back_empty() {
+    // Was: `---\nnull\n---\nbody\n`. `set` takes no edit on a frontmatter
+    // file, empty header or not (exit 7), and leaves it alone.
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    for src in ["---\n---\nbody\n", "\u{feff}---\n---\nbody\n"] {
+        std::fs::write(dir.path().join("p.md"), src).expect("write p.md");
+        dq().current_dir(dir.path())
+            .args(["--no-color", "--input-format", "frontmatter", "fmt", "p.md"])
+            .assert()
+            .success()
+            .stdout(src.to_owned());
+        dq().current_dir(dir.path())
+            .args([
+                "--no-color",
+                "--input-format",
+                "frontmatter",
+                "-i",
+                "set",
+                "p.md",
+                "/t",
+                "x",
+            ])
+            .assert()
+            .code(7);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("p.md")).unwrap(),
+            src
+        );
+    }
+}

@@ -20,7 +20,8 @@
 //!
 //! Empty-map fallback (no frontmatter): the writer emits just the body bytes
 //! — no synthetic `---\n---\n` markers — so a file with no frontmatter
-//! round-trips verbatim.
+//! round-trips verbatim. A YAML header with nothing in it (`---\n---\n`)
+//! reads as null and is written back empty.
 
 use std::io::Write;
 
@@ -129,8 +130,12 @@ impl Format for Frontmatter {
         match payload.kind {
             FrontmatterKind::Yaml => {
                 write_io(w, b"---\n")?;
-                let inner = Document::value_only(doc.value().clone(), FormatTag::Yaml);
-                Yaml.write(&inner, w)?;
+                // A header with nothing in it reads as null: written back
+                // empty, not as the scalar `null`.
+                if *doc.value() != Value::Null {
+                    let inner = Document::value_only(doc.value().clone(), FormatTag::Yaml);
+                    Yaml.write(&inner, w)?;
+                }
                 write_io(w, b"---\n")?;
                 write_io(w, &payload.body)?;
             }
