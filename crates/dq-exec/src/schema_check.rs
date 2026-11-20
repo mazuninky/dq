@@ -132,12 +132,17 @@ fn external_ref_error(rule_id: &str, uri: &str) -> ExecError {
 }
 
 /// Recursively walk `schema` looking for a `$ref` that points at an
-/// external resource (`http://` / `https://` / `file://` / a path with
-/// any non-fragment scheme). Returns the offending URI if any.
+/// external resource. Returns the offending `$ref` as written, if any.
 ///
-/// Internal `$ref` (`#/...`) and pure JSON-pointer fragments are
-/// allowed — those are resolved entirely from within the schema's own
-/// `$id` graph and don't trigger the default retriever.
+/// A `$ref` is internal when it names a resource the document itself
+/// holds: a fragment (`#/$defs/x`, `#anchor`), or a reference that,
+/// resolved against the base of the schema it sits in (its own `$id`, else
+/// the nearest enclosing one, else `json-schema:///`), names the root or a
+/// schema's `$id` ([`embedded_resources`]) — `inner.json` beside an
+/// embedded `$id: inner.json`, `https://example.com/s.json#/$defs/x` in a
+/// schema whose `$id` is `https://example.com/s.json`. Anything else is
+/// external: another URI, a `file:` or `http:` one no `$id` names, a
+/// relative path to a file next to the schema.
 ///
 /// The walk follows the schema's keywords ([`RefKeyword`]): the value of
 /// a data keyword (`const`, `enum`, `default`, `examples`) is an instance,
@@ -154,10 +159,58 @@ fn external_ref_error(rule_id: &str, uri: &str) -> ExecError {
 /// not follow them: the validator's own build error catches what they
 /// lead to (`compile_json`).
 fn find_external_ref(schema: &serde_json::Value) -> Option<&str> {
-    find_external_ref_in(schema, RefWalk::Schema)
+    // A root `$id` that does not parse leaves no base to resolve against:
+    // every reference but a fragment counts as external then.
+    let root = root_base(schema).ok();
+    let resources = root
+        .as_ref()
+        .map(|root| embedded_resources(schema, root))
+        .unwrap_or_default();
+    let refs = RefScope {
+        resources: &resources,
+    };
+    refs.find_in(schema, RefWalk::Schema, root.as_ref())
 }
 
-/// How [`find_external_ref_in`] reads the value it walks.
+/// The base URI of `schema`'s root: its `$id` without trailing `#`s, else
+/// `json-schema:///`, normalized.
+fn root_base(schema: &serde_json::Value) -> std::result::Result<Uri<String>, String> {
+    let root = jsonschema::uri::from_str(schema_id(schema).unwrap_or(DEFAULT_BASE_URI))
+        .map_err(|err| err.to_string())?;
+    jsonschema::uri::from_str(root.as_str().trim_end_matches('#')).map_err(|err| err.to_string())
+}
+
+/// The normalized URI of every resource `schema` holds: its root (`root`)
+/// and each schema's `$id`, resolved against the base of the schema around
+/// it. The schemas are the ones the registry crawls ([`subschemas`]); a
+/// `$id` in data (`const`, `default`, an unknown keyword) names nothing.
+fn embedded_resources(schema: &serde_json::Value, root: &Uri<String>) -> HashSet<String> {
+    let mut resources = HashSet::from([root.as_str().to_owned()]);
+    let mut queue = VecDeque::from([(root.clone(), schema)]);
+    while let Some((mut base, contents)) = queue.pop_front() {
+        if let Some(id) = schema_id(contents) {
+            // A `$id` that does not resolve names no resource; nothing
+            // under it is resolved against it either.
+            let Ok(resolved) = resolve_reference(&base.borrow(), id) else {
+                continue;
+            };
+            base = resolved;
+            resources.insert(base.as_str().to_owned());
+        }
+        if let serde_json::Value::Object(map) = contents {
+            queue.extend(subschemas(map).map(|child| (base.clone(), child)));
+        }
+    }
+    resources
+}
+
+/// What [`find_external_ref`] checks each `$ref` against.
+struct RefScope<'r> {
+    /// [`embedded_resources`] of the whole schema.
+    resources: &'r HashSet<String>,
+}
+
+/// How [`RefScope::find_in`] reads the value it walks.
 #[derive(Clone, Copy)]
 enum RefWalk {
     /// A schema (or an array of schemas): keys are keywords.
@@ -167,7 +220,7 @@ enum RefWalk {
     Opaque,
 }
 
-/// What the value of a schema keyword is, for [`find_external_ref_in`].
+/// What the value of a schema keyword is, for [`RefScope::find_in`].
 enum RefKeyword {
     /// An instance (`const`, `enum`, `default`, `examples`): not walked.
     Data,
@@ -211,69 +264,74 @@ impl RefKeyword {
     }
 }
 
-/// [`find_external_ref`] over `value`, read the way `walk` says.
-fn find_external_ref_in(value: &serde_json::Value, walk: RefWalk) -> Option<&str> {
-    match value {
-        serde_json::Value::Object(map) => {
-            if let Some(serde_json::Value::String(uri)) = map.get("$ref")
-                && is_external_ref(uri)
-            {
-                return Some(uri.as_str());
-            }
-            match walk {
-                RefWalk::Opaque => map
-                    .values()
-                    .find_map(|child| find_external_ref_in(child, RefWalk::Opaque)),
-                RefWalk::Schema => {
-                    map.iter()
-                        .find_map(|(keyword, child)| match (RefKeyword::of(keyword), child) {
+impl RefScope<'_> {
+    /// [`find_external_ref`] over `value`, read the way `walk` says;
+    /// `base` is the base URI of the schema `value` sits in, `None` when
+    /// it did not resolve.
+    fn find_in<'s>(
+        &self,
+        value: &'s serde_json::Value,
+        walk: RefWalk,
+        base: Option<&Uri<String>>,
+    ) -> Option<&'s str> {
+        match value {
+            serde_json::Value::Object(map) => {
+                // A schema's own `$id` is the base of its `$ref`; one in
+                // data changes nothing.
+                let rebased = match (walk, schema_id(value)) {
+                    (RefWalk::Schema, Some(id)) => {
+                        Some(base.and_then(|base| resolve_reference(&base.borrow(), id).ok()))
+                    }
+                    _ => None,
+                };
+                let base = rebased.as_ref().map_or(base, Option::as_ref);
+                if let Some(serde_json::Value::String(uri)) = map.get("$ref")
+                    && self.is_external(uri, base)
+                {
+                    return Some(uri.as_str());
+                }
+                match walk {
+                    RefWalk::Opaque => map
+                        .values()
+                        .find_map(|child| self.find_in(child, RefWalk::Opaque, base)),
+                    RefWalk::Schema => map.iter().find_map(|(keyword, child)| {
+                        match (RefKeyword::of(keyword), child) {
                             (RefKeyword::Data, _) => None,
                             (RefKeyword::Subschema, _) => {
-                                find_external_ref_in(child, RefWalk::Schema)
+                                self.find_in(child, RefWalk::Schema, base)
                             }
                             (RefKeyword::SchemaMap, serde_json::Value::Object(schemas)) => schemas
                                 .values()
-                                .find_map(|schema| find_external_ref_in(schema, RefWalk::Schema)),
+                                .find_map(|schema| self.find_in(schema, RefWalk::Schema, base)),
                             (RefKeyword::SchemaMap | RefKeyword::Unknown, _) => {
-                                find_external_ref_in(child, RefWalk::Opaque)
+                                self.find_in(child, RefWalk::Opaque, base)
                             }
-                        })
+                        }
+                    }),
                 }
             }
+            serde_json::Value::Array(items) => {
+                items.iter().find_map(|item| self.find_in(item, walk, base))
+            }
+            _ => None,
         }
-        serde_json::Value::Array(items) => items
-            .iter()
-            .find_map(|item| find_external_ref_in(item, walk)),
-        _ => None,
     }
-}
 
-/// Whether a `$ref` value names something outside the schema document.
-fn is_external_ref(uri: &str) -> bool {
-    // RFC 3986: a URI with a scheme is `scheme:rest`. We treat
-    // anything other than a pure fragment-only reference as
-    // potentially external. This is conservative — relative paths
-    // like `./other.json` would also be flagged, which matches the
-    // spec intent (the validator's default retriever can't fetch
-    // them either).
-    if uri.starts_with('#') || uri.is_empty() {
-        return false;
-    }
-    // Look for a scheme separator before any path-like char.
-    match uri.find(':') {
-        Some(idx) => {
-            let scheme = &uri[..idx];
-            // A scheme is alpha (1+) followed by alphanumerics / +
-            // / - / .
-            !scheme.is_empty()
-                && scheme
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_ascii_alphabetic())
+    /// Whether the `$ref` `uri`, in a schema whose base is `base`, names
+    /// something outside the schema document: anything but a fragment
+    /// that does not resolve, against `base`, to the root or an embedded
+    /// `$id` ([`embedded_resources`]). Without a base (`None`) only a
+    /// fragment is internal.
+    fn is_external(&self, uri: &str, base: Option<&Uri<String>>) -> bool {
+        if uri.starts_with('#') || uri.is_empty() {
+            return false;
         }
-        // Relative paths without a scheme are still external for
-        // the default-registry validator's purposes.
-        None => true,
+        let Some(base) = base else {
+            return true;
+        };
+        resolve_reference(&base.borrow(), uri).map_or(true, |resolved| {
+            !self.resources.contains(resolved.strip_fragment().as_str())
+        })
     }
 }
 
@@ -325,10 +383,7 @@ struct MetaSchemaCrawl {
 
 impl MetaSchemaCrawl {
     fn run(schema: &serde_json::Value) -> std::result::Result<(), String> {
-        let root = jsonschema::uri::from_str(schema_id(schema).unwrap_or(DEFAULT_BASE_URI))
-            .map_err(|err| err.to_string())?;
-        let root = jsonschema::uri::from_str(root.as_str().trim_end_matches('#'))
-            .map_err(|err| err.to_string())?;
+        let root = root_base(schema)?;
         let mut crawl = Self::default();
         crawl.resources.insert(root.as_str().to_owned());
         let mut queue = VecDeque::from([(root, schema)]);
@@ -1745,6 +1800,65 @@ $defs:
             "items": {"$ref": "#/default"},
         }));
         assert_eq!(message, "external $ref is not supported: https://x.com/y");
+    }
+
+    #[test]
+    fn find_external_ref_resolves_against_the_schemas_own_and_embedded_ids() {
+        let root = "https://example.com/root.json";
+        for (schema, external) in [
+            // The root's own `$id`, absolute.
+            (
+                serde_json::json!({"$id": root, "$ref": "https://example.com/root.json#/$defs/x"}),
+                None,
+            ),
+            // An embedded `$id`, relative, with and without a fragment.
+            (
+                serde_json::json!({"$id": root, "$defs": {"i": {"$id": "inner.json"}},
+                    "properties": {"a": {"$ref": "inner.json"}, "b": {"$ref": "inner.json#/x"}}}),
+                None,
+            ),
+            // Inside the embedded resource, `inner.json` is its own base.
+            (
+                serde_json::json!({"$id": root, "$defs": {"i": {"$id": "dir/inner.json",
+                    "properties": {"a": {"$ref": "inner.json"}}}}}),
+                None,
+            ),
+            // No `$id` names these.
+            (
+                serde_json::json!({"$id": root, "$defs": {"i": {"$id": "inner.json"}},
+                    "properties": {"a": {"$ref": "other.json"}}}),
+                Some("other.json"),
+            ),
+            (
+                serde_json::json!({"$id": root, "x-data": {"$id": "inner.json"},
+                    "properties": {"a": {"$ref": "inner.json"}}}),
+                Some("inner.json"),
+            ),
+            (
+                serde_json::json!({"$id": root, "$defs": {"i": {"$id": "dir/inner.json"}},
+                    "properties": {"a": {"$ref": "inner.json"}}}),
+                Some("inner.json"),
+            ),
+        ] {
+            assert_eq!(find_external_ref(&schema), external, "for {schema}");
+        }
+    }
+
+    #[test]
+    fn compile_inline_resolves_a_ref_to_the_schemas_own_or_an_embedded_id() {
+        for schema in [
+            serde_json::json!({"$id": "https://example.com/s.json",
+                "$defs": {"x": {"maximum": 5}},
+                "properties": {"x": {"$ref": "https://example.com/s.json#/$defs/x"}}}),
+            serde_json::json!({"$id": "https://example.com/root.json",
+                "$defs": {"inner": {"$id": "inner.json", "maximum": 5}},
+                "properties": {"x": {"$ref": "inner.json"}}}),
+        ] {
+            let compiled = compile_inline("test.ok", &schema, &SchemaNotes::default(), None)
+                .unwrap_or_else(|err| panic!("{schema} should compile, got {err:?}"));
+            assert!(holds(&compiled, &serde_json::json!({"x": 5})), "{schema}");
+            assert!(!holds(&compiled, &serde_json::json!({"x": 6})), "{schema}");
+        }
     }
 
     #[test]

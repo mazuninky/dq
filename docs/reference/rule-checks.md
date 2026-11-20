@@ -66,9 +66,28 @@ rule's own sidecar. Three layers enforce it: the validator is built offline
 `resolve-file` features are off. A schema with an unresolvable `$ref` fails
 with `schema_compile` (exit 3).
 
-Known issue: a relative `$ref` to a subschema's embedded `$id`, and an
-absolute reference to the schema's own `$id`, are currently rejected as
-external although they are internal (see [../roadmap.md](../roadmap.md)).
+A `$ref` is internal when it resolves inside the schema document. That
+is a fragment (`#/$defs/x`, `#anchor`), or a reference that names the root
+or a schema's `$id` once it is resolved against the base of the schema it
+sits in (that schema's own `$id`, else the nearest enclosing one). Both of
+these resolve:
+
+```yaml
+$id: https://example.com/root.json
+$defs:
+  inner: { $id: inner.json, maximum: 5 }   # https://example.com/inner.json
+  x: { minimum: 0 }
+properties:
+  a: { $ref: inner.json }                  # the embedded $id, relative
+  b: { $ref: 'https://example.com/root.json#/$defs/x' }   # the schema's own $id
+```
+
+Everything else is external and refused, even when it looks close: a URI
+no `$id` names (`other.json`, `https://example.com/other.json`), a `file:`
+path, a `$id` inside data (`const`, `default`, an unknown keyword), which
+names no resource, a `$dynamicRef` outside the document, and a `$schema` that
+names a meta-schema dq does not bundle. Nothing is fetched to decide: dq
+never opens a connection or reads a file for a reference.
 
 Not supported, by decision: XSD, RelaxNG, Schematron, and OpenAPI request /
 response validation. OpenAPI documents are checked for shape only
