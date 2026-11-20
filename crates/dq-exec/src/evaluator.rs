@@ -825,9 +825,10 @@ fn build_jq_diagnostic(
 ///
 /// Each error's `instance_path` is parsed as an RFC 6901 [`Pointer`];
 /// when the IR has a span for that pointer, the diagnostic's
-/// `(line, col)` come from `Ir::line_col_for`. The message format is
-/// `<message_prefix><keyword_location>: <error>` so reporters can show
-/// both the schema location and the human-readable explanation.
+/// `(line, col)` come from `Ir::line_col_for`. The message is
+/// `[<message_prefix>: ]<keyword_location>: <error>` (see
+/// [`schema_message`]) so reporters can show both the schema location and
+/// the human-readable explanation.
 ///
 /// `loc.file`, `loc.pointer`, and `loc.line` overrides on the rule are
 /// honored via the same [`resolve_loc_file`] / [`resolve_loc_position`]
@@ -914,7 +915,6 @@ fn run_schema_check(
                 }
             }
         };
-        let prefix = compiled.message_prefix.as_deref().unwrap_or("");
         // `evaluation_path()` is the dynamic path *including* `$ref`
         // traversals (`/properties/x/$ref/enum`) — what jsonschema
         // ≤ 0.38 exposed as `schema_path`. Since 0.39 `schema_path()` is
@@ -922,7 +922,7 @@ fn run_schema_check(
         // using it would silently change every diagnostic under a `$ref`.
         // dq's own keywords get theirs from `EvaluationPaths`.
         let keyword = evaluation_path.as_str();
-        let message = format!("{prefix}{keyword}: {error_text}");
+        let message = schema_message(compiled.message_prefix.as_deref(), keyword, &error_text);
         out.diagnostics.push(Diagnostic {
             rule_id: rule.rule.id.clone(),
             severity: rule.rule.severity,
@@ -934,6 +934,22 @@ fn run_schema_check(
             references: rule.rule.references.clone(),
             fix: rule.rule.fix.clone(),
         });
+    }
+}
+
+/// The message of one schema validation error: `<keyword>: <error_text>`,
+/// behind the rule's `message` prefix and `: ` when the rule has one — the
+/// separator a composite puts between its `message` and a nested
+/// diagnostic. Trailing whitespace and one trailing `:` of the prefix are
+/// dropped first, so `shape`, `shape:` and `shape: ` all give
+/// `shape: /required: …`; a blank prefix is no prefix.
+fn schema_message(prefix: Option<&str>, keyword: &str, error_text: &str) -> String {
+    let prefix = prefix.unwrap_or_default().trim_end();
+    let prefix = prefix.strip_suffix(':').unwrap_or(prefix).trim_end();
+    if prefix.is_empty() {
+        format!("{keyword}: {error_text}")
+    } else {
+        format!("{prefix}: {keyword}: {error_text}")
     }
 }
 

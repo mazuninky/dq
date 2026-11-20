@@ -33,13 +33,16 @@ validation error becomes one diagnostic:
   comes from the IR's spans (`line:col` on YAML / JSON / TOML /
   Dockerfile, line 1 elsewhere);
 - the message is the optional `message` prefix, the `keywordLocation`, and the
-  validator's text: `/properties/age/type: "twelve" is not of type
-  "integer"`. Values are spelled as the document spells them
-  (`.nan is not of type "string"`), and a limit as the rule or the schema
-  file writes it (`the maximum of 1E2`). That holds wherever the limit sits:
-  behind a YAML alias (`x: *lim`), or in a place a `$ref` reaches outside
-  the schema keywords (`$ref: '#/x-limits/a'`). The prefix is glued on without a
-  separator today (`shape/properties/age/type: …`).
+  validator's text, joined with `: `: `/properties/age/type: "twelve" is
+  not of type "integer"`, or with `message: shape`, `shape:
+  /properties/age/type: …` — the separator a composite puts between its
+  `message` and a nested message. Trailing spaces and one trailing colon of
+  the prefix are dropped first, so `shape`, `shape:` and `"shape: "` read
+  alike; a blank prefix is no prefix. Values are spelled as the document
+  spells them (`.nan is not of type "string"`), and a limit as the rule or
+  the schema file writes it (`the maximum of 1E2`). That holds wherever the
+  limit sits: behind a YAML alias (`x: *lim`), or in a place a `$ref`
+  reaches outside the schema keywords (`$ref: '#/x-limits/a'`).
 
 Numbers a JSON document cannot hold follow these rules:
 

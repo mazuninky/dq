@@ -50,9 +50,9 @@ pub(crate) struct CompiledSchemaCheck {
     /// It validates the document's own [`dq_core::Value`] — see
     /// [`crate::schema_value`].
     pub(crate) validator: jsonschema::Validator<crate::schema_value::DqJson>,
-    /// Optional message prefix — when set, prepended to the
+    /// Optional message prefix — when set, put ahead of the
     /// auto-generated `keywordLocation`-based message in each
-    /// diagnostic.
+    /// diagnostic, separated by `: ` (see `evaluator::schema_message`).
     pub(crate) message_prefix: Option<String>,
 }
 

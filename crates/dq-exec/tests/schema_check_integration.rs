@@ -119,11 +119,46 @@ check:
     let path = Utf8PathBuf::from("doc.yaml");
     let diags = eval.evaluate_file(&path, &owned.to_borrowed(), "yaml");
     assert_eq!(diags.len(), 1, "expected one diagnostic");
-    assert!(
-        diags[0].message.starts_with("shape: "),
-        "expected prefix, got: {}",
-        diags[0].message
+    assert_eq!(
+        diags[0].message,
+        r#"shape: /required: "name" is a required property"#
     );
+}
+
+/// The rule's `message` and the keyword location are joined with `: `,
+/// as a composite joins its `message` to a nested diagnostic. A prefix
+/// that already ends in a colon, or in a colon and spaces, keeps one
+/// separator; a blank prefix is no prefix. Before, the prefix was glued
+/// on as written: `shape/required: …`.
+#[test]
+fn schema_message_prefix_is_separated_from_the_keyword_location() {
+    for (prefix, expected) in [
+        (
+            "shape",
+            r#"shape: /required: "name" is a required property"#,
+        ),
+        (
+            "shape:",
+            r#"shape: /required: "name" is a required property"#,
+        ),
+        (
+            "shape :  ",
+            r#"shape: /required: "name" is a required property"#,
+        ),
+        ("  ", r#"/required: "name" is a required property"#),
+    ] {
+        let yaml = format!(
+            "id: test.prefixed\ndescription: x\nseverity: error\nmatch:\n  format: yaml\n\
+             check:\n  schema:\n    type: object\n    required: [name]\n  message: {prefix:?}\n"
+        );
+        let eval = evaluator_from_yaml(&yaml);
+        let value = serde_json::json!({});
+        let owned = ir_for(&value, "yaml");
+        let path = Utf8PathBuf::from("doc.yaml");
+        let diags = eval.evaluate_file(&path, &owned.to_borrowed(), "yaml");
+        assert_eq!(diags.len(), 1, "{prefix:?}: {diags:?}");
+        assert_eq!(diags[0].message, expected, "{prefix:?}");
+    }
 }
 
 #[test]
