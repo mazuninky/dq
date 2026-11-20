@@ -337,3 +337,63 @@ fn raw_template_strings_refuse_a_file_that_spells_every_placeholder() {
         "DQtplxxxxxxxxq0qx\n"
     );
 }
+
+/// XML reads the text on both sides of a comment, a processing instruction
+/// or a child element as one text node, so a file spells the placeholder
+/// text without any escape: `DQtpl<!-- c -->xq0qx`. Was: `c` read as the
+/// template `{{ .a }}` (exit 0), and `set -i` wrote the template into the
+/// place of the text.
+#[test]
+fn raw_template_strings_leave_placeholder_text_split_by_markup_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, src, pointer) in [
+        (
+            "c.xml",
+            "<r><a>{{ .a }}</a><c>DQtpl<!-- c -->xq0qx</c></r>\n",
+            "/r/0/c/0/#text",
+        ),
+        (
+            "p.xml",
+            "<r><a>{{ .a }}</a><c>DQtpl<?p q?>xq0qx</c></r>\n",
+            "/r/0/c/0/#text",
+        ),
+        (
+            "e.xml",
+            "<r><a>{{ .a }}</a><d>DQtpl<i/>xq0qx</d></r>\n",
+            "/r/0/d/0/#text",
+        ),
+    ] {
+        let file = write(dir.path(), name, src);
+        let get = |pointer: &str| {
+            let out = dq()
+                .args([
+                    "--no-color",
+                    "--raw-template-strings",
+                    "get",
+                    &file,
+                    pointer,
+                ])
+                .assert()
+                .success();
+            String::from_utf8_lossy(&out.get_output().stdout).into_owned()
+        };
+        assert_eq!(get(pointer), "DQtplxq0qx\n", "{name}");
+        assert_eq!(get("/r/0/a/0/#text"), "{{ .a }}\n", "{name}");
+        dq().args([
+            "--no-color",
+            "--raw-template-strings",
+            "-i",
+            "set",
+            &file,
+            "/r/0/a/0/#text",
+            "b",
+        ])
+        .assert()
+        .success();
+        let written = std::fs::read_to_string(&file).unwrap();
+        assert!(!written.contains("{{ .a }}"), "{name}: {written:?}");
+        assert!(!written.contains("DQtplxx"), "{name}: {written:?}");
+        assert_eq!(get(pointer), "DQtplxq0qx\n", "{name}: {written:?}");
+        assert_eq!(get("/r/0/a/0/#text"), "b\n", "{name}: {written:?}");
+    }
+}

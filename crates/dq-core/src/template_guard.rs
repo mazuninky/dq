@@ -370,8 +370,10 @@ const MAX_FILL: usize = 8;
 /// they do not, the data holds a prefix's text, and both are tried again
 /// one fill letter longer — up to [`MAX_FILL`] letters, past which the
 /// file is refused rather than read wrongly. Bytes with no escape character
-/// (`\\`, or `&` for an XML or Markdown character reference) spell no
-/// prefix the bytes do not hold, and are read once.
+/// (`\\`, or `&` for an XML or Markdown character reference) and no `<` (the
+/// comment, processing instruction or element that XML, Markdown or HTML read
+/// between two runs of text as one text node) spell no prefix the bytes do
+/// not hold, and are read once.
 ///
 /// # Errors
 ///
@@ -381,13 +383,13 @@ fn parse_placeheld(
     bytes: &[u8],
     parse: impl Fn(&[u8]) -> crate::Result<crate::Document>,
 ) -> crate::Result<(crate::Document, HashMap<String, String>)> {
-    let escapes = bytes.iter().any(|&b| b == b'\\' || b == b'&');
+    let spells_apart = bytes.iter().any(|&b| matches!(b, b'\\' | b'&' | b'<'));
     let mut min_fill = 1;
     loop {
         let (marks, twin) = Marks::pair(bytes, min_fill);
         let (text, map) = substitute_with(bytes, &marks);
         let doc = parse(&text)?;
-        if map.is_empty() || !escapes {
+        if map.is_empty() || !spells_apart {
             return Ok((doc, map));
         }
         let (twin_text, _) = substitute_with(bytes, &twin);

@@ -119,8 +119,9 @@ file is read a second time with placeholders of the same length spelled with
 placeholders, both get one more letter, up to eight. A file that spells the
 placeholder text at every one of those lengths is refused (exit 3,
 `file contains Go template syntax`, with a hint naming the placeholder text),
-never read wrongly. A file with no `\` and no `&` spells nothing with
-escapes, and is read once. The placeholder is
+never read wrongly. A file with no `\`, no `&` and no `<` spells nothing with
+escapes or with markup between two runs of text (XML reads
+`DQtpl<!-- c -->xq0qx` as one text node), and is read once. The placeholder is
 letters and digits only, so every format reads it as plain text: Markdown
 took the former `__DQ_TPL_<N>__` for strong emphasis, and a template alone in
 a paragraph came back as a `strong` node holding `DQ_TPL_0`. HCL reads a bare
