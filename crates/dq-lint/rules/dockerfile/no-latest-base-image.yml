@@ -14,8 +14,8 @@ check:
   # variable (`${BASE}`). A tag is a `:` after the last `/`, so a registry
   # port (`localhost:5000/img`) is not one.
   jq: |-
-    [range(0; length) as $at | .[$at]
-     | select(.instruction == "FROM" and (.arguments | type) == "string") | . + {pointer: "/\($at)"}]
+    arrays | [range(0; length) as $at | .[$at]
+     | select(type == "object" and .instruction == "FROM" and (.arguments | type) == "string") | . + {pointer: "/\($at)"}]
     | . as $froms
     | range(0; length) as $i
     | $froms[$i]

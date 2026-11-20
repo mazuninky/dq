@@ -11,7 +11,7 @@ match:
   filter: 'length > 0'
 check:
   # `any` compares whole names; `contains` on strings is a substring test.
-  jq: 'select(any(.[]; .instruction == "HEALTHCHECK") | not) | {summary: "no HEALTHCHECK"}'
+  jq: 'arrays | select(any(.[]; type == "object" and .instruction == "HEALTHCHECK") | not) | {summary: "no HEALTHCHECK"}'
   message: "Dockerfile has no HEALTHCHECK directive"
 references:
   - https://docs.docker.com/engine/reference/builder/#healthcheck

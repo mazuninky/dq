@@ -245,3 +245,9 @@ tests:
     format: yaml
     expected:
       violations: []
+  - name: RUN with an empty JSON form produces no violations
+    input: |
+      FROM alpine:3.20
+      RUN []
+    expected:
+      violations: []

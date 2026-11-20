@@ -64,3 +64,8 @@ tests:
     format: yaml
     expected:
       violations: []
+  - name: a comment-only Dockerfile produces no violations
+    input: |
+      # nothing here
+    expected:
+      violations: []

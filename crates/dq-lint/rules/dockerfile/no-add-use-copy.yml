@@ -21,8 +21,12 @@ check:
         sub("^(--\\S+\\s+)*"; "") | select(startswith("[")) | (try fromjson catch null)
         | select(type == "array" and all(.[]; type == "string"))
       else empty end;
-    range(0; length) as $i | .[$i]
-    | select(.instruction == "ADD")
+    # A root that is not an array, an instruction that is not a map and
+    # `arguments` that are neither a string nor an array of strings
+    # yield nothing instead of raising.
+    arrays | range(0; length) as $i | .[$i]
+    | select(type == "object" and .instruction == "ADD")
+    | select(.arguments | type == "string" or (type == "array" and all(.[]; type == "string")))
     | select(
         ([.arguments | exec_args] | .[0]) as $exec
         | (if $exec != null then $exec

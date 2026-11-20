@@ -34,8 +34,12 @@ check:
                and any($stages[$i + 1:][];
                    test("^\\s*(sudo(\\s+-\\S+)*\\s+)?([A-Za-z_][A-Za-z0-9_]*=(\"[^\"]*\"|'[^']*'|\\S*)\\s+)*((\\S*/)?env(\\s+-\\S+)*\\s+([A-Za-z_][A-Za-z0-9_]*=(\"[^\"]*\"|'[^']*'|\\S*)\\s+)*)?(\\S*/)?(ba|da|z|k|a)?sh(\\s|\\)|$)"))]
           | any);
-    range(0; length) as $i | .[$i]
-    | select(.instruction == "RUN")
+    # A root that is not an array, an instruction that is not a map and
+    # `arguments` that are neither a string nor an array of strings
+    # yield nothing instead of raising.
+    arrays | range(0; length) as $i | .[$i]
+    | select(type == "object" and .instruction == "RUN")
+    | select(.arguments | type == "string" or (type == "array" and all(.[]; type == "string")))
     | select(
         ([.arguments | exec_args] | .[0]) as $exec
         | (if $exec == null then .arguments | tostring
