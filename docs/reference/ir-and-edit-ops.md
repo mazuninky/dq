@@ -82,7 +82,10 @@ scalar's content starts so composite rules can project inner positions:
 - Markdown fenced code blocks: `Some({byte_start: 0, line: 1, col})` with
   `col` the file column the content lines start at — the fence's column, 1
   for a top-level block, more inside a list item or a block quote (comrak
-  takes that indentation off every content line).
+  takes that indentation off every content line). comrak takes at most that
+  many blanks from a line: a content line indented less starts at its own
+  first non-blank, and `Ir::inline_line_cols_for` gives that column line by
+  line.
 - JSON strings with `\n` escapes: best effort, may be `None`.
 - Everything else: `None`; composite rules then fall back to the anchor's
   span.

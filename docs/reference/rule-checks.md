@@ -174,7 +174,10 @@ col  = inner.line == 1 ? anchor.col + inner.col - 1 : inner.col   (without)
 
 So a YAML block starting at line 10 with an inner finding at 3:7 lands on
 12:7, and a Markdown YAML block inside a list item, whose content lines start
-at column 3, puts an error at its 1:4 on file column 6. Without an anchor
+at column 3, puts an error at its 1:4 on file column 6. A content line
+indented less than the fence starts at its own first non-blank, and `inline.col`
+is that column on that line: under a fence at column 3, an error at 1:5 of an
+unindented line lands on file column 5. Without an anchor
 position the inner line is kept and a warning is logged. The anchor of
 `markdown.code-blocks-yaml-valid` is the block's `value` leaf, which has
 both; the code-block node itself has no span.

@@ -323,7 +323,8 @@ Every node is a map with a `type` discriminator and node-specific fields
 `children`. Block nodes carry `position`; inline nodes do not. Frontmatter
 (`---` YAML, `+++` TOML, or `{…}` JSON followed by a blank line) is parsed
 before comrak and folded into `frontmatter: {kind, value}`; without one,
-`frontmatter` is absent/null. Positions count from the start of the file,
+`frontmatter` is absent/null. A UTF-8 byte order mark before the header is
+skipped, so it does not hide the frontmatter. Positions count from the start of the file,
 frontmatter included: a heading on file line 4 after a three-line
 frontmatter reports line 4.
 

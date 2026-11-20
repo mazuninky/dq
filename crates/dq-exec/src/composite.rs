@@ -477,6 +477,10 @@ struct AnchorPosition {
     /// [`dq_core::InlineBaseline`] — used as the column-projection base
     /// for inner_line == 1.
     inline_col: Option<u32>,
+    /// The column each content line starts at, where a line may start left
+    /// of `inline_col` ([`dq_core::Ir::inline_line_cols_for`]); `[n]` is
+    /// inner line `n + 1`. Empty when every line starts at `inline_col`.
+    inline_line_cols: Vec<u32>,
 }
 
 impl AnchorPosition {
@@ -486,15 +490,20 @@ impl AnchorPosition {
     /// column of every line starts at the inline-offset column when the
     /// anchor has one (the markdown parser gives a fenced code block's
     /// content the column its lines start at; YAML block scalars give 1,
-    /// which leaves the column as it is); without one, only the first
-    /// line starts at the anchor span's column.
+    /// which leaves the column as it is) — or, on a line indented less
+    /// than the fence, at its own first non-blank; without one, only the
+    /// first line starts at the anchor span's column.
     fn project(&self, line: u32, col: u32) -> (u32, u32) {
         let projected_line = match self.span_line {
             Some(span_line) => span_line.saturating_add(line).saturating_sub(1),
             None => line,
         };
         let base_col = match (self.inline_col, line) {
-            (Some(inline_col), _) => inline_col,
+            (Some(inline_col), _) => line
+                .checked_sub(1)
+                .and_then(|i| self.inline_line_cols.get(i as usize))
+                .copied()
+                .unwrap_or(inline_col),
             (None, 1) => self.span_col.unwrap_or(1),
             (None, _) => 1,
         };
@@ -529,6 +538,7 @@ fn resolve_anchor_position(
                 span_line: None,
                 span_col: None,
                 inline_col: None,
+                inline_line_cols: Vec::new(),
             };
         }
     };
@@ -548,6 +558,7 @@ fn resolve_anchor_position(
         span_line: span.map(|(l, _)| l),
         span_col: span.map(|(_, c)| c),
         inline_col: inline.map(|b| b.col),
+        inline_line_cols: outer_ir.inline_line_cols_for(&pointer).unwrap_or_default(),
     }
 }
 

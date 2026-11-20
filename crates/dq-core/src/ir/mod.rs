@@ -371,6 +371,36 @@ impl<'a> Ir<'a> {
         }
     }
 
+    /// The column in the source each line of the content at `pointer`
+    /// starts at — `[n]` for content line `n + 1` — when a line may start
+    /// left of the [`InlineBaseline::col`]: a Markdown fence indented by
+    /// `col - 1` blanks takes at most that many from each content line, so
+    /// a line indented less starts at its first non-blank. Empty when every
+    /// line starts at the baseline's column (a baseline at column 1, or no
+    /// span or source bytes to look the lines up in); `None` without a
+    /// baseline.
+    #[must_use]
+    pub fn inline_line_cols_for(&self, pointer: &Pointer) -> Option<Vec<u32>> {
+        let baseline = self.inline_offset_for(pointer)?;
+        let Some(span) = self.span_for(pointer) else {
+            return Some(Vec::new());
+        };
+        if baseline.col <= 1 || self.bytes.is_empty() {
+            return Some(Vec::new());
+        }
+        let end = span.value_range.end.min(self.bytes.len());
+        let start = span.line_range.start.min(end);
+        let strip = baseline.col - 1;
+        let cols = self.bytes[start..end]
+            .split(|&b| b == b'\n')
+            .map(|line| {
+                let blanks = line.iter().take_while(|&&b| b == b' ').count();
+                1 + u32::try_from(blanks).unwrap_or(u32::MAX).min(strip)
+            })
+            .collect();
+        Some(cols)
+    }
+
     /// Resolve `pointer` to a 1-indexed `(line, col)` position in the
     /// source bytes.
     ///

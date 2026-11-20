@@ -167,3 +167,61 @@ fn convert_positions_count_from_the_start_of_the_file() {
     assert_eq!(heading["position"]["start"]["column"], 1);
     assert_eq!(heading["position"]["end"]["line"], 4);
 }
+
+/// A fence indented by two blanks takes at most two from each content
+/// line: a line indented less starts at its own first non-blank, and the
+/// finding lands at the error's column in the file there too — not two
+/// columns to the right.
+#[test]
+fn yaml_code_block_finding_on_a_line_indented_less_than_the_fence() {
+    let id = "markdown.code-blocks-yaml-valid.parse-failed";
+    let only = |markdown: &str| -> Vec<(String, u64, u64)> {
+        findings(markdown)
+            .into_iter()
+            .filter(|(rule, _, _)| rule == id)
+            .collect()
+    };
+    // Not indented at all: `a: b: c`, the error at its second `:`.
+    assert_eq!(
+        only("# T\n\n  ```yaml\na: b: c\n  ```\n"),
+        [(id.to_owned(), 4, 5)]
+    );
+    // Indented by one blank, under a line indented by two.
+    assert_eq!(
+        only("# T\n\n  ```yaml\n  a: 1\n b: c: d\n  ```\n"),
+        [(id.to_owned(), 5, 6)]
+    );
+}
+
+/// A UTF-8 byte order mark before the frontmatter: the header is read as
+/// the frontmatter, not as a thematic break and a paragraph, and the first
+/// heading after it starts on line 4, column 1.
+#[test]
+fn frontmatter_after_a_byte_order_mark() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("post.md");
+    std::fs::write(&path, "\u{feff}---\ntitle: t\n---\n# T\n").unwrap();
+    let out = dq()
+        .args([
+            "--no-color",
+            "-F",
+            "json",
+            "convert",
+            path.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let ir: serde_json::Value = serde_json::from_slice(&out).expect("JSON");
+    assert_eq!(
+        ir["frontmatter"],
+        serde_json::json!({"kind": "yaml", "value": {"title": "t"}})
+    );
+    assert_eq!(ir["children"][0]["type"], "heading");
+    assert_eq!(
+        ir["children"][0]["position"]["start"],
+        serde_json::json!({"line": 4, "column": 1})
+    );
+}

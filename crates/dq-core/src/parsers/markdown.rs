@@ -605,21 +605,26 @@ fn build_options() -> Options<'static> {
 /// body_bytes)`. The frontmatter value is `Value::Null` when no recognised
 /// delimiter is found (per spec).
 fn detect_and_parse_frontmatter(bytes: &[u8]) -> Result<(Value, &[u8])> {
-    if let Some((header_bytes, body_bytes)) = detect_yaml_frontmatter(bytes) {
+    // A UTF-8 byte order mark stands before the delimiter, not in it. The
+    // body after a header starts on a line of its own, so the mark moves
+    // no position; without a header comrak reads it (and counts it in the
+    // first line's columns).
+    let content = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    if let Some((header_bytes, body_bytes)) = detect_yaml_frontmatter(content) {
         let header_doc = Yaml.parse(header_bytes)?;
         let mut wrap = IndexMap::new();
         wrap.insert("kind".to_owned(), Value::String("yaml".to_owned()));
         wrap.insert("value".to_owned(), header_doc.value().clone());
         return Ok((Value::Map(wrap), body_bytes));
     }
-    if let Some((header_bytes, body_bytes)) = detect_toml_frontmatter(bytes) {
+    if let Some((header_bytes, body_bytes)) = detect_toml_frontmatter(content) {
         let header_doc = Toml.parse(header_bytes)?;
         let mut wrap = IndexMap::new();
         wrap.insert("kind".to_owned(), Value::String("toml".to_owned()));
         wrap.insert("value".to_owned(), header_doc.value().clone());
         return Ok((Value::Map(wrap), body_bytes));
     }
-    if let Some((header_bytes, body_bytes)) = detect_json_frontmatter(bytes) {
+    if let Some((header_bytes, body_bytes)) = detect_json_frontmatter(content) {
         let header_doc = Json.parse(header_bytes)?;
         let mut wrap = IndexMap::new();
         wrap.insert("kind".to_owned(), Value::String("json".to_owned()));
