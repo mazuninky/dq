@@ -272,7 +272,7 @@ Write commands (`set`, `del`, `patch`, `merge`, `convert`, `fmt`, `fix`) share t
 | `--indent <N>` | JSON / JSONL only |
 | `--allow-templates` / `--raw-template-strings` | Helm / Go-template guard |
 
-Bulk multi-file mode prints `Modified: N, Skipped: M, Failed: K`. Single-file invocation stays byte-identical. In a glob, `*` and `?` stop at `/` and `**` crosses directories (`'k8s/**/*.yaml'`); a pattern without a directory (`'2-*.yaml'`) matches in the current directory, and an existing path is taken literally even with `[` in it.
+Bulk multi-file mode prints `Modified: N, Skipped: M, Failed: K`; Skipped counts files whose bytes would not change (never rewritten, mtime kept) and files without the `--doc N` document. Single-file invocation stays byte-identical. In a glob, `*` and `?` stop at `/` and `**` crosses directories (`'k8s/**/*.yaml'`); a pattern without a directory (`'2-*.yaml'`) matches in the current directory, and an existing path is taken literally even with `[` in it.
 
 | Code | Meaning |
 |---|---|

@@ -5,9 +5,12 @@
 //! - `*` and `?` stop at `/`; `**` crosses directories; `[...]` and
 //!   `{a,b}` still work; an existing path is taken literally even when it
 //!   holds a metacharacter.
+//! - A file whose bytes would not change is neither rewritten nor counted
+//!   as Modified: it lands under Skipped and keeps its mtime.
 
 use std::fs;
 use std::path::Path;
+use std::time::{Duration, SystemTime};
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -36,6 +39,27 @@ fn seed(dir: &Path, rel: &str, content: &str) {
 
 fn read(dir: &Path, rel: &str) -> String {
     fs::read_to_string(dir.join(rel)).expect("read back")
+}
+
+/// A fixed point in the past, far from "now", so a rewrite is visible.
+fn past() -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000)
+}
+
+fn set_mtime(path: &Path, when: SystemTime) {
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open for mtime")
+        .set_modified(when)
+        .expect("set mtime");
+}
+
+fn mtime(path: &Path) -> SystemTime {
+    fs::metadata(path)
+        .expect("metadata")
+        .modified()
+        .expect("mtime")
 }
 
 // ---------------------------------------------------------------------------
@@ -211,4 +235,74 @@ fn an_existing_path_with_a_bracket_is_taken_literally() {
         .stdout("");
     assert_eq!(read(dir.path(), "a[1].yaml"), "a: 2\n");
     assert_eq!(read(dir.path(), "a1.yaml"), "a: 1\n");
+}
+
+// ---------------------------------------------------------------------------
+// Item 3: unchanged files are not rewritten and not counted as Modified.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn bulk_in_place_leaves_unchanged_files_alone_and_counts_them_skipped() {
+    let dir = TempDir::new().expect("tempdir");
+    seed(dir.path(), "1.yaml", "a: 1\n");
+    seed(dir.path(), "2.yaml", "a: 2\n");
+    seed(dir.path(), "3.yaml", "a: 2\n");
+    for name in ["1.yaml", "2.yaml", "3.yaml"] {
+        set_mtime(&dir.path().join(name), past());
+    }
+
+    dq().current_dir(dir.path())
+        .args(["-i", "--backup", "--no-color", "set", "*.yaml", "/a", "2"])
+        .assert()
+        .success()
+        .stdout("Modified: 1, Skipped: 2, Failed: 0\n");
+
+    assert_eq!(read(dir.path(), "1.yaml"), "a: 2\n");
+    assert_ne!(mtime(&dir.path().join("1.yaml")), past());
+    assert!(dir.path().join("1.yaml.bak").exists());
+    for name in ["2.yaml", "3.yaml"] {
+        assert_eq!(
+            mtime(&dir.path().join(name)),
+            past(),
+            "{name} was rewritten"
+        );
+        assert!(
+            !dir.path().join(format!("{name}.bak")).exists(),
+            "{name} got a backup"
+        );
+    }
+}
+
+#[test]
+fn single_file_in_place_does_not_rewrite_an_unchanged_file() {
+    let dir = TempDir::new().expect("tempdir");
+    seed(dir.path(), "1.yaml", "a: 2\n");
+    let path = dir.path().join("1.yaml");
+    set_mtime(&path, past());
+
+    dq().current_dir(dir.path())
+        .args(["-i", "--no-color", "set", "1.yaml", "/a", "2"])
+        .assert()
+        .success()
+        .stdout("");
+    assert_eq!(mtime(&path), past());
+}
+
+#[test]
+fn bulk_diff_counts_unchanged_files_skipped_and_prints_no_marker_for_them() {
+    let dir = TempDir::new().expect("tempdir");
+    seed(dir.path(), "1.yaml", "a: 1\n");
+    seed(dir.path(), "2.yaml", "a: 2\n");
+
+    dq().current_dir(dir.path())
+        .args(["--diff", "--no-color", "set", "*.yaml", "/a", "2"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("=== 1.yaml ===")
+                .and(predicate::str::contains("=== 2.yaml ===").not())
+                .and(predicate::str::contains(
+                    "Modified: 1, Skipped: 1, Failed: 0",
+                )),
+        );
 }

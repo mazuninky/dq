@@ -40,6 +40,9 @@ pub enum FileOpResult {
         diff: Option<String>,
     },
     /// File is byte-identical to its prospective output (idempotent run).
+    /// Counted under `Skipped`, nothing printed. An op may return
+    /// [`FileOpResult::Modified`] with the same bytes instead: the driver
+    /// compares them with the file and treats that as unchanged too.
     Unchanged,
     /// In a bulk run, the file lacks the document `--doc N` names. The
     /// driver counts it under `Skipped` and notes the reason on stderr (a
@@ -129,7 +132,9 @@ fn resolve_parallel(n: Option<usize>) -> usize {
 ///   mode (an error still aborts).
 /// - **Bulk (`files.len() > 1`)**: per-file output is buffered in
 ///   matched-file order; a `Modified: N, Skipped: M, Failed: K` summary
-///   line follows the per-file output. `--diff` and stdout-mode bulk
+///   line follows the per-file output. Skipped counts files whose bytes
+///   would not change (never rewritten, so their mtime stays) and files
+///   without the `--doc N` document. `--diff` and stdout-mode bulk
 ///   output are prefixed with `=== <path> ===` markers so consumers can
 ///   tell files apart.
 /// - **`--check`**: never writes to disk; the driver compares each op's
@@ -191,7 +196,17 @@ pub fn run_per_file(
             Ok(FileOpResult::Modified { output_bytes, diff }) => {
                 if cli.check {
                     handle_check(&path, &output_bytes, &mut would_modify)?;
-                } else if cli.in_place {
+                    continue;
+                }
+                // A file whose bytes would not change is never rewritten
+                // (its mtime and any `.bak` stay as they are) and counts
+                // under Skipped, like an op's own `Unchanged`.
+                let unchanged = source_matches(&path, &output_bytes);
+                if cli.in_place {
+                    if unchanged {
+                        skipped += 1;
+                        continue;
+                    }
                     match dq_core::atomic_write::write(&path, &output_bytes, cli.backup) {
                         Ok(()) => modified += 1,
                         Err(e) => {
@@ -203,6 +218,10 @@ pub fn run_per_file(
                         }
                     }
                 } else if cli.diff {
+                    if unchanged {
+                        skipped += 1;
+                        continue;
+                    }
                     if let Some(d) = diff {
                         if is_bulk {
                             writeln!(buffer, "=== {path} ===")?;
@@ -211,14 +230,20 @@ pub fn run_per_file(
                     }
                     modified += 1;
                 } else {
-                    // Plain stdout mode. In bulk we prefix a marker so
-                    // streams can be split per file; single-file mode
-                    // matches M2 byte-for-byte (no marker, no summary).
+                    // Plain stdout mode: the output is the command's
+                    // result, so every file is printed, changed or not.
+                    // In bulk we prefix a marker so streams can be split
+                    // per file; single-file mode matches M2 byte-for-byte
+                    // (no marker, no summary).
                     if is_bulk {
                         writeln!(buffer, "=== {path} ===")?;
                     }
                     buffer.write_all(&output_bytes)?;
-                    modified += 1;
+                    if unchanged {
+                        skipped += 1;
+                    } else {
+                        modified += 1;
+                    }
                 }
             }
             Ok(FileOpResult::Unchanged) => {
@@ -288,6 +313,13 @@ pub fn run_per_file(
         }));
     }
     Ok(())
+}
+
+/// Whether the file at `path` already holds exactly `output_bytes`. A file
+/// that cannot be read counts as different, so the write that follows
+/// reports the real error.
+fn source_matches(path: &Utf8Path, output_bytes: &[u8]) -> bool {
+    std::fs::read(path.as_std_path()).is_ok_and(|source| source == output_bytes)
 }
 
 /// Compare `output_bytes` to the file's on-disk bytes and append `path` to

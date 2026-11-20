@@ -41,9 +41,14 @@ files the driver prints:
 Modified: N, Skipped: M, Failed: K
 ```
 
-`Skipped` counts files that had nothing to do (no document N for `--doc N`,
-noted on stderr). Observed on this branch: with `-i`, files whose bytes did
-not change are still counted as Modified; see [../roadmap.md](../roadmap.md).
+`Modified` counts files whose bytes change: written with `-i`, shown with
+`--diff`. `Skipped` counts files that had nothing to do: their bytes would
+not change, or they lack document N for `--doc N` (noted on stderr). A file
+whose bytes would not change is never rewritten — `-i` leaves its mtime
+alone and `--backup` writes no `.bak` for it — and `--diff` prints no marker
+for it. In stdout mode every file is still printed (the output is the
+result), and an unchanged one still counts as Skipped. The same holds for a
+single file: `-i` does not rewrite a file whose bytes would not change.
 
 ## `--check`
 
