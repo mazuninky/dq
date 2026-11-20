@@ -597,7 +597,7 @@ fn a_refused_xml_write_leaves_the_file_untouched() {
         (code, String::from_utf8_lossy(&stdout).into_owned(), stderr),
         (
             7,
-            format!("Modified: 2, Skipped: 0, Failed: 1\n  - ./a.xml: {ASCII_REFUSAL}\n"),
+            format!("Modified: 2, Skipped: 0, Failed: 1\n  - a.xml: {ASCII_REFUSAL}\n"),
             "1 file(s) failed in bulk run\n".to_owned()
         )
     );
@@ -638,8 +638,8 @@ fn a_bulk_run_counts_each_refused_xml_write_as_failed() {
         (
             7,
             format!(
-                "Modified: 0, Skipped: 0, Failed: 3\n  - ./a.xml: {comment}\n  \
-                 - ./b.xml: {comment}\n  - ./c.xml: {comment}\n"
+                "Modified: 0, Skipped: 0, Failed: 3\n  - a.xml: {comment}\n  \
+                 - b.xml: {comment}\n  - c.xml: {comment}\n"
             ),
             "3 file(s) failed in bulk run\n".to_owned()
         )

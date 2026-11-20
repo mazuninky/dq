@@ -17,13 +17,12 @@
 use std::io::{self, Write};
 
 use camino::{Utf8Path, Utf8PathBuf};
-use globset::Glob;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-use walkdir::WalkDir;
 
 use crate::cli::Cli;
 use crate::commands::io_helpers::every_file_lacks;
 use crate::error::{BulkPartialFailure, CheckPending, DocOutOfRange};
+use crate::glob::{self, GlobError};
 
 /// Per-file outcome reported by an [`FileOp`] implementation.
 #[derive(Debug)]
@@ -71,110 +70,39 @@ pub trait FileOp: Sync {
     fn apply(&self, path: &Utf8Path) -> anyhow::Result<FileOpResult>;
 }
 
-/// Detect whether `pattern` contains glob metacharacters.
-///
-/// We treat any of `*` / `?` / `[` / `{` as the trigger. False positives
-/// are documented in the change's design.md (D5): a literal path that
-/// happens to contain `[` will be misidentified, and the user must escape
-/// it via shell quoting (`\[`).
-fn pattern_has_meta(pattern: &Utf8Path) -> bool {
-    pattern
-        .as_str()
-        .chars()
-        .any(|c| matches!(c, '*' | '?' | '[' | '{'))
-}
-
-/// Compute the longest non-meta prefix of `pattern`.
-///
-/// Splits on `/`, takes the leading components free of metacharacters, and
-/// joins them back together. If every component contains a metacharacter
-/// (e.g. `'*.yaml'`), the prefix is `.` (the current directory).
-fn longest_non_meta_prefix(pattern: &Utf8Path) -> Utf8PathBuf {
-    let s = pattern.as_str();
-    let mut prefix_components: Vec<&str> = Vec::new();
-    for component in s.split('/') {
-        if component
-            .chars()
-            .any(|c| matches!(c, '*' | '?' | '[' | '{'))
-        {
-            break;
-        }
-        prefix_components.push(component);
-    }
-    if prefix_components.is_empty() {
-        return Utf8PathBuf::from(".");
-    }
-    // Preserve a leading slash for absolute patterns (the first split item
-    // is empty when the pattern starts with `/`).
-    let joined = prefix_components.join("/");
-    if joined.is_empty() {
-        Utf8PathBuf::from("/")
-    } else {
-        Utf8PathBuf::from(joined)
-    }
-}
-
 /// Expand a glob pattern (or pass through a literal path).
 ///
 /// Behaviour:
-/// - Pattern contains no glob metacharacters (`*`/`?`/`[`/`{`) → returns
-///   `vec![pattern.to_owned()]` without any FS access (M2 single-file fast
-///   path; preserves byte-identical behaviour).
-/// - Otherwise: walks from the longest non-meta prefix and filters via a
-///   compiled `globset::GlobMatcher`. The result is sorted alphabetically.
-/// - Zero matches on a glob pattern → `Err` mapping to IO_ERROR (5).
+/// - Not a glob ([`crate::glob::is_glob`]: no `*`/`?`/`[`/`{`, or a file
+///   exists at that literal path) → returns `vec![pattern.to_owned()]`; the
+///   command handler hits the real I/O error downstream if the file is
+///   missing.
+/// - Otherwise the matching files, sorted ([`crate::glob::expand`]: `*` and
+///   `?` stop at `/`, `**` crosses directories).
 ///
 /// # Errors
 ///
-/// - [`dq_core::Error::Io`] (kind `"io"`, exit 5) when the prefix
-///   directory does not exist or the glob matched no files.
-/// - `anyhow::Error` from `globset::Glob::new` when the pattern is
+/// - [`dq_core::Error::Io`] (kind `"io"`, exit 5) when the walk root does
+///   not exist or the glob matched no files.
+/// - `anyhow::Error` wrapping the `globset` error when the pattern is
 ///   syntactically invalid.
 pub fn expand_glob(pattern: &Utf8Path) -> anyhow::Result<Vec<Utf8PathBuf>> {
-    if !pattern_has_meta(pattern) {
-        // Literal path fast path: do NOT touch the filesystem here. The
-        // command handler will hit a real IO error downstream if the file
-        // doesn't exist, mapping to IO_ERROR via the standard path.
+    if !glob::is_glob(pattern) {
         return Ok(vec![pattern.to_owned()]);
     }
-
-    let glob = Glob::new(pattern.as_str())
-        .map_err(|e| anyhow::Error::new(e).context(format!("invalid glob pattern: {pattern}")))?;
-    let matcher = glob.compile_matcher();
-
-    let prefix = longest_non_meta_prefix(pattern);
-    if !prefix.as_std_path().exists() {
-        return Err(anyhow::Error::new(dq_core::Error::Io {
-            path: prefix.clone(),
-            source: io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("glob root {prefix} does not exist"),
-            ),
-        }));
-    }
-
-    let mut matches: Vec<Utf8PathBuf> = WalkDir::new(prefix.as_std_path())
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-        .filter(|entry| matcher.is_match(entry.path()))
-        .filter_map(|entry| Utf8PathBuf::from_path_buf(entry.into_path()).ok())
-        .collect();
-
-    if matches.is_empty() {
-        return Err(anyhow::Error::new(dq_core::Error::Io {
-            path: pattern.to_owned(),
-            source: io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("glob {pattern} matched zero files"),
-            ),
-        }));
-    }
-
-    // Deterministic ordering — the spec requires per-file output to appear
-    // in matched-file order regardless of execution order.
-    matches.sort();
-    Ok(matches)
+    glob::expand(pattern).map_err(|err| match err {
+        GlobError::Invalid { pattern, source } => {
+            anyhow::Error::new(source).context(format!("invalid glob pattern: {pattern}"))
+        }
+        GlobError::RootMissing { ref root } => anyhow::Error::new(dq_core::Error::Io {
+            path: root.clone(),
+            source: io::Error::new(io::ErrorKind::NotFound, err.to_string()),
+        }),
+        GlobError::NoMatch { ref pattern } => anyhow::Error::new(dq_core::Error::Io {
+            path: pattern.clone(),
+            source: io::Error::new(io::ErrorKind::NotFound, err.to_string()),
+        }),
+    })
 }
 
 /// Resolve `cli.parallel` into a concrete worker count.

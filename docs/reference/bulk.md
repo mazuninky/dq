@@ -12,18 +12,24 @@ markers, no summary.
 
 ## Glob expansion
 
-- The argument is a glob when it contains `*`, `?`, `[` or `{`. A literal
-  path containing `[` is therefore misread as a glob; escape it.
+- The argument is a glob when it contains `*`, `?`, `[` or `{` and nothing
+  exists at that literal path: a shell-expanded `a[1].yaml` is a plain path.
+  A pattern for a file that does not exist yet is still a glob; escape the
+  metacharacter (`a\[1\].yaml`) to name such a file literally.
+- `*` and `?` match within one path component and never match `/`: `k8s/*.yaml`
+  matches `k8s/a.yaml`, not `k8s/sub/x.yaml`. `**` crosses directories:
+  `k8s/**/*.yaml` matches both (and `k8s/a.yaml` itself). `[abc]` classes
+  and `{a,b}` alternation work as usual (`globset`). Quote the pattern so the
+  shell does not expand it.
 - dq walks the file tree from the longest leading part of the pattern that
-  has no metacharacter (`k8s/**/*.yaml` walks `k8s/`; `*.yaml` walks `.`)
-  and keeps the files the pattern matches (`globset`). Results are sorted, so
-  output order is stable.
-- `*` also matches across `/` (globset's default): `g/*.yaml` matches
-  `g/sub/x.yaml` too. Quote the pattern so the shell does not expand it.
-- A walk root that does not exist, or a glob matching no file, is exit 5.
-- Known bug: a pattern with no directory part that starts with a literal
-  (`2-*.yaml`) matches nothing, because the walk from `.` yields `./2-x.yaml`;
-  `./2-*.yaml` works. See [../roadmap.md](../roadmap.md).
+  has no metacharacter (`k8s/**/*.yaml` walks `k8s/`) and keeps the files the
+  pattern matches; without `**`, the walk goes no deeper than the pattern
+  does. A pattern with no such leading part (`2-*.yaml`, `{a,b}/*.yaml`) is
+  matched in the current directory, and the files are named as the pattern
+  spells them (`2-a.yaml`, not `./2-a.yaml`). Results are sorted, so output
+  order is stable.
+- A walk root that does not exist, or a glob matching no file, is exit 5
+  (exit 6 for `lint`, `check` and `fix`, where it is a caller mistake).
 
 ## Per-file output and summary
 

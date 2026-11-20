@@ -11,6 +11,7 @@ pub mod commands;
 pub mod diff;
 pub mod error;
 pub mod exit_code;
+mod glob;
 pub mod output;
 
 pub use cli::{Cli, Command};

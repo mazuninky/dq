@@ -26,7 +26,6 @@ use std::io::Write;
 use camino::{Utf8Path, Utf8PathBuf};
 use dq_exec::{Diagnostic, Evaluator, LoaderArgs, RuleLoader, RuleSet, Severity};
 use indexmap::IndexSet;
-use walkdir::WalkDir;
 
 use crate::cli::{Cli, DocSelector};
 use crate::commands::io_helpers::{
@@ -233,93 +232,29 @@ fn lint_document(
     Ok(())
 }
 
-/// Expand each input path: if it contains glob metacharacters (`*`/`?`/`[`)
-/// walk the matching files; otherwise pass through unchanged. Returns a
+/// Expand each input path: a glob ([`crate::glob::is_glob`]) becomes the
+/// files it matches; anything else passes through unchanged. Returns a
 /// flat, deterministically-ordered list of files.
+///
+/// A glob failure (invalid pattern, missing walk root, zero matches) is an
+/// `InvalidInput` so the exit-code mapper picks 6 — distinct from
+/// `bulk::expand_glob`'s "I/O error" mapping because lint is read-only and
+/// "no files matched" is a caller-side mistake, not a write failure.
 ///
 /// Visibility: `pub(crate)` so the M10 `dq fix` handler can reuse the
 /// same read-mode glob expansion semantics (zero-match → InvalidInput).
 pub(crate) fn expand_lint_inputs(paths: &[Utf8PathBuf]) -> anyhow::Result<Vec<Utf8PathBuf>> {
     let mut out = Vec::new();
     for p in paths {
-        if has_glob_chars(p.as_str()) {
-            let matched = expand_glob(p)?;
+        if crate::glob::is_glob(p) {
+            let matched = crate::glob::expand(p)
+                .map_err(|err| anyhow::Error::new(InvalidInput::new(err.to_string())))?;
             out.extend(matched);
         } else {
             out.push(p.clone());
         }
     }
     Ok(out)
-}
-
-fn has_glob_chars(s: &str) -> bool {
-    s.chars().any(|c| matches!(c, '*' | '?' | '[' | '{'))
-}
-
-/// Read-mode glob expansion. Walks from the longest non-meta prefix and
-/// filters via a compiled `globset::GlobMatcher`. Zero matches is an
-/// `InvalidInput` so the exit-code mapper picks 6 — distinct from
-/// `bulk::expand_glob`'s "I/O error" mapping because lint is read-only and
-/// "no files matched" is a caller-side mistake, not a write failure.
-fn expand_glob(pattern: &Utf8Path) -> anyhow::Result<Vec<Utf8PathBuf>> {
-    let glob = globset::Glob::new(pattern.as_str()).map_err(|e| {
-        anyhow::Error::new(InvalidInput::new(format!(
-            "invalid glob pattern '{pattern}': {e}"
-        )))
-    })?;
-    let matcher = glob.compile_matcher();
-
-    let prefix = longest_non_meta_prefix(pattern);
-    let walk_root = if prefix.as_str().is_empty() {
-        Utf8PathBuf::from(".")
-    } else {
-        prefix
-    };
-    if !walk_root.as_std_path().exists() {
-        return Err(anyhow::Error::new(InvalidInput::new(format!(
-            "glob root {walk_root} does not exist"
-        ))));
-    }
-
-    let mut matches: Vec<Utf8PathBuf> = WalkDir::new(walk_root.as_std_path())
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-        .filter(|entry| matcher.is_match(entry.path()))
-        .filter_map(|entry| Utf8PathBuf::from_path_buf(entry.into_path()).ok())
-        .collect();
-
-    if matches.is_empty() {
-        return Err(anyhow::Error::new(InvalidInput::new(format!(
-            "glob {pattern} matched zero files"
-        ))));
-    }
-
-    matches.sort();
-    Ok(matches)
-}
-
-fn longest_non_meta_prefix(pattern: &Utf8Path) -> Utf8PathBuf {
-    let s = pattern.as_str();
-    let mut prefix_components: Vec<&str> = Vec::new();
-    for component in s.split('/') {
-        if component
-            .chars()
-            .any(|c| matches!(c, '*' | '?' | '[' | '{'))
-        {
-            break;
-        }
-        prefix_components.push(component);
-    }
-    if prefix_components.is_empty() {
-        return Utf8PathBuf::from(".");
-    }
-    let joined = prefix_components.join("/");
-    if joined.is_empty() {
-        Utf8PathBuf::from("/")
-    } else {
-        Utf8PathBuf::from(joined)
-    }
 }
 
 /// Build the canonical `{ "diagnostics": [...] }` envelope every lint
@@ -430,33 +365,5 @@ mod tests {
             .expect("diagnostics must be an array");
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["severity"], "error");
-    }
-
-    #[test]
-    fn has_glob_chars_detects_metacharacters() {
-        assert!(has_glob_chars("foo/*.yaml"));
-        assert!(has_glob_chars("a?b"));
-        assert!(has_glob_chars("a[bc]d"));
-        assert!(!has_glob_chars("plain.yaml"));
-        assert!(!has_glob_chars("a/b/c.json"));
-    }
-
-    #[test]
-    fn has_glob_chars_detects_brace_expansion() {
-        // Must agree with `longest_non_meta_prefix`'s metachar set so brace
-        // patterns don't slip through `expand_lint_inputs` as literal paths.
-        assert!(has_glob_chars("dir/{a,b}/file.yaml"));
-    }
-
-    #[test]
-    fn longest_non_meta_prefix_walks_until_first_meta() {
-        assert_eq!(
-            longest_non_meta_prefix(Utf8Path::new("dir/sub/*.yaml")),
-            Utf8PathBuf::from("dir/sub")
-        );
-        assert_eq!(
-            longest_non_meta_prefix(Utf8Path::new("*.yaml")),
-            Utf8PathBuf::from(".")
-        );
     }
 }
