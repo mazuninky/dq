@@ -325,7 +325,16 @@ cannot read name their byte index instead:
   reference left open; an attribute repeated, with no value, or unquoted
   (`attribute 'a' appears twice on <c>`); an entity XML does not
   predefine; a character reference that is no number (`&#X41;`) or past
-  U+10FFFF; a closing tag that does not match;
+  U+10FFFF; a closing tag that does not match; an element the input
+  leaves open, the innermost named at its start tag (`element <c> is not
+  closed`);
+- content outside the root element (XML 1.0 §2.1): a second root element,
+  and text, CDATA or a reference before or after the root. Only comments,
+  PIs and white space may follow the root; the XML declaration, one
+  DOCTYPE, comments, PIs and white space may precede it. A DOCTYPE after
+  the root, inside it, or given twice is refused too. White space is
+  space, tab, CR and LF, and in a `version="1.1"` document NEL and LS,
+  which its end-of-line handling reads as LF;
 - an XML declaration its grammar (XML 1.0 §2.8) rules out, at the
   pseudo-attribute or value at fault: `version` missing or not first,
   `standalone` before `encoding`, a pseudo-attribute given twice or one

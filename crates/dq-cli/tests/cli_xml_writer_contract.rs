@@ -2547,3 +2547,159 @@ fn malformed_xml_is_reported_in_dqs_words() {
         .collect();
     assert_cases(&dir, &expected);
 }
+
+/// Each `(file, bytes, line, col, message)` is refused by `convert -F
+/// json` with exit 3 and `message` placed at `line`, `col`.
+fn assert_unreadable(cases: &[(&str, &[u8], u32, u32, &str)]) {
+    let files: Vec<(&str, &[u8])> = cases.iter().map(|&(f, b, ..)| (f, b)).collect();
+    let dir = dir_with(&files);
+    let expected: Vec<(Vec<&str>, Outcome)> = cases
+        .iter()
+        .map(|&(file, _, line, col, message)| {
+            (
+                convert(file, "json"),
+                unreadable_at(file, line, col, message),
+            )
+        })
+        .collect();
+    assert_cases(&dir, &expected);
+}
+
+/// An element the input leaves open is named, innermost first, at its
+/// start tag. Before, `<r/><c>` read as `{r: [{}]}` with exit 0, the `<c>`
+/// dropped, and `<r><c>` was "a document must have exactly one root
+/// element; found 0".
+#[test]
+fn an_element_left_open_is_named_at_its_start_tag() {
+    assert_unreadable(&[
+        ("inner.xml", b"<r><c>", 1, 4, "element <c> is not closed"),
+        ("root.xml", b"<a>", 1, 1, "element <a> is not closed"),
+        (
+            "nested.xml",
+            b"<r>\n  <c><d/>",
+            2,
+            3,
+            "element <c> is not closed",
+        ),
+        ("text.xml", b"<r><c>text", 1, 4, "element <c> is not closed"),
+        (
+            "second.xml",
+            b"<r/><c>",
+            1,
+            5,
+            "a document must have exactly one root element; <c> is a second one, after <r>",
+        ),
+    ]);
+}
+
+/// Past the root element only comments, PIs and white space may stand, and
+/// before it the declaration, one DOCTYPE, comments, PIs and white space
+/// (XML 1.0 §2.1 `document ::= prolog element Misc*`). Before, text, CDATA
+/// and a reference outside the root, and a DOCTYPE after the root, inside
+/// it or given twice, were dropped with exit 0.
+#[test]
+fn only_comments_pis_and_white_space_stand_outside_the_root() {
+    const AFTER: &str = "only comments, processing instructions and white space may follow it";
+    const BEFORE: &str = "only the XML declaration, a DOCTYPE declaration, comments, processing \
+                          instructions and white space may precede it";
+    let after = |what: &str| format!("{what} after the root element <r>; {AFTER}");
+    let before = |what: &str| format!("{what} before the root element; {BEFORE}");
+    let (text_after, cdata_after, ref_after, doctype_after) = (
+        after("text"),
+        after("a CDATA section"),
+        after("the reference '&amp;'"),
+        after("a DOCTYPE declaration"),
+    );
+    let (text_before, cdata_before, ref_before) = (
+        before("text"),
+        before("a CDATA section"),
+        before("the reference '&amp;'"),
+    );
+    assert_unreadable(&[
+        ("text_after.xml", b"<r/>y", 1, 5, &text_after),
+        ("text_after_line.xml", b"<r/>\n  y\n", 2, 3, &text_after),
+        ("cdata_after.xml", b"<r/><![CDATA[x]]>", 1, 5, &cdata_after),
+        ("ref_after.xml", b"<r/>&amp;", 1, 5, &ref_after),
+        (
+            "element_after.xml",
+            b"<r/><s/>",
+            1,
+            5,
+            "a document must have exactly one root element; <s> is a second one, after <r>",
+        ),
+        (
+            "doctype_after.xml",
+            b"<r/><!DOCTYPE r>",
+            1,
+            5,
+            &doctype_after,
+        ),
+        (
+            "doctype_inside.xml",
+            b"<r><!DOCTYPE r></r>",
+            1,
+            4,
+            "a DOCTYPE declaration inside element <r>; it may stand only before the root \
+             element",
+        ),
+        (
+            "doctype_twice.xml",
+            b"<!DOCTYPE r><!DOCTYPE r><r/>",
+            1,
+            13,
+            "a second DOCTYPE declaration; a document has at most one",
+        ),
+        // NEL is white space only where 1.1 end-of-line handling makes it LF.
+        (
+            "nel_10.xml",
+            b"<?xml version=\"1.0\"?><r/>\xc2\x85",
+            1,
+            26,
+            &text_after,
+        ),
+        ("text_before.xml", b" x<r/>", 1, 2, &text_before),
+        (
+            "cdata_before.xml",
+            b"<![CDATA[x]]><r/>",
+            1,
+            1,
+            &cdata_before,
+        ),
+        ("ref_before.xml", b"&amp;<r/>", 1, 1, &ref_before),
+    ]);
+    let dir = dir_with(&[
+        ("misc_after.xml", b"<r/><!-- c --><?p x?>\n \t\r\n"),
+        (
+            "nel_11.xml",
+            b"<?xml version=\"1.1\"?><r/>\xc2\x85\xe2\x80\xa8\r\n",
+        ),
+        (
+            "doctype.xml",
+            b"<!-- c --><!DOCTYPE r [<!ELEMENT r ANY><!ATTLIST r a CDATA \"x\">]>\n<r/>\n",
+        ),
+        ("bom.xml", b"\xef\xbb\xbf<r/>\n"),
+        (
+            "utf16.xml",
+            &with_bom(b"\xff\xfe", utf16("<r/>\n <!--c-->", false)),
+        ),
+    ]);
+    assert_cases(
+        &dir,
+        &[
+            (
+                convert("misc_after.xml", "xml"),
+                ok("<?p x?><!-- c --><r/>"),
+            ),
+            (
+                convert("nel_11.xml", "xml"),
+                ok("<?xml version=\"1.1\"?><r/>"),
+            ),
+            (convert("doctype.xml", "xml"), ok("<!-- c --><r/>")),
+            (convert("bom.xml", "xml"), ok(b"\xef\xbb\xbf<r/>".to_vec())),
+            (
+                convert("utf16.xml", "xml"),
+                ok(with_bom(b"\xff\xfe", utf16("<!--c--><r/>", false))),
+            ),
+        ],
+    );
+}

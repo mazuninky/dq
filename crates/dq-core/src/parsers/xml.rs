@@ -82,6 +82,13 @@
 //! error, and so is a processing instruction named `xml` in any case
 //! (`<?XML …?>`), which the writer refuses too.
 //!
+//! quick-xml reads some ill-formed documents without an error; the reader
+//! refuses them itself. A document is one root element with only the
+//! declaration, a DOCTYPE, comments, PIs and white space before it and
+//! comments, PIs and white space after it (XML 1.0 §2.1): a second root,
+//! text, CDATA or a reference outside the root, a misplaced or second
+//! DOCTYPE, and an element the input leaves open are parse errors.
+//!
 //! ## Encodings
 //!
 //! The reader decodes a file per its byte order mark, else per the
@@ -196,6 +203,9 @@ impl Format for Xml {
 struct Frame {
     /// Element tag name (with namespace prefix, if any), verbatim.
     tag: String,
+    /// Where its start tag begins (its `<`), to place an element the
+    /// input leaves open.
+    start: usize,
     /// Attributes map; populated on Start and frozen by the time the
     /// element is finalised.
     attrs: IndexMap<String, Value>,
@@ -223,9 +233,10 @@ struct Frame {
 }
 
 impl Frame {
-    fn new(tag: String) -> Self {
+    fn new(tag: String, start: usize) -> Self {
         Self {
             tag,
+            start,
             attrs: IndexMap::new(),
             children: IndexMap::new(),
             text: String::new(),
@@ -304,9 +315,11 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
     let mut top_pi: Vec<String> = Vec::new();
     let mut top_comments: Vec<String> = Vec::new();
     let mut stack: Vec<Frame> = Vec::new();
-    // Where the second root element begins, to report it there.
-    let mut roots = 0_usize;
-    let mut extra_root = None;
+    // The root element's name, once its start tag is read: past it, only
+    // comments, PIs and white space may stand at the top level (XML 1.0
+    // §2.1, `document ::= prolog element Misc*`).
+    let mut root: Option<String> = None;
+    let mut doctype = false;
 
     loop {
         // Where the next event begins: its `<` (or `&`), or the first
@@ -319,7 +332,18 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                 let (pos, message) = reader_refusal(&e, text, reader.error_position() as usize);
                 return Err(parse_error_at(text, pos, message));
             }
-            Ok(Event::Eof) => break,
+            Ok(Event::Eof) => {
+                // quick-xml ends on `Eof` with elements still open; the
+                // innermost is the one the input leaves unclosed first.
+                if let Some(frame) = stack.last() {
+                    return Err(parse_error_at(
+                        text,
+                        frame.start,
+                        format!("element <{}> is not closed", frame.tag),
+                    ));
+                }
+                break;
+            }
             Ok(Event::Decl(_)) => {
                 // The declaration `read_declaration` read, the document's
                 // first characters. One anywhere else — after white space,
@@ -347,6 +371,24 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                 top.insert(KEY_XML_DECL.to_owned(), Value::Map(decl_map));
             }
             Ok(Event::DocType(_)) => {
+                // One DOCTYPE, in the prolog (XML 1.0 §2.8).
+                let refusal = if let Some(frame) = stack.last() {
+                    Some(format!(
+                        "a DOCTYPE declaration inside element <{}>; it may stand only before \
+                         the root element",
+                        frame.tag
+                    ))
+                } else if root.is_some() {
+                    Some(outside_root("a DOCTYPE declaration", root.as_deref()))
+                } else if doctype {
+                    Some("a second DOCTYPE declaration; a document has at most one".to_owned())
+                } else {
+                    None
+                };
+                if let Some(message) = refusal {
+                    return Err(parse_error_at(text, event_start, message));
+                }
+                doctype = true;
                 // M11 v1: DOCTYPE declarations are not preserved on
                 // round-trip. Document the omission via tracing so the user
                 // is aware before relying on this for DTD-bearing files.
@@ -376,18 +418,15 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                 push_comment(&mut stack, &mut top_comments, txt);
             }
             Ok(Event::Start(start)) => {
+                if stack.is_empty() {
+                    take_root(&mut root, &start, text, event_start)?;
+                }
                 check_attribute_references(text, &start, xml11)?;
                 let mut frame = build_start_frame(&start, text, event_start, xml11)?;
                 check_namespaces(&stack, &mut frame, xml11).map_err(|(message, attr)| {
                     let pos = name_offset(text, &start, event_start, attr.as_deref());
                     parse_error_at(text, pos, message)
                 })?;
-                if stack.is_empty() {
-                    roots += 1;
-                    if roots == 2 {
-                        extra_root = Some(event_start);
-                    }
-                }
                 if let Some(parent) = stack.last_mut() {
                     parent.saw_element = true;
                     if parent.has_text {
@@ -397,18 +436,15 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                 stack.push(frame);
             }
             Ok(Event::Empty(start)) => {
+                if stack.is_empty() {
+                    take_root(&mut root, &start, text, event_start)?;
+                }
                 check_attribute_references(text, &start, xml11)?;
                 let mut frame = build_start_frame(&start, text, event_start, xml11)?;
                 check_namespaces(&stack, &mut frame, xml11).map_err(|(message, attr)| {
                     let pos = name_offset(text, &start, event_start, attr.as_deref());
                     parse_error_at(text, pos, message)
                 })?;
-                if stack.is_empty() {
-                    roots += 1;
-                    if roots == 2 {
-                        extra_root = Some(event_start);
-                    }
-                }
                 if let Some(parent) = stack.last_mut() {
                     parent.saw_element = true;
                     if parent.has_text {
@@ -458,6 +494,24 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                 append_child(&mut stack, &mut top_children, &tag, value);
             }
             Ok(Event::Text(t)) => {
+                if stack.is_empty() {
+                    // Only white space may stand between top-level
+                    // constructs: XML's four characters, and in 1.1 the
+                    // NEL and LS its end-of-line handling makes LFs.
+                    let raw: &str = &t;
+                    let other = raw.char_indices().find(|&(_, c)| {
+                        !(matches!(c, ' ' | '\t' | '\r' | '\n')
+                            || xml11 && matches!(c, '\u{85}' | '\u{2028}'))
+                    });
+                    if let Some((offset, _)) = other {
+                        return Err(parse_error_at(
+                            text,
+                            event_start + offset,
+                            outside_root("text", root.as_deref()),
+                        ));
+                    }
+                    continue;
+                }
                 let s = decode_text(&t, xml11);
                 if let Some(frame) = stack.last_mut() {
                     if !is_xml_whitespace(&s) {
@@ -467,14 +521,16 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                         frame.has_text = true;
                     }
                     frame.text.push_str(&s);
-                } else {
-                    // Whitespace between top-level constructs is harmless;
-                    // ignore non-whitespace text (it would be a malformed
-                    // XML doc, but quick-xml will report that as Err
-                    // separately).
                 }
             }
             Ok(Event::CData(c)) => {
+                if stack.is_empty() {
+                    return Err(parse_error_at(
+                        text,
+                        event_start,
+                        outside_root("a CDATA section", root.as_deref()),
+                    ));
+                }
                 // CData payload is stored verbatim (no escape decoding —
                 // CDATA bodies are not entity-encoded), but for its line
                 // ends.
@@ -482,8 +538,6 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                 if let Some(frame) = stack.last_mut() {
                     frame.cdata.push(s);
                 }
-                // CDATA at top level is unusual; ignore (well-formed
-                // XML cannot contain it outside an element).
             }
             Ok(Event::GeneralRef(r)) => {
                 // quick-xml 0.38+ reports `&amp;`, `&lt;`, etc. as a separate
@@ -491,6 +545,14 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                 // the reference here and append to the current frame's text so
                 // the parsed `Value` matches the pre-0.38 behaviour (entities
                 // are folded into the surrounding text body).
+                if stack.is_empty() {
+                    let name: &str = &r;
+                    return Err(parse_error_at(
+                        text,
+                        event_start,
+                        outside_root(&format!("the reference '&{name};'"), root.as_deref()),
+                    ));
+                }
                 let s = resolve_general_ref(&r, text, event_start, xml11)?;
                 if let Some(frame) = stack.last_mut() {
                     if frame.saw_element {
@@ -499,8 +561,6 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                     frame.has_text = true;
                     frame.text.push_str(&s);
                 }
-                // GeneralRef outside any element would be a malformed document;
-                // quick-xml reports the structural error separately.
             }
         }
     }
@@ -519,26 +579,14 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
             Value::Array(top_comments.into_iter().map(Value::String).collect()),
         );
     }
-    // Well-formed XML requires exactly one root element. The writer
-    // (`render_xml`) silently emits only the first non-conventional key
-    // when more than one is present, so we fail loudly here during parse
-    // instead of accepting input we cannot round-trip. Conventional keys
-    // (`#xml`, `#pi`, `#comments`) are not "elements" and don't count.
-    let root_count: usize = top_children.values().map(Vec::len).sum();
-    if root_count != 1 {
-        let pos = extra_root.unwrap_or_else(|| reader.buffer_position() as usize);
-        let (line, col) = byte_pos_to_line_col(text, pos);
-        return Err(Error::Parse {
-            file: None,
-            line,
-            col,
-            span: pos..pos,
-            snippet: snippet_for_pos(text, pos),
-            message: format!(
-                "XML parse error: a document must have exactly one root element; found \
-                 {root_count}",
-            ),
-        });
+    // Well-formed XML requires exactly one root element: a second one is
+    // refused where it begins (`take_root`), no root at the end of input.
+    if root.is_none() {
+        return Err(parse_error_at(
+            text,
+            reader.buffer_position() as usize,
+            "a document must have exactly one root element; found 0".to_owned(),
+        ));
     }
     for (name, group) in top_children {
         top.insert(name, Value::Array(group));
@@ -559,6 +607,45 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
         }
     }
     Ok(Value::Map(top))
+}
+
+/// Record `start`, a start or empty-element tag at the top level (at
+/// `event_start` in `text`), as the root element, or refuse it as a second
+/// one.
+fn take_root(
+    root: &mut Option<String>,
+    start: &BytesStart<'_>,
+    text: &str,
+    event_start: usize,
+) -> Result<()> {
+    let name = start.name();
+    let tag: &str = name.as_ref();
+    if let Some(first) = root {
+        return Err(parse_error_at(
+            text,
+            event_start,
+            format!(
+                "a document must have exactly one root element; <{tag}> is a second one, after <{first}>"
+            ),
+        ));
+    }
+    *root = Some(tag.to_owned());
+    Ok(())
+}
+
+/// Why `what` (`text`, `a CDATA section`) cannot stand at the top level,
+/// before the root element or after `root`.
+fn outside_root(what: &str, root: Option<&str>) -> String {
+    match root {
+        Some(root) => format!(
+            "{what} after the root element <{root}>; only comments, processing instructions \
+             and white space may follow it"
+        ),
+        None => format!(
+            "{what} before the root element; only the XML declaration, a DOCTYPE declaration, \
+             comments, processing instructions and white space may precede it"
+        ),
+    }
 }
 
 /// The byte order mark an XML file began with. The reader keeps it as the
@@ -1298,7 +1385,7 @@ fn build_start_frame(
     // quick-xml counts an attribute error's position from past the `<`.
     let content_start = event_start + "<".len();
     let content = text.get(content_start..).unwrap_or_default();
-    let mut frame = Frame::new(tag);
+    let mut frame = Frame::new(tag, event_start);
     for attr in start.attributes() {
         let attr = attr.map_err(|e| {
             let (pos, message) = attr_refusal(&e, content, &frame.tag);
