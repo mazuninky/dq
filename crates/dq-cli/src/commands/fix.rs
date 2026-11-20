@@ -58,7 +58,7 @@ use indexmap::IndexSet;
 use crate::bulk::{self, FileOp, FileOpResult};
 use crate::cli::{Cli, DocSelector, FixArgs};
 use crate::commands::io_helpers::{
-    checked_index, load_document_for_lint, pick_format, read_bytes, skip_out_of_range,
+    checked_index, parse_for_lint, pick_format, read_bytes, skip_out_of_range,
 };
 use crate::commands::lint_core::expand_lint_inputs;
 use crate::commands::plugin_loader::{self, LoadedPlugins};
@@ -185,15 +185,14 @@ struct FixFileOp<'a> {
 
 impl<'a> FileOp for FixFileOp<'a> {
     fn apply(&self, path: &Utf8Path) -> anyhow::Result<FileOpResult> {
-        // Read the bytes once for the diff renderer below; route the
-        // parse through the lint helper so YAML / JSON pick up the
-        // span-aware parsers (otherwise `EditScript::apply` would fail
-        // with `WriteUnavailable` against a value-only `Document`).
-        // The helper re-reads the file internally — accept the 2× I/O
-        // for the simpler call site.
+        // Read the bytes once — for the diff renderer below too, and
+        // stdin cannot be read twice; parse them as the lint path does so
+        // YAML / JSON pick up the span-aware parsers (otherwise
+        // `EditScript::apply` would fail with `WriteUnavailable` against a
+        // value-only `Document`).
+        let format = pick_format(path, self.input_format)?;
         let original_bytes = read_bytes(path)?;
-        let (format, mut document) =
-            load_document_for_lint(path, self.input_format, TemplateMode::Guard)?;
+        let mut document = parse_for_lint(path, format, &original_bytes, TemplateMode::Guard)?;
         // A multi-document stream is fixed one document at a time, and
         // written back with every document; `--doc N` fixes document N
         // alone.

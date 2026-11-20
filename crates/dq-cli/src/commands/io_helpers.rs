@@ -97,19 +97,37 @@ pub(crate) fn load_document_for_lint(
 ) -> anyhow::Result<(&'static dyn Format, Document)> {
     let format = pick_format(file, format_override)?;
     let bytes = read_bytes(file)?;
+    let doc = parse_for_lint(file, format, &bytes, templates)?;
+    Ok((format, doc))
+}
+
+/// Parse `bytes`, already read from `file`, as [`load_document_for_lint`]
+/// does — for a caller that needs the bytes as well, so `file` is read once
+/// (stdin cannot be read twice).
+///
+/// # Errors
+///
+/// [`dq_core::Error::TemplatedFile`] (exit 3) as the template guard says;
+/// any parse error, naming `file` (none for stdin).
+pub(crate) fn parse_for_lint(
+    file: &Utf8Path,
+    format: &'static dyn Format,
+    bytes: &[u8],
+    templates: TemplateMode,
+) -> anyhow::Result<Document> {
     let path_label = if file == "-" {
         None
     } else {
         Some(file.to_path_buf())
     };
-    let doc_result = guarded_parse(&bytes, templates, |b| match format.name() {
+    let doc_result = guarded_parse(bytes, templates, |b| match format.name() {
         // Stream-aware: a multi-document stream comes back as one, so the
         // lint pipeline and `dq fix` work on each document by itself.
         "yaml" => dq_core::parse_yaml_stream_with_spans(b),
         "json" => dq_core::parse_json_with_spans(b),
         _ => format.parse(b),
     });
-    let doc = doc_result
+    doc_result
         .map_err(|mut e| {
             if let dq_core::Error::Parse { ref mut file, .. } = e
                 && file.is_none()
@@ -118,8 +136,7 @@ pub(crate) fn load_document_for_lint(
             }
             e
         })
-        .map_err(anyhow::Error::new)?;
-    Ok((format, doc))
+        .map_err(anyhow::Error::new)
 }
 
 /// Parse `bytes` as `format` into a document an edit can change: YAML
