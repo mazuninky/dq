@@ -64,10 +64,15 @@ An index that is a float with an integral value is the integer, as in jq:
 `.[2.0] = 1` and `.[1e3] = 1` on `null` give `[null,null,1]` and an array of
 1001 items, `setpath([2.0]; 1)` and `delpaths([[1.0]])` take it too.
 
+A read takes it too: `.[2.0]` on `[1,2,3]` is `3`, `del(.[1.0])` gives
+`[1,3]`, and `.[1e300]` on an array or null is `null`, as in jq. Only for an
+array or null is an index past the integer range taken as the largest
+integer; into anything else it is an error that quotes the index as written
+(see Object keys).
+
 Left as jaq has it: a slice of null on the path (`.a[1:2] = [1]` on `{}`,
 jq gives `{"a":[1]}`) and a fractional index fail (jq truncates: `.[1.5] = 1`
-gives `[null,1]`); an integral float index outside an assignment's left-hand
-side still fails as in jaq (`.[2.0]` read from an array, `del(.[1.0])`); `.a.b |= empty` on `{}`
+gives `[null,1]`, `.[1.5]` on `[1,2,3]` gives `2`); `.a.b |= empty` on `{}`
 gives `{"a":{}}` where jq gives `{}`.
 
 ## Object keys
@@ -89,6 +94,15 @@ Before, jaq read `null` there, and an assignment wrote the key as a string:
 `9223372036854775807`. `.[1]?` on an object gives nothing, and
 `.[1]? = 1` leaves the object as it is, as in jq.
 
+The same check names the other keys jq refuses, the index as the program
+spells it: `.[0]`, `.[1e300] = 1`, `setpath([1e300]; 1)`, `getpath([0])` and
+`del(.[0])` on a string are `Cannot index string with number (1e300)` (jq
+prints `1E+300`); a number or a boolean takes no index (`Cannot index number
+with number (0)`); an array refuses a string, a boolean or null when the
+index is computed (`.[null]` on `[1]` is `Cannot index array with null
+(null)`; a literal `.["a"]` keeps jaq's message). A slice of a string
+(`.[1:2]`, `.[{"start":1,"end":2}]`) reads as before.
+
 `has` is jq's: an array has a number `k` when `0 <= k < length`, null has
 nothing (`false`), any other pairing is an error. `from_entries` takes the
 names jq 1.8 takes — the key from `key`, `Key`, `name` or `Name` (the first
@@ -97,10 +111,10 @@ that is neither null nor false), the value from `value`, else `Value` — so
 (`null | pick(.[1])` is `[null,null]`).
 
 How: the rewrite of the program (see Path assignment) also puts every index
-but a string literal through `_dq_objkey`, which fails on an object with a
-key that is not a string: `t[e]` becomes `(e) as $__dq_key_N | t |
-_dq_objkey($__dq_key_N) | .[$__dq_key_N]` (no binding for a number literal or
-a variable). `e` is computed once from the input `t` sees, and the last index
+but a string literal through `_dq_objkey`, which fails on a key jq refuses
+for the value indexed: `t[e]` becomes `(e) as $__dq_key_N | t |
+_dq_objkey($__dq_key_N) | .[$__dq_key_N | _dq_index]` (no binding for a
+number literal or a variable). `e` is computed once from the input `t` sees, and the last index
 of a chain binds outermost, so `[.[0,1][0,1]]` on `[[1,2],[3,4]]` gives jq's
 `[1,3,2,4]` (jaq gave `[1,2,3,4]`). On the left-hand side of an assignment the
 check runs in `_dq_vivify`, before the update. A computed key of an object

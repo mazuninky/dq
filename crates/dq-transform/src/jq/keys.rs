@@ -9,7 +9,8 @@
 //! The natives here check the key where jaq would take it:
 //!
 //! - `_dq_objkey($k)` passes its input through, or fails when the input is
-//!   an object and `$k` is not a string. It works in path and update mode
+//!   an object and `$k` is not a string — or another key jq refuses for
+//!   the input ([`check_index`]: a number into a string, say). It works in path and update mode
 //!   too, so the rewrite in [`super::paths`] puts it before every index
 //!   that is not a string literal: `t[e]` becomes
 //!   `(e) as $k | t | _dq_objkey($k) | .[$k]`.
@@ -113,20 +114,33 @@ pub(super) fn is_str(v: &Val) -> bool {
     matches!(v, Val::TStr(_) | Val::BStr(_))
 }
 
-/// Whether `container` may be indexed with `key`: anything but an object
-/// takes any key here (jaq reports what it refuses itself); an object
-/// takes a string only.
-fn check_index(container: &Val, key: &Val) -> Result<(), Error<Val>> {
-    if matches!(container, Val::Obj(_)) && !is_str(key) {
-        return Err(index_error(key));
+/// Whether `container` may be indexed with `key`, as jq decides it: null
+/// takes any key; an object a string; an array anything but a string, a
+/// boolean or null (a number, an array for `indices`, an object for a
+/// slice); a string only a slice (and a byte string, jaq's, a number); a
+/// number or a boolean nothing. What jaq refuses besides is left to it.
+pub(super) fn check_index(container: &Val, key: &Val) -> Result<(), Error<Val>> {
+    let ok = match container {
+        Val::Null => true,
+        Val::Obj(_) => is_str(key),
+        Val::Arr(_) => !matches!(key, Val::TStr(_) | Val::BStr(_) | Val::Bool(_) | Val::Null),
+        Val::TStr(_) => matches!(key, Val::Obj(_)),
+        Val::BStr(_) => matches!(key, Val::Obj(_) | Val::Num(_)),
+        Val::Num(_) | Val::Bool(_) => false,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(index_error(container, key))
     }
-    Ok(())
 }
 
-/// jq's message for an object indexed with the non-string `key`.
-pub(super) fn index_error(key: &Val) -> Error<Val> {
+/// jq's message for `container` indexed with `key`, the key as the program
+/// spelled it (`1e300`, not the integer an assignment would take it for).
+pub(super) fn index_error(container: &Val, key: &Val) -> Error<Val> {
     Error::str(format_args!(
-        "Cannot index object with {} ({key})",
+        "Cannot index {} with {} ({key})",
+        type_name(container),
         type_name(key)
     ))
 }

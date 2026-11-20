@@ -54,8 +54,9 @@ pub(super) const DEFS: &str = r#"
 def _dq_vivify(f): _dq_ensure([path(f)]);
 def getpath($path): reduce $path[] as $p (.; _dq_objkey($p) | .[$p]);
 def setpath($p; $x):
-  (if $p | type == "array" then $p | map(_dq_index) else $p end) as $p
-  | _dq_ensure([$p]) | reduce $p[] as $k (.; .[$k]) = $x;
+  _dq_ensure([$p])
+  | ($p | map(_dq_index)) as $p
+  | reduce $p[] as $k (.; .[$k]) = $x;
 def delpaths($ps): _dq_delpaths($ps);
 def del(f): delpaths([path(f)]);
 def has($k): _dq_has($k);
@@ -138,10 +139,9 @@ fn ensure_all<'a>(mut v: Val, paths: &Val) -> ValX<'a, Val> {
 /// [`MAX_INDEX`], past which it is jq's "Array index too large".
 ///
 /// A missing object key at the end of the path is left for the assignment
-/// to insert. A key that is not a string, into an object, is jq's "Cannot
-/// index object with …". What else jq refuses (a string key into a number,
-/// say) is left as it is: the assignment then fails the way jaq reports
-/// it.
+/// to insert. A key jq refuses for the value it indexes (a number into an
+/// object or a string, say) is jq's "Cannot index … with …", the key as
+/// written.
 fn ensure<'a>(v: Val, path: &[Val]) -> ValX<'a, Val> {
     if !needs_change(&v, path) {
         return Ok(v);
@@ -149,6 +149,7 @@ fn ensure<'a>(v: Val, path: &[Val]) -> ValX<'a, Val> {
     let Some((key, rest)) = path.split_first() else {
         return Ok(v);
     };
+    keys::check_index(&v, key)?;
     match v {
         Val::Null => {
             let container = if is_str(key) {
@@ -168,11 +169,11 @@ fn ensure<'a>(v: Val, path: &[Val]) -> ValX<'a, Val> {
                     Rc::make_mut(&mut items).resize(idx + 1, Val::Null);
                     ensure(Val::Arr(items), path)
                 }
-                _ => Val::Arr(items)
-                    .map_index(key, Opt::Essential, |child| once(ensure(child, rest))),
+                _ => Val::Arr(items).map_index(&integral(key.clone()), Opt::Essential, |child| {
+                    once(ensure(child, rest))
+                }),
             }
         }
-        Val::Obj(_) if !is_str(key) => Err(keys::index_error(key).into()),
         v @ Val::Obj(_) => v.map_index(key, Opt::Essential, |child| once(ensure(child, rest))),
         other => Ok(other),
     }
@@ -191,13 +192,13 @@ fn needs_change(v: &Val, path: &[Val]) -> bool {
         return false;
     };
     match v {
+        // Not a change: `ensure` refuses the key.
+        _ if keys::check_index(v, key).is_err() => true,
         Val::Null => is_str(key) || int_key(key).is_some() || matches!(key, Val::Obj(_)),
         Val::Obj(map) if is_str(key) => map.get(key).map_or_else(
             || needs_change(&Val::Null, rest),
             |child| needs_change(child, rest),
         ),
-        // Not a change: `ensure` refuses the key.
-        Val::Obj(_) => true,
         Val::Arr(items) => match array_index(key, items.len()) {
             Some(idx) => items.get(idx).is_none_or(|child| needs_change(child, rest)),
             None => false,
@@ -312,7 +313,7 @@ fn child_at<'a>(v: &Val, key: &Val) -> ValX<'a, Val> {
     match (v, key) {
         (Val::Null, _) => Ok(Val::Null),
         (Val::Obj(map), _) if is_str(key) => Ok(map.get(key).cloned().unwrap_or_default()),
-        (Val::Obj(_), _) => Err(keys::index_error(key).into()),
+        (Val::Obj(_), _) => Err(keys::index_error(v, key).into()),
         (Val::Arr(items), _) if int_key(key).is_some() => Ok(array_index(key, items.len())
             .and_then(|idx| items.get(idx))
             .cloned()
@@ -787,14 +788,11 @@ impl Printer {
             self.out.push_str(&key);
             self.out.push_str(") | ");
         }
-        self.out.push_str(".[");
-        if self.lhs {
-            self.out.push('(');
-            self.out.push_str(&key);
-            self.out.push_str(" | _dq_index)");
-        } else {
-            self.out.push_str(&key);
-        }
+        // An integral float indexes an array as the integer it is, read or
+        // assigned, as in jq; the check above saw the key as written.
+        self.out.push_str(".[(");
+        self.out.push_str(&key);
+        self.out.push_str(" | _dq_index)");
         self.out.push(']');
         if matches!(opt, Opt::Optional) {
             self.out.push('?');
@@ -1196,6 +1194,68 @@ mod tests {
     }
 
     #[test]
+    fn an_index_error_names_the_container_and_the_index_as_written() {
+        // jq 1.8.2 refuses each of these; past `isize` the index is not
+        // saturated, as it is for an array or null.
+        for (filter, input, message) in [
+            (
+                ".[1e300] = 1",
+                r#"{"a":1}"#,
+                "Cannot index object with number (1e300)",
+            ),
+            (
+                ".[1e19] |= 1",
+                r#"{"a":1}"#,
+                "Cannot index object with number (1e19)",
+            ),
+            (
+                ".[5] = 1",
+                r#"{"a":1}"#,
+                "Cannot index object with number (5)",
+            ),
+            (
+                "setpath([1e300]; 1)",
+                r#"{"a":1}"#,
+                "Cannot index object with number (1e300)",
+            ),
+            (
+                ".[1e300] = 1",
+                r#""s""#,
+                "Cannot index string with number (1e300)",
+            ),
+            (
+                "setpath([1e300]; 1)",
+                r#""s""#,
+                "Cannot index string with number (1e300)",
+            ),
+            (".[0]", r#""s""#, "Cannot index string with number (0)"),
+            (".[0] = 1", r#""s""#, "Cannot index string with number (0)"),
+            (
+                "getpath([0])",
+                r#""s""#,
+                "Cannot index string with number (0)",
+            ),
+            ("del(.[0])", r#""s""#, "Cannot index string with number (0)"),
+            (
+                "has(0)",
+                r#""s""#,
+                "Cannot check whether string has a number key",
+            ),
+            (".[0]", "1", "Cannot index number with number (0)"),
+            (
+                "null as $k | .[$k]",
+                "true",
+                "Cannot index boolean with null (null)",
+            ),
+            (".[null]", "[1]", "Cannot index array with null (null)"),
+            (".[true]", "[1]", "Cannot index array with boolean (true)"),
+        ] {
+            let err = run(filter, input).expect_err(filter);
+            assert!(err.contains(message), "{filter} on {input}: {err}");
+        }
+    }
+
+    #[test]
     fn string_keys_and_optional_indices_on_objects_still_work() {
         // Each expectation is what jq 1.8.2 prints for the same program.
         for (filter, input, want) in [
@@ -1236,6 +1296,12 @@ mod tests {
             ),
             ("pick(.a[1])", r#"{"a":[1,2]}"#, r#"{"a":[null,2]}"#),
             ("pick(.[1])", "null", "[null,null]"),
+            (r#".[{"start": 1, "end": 2}]"#, r#""abc""#, r#""b""#),
+            (".[1e300]", "[1]", "null"),
+            (".[1e300]", "null", "null"),
+            ("setpath([2.0]; 1)", "[0,0,0]", "[0,0,1]"),
+            (".[2.0]", "[1,2,3]", "3"),
+            ("del(.[1.0])", "[1,2,3]", "[1,3]"),
             (r#"getpath(["a", "b"])"#, "{}", "null"),
             // jq evaluates the last index outermost.
             ("[.[0, 1][0, 1]]", "[[1,2],[3,4]]", "[1,3,2,4]"),
@@ -1356,7 +1422,7 @@ mod tests {
         assert_eq!(rewrite(r#".["a"]"#), None);
         assert_eq!(
             rewrite(".[0]").as_deref(),
-            Some("((.) | _dq_objkey(0) | .[0])")
+            Some("((.) | _dq_objkey(0) | .[(0 | _dq_index)])")
         );
         // The key is computed once, from the input the indexed term sees;
         // the last index binds outermost, as jq evaluates it.
@@ -1364,7 +1430,7 @@ mod tests {
             rewrite(".a[.k][1]").as_deref(),
             Some(
                 "((((.[(\"k\")]) as $__dq_key_0 | (.[(\"a\")]) | _dq_objkey($__dq_key_0) \
-                 | .[$__dq_key_0])) | _dq_objkey(1) | .[1])"
+                 | .[($__dq_key_0 | _dq_index)])) | _dq_objkey(1) | .[(1 | _dq_index)])"
             )
         );
         // A variable the program holds is not captured.
@@ -1372,7 +1438,7 @@ mod tests {
             rewrite(".[.k] as $__dq_key | $__dq_key").as_deref(),
             Some(
                 "(((.[(\"k\")]) as $__dq_key1_0 | (.) | _dq_objkey($__dq_key1_0) \
-                 | .[$__dq_key1_0])) as $__dq_key | ($__dq_key)"
+                 | .[($__dq_key1_0 | _dq_index)])) as $__dq_key | ($__dq_key)"
             )
         );
         assert_eq!(
