@@ -180,6 +180,12 @@ pub struct FrontmatterPayload {
     /// delimiter: the writer puts it back. (Without a header the mark
     /// stays in [`Self::body`].)
     pub bom: bool,
+    /// Whether the file had a header — delimiters, whatever stands between
+    /// them: the writer writes them back even around nothing (`+++` /
+    /// `+++`) or an empty map (`---` / `{}` / `---`). False for a file with
+    /// no frontmatter ([`Document::frontmatter_absent`]), whose header is
+    /// written only once it holds something.
+    pub header: bool,
 }
 
 /// Inner format used to parse a frontmatter header.
@@ -901,12 +907,25 @@ impl Document {
                 kind,
                 body,
                 bom: false,
+                header: true,
             }),
             provenance: ProvenanceMap::new(),
             write_aware: false,
             layout: Layout::None,
             rewrite: RewriteState::default(),
         }
+    }
+
+    /// A frontmatter `Document` for a file with no frontmatter: an empty
+    /// map as the value, the whole file as `body`. Written back as `body`
+    /// alone until the value holds something, then with a YAML header.
+    #[must_use]
+    pub fn frontmatter_absent(body: Vec<u8>) -> Self {
+        let mut doc = Self::frontmatter(Value::Map(IndexMap::new()), body, FrontmatterKind::Yaml);
+        if let Some(payload) = doc.frontmatter_payload.as_mut() {
+            payload.header = false;
+        }
+        doc
     }
 
     /// [`Document::frontmatter`] for a file that starts with a UTF-8 byte

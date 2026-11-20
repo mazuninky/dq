@@ -247,3 +247,53 @@ fn an_empty_yaml_header_is_written_back_empty() {
         assert_eq!(String::from_utf8(out).expect("utf-8"), want, "{input:?}");
     }
 }
+
+/// Every header keeps its delimiters through a rewrite, whatever it holds:
+/// each delimiter × an empty header, `{}` and one with a key, after a BOM
+/// or not. Was: `+++` / `+++` and `---` / `{}` / `---` read as `{}`, taken
+/// for a file with no frontmatter, and written as the body alone; `---` /
+/// `---` read as null and written `---\nnull\n---` (until 654a742).
+#[test]
+fn every_header_keeps_its_delimiters_through_a_rewrite() {
+    let cases = [
+        ("---\n---\n", "---\n---\n"),
+        ("---\n{}\n---\n", "---\n{}\n---\n"),
+        ("---\ntitle: Hello\n---\n", "---\ntitle: Hello\n---\n"),
+        ("+++\n+++\n", "+++\n+++\n"),
+        (
+            "+++\ntitle = \"Hello\"\n+++\n",
+            "+++\ntitle = \"Hello\"\n+++\n",
+        ),
+        ("{}\n\n", "{}\n\n"),
+        (
+            "{\"title\": \"Hello\"}\n\n",
+            "{\n  \"title\": \"Hello\"\n}\n\n",
+        ),
+    ];
+    for (header, want) in cases {
+        for bom in ["", "\u{feff}"] {
+            let input = format!("{bom}{header}# Body\n");
+            let doc = parse_md(&input);
+            assert!(
+                doc.frontmatter_payload().expect("payload").header,
+                "{input:?}: read as no header"
+            );
+            let mut out = Vec::new();
+            frontmatter().write(&doc, &mut out).expect("write");
+            assert_eq!(
+                String::from_utf8(out).expect("utf-8"),
+                format!("{bom}{want}# Body\n"),
+                "{input:?}"
+            );
+        }
+    }
+    // No header: the body alone, the BOM in it; a value given to it later
+    // gets a YAML header.
+    for input in ["# Body\n", "\u{feff}# Body\n"] {
+        let doc = parse_md(input);
+        assert!(!doc.frontmatter_payload().expect("payload").header);
+        let mut out = Vec::new();
+        frontmatter().write(&doc, &mut out).expect("write");
+        assert_eq!(out, input.as_bytes());
+    }
+}

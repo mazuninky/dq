@@ -370,8 +370,12 @@ No frontmatter within the first 64 KiB gives an empty map and the whole file
 as body. Re-emitting serialises the header through its own format and
 appends the body verbatim. A UTF-8 byte order mark before the header is
 skipped when reading, as in the Markdown parser, and written back before it.
-A YAML header with nothing in it (`---` / `---`, or comments alone) reads as
-`null` and is written back empty, `---\n---\n`, not as `---\nnull\n---`.
+A header keeps its delimiters through `fmt` and every rewrite, whatever it
+holds: a YAML header with nothing in it (`---` / `---`, or comments alone)
+reads as `null` and is written back empty, `---\n---\n`, not as
+`---\nnull\n---`; an empty TOML header (`+++` / `+++`) and a YAML `{}` are
+written back as they are. A file with no frontmatter is written as its body
+alone until its value holds something; then it gets a YAML header.
 
 ### XML
 

@@ -9,24 +9,24 @@
 //!
 //! If no opening delimiter is recognised within the first byte OR no matching
 //! closing delimiter is found within the first 64 KiB of the file, the
-//! parser returns `Document::frontmatter(empty_map, whole_file_bytes,
-//! FrontmatterKind::Yaml)` — the value is an empty map and the body equals
-//! the entire input.
+//! parser returns `Document::frontmatter_absent(whole_file_bytes)` — the
+//! value is an empty map and the body equals the entire input.
 //!
 //! Round-trip contract (`Format::write`):
 //! 1. Re-serialize the value through the inner format (YAML / TOML / JSON).
 //! 2. Emit the opening delimiter, header, closing delimiter.
 //! 3. Concatenate the stored body bytes verbatim.
 //!
-//! Empty-map fallback (no frontmatter): the writer emits just the body bytes
-//! — no synthetic `---\n---\n` markers — so a file with no frontmatter
-//! round-trips verbatim. A YAML header with nothing in it (`---\n---\n`)
-//! reads as null and is written back empty.
+//! No frontmatter ([`crate::document::FrontmatterPayload::header`] false):
+//! the writer emits just the body bytes — no synthetic `---\n---\n`
+//! markers — so such a file round-trips verbatim, until its value holds
+//! something. A file with a header keeps its delimiters whatever the header
+//! holds: a YAML header with nothing in it (`---\n---\n`) reads as null and
+//! is written back empty, `+++\n+++\n` and `---\n{}\n---\n` as they are.
 
 use std::io::Write;
 
 use camino::Utf8PathBuf;
-use indexmap::IndexMap;
 
 use crate::Result;
 use crate::document::{Document, FormatTag, FrontmatterKind, Value};
@@ -99,14 +99,9 @@ impl Format for Frontmatter {
             ));
         }
         // No recognised frontmatter — preserve the whole file as the body
-        // and pin the value to an empty map. Kind is `Yaml` as a benign
-        // placeholder; the writer's empty-map shortcut emits only the body
-        // so the placeholder is never observable on round-trip.
-        Ok(Document::frontmatter(
-            Value::Map(IndexMap::new()),
-            bytes.to_vec(),
-            FrontmatterKind::Yaml,
-        ))
+        // and pin the value to an empty map; the writer emits only the body
+        // until the value holds something.
+        Ok(Document::frontmatter_absent(bytes.to_vec()))
     }
 
     fn write(&self, doc: &Document, w: &mut dyn Write) -> Result<()> {
@@ -115,12 +110,15 @@ impl Format for Frontmatter {
             message: "document is not a frontmatter document (no payload)".to_owned(),
         })?;
 
-        // Empty-map shortcut: a frontmatter doc whose value is an empty map
-        // came from the no-frontmatter fallback — emit just the body so the
-        // round-trip is byte-identical.
-        if let Value::Map(m) = doc.value()
-            && m.is_empty()
-        {
+        // A file with no frontmatter: just the body, so the round-trip is
+        // byte-identical, while the value holds nothing. A header the file
+        // had keeps its delimiters whatever it holds.
+        let holds_nothing = match doc.value() {
+            Value::Map(m) => m.is_empty(),
+            Value::Null => true,
+            _ => false,
+        };
+        if !payload.header && holds_nothing {
             return write_io(w, &payload.body);
         }
 
