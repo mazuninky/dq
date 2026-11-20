@@ -56,8 +56,10 @@ The input format is chosen by, in order:
 2. the file extension, case-insensitively;
 3. the file name, case-insensitively, for files without a telling extension:
    `Dockerfile`, `Containerfile` → dockerfile; `.gitignore`,
-   `.dockerignore`, `.npmignore`, `.eslintignore` → ignore-list; `.env` →
-   dotenv.
+   `.dockerignore`, `.npmignore`, `.eslintignore` → ignore-list; `.env` and
+   `.env.<name>` (`.env.local`, `.env.production`, `.env.example`) →
+   dotenv. An extension dq knows wins over the `.env.` prefix (`.env.json`
+   is JSON); `.envrc` is not dotenv.
 
 An unknown extension is an error ("unsupported format 'sh'", exit 6), never a
 guess. stdin (`-`) has no name, so it needs `-F`.
@@ -70,20 +72,17 @@ guess. stdin (`-`) has no name, so it needs `-F`.
 | TOML (`toml`) | `.toml` | yes | yes, textual, comments kept | yes, comments dropped |
 | HCL (`hcl`) | `.hcl`, `.tf`, `.tfvars` | yes | no (exit 7) | yes, best effort |
 | INI / properties (`ini`) | `.ini`, `.properties`, `.cfg` | yes | no (exit 7) | yes, comments dropped |
-| dotenv (`dotenv`, `-F dot-env`) | `.env` (name), `*.env` | yes | no (exit 7) | yes, comments dropped |
+| dotenv (`dotenv`, `-F dot-env`) | `.env`, `.env.*` (names), `*.env` | yes | no (exit 7) | yes, comments dropped |
 | CSV / TSV (`csv`, `tsv`) | `.csv`, `.tsv` | yes, array of records | no (exit 7) | yes, tabular values only |
 | Markdown (`markdown`) | `.md`, `.markdown` | yes, CommonMark + GFM tree | no (exit 7) | unmodified documents only |
 | Markdown frontmatter (`frontmatter`) | same extensions, only via `-F frontmatter` | yes, header only | no (exit 7) | yes, body kept byte for byte |
-| XML (`xml`) | `.xml` | yes | no (exit 7) | yes, partial round trip |
+| XML (`xml`) | `.xml`, `.pom`, `.xsd` | yes | no (exit 7) | yes, partial round trip |
 | Dockerfile (`dockerfile`) | `Dockerfile`, `Containerfile` (names), `*.dockerfile`, `*.containerfile` | yes | no | no (read-only) |
 | ignore-list (`ignore-list`) | `.gitignore`, `.dockerignore`, `.npmignore`, `.eslintignore` | yes | no | no (read-only) |
 | TOON (`toon`) | — | no | — | output only |
 
 Notes on the table:
 
-- `.pom` and `.xsd` are not detected as XML (README lists them; the parser
-  claims only `.xml`); pass `-F xml`. `.env.local` and other `.env.*` names
-  are not detected either.
 - "Point edits" are the textual edits described in
   [write-commands.md](write-commands.md); on any other format they fail with
   `write operation unavailable: <format> has no textual edits` (exit 7). Use

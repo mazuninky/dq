@@ -82,13 +82,20 @@ const FILENAME_FALLBACK: &[(&str, &str)] = &[
     (".env", "dotenv"),
 ];
 
+/// Filename prefixes consulted by [`detect`] after [`FILENAME_FALLBACK`]:
+/// a basename that starts with one of them and goes on past it is of the
+/// paired format. `.env.local`, `.env.production` and `.env.example` are
+/// dotenv files; `.envrc` (no `.` after `.env`) is not.
+const PREFIX_FALLBACK: &[(&str, &str)] = &[(".env.", "dotenv")];
+
 /// Look up a format by file extension, falling back to a filename match for
 /// dotfiles and extensionless config formats (`.gitignore`, `Dockerfile`,
-/// `.env`, …).
+/// `.env`, `.env.local`, …).
 ///
-/// The fallback consults [`FILENAME_FALLBACK`] only after the extension
-/// lookup fails; both lookups are ASCII-case-insensitive on the filename
-/// and on the extension.
+/// The fallback consults [`FILENAME_FALLBACK`], then [`PREFIX_FALLBACK`],
+/// only after the extension lookup fails — so a telling extension wins
+/// (`.env.json` is JSON); every lookup is ASCII-case-insensitive on the
+/// filename and on the extension.
 #[must_use]
 pub fn detect(path: &Utf8Path) -> Option<&'static dyn Format> {
     let registry = crate::parsers::registry();
@@ -106,6 +113,12 @@ pub fn detect(path: &Utf8Path) -> Option<&'static dyn Format> {
     let target = FILENAME_FALLBACK
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case(basename))
+        .or_else(|| {
+            PREFIX_FALLBACK.iter().find(|(prefix, _)| {
+                basename.len() > prefix.len()
+                    && basename.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+            })
+        })
         .map(|(_, fmt_name)| *fmt_name)?;
     registry.iter().copied().find(|fmt| fmt.name() == target)
 }
@@ -142,6 +155,33 @@ mod tests {
         // registered `XmlFormat` parser.
         let f = detect(Utf8Path::new("pom.xml")).expect("xml registered");
         assert_eq!(f.name(), "xml");
+    }
+
+    #[test]
+    fn detect_reads_pom_and_xsd_as_xml() {
+        for name in ["pom.pom", "schema.xsd", "A.XSD"] {
+            let f = detect(Utf8Path::new(name)).expect(name);
+            assert_eq!(f.name(), "xml", "{name}");
+        }
+    }
+
+    #[test]
+    fn detect_reads_env_dot_anything_as_dotenv_unless_the_extension_tells() {
+        for name in [
+            ".env.local",
+            ".env.production",
+            "cfg/.env.example",
+            ".ENV.Local",
+        ] {
+            let f = detect(Utf8Path::new(name)).expect(name);
+            assert_eq!(f.name(), "dotenv", "{name}");
+        }
+        // A telling extension wins over the prefix.
+        assert_eq!(detect(Utf8Path::new(".env.json")).unwrap().name(), "json");
+        // Not `.env.` followed by a name.
+        for name in [".envrc", ".env.", "x.env.local", "env.local"] {
+            assert!(detect(Utf8Path::new(name)).is_none(), "{name}");
+        }
     }
 
     #[test]

@@ -179,7 +179,7 @@ impl Format for Xml {
     }
 
     fn extensions(&self) -> &'static [&'static str] {
-        &["xml"]
+        &["xml", "pom", "xsd"]
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<Document> {
