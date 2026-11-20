@@ -339,3 +339,31 @@ fn json_carries_the_raw_message_and_the_console_escapes_it() {
         out.stdout
     );
 }
+
+/// With `RUST_BACKTRACE` set, an error ends with the backtrace anyhow
+/// captured, as its `{:?}` wrote it. Was: no backtrace, since 0339989
+/// wrote the chain itself.
+#[test]
+fn an_error_ends_with_its_backtrace_when_one_is_captured() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for (backtrace, shown) in [(Some("1"), true), (None, false)] {
+        let mut cmd = dq(dir.path());
+        if let Some(value) = backtrace {
+            cmd.env("RUST_BACKTRACE", value);
+        }
+        let out = cmd
+            .args(["--no-color", "get", "missing.json", "/a"])
+            .output()
+            .expect("run dq");
+        let stderr = String::from_utf8(out.stderr).expect("utf-8");
+        assert!(
+            stderr.starts_with("I/O error reading 'missing.json': "),
+            "{stderr:?}"
+        );
+        assert_eq!(
+            stderr.contains("\n\nStack backtrace:\n"),
+            shown,
+            "{backtrace:?}: {stderr:?}"
+        );
+    }
+}

@@ -336,7 +336,8 @@ fn render_error_raw(err: &anyhow::Error, w: &mut dyn Write) -> std::io::Result<(
 
 /// `err` and the errors that caused it, as anyhow's `{:?}` writes them —
 /// the message, then `Caused by:` and each cause indented, numbered when
-/// there are several — each message as [`terminal_message`] gives it.
+/// there are several, then the backtrace when one was captured — each
+/// message as [`terminal_message`] gives it.
 fn write_chain(err: &anyhow::Error, w: &mut dyn Write) -> std::io::Result<()> {
     let mut chain = err.chain();
     if let Some(top) = chain.next() {
@@ -359,51 +360,144 @@ fn write_chain(err: &anyhow::Error, w: &mut dyn Write) -> std::io::Result<()> {
             }
         }
     }
+    // The backtrace anyhow captured (`RUST_BACKTRACE`), as its `{:?}`
+    // writes it.
+    let backtrace = err.backtrace();
+    if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
+        let mut backtrace = backtrace.to_string();
+        write!(w, "\n\n")?;
+        if backtrace.starts_with("stack backtrace:") {
+            backtrace.replace_range(0..1, "S");
+        } else {
+            writeln!(w, "Stack backtrace:")?;
+        }
+        write!(w, "{}", backtrace.trim_end())?;
+    }
     writeln!(w)
 }
 
-/// The message of `err` for the terminal. An error dq knows to be one line
-/// — a writer's refusal, a rejected edit, a path or I/O error, a rule's
-/// error but its parse error — is put on one line ([`dq_core::one_line`]),
-/// so a key, a pointer or a path it quotes cannot break it. A parse error
-/// and a template refusal span lines of their own: the file name and the
-/// template line they quote go on one line, the rest stays as it is, as
-/// does the message of any other error. The messages themselves keep the
-/// text as it is, for the machine-readable outputs that carry them.
+/// The message of `err` for the terminal. A `dq_core` error dq knows to be
+/// one line — a writer's refusal, a rejected edit, a path or I/O error —
+/// and the CLI's own are put on one line ([`dq_core::one_line`]), so a key,
+/// a pointer or a path they quote cannot break them. In the others only
+/// what the user or a file put there goes on one line — a parse error's
+/// file name, a template refusal's line, a rule's id and paths, a plugin's
+/// rule id and path — and the rest keeps its line breaks: a parse error's
+/// snippet, a wasm backtrace in a plugin's error. Any other error's
+/// message stays as it is. [`render_error`] escapes the controls of every
+/// line. The messages themselves keep the text as it is, for the
+/// machine-readable outputs that carry them.
 fn terminal_message(err: &(dyn std::error::Error + 'static)) -> String {
+    use dq_exec::ExecError as X;
+    use dq_plugin::PluginError as P;
     let text = err.to_string();
     if let Some(err) = err.downcast_ref::<dq_core::Error>() {
         return match err {
             dq_core::Error::Parse {
                 file: Some(file), ..
-            } => text.replacen(file.as_str(), &one_line(file.as_str()), 1),
+            } => one_line_fields(text, &[file.as_str()]),
             dq_core::Error::Parse { .. } => text,
-            dq_core::Error::TemplatedFile { snippet, .. } => {
-                text.replacen(snippet.as_str(), &one_line(snippet), 1)
-            }
+            dq_core::Error::TemplatedFile { snippet, .. } => one_line_fields(text, &[snippet]),
             _ => one_line(&text).into_owned(),
         };
     }
-    let one_lined = match err.downcast_ref::<dq_exec::ExecError>() {
-        Some(err) => !matches!(err, dq_exec::ExecError::Parse { .. }),
-        None => {
-            err.is::<dq_plugin::PluginError>()
-                || err.is::<error::InvalidInput>()
-                || err.is::<error::DocOutOfRange>()
-                || err.is::<error::WrongType>()
-        }
-    };
-    if one_lined {
-        one_line(&text).into_owned()
-    } else {
-        text
+    if let Some(err) = err.downcast_ref::<X>() {
+        let fields: Vec<&str> = match err {
+            X::Parse { .. } => Vec::new(),
+            X::UnknownRule { id, .. } => vec![id],
+            X::Io { path, .. } | X::TestFixture { path, .. } => vec![path.as_str()],
+            X::CompositeExtractUnknownFormat {
+                rule_id, format, ..
+            } => vec![rule_id, format],
+            X::SchemaFileAbsolutePath { rule_id, path, .. }
+            | X::SchemaFileEscapesRuleDir { rule_id, path, .. } => vec![rule_id, path.as_str()],
+            X::RuleCompile { rule_id, .. }
+            | X::GlobCompile { rule_id, .. }
+            | X::FixApply { rule_id, .. }
+            | X::CheckMutuallyExclusive { rule_id, .. }
+            | X::CheckMissing { rule_id, .. }
+            | X::CompositeIncomplete { rule_id, .. }
+            | X::CompositeExtractNotArray { rule_id, .. }
+            | X::CompositeExtractMalformed { rule_id, .. }
+            | X::CompositeDepthExceeded { rule_id, .. }
+            | X::SchemaCompile { rule_id, .. } => vec![rule_id],
+        };
+        return one_line_fields(text, &fields);
     }
+    if let Some(err) = err.downcast_ref::<P>() {
+        let fields: Vec<&str> = match err {
+            P::FeatureDisabled { .. } => Vec::new(),
+            P::SchemaVersion { plugin_version, .. } => vec![plugin_version],
+            P::DisallowedImport { interface, .. } => vec![interface],
+            P::Load { path, .. } => vec![path.as_str()],
+            P::Exhausted { rule_id, .. }
+            | P::Memory { rule_id, .. }
+            | P::MalformedFix { rule_id, .. }
+            | P::Invoke { rule_id, .. } => vec![rule_id],
+        };
+        return one_line_fields(text, &fields);
+    }
+    if err.is::<error::InvalidInput>()
+        || err.is::<error::DocOutOfRange>()
+        || err.is::<error::WrongType>()
+    {
+        return one_line(&text).into_owned();
+    }
+    text
+}
+
+/// `text` with the first spelling of each of `fields` in it put on one
+/// line ([`dq_core::one_line`]); the rest of `text` as it is.
+fn one_line_fields(mut text: String, fields: &[&str]) -> String {
+    for field in fields {
+        if field.contains(['\n', '\r']) {
+            text = text.replacen(field, &one_line(field), 1);
+        }
+    }
+    text
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
+
+    fn rendered(err: impl std::error::Error + Send + Sync + 'static) -> String {
+        let mut out = Vec::new();
+        render_error(&anyhow::Error::new(err), &mut out).expect("render");
+        String::from_utf8(out).expect("utf-8")
+    }
+
+    #[test]
+    fn a_plugin_error_keeps_its_line_breaks_but_the_rule_ids() {
+        // Was: one line, every line break of wasmtime's backtrace `\x0a`.
+        let err = dq_plugin::PluginError::Invoke {
+            rule_id: "x.a\nb".into(),
+            message: "error while executing at wasm backtrace:\n    0: 0x1 - f\u{1b}".into(),
+        };
+        assert_eq!(
+            rendered(err),
+            "plugin rule x.a\\x0ab invocation failed: error while executing at wasm \
+             backtrace:\n    0: 0x1 - f\\x1b\n"
+        );
+        let err = dq_plugin::PluginError::Load {
+            path: "p\nq.wasm".into(),
+            message: "bad\nmodule".into(),
+        };
+        assert_eq!(
+            rendered(err),
+            "failed to load plugin p\\x0aq.wasm: bad\nmodule\n"
+        );
+    }
+
+    #[test]
+    fn a_rule_error_puts_its_rule_id_on_one_line() {
+        let err = dq_exec::ExecError::FixApply {
+            rule_id: "r\nx".into(),
+            message: "two\nlines".into(),
+        };
+        assert_eq!(rendered(err), "rule r\\x0ax fix failed: two\nlines\n");
+    }
 
     #[test]
     fn run_dispatches_to_get_against_missing_file() {
