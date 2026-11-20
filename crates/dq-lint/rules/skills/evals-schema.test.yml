@@ -18,6 +18,57 @@ tests:
     expected:
       violations: []
 
+  - name: an eval's name or eval_name label passes
+    input: |
+      {
+        "skill_name": "my-skill",
+        "evals": [
+          {
+            "id": 1,
+            "name": "bump-replicas",
+            "prompt": "do the thing",
+            "expected_output": "Uses tool foo ...",
+            "assertions": [
+              { "text": "uses -F toon", "type": "output" }
+            ]
+          },
+          {
+            "id": 2,
+            "eval_name": "Empty input!",
+            "prompt": "do the other thing",
+            "expected_output": "Uses tool bar ...",
+            "assertions": [
+              { "text": "uses -F json", "type": "output" }
+            ]
+          }
+        ]
+      }
+    format: json
+    expected:
+      violations: []
+
+  - name: a non-string name fires
+    input: |
+      {
+        "skill_name": "my-skill",
+        "evals": [
+          {
+            "id": 1,
+            "name": 7,
+            "prompt": "x",
+            "expected_output": "y",
+            "assertions": [
+              { "text": "z", "type": "output" }
+            ]
+          }
+        ]
+      }
+    format: json
+    expected:
+      violations:
+        - rule: skills.evals-schema
+          message_contains: "not of type"
+
   - name: missing expected_output fires
     input: |
       {

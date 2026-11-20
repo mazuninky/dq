@@ -4,7 +4,9 @@ description: |
   in `skill/evals/evals.json`. The bundled schema sidecar
   (`evals.schema.json`) describes the canonical shape — `skill_name`,
   `evals[].{id, prompt, expected_output, assertions[].{text, type}}`,
-  with `additionalProperties: false`. The shape filter
+  plus the optional `files` and the optional `name` / `eval_name` label
+  that skill-creator turns into the eval's case name, with
+  `additionalProperties: false`. The shape filter
   (`has("skill_name") and has("evals")`) gates the rule so unrelated
   JSON payloads in the workspace are not flagged — only files that
   carry the canonical skill-eval top-level keys are validated.

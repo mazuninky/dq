@@ -27,6 +27,12 @@
           "type": "integer",
           "minimum": 1
         },
+        "name": {
+          "type": "string"
+        },
+        "eval_name": {
+          "type": "string"
+        },
         "prompt": {
           "type": "string",
           "minLength": 1
