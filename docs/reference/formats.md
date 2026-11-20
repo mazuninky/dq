@@ -236,7 +236,33 @@ block cannot hold back (a scalar, an empty label map, a list of one body,
 which would read back as the body alone) is written as an attribute; so
 is every key of a document read from another format, which records no
 blocks (`convert -F hcl` of YAML writes `resource = { … }`). Comments,
-spacing and layout are not kept. An HCL file is a body of attributes and
+spacing and layout are not kept.
+
+An expression a value cannot spell — a traversal (`var.ami`), a function
+call, an operator, a conditional, a `for`, a splat, a template with an
+interpolation or a directive (`"${var.p}-web"`), a heredoc, a parenthesis —
+reads as the string `hcl-rs` gives it (`${var.ami}`, `${var.p}-web`), and
+its source is recorded at its pointer. A rewrite (a point edit, `patch`,
+`merge`, `fix.ops`, `set --jq`, `fix.jq`, `fmt`) writes a value that still
+reads as what its expression read as back as that source, byte for byte;
+an object with a key that is an expression (`{ (var.k) = 1 }`) is kept
+whole the same way. A point edit moves the expressions of the items after
+one it deletes or inserts along with them; after `set --jq` or `fix.jq` a
+string that is what an expression of the file read as is written as that
+expression wherever the filter put it. A string you set is a string:
+`dq set a.tf /x '${y}'` writes `x = "$${y}"`. What no writer can keep is
+refused, exit 1, the file untouched: a point edit into an expression
+(`dq set a.tf /tags/Name x` where `tags = merge(…)`: "cannot set
+'/tags/Name': '/tags' is the expression `merge(…)`, whose value HCL
+computes; dq can replace the whole expression, not edit inside it"), a
+filter that turns the string of an expression into another one holding
+`${` or `%{` (`.name |= sub("web"; "api")`), and a moved string that two
+expressions of different source read as (`var.a` and `"${var.a}"`). Only
+the expression is kept, not the spacing around it: `ami   = var.ami` is
+written `ami = var.ami`; a comma after a heredoc item goes on the line
+after its closing marker.
+
+An HCL file is a body of attributes and
 blocks, so only a map can be written as one: `-F hcl` of an array, a
 string, a number, a boolean or null exits 1 ("an HCL document is a body of
 attributes, so its root is a map, not an array").

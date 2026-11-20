@@ -27,7 +27,9 @@ made to the value tree and the whole file is re-emitted, exactly as
 `set --jq` would: `dq set app.ini /server/port 8080` writes
 `[server]\nhost=a\nport=8080\n` for `; c\n[server]\nhost = a\nport = 80\n`.
 The comments go (XML keeps its own, which are in its tree), an HCL file keeps
-its blocks as blocks, and the value is read back as the file holds it (an
+its blocks as blocks and every expression the edit does not change as its
+source (`ami = var.ami` stays; see [formats.md](formats.md#hcl)), and the
+value is read back as the file holds it (an
 INI, dotenv or CSV value is a string). A tree the writer cannot hold — a
 nested map or list in INI, dotenv or CSV, a scalar where XML wants an
 element, a number HCL cannot write — is refused with the writer's error

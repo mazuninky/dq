@@ -8,8 +8,10 @@
 //! nested map". Blocks repeated with the same type and labels become a
 //! list of their bodies, in source order, under that same key:
 //! `ingress { p = 1 }` twice is `{ ingress: [{ p: 1 }, { p: 2 }] }`. The
-//! document records which keys were blocks ([`HclBlocks`]), and the writer
-//! writes those back as blocks.
+//! document records which keys were blocks, and the writer writes those
+//! back as blocks; it records the source of every expression too
+//! ([`HclLayout`]), and the writer writes an expression whose value is
+//! still what it read as back as that source.
 //!
 //! This parser produces a document with no spans, so no textual edits:
 //! `Document::set_at` / `del_at` against an HCL document change its value
@@ -29,7 +31,7 @@ use hcl::{Expression, Number, Value as HclValue};
 use indexmap::IndexMap;
 
 use crate::Result;
-use crate::document::{Document, FormatTag, Value};
+use crate::document::{Document, FormatTag, Layout, Value};
 use crate::error::Error;
 use crate::format::Format;
 
@@ -63,10 +65,11 @@ impl Format for Hcl {
         let mut reader = Reader {
             text,
             path: Vec::new(),
-            blocks: HclBlocks::default(),
+            layout: HclLayout::default(),
         };
-        let value = reader.body_to_value(&body)?;
-        Ok(Document::value_only(value, FormatTag::Hcl).with_hcl_blocks(reader.blocks))
+        let (value, exprs) = reader.body_to_value(&body)?;
+        reader.layout.exprs = exprs.into_iter().collect();
+        Ok(Document::value_only(value, FormatTag::Hcl).with_layout(Layout::Hcl(reader.layout)))
     }
 
     fn write(&self, doc: &Document, w: &mut dyn Write) -> Result<()> {
@@ -74,7 +77,13 @@ impl Format for Hcl {
         // cannot carry an arbitrary-precision literal: a big number past
         // `u64` / `f64` is refused rather than written as another value.
         let serialized = match doc.value() {
-            Value::Map(map) => write_body(map, doc.hcl_blocks())?,
+            Value::Map(map) => write_body(
+                map,
+                match doc.layout() {
+                    Layout::Hcl(layout) => Some(layout),
+                    _ => None,
+                },
+            )?,
             other => {
                 return Err(Error::Format {
                     format: "hcl",
@@ -90,25 +99,47 @@ impl Format for Hcl {
     }
 }
 
-/// Which keys of an HCL document the reader read as blocks, and with how
-/// many labels, so the writer writes them back as blocks.
-///
-/// A key is addressed by its path from the root: the keys down to the
-/// body it is in — block types, labels and attribute names, but not the
-/// index of a repeated block, so every repeat shares one path — then the
-/// key itself. Bodies that share a path because their blocks repeat may
-/// disagree on a key's label count (`x { y "a" {} }`, `x { y {} }`); such a
-/// key is written as an attribute, which reads back as the same tree.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct HclBlocks {
-    labels: HashMap<Vec<String>, Option<usize>>,
+/// What the HCL reader saw of a file beyond its value tree, for the
+/// writer to write back ([`Layout::Hcl`]): which keys are blocks, and the
+/// source of every expression.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct HclLayout {
+    /// Which keys were read as blocks, with how many labels.
+    ///
+    /// A key is addressed by its path from the root: the keys down to the
+    /// body it is in — block types, labels and attribute names, but not
+    /// the index of a repeated block, so every repeat shares one path —
+    /// then the key itself. Bodies that share a path because their blocks
+    /// repeat may disagree on a key's label count (`x { y "a" {} }`,
+    /// `x { y {} }`); such a key is written as an attribute, which reads
+    /// back as the same tree.
+    blocks: HashMap<Vec<String>, Option<usize>>,
+    /// Every value read from an expression a value cannot spell — a
+    /// traversal, a function call, an operator, a conditional, a `for`, a
+    /// template with an interpolation or a directive, a heredoc, a
+    /// parenthesis — or from a string holding `${` or `%{`, by its exact
+    /// path from the root (the index of a repeated block or of an array
+    /// item included): what it read as, and its source text.
+    exprs: HashMap<Vec<String>, Expr>,
+    /// Whether the tree written may have moved values since they were
+    /// read (`set --jq`, `fix.jq`): an expression's value is then also
+    /// looked for away from its place. A point edit moves nothing it does
+    /// not account for ([`HclLayout::after_edit`]).
+    moved: bool,
 }
 
-impl HclBlocks {
+/// One expression the reader saw: what it read as, and its source.
+#[derive(Debug, Clone, PartialEq)]
+struct Expr {
+    value: Value,
+    source: String,
+}
+
+impl HclLayout {
     /// Note that the key `path` ends in is a block type with `labels`
     /// labels.
     fn record(&mut self, path: &[String], labels: usize) {
-        self.labels
+        self.blocks
             .entry(path.to_vec())
             .and_modify(|seen| {
                 if *seen != Some(labels) {
@@ -121,8 +152,92 @@ impl HclBlocks {
     /// How many labels the blocks of the key `path` ends in carry, if that
     /// key was read as a block type with one label count.
     fn labels_at(&self, path: &[String]) -> Option<usize> {
-        self.labels.get(path).copied().flatten()
+        self.blocks.get(path).copied().flatten()
     }
+
+    /// This layout, for a tree a transform may have moved values in.
+    pub(crate) fn moved(&self) -> Self {
+        Self {
+            moved: true,
+            ..self.clone()
+        }
+    }
+
+    /// This layout after the point edit `action` (`set`, `delete` or
+    /// `insert`) at `path` — each segment a key or an array index as
+    /// decimal digits — whose parent is an array when `in_array`: the
+    /// expressions at and below a value set or deleted go, and those after
+    /// an item deleted from or inserted into an array move with it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Format`] when `path` runs through a value read from an
+    /// expression: what it holds is the expression's to compute, and no
+    /// value dq could write there would stay that expression.
+    pub(crate) fn after_edit(&self, action: &str, path: &[String], in_array: bool) -> Result<Self> {
+        if let Some((at, expr)) = self
+            .exprs
+            .iter()
+            .filter(|(at, _)| at.len() < path.len() && path.starts_with(at))
+            .min_by_key(|(at, _)| at.len())
+        {
+            return Err(Error::Format {
+                format: "hcl",
+                message: format!(
+                    "cannot {action} {}: {} is the expression `{}`, whose value HCL computes; \
+                     dq can replace the whole expression, not edit inside it",
+                    pointer_text(path),
+                    pointer_text(at),
+                    expr.source,
+                ),
+            });
+        }
+        let mut out = Self {
+            blocks: self.blocks.clone(),
+            exprs: HashMap::with_capacity(self.exprs.len()),
+            moved: false,
+        };
+        let shift = match (in_array, path.split_last()) {
+            (true, Some((last, parent))) => last.parse::<usize>().ok().map(|i| (parent, i)),
+            _ => None,
+        };
+        for (at, expr) in &self.exprs {
+            if action != "insert" && at.starts_with(path) {
+                continue;
+            }
+            let mut at = at.clone();
+            if let Some((parent, i)) = shift
+                && at.len() > parent.len()
+                && at.starts_with(parent)
+                && let Ok(j) = at[parent.len()].parse::<usize>()
+            {
+                match action {
+                    "delete" if j > i => at[parent.len()] = (j - 1).to_string(),
+                    "insert" if j >= i => at[parent.len()] = (j + 1).to_string(),
+                    _ => {}
+                }
+            }
+            out.exprs.insert(at, expr.clone());
+        }
+        Ok(out)
+    }
+}
+
+/// `path` as a JSON Pointer, for a message.
+fn pointer_text(path: &[String]) -> String {
+    let pointer = crate::pointer::Pointer::new(
+        path.iter()
+            .map(|key| crate::pointer::Segment::Key(key.clone()))
+            .collect(),
+    )
+    .as_canonical();
+    format!("'{pointer}'")
+}
+
+/// Whether a string read from HCL holds what an HCL template would read
+/// as an interpolation or a directive, once written as a string.
+fn has_template_marker(s: &str) -> bool {
+    s.contains("${") || s.contains("%{")
 }
 
 /// How a key of one body was read.
@@ -137,11 +252,14 @@ enum Slot {
 struct Reader<'a> {
     /// The source, for the line and column of an error.
     text: &'a str,
-    /// The keys from the root down to the body being read (see
-    /// [`HclBlocks`]).
+    /// The keys from the root down to the body being read, as
+    /// [`HclLayout::blocks`] addresses them.
     path: Vec<String>,
-    blocks: HclBlocks,
+    layout: HclLayout,
 }
+
+/// The expressions of a body, each by its path from that body.
+type BodyExprs = Vec<(Vec<String>, Expr)>;
 
 impl Reader<'_> {
     /// Convert a body (top-level or nested block body), as `hcl-edit` reads
@@ -162,9 +280,17 @@ impl Reader<'_> {
     /// [`Error::Parse`] from [`check_expression_keys`], and for a body
     /// whose keys one map cannot hold apart: an attribute and a block of
     /// one name, or blocks of one type with different label counts.
-    fn body_to_value(&mut self, body: &EditBody) -> Result<Value> {
+    ///
+    /// Returns the body's value, and its expressions ([`HclLayout::exprs`])
+    /// by their paths from the body.
+    fn body_to_value(&mut self, body: &EditBody) -> Result<(Value, BodyExprs)> {
         let mut out: IndexMap<String, Value> = IndexMap::new();
         let mut slots: HashMap<String, Slot> = HashMap::new();
+        let mut exprs = BodyExprs::new();
+        // The expressions of each block body, by the block's type and
+        // labels, one entry per repeat: a repeated block's bodies become
+        // a list, and the path of each expression takes its index.
+        let mut block_exprs: IndexMap<Vec<String>, Vec<BodyExprs>> = IndexMap::new();
         for structure in body.iter() {
             match structure {
                 EditStructure::Attribute(attr) => {
@@ -183,13 +309,36 @@ impl Reader<'_> {
                     check_expression_keys(&expr)?;
                     let mut val = hcl_value_to_value(HclValue::from(expr));
                     restore_in_expression(&attr.value, &mut val);
+                    collect_exprs(
+                        self.text,
+                        &attr.value,
+                        &val,
+                        &mut vec![key.clone()],
+                        &mut exprs,
+                    );
                     slots.insert(key.clone(), Slot::Attribute);
                     out.insert(key, val);
                 }
-                EditStructure::Block(block) => self.insert_block(&mut out, &mut slots, block)?,
+                EditStructure::Block(block) => {
+                    let (at, body_exprs) = self.insert_block(&mut out, &mut slots, block)?;
+                    block_exprs.entry(at).or_default().push(body_exprs);
+                }
             }
         }
-        Ok(Value::Map(out))
+        for (at, bodies) in block_exprs {
+            let repeated = bodies.len() > 1;
+            for (index, body) in bodies.into_iter().enumerate() {
+                for (rest, expr) in body {
+                    let mut path = at.clone();
+                    if repeated {
+                        path.push(index.to_string());
+                    }
+                    path.extend(rest);
+                    exprs.push((path, expr));
+                }
+            }
+        }
+        Ok((Value::Map(out), exprs))
     }
 
     /// Insert a block into `parent` honouring the labels-as-keys nesting
@@ -206,12 +355,15 @@ impl Reader<'_> {
     /// [`Error::Parse`] when the block's type is an attribute of this body,
     /// or a type earlier blocks of this body carried a different number of
     /// labels for: a map level cannot hold both labels and a body.
+    ///
+    /// Returns the block's type and labels, and the expressions of its
+    /// body by their paths from the body.
     fn insert_block(
         &mut self,
         parent: &mut IndexMap<String, Value>,
         slots: &mut HashMap<String, Slot>,
         block: &EditBlock,
-    ) -> Result<()> {
+    ) -> Result<(Vec<String>, BodyExprs)> {
         let identifier = block.ident.as_str().to_owned();
         let labels: Vec<String> = block
             .labels
@@ -249,25 +401,28 @@ impl Reader<'_> {
 
         let depth = self.path.len();
         self.path.push(identifier.clone());
-        self.blocks.record(&self.path, labels.len());
+        self.layout.record(&self.path, labels.len());
         self.path.extend(labels.iter().cloned());
         let body = self.body_to_value(&block.body);
         self.path.truncate(depth);
-        let body = body?;
+        let (body, exprs) = body?;
+        let mut at = Vec::with_capacity(labels.len() + 1);
+        at.push(identifier.clone());
+        at.extend(labels.iter().cloned());
 
         // Walk into `parent[identifier]`, then one map per label but the
         // last: label maps hold nothing but labels, as the slot check above
         // keeps every block of this type at one label count.
         let Some((last, inner)) = labels.split_last() else {
             add_repeat(parent, identifier, body);
-            return Ok(());
+            return Ok((at, exprs));
         };
         let mut map = label_map(parent, identifier);
         for label in inner {
             map = label_map(map, label.clone());
         }
         add_repeat(map, last.clone(), body);
-        Ok(())
+        Ok((at, exprs))
     }
 
     /// An [`Error::Parse`] at the start of `span`.
@@ -365,6 +520,59 @@ fn check_expression_keys(expr: &Expression) -> Result<()> {
             Ok(())
         }
         _ => Ok(()),
+    }
+}
+
+/// Note in `out` every value of `expr` (read as `value`, at `path` from
+/// its body) that a value cannot spell, with its source: an expression
+/// other than a literal, an array or an object of literal keys — and a
+/// string holding `${` or `%{`, which the writer would escape. The items
+/// of an array and the members of an object are looked into; an object
+/// with a key that is an expression is noted whole.
+fn collect_exprs(
+    text: &str,
+    expr: &hcl::edit::expr::Expression,
+    value: &Value,
+    path: &mut Vec<String>,
+    out: &mut BodyExprs,
+) {
+    use hcl::edit::expr::{Expression as EditExpression, ObjectKey};
+    match (expr, value) {
+        (EditExpression::Null(_) | EditExpression::Bool(_) | EditExpression::Number(_), _) => {}
+        (EditExpression::String(_), Value::String(s)) if !has_template_marker(s) => {}
+        (EditExpression::Array(items), Value::Array(values)) if items.len() == values.len() => {
+            for (index, (item, value)) in items.iter().zip(values).enumerate() {
+                path.push(index.to_string());
+                collect_exprs(text, item, value, path, out);
+                path.pop();
+            }
+        }
+        (EditExpression::Object(object), Value::Map(map))
+            if object.len() == map.len()
+                && object.iter().all(|(key, _)| {
+                    matches!(
+                        key,
+                        ObjectKey::Ident(_) | ObjectKey::Expression(EditExpression::String(_))
+                    )
+                }) =>
+        {
+            for ((_, member), (key, value)) in object.iter().zip(map) {
+                path.push(key.clone());
+                collect_exprs(text, member.expr(), value, path, out);
+                path.pop();
+            }
+        }
+        _ => {
+            if let Some(source) = expr.span().and_then(|span| text.get(span)) {
+                out.push((
+                    path.clone(),
+                    Expr {
+                        value: value.clone(),
+                        source: source.to_owned(),
+                    },
+                ));
+            }
+        }
     }
 }
 
@@ -498,11 +706,33 @@ fn serialize_error(e: hcl::Error) -> Error {
 ///
 /// [`Error::Format`] naming the first big number, NaN or infinity HCL
 /// cannot hold, else the first key that is no HCL identifier.
-fn write_body(map: &IndexMap<String, Value>, blocks: Option<&HclBlocks>) -> Result<String> {
+fn write_body(map: &IndexMap<String, Value>, layout: Option<&HclLayout>) -> Result<String> {
+    // Where a transform may have moved values, an expression is also
+    // looked for by the string it read as: each such string, with the one
+    // source it was read from, or `None` when two sources read as it.
+    let mut by_string: HashMap<&str, Option<&str>> = HashMap::new();
+    if let Some(layout) = layout.filter(|layout| layout.moved) {
+        for expr in layout.exprs.values() {
+            if let Value::String(s) = &expr.value
+                && has_template_marker(s)
+            {
+                by_string
+                    .entry(s.as_str())
+                    .and_modify(|seen| {
+                        if *seen != Some(expr.source.as_str()) {
+                            *seen = None;
+                        }
+                    })
+                    .or_insert(Some(expr.source.as_str()));
+            }
+        }
+    }
     let mut writer = BodyWriter {
         out: String::new(),
-        blocks,
+        layout,
+        by_string,
         path: Vec::new(),
+        exact: Vec::new(),
         bad_key: None,
     };
     writer.body(map, 0)?;
@@ -515,26 +745,33 @@ fn write_body(map: &IndexMap<String, Value>, blocks: Option<&HclBlocks>) -> Resu
 /// One write of a body tree (see [`write_body`]).
 struct BodyWriter<'a> {
     out: String,
-    blocks: Option<&'a HclBlocks>,
+    layout: Option<&'a HclLayout>,
+    /// See [`write_body`].
+    by_string: HashMap<&'a str, Option<&'a str>>,
     /// The keys from the root down to the key being written, as
-    /// [`HclBlocks`] addresses them.
+    /// [`HclLayout::blocks`] addresses them.
     path: Vec<String>,
+    /// The path from the root of the value being written, as
+    /// [`HclLayout::exprs`] addresses it.
+    exact: Vec<String>,
     /// The first key that is no HCL identifier, reported once every number
     /// has been checked.
     bad_key: Option<hcl::Error>,
 }
 
-impl BodyWriter<'_> {
+impl<'a> BodyWriter<'a> {
     /// Append the attributes and blocks of `map`, `depth` indents deep.
     fn body(&mut self, map: &IndexMap<String, Value>, depth: usize) -> Result<()> {
         for (key, value) in map {
             self.path.push(key.clone());
-            let written = match self.blocks.and_then(|b| b.labels_at(&self.path)) {
+            self.exact.push(key.clone());
+            let written = match self.layout.and_then(|l| l.labels_at(&self.path)) {
                 Some(labels) if has_block_shape(value, labels) => {
                     self.blocks_of(key, value, labels, &mut Vec::new(), depth)
                 }
                 _ => self.attribute(key, value, depth),
             };
+            self.exact.pop();
             self.path.pop();
             written?;
         }
@@ -546,7 +783,7 @@ impl BodyWriter<'_> {
         indent(&mut self.out, depth);
         self.identifier(key);
         self.out.push_str(" = ");
-        write_expression(&mut self.out, value, depth + 1)?;
+        self.expression(value, depth + 1)?;
         self.out.push('\n');
         Ok(())
     }
@@ -566,18 +803,23 @@ impl BodyWriter<'_> {
             Value::Map(map) if remaining > 0 => {
                 for (label, inner) in map {
                     self.path.push(label.clone());
+                    self.exact.push(label.clone());
                     labels.push(label);
                     let written = self.blocks_of(key, inner, remaining - 1, labels, depth);
                     labels.pop();
+                    self.exact.pop();
                     self.path.pop();
                     written?;
                 }
             }
             Value::Map(body) => self.block(key, labels, body, depth)?,
             Value::Array(bodies) => {
-                for body in bodies {
+                for (index, body) in bodies.iter().enumerate() {
                     if let Value::Map(body) = body {
-                        self.block(key, labels, body, depth)?;
+                        self.exact.push(index.to_string());
+                        let written = self.block(key, labels, body, depth);
+                        self.exact.pop();
+                        written?;
                     }
                 }
             }
@@ -621,6 +863,137 @@ impl BodyWriter<'_> {
             }
         }
     }
+
+    /// The source to write for `value`, at [`BodyWriter::exact`], if it is
+    /// an expression the reader saw: the one read there, when `value` is
+    /// still what it read as, else — where a transform may have moved
+    /// values — the one the string `value` was read from anywhere.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Format`] when the string `value` holds `${` or `%{` and is
+    /// what two expressions of different source read as, or replaces an
+    /// expression it does not read as: written as a string it would turn
+    /// what was an expression into a string, and dq cannot tell an edited
+    /// expression from a new string.
+    fn source_of(&self, value: &Value) -> Result<Option<&'a str>> {
+        let Some(layout) = self.layout else {
+            return Ok(None);
+        };
+        let here = layout.exprs.get(&self.exact);
+        if let Some(expr) = here
+            && expr.value.same_data(value)
+        {
+            return Ok(Some(expr.source.as_str()));
+        }
+        let Value::String(s) = value else {
+            return Ok(None);
+        };
+        if !layout.moved || !has_template_marker(s) {
+            return Ok(None);
+        }
+        match (self.by_string.get(s.as_str()), here) {
+            (Some(Some(source)), _) => Ok(Some(source)),
+            (Some(None), _) => Err(Error::Format {
+                format: "hcl",
+                message: format!(
+                    "{}: the string {s:?} is what more than one expression of the file reads \
+                     as, and the edit moved it; dq cannot tell which expression to write there",
+                    pointer_text(&self.exact),
+                ),
+            }),
+            (None, Some(expr)) => Err(Error::Format {
+                format: "hcl",
+                message: format!(
+                    "{}: the edit turned the expression `{}` into the string {s:?}; dq would \
+                     write that as a string, no longer an expression, so it refuses: edit the \
+                     expression in the file itself, or set a value that holds no `${{` or `%{{`",
+                    pointer_text(&self.exact),
+                    expr.source,
+                ),
+            }),
+            (None, None) => Ok(None),
+        }
+    }
+
+    /// Append `value`, whose members go `depth` indents deep: the source
+    /// of the expression it was read from ([`BodyWriter::source_of`]), else
+    /// the value.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Format`] from [`BodyWriter::source_of`], and naming the
+    /// first big number, NaN or infinity of `value`: HCL has no literal for
+    /// any of them.
+    fn expression(&mut self, value: &Value, depth: usize) -> Result<()> {
+        if let Some(source) = self.source_of(value)? {
+            self.out.push_str(source);
+            return Ok(());
+        }
+        // A NaN or an infinity, held as a float or as its literal (`.nan`
+        // read from YAML): HCL has no literal for one, so writing `null` or
+        // the string `".nan"` would change the value without a word.
+        if let Some(spelling) = value.non_finite_spelling() {
+            return Err(non_finite_error(spelling));
+        }
+        match value {
+            Value::Null => self.out.push_str("null"),
+            Value::Bool(b) => self.out.push_str(if *b { "true" } else { "false" }),
+            Value::Int(i) => self.out.push_str(&i.to_string()),
+            Value::Float(f) => self.out.push_str(&crate::document::shortest_float(*f)),
+            Value::BigInt(s) => match s.parse::<u64>() {
+                Ok(u) if u.to_string() == *s => self.out.push_str(s),
+                _ => return Err(big_number_error(s)),
+            },
+            Value::BigFloat(s) => return Err(big_number_error(s)),
+            Value::String(s) => self
+                .out
+                .push_str(&hcl_text(&hcl::Expression::String(s.clone()))?),
+            Value::Array(items) if items.is_empty() => self.out.push_str("[]"),
+            Value::Array(items) => {
+                self.out.push('[');
+                // A heredoc's closing marker stands on a line of its own,
+                // so the comma after one goes on the next line.
+                let mut after_heredoc = false;
+                for (at, item) in items.iter().enumerate() {
+                    if after_heredoc {
+                        self.out.push('\n');
+                        indent(&mut self.out, depth);
+                    }
+                    self.out.push_str(if at == 0 { "\n" } else { ",\n" });
+                    indent(&mut self.out, depth);
+                    self.exact.push(at.to_string());
+                    let start = self.out.len();
+                    let written = self.expression(item, depth + 1);
+                    self.exact.pop();
+                    written?;
+                    after_heredoc = self.out[start..].starts_with("<<");
+                }
+                self.out.push('\n');
+                indent(&mut self.out, depth - 1);
+                self.out.push(']');
+            }
+            Value::Map(map) if map.is_empty() => self.out.push_str("{}"),
+            Value::Map(map) => {
+                self.out.push('{');
+                for (key, member) in map {
+                    self.out.push('\n');
+                    indent(&mut self.out, depth);
+                    self.out
+                        .push_str(&hcl_text(&hcl::ObjectKey::from(key.as_str()))?);
+                    self.out.push_str(" = ");
+                    self.exact.push(key.clone());
+                    let written = self.expression(member, depth + 1);
+                    self.exact.pop();
+                    written?;
+                }
+                self.out.push('\n');
+                indent(&mut self.out, depth - 1);
+                self.out.push('}');
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Whether `value` can be written as the blocks of a type with `labels`
@@ -645,60 +1018,6 @@ fn indent(out: &mut String, depth: usize) {
     for _ in 0..depth {
         out.push_str("  ");
     }
-}
-
-/// Append `value`, whose members go `depth` indents deep, to `out`.
-///
-/// # Errors
-///
-/// [`Error::Format`] naming the first big number, NaN or infinity of
-/// `value`: HCL has no literal for any of them.
-fn write_expression(out: &mut String, value: &Value, depth: usize) -> Result<()> {
-    // A NaN or an infinity, held as a float or as its literal (`.nan` read
-    // from YAML): HCL has no literal for one, so writing `null` or the
-    // string `".nan"` would change the value without a word.
-    if let Some(spelling) = value.non_finite_spelling() {
-        return Err(non_finite_error(spelling));
-    }
-    match value {
-        Value::Null => out.push_str("null"),
-        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Value::Int(i) => out.push_str(&i.to_string()),
-        Value::Float(f) => out.push_str(&crate::document::shortest_float(*f)),
-        Value::BigInt(s) => match s.parse::<u64>() {
-            Ok(u) if u.to_string() == *s => out.push_str(s),
-            _ => return Err(big_number_error(s)),
-        },
-        Value::BigFloat(s) => return Err(big_number_error(s)),
-        Value::String(s) => out.push_str(&hcl_text(&hcl::Expression::String(s.clone()))?),
-        Value::Array(items) if items.is_empty() => out.push_str("[]"),
-        Value::Array(items) => {
-            out.push('[');
-            for (at, item) in items.iter().enumerate() {
-                out.push_str(if at == 0 { "\n" } else { ",\n" });
-                indent(out, depth);
-                write_expression(out, item, depth + 1)?;
-            }
-            out.push('\n');
-            indent(out, depth - 1);
-            out.push(']');
-        }
-        Value::Map(map) if map.is_empty() => out.push_str("{}"),
-        Value::Map(map) => {
-            out.push('{');
-            for (key, member) in map {
-                out.push('\n');
-                indent(out, depth);
-                out.push_str(&hcl_text(&hcl::ObjectKey::from(key.as_str()))?);
-                out.push_str(" = ");
-                write_expression(out, member, depth + 1)?;
-            }
-            out.push('\n');
-            indent(out, depth - 1);
-            out.push('}');
-        }
-    }
-    Ok(())
 }
 
 /// `value` as `hcl-rs` formats it.
@@ -1105,6 +1424,84 @@ mod tests {
                 "{value:?}"
             );
         }
+    }
+
+    fn layout_of(text: &str) -> HclLayout {
+        match Hcl.parse(text.as_bytes()).expect("parse").layout() {
+            Layout::Hcl(layout) => layout.clone(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn path(p: &[&str]) -> Vec<String> {
+        p.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    fn sources(layout: &HclLayout) -> Vec<(Vec<String>, String)> {
+        let mut found: Vec<(Vec<String>, String)> = layout
+            .exprs
+            .iter()
+            .map(|(at, expr)| (at.clone(), expr.source.clone()))
+            .collect();
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn the_reader_notes_each_expression_by_its_exact_path() {
+        let layout = layout_of(
+            "a = var.x\nb = [1, f(2)]\nc = { k = \"$${l}\", n = 1 }\n\
+             r \"t\" {\n  e = x.y\n}\nr \"t\" {\n  e = 3\n}\nq {\n  e = z\n}\n",
+        );
+        assert_eq!(
+            sources(&layout),
+            vec![
+                (path(&["a"]), "var.x".to_owned()),
+                (path(&["b", "1"]), "f(2)".to_owned()),
+                (path(&["c", "k"]), "\"$${l}\"".to_owned()),
+                (path(&["q", "e"]), "z".to_owned()),
+                (path(&["r", "t", "0", "e"]), "x.y".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn after_edit_drops_replaced_expressions_and_moves_shifted_ones() {
+        let layout = layout_of("l = [a, b, c]\nm = d\n");
+        let deleted = layout
+            .after_edit("delete", &path(&["l", "1"]), true)
+            .unwrap();
+        assert_eq!(
+            sources(&deleted),
+            vec![
+                (path(&["l", "0"]), "a".to_owned()),
+                (path(&["l", "1"]), "c".to_owned()),
+                (path(&["m"]), "d".to_owned()),
+            ]
+        );
+        let inserted = layout
+            .after_edit("insert", &path(&["l", "1"]), true)
+            .unwrap();
+        assert_eq!(
+            sources(&inserted),
+            vec![
+                (path(&["l", "0"]), "a".to_owned()),
+                (path(&["l", "2"]), "b".to_owned()),
+                (path(&["l", "3"]), "c".to_owned()),
+                (path(&["m"]), "d".to_owned()),
+            ]
+        );
+        let set = layout.after_edit("set", &path(&["m"]), false).unwrap();
+        assert_eq!(sources(&set).len(), 3);
+        assert!(!set.moved && layout.moved().moved);
+        let err = layout
+            .after_edit("set", &path(&["m", "k"]), false)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "hcl format error: cannot set '/m/k': '/m' is the expression `d`, whose value HCL \
+             computes; dq can replace the whole expression, not edit inside it"
+        );
     }
 
     #[test]

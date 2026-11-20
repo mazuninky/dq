@@ -233,11 +233,23 @@ pub struct Document {
     /// edits apply to it. Not the same as having bytes: an empty YAML file
     /// parsed write-aware has neither bytes nor spans.
     write_aware: bool,
-    /// Which keys the HCL reader read as blocks, so the HCL writer writes
-    /// them back as blocks rather than as attributes. `None` for every
-    /// document no HCL reader built; carried over a value-only rebuild by
-    /// [`Document::with_layout_of`].
-    hcl_blocks: Option<crate::parsers::hcl::HclBlocks>,
+    /// What the reader of a format with no textual edits saw of the file
+    /// beyond its value tree, for its writer to write back: see [`Layout`].
+    /// Carried over a value-only rebuild by [`Document::with_layout_of`].
+    layout: Layout,
+}
+
+/// What a reader saw of a file beyond its value tree, so the writer of a
+/// format dq rewrites whole ([`Document::edits_by_rewrite`]) writes it
+/// back: for HCL, which keys are blocks and the source of every
+/// expression.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) enum Layout {
+    /// Nothing: every document no such reader built.
+    #[default]
+    None,
+    /// What the HCL reader saw.
+    Hcl(crate::parsers::hcl::HclLayout),
 }
 
 /// The not-a-number or infinite float a number literal spells in YAML
@@ -674,7 +686,7 @@ impl Document {
             frontmatter_payload: None,
             provenance: ProvenanceMap::new(),
             write_aware: false,
-            hcl_blocks: None,
+            layout: Layout::None,
         }
     }
 
@@ -697,7 +709,7 @@ impl Document {
             frontmatter_payload: None,
             provenance: ProvenanceMap::new(),
             write_aware: false,
-            hcl_blocks: None,
+            layout: Layout::None,
         }
     }
 
@@ -724,7 +736,7 @@ impl Document {
             frontmatter_payload: None,
             provenance,
             write_aware: true,
-            hcl_blocks: None,
+            layout: Layout::None,
         }
     }
 
@@ -762,7 +774,7 @@ impl Document {
             frontmatter_payload: None,
             provenance,
             write_aware: true,
-            hcl_blocks: None,
+            layout: Layout::None,
         }
     }
 
@@ -795,7 +807,7 @@ impl Document {
             frontmatter_payload: None,
             provenance,
             write_aware: false,
-            hcl_blocks: None,
+            layout: Layout::None,
         }
     }
 
@@ -813,7 +825,7 @@ impl Document {
             frontmatter_payload: Some(FrontmatterPayload { kind, body }),
             provenance: ProvenanceMap::new(),
             write_aware: false,
-            hcl_blocks: None,
+            layout: Layout::None,
         }
     }
 
@@ -963,30 +975,34 @@ impl Document {
     }
 
     /// This document, written with the layout `source` was read with,
-    /// when both are of one format that has one: today which keys of an
-    /// HCL document are blocks, so a value-only document rebuilt from a
-    /// transformed HCL document (`set --jq`, `fix`) still writes its
-    /// blocks as blocks. A key whose new value no longer has a block's
-    /// shape is written as an attribute; any other document is returned
-    /// as it is.
+    /// when both are of one format that has one, so a value-only document
+    /// rebuilt from a transformed document (`set --jq`, `fix.jq`) writes
+    /// what the transform left of it as the file had it. In HCL: a key
+    /// that was a block stays a block, and a value that was an expression
+    /// (`var.ami`, `"${var.p}-web"`, `length(var.l)`) and still reads the
+    /// same is written as that expression's source — at its place, or
+    /// wherever the transform moved it. Any other document is returned as
+    /// it is.
     #[must_use]
     pub fn with_layout_of(mut self, source: &Document) -> Self {
-        if self.format == FormatTag::Hcl && source.format == FormatTag::Hcl {
-            self.hcl_blocks.clone_from(&source.hcl_blocks);
+        if self.format == source.format {
+            self.layout = match &source.layout {
+                Layout::Hcl(layout) => Layout::Hcl(layout.moved()),
+                other => other.clone(),
+            };
         }
         self
     }
 
-    /// Record which keys the HCL reader read as blocks.
-    pub(crate) fn with_hcl_blocks(mut self, blocks: crate::parsers::hcl::HclBlocks) -> Self {
-        self.hcl_blocks = Some(blocks);
+    /// Record what the reader saw beyond the value tree.
+    pub(crate) fn with_layout(mut self, layout: Layout) -> Self {
+        self.layout = layout;
         self
     }
 
-    /// Which keys the HCL reader read as blocks, if an HCL reader built
-    /// this document.
-    pub(crate) fn hcl_blocks(&self) -> Option<&crate::parsers::hcl::HclBlocks> {
-        self.hcl_blocks.as_ref()
+    /// What the reader saw beyond the value tree.
+    pub(crate) fn layout(&self) -> &Layout {
+        &self.layout
     }
 
     /// Borrow this `Document` as an [`Ir<'_>`] — the read-only IR view used
@@ -1267,11 +1283,12 @@ impl Document {
         let Some(format) = crate::format::by_name(name) else {
             return Err(self.no_textual_edits("write it"));
         };
+        let layout = self.layout_after_edit(action, pointer)?;
         let mut tree = self.value.clone();
         edit(&mut tree)?;
         let mut bytes = Vec::new();
         format.write(
-            &Document::value_only(tree, self.format).with_layout_of(self),
+            &Document::value_only(tree, self.format).with_layout(layout),
             &mut bytes,
         )?;
         let fresh = format.parse(&bytes).map_err(|err| Error::EditRejected {
@@ -1280,9 +1297,47 @@ impl Document {
             reason: format!("the {name} dq would write does not read back: {err}"),
         })?;
         self.value = fresh.value;
-        self.hcl_blocks = fresh.hcl_blocks;
+        self.layout = fresh.layout;
         self.original_bytes = bytes;
         Ok(())
+    }
+
+    /// The layout to write this document with after the point edit
+    /// `action` (`set`, `delete`, `insert`) at `pointer`: in HCL, the
+    /// expressions the edit replaces or removes go, and those it moves up
+    /// or down an array move with their values
+    /// ([`crate::parsers::hcl::HclLayout::after_edit`]).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Format`] when `pointer` runs through an HCL expression.
+    fn layout_after_edit(&self, action: &'static str, pointer: &Pointer) -> Result<Layout> {
+        let Layout::Hcl(layout) = &self.layout else {
+            return Ok(self.layout.clone());
+        };
+        let segments = pointer.segments();
+        let parent_len = match segments.split_last() {
+            Some((_, parent)) => match Pointer::new(parent.to_vec()).resolve(&self.value) {
+                Ok(Value::Array(items)) => Some(items.len()),
+                _ => None,
+            },
+            None => None,
+        };
+        let mut path: Vec<String> = segments
+            .iter()
+            .map(|segment| match segment {
+                Segment::Key(key) => key.clone(),
+                Segment::Index(index) => index.to_string(),
+            })
+            .collect();
+        if let (Some(len), Some(last)) = (parent_len, path.last_mut())
+            && last == "-"
+        {
+            *last = len.to_string();
+        }
+        layout
+            .after_edit(action, &path, parent_len.is_some())
+            .map(Layout::Hcl)
     }
 
     /// The refusal of a textual edit — `what` it would do, as "set a value
