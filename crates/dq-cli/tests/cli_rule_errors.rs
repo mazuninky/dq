@@ -164,7 +164,109 @@ fn test_json_and_tap_name_the_raised_rule() {
             "not ok 1 - ./rule.test.yml: wrong-type spec\n",
             "  ---\n",
             "  raised:\n",
-            "    - rule=local.raises-in-check check.jq: jq runtime error: cannot index \"x\" with \"template\"\n",
+            "    - \"rule=local.raises-in-check check.jq: jq runtime error: cannot index \\\"x\\\" with \\\"template\\\"\"\n",
             "  ...\n",
         ));
+}
+
+/// A rule that fires on `kind: Pod` with a message holding `: ` and `"`.
+const FIRES_WITH_AWKWARD_MESSAGE: &str = r#"id: local.fires
+description: fires on every pod
+severity: error
+match:
+  format: yaml
+check:
+  jq: 'select(.kind == "Pod") | .'
+  message: 'broken: "pod" # not - fine'
+"#;
+
+/// The `---` .. `...` YAML block of every `not ok` entry of a TAP stream.
+fn tap_yaml_blocks(tap: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut current: Option<String> = None;
+    for line in tap.lines() {
+        match (line, current.as_mut()) {
+            ("  ---", None) => current = Some(String::new()),
+            ("  ...", Some(_)) => blocks.extend(current.take()),
+            (_, Some(block)) => {
+                block.push_str(line);
+                block.push('\n');
+            }
+            _ => {}
+        }
+    }
+    blocks
+}
+
+#[test]
+fn test_tap_yaml_blocks_parse_back_to_the_json_lists() {
+    let dir = TempDir::new().expect("tempdir");
+    let write = |name: &str, text: &str| std::fs::write(dir.path().join(name), text).expect(name);
+    // One case whose rule raises, one whose expected and actual
+    // violations differ: every list item holds `: ` and `"`.
+    write("a-raises.yml", RAISES_IN_CHECK);
+    write(
+        "a-raises.test.yml",
+        "tests:\n  - name: wrong-type spec\n    input: |\n      kind: Pod\n      spec: x\n    expected:\n      violations: []\n",
+    );
+    write("b-fires.yml", FIRES_WITH_AWKWARD_MESSAGE);
+    write(
+        "b-fires.test.yml",
+        "tests:\n  - name: other message\n    input: |\n      kind: Pod\n    expected:\n      violations:\n        - rule: local.fires\n          message_equals: 'other: \"msg\"'\n",
+    );
+
+    let json_out = dq()
+        .current_dir(dir.path())
+        .args(["--no-color", "-F", "json", "test", "."])
+        .assert()
+        .code(4);
+    let json: serde_json::Value =
+        serde_json::from_slice(&json_out.get_output().stdout).expect("JSON stdout");
+    let results = json["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 2);
+
+    let tap_out = dq()
+        .current_dir(dir.path())
+        .args(["--no-color", "-F", "tap", "test", "."])
+        .assert()
+        .code(4);
+    let tap = String::from_utf8(tap_out.get_output().stdout.clone()).expect("UTF-8 TAP");
+    let blocks = tap_yaml_blocks(&tap);
+    assert_eq!(blocks.len(), 2, "one YAML block per failed case:\n{tap}");
+
+    for (i, (block, result)) in blocks.iter().zip(results).enumerate() {
+        let path = dir.path().join(format!("block{i}.yaml"));
+        std::fs::write(&path, block).expect("write block");
+        let parsed = dq()
+            .current_dir(dir.path())
+            .args([
+                "--no-color",
+                "convert",
+                "-F",
+                "json",
+                path.to_str().unwrap(),
+            ])
+            .assert()
+            .success();
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&parsed.get_output().stdout).expect("JSON stdout");
+        for key in ["missing", "extra", "raised"] {
+            // The block omits an empty list.
+            let want = result[key].clone();
+            let got = parsed.get(key).cloned().unwrap_or(serde_json::json!([]));
+            assert_eq!(got, want, "`{key}` of block {i}:\n{block}");
+        }
+    }
+    let awkward = results.iter().flat_map(|r| {
+        ["missing", "extra", "raised"]
+            .into_iter()
+            .flat_map(|k| r[k].as_array().cloned().unwrap_or_default())
+    });
+    assert!(
+        awkward
+            .filter(|s| s.as_str().is_some_and(|s| s.contains(": ")))
+            .count()
+            >= 3,
+        "the fixture must exercise `: ` in all three lists",
+    );
 }

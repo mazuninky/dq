@@ -29,6 +29,7 @@ use dq_exec::{RuleTester, TestOutcome};
 use crate::cli::{Cli, TestArgs};
 use crate::error::{InvalidInput, LintFail};
 use crate::output::OutputFormat;
+use crate::output::tap::yaml_escape_double_quoted;
 
 /// Run the `test` command.
 ///
@@ -205,19 +206,19 @@ fn render_tap(outcomes: &[TestOutcome], out: &mut dyn Write) -> std::io::Result<
                 if !missing.is_empty() {
                     writeln!(out, "  missing:")?;
                     for m in missing {
-                        writeln!(out, "    - {m}")?;
+                        writeln!(out, "    - \"{}\"", yaml_escape_double_quoted(m))?;
                     }
                 }
                 if !extra.is_empty() {
                     writeln!(out, "  extra:")?;
                     for e in extra {
-                        writeln!(out, "    - {e}")?;
+                        writeln!(out, "    - \"{}\"", yaml_escape_double_quoted(e))?;
                     }
                 }
                 if !raised.is_empty() {
                     writeln!(out, "  raised:")?;
                     for r in raised {
-                        writeln!(out, "    - {r}")?;
+                        writeln!(out, "    - \"{}\"", yaml_escape_double_quoted(r))?;
                     }
                 }
                 writeln!(out, "  ...")?;
@@ -229,7 +230,7 @@ fn render_tap(outcomes: &[TestOutcome], out: &mut dyn Write) -> std::io::Result<
             } => {
                 writeln!(out, "not ok {n} - {fixture}: {name} # ERROR")?;
                 writeln!(out, "  ---")?;
-                writeln!(out, "  error: {error}")?;
+                writeln!(out, "  error: \"{}\"", yaml_escape_double_quoted(error))?;
                 writeln!(out, "  ...")?;
             }
         }
