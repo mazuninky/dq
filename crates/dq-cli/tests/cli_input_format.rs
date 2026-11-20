@@ -307,3 +307,47 @@ fn no_pager_is_accepted_and_hidden_from_help() {
         assert!(stdout.contains("--input-format"), "{args:?}:\n{stdout}");
     }
 }
+
+/// A command that reads no data file refuses `--input-format`, as it
+/// refuses `--doc`: a usage error (exit 2), rendered by clap, before it
+/// does anything.
+#[test]
+fn input_format_is_refused_by_every_command_that_reads_no_data() {
+    let dir = TempDir::new().expect("tempdir");
+    std::fs::create_dir(dir.path().join("rules")).expect("seed");
+    let refused: &[(&str, &[&str])] = &[
+        ("test", &["test", "rules"]),
+        ("explain", &["explain", "k8s.no-latest-tag"]),
+        ("rules", &["rules", "list"]),
+        ("rules", &["rules", "add", "@std/npm"]),
+        ("completions", &["completions", "bash"]),
+        ("man", &["man"]),
+        ("self", &["self", "check"]),
+        ("generate-docs", &["generate-docs", "--output-dir", "out"]),
+    ];
+    for (command, args) in refused {
+        let argv: Vec<&str> = ["--input-format", "json"]
+            .iter()
+            .chain(args.iter())
+            .copied()
+            .collect();
+        let (code, stdout, stderr) = run(&dir, &argv, "");
+        assert_eq!(code, 2, "dq {argv:?}: stdout {stdout} stderr {stderr}");
+        let head = format!(
+            "error: `--input-format json` is not supported by `dq {command}`: it reads no data file"
+        );
+        assert!(stderr.starts_with(&head), "dq {argv:?}: {stderr}");
+        assert!(
+            stderr.ends_with(
+                "\n\nUsage: dq [OPTIONS] <COMMAND>\n\nFor more information, try '--help'.\n"
+            ),
+            "dq {argv:?}: rendered like clap's own usage errors: {stderr:?}"
+        );
+        assert_eq!(stdout, "", "dq {argv:?}");
+    }
+    assert!(
+        !dir.path().join("out").exists(),
+        "generate-docs wrote nothing"
+    );
+    assert!(!dir.path().join(".dq").exists(), "rules add wrote nothing");
+}

@@ -72,6 +72,13 @@ fn dispatch(
     {
         return Err(cli.doc_usage_error(cli.command.name(), why));
     }
+    // `--input-format` is global too: refused where there is no data file
+    // for it to name the format of.
+    if cli.input_format.is_some()
+        && let Some(why) = cli.command.input_format_unsupported_reason()
+    {
+        return Err(cli.input_format_usage_error(cli.command.name(), why));
+    }
     // Stdin can be read once: a command given `-` for two inputs would
     // find it empty for the second.
     let stdin_inputs = cli.command.stdin_inputs();

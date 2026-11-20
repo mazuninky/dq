@@ -61,7 +61,7 @@ harmless) or refuses it, as noted.
 | Flag | Meaning |
 |---|---|
 | `-F, --format <FMT>` | Output format, on every command; never the format a file is read in. See [Input and output formats](#input-and-output-formats). Default `console`. |
-| `--input-format <FMT>` | The format to read files, globs and stdin (`-`) in, instead of detecting it from the file name. Needed for stdin. No short form (`-i` is in-place). |
+| `--input-format <FMT>` | The format to read files, globs and stdin (`-`) in, instead of detecting it from the file name. Needed for stdin. Refused (exit 2) by the commands that read no data file: `test`, `explain`, `rules`, `completions`, `man`, `self`. No short form (`-i` is in-place). |
 | `-v, --verbose` (repeatable) | Log level: default WARN, `-v` INFO, `-vv` DEBUG, `-vvv` TRACE. `RUST_LOG` overrides. |
 | `-q, --quiet` | Log level ERROR. Conflicts with `-v` (clap usage error). |
 | `--no-color` | No ANSI colour. |
@@ -251,7 +251,7 @@ defined as named constants in `crates/dq-cli/src/exit_code.rs`.
 |---|---|---|
 | 0 | `SUCCESS` | Done. |
 | 1 | `GENERIC` | Unclassified failure; `exists` answering "no"; `--check` with changes pending; `lint --strict` with warnings; a failed `patch` `test` op; a jq runtime error; a value the output format cannot hold (NaN or infinity in JSON or HCL, a number HCL/TOON cannot represent); `keys` / `values` / `len` on a node of the wrong type; a composite-rule extract error. |
-| 2 | `NOT_FOUND` | A JSON Pointer that does not resolve; a `--doc N` the file does not have (or no file of the run has); **any clap usage error** (unknown flag, conflicting flags, invalid value, `--doc` on a command that cannot honour it, stdin without `--input-format`, a `-F` a write command cannot keep the file in, `-i` or `--check` on stdin, `-` for more than one input). |
+| 2 | `NOT_FOUND` | A JSON Pointer that does not resolve; a `--doc N` the file does not have (or no file of the run has); **any clap usage error** (unknown flag, conflicting flags, invalid value, `--doc` on a command that cannot honour it, `--input-format` on a command that reads no data file, stdin without `--input-format`, a `-F` a write command cannot keep the file in, `-i` or `--check` on stdin, `-` for more than one input). |
 | 3 | `PARSE_ERROR` | The input does not parse; a templated file without an escape hatch; a jq compile error; an invalid rule file (bad YAML, unknown field, bad `check`, schema compile failure, unsafe `schema_file`); a failing `fix` script; a plugin with the wrong ABI major or a malformed fix. |
 | 4 | `VALIDATE_FAIL` | `validate` found a parse error; `lint` / `check` found an error-severity diagnostic; a plugin trapped, ran out of fuel or memory, or failed to load; `self update` refused a downloaded archive at its SHA-256 check. |
 | 5 | `IO_ERROR` | Read-side I/O (missing file, unreadable file, a glob root that does not exist or a glob that matched nothing); network errors in `self check` / `self update` (incl. downloading `dq-checksums.txt`). |
@@ -260,7 +260,7 @@ defined as named constants in `crates/dq-cli/src/exit_code.rs`.
 
 The split between 2 and 6 follows who raises the error: anything clap rejects
 while parsing (and the usage errors handlers build as clap errors: `--doc`
-refusals, stdin without `--input-format`, a `-F` a write command cannot keep
+refusals, `--input-format` on a command that reads no data file, stdin without `--input-format`, a `-F` a write command cannot keep
 a file in, `-i` or `--check` on stdin, `-` for more than one input) exits 2, clap's own code; validation a handler performs after parsing exits 6. Older design
 documents said clap errors exit 6; that was never true once clap's own exit
 path was used.

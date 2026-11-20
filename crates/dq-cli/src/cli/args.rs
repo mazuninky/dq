@@ -95,7 +95,8 @@ pub struct Cli {
     /// one their extension or name implies.
     ///
     /// Stdin has no extension: a command reading `-` needs this flag (exit
-    /// 2 without it).
+    /// 2 without it). test, explain, rules, completions, man and self read
+    /// no data file and refuse it (exit 2).
     #[arg(long, global = true, value_enum, value_name = "FORMAT")]
     pub input_format: Option<InputFormat>,
 
@@ -384,6 +385,20 @@ impl Cli {
         usage_error(clap::error::ErrorKind::ArgumentConflict, message)
     }
 
+    /// The usage error (exit 2) for `--input-format` on a command that
+    /// cannot honour it, worded as [`Cli::doc_usage_error`] words `--doc`'s.
+    ///
+    /// Returned instead of ignoring the flag, as `--doc` is: a format named
+    /// for nothing to read is a mistake worth saying so.
+    #[must_use]
+    pub fn input_format_usage_error(&self, command: &str, why: &str) -> anyhow::Error {
+        let shown = self
+            .input_format
+            .map_or_else(String::new, |f| format!(" {}", f.parser_name()));
+        let message = format!("`--input-format{shown}` is not supported by `dq {command}`: {why}");
+        usage_error(clap::error::ErrorKind::ArgumentConflict, message)
+    }
+
     /// Refuse a `-F` that names another format than the one `dq {command}`
     /// writes `file` in — its own, `format`.
     ///
@@ -447,6 +462,10 @@ impl Cli {
 pub fn usage_error(kind: clap::error::ErrorKind, message: impl std::fmt::Display) -> anyhow::Error {
     anyhow::Error::new(<Cli as clap::CommandFactory>::command().error(kind, message))
 }
+
+/// Why a command that reads no data file refuses `--doc` and
+/// `--input-format`.
+const NO_DATA_FILE: &str = "it reads no data file";
 
 /// The usage error (exit 2) for `dq {command}` given stdin (`-`) for each
 /// of `inputs` ([`Command::stdin_inputs`], more than one): the first read
@@ -597,7 +616,47 @@ impl Command {
             | Self::Test(_)
             | Self::Explain(_)
             | Self::Rules(_)
-            | Self::GenerateDocs(_) => Some("it reads no data file"),
+            | Self::GenerateDocs(_) => Some(NO_DATA_FILE),
+        }
+    }
+
+    /// Why this command cannot take `--input-format`, or `None` when it
+    /// reads a data file the flag names the format of. The dispatcher turns
+    /// a `Some` into [`Cli::input_format_usage_error`].
+    ///
+    /// `test` reads the inputs of rule fixtures, but each fixture case
+    /// names its own format (or takes the rule's): one flag for every case
+    /// of every fixture would override what they say.
+    #[must_use]
+    pub fn input_format_unsupported_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Completions(_)
+            | Self::Man(_)
+            | Self::Self_(_)
+            | Self::Test(_)
+            | Self::Explain(_)
+            | Self::Rules(_)
+            | Self::GenerateDocs(_) => Some(NO_DATA_FILE),
+            Self::Get(_)
+            | Self::Exists(_)
+            | Self::Keys(_)
+            | Self::Values(_)
+            | Self::Len(_)
+            | Self::Type(_)
+            | Self::Paths(_)
+            | Self::Select(_)
+            | Self::Convert(_)
+            | Self::Fmt(_)
+            | Self::Validate(_)
+            | Self::Diff(_)
+            | Self::Set(_)
+            | Self::Del(_)
+            | Self::Patch(_)
+            | Self::Query(_)
+            | Self::Merge(_)
+            | Self::Lint(_)
+            | Self::Check(_)
+            | Self::Fix(_) => None,
         }
     }
 
