@@ -180,7 +180,7 @@ const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
 /// `XML_BODY` as written by the XML writer (`convert -F xml`, `fmt -i`),
 /// after the BOM when the source had one.
 const XML_WRITTEN: &[u8] = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><cfg name=\"dq\">\n  \
-<port>8080</port>\n  <tag>caf\xC3\xA9</tag>\n</cfg>";
+<port>8080</port>\n  <tag>caf\xC3\xA9</tag>\n</cfg>\n";
 
 /// Write `XML_BODY`, prefixed with a UTF-8 BOM when `bom` is set, to
 /// `cfg.xml` in a fresh tempdir.

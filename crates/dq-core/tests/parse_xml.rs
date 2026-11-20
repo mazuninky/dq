@@ -367,7 +367,7 @@ fn parse_utf8_bom_is_kept_as_xml_bom_and_written_back() {
     assert_eq!(with.get("a"), without.get("a"));
     let mut buf: Vec<u8> = Vec::new();
     xml().write(&with_bom, &mut buf).expect("write");
-    assert_eq!(buf, b"\xEF\xBB\xBF<a b=\"1\">x</a>");
+    assert_eq!(buf, b"\xEF\xBB\xBF<a b=\"1\">x</a>\n");
 }
 
 #[test]

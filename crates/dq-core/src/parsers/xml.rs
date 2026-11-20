@@ -143,7 +143,7 @@ use quick_xml::reader::Reader;
 use quick_xml::{Writer, XmlVersion};
 
 use crate::Result;
-use crate::document::{Document, FormatTag, Value};
+use crate::document::{Document, FormatTag, Layout, Value};
 use crate::error::Error;
 use crate::format::Format;
 
@@ -184,16 +184,31 @@ impl Format for Xml {
 
     fn parse(&self, bytes: &[u8]) -> Result<Document> {
         let value = parse_xml(bytes).map_err(with_position)?;
-        Ok(Document::value_only(value, FormatTag::Xml).with_source_bytes(bytes))
+        // The line break the file uses, from its first: decoded, as the
+        // file may be UTF-16.
+        let crlf = decode_input(bytes)
+            .is_ok_and(|(text, ..)| text.find('\n').is_some_and(|at| text[..at].ends_with('\r')));
+        Ok(Document::value_only(value, FormatTag::Xml)
+            .with_layout(Layout::Xml(XmlLayout { crlf }))
+            .with_source_bytes(bytes))
     }
 
     fn write(&self, doc: &Document, w: &mut dyn Write) -> Result<()> {
-        let buf = render_xml(doc.value())?;
+        let crlf = matches!(doc.layout(), Layout::Xml(XmlLayout { crlf: true }));
+        let buf = render_xml(doc.value(), crlf)?;
         w.write_all(&buf).map_err(|source| Error::WriteIo {
             path: Utf8PathBuf::from("<xml-writer>"),
             source,
         })
     }
+}
+
+/// What the XML reader saw of a file beyond its value tree
+/// ([`Layout::Xml`]): whether its lines end in `\r\n`, which the writer
+/// then ends the lines it writes with.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct XmlLayout {
+    crlf: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1771,7 +1786,7 @@ fn snippet_for_pos(text: &str, pos: usize) -> String {
 /// Top-level value MUST be a `Value::Map`. The map may carry `#xml` (decl),
 /// `#pi` and `#comments` entries plus exactly one element-shaped entry that
 /// becomes the root `<tag>...</tag>`. Other shapes return `Error::Format`.
-fn render_xml(top: &Value) -> Result<Vec<u8>> {
+fn render_xml(top: &Value, crlf: bool) -> Result<Vec<u8>> {
     let Value::Map(top) = top else {
         return Err(Error::Format {
             format: "xml",
@@ -1893,9 +1908,12 @@ fn render_xml(top: &Value) -> Result<Vec<u8>> {
         &mut unencodable,
         &Scope {
             xml11,
+            crlf,
             ..Scope::default()
         },
     )?;
+    // The output ends with one line break, as every re-emit does.
+    write_line_break(&mut writer, 0, crlf)?;
 
     if let Some((c, place)) = unencodable.first {
         let label = decl
@@ -2137,6 +2155,8 @@ struct Scope<'a> {
     /// Whether the document is XML 1.1, whose namespaces may undeclare a
     /// prefix.
     xml11: bool,
+    /// Whether the lines the writer breaks end in `\r\n` rather than `\n`.
+    crlf: bool,
 }
 
 impl<'a> Scope<'a> {
@@ -2160,6 +2180,7 @@ impl<'a> Scope<'a> {
             parent: Some(parent),
             prefixes,
             xml11: parent.xml11,
+            crlf: parent.crlf,
         })
     }
 
@@ -2276,7 +2297,8 @@ fn is_namespace_declaration(name: &str) -> bool {
 /// whitespace, so on `parse → write` we always synthesise this layout.
 const XML_INDENT_WIDTH: usize = 2;
 
-/// Emit `\n` + `indent_level * XML_INDENT_WIDTH` spaces as a text event.
+/// Emit a line break (`\r\n` when `crlf`, else `\n`) +
+/// `indent_level * XML_INDENT_WIDTH` spaces as a text event.
 ///
 /// We pass the whitespace through `BytesText::from_escaped` so `quick-xml`
 /// writes it verbatim (no entity escaping — there is nothing to escape).
@@ -2284,9 +2306,13 @@ const XML_INDENT_WIDTH: usize = 2;
 /// `Frame::text` but is discarded during `Frame::finalise` (because
 /// `has_text` only flips on non-whitespace text), so round-trip stays
 /// structurally stable.
-fn write_indent_break(writer: &mut Writer<Cursor<Vec<u8>>>, indent_level: usize) -> Result<()> {
-    let mut s = String::with_capacity(1 + indent_level * XML_INDENT_WIDTH);
-    s.push('\n');
+fn write_line_break(
+    writer: &mut Writer<Cursor<Vec<u8>>>,
+    indent_level: usize,
+    crlf: bool,
+) -> Result<()> {
+    let mut s = String::with_capacity(2 + indent_level * XML_INDENT_WIDTH);
+    s.push_str(if crlf { "\r\n" } else { "\n" });
     for _ in 0..(indent_level * XML_INDENT_WIDTH) {
         s.push(' ');
     }
@@ -2444,7 +2470,7 @@ fn write_element(
     // lossy on round-trip (per spec D5).
     for s in &comments {
         if pretty {
-            write_indent_break(writer, child_indent)?;
+            write_line_break(writer, child_indent, scope.crlf)?;
         }
         writer
             .write_event(Event::Comment(comment_event(s)))
@@ -2452,7 +2478,7 @@ fn write_element(
     }
     for s in &pis {
         if pretty {
-            write_indent_break(writer, child_indent)?;
+            write_line_break(writer, child_indent, scope.crlf)?;
         }
         writer
             .write_event(Event::PI(BytesPI::new(s.as_str())))
@@ -2483,7 +2509,7 @@ fn write_element(
         };
         for child in items {
             if pretty {
-                write_indent_break(writer, child_indent)?;
+                write_line_break(writer, child_indent, scope.crlf)?;
             }
             match child {
                 Value::Map(child_body) => {
@@ -2523,7 +2549,7 @@ fn write_element(
     // pretty-printed the body. Inline-emitted bodies (leaves, mixed content)
     // close immediately after the last inner event.
     if pretty {
-        write_indent_break(writer, indent_level)?;
+        write_line_break(writer, indent_level, scope.crlf)?;
     }
 
     writer
@@ -3063,9 +3089,45 @@ mod tests {
         parse_xml(s.as_bytes()).expect("parse xml")
     }
 
+    /// `v` written, without the line break every output ends with.
     fn render(v: &Value) -> String {
-        let bytes = render_xml(v).expect("render xml");
-        String::from_utf8(bytes).expect("utf-8")
+        let bytes = render_xml(v, false).expect("render xml");
+        let text = String::from_utf8(bytes).expect("utf-8");
+        let body = text.strip_suffix('\n').expect("ends with a line break");
+        assert!(!body.ends_with('\n'), "{text:?}");
+        body.to_owned()
+    }
+
+    #[test]
+    fn a_rewrite_ends_with_one_line_break_the_file_s_own() {
+        let pointer = |p: &str| crate::pointer::Pointer::parse(p).unwrap();
+        for (src, want) in [
+            ("<a><b>1</b></a>", "<a>\n  <b>2</b>\n</a>\n"),
+            ("<a>\n  <b>1</b>\n</a>\n\n\n", "<a>\n  <b>2</b>\n</a>\n"),
+            (
+                "<a>\r\n  <b>1</b>\r\n</a>\r\n",
+                "<a>\r\n  <b>2</b>\r\n</a>\r\n",
+            ),
+        ] {
+            let mut doc = Xml.parse(src.as_bytes()).expect("parse");
+            doc.set_at(&pointer("/a/0/b/0/#text"), Value::Int(2))
+                .expect("set");
+            assert_eq!(
+                String::from_utf8(doc.original_bytes().to_vec()).unwrap(),
+                want,
+                "{src:?}"
+            );
+        }
+        // In the encoding the declaration names, after a BOM.
+        let mut doc = Xml
+            .parse(b"\xEF\xBB\xBF<?xml version=\"1.0\" encoding=\"UTF-8\"?><a>1</a>")
+            .expect("parse");
+        doc.set_at(&pointer("/a/0/#text"), Value::Int(2))
+            .expect("set");
+        assert_eq!(
+            doc.original_bytes(),
+            b"\xEF\xBB\xBF<?xml version=\"1.0\" encoding=\"UTF-8\"?><a>2</a>\n"
+        );
     }
 
     #[test]
@@ -3085,7 +3147,7 @@ mod tests {
         ] {
             assert_eq!(render(&element(text)), xml);
         }
-        let err = render_xml(&element(Value::Array(vec![]))).expect_err("refused");
+        let err = render_xml(&element(Value::Array(vec![])), false).expect_err("refused");
         assert!(
             err.to_string().contains("must be a scalar (got an array)"),
             "{err}"
@@ -3146,7 +3208,7 @@ mod tests {
             Value::Map(top)
         };
         assert_eq!(render(&element(Value::Null)), "<x/>");
-        let err = render_xml(&element(Value::String("v".to_owned()))).expect_err("refused");
+        let err = render_xml(&element(Value::String("v".to_owned())), false).expect_err("refused");
         assert!(
             err.to_string()
                 .contains("child 'c' under <x> must be an Array of element maps (got \"v\")"),
@@ -3174,8 +3236,11 @@ mod tests {
         ] {
             assert_eq!(render(&element(key, entry)), xml);
         }
-        let err = render_xml(&element(KEY_PI, Value::Array(vec![Value::Array(vec![])])))
-            .expect_err("refused");
+        let err = render_xml(
+            &element(KEY_PI, Value::Array(vec![Value::Array(vec![])])),
+            false,
+        )
+        .expect_err("refused");
         assert!(
             err.to_string()
                 .contains("'#pi' of <x> must hold scalars (got an array)"),
@@ -3202,9 +3267,9 @@ mod tests {
         );
         assert_eq!(render(&doc(Value::Null)), "<r/>");
         decl.insert("doctype".to_owned(), Value::String("html".to_owned()));
-        let err = render_xml(&doc(Value::Map(decl))).expect_err("refused");
+        let err = render_xml(&doc(Value::Map(decl)), false).expect_err("refused");
         assert!(err.to_string().contains("has no field 'doctype'"), "{err}");
-        let err = render_xml(&doc(Value::Int(1))).expect_err("refused");
+        let err = render_xml(&doc(Value::Int(1)), false).expect_err("refused");
         assert!(err.to_string().contains("(got a number 1)"), "{err}");
     }
 
@@ -3753,7 +3818,7 @@ mod tests {
             "<?xml version='1.1'?><r xmlns:p='u'><k xmlns:p=''><j xmlns:p='v'><p:i/></j></k></r>",
         ] {
             let value = parse_xml(xml.as_bytes()).expect(xml);
-            render_xml(&value).expect(xml);
+            render_xml(&value, false).expect(xml);
         }
         // Undeclared, the prefix is out of scope — down to the next
         // declaration.
@@ -3802,13 +3867,13 @@ mod tests {
         let mut top = IndexMap::new();
         top.insert("a".to_owned(), empty());
         top.insert("b".to_owned(), empty());
-        let err = render_xml(&Value::Map(top)).expect_err("refused");
+        let err = render_xml(&Value::Map(top), false).expect_err("refused");
         assert!(err.to_string().contains("holds 'a' and 'b'"), "{err}");
 
         let mut top = IndexMap::new();
         top.insert(KEY_CDATA.to_owned(), Value::Array(vec![Value::Int(1)]));
         top.insert("r".to_owned(), empty());
-        let err = render_xml(&Value::Map(top)).expect_err("refused");
+        let err = render_xml(&Value::Map(top), false).expect_err("refused");
         assert!(
             err.to_string()
                 .contains("'#cdata' cannot stand at the top level"),
@@ -3996,7 +4061,7 @@ mod tests {
     #[test]
     fn write_top_level_non_map_is_format_error() {
         let v = Value::String("not a map".into());
-        let err = render_xml(&v).expect_err("top-level non-map must reject");
+        let err = render_xml(&v, false).expect_err("top-level non-map must reject");
         assert!(matches!(err, Error::Format { format: "xml", .. }));
     }
 
@@ -4009,7 +4074,7 @@ mod tests {
         let mut decl = IndexMap::new();
         decl.insert("version".into(), Value::String("1.0".into()));
         top.insert(KEY_XML_DECL.into(), Value::Map(decl));
-        let err = render_xml(&Value::Map(top)).expect_err("no root must reject");
+        let err = render_xml(&Value::Map(top), false).expect_err("no root must reject");
         assert!(
             matches!(err, Error::Format { format: "xml", message } if message.contains("root")),
             "expected Error::Format mentioning 'root'",

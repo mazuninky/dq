@@ -669,7 +669,7 @@ fn the_console_and_every_writer_spell_a_float_without_a_digit_run() {
             ),
             (
                 vec!["-q", "convert", "x.yaml", "-F", "xml"],
-                ok("<r a=\"1e300\">\n  <y>3.0</y>\n  <y>1e-7</y>\n</r>"),
+                ok("<r a=\"1e300\">\n  <y>3.0</y>\n  <y>1e-7</y>\n</r>\n"),
             ),
         ],
     );
@@ -732,7 +732,7 @@ fn xml_writes_a_scalar_text_and_refuses_a_container() {
                 vec!["-q", "convert", "t.yaml", "-F", "xml"],
                 ok(
                     "<r a=\"1e300\" b=\"true\" c=\"\">\n  <x>1.5e20</x>\n  <t>true</t>\n  \
-                    <i>42</i>\n  <z/>\n  <big>18446744073709551617</big>\n</r>",
+                    <i>42</i>\n  <z/>\n  <big>18446744073709551617</big>\n</r>\n",
                 ),
             ),
             (
@@ -786,13 +786,16 @@ fn xml_writes_scalar_comments_pis_and_cdata_and_refuses_containers() {
         &[
             (
                 vec!["-q", "convert", "items.yaml", "-F", "xml"],
-                ok("<r><!--42--><!--c--><?true?><![CDATA[1.5e20]]></r>"),
+                ok("<r><!--42--><!--c--><?true?><![CDATA[1.5e20]]></r>\n"),
             ),
             (
                 vec!["-q", "convert", "lone.yaml", "-F", "xml"],
-                ok("<r><!--only--><![CDATA[7]]></r>"),
+                ok("<r><!--only--><![CDATA[7]]></r>\n"),
             ),
-            (vec!["-q", "convert", "nulls.yaml", "-F", "xml"], ok("<r/>")),
+            (
+                vec!["-q", "convert", "nulls.yaml", "-F", "xml"],
+                ok("<r/>\n"),
+            ),
             (
                 vec!["-q", "convert", "item.yaml", "-F", "xml"],
                 (
@@ -883,7 +886,7 @@ fn every_xml_writer_refusal_names_what_it_got() {
             ),
             (
                 vec!["-q", "convert", "child_null.yaml", "-F", "xml"],
-                ok("<r/>"),
+                ok("<r/>\n"),
             ),
             (
                 vec!["-q", "convert", "attr.yaml", "-F", "xml"],
@@ -929,7 +932,7 @@ fn xml_writes_the_declaration_fields_and_refuses_what_a_document_cannot_hold() {
         &[
             (
                 vec!["-q", "convert", "decl.yaml", "-F", "xml"],
-                ok("<?xml version=\"1.1\" encoding=\"UTF-8\"?><?x?><!--1--><r/>"),
+                ok("<?xml version=\"1.1\" encoding=\"UTF-8\"?><?x?><!--1--><r/>\n"),
             ),
             (
                 vec!["-q", "convert", "decl_str.yaml", "-F", "xml"],
@@ -976,7 +979,10 @@ fn xml_writes_the_declaration_fields_and_refuses_what_a_document_cannot_hold() {
                      outside the root element (got \"hi\")\n",
                 ),
             ),
-            (vec!["-q", "convert", "empty.yaml", "-F", "xml"], ok("<r/>")),
+            (
+                vec!["-q", "convert", "empty.yaml", "-F", "xml"],
+                ok("<r/>\n"),
+            ),
         ],
     );
 }
@@ -1027,7 +1033,7 @@ fn xml_refuses_names_and_declaration_fields_xml_does_not_allow() {
     let cases = [
         (
             "sa_bool.yaml",
-            ok("<?xml version=\"1.0\" standalone=\"yes\"?><r/>"),
+            ok("<?xml version=\"1.0\" standalone=\"yes\"?><r/>\n"),
         ),
         (
             "sa_str.yaml",
@@ -1064,7 +1070,7 @@ fn xml_refuses_names_and_declaration_fields_xml_does_not_allow() {
         ),
         (
             "prefixed.yaml",
-            ok("<svg:r xmlns:svg=\"u\" xmlns=\"d\" svg:w=\"1\"/>"),
+            ok("<svg:r xmlns:svg=\"u\" xmlns=\"d\" svg:w=\"1\"/>\n"),
         ),
         (
             "pi_colon.yaml",
@@ -1123,7 +1129,7 @@ fn xml_refuses_names_and_declaration_fields_xml_does_not_allow() {
 #[test]
 fn xml_refuses_content_xml_cannot_hold_and_round_trips_a_read_tree() {
     let round_trip = "<?xml version=\"1.0\" standalone=\"yes\"?><!--top & <x>--><r a=\"1\">\n  \
-                      <!--c < d-->\n  <?pi x?><![CDATA[d]]]]><![CDATA[>e]]>\n  <k>v</k>\n</r>";
+                      <!--c < d-->\n  <?pi x?><![CDATA[d]]]]><![CDATA[>e]]>\n  <k>v</k>\n</r>\n";
     let dir = dir_with(&[
         ("comment.yaml", "r:\n- \"#comments\": [\"a < b & c\"]\n"),
         ("dashes.yaml", "r:\n- \"#comments\": [\"a--b\"]\n"),
@@ -1136,7 +1142,7 @@ fn xml_refuses_content_xml_cannot_hold_and_round_trips_a_read_tree() {
         ("rt.xml", round_trip),
     ]);
     let cases = [
-        ("comment.yaml", ok("<r><!--a < b & c--></r>")),
+        ("comment.yaml", ok("<r><!--a < b & c--></r>\n")),
         (
             "dashes.yaml",
             refused!(
@@ -1156,7 +1162,7 @@ fn xml_refuses_content_xml_cannot_hold_and_round_trips_a_read_tree() {
                 "a processing instruction in '#pi' of <r> contains '?>', which would end it early"
             ),
         ),
-        ("cdata.yaml", ok("<r><![CDATA[x]]]]><![CDATA[>y]]></r>")),
+        ("cdata.yaml", ok("<r><![CDATA[x]]]]><![CDATA[>y]]></r>\n")),
         (
             "ctl_text.yaml",
             refused!("'#text' of <r> holds U+0001, a character XML 1.0 does not allow"),
@@ -1185,8 +1191,8 @@ fn xml_refuses_content_xml_cannot_hold_and_round_trips_a_read_tree() {
 /// file holding those references writes back byte for byte.
 #[test]
 fn xml_writes_the_declared_encoding_and_keeps_whitespace() {
-    let refs = "<r a=\"x&#10;y&#9;z&#13;w\">p&#13;q\ns</r>";
-    let latin = "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><r>cafe</r>";
+    let refs = "<r a=\"x&#10;y&#9;z&#13;w\">p&#13;q\ns</r>\n";
+    let latin = "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><r>cafe</r>\n";
     let dir = dir_with(&[
         (
             "utf8.yaml",
@@ -1219,11 +1225,11 @@ fn xml_writes_the_declared_encoding_and_keeps_whitespace() {
     let cases = [
         (
             "utf8.yaml",
-            ok("<?xml version=\"1.0\" encoding=\"utf8\"?><r>é</r>"),
+            ok("<?xml version=\"1.0\" encoding=\"utf8\"?><r>é</r>\n"),
         ),
         (
             "latin_ascii.yaml",
-            ok("<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><r>cafe</r>"),
+            ok("<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><r>cafe</r>\n"),
         ),
         (
             "ascii.yaml",
@@ -1276,17 +1282,20 @@ fn utf16(text: &str, big_endian: bool) -> Vec<u8> {
 #[test]
 fn xml_reads_and_writes_files_in_their_declared_encoding() {
     let latin =
-        b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><r a=\"\xe9\">caf\xe9</r>".to_vec();
+        b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><r a=\"\xe9\">caf\xe9</r>\n".to_vec();
     let windows =
-        b"<?xml version=\"1.0\" encoding=\"windows-1252\"?><r>\x93q\x94 \x80</r>".to_vec();
+        b"<?xml version=\"1.0\" encoding=\"windows-1252\"?><r>\x93q\x94 \x80</r>\n".to_vec();
     // "日本" in Shift_JIS.
-    let sjis = b"<?xml version=\"1.0\" encoding=\"Shift_JIS\"?><r>\x93\xfa\x96\x7b</r>".to_vec();
+    let sjis = b"<?xml version=\"1.0\" encoding=\"Shift_JIS\"?><r>\x93\xfa\x96\x7b</r>\n".to_vec();
     let le = utf16(
-        "<?xml version=\"1.0\" encoding=\"UTF-16\"?><r>é ☃</r>",
+        "<?xml version=\"1.0\" encoding=\"UTF-16\"?><r>é ☃</r>\n",
         false,
     );
-    let be = utf16("<?xml version=\"1.0\" encoding=\"UTF-16\"?><r>é</r>", true);
-    let bare = utf16("<r>é</r>", false);
+    let be = utf16(
+        "<?xml version=\"1.0\" encoding=\"UTF-16\"?><r>é</r>\n",
+        true,
+    );
+    let bare = utf16("<r>é</r>\n", false);
     let dir = dir_with_bytes(&[
         ("latin.xml", &latin),
         ("windows.xml", &windows),
@@ -1321,12 +1330,15 @@ fn xml_reads_and_writes_files_in_their_declared_encoding() {
         (
             "latin.yaml",
             "xml",
-            b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><r>caf\xe9</r>",
+            b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><r>caf\xe9</r>\n",
         ),
         (
             "utf16.yaml",
             "xml",
-            &utf16("<?xml version=\"1.0\" encoding=\"UTF-16\"?><r>é</r>", false),
+            &utf16(
+                "<?xml version=\"1.0\" encoding=\"UTF-16\"?><r>é</r>\n",
+                false,
+            ),
         ),
     ];
     assert_byte_cases(
@@ -1384,7 +1396,7 @@ fn assert_byte_cases(dir: &TempDir, cases: &[(&str, &str, i32, &[u8], &str)]) {
 /// is refused. windows-1252 keeps 0x80 = €.
 #[test]
 fn xml_reads_us_ascii_strictly_and_iso_8859_1_byte_for_code_point() {
-    let latin = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><r>\x80\xe9</r>".to_vec();
+    let latin = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><r>\x80\xe9</r>\n".to_vec();
     let windows = b"<?xml version=\"1.0\" encoding=\"windows-1252\"?><r>\x80</r>".to_vec();
     let ascii = b"<?xml version=\"1.0\" encoding=\"US-ASCII\"?><r>caf\xe9</r>".to_vec();
     let dir = dir_with_bytes(&[
@@ -1432,7 +1444,7 @@ fn xml_reads_us_ascii_strictly_and_iso_8859_1_byte_for_code_point() {
                 "latin_c1.yaml",
                 "xml",
                 0,
-                b"<?xml version=\"1.0\" encoding=\"latin1\"?><r>\x80</r>",
+                b"<?xml version=\"1.0\" encoding=\"latin1\"?><r>\x80</r>\n",
                 "",
             ),
             ("latin_euro.yaml", "xml", 1, b"", &euro),
@@ -1478,7 +1490,7 @@ fn xml_refuses_names_outside_the_namespaces_in_scope() {
     let cases = [
         (
             "ok.yaml",
-            ok("<r xmlns:p=\"u\">\n  <p:k p:a=\"1\" xml:lang=\"en\"/>\n</r>"),
+            ok("<r xmlns:p=\"u\">\n  <p:k p:a=\"1\" xml:lang=\"en\"/>\n</r>\n"),
         ),
         (
             "element.yaml",
@@ -1785,8 +1797,8 @@ fn xml_refuses_a_bom_its_declaration_contradicts_and_keeps_a_utf8_bom() {
     );
     let utf8_bom = |text: &str| [b"\xEF\xBB\xBF".as_slice(), text.as_bytes()].concat();
     let u8_latin = utf8_bom("<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><r>é</r>");
-    let u8_decl = utf8_bom("<?xml version=\"1.0\" encoding=\"UTF-8\"?><r>é</r>");
-    let u8_bare = utf8_bom("<r>é</r>");
+    let u8_decl = utf8_bom("<?xml version=\"1.0\" encoding=\"UTF-8\"?><r>é</r>\n");
+    let u8_bare = utf8_bom("<r>é</r>\n");
     let dir = dir_with_bytes(&[
         ("u16_latin.xml", &u16_latin),
         ("u16_be_le.xml", &u16_be_le),
@@ -1836,9 +1848,9 @@ fn xml_refuses_a_bom_its_declaration_contradicts_and_keeps_a_utf8_bom() {
             ("u8_decl.xml", "xml", 0, &u8_decl, ""),
             ("u8_bare.xml", "xml", 0, &u8_bare, ""),
             ("u8_bare.xml", "json", 0, u8_json.as_bytes(), ""),
-            ("u8.yaml", "xml", 0, b"\xEF\xBB\xBF<r/>", ""),
+            ("u8.yaml", "xml", 0, b"\xEF\xBB\xBF<r/>\n", ""),
             ("u8_latin.yaml", "xml", 1, b"", u8_latin_refused),
-            ("attrs_null.yaml", "xml", 0, b"<r/>", ""),
+            ("attrs_null.yaml", "xml", 0, b"<r/>\n", ""),
         ],
     );
 }

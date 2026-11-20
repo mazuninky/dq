@@ -242,7 +242,8 @@ pub struct Document {
 /// What a reader saw of a file beyond its value tree, so the writer of a
 /// format dq rewrites whole ([`Document::edits_by_rewrite`]) writes it
 /// back: for HCL, which keys are blocks and the source of every
-/// expression; for dotenv, which keys had `export`.
+/// expression; for dotenv, which keys had `export`; for XML, its line
+/// break.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) enum Layout {
     /// Nothing: every document no such reader built.
@@ -252,6 +253,8 @@ pub(crate) enum Layout {
     Hcl(crate::parsers::hcl::HclLayout),
     /// What the dotenv reader saw: the keys with `export`.
     DotEnv(crate::parsers::dotenv::DotEnvLayout),
+    /// What the XML reader saw: the line break the file uses.
+    Xml(crate::parsers::xml::XmlLayout),
 }
 
 /// The not-a-number or infinite float a number literal spells in YAML

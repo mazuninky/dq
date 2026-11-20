@@ -363,7 +363,13 @@ appends the body verbatim.
 So `<project><version>1</version></project>` is read as
 `/project/0/version/0/#text`. Round trip is partial: structure, attributes,
 comments, CDATA, PIs, prefixes and the declaration survive; whitespace
-between elements is normalised; mixed content (`<p>Hello <b>w</b>!</p>`) is
+between elements is normalised, two-space indents, and every output
+(`convert -F xml`, `fmt`, `set`, `del`, `set --jq`, `fix`) ends with exactly
+one line break, encoded as the rest of the output (after the BOM, in
+UTF-16 when the file is). The line breaks the writer puts between elements
+and at the end are `\r\n` when the first line of the file it rewrites ends
+in one, else `\n`; line ends inside text, comments, PIs and CDATA are
+written as they read. Mixed content (`<p>Hello <b>w</b>!</p>`) is
 folded into `#text` with a warning. Whitespace is XML's: space, tab, CR
 and LF. Text of nothing else is indentation on read, and is written as
 character references (`&#32;`) so it reads back as text; U+3000 and other
