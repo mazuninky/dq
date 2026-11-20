@@ -115,13 +115,14 @@ pub(super) fn is_str(v: &Val) -> bool {
 }
 
 /// Whether `container` may be indexed with `key`, as jq decides it: null
-/// takes any key; an object a string; an array anything but a string, a
+/// takes a string, a number or a slice (`null | .[true]` is jq's "Cannot
+/// index null with boolean"); an object a string; an array anything but a string, a
 /// boolean or null (a number, an array for `indices`, an object for a
 /// slice); a string only a slice (and a byte string, jaq's, a number); a
 /// number or a boolean nothing. What jaq refuses besides is left to it.
 pub(super) fn check_index(container: &Val, key: &Val) -> Result<(), Error<Val>> {
     let ok = match container {
-        Val::Null => true,
+        Val::Null => matches!(key, Val::TStr(_) | Val::BStr(_) | Val::Num(_) | Val::Obj(_)),
         Val::Obj(_) => is_str(key),
         Val::Arr(_) => !matches!(key, Val::TStr(_) | Val::BStr(_) | Val::Bool(_) | Val::Null),
         Val::TStr(_) => matches!(key, Val::Obj(_)),
@@ -145,16 +146,16 @@ pub(super) fn index_error(container: &Val, key: &Val) -> Error<Val> {
     ))
 }
 
-/// jq's `has`: an object has string keys, an array number keys in
-/// `0 <= k < length` (a fraction included, NaN not), null has nothing;
-/// any other pairing is an error.
+/// jq's `has`: an object has string keys, an array the number keys that
+/// truncate toward zero into `0 <= k < length` (`-0.5` and `0.9` name item
+/// 0, NaN nothing), null has nothing; any other pairing is an error.
 fn has(v: &Val, k: &Val) -> Result<bool, Error<Val>> {
     match (v, k) {
         (Val::Null, _) => Ok(false),
         (Val::Obj(map), _) if is_str(k) => Ok(map.contains_key(k)),
         (Val::Arr(items), Val::Num(_)) => {
-            let f = k.as_f64().unwrap_or(f64::NAN);
-            Ok(f >= 0.0 && f < items.len() as f64)
+            let i = k.as_f64().unwrap_or(f64::NAN).trunc();
+            Ok(i >= 0.0 && i < items.len() as f64)
         }
         _ => Err(Error::str(format_args!(
             "Cannot check whether {} has a {} key",

@@ -65,15 +65,21 @@ An index that is a float with an integral value is the integer, as in jq:
 1001 items, `setpath([2.0]; 1)` and `delpaths([[1.0]])` take it too.
 
 A read takes it too: `.[2.0]` on `[1,2,3]` is `3`, `del(.[1.0])` gives
-`[1,3]`, and `.[1e300]` on an array or null is `null`, as in jq. Only for an
-array or null is an index past the integer range taken as the largest
-integer; into anything else it is an error that quotes the index as written
-(see Object keys).
+`[1,3]`. A read truncates any other number toward zero, as jq 1.8 does:
+`.[1.7]` and `.[-1.5]` on `[1,2]` are `2`, `.[-0.5]` is `1`, `getpath([-1.5])`
+is `2`; and one no position holds — NaN, or past the integer range either way
+(`.[1e300]`, `.[-1e300]`, `getpath([1e300])`, `getpath([1e300, 2])`) — reads
+`null` from an array or null, as in jq. `has` truncates the same way: on `[3]`,
+`has(-0.5)` and `has(0.9)` are `true`, `has(-1)` is `false`. Into anything
+else such an index is an error that quotes the index as written (see Object
+keys).
 
 Left as jaq has it: a slice of null on the path (`.a[1:2] = [1]` on `{}`,
-jq gives `{"a":[1]}`) and a fractional index fail (jq truncates: `.[1.5] = 1`
-gives `[null,1]`, `.[1.5]` on `[1,2,3]` gives `2`); `.a.b |= empty` on `{}`
-gives `{"a":{}}` where jq gives `{}`.
+jq gives `{"a":[1]}`) and a fractional index in an assignment fail (jq
+truncates: `.[1.5] = 1` gives `[null,1]`); `path(.[1.5])` is `[1]` and
+`path(.[-1e300])` is `[9223372036854775807]`, where jq keeps the index as
+written (`[1.5]`, `[-1E+300]`); `.a.b |= empty` on `{}` gives `{"a":{}}`
+where jq gives `{}`.
 
 ## Object keys
 
@@ -84,12 +90,14 @@ these is a jq runtime error (exit 1), with jq's message:
 |---|---|---|
 | `.[1]`, `.[1] = 1`, `.[1] \|= 1`, `path(.[1])`, `getpath([1])`, `setpath([1]; 1)`, `del(.[1])`, `pick(.[1])` | `{}` | `Cannot index object with number (1)` |
 | `.[null]`, `.[true]`, `.[[1]]` | `{}` | `Cannot index object with null (null)` (`boolean`, `array`) |
+| `.[null]`, `.[true]`, `.[[1]]`, `getpath([true])`, `.[true] = 1` | `null` | `Cannot index null with null (null)` (`boolean`, `array`) |
 | `delpaths([[1]])` | `{}` | `Cannot delete number field of object` |
 | `has(1)`, `1 \| in({})` | `{}` | `Cannot check whether object has a number key` |
 | `{(1): 2}`, `1 as $x \| {$x: 2}` | any | `Cannot use number (1) as object key` |
 | `from_entries` | `[{"key":1,"value":2}]` | `Cannot use number (1) as object key` |
 
-Before, jaq read `null` there, and an assignment wrote the key as a string:
+Null takes a string, a number or a slice as key, and nothing else. Before,
+jaq read `null` there, and an assignment wrote the key as a string:
 `.[1] = 1` on `{}` gave `{"1":1}`, and `.[1e300] = 1` the key
 `9223372036854775807`. `.[1]?` on an object gives nothing, and
 `.[1]? = 1` leaves the object as it is, as in jq.

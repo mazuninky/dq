@@ -52,7 +52,7 @@ use super::keys;
 /// 1.8 takes.
 pub(super) const DEFS: &str = r#"
 def _dq_vivify(f): _dq_ensure([path(f)]);
-def getpath($path): reduce $path[] as $p (.; _dq_objkey($p) | .[$p]);
+def getpath($path): reduce $path[] as $p (.; _dq_objkey($p) | .[$p | _dq_rindex]);
 def setpath($p; $x):
   _dq_ensure([$p])
   | ($p | map(_dq_index)) as $p
@@ -92,10 +92,12 @@ pub(super) fn funs() -> impl Iterator<Item = Fun<D>> {
         box_once(delpaths(v, &paths))
     };
     let index: jaq_core::RunPtr<D> = |cv| box_once(Ok(integral(cv.1)));
+    let read_index: jaq_core::RunPtr<D> = |cv| box_once(Ok(read_index(cv.1)));
     [
         run::<D>(("_dq_ensure", v(1), ensure)),
         run::<D>(("_dq_delpaths", v(1), delpaths)),
         run::<D>(("_dq_index", v(0), index)),
+        run::<D>(("_dq_rindex", v(0), read_index)),
     ]
     .into_iter()
 }
@@ -246,6 +248,29 @@ fn integral(v: Val) -> Val {
         }
         Some(f) if f.is_finite() && f.fract() == 0.0 && f > 0.0 => Val::Num(Num::Int(isize::MAX)),
         _ => v,
+    }
+}
+
+/// `v` as an index that reads, outside an assignment, what jq reads: a
+/// number truncated toward zero (`1.7` is `1`, `-1.5` is `-1`), one no
+/// position holds — NaN, infinite, past `isize` either way (`-1e300`) —
+/// as `isize::MAX`, which reads nothing, as jq's `null`. jaq refuses a
+/// fractional index, and a float past `isize`. Anything else is left as
+/// it is: an object refuses a number before this (`_dq_objkey`), and null
+/// reads nothing at any index.
+fn read_index(v: Val) -> Val {
+    if !matches!(v, Val::Num(Num::Float(_) | Num::Dec(_))) {
+        return v;
+    }
+    let Some(f) = v.as_f64() else {
+        return v;
+    };
+    let t = f.trunc();
+    // `isize::MAX as f64` rounds up to 2^63, hence `<`; NaN fails both.
+    if t >= isize::MIN as f64 && t < isize::MAX as f64 {
+        Val::Num(Num::Int(t as isize))
+    } else {
+        Val::Num(Num::Int(isize::MAX))
     }
 }
 
@@ -789,10 +814,16 @@ impl Printer {
             self.out.push_str(") | ");
         }
         // An integral float indexes an array as the integer it is, read or
-        // assigned, as in jq; the check above saw the key as written.
+        // assigned, as in jq; a read truncates any other number and reads
+        // nothing past `isize` ([`read_index`]). The check above saw the
+        // key as written.
         self.out.push_str(".[(");
         self.out.push_str(&key);
-        self.out.push_str(" | _dq_index)");
+        self.out.push_str(if self.lhs {
+            " | _dq_index)"
+        } else {
+            " | _dq_rindex)"
+        });
         self.out.push(']');
         if matches!(opt, Opt::Optional) {
             self.out.push('?');
@@ -1311,6 +1342,62 @@ mod tests {
     }
 
     #[test]
+    fn number_indices_read_as_jq_reads_them() {
+        // Each expectation is what jq 1.8.2 prints for the same program:
+        // a number key is truncated toward zero, one no array position
+        // holds (NaN, past isize either way) reads nothing.
+        for (filter, input, want) in [
+            (
+                "[has(-0.5), has(-1), has(0.9), has(1e300), has(-1e300)]",
+                "[3]",
+                "[true,false,true,false,false]",
+            ),
+            (".[-1e300]", "[1,2]", "null"),
+            ("getpath([1e300])", "[1,2]", "null"),
+            ("getpath([-1e300])", "[1,2]", "null"),
+            ("getpath([1e300, 2])", "[1,2]", "null"),
+            ("[.[-1e300]?]", "[1,2]", "[null]"),
+            (".[nan]", "[1,2]", "null"),
+            (".[1.7]", "[1,2]", "2"),
+            (".[-1.5]", "[1,2]", "2"),
+            (".[-0.5]", "[1,2]", "1"),
+            ("getpath([-1.5])", "[1,2]", "2"),
+            ("del(.[-1e300])", "[1,2]", "[1,2]"),
+            (".[1e300]", "[1,2]", "null"),
+        ] {
+            assert_eq!(one(filter, input), want, "{filter} on {input}");
+        }
+    }
+
+    #[test]
+    fn null_takes_a_string_a_number_or_a_slice_as_key() {
+        // jq 1.8.2: `null | .[true]` is "Cannot index null with boolean
+        // (true)", where jaq gave null.
+        for (filter, want) in [
+            (".[true]", "Cannot index null with boolean (true)"),
+            (".[null]", "Cannot index null with null (null)"),
+            (".[[1]]", "Cannot index null with array ([1])"),
+            ("getpath([true])", "Cannot index null with boolean (true)"),
+            (".[true] = 1", "Cannot index null with boolean (true)"),
+        ] {
+            let err = run(filter, "null").expect_err(filter);
+            assert!(err.contains(want), "{filter}: {err}");
+        }
+        for (filter, want) in [
+            ("[.[true]?]", "[]"),
+            (".[1]", "null"),
+            (r#".["a"]"#, "null"),
+            (r#".[{"start": 1}]"#, "null"),
+            (
+                "try .[true] catch .",
+                r#""Cannot index null with boolean (true)""#,
+            ),
+        ] {
+            assert_eq!(one(filter, "null"), want, "{filter}");
+        }
+    }
+
+    #[test]
     fn a_fractional_index_stays_refused() {
         // jq truncates (`.[1.5] = 1` is `[null,1]`); jaq refuses it.
         for (filter, input) in [(".[1.5] = 1", "null"), (".[1.5] = 9", "[1,2,3]")] {
@@ -1422,7 +1509,7 @@ mod tests {
         assert_eq!(rewrite(r#".["a"]"#), None);
         assert_eq!(
             rewrite(".[0]").as_deref(),
-            Some("((.) | _dq_objkey(0) | .[(0 | _dq_index)])")
+            Some("((.) | _dq_objkey(0) | .[(0 | _dq_rindex)])")
         );
         // The key is computed once, from the input the indexed term sees;
         // the last index binds outermost, as jq evaluates it.
@@ -1430,7 +1517,7 @@ mod tests {
             rewrite(".a[.k][1]").as_deref(),
             Some(
                 "((((.[(\"k\")]) as $__dq_key_0 | (.[(\"a\")]) | _dq_objkey($__dq_key_0) \
-                 | .[($__dq_key_0 | _dq_index)])) | _dq_objkey(1) | .[(1 | _dq_index)])"
+                 | .[($__dq_key_0 | _dq_rindex)])) | _dq_objkey(1) | .[(1 | _dq_rindex)])"
             )
         );
         // A variable the program holds is not captured.
@@ -1438,7 +1525,7 @@ mod tests {
             rewrite(".[.k] as $__dq_key | $__dq_key").as_deref(),
             Some(
                 "(((.[(\"k\")]) as $__dq_key1_0 | (.) | _dq_objkey($__dq_key1_0) \
-                 | .[($__dq_key1_0 | _dq_index)])) as $__dq_key | ($__dq_key)"
+                 | .[($__dq_key1_0 | _dq_rindex)])) as $__dq_key | ($__dq_key)"
             )
         );
         assert_eq!(
