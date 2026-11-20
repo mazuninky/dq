@@ -10,6 +10,8 @@
 //! - [`RuleSet::from_std`] — `@std/<name>` namespace lookup (M8 stub; the
 //!   real `dq-lint` wiring lands in §4.4 of `add-exec-engine/tasks.md`).
 
+use std::collections::HashMap;
+
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::Deserialize;
 use serde_norway::Value as YamlValue;
@@ -259,8 +261,9 @@ struct Literals<'a> {
     /// The rule file as the span parse reads it.
     doc: &'a dq_core::Document,
     /// Each YAML alias of the rule file and the anchored node it repeats,
-    /// as canonical pointers ([`dq_core::Document::yaml_aliases`]).
-    aliases: Vec<(String, String)>,
+    /// as canonical pointers ([`dq_core::Document::yaml_aliases`]), indexed
+    /// by the alias so a lookup walks the ancestors of a place.
+    aliases: HashMap<String, String>,
 }
 
 impl<'a> Literals<'a> {
@@ -293,15 +296,28 @@ impl<'a> Literals<'a> {
         // is at or above a place; each step moves into an anchored node
         // written before the alias, so the steps end. The bound guards it.
         for _ in 0..=self.aliases.len() {
-            let Some(written) = self.aliases.iter().find_map(|(alias, anchored)| {
-                let rest = place.strip_prefix(alias.as_str())?;
-                (rest.is_empty() || rest.starts_with('/')).then(|| format!("{anchored}{rest}"))
-            }) else {
+            let Some(written) = self.alias_at_or_above(&place) else {
                 break;
             };
             place = written;
         }
         dq_core::Pointer::parse(&place).ok()
+    }
+
+    /// `place` with its alias (or the prefix of it naming one) replaced by
+    /// the alias's anchored node, if an alias sits at or above `place`. Walks
+    /// the ancestors of `place` (`/a/b/c`, `/a/b`, `/a`, ``) against the
+    /// index, never every alias. A canonical pointer escapes `/` inside a
+    /// key, so each `/` starts a segment.
+    fn alias_at_or_above(&self, place: &str) -> Option<String> {
+        let mut end = place.len();
+        loop {
+            let prefix = &place[..end];
+            if let Some(anchored) = self.aliases.get(prefix) {
+                return Some(format!("{anchored}{}", &place[end..]));
+            }
+            end = prefix.rfind('/')?;
+        }
     }
 
     /// `json`, a schema read from the rule file at `at`, with every number
@@ -581,6 +597,31 @@ mod tests {
         assert_eq!(
             at("/properties/z/minimum"),
             (Some("2e+1".to_owned()), Some("2E1"))
+        );
+    }
+
+    #[test]
+    fn from_str_reads_limits_behind_many_aliases_and_a_slash_in_a_key() {
+        // Each alias is found by walking the ancestors of the place, so a
+        // key holding `/` (escaped `~1` in a pointer) and a deep place
+        // under an alias still resolve to the anchored node's text.
+        let mut rule = String::from(
+            "id: n.many\ndescription: x\nseverity: error\nmatch: { format: yaml }\n\
+             check:\n  schema:\n    $defs:\n      lim: &lim { maximum: 1E2, items: { minimum: 5E0 } }\n    \
+             properties:\n      \"a/b\": *lim\n",
+        );
+        for n in 0..300 {
+            rule.push_str(&format!("      p{n}: *lim\n"));
+        }
+        let set = RuleSet::from_str(&rule, RuleSource::Inline).expect("parse rule");
+        let Check::Schema { notes, .. } = &set.rules[0].check else {
+            panic!("expected a schema check: {:?}", set.rules[0].check);
+        };
+        assert_eq!(notes.spelling_at("/properties/a~1b/maximum"), Some("1E2"));
+        assert_eq!(notes.spelling_at("/properties/p299/maximum"), Some("1E2"));
+        assert_eq!(
+            notes.spelling_at("/properties/p0/items/minimum"),
+            Some("5E0")
         );
     }
 
