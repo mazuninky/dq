@@ -23,6 +23,7 @@ use crate::cli::Cli;
 use crate::commands::io_helpers::every_file_lacks;
 use crate::error::{BulkPartialFailure, CheckPending, DocOutOfRange};
 use crate::glob::{self, GlobError};
+use crate::output::terminal_text;
 
 /// Per-file outcome reported by an [`FileOp`] implementation.
 #[derive(Debug)]
@@ -225,7 +226,7 @@ pub fn run_per_file(
                     }
                     if let Some(d) = diff {
                         if is_bulk {
-                            writeln!(buffer, "=== {path} ===")?;
+                            writeln!(buffer, "=== {} ===", terminal_text(path.as_str()))?;
                         }
                         buffer.write_all(d.as_bytes())?;
                     }
@@ -237,7 +238,7 @@ pub fn run_per_file(
                     // per file; single-file mode matches M2 byte-for-byte
                     // (no marker, no summary).
                     if is_bulk {
-                        writeln!(buffer, "=== {path} ===")?;
+                        writeln!(buffer, "=== {} ===", terminal_text(path.as_str()))?;
                     }
                     buffer.write_all(&output_bytes)?;
                     if unchanged {
@@ -283,7 +284,7 @@ pub fn run_per_file(
     // `--check` short-circuits before any summary.
     if cli.check {
         for p in &would_modify {
-            writeln!(out, "would modify: {p}")?;
+            writeln!(out, "would modify: {}", terminal_text(p.as_str()))?;
         }
         let count = would_modify.len();
         if count > 0 {
@@ -304,7 +305,10 @@ pub fn run_per_file(
             failed.len(),
         )?;
         for (path, err) in &failed {
-            writeln!(out, "  - {path}: {err:#}")?;
+            // One line per file: the path and the error chain, a parse
+            // error's snippet included, through `terminal_text`.
+            let entry = format!("{path}: {err:#}");
+            writeln!(out, "  - {}", terminal_text(&entry))?;
         }
     }
 

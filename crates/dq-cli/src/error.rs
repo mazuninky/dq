@@ -73,8 +73,11 @@ impl InvalidInput {
 }
 
 impl fmt::Display for InvalidInput {
+    /// The message on one line ([`dq_core::one_line`]): it quotes paths,
+    /// globs and names as the user gave them, and has no line break of its
+    /// own.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&dq_core::one_line(&self.0))
     }
 }
 

@@ -240,7 +240,18 @@ the file holds — never reaches the terminal with a raw control or direction
 character; the message keeps its own line breaks. A line break inside the
 pointer, the key, the path or the file name prints as `\x0a` (a carriage
 return as `\x0d`), so `dq get x.json $'/a\nY'` reports `path '/a\x0aY' not
-found` on one line rather than a line `Y' …` of its own. A path error names the
+found` on one line rather than a line `Y' …` of its own. The same holds for
+a key, a section, an element or a label a writer's refusal quotes from the
+file (`csv format error: row 0 key 'k\x0az': …`), a rule id or path in a
+rule's error, and for every other line dq prints outside a reporter: the
+bulk `=== <path> ===`, `would modify: <path>` and `  - <path>: <error>`
+lines, the `--- a/<path>` / `+++ b/<path>` header of `--diff`, the fields of
+a log line on stderr, the `test` runner's fixture paths, case names and
+diagnostics (console and TAP), and `explain`'s rule id, description and
+references. Each prints control characters as `\xNN` and the direction
+controls as `\uNNNN`, as `console` does. A parse error's snippet keeps its
+own line breaks, and the lines of a `--diff` are the file's text, as they
+are. A path error names the
 pointer, the deepest prefix that exists and up to three close sibling keys:
 
 ```

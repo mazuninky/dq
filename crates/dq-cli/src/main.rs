@@ -45,6 +45,7 @@ fn init_tracing(verbose: u8, quiet: bool, ansi: bool) {
         .with_writer(std::io::stderr)
         .with_ansi(ansi)
         .with_target(false)
+        .fmt_fields(dq::output::log_fields())
         .try_init();
 }
 

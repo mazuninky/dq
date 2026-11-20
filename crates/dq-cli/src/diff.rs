@@ -12,6 +12,8 @@
 
 use similar::TextDiff;
 
+use crate::output::terminal_text;
+
 // ANSI escape codes for colored output. `git diff` uses red on removals,
 // green on additions, and cyan on hunk headers; we mirror that to keep the
 // output familiar.
@@ -71,10 +73,13 @@ pub fn render_unified_files(
     // similar's line splitter normalises away" (e.g. trailing-newline-only
     // delta). Treat that as "no displayable diff" rather than synthesizing a
     // header for an empty body.
+    // The labels are file names: a line break or a control character in
+    // one prints escaped, so the header stays one line each. The lines
+    // below are the files' text, the diff itself, and stay as they are.
     let raw = diff
         .unified_diff()
         .context_radius(3)
-        .header(header_a, header_b)
+        .header(&terminal_text(header_a), &terminal_text(header_b))
         .to_string();
 
     if raw.is_empty() {

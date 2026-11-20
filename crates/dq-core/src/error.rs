@@ -109,7 +109,7 @@ pub enum Error {
     },
 
     /// A format-specific limitation (e.g. JSONL writer asked to emit multi-doc).
-    #[error("{format} format error: {message}")]
+    #[error("{format} format error: {}", one_line(message))]
     Format {
         /// Which format produced the error.
         format: &'static str,
@@ -124,7 +124,7 @@ pub enum Error {
     /// Carries a human-readable reason so the CLI can surface a clear
     /// "this read-only document cannot be written" diagnostic without
     /// having to introspect parser state.
-    #[error("write operation unavailable: {reason}")]
+    #[error("write operation unavailable: {}", one_line(reason))]
     WriteUnavailable {
         /// Why the write could not proceed.
         reason: String,
@@ -135,7 +135,7 @@ pub enum Error {
     /// node — deleting a YAML anchor an alias elsewhere refers to, or a
     /// textual edit whose result does not read back as the edited tree.
     /// The document is left as it was.
-    #[error("cannot {action} '{}': {reason}", one_line(pointer))]
+    #[error("cannot {action} '{}': {}", one_line(pointer), one_line(reason))]
     EditRejected {
         /// The operation: `set` or `delete`.
         action: &'static str,
@@ -152,7 +152,10 @@ pub enum Error {
     /// match. The CLI maps this to `PARSE_ERROR` (exit 3) and surfaces both
     /// escape-hatch flags (`--allow-templates`, `--raw-template-strings`) in
     /// the diagnostic message.
-    #[error("file contains Go template syntax (line {line}): {snippet}\n  hint: {hint}")]
+    #[error(
+        "file contains Go template syntax (line {line}): {}\n  hint: {hint}",
+        one_line(snippet)
+    )]
     TemplatedFile {
         /// 1-based line of the first template marker.
         line: u32,

@@ -55,7 +55,7 @@ pub enum PluginError {
     /// The plugin exhausted its per-invocation fuel budget (≈ 100M units,
     /// ~1s of CPU). Surfaced as `wasmtime::Trap::Interrupt` and remapped
     /// here so the CLI can route to a stable exit code.
-    #[error("plugin rule {rule_id} exhausted fuel budget")]
+    #[error("plugin rule {rule} exhausted fuel budget", rule = dq_core::one_line(rule_id.as_ref()))]
     Exhausted {
         /// `rule-id` of the offending plugin invocation.
         rule_id: String,
@@ -63,7 +63,7 @@ pub enum PluginError {
 
     /// The plugin tried to allocate beyond the memory limit (64 MiB across
     /// all of its linear memories), enforced via `Store::limiter`.
-    #[error("plugin rule {rule_id} exceeded memory limit")]
+    #[error("plugin rule {rule} exceeded memory limit", rule = dq_core::one_line(rule_id.as_ref()))]
     Memory {
         /// `rule-id` of the offending plugin invocation.
         rule_id: String,
@@ -72,7 +72,7 @@ pub enum PluginError {
     /// The plugin imports an interface that the runtime does not provide
     /// (typically `wasi_snapshot_preview1`). Plugins are sandboxed: no
     /// filesystem, no network, no process control.
-    #[error("plugin imports disallowed interface {interface}")]
+    #[error("plugin imports disallowed interface {iface}", iface = dq_core::one_line(interface.as_ref()))]
     DisallowedImport {
         /// Name of the import the runtime refused to satisfy.
         interface: String,
@@ -82,7 +82,7 @@ pub enum PluginError {
     /// JSON Patch / [`dq_core::EditScript`]. The underlying
     /// `serde_json::Error` is chained via `#[source]` for callers that want
     /// the parser-level details.
-    #[error("plugin rule {rule_id} returned malformed fix payload")]
+    #[error("plugin rule {rule} returned malformed fix payload", rule = dq_core::one_line(rule_id.as_ref()))]
     MalformedFix {
         /// `rule-id` of the offending plugin invocation.
         rule_id: String,
@@ -96,7 +96,7 @@ pub enum PluginError {
     /// `Invoke` because the failure is attributable to the artifact (bad
     /// magic bytes, malformed component, etc.) rather than to a runtime
     /// trap.
-    #[error("failed to load plugin {path}: {message}")]
+    #[error("failed to load plugin {file}: {message}", file = dq_core::one_line(path.as_ref()))]
     Load {
         /// Path to the `.wasm` file that failed to load.
         path: Utf8PathBuf,
@@ -109,7 +109,7 @@ pub enum PluginError {
     /// generic runtime error inside the plugin module). Carries the
     /// rule-id under which the failure happened so the reporter can point
     /// the user at the offending plugin invocation.
-    #[error("plugin rule {rule_id} invocation failed: {message}")]
+    #[error("plugin rule {rule} invocation failed: {message}", rule = dq_core::one_line(rule_id.as_ref()))]
     Invoke {
         /// `rule-id` of the offending plugin invocation.
         rule_id: String,

@@ -17,6 +17,7 @@ pub mod toml;
 pub mod toon;
 pub mod yaml;
 
+use std::borrow::Cow;
 use std::io::IsTerminal;
 use std::io::Write;
 
@@ -29,6 +30,40 @@ pub use tap::TapReporter;
 pub use toml::TomlReporter;
 pub use toon::ToonReporter;
 pub use yaml::YamlReporter;
+
+/// `text` — a file name, a key, a rule id, a test case's name: what the
+/// user or a file put in a line dq prints outside a reporter (the bulk
+/// summary, a `--diff` header, the `test` runner, a log line) — on one
+/// line a terminal shows as it is: a line break and every other control
+/// character as `\xNN`, the direction controls and separators as
+/// `\uNNNN`, as the console reporter prints them
+/// ([`console::escape_control`]). It cannot start a line of its own, nor
+/// send the terminal a control sequence.
+#[must_use]
+pub fn terminal_text(text: &str) -> Cow<'_, str> {
+    console::escape_control(text)
+}
+
+/// The field formatter of the log lines `tracing` writes on stderr: each
+/// field as it prints, through [`terminal_text`] — a path, a key or a rule
+/// id a warning quotes cannot break the line or reach the terminal raw —
+/// the message alone, any other field as `name=value`, separated by a
+/// space, as `tracing_subscriber`'s default formatter writes them. The
+/// level's colour is the event formatter's, outside the fields, and stays.
+#[must_use]
+pub fn log_fields() -> impl for<'writer> tracing_subscriber::fmt::FormatFields<'writer> + 'static {
+    use tracing_subscriber::field::MakeExt;
+    tracing_subscriber::fmt::format::debug_fn(|writer, field, value| {
+        let text = format!("{value:?}");
+        let text = terminal_text(&text);
+        if field.name() == "message" {
+            write!(writer, "{text}")
+        } else {
+            write!(writer, "{field}={text}")
+        }
+    })
+    .delimited(" ")
+}
 
 /// Output format selectable via the global `-F/--format` flag.
 ///
