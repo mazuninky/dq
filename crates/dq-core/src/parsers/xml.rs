@@ -87,7 +87,8 @@
 //! declaration, a DOCTYPE, comments, PIs and white space before it and
 //! comments, PIs and white space after it (XML 1.0 §2.1): a second root,
 //! text, CDATA or a reference outside the root, a misplaced or second
-//! DOCTYPE, and an element the input leaves open are parse errors.
+//! DOCTYPE, and an element the input leaves open are parse errors. So are
+//! `]]>` in text (§2.4) and a raw `<` in an attribute value (§3.1).
 //!
 //! ## Encodings
 //!
@@ -421,7 +422,7 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                 if stack.is_empty() {
                     take_root(&mut root, &start, text, event_start)?;
                 }
-                check_attribute_references(text, &start, xml11)?;
+                check_attribute_values(text, &start, xml11)?;
                 let mut frame = build_start_frame(&start, text, event_start, xml11)?;
                 check_namespaces(&stack, &mut frame, xml11).map_err(|(message, attr)| {
                     let pos = name_offset(text, &start, event_start, attr.as_deref());
@@ -439,7 +440,7 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                 if stack.is_empty() {
                     take_root(&mut root, &start, text, event_start)?;
                 }
-                check_attribute_references(text, &start, xml11)?;
+                check_attribute_values(text, &start, xml11)?;
                 let mut frame = build_start_frame(&start, text, event_start, xml11)?;
                 check_namespaces(&stack, &mut frame, xml11).map_err(|(message, attr)| {
                     let pos = name_offset(text, &start, event_start, attr.as_deref());
@@ -511,6 +512,20 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                         ));
                     }
                     continue;
+                }
+                // `]]>` only ends a CDATA section (XML 1.0 §2.4). A
+                // reference cannot hold it, so it stands within one text.
+                let raw: &str = &t;
+                if let (Some(offset), Some(frame)) = (raw.find("]]>"), stack.last()) {
+                    return Err(parse_error_at(
+                        text,
+                        event_start + offset,
+                        format!(
+                            "the text of <{}> holds ']]>', which XML allows only to end a CDATA \
+                             section; write its '>' as '&gt;'",
+                            frame.tag
+                        ),
+                    ));
                 }
                 let s = decode_text(&t, xml11);
                 if let Some(frame) = stack.last_mut() {
@@ -1163,7 +1178,9 @@ fn reader_refusal(e: &quick_xml::Error, text: &str, at: usize) -> (usize, String
             SyntaxError::UnclosedSingleQuotedAttributeValue
             | SyntaxError::UnclosedDoubleQuotedAttributeValue => {
                 // quick-xml points at the tag; the value begins at the
-                // quote that is still open at the end of the input.
+                // quote that is still open at the end of the input. Its
+                // `ElementParser` toggles quotes from the same `<`, so one
+                // is found; should it not be, the tag stands in.
                 let mut open = None;
                 for (i, b) in text.get(at..).unwrap_or_default().bytes().enumerate() {
                     match open {
@@ -1172,7 +1189,7 @@ fn reader_refusal(e: &quick_xml::Error, text: &str, at: usize) -> (usize, String
                         _ => {}
                     }
                 }
-                let (quote, pos) = open.map_or((b'"', 0), |(quote, i)| (quote, at + i));
+                let (quote, pos) = open.map_or((b'"', at), |(quote, i)| (quote, at + i));
                 return (
                     pos,
                     format!(
@@ -1460,7 +1477,7 @@ fn normalize_line_ends(s: &str, xml11: bool) -> String {
 
 /// The value of `attr`, its references resolved and normalized as the
 /// version has it. `Err` only for a reference
-/// [`check_attribute_references`] lets through, which it should not.
+/// [`check_attribute_values`] lets through, which it should not.
 fn decode_attr(attr: &Attribute<'_>, xml11: bool) -> std::result::Result<String, ()> {
     // `unescape_value` was deprecated in quick-xml 0.38 in favour of
     // `normalized_value`, which does the same predefined-entity resolution
@@ -1547,15 +1564,29 @@ fn reference_refusal(name: &str, xml11: bool) -> Option<String> {
     })
 }
 
-/// Refuse a reference in an attribute value of `start` that
-/// [`reference_refusal`] refuses, or one with no closing `;`, at its `&`.
+/// Refuse, in an attribute value of `start`, a raw `<` (XML 1.0 §3.1
+/// `AttValue` takes it only as a reference), and a reference that
+/// [`reference_refusal`] refuses or one with no closing `;`, at its `&`.
 /// The reader borrows the value from `text`.
-fn check_attribute_references(text: &str, start: &BytesStart<'_>, xml11: bool) -> Result<()> {
+fn check_attribute_values(text: &str, start: &BytesStart<'_>, xml11: bool) -> Result<()> {
     let base = text.as_ptr() as usize;
     for attr in start.attributes().flatten() {
         let value: &str = &attr.value;
         let at = (value.as_ptr() as usize).saturating_sub(base);
-        for (index, _) in value.match_indices('&') {
+        for (index, markup) in value.match_indices(['&', '<']) {
+            if markup == "<" {
+                let name = start.name();
+                let tag: &str = name.as_ref();
+                let key: &str = attr.key.as_ref();
+                return Err(parse_error_at(
+                    text,
+                    at + index,
+                    format!(
+                        "the value of attribute '{key}' on <{tag}> holds '<', which XML allows \
+                         there only as '&lt;'"
+                    ),
+                ));
+            }
             let Some(end) = value[index..].find(';') else {
                 return Err(parse_error_at(
                     text,
@@ -3496,6 +3527,28 @@ mod tests {
         unencodable.note("caf\u{e9}", || "in <r>".to_owned());
         assert_eq!(unencodable.first, Some(('\u{e9}', "in <r>".to_owned())));
         assert!(ascii.encode("\u{e9}".into()).is_err());
+    }
+
+    #[test]
+    fn an_open_attribute_value_is_placed_at_its_quote_else_at_the_tag() {
+        use quick_xml::errors::SyntaxError;
+        let open = quick_xml::Error::Syntax(SyntaxError::UnclosedDoubleQuotedAttributeValue);
+        let text = "<r>\n<c a=\"x/>";
+        assert_eq!(
+            reader_refusal(&open, text, 4),
+            (
+                9,
+                "the attribute value has no closing quote (\")".to_owned()
+            )
+        );
+        // Past the quote, no open one is found: the tag's `<`, not byte 0.
+        assert_eq!(
+            reader_refusal(&open, text, 10),
+            (
+                10,
+                "the attribute value has no closing quote (\")".to_owned()
+            )
+        );
     }
 
     #[test]

@@ -2703,3 +2703,42 @@ fn only_comments_pis_and_white_space_stand_outside_the_root() {
         ],
     );
 }
+
+/// `]]>` in character data (XML 1.0 §2.4) and a raw `<` in an attribute
+/// value (§3.1 `AttValue`) are refused where they begin. Before, both read
+/// with exit 0. `]]>` stays legal in an attribute value, and `]]&gt;`,
+/// `]] >` and `&lt;` everywhere.
+#[test]
+fn cdata_end_in_text_and_a_raw_lt_in_a_value_are_refused() {
+    const CDATA_END: &str = "the text of <r> holds ']]>', which XML allows only to end a CDATA \
+                             section; write its '>' as '&gt;'";
+    assert_unreadable(&[
+        ("cdata_end.xml", b"<r>a]]>b</r>", 1, 5, CDATA_END),
+        ("cdata_end_line.xml", b"<r>\n  a]]]>b</r>", 2, 5, CDATA_END),
+        (
+            "lt.xml",
+            b"<r a=\"x<y\"/>",
+            1,
+            8,
+            "the value of attribute 'a' on <r> holds '<', which XML allows there only as '&lt;'",
+        ),
+        (
+            "lt_line.xml",
+            b"<r><c a='1' b='x\n<y'/></r>",
+            2,
+            1,
+            "the value of attribute 'b' on <c> holds '<', which XML allows there only as '&lt;'",
+        ),
+    ]);
+    let dir = dir_with(&[(
+        "ok.xml",
+        b"<r a=\"]]>\" b=\"&lt;\">]]&gt; ]] > <![CDATA[x]]></r>",
+    )]);
+    assert_cases(
+        &dir,
+        &[(
+            convert("ok.xml", "xml"),
+            ok("<r a=\"]]&gt;\" b=\"&lt;\">]]&gt; ]] &gt; <![CDATA[x]]></r>"),
+        )],
+    );
+}

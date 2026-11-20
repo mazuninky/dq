@@ -335,6 +335,9 @@ cannot read name their byte index instead:
   the root, inside it, or given twice is refused too. White space is
   space, tab, CR and LF, and in a `version="1.1"` document NEL and LS,
   which its end-of-line handling reads as LF;
+- `]]>` in text, which only ends a CDATA section (XML 1.0 §2.4; write
+  `]]&gt;`), and a raw `<` in an attribute value (§3.1; write `&lt;`).
+  `]]>` in an attribute value is well-formed and kept;
 - an XML declaration its grammar (XML 1.0 §2.8) rules out, at the
   pseudo-attribute or value at fault: `version` missing or not first,
   `standalone` before `encoding`, a pseudo-attribute given twice or one
