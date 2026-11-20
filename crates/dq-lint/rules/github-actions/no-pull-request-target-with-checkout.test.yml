@@ -568,3 +568,139 @@ tests:
                 repository: ${{ github.repository }}
     expected:
       violations: []
+  - name: repository named by the PR author fires
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                repository: ${{ github.event.pull_request.user.login }}/dq
+    expected:
+      violations:
+        - rule: github-actions.no-pull-request-target-with-checkout
+  - name: repository named by github.actor fires
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                repository: ${{ github.actor }}/${{ github.event.repository.name }}
+    expected:
+      violations:
+        - rule: github-actions.no-pull-request-target-with-checkout
+  - name: repository named by github.triggering_actor fires
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                repository: ${{ github.triggering_actor }}/dq
+    expected:
+      violations:
+        - rule: github-actions.no-pull-request-target-with-checkout
+  - name: github.actor in ref passes
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.actor }}
+    expected:
+      violations: []
+  - name: mixed-case uses owner and repo fires
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: Actions/Checkout@v4
+              with:
+                ref: ${{ github.head_ref }}
+    expected:
+      violations:
+        - rule: github-actions.no-pull-request-target-with-checkout
+  - name: format() with a PR number and several arguments fires
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ format('refs/{0}/{1}/merge', 'pull', github.event.number) }}
+    expected:
+      violations:
+        - rule: github-actions.no-pull-request-target-with-checkout
+  - name: format() with pull_request.number in a bracket access fires
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ format('x/{0}', github.event['pull_request']['number']) }}
+    expected:
+      violations:
+        - rule: github-actions.no-pull-request-target-with-checkout
+  - name: format() without a PR number passes
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ format('refs/heads/{0}', github.base_ref) }}
+    expected:
+      violations: []
+  - name: inputs.head.ref is no PR head and passes
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ inputs.head.ref }}
+    expected:
+      violations: []
+  - name: inputs.head.sha is no PR head and passes
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ inputs.head.sha }}
+    expected:
+      violations: []
