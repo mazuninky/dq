@@ -3,8 +3,6 @@
 //! (`Document::write_pending`) compares the tree written with the tree read
 //! back, both in this form, and refuses the edit where they differ.
 
-use indexmap::IndexMap;
-
 use super::{FormatTag, Layout, Value};
 
 /// `value` as the file `format`'s writer writes it (with `layout`) reads
@@ -12,8 +10,9 @@ use super::{FormatTag, Layout, Value};
 ///
 /// - INI, dotenv, CSV and TSV hold strings: a number, a boolean or a big
 ///   number reads back as its text, a null as the empty string. A CSV row
-///   lacking a column of another reads back with it empty; an INI section
-///   of no name and no keys reads back as no section.
+///   lacking a column of another, or of the header the file was read with,
+///   reads back with it empty; an INI section of no name and no keys reads
+///   back as no section.
 /// - XML: see [`crate::parsers::xml::read_back_form`].
 /// - HCL: a key read as blocks reads back as their bodies, a list of one as
 ///   the body alone, none as no key
@@ -32,7 +31,7 @@ pub(super) fn read_back_form(format: FormatTag, layout: &Layout, value: &Value) 
                 .collect(),
         ),
         (FormatTag::DotEnv, Value::Map(_)) => texts(value),
-        (FormatTag::Csv | FormatTag::Tsv, Value::Array(rows)) => csv_rows(rows),
+        (FormatTag::Csv | FormatTag::Tsv, Value::Array(rows)) => csv_rows(layout, rows),
         (FormatTag::Xml, _) => crate::parsers::xml::read_back_form(value),
         (FormatTag::Hcl, Value::Map(body)) => match layout {
             Layout::Hcl(layout) => crate::parsers::hcl::read_back_form(body, layout),
@@ -73,23 +72,17 @@ fn texts(map: &Value) -> Value {
     }
 }
 
-/// CSV rows as they read back: every row with every column any row has,
-/// a missing one empty, each cell its [`text`].
-fn csv_rows(rows: &[Value]) -> Value {
-    let mut columns: IndexMap<&str, ()> = IndexMap::new();
-    for row in rows {
-        if let Value::Map(cells) = row {
-            for key in cells.keys() {
-                columns.entry(key.as_str()).or_insert(());
-            }
-        }
-    }
+/// CSV rows as they read back: every row with every column the writer
+/// writes ([`crate::parsers::csv::columns`]), a missing one empty, each
+/// cell its [`text`].
+fn csv_rows(layout: &Layout, rows: &[Value]) -> Value {
+    let columns = crate::parsers::csv::columns(layout, rows);
     Value::Array(
         rows.iter()
             .map(|row| match row {
                 Value::Map(cells) => Value::Map(
                     columns
-                        .keys()
+                        .iter()
                         .map(|column| {
                             let cell = cells.get(*column).map_or_else(
                                 || Value::String(String::new()),

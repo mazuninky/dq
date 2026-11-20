@@ -206,12 +206,68 @@ fn a_csv_with_no_rows_left_keeps_its_header() {
     );
     // A file of its header alone is written back as it is.
     edits_to("t.csv", "n,a\n", &["fmt", "t.csv"], "n,a\n");
-    // A row added to a header alone follows its columns.
+    // A row added to a header alone gets every column of it. Was: `a\n1\n`,
+    // the column `n` gone.
     edits_to(
         "t.csv",
         "n,a\n",
         &["set", "t.csv", "/-", r#"{"a": "1"}"#],
-        "a\n1\n",
+        "n,a\n,1\n",
+    );
+    edits_to(
+        "t.tsv",
+        "n\ta\n",
+        &["set", "t.tsv", "/-", r#"{"a": "1", "c": 2}"#],
+        "n\ta\tc\n\t1\t2\n",
+    );
+}
+
+/// The header the file was read with keeps its columns and their order
+/// through a point edit; a new key is a new column after them, in the
+/// order first seen. A cell a point edit deletes is left empty, whether
+/// other rows hold its column or not.
+#[test]
+fn a_csv_point_edit_keeps_the_header_the_file_has() {
+    // Was: `b,a\n9,8\n3,4\n`, the header of the whole file reordered.
+    edits_to(
+        "t.csv",
+        "a,b\n1,2\n3,4\n",
+        &["set", "t.csv", "/0", r#"{"b": "9", "a": "8"}"#],
+        "a,b\n8,9\n3,4\n",
+    );
+    edits_to(
+        "t.csv",
+        "a,b\n1,2\n",
+        &["set", "t.csv", "/0", r#"{"c": "5", "b": "9"}"#],
+        "a,b,c\n,9,5\n",
+    );
+    // A deleted cell is empty, the column kept — as in a file of several
+    // rows, where another row holds it. Was: `a\n1\n`.
+    edits_to(
+        "t.csv",
+        "a,b\n1,2\n",
+        &["del", "t.csv", "/0/b"],
+        "a,b\n1,\n",
+    );
+    edits_to(
+        "t.csv",
+        "a,b\n1,2\n3,4\n",
+        &["del", "t.csv", "/0/b"],
+        "a,b\n1,\n3,4\n",
+    );
+    // A filter rebuilds the rows, which then decide the columns and their
+    // order: one no row holds goes.
+    edits_to(
+        "t.csv",
+        "a,b\n1,2\n3,4\n",
+        &["set", "t.csv", "--jq", "map(del(.a))"],
+        "b\n2\n4\n",
+    );
+    edits_to(
+        "t.csv",
+        "a,b\n1,2\n",
+        &["set", "t.csv", "--jq", "map({b, c: 1, a})"],
+        "b,c,a\n2,1,1\n",
     );
 }
 

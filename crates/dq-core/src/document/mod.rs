@@ -1057,13 +1057,15 @@ impl Document {
     /// that was a block stays a block, and a value that was an expression
     /// (`var.ami`, `"${var.p}-web"`, `length(var.l)`) and still reads the
     /// same is written as that expression's source — at its place, or
-    /// wherever the transform moved it. Any other document is returned as
-    /// it is.
+    /// wherever the transform moved it. In CSV and TSV: the header, for a
+    /// tree with no rows left; the rows decide the columns of any other.
+    /// Any other document is returned as it is.
     #[must_use]
     pub fn with_layout_of(mut self, source: &Document) -> Self {
         if self.format == source.format {
             self.layout = match &source.layout {
                 Layout::Hcl(layout) => Layout::Hcl(layout.moved()),
+                Layout::Csv(layout) => Layout::Csv(layout.rebuilt()),
                 other => other.clone(),
             };
         }

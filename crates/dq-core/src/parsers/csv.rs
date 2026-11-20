@@ -69,10 +69,48 @@ impl Format for Tsv {
 
 /// What the CSV / TSV reader saw of a file beyond its value tree
 /// ([`Layout::Csv`]): its header, which the writer writes for a document
-/// with no rows left — a header alone has nothing else to hold it.
+/// with no rows left — a header alone has nothing else to hold it — and,
+/// for the tree the reader built and the point edits made to it, first,
+/// every column of it whether a row still holds it or not.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct CsvLayout {
     header: Vec<String>,
+    /// Whether the header's columns come first and stay: false once a
+    /// filter rebuilt the tree ([`CsvLayout::rebuilt`]), whose rows then
+    /// decide the columns and their order.
+    kept: bool,
+}
+
+impl CsvLayout {
+    /// This layout for a tree a filter rebuilt (`set --jq`, `fix.jq`):
+    /// the header only for a tree with no rows left.
+    pub(crate) fn rebuilt(&self) -> Self {
+        Self {
+            header: self.header.clone(),
+            kept: false,
+        }
+    }
+}
+
+/// The columns to write `rows` with: the header the file was read with,
+/// its columns in its order, when `layout` keeps it; then every other key
+/// of every row, in the order first seen. The read-back check reads a row
+/// back with every one of them, a missing one empty.
+pub(crate) fn columns<'a>(layout: &'a Layout, rows: &'a [Value]) -> Vec<&'a str> {
+    let mut columns: IndexMap<&str, ()> = IndexMap::new();
+    if let Layout::Csv(CsvLayout { header, kept: true }) = layout {
+        for column in header {
+            columns.entry(column.as_str()).or_insert(());
+        }
+    }
+    for row in rows {
+        if let Value::Map(cells) = row {
+            for key in cells.keys() {
+                columns.entry(key.as_str()).or_insert(());
+            }
+        }
+    }
+    columns.into_keys().collect()
 }
 
 /// Parse `bytes` as delimited records into `Value::Array<Value::Map>`, and
@@ -131,7 +169,10 @@ fn parse_with_delimiter(
     }
     Ok((
         Value::Array(rows),
-        Layout::Csv(CsvLayout { header: headers }),
+        Layout::Csv(CsvLayout {
+            header: headers,
+            kept: true,
+        }),
     ))
 }
 
@@ -157,7 +198,7 @@ fn write_with_delimiter(
 
     // No rows: the header the file was read with, if any, alone.
     if items.is_empty() {
-        if let Layout::Csv(CsvLayout { header }) = doc.layout()
+        if let Layout::Csv(CsvLayout { header, .. }) = doc.layout()
             && !header.is_empty()
         {
             wtr.write_record(header)
@@ -169,9 +210,9 @@ fn write_with_delimiter(
         });
     }
 
-    // The header is every key of every row, in the order first seen; a
-    // row without one of them has an empty cell there.
-    let mut columns: IndexMap<&str, ()> = IndexMap::new();
+    // The header is the file's, then every other key of every row, in the
+    // order first seen ([`columns`]); a row without one of them has an
+    // empty cell there.
     let mut rows = Vec::with_capacity(items.len());
     for (idx, row) in items.iter().enumerate() {
         let Value::Map(map) = row else {
@@ -183,12 +224,9 @@ fn write_with_delimiter(
                 ),
             });
         };
-        for key in map.keys() {
-            columns.entry(key.as_str()).or_insert(());
-        }
         rows.push(map);
     }
-    let headers: Vec<&str> = columns.into_keys().collect();
+    let headers = columns(doc.layout(), items);
     wtr.write_record(&headers)
         .map_err(|e| map_delim_write_err(format_name, e))?;
 

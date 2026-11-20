@@ -308,10 +308,17 @@ by the header; every cell is a string (no type inference). TSV is the same
 with a tab delimiter. Writing needs an array of maps; the header is the union
 of the keys of every row in first-seen order, and a row without one of them
 has an empty cell there (`dq set t.csv /- '{"a": "3", "c": "4"}'` on `a,b` /
-`1,2` writes `a,b,c` / `1,2,` / `3,,4`). With no rows left, the header the
-file was read with is written alone (`dq del t.csv /0` on `a,b` / `1,2`
-writes `a,b`), so a file of its header alone round-trips; a tree from
-another format with no rows writes an empty file. Any other shape is an
+`1,2` writes `a,b,c` / `1,2,` / `3,,4`). A point edit (`set`, `del`,
+`patch`, `merge`, `fix.ops`) keeps the header the file was read with: its
+columns come first, in its order, whether a row still holds them or not,
+and a new key is a new column after them. So `set /0 '{"b": "9", "a": "8"}'`
+leaves the header `a,b`, `del /0/b` leaves the cell empty and the column in
+place, and `set /- '{"a": "1"}'` on a file of the header `a,b` alone writes
+`a,b` / `,1`. A filter (`set --jq`, `fix.jq`) rebuilds the rows, and they
+decide the columns: `map(del(.a))` drops the column `a`. With no rows left,
+the header the file was read with is written alone (`dq del t.csv /0` on
+`a,b` / `1,2` writes `a,b`), so a file of its header alone round-trips; a
+tree from another format with no rows writes an empty file. Any other shape is an
 error naming the offending type, a nested value one naming its row.
 
 ### Markdown
