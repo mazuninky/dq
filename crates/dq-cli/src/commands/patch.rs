@@ -6,7 +6,7 @@
 //!
 //! Pipeline (per file, executed inside [`PatchFileOp::apply`]):
 //!
-//! 1. Resolve the format (extension or `-F`).
+//! 1. Resolve the format (extension or `--input-format`).
 //! 2. Read the original bytes.
 //! 3. Run the template guard (mirrors `commands::set`).
 //! 4. Parse to a write-aware [`Document`].
@@ -75,6 +75,7 @@ pub fn run(
     };
 
     let files = bulk::expand_glob(&args.file)?;
+    super::io_helpers::check_write_targets(cli, "patch", &files, input_format)?;
     bulk::run_per_file(files, &op, cli, out)
 }
 

@@ -97,7 +97,7 @@ pub fn run(
                  convert to stdout instead",
             ));
         }
-        run_in_place(cli, args, output_format, use_color, opts, out)
+        run_in_place(cli, args, input_format, output_format, use_color, opts, out)
     } else {
         // Read-only mode: existing M2 contract. We do NOT call the generic
         // `Cli::ensure_no_write_flags` because `--keep-source` is not a
@@ -188,16 +188,16 @@ fn select_for_convert(
 /// M3 §8 in-place mode: read source, render to target format, atomic-write
 /// to a sibling file with the swapped extension, remove source on success.
 ///
-/// Validates the `-i`-specific flag combination directly (the global
-/// [`Cli::ensure_write_flags_consistent`] would reject `-i + -F`, which is
-/// exactly what `convert -i` requires; the cli-shell spec calls out
-/// `convert` as the one command that accepts that combination). We
-/// hand-check the subset of write-flag rules that DO apply: `-i` ⊥ `--diff`,
+/// Validates the `-i`-specific flag combination directly: `convert -i`
+/// writes a sibling in the `-F` format rather than the file itself, so it
+/// is the one write command whose `-F` need not match the file's format
+/// (the other write commands refuse a differing one). We hand-check the subset of write-flag rules that DO apply: `-i` ⊥ `--diff`,
 /// `-i` ⊥ `--check` (TODO M4+: `--check` for convert means "would this
 /// target be created/changed?"), and `--backup` requires `-i`.
 fn run_in_place(
     cli: &Cli,
     args: &ConvertArgs,
+    input_format: Option<&str>,
     output_format: OutputFormat,
     use_color: bool,
     opts: &WriteOptions,
@@ -205,12 +205,9 @@ fn run_in_place(
 ) -> anyhow::Result<()> {
     // -- 1. Validate the convert-specific write-flag subset --------------
     //
-    // Do NOT call `cli.ensure_write_flags_consistent()`: that helper
-    // rejects `-i + -F`, which is the entire point of `convert -i`. The
-    // cli-shell spec (`crates/dq-cli/specs/cli-shell/spec.md` in the
-    // `add-bulk-and-ci` change) explicitly notes "convert is special: it
-    // accepts `-i` (when paired with `-F`) but rejects the other write
-    // modes".
+    // Not `cli.ensure_write_flags_consistent()`: `convert -i` supports a
+    // narrower set of write modes, checked one by one below, with
+    // messages that name `convert`.
     if cli.diff {
         return Err(anyhow::Error::new(InvalidInput::new(
             "-i/--in-place and --diff are mutually exclusive (convert -i has no diff mode)",
@@ -258,6 +255,12 @@ fn run_in_place(
     // -- 3. Glob-expand the input pattern (single file fast path is built
     //       into `expand_glob`).
     let files = bulk::expand_glob(&args.file)?;
+    if files.iter().any(|f| f == "-") {
+        return Err(crate::cli::usage_error(
+            clap::error::ErrorKind::ArgumentConflict,
+            "-i/--in-place needs a file on disk; `dq convert -` reads stdin, which has none",
+        ));
+    }
 
     // -- 4. Loop ---------------------------------------------------------
     //
@@ -282,7 +285,7 @@ fn run_in_place(
         }
 
         // Parse + render.
-        let (input_fmt, doc) = load_document_with_path(source_path, None)?;
+        let (input_fmt, doc) = load_document_with_path(source_path, input_format)?;
         maybe_warn_lossy(input_fmt.name(), output_format);
         let output_bytes = render_to_format(&doc, output_format, use_color, opts)?;
 

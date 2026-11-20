@@ -19,7 +19,7 @@
 //!
 //! Per-file work executed inside [`SetFileOp::apply`]:
 //!
-//! 1. Resolve the format (extension or `-F`).
+//! 1. Resolve the format (extension or `--input-format`).
 //! 2. Read the original bytes.
 //! 3. Run the Helm/Argo/GitHub Actions template guard
 //!    ([`dq_core::template_guard`]) according to the global
@@ -159,6 +159,7 @@ pub fn run(
         value: &value,
         no_create: args.no_create,
     };
+    super::io_helpers::check_write_targets(cli, "set", &files, input_format)?;
     bulk::run_per_file(files, &op, cli, out)
 }
 
@@ -474,6 +475,7 @@ fn run_jq_transform(
         use_color,
         engine: Arc::new(engine),
     };
+    super::io_helpers::check_write_targets(cli, "set", &files, input_format)?;
     bulk::run_per_file(files, &op, cli, out)
 }
 

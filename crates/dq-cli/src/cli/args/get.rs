@@ -6,7 +6,7 @@ use clap::Args;
 /// Arguments for `dq get`.
 #[derive(Debug, Args)]
 pub struct GetArgs {
-    /// File to read (format detected by extension or `-F`).
+    /// File to read (format detected by extension or `--input-format`).
     #[arg(value_parser = clap::value_parser!(Utf8PathBuf))]
     pub file: Utf8PathBuf,
 

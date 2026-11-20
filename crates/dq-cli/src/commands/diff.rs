@@ -42,10 +42,8 @@ use crate::output::{OutputFormat, Reporter};
 
 /// Run the `diff` command.
 ///
-/// `input_format` is the optional input parser override (used in tests to
-/// force a parser for both files). The dispatcher in [`crate::dispatch`]
-/// always passes `None` — `-F` for `diff` controls the OUTPUT renderer, not
-/// the input parser, mirroring `convert`'s behaviour.
+/// `input_format` is `--input-format`: when set, both files are read in it;
+/// otherwise each one's format is detected. `-F` only picks the renderer.
 ///
 /// `use_color` is the dispatcher's colour decision
 /// ([`crate::output::resolve_color`]: `--no-color`, `NO_COLOR`,

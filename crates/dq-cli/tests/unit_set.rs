@@ -14,7 +14,7 @@
 //! - `--no-create` rejection
 //! - `--value-string` vs JSON-literal heuristic
 //! - `@<path>` and `--value-from <path>` value sources
-//! - flag-combination rejections (`-i --diff`, `-i -F`, `--backup` w/o `-i`)
+//! - flag-combination rejections (`-i --diff`, `-i -F <other format>`, `--backup` w/o `-i`)
 //! - write-failure handling with the original file left intact (Unix only).
 
 use std::io::Write as _;
@@ -270,22 +270,25 @@ fn set_rejects_in_place_with_diff() {
 
 #[test]
 fn set_rejects_in_place_with_format_override() {
-    // `-i -F json` against a YAML file would imply an in-place format change,
-    // which is M3 territory. The handler must reject it before any I/O.
+    // `-i -F json` against a YAML file: `set` keeps the file in its own
+    // format, so a `-F` naming another is a usage error (exit 2) before
+    // any I/O. (It was `InvalidInput`, exit 6, for any `-F` with `-i`.)
     let tmp = write_yaml("a: 1\n");
     let path = tmp.to_str().unwrap();
     let cli = Cli::try_parse_from(["dq", "-i", "-F", "json", "set", path, "/a", "2"]).unwrap();
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
-    let e = dq::run(&cli, false, &mut out, &mut err).expect_err("`-i -F` must be rejected");
-    assert!(
-        e.downcast_ref::<dq::error::InvalidInput>().is_some(),
-        "rejection must carry InvalidInput marker (exit 6), got: {e:?}",
+    let e = dq::run(&cli, false, &mut out, &mut err).expect_err("`-i -F json` must be rejected");
+    assert_eq!(
+        dq::exit_code::exit_code_for_error(&e),
+        2,
+        "a -F the file cannot be kept in is a usage error, got: {e:?}",
     );
     assert!(
-        e.to_string().contains("-F") || e.to_string().contains("format"),
-        "error message must mention -F, got: {e}",
+        e.to_string().contains("--input-format"),
+        "error message must point to --input-format, got: {e}",
     );
+    assert_eq!(std::fs::read_to_string(&tmp).unwrap(), "a: 1\n");
 }
 
 #[test]

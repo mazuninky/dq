@@ -57,8 +57,8 @@ impl std::error::Error for ValidateFail {
 
 /// "Caller-side input error — map to exit 6 instead of the catch-all exit 1."
 ///
-/// Used for cases like `--in-place` rejection in M1 or stdin without a `-F`
-/// hint where the user can correct the mistake by passing different args.
+/// Used for cases like `--in-place` rejection on a read command, where the user can
+/// correct the mistake by passing different args.
 /// `exit_code_for_error` recognises this marker via `downcast_ref` before the
 /// generic fallback.
 #[derive(Debug)]

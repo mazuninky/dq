@@ -120,14 +120,15 @@ pub enum OutputFormat {
 }
 
 impl OutputFormat {
-    /// Map this format to a `dq-core` parser name when one applies.
+    /// The `dq-core` file format this output format writes, when it is one.
     ///
-    /// `-F` is overloaded: it picks both the renderer and the *input* parser
-    /// when the file's extension does not match. Console and Toon are
-    /// output-only — they map to `None` so input detection falls back to the
-    /// file's extension.
+    /// `-F` never picks the parser (that is `--input-format`); this name is
+    /// only compared with a file's own format by
+    /// [`crate::cli::Cli::ensure_format_kept`], so `-F yaml` on a YAML file
+    /// a write command keeps in place is accepted. Console, TOON and the
+    /// diagnostic reports are no file format and map to `None`.
     #[must_use]
-    pub fn as_input_format_name(&self) -> Option<&'static str> {
+    pub fn file_format_name(&self) -> Option<&'static str> {
         match self {
             Self::Json => Some("json"),
             Self::Yaml => Some("yaml"),
@@ -141,10 +142,8 @@ impl OutputFormat {
             Self::Frontmatter => Some("frontmatter"),
             Self::Markdown => Some("markdown"),
             Self::Xml => Some("xml"),
-            // M6: SARIF is a diagnostic *output* format with no source-side
-            // parser. M8: Junit and Tap follow the same discipline.
-            // Falling through to `None` keeps input detection on the
-            // file-extension path, matching `Console` / `Toon`.
+            // SARIF, JUnit and TAP are diagnostic reports; console and TOON
+            // have no file writer in dq-core.
             Self::Console | Self::Toon | Self::Sarif | Self::Junit | Self::Tap => None,
         }
     }

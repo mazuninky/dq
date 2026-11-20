@@ -1055,28 +1055,58 @@ fn bulk_set_doc_skips_the_file_without_that_document() {
     assert_eq!(scratch.read("bk/c.yaml"), edited);
 }
 
-/// `--doc` reads stdin (`-` with `-F yaml`) the way it reads a file.
+/// `--doc` reads stdin (`-` with `--input-format yaml`) the way it reads a file.
 #[test]
 fn doc_on_stdin() {
     let scratch = Scratch::new();
     let stdin = |args: &[&str]| scratch.run_with_stdin(args, STREAM);
     assert_eq!(
-        stdin(&["--doc", "1", "-F", "yaml", "get", "-", "/metadata/name"]),
+        stdin(&[
+            "--doc",
+            "1",
+            "--input-format",
+            "yaml",
+            "-F",
+            "yaml",
+            "get",
+            "-",
+            "/metadata/name"
+        ]),
         Ok("b\n".to_owned())
     );
     assert_eq!(
-        stdin(&["--doc", "all", "-F", "yaml", "get", "-", "/1/kind"]),
+        stdin(&[
+            "--doc",
+            "all",
+            "--input-format",
+            "yaml",
+            "-F",
+            "yaml",
+            "get",
+            "-",
+            "/1/kind"
+        ]),
         Ok("Pod\n".to_owned())
     );
     assert_eq!(
-        stdin(&["--doc", "3", "-F", "yaml", "get", "-", "/kind"]),
+        stdin(&[
+            "--doc",
+            "3",
+            "--input-format",
+            "yaml",
+            "-F",
+            "yaml",
+            "get",
+            "-",
+            "/kind"
+        ]),
         Err((
             2,
             "--doc 3 is out of range: - holds 2 document(s) (--doc 0 to 1)\n".to_owned()
         ))
     );
     assert_eq!(
-        stdin(&["--doc", "1", "-F", "yaml", "paths", "-"]),
+        stdin(&["--doc", "1", "--input-format", "yaml", "-F", "yaml", "paths", "-"]),
         Ok("'': object\n/apiVersion: string\n/kind: string\n/metadata: object\n/metadata/name: string\n"
             .to_owned())
     );
@@ -1084,7 +1114,7 @@ fn doc_on_stdin() {
         stdin(&[
             "--doc",
             "1",
-            "-F",
+            "--input-format",
             "yaml",
             "set",
             "-",

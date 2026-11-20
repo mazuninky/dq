@@ -27,6 +27,7 @@ mod fix;
 mod fmt;
 mod generate_docs;
 mod get;
+mod input_format;
 mod keys;
 mod len;
 mod lint;
@@ -56,6 +57,7 @@ pub use fix::FixArgs;
 pub use fmt::FmtArgs;
 pub use generate_docs::GenerateDocsArgs;
 pub use get::GetArgs;
+pub use input_format::InputFormat;
 pub use keys::KeysArgs;
 pub use len::LenArgs;
 pub use lint::LintArgs;
@@ -79,9 +81,23 @@ pub use values::ValuesArgs;
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]
 pub struct Cli {
-    /// Output format.
+    /// Output format; never the format a file is read in (see
+    /// --input-format).
+    ///
+    /// convert: the format to convert to. set, del, patch, merge, fmt, fix:
+    /// the file keeps its own format, so a -F naming another one is refused
+    /// (exit 2) and the same one is accepted. exists, test, completions,
+    /// man, self and rules add print no formatted value and do not use it.
     #[arg(short = 'F', long, global = true, value_enum, default_value_t = OutputFormat::Console)]
     pub format: OutputFormat,
+
+    /// The format to read files, globs and stdin (`-`) in, instead of the
+    /// one their extension or name implies.
+    ///
+    /// Stdin has no extension: a command reading `-` needs this flag (exit
+    /// 2 without it).
+    #[arg(long, global = true, value_enum, value_name = "FORMAT")]
+    pub input_format: Option<InputFormat>,
 
     /// Increase logging verbosity (`-v`, `-vv`, `-vvv`).
     #[arg(short, long, action = clap::ArgAction::Count, global = true, conflicts_with = "quiet")]
@@ -248,10 +264,11 @@ impl Cli {
 
     /// Validate write-mode flag combinations for `set`/`del` handlers.
     ///
-    /// Rejects: `-i` together with `--diff`, `--backup` without `-i`, and
-    /// `-i` together with `-F` (in-place format change is deferred to M3).
-    /// All rejections carry the [`InvalidInput`] marker so the exit-code
-    /// mapper produces 6.
+    /// Rejects: `-i` together with `--diff` or `--check`, `--diff` with
+    /// `--check`, and `--backup` with `--check` or without `-i`. All
+    /// rejections carry the [`InvalidInput`] marker so the exit-code mapper
+    /// produces 6. A `-F` naming another format than the file's is refused
+    /// per file by [`Cli::ensure_format_kept`].
     ///
     /// # Errors
     ///
@@ -286,18 +303,8 @@ impl Cli {
                 "--backup requires -i/--in-place",
             )));
         }
-        // M2 baseline: -i + -F is rejected for `set`/`del`. The format is
-        // implied by the file extension when writing back. The M3 `convert`
-        // handler (§8) needs `-i + -F` to express in-place format conversion;
-        // its handler will perform its own targeted validation rather than
-        // calling this method, so this rule stays as-is for set/del.
-        // `OutputFormat::default() == Console`, so anything else means the
-        // user explicitly passed `-F`.
-        if self.in_place && self.format != OutputFormat::Console {
-            return Err(anyhow::Error::new(InvalidInput::new(
-                "-i/--in-place cannot be combined with -F (format is implied by file extension)",
-            )));
-        }
+        // `-F` is checked per file, once its format is known: see
+        // `Cli::ensure_format_kept`.
         // NOTE: `--parallel > 1` without a glob (single-file invocation) is
         // a runtime decision in `bulk::run_per_file` — the validator does
         // not have access to the matched-file count at this point. The
@@ -356,10 +363,47 @@ impl Cli {
     pub fn doc_usage_error(&self, command: &str, why: &str) -> anyhow::Error {
         let shown = self.doc.map_or_else(String::new, |doc| format!(" {doc}"));
         let message = format!("`--doc{shown}` is not supported by `dq {command}`: {why}");
-        anyhow::Error::new(
-            <Self as clap::CommandFactory>::command()
-                .error(clap::error::ErrorKind::ArgumentConflict, message),
-        )
+        usage_error(clap::error::ErrorKind::ArgumentConflict, message)
+    }
+
+    /// Refuse a `-F` that names another format than the one `dq {command}`
+    /// writes `file` in — its own, `format`.
+    ///
+    /// `set`, `del`, `patch`, `merge`, `fmt` and `fix` put a file back in
+    /// the format it was read in, whether to the file (`-i`), to stdout or
+    /// as a diff; `-F` can only ever be the output format, so one that
+    /// differs cannot be honoured, and reading it as the input format —
+    /// what it once did — is `--input-format`'s job. The same format, and
+    /// `-F` left at its `console` default, are accepted: scripts that
+    /// passed `-F yaml -i` on a YAML file keep working.
+    ///
+    /// # Errors
+    ///
+    /// A usage error (exit 2) naming `--input-format` when `-F` names a
+    /// format other than `format`.
+    pub fn ensure_format_kept(
+        &self,
+        command: &str,
+        file: &camino::Utf8Path,
+        format: &dyn dq_core::Format,
+    ) -> anyhow::Result<()> {
+        if self.format == OutputFormat::Console
+            || self.format.file_format_name() == Some(format.name())
+        {
+            return Ok(());
+        }
+        let shown = clap::ValueEnum::to_possible_value(&self.format)
+            .map_or_else(String::new, |v| v.get_name().to_owned());
+        let file = if file == "-" { "stdin" } else { file.as_str() };
+        Err(usage_error(
+            clap::error::ErrorKind::ArgumentConflict,
+            format!(
+                "-F {shown} is the output format, but `dq {command}` keeps {file} in its own \
+                 format, {name}: drop -F (to read a file as another format, use \
+                 --input-format; to change its format, use `dq convert`)",
+                name = format.name(),
+            ),
+        ))
     }
 
     /// Build a [`dq_core::WriteOptions`] snapshot from the current global
@@ -376,6 +420,14 @@ impl Cli {
         opts.indent = self.indent;
         opts
     }
+}
+
+/// A usage error (exit 2) raised after parsing, built by clap so it reads
+/// like the ones clap raises itself: `error: …`, the usage line, the
+/// `--help` hint.
+#[must_use]
+pub fn usage_error(kind: clap::error::ErrorKind, message: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::Error::new(<Cli as clap::CommandFactory>::command().error(kind, message))
 }
 
 /// Subcommand surface for M1.
@@ -655,18 +707,29 @@ mod tests {
     }
 
     #[test]
-    fn ensure_write_flags_consistent_rejects_in_place_with_format_override() {
-        // The M2 baseline writes back in the source format (extension-driven).
-        // Combining `-i` with `-F` would imply an in-place format conversion,
-        // which is M3 territory.
+    fn ensure_write_flags_consistent_leaves_dash_f_to_the_per_file_check() {
+        // `-F` with `-i` is no flag conflict: whether it is refused depends
+        // on the file's format, which `ensure_format_kept` sees.
         let cli =
             Cli::try_parse_from(["dq", "-i", "-F", "json", "set", "f.yaml", "/x", "1"]).unwrap();
-        let err = cli.ensure_write_flags_consistent().unwrap_err();
-        assert!(
-            err.to_string().contains("-F") || err.to_string().contains("format"),
-            "error should mention -F, got: {err}",
-        );
-        assert!(err.downcast_ref::<InvalidInput>().is_some());
+        cli.ensure_write_flags_consistent().unwrap();
+    }
+
+    #[test]
+    fn ensure_format_kept_refuses_another_format_and_accepts_the_same() {
+        let yaml = dq_core::by_name("yaml").unwrap();
+        let file = camino::Utf8Path::new("f.yaml");
+        let cli =
+            Cli::try_parse_from(["dq", "-i", "-F", "json", "set", "f.yaml", "/x", "1"]).unwrap();
+        let err = cli.ensure_format_kept("set", file, yaml).unwrap_err();
+        assert_eq!(crate::exit_code::exit_code_for_error(&err), 2, "{err}");
+        assert!(err.to_string().contains("--input-format"), "{err}");
+
+        let same =
+            Cli::try_parse_from(["dq", "-i", "-F", "yaml", "set", "f.yaml", "/x", "1"]).unwrap();
+        same.ensure_format_kept("set", file, yaml).unwrap();
+        let unset = Cli::try_parse_from(["dq", "-i", "set", "f.yaml", "/x", "1"]).unwrap();
+        unset.ensure_format_kept("set", file, yaml).unwrap();
     }
 
     #[test]

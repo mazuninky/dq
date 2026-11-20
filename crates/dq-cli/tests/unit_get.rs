@@ -88,18 +88,27 @@ fn get_against_unsupported_format_extension_returns_format_error() {
 
 #[test]
 fn get_with_format_override_parses_unknown_extension() {
-    // Override the parser via `-F json`: the file extension is `.txt` (no parser
-    // would match by extension), but `-F json` forces JSON. This proves the
-    // override path works through the full `dq::run` pipeline.
+    // Override the parser via `--input-format json`: the file extension is
+    // `.txt` (no parser would match by extension). This proves the override
+    // path works through the full `dq::run` pipeline. (It was `-F json`
+    // until `-F` became the output format only.)
     let mut tmp = NamedTempFile::with_suffix(".txt").expect("tempfile");
     tmp.write_all(br#"{"a": 1}"#).unwrap();
     let tmp = tmp.into_temp_path();
     let path = tmp.to_str().unwrap();
-    let cli = Cli::parse_from(["dq", "-F", "json", "get", path, "/a", "--no-color"]);
+    let cli = Cli::parse_from([
+        "dq",
+        "--input-format",
+        "json",
+        "-F",
+        "json",
+        "get",
+        path,
+        "/a",
+        "--no-color",
+    ]);
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
-    // NOTE: `-F` is overloaded — for `get` it sets the *input* parser, but it
-    // also picks the output reporter. Json output for the scalar `1` is `1`.
     dq::run(&cli, false, &mut out, &mut err).expect("override should succeed");
     let stdout = String::from_utf8(out).unwrap();
     // JsonReporter pretty-prints: a single integer is just `1`.

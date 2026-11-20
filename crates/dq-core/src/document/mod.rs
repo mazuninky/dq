@@ -139,7 +139,7 @@ impl FormatTag {
     /// Inverse of [`FormatTag::from_name`]; matches the
     /// [`crate::Format::name`] string of the registered parser. Used in
     /// diagnostic messages so the user sees the same identifier they pass via
-    /// `-F` on the command line (e.g. "dockerfile", "ignore-list").
+    /// `--input-format` on the command line (e.g. "dockerfile", "ignore-list").
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {

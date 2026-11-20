@@ -21,6 +21,7 @@ pub use error::{
 
 use std::io::Write;
 
+use cli::InputFormat;
 use output::{
     ConsoleReporter, JsonReporter, JsonlReporter, JunitReporter, OutputFormat, Reporter,
     SarifReporter, TapReporter, TomlReporter, ToonReporter, YamlReporter,
@@ -61,7 +62,9 @@ fn dispatch(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> anyhow::Result<()> {
-    let input_format = cli.format.as_input_format_name();
+    // `-F` is the output format only (the reporter above, or `convert`'s
+    // target); the parser comes from `--input-format`, else detection.
+    let input_format = cli.input_format.map(InputFormat::parser_name);
     // `--doc` is global, so clap accepts it on every command; refuse it
     // where the command would otherwise ignore it.
     if cli.doc.is_some()
@@ -89,26 +92,18 @@ fn dispatch(
         }
         Command::Paths(args) => commands::paths::run(cli, args, input_format, reporter, out),
         Command::Select(args) => commands::select::run(cli, args, input_format, reporter, out),
-        // For `convert`, `-F` is the OUTPUT format. Input format always
-        // comes from the file extension; passing `cli.format` as the input
-        // override would force `dq convert deployment.yaml -F json` to parse
-        // the YAML file as JSON (and fail). The convert handler needs the
-        // raw `cli.format` for output routing, plus `use_color` for the
-        // console-output branch which constructs its own `ConsoleReporter`
-        // (the dispatcher's reporter is for non-convert commands).
+        // `convert` renders `-F` itself (writers, not reporters), plus
+        // `use_color` for its console branch.
         Command::Convert(args) => {
-            commands::convert::run(cli, args, None, cli.format, use_color, &opts, out)
+            commands::convert::run(cli, args, input_format, cli.format, use_color, &opts, out)
         }
         // M4 §3: `dq fmt FILE` — re-emit through the format's native
         // writer with the global `--sort-keys` / `--indent` knobs applied.
         Command::Fmt(args) => commands::fmt::run(cli, args, input_format, use_color, &opts, out),
         Command::Validate(args) => commands::validate::run(cli, args, input_format, reporter, err),
-        // For `diff`, `-F` controls the OUTPUT format (how the resulting
-        // `Vec<PatchOp>` is rendered). Input formats for both files come from
-        // their extensions — same special-case as `convert`. Passing
-        // `cli.format` as the input override would force `dq diff a.yaml
-        // b.yaml -F json` to parse the YAML files as JSON and fail.
-        Command::Diff(args) => commands::diff::run(cli, args, None, use_color, reporter, out),
+        Command::Diff(args) => {
+            commands::diff::run(cli, args, input_format, use_color, reporter, out)
+        }
         Command::Set(args) => commands::set::run(cli, args, input_format, use_color, out),
         Command::Del(args) => commands::del::run(cli, args, input_format, use_color, out),
         Command::Patch(args) => commands::patch::run(cli, args, input_format, use_color, out),
@@ -140,14 +135,8 @@ fn dispatch(
         // → reporter); the other three (`test`, `explain`, `rules`) drive
         // their own logic but reuse the same write-flag rejection and
         // exit-code markers.
-        //
-        // `-F` is the OUTPUT format (renderer selection). Input formats come
-        // from each file's extension via `pick_format` inside the lint
-        // pipeline — same special-case as `convert` / `diff`. Passing
-        // `cli.format` as the input override would force `dq lint -F json
-        // file.yaml` to parse every file as JSON and fail.
-        Command::Lint(args) => commands::lint::run(cli, args, None, reporter, out),
-        Command::Check(args) => commands::check::run(cli, args, None, reporter, out),
+        Command::Lint(args) => commands::lint::run(cli, args, input_format, reporter, out),
+        Command::Check(args) => commands::check::run(cli, args, input_format, reporter, out),
         Command::Test(args) => {
             cli.ensure_no_write_flags()?;
             commands::test_cmd::run(cli, args, out)

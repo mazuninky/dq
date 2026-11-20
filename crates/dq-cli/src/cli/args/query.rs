@@ -15,7 +15,7 @@ pub struct QueryArgs {
     /// jq expression (jaq dialect — `jq -h` syntax minus `--arg`/`--slurpfile`).
     pub expression: String,
 
-    /// File to query (or `-` for stdin, requiring `-F`).
+    /// File to query (or `-` for stdin, requiring `--input-format`).
     #[arg(value_parser = clap::value_parser!(Utf8PathBuf))]
     pub file: Utf8PathBuf,
 }

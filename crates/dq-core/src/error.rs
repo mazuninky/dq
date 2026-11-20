@@ -100,7 +100,7 @@ pub enum Error {
         did_you_mean: Vec<String>,
     },
 
-    /// File extension or `-F` value did not match any known parser.
+    /// File extension or `--input-format` value did not match any known parser.
     #[error("unsupported format '{name}'")]
     UnsupportedFormat {
         /// The format name or extension that was rejected.

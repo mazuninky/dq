@@ -1,7 +1,7 @@
 //! Shared I/O and conversion helpers used by every Section-5 command handler.
 //!
 //! The handlers in this module follow a small set of repeated steps — open the
-//! file (or stdin), pick a [`Format`] (override > extension), parse to a
+//! file (or stdin), pick a [`Format`] (`--input-format` > extension), parse to a
 //! [`Document`], and then convert pieces of the parsed `Value` back into a
 //! `serde_json::Value` so [`crate::output::Reporter`] can render them. Pulling
 //! the boilerplate into one helper module keeps the per-command modules
@@ -15,20 +15,19 @@
 use std::fs;
 use std::io::Read;
 
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use dq_core::{Document, Format, Pointer, Segment, Value};
 
-use crate::cli::DocSelector;
-use crate::error::{DocOutOfRange, DocOutOfRangeEverywhere, InvalidInput};
+use crate::cli::{Cli, DocSelector};
+use crate::error::{DocOutOfRange, DocOutOfRangeEverywhere};
 
 /// Load and parse a file (or stdin when `file == "-"`), returning the chosen
 /// [`Format`] together with the parsed [`Document`].
 ///
 /// Format selection precedence:
-/// 1. `format_override` (the global `-F` flag) wins when set.
-/// 2. Otherwise the extension is used via [`dq_core::detect`].
-/// 3. Reading from stdin (`-`) without an override is rejected — there is no
-///    extension to fall back on.
+/// Format selection is [`pick_format`]'s: `format_override` (the global
+/// `--input-format`), else detection; stdin without an override is a usage
+/// error.
 ///
 /// `Parse` errors are tagged with the actual file path (or `None` for stdin)
 /// so renderers can include it in diagnostics.
@@ -117,8 +116,11 @@ pub(crate) fn load_document_for_lint(
     Ok((format, doc))
 }
 
-/// Pick a [`Format`] for `file` from an explicit `-F` override or the file's
-/// extension.
+/// Pick a [`Format`] for `file`: the one `--input-format` names
+/// (`format_override`), else the one its extension or name implies.
+///
+/// The one place a command resolves the format it reads a file — or stdin
+/// — in; `-F` never reaches it.
 ///
 /// Visibility note: exposed as `pub(crate)` so the write handlers in
 /// [`crate::commands::set`] / [`crate::commands::del`] can pre-resolve the
@@ -129,7 +131,8 @@ pub(crate) fn load_document_for_lint(
 ///
 /// # Errors
 ///
-/// - [`InvalidInput`] when the file is `-` (stdin) and no override is provided.
+/// - A usage error (exit 2) naming `--input-format` when the file is `-`
+///   (stdin) and no override is provided: stdin has no extension.
 /// - [`dq_core::Error::UnsupportedFormat`] when neither the override nor the
 ///   extension resolves to a known format.
 pub(crate) fn pick_format(
@@ -145,9 +148,7 @@ pub(crate) fn pick_format(
         return Ok(fmt);
     }
     if file == "-" {
-        return Err(anyhow::Error::new(InvalidInput::new(
-            "stdin requires -F <format> (no extension to detect from)",
-        )));
+        return Err(stdin_needs_input_format());
     }
     dq_core::detect(file).ok_or_else(|| {
         let ext = file
@@ -156,6 +157,54 @@ pub(crate) fn pick_format(
             .unwrap_or_else(|| file.to_string());
         anyhow::Error::new(dq_core::Error::UnsupportedFormat { name: ext })
     })
+}
+
+/// Refuse, before a write command touches any of `files`, what it cannot
+/// do with them: write stdin back (`-i`) or compare it with the file on
+/// disk (`--check`) — stdin has neither — and keep a file in its own
+/// format while `-F` names another ([`Cli::ensure_format_kept`]).
+///
+/// Checked over every file up front, so a run that cannot be honoured
+/// stops before it writes the first one, `--continue-on-error` or not. A
+/// file whose format cannot be resolved is left to the command, which
+/// reports it as it always has.
+///
+/// # Errors
+///
+/// A usage error (exit 2) for the first file that cannot be honoured.
+pub(crate) fn check_write_targets(
+    cli: &Cli,
+    command: &str,
+    files: &[Utf8PathBuf],
+    format_override: Option<&str>,
+) -> anyhow::Result<()> {
+    for file in files {
+        if file == "-" && (cli.in_place || cli.check) {
+            let flag = if cli.in_place {
+                "-i/--in-place"
+            } else {
+                "--check"
+            };
+            return Err(crate::cli::usage_error(
+                clap::error::ErrorKind::ArgumentConflict,
+                format!(
+                    "{flag} needs a file on disk; `dq {command} -` reads stdin, which has none"
+                ),
+            ));
+        }
+        if let Ok(format) = pick_format(file, format_override) {
+            cli.ensure_format_kept(command, file, format)?;
+        }
+    }
+    Ok(())
+}
+
+/// The usage error (exit 2) for stdin read without `--input-format`.
+pub(crate) fn stdin_needs_input_format() -> anyhow::Error {
+    crate::cli::usage_error(
+        clap::error::ErrorKind::MissingRequiredArgument,
+        "stdin (`-`) has no extension to detect its format from; name it with --input-format <FORMAT>",
+    )
 }
 
 /// Read every byte of `file` (or stdin when `file == "-"`), wrapping I/O
@@ -337,10 +386,11 @@ mod tests {
         // `&dyn Format` is not `Debug`, so we cannot call `.unwrap_err()`
         // directly. Match instead.
         let err = match pick_format(&path, None) {
-            Ok(_) => panic!("stdin without -F must error"),
+            Ok(_) => panic!("stdin without --input-format must error"),
             Err(e) => e,
         };
-        assert!(err.to_string().contains("stdin"), "got: {err:?}");
+        assert!(err.to_string().contains("--input-format"), "got: {err:?}");
+        assert_eq!(crate::exit_code::exit_code_for_error(&err), 2);
     }
 
     #[test]

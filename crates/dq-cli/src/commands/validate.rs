@@ -13,15 +13,16 @@ use std::io::Write;
 
 use camino::Utf8Path;
 
+use super::io_helpers::{pick_format, read_bytes};
 use crate::cli::{Cli, ValidateArgs};
-use crate::error::{InvalidInput, ValidateFail};
+use crate::error::ValidateFail;
 use crate::output::{OutputFormat, Reporter};
 
 /// Run the `validate` command.
 ///
 /// # Errors
 ///
-/// - [`InvalidInput`] (exit 6) when any write-mode flag (`-i`, `--diff`,
+/// - [`InvalidInput`](crate::error::InvalidInput) (exit 6) when any write-mode flag (`-i`, `--diff`,
 ///   `--backup`) is set — `validate` is a read subcommand.
 /// - `dq_core::Error::Parse` (mapped to exit 4 via [`ValidateFail`]) when the
 ///   file's syntax does not match the chosen format. Other I/O /
@@ -44,12 +45,10 @@ pub fn run(
     // `dq validate --check FILE` in CI alongside `dq fmt --check` /
     // `dq set --check` without the flag being filtered out.
     cli.ensure_no_write_flags_except_check()?;
-    // Implementation note: we duplicate `io_helpers::pick_format` and
-    // `read_bytes` here in miniature so we can render the parse error
-    // through `reporter` to `err` BEFORE returning the error to main.rs.
-    // Going through `load_document` would surface the parse error too late
-    // (already wrapped in `anyhow::Error`), at which point the reporter has
-    // no structured data to format.
+    // Resolve and read by hand rather than through `load_document_with_path`
+    // so the parse error is rendered through `reporter` to `err` before it
+    // is returned: once wrapped in `anyhow::Error` the reporter has no
+    // structured data to format.
     let format = pick_format(&args.file, input_format)?;
     let bytes = read_bytes(&args.file)?;
     match format.parse(&bytes) {
@@ -97,50 +96,6 @@ pub fn run(
             Err(anyhow::Error::new(ValidateFail { source: parse_err }))
         }
     }
-}
-
-fn pick_format(
-    file: &Utf8Path,
-    input_format: Option<&str>,
-) -> anyhow::Result<&'static dyn dq_core::Format> {
-    if let Some(name) = input_format {
-        return dq_core::by_name(name).ok_or_else(|| {
-            anyhow::Error::new(dq_core::Error::UnsupportedFormat {
-                name: name.to_owned(),
-            })
-        });
-    }
-    if file == "-" {
-        return Err(anyhow::Error::new(InvalidInput::new(
-            "stdin requires -F <format> (no extension to detect from)",
-        )));
-    }
-    dq_core::detect(file).ok_or_else(|| {
-        let ext = file
-            .extension()
-            .map(str::to_owned)
-            .unwrap_or_else(|| file.to_string());
-        anyhow::Error::new(dq_core::Error::UnsupportedFormat { name: ext })
-    })
-}
-
-fn read_bytes(file: &Utf8Path) -> anyhow::Result<Vec<u8>> {
-    if file == "-" {
-        let mut buf = Vec::new();
-        std::io::Read::read_to_end(&mut std::io::stdin(), &mut buf).map_err(|source| {
-            anyhow::Error::new(dq_core::Error::Io {
-                path: camino::Utf8PathBuf::from(":stdin"),
-                source,
-            })
-        })?;
-        return Ok(buf);
-    }
-    std::fs::read(file.as_std_path()).map_err(|source| {
-        anyhow::Error::new(dq_core::Error::Io {
-            path: file.to_path_buf(),
-            source,
-        })
-    })
 }
 
 /// Render a parse error as the bare diagnostic object the Console reporter
@@ -233,6 +188,7 @@ fn render_parse_error_diagnostics(err: &dq_core::Error, file: &Utf8Path) -> serd
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::InvalidInput;
     use crate::output::JsonReporter;
     use clap::Parser;
     use tempfile::NamedTempFile;

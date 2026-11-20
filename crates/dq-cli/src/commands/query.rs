@@ -49,32 +49,12 @@ use crate::output::Reporter;
 pub fn run(
     cli: &Cli,
     args: &QueryArgs,
-    _input_format: Option<&str>,
+    input_format: Option<&str>,
     doc_arg: Option<crate::cli::DocSelector>,
     reporter: &dyn Reporter,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
     cli.ensure_no_write_flags()?;
-
-    // For `query`, `-F` is the **output** format (the reporter format), not
-    // the input parser. The input format is detected from the file extension
-    // so that `dq query '.spec.containers[].image' deployment.yaml -F json`
-    // does the obvious thing (parse YAML, render JSON).
-    //
-    // The single exception is stdin (`file == "-"`): there is no extension to
-    // fall back on, so we honour `cli.format` as a last resort. Without this,
-    // `dq query '.foo' - -F yaml` would hit the "stdin requires -F" guard in
-    // `pick_format` even though the user *did* supply `-F`.
-    //
-    // The dispatcher in `lib.rs` still passes `input_format` for symmetry with
-    // the other handler signatures, but we deliberately ignore it (note the
-    // leading underscore in the parameter name) so the override only ever
-    // applies to stdin.
-    let input_format = if args.file == "-" {
-        cli.format.as_input_format_name()
-    } else {
-        None
-    };
 
     let (_fmt, doc) = load_document_with_path(&args.file, input_format)?;
     let view = select_document(&doc, doc_arg, &args.file)?;
@@ -287,21 +267,9 @@ mod tests {
 
     #[test]
     fn query_with_format_override_still_uses_extension_for_input_parsing() {
-        // Regression: passing `-F json` is an OUTPUT-format hint for `query`.
-        // It must NOT be forwarded to the input parser — otherwise a YAML file
-        // gets parsed as JSON and fails with PARSE_ERROR (exit 3).
-        //
-        // Before the fix, the dispatcher in `lib.rs` forwarded
-        // `cli.format.as_input_format_name()` (Some("json") under `-F json`)
-        // straight into `load_document_with_path`, overriding the `.yaml`
-        // extension. The smoke test
-        //   dq query '.spec.containers[].image' deployment.yaml -F json
-        // would error instead of returning ["a","b"].
-        //
-        // This test pins the new contract: even if the dispatcher passes
-        // `Some("json")` (we mimic that here by hand), the handler must
-        // ignore it for non-stdin inputs and detect the format from the
-        // file extension. Only the stdin branch consults `cli.format`.
+        // `-F json` is the output format: the YAML file is still read as
+        // YAML (the dispatcher derives the parser from `--input-format`,
+        // never from `-F` — pinned end to end in `tests/cli_input_format.rs`).
         let tmp = write_yaml("spec:\n  containers:\n    - image: a\n    - image: b\n");
         let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = Cli::try_parse_from([
@@ -319,8 +287,7 @@ mod tests {
         };
         let reporter = JsonReporter;
         let mut out: Vec<u8> = Vec::new();
-        // Pass `Some("json")` deliberately — the handler must ignore it.
-        run(&cli, &args, Some("json"), None, &reporter, &mut out)
+        run(&cli, &args, None, None, &reporter, &mut out)
             .expect("YAML file with -F json should parse via extension, render JSON");
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed, serde_json::json!(["a", "b"]));

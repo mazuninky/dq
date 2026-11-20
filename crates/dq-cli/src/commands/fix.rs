@@ -108,6 +108,7 @@ pub fn run(
         // No files to process — nothing to do.
         return Ok(());
     }
+    super::io_helpers::check_write_targets(cli, "fix", &expanded, input_format)?;
 
     // Detect formats up front so the loader can pick which `@std/*`
     // namespaces to auto-bind. Same approach as `dq lint`.

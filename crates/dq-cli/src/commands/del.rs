@@ -16,7 +16,7 @@
 //!
 //! Per-file work executed inside [`DelFileOp::apply`]:
 //!
-//! 1. Resolve the format (extension or `-F`).
+//! 1. Resolve the format (extension or `--input-format`).
 //! 2. Read the original bytes.
 //! 3. Apply the same template guard as `set`.
 //! 4. Parse to a write-aware [`Document`].
@@ -90,6 +90,7 @@ pub fn run(
         doc_index,
         several: files.len() > 1,
     };
+    super::io_helpers::check_write_targets(cli, "del", &files, input_format)?;
     bulk::run_per_file(files, &op, cli, out)
 }
 

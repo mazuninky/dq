@@ -1,7 +1,7 @@
 //! Parser throughput benchmarks per registered format.
 //!
 //! Each group dispatches through [`dq_core::format::by_name`] so we exercise
-//! the same path the CLI uses (`dq … -F <format>`). Workloads are
+//! the same path the CLI uses (`dq … --input-format <format>`). Workloads are
 //! synthesised in-file from a seeded RNG and timed in bytes, so the result
 //! is reproducible and the relative ordering between formats is meaningful
 //! even on a noisy machine.

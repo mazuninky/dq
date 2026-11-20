@@ -271,7 +271,10 @@ fn snapshot_templated_file_console_render() {
 
 #[test]
 fn snapshot_templated_file_json_render() {
-    // Case 10 (M2 §12.4): same as above but under `-F json`. Today the
+    // Case 10 (M2 §12.4): same as above but under a structured `-F`
+    // (`yaml`: `set` keeps a file in its own format and refuses a `-F`
+    // naming another, so `-F json` on this YAML file is a usage error —
+    // pinned in `cli_input_format.rs`). Today the
     // binary routes domain errors through `render_error` which emits
     // console-text regardless of `-F json` — the snapshot pins that
     // *current* behaviour. The contract this test pins is "the user still
@@ -282,7 +285,7 @@ fn snapshot_templated_file_json_render() {
     let f = fixture("helm_values_templated.yaml");
     let f_str = f.to_str().unwrap();
     let out = dq()
-        .args(["-F", "json", "set", f_str, "/image/tag", "v2", "--no-color"])
+        .args(["-F", "yaml", "set", f_str, "/image/tag", "v2", "--no-color"])
         .output()
         .unwrap();
     let code = out.status.code();
@@ -389,10 +392,9 @@ fn snapshot_json_render_unsupported_format_via_get() {
         .args(["-F", "json", "get", f_str, "/x", "--no-color"])
         .output()
         .unwrap();
-    // Exit 3 (PARSE_ERROR) because the user provided `-F json` — the override
-    // is honoured, so the parser tries to read the `.unknown` file as JSON,
-    // which fails inside the parse layer and maps to PARSE_ERROR (3) rather
-    // than the GENERIC (1) exit reserved for catch-all failures.
+    // Exit 6: `-F json` is the output format and never picks the parser, so
+    // the `.unknown` extension stays unsupported. (Until `--input-format`
+    // split the two, `-F json` read the file as JSON and failed with exit 3.)
     let stderr = normalize_path(&String::from_utf8_lossy(&out.stderr), f_str);
     let code = out.status.code();
     insta::with_settings!({

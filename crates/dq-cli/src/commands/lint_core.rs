@@ -3,7 +3,7 @@
 //! Pipeline:
 //!
 //! 1. Expand input glob patterns into a flat list of file paths.
-//! 2. For each file, detect the format (extension or `-F` override) and
+//! 2. For each file, detect the format (extension or `--input-format`) and
 //!    record it in an `IndexSet` of discovered formats.
 //! 3. Resolve `--rules` (or auto-bind on empty) into a `Vec<RuleSet>`.
 //! 4. Compile every rule via [`Evaluator::new`].

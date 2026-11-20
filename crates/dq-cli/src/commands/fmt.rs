@@ -8,7 +8,7 @@
 //!
 //! Pipeline (per file, executed inside [`FmtFileOp::apply`]):
 //!
-//! 1. Resolve the format (extension or `-F`) and load the document via the
+//! 1. Resolve the format (extension or `--input-format`) and load the document via the
 //!    standard read-side helper. Unlike `set`/`del`, fmt uses the read-only
 //!    parsers — there is no textual-edit splice to perform.
 //! 2. Render the parsed [`dq_core::Document`] into a `Vec<u8>` via
@@ -37,8 +37,11 @@ use crate::cli::{Cli, FmtArgs};
 /// # Errors
 ///
 /// - [`crate::error::InvalidInput`] (exit 6) for inconsistent write flags
-///   (`-i + --diff`, `--backup` without `-i`, `-i + -F`, `-i + --check`,
+///   (`-i + --diff`, `--backup` without `-i`, `-i + --check`,
 ///   etc. — see [`Cli::ensure_write_flags_consistent`]).
+/// - A usage error (exit 2) for a `-F` naming another format than a file's,
+///   or `-i` / `--check` on stdin — see
+///   [`super::io_helpers::check_write_targets`].
 /// - [`dq_core::Error`] family on parse / I/O / write failures.
 /// - [`crate::error::CheckPending`] (exit 1) when `--check` finds at least
 ///   one file that would be modified.
@@ -62,6 +65,7 @@ pub fn run(
     };
 
     let files = bulk::expand_glob(&args.file)?;
+    super::io_helpers::check_write_targets(cli, "fmt", &files, input_format)?;
     bulk::run_per_file(files, &op, cli, out)
 }
 

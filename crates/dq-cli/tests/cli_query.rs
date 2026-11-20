@@ -208,29 +208,26 @@ fn query_rejects_in_place_with_invalid_input_exit_six() {
 }
 
 #[test]
-fn query_stdin_without_format_is_rejected_with_invalid_input() {
-    // Spec scenario "Stdin read without format errors": passing `-` as the
-    // file path with no `-F` override has no extension to dispatch from →
-    // `InvalidInput` from `pick_format`, exit 6.
+fn query_stdin_without_format_is_a_usage_error() {
+    // Passing `-` as the file path with no `--input-format` has no
+    // extension to dispatch from: a usage error from `pick_format`, exit 2.
+    // (It was exit 6, `InvalidInput`, while `-F` still named the parser.)
     //
     // This is in-process safe because the gate fires inside `pick_format`
     // BEFORE any stdin read attempt, so we never touch the parent's stdin.
     let cli = Cli::try_parse_from(["dq", "query", ".foo", "-", "--no-color"]).unwrap();
     let mut out: Vec<u8> = Vec::new();
     let mut err: Vec<u8> = Vec::new();
-    let e = dq::run(&cli, false, &mut out, &mut err).expect_err("stdin without -F must error");
-    assert!(
-        e.downcast_ref::<dq::error::InvalidInput>().is_some(),
-        "rejection must carry InvalidInput marker, got: {e:?}",
-    );
+    let e = dq::run(&cli, false, &mut out, &mut err)
+        .expect_err("stdin without --input-format must error");
     assert_eq!(
         exit_code::exit_code_for_error(&e),
-        exit_code::INVALID_INPUT,
-        "stdin-without-format must map to exit 6, got: {e:?}",
+        exit_code::NOT_FOUND,
+        "stdin-without-format is a usage error, exit 2, got: {e:?}",
     );
     assert!(
-        e.to_string().to_lowercase().contains("stdin"),
-        "error message must name `stdin`, got: {e}",
+        e.to_string().contains("--input-format"),
+        "error message must name `--input-format`, got: {e}",
     );
 }
 
@@ -359,8 +356,8 @@ fn query_doc_all_returns_array_of_all_documents() {
 
 #[test]
 fn query_stdin_with_explicit_format_round_trips_value() {
-    // Spec scenario "Stdin read with explicit format": `cat config.yaml | dq
-    // query '.foo' - -F yaml` reads stdin as YAML, evaluates the filter,
+    // `cat config.yaml | dq query '.foo' - --input-format yaml` reads
+    // stdin as YAML, evaluates the filter,
     // writes the result to stdout (exit 0). Driven through a real
     // subprocess because the in-process driver shares the test runner's
     // stdin handle.
@@ -375,7 +372,7 @@ fn query_stdin_with_explicit_format_round_trips_value() {
     }
     cmd.env("HOME", "/tmp");
 
-    cmd.args(["query", ".foo", "-", "-F", "yaml", "--no-color"])
+    cmd.args(["query", ".foo", "-", "--input-format", "yaml", "--no-color"])
         .write_stdin("foo: hello\n")
         .assert()
         .success()
@@ -386,8 +383,8 @@ fn query_stdin_with_explicit_format_round_trips_value() {
 fn query_with_format_override_does_not_misparse_input_yaml() {
     // Regression: `dq query '...' file.yaml -F json` previously caused the
     // YAML file to be parsed as JSON because the dispatcher forwarded -F to
-    // the input parser. The handler now ignores its `_input_format`
-    // parameter for file inputs and uses the extension. This test exercises
+    // the input parser. `-F` is the output format only; the
+    // parser comes from `--input-format`, else the extension. This test exercises
     // the full dq::run path so a future dispatcher-arm regression is caught.
     let tmp = write_yaml("spec:\n  containers:\n    - image: a\n    - image: b\n");
     let path = tmp.to_str().unwrap();

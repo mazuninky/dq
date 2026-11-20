@@ -6,7 +6,7 @@ use clap::Args;
 /// Arguments for `dq merge`.
 #[derive(Debug, Args, Clone)]
 pub struct MergeArgs {
-    /// File (or glob pattern) to mutate. Format is detected from extension or `-F`.
+    /// File (or glob pattern) to mutate. Format is detected from the extension or `--input-format`.
     #[arg(value_parser = clap::value_parser!(Utf8PathBuf))]
     pub file: Utf8PathBuf,
 

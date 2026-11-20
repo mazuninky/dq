@@ -15,7 +15,7 @@ use crate::document::Document;
 
 /// Pluggable file-format reader/writer.
 pub trait Format: Send + Sync {
-    /// Stable short name used by the CLI's `-F` flag and error messages.
+    /// Stable short name used by the CLI's `--input-format` flag and error messages.
     fn name(&self) -> &'static str;
 
     /// File extensions (without the leading `.`) this format claims.
@@ -123,7 +123,7 @@ pub fn detect(path: &Utf8Path) -> Option<&'static dyn Format> {
     registry.iter().copied().find(|fmt| fmt.name() == target)
 }
 
-/// Look up a format by short name (`-F` flag).
+/// Look up a format by short name (`--input-format` flag).
 #[must_use]
 pub fn by_name(name: &str) -> Option<&'static dyn Format> {
     crate::parsers::registry()
