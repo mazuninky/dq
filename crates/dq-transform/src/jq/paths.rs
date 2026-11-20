@@ -34,7 +34,7 @@ use jaq_core::load::parse::{BinaryOp, Def, Pattern, Term};
 use jaq_core::native::{Fun, run, v};
 use jaq_core::path::{Opt, Part, Path};
 use jaq_core::{Cv, Error, ValT as _, ValX};
-use jaq_json::{Map, Val};
+use jaq_json::{Map, Rc, Val};
 use jaq_std::ValT as _;
 
 /// Definitions chained after jaq's own, so these shadow jaq's.
@@ -113,7 +113,8 @@ fn ensure_all<'a>(mut v: Val, paths: &Val) -> ValX<'a, Val> {
 
 /// `v` with the containers `path` walks through created: a null becomes
 /// `{}` before a string key and `[]` before a number or a slice, and an
-/// array is padded with nulls up to an index past its end.
+/// array is padded with nulls up to an index past its end — up to
+/// [`MAX_INDEX`], past which it is jq's "Array index too large".
 ///
 /// A missing object key at the end of the path is left for the assignment
 /// to insert. What jq refuses (a string key into a number, say) is left as
@@ -134,16 +135,15 @@ fn ensure<'a>(v: Val, path: &[Val]) -> ValX<'a, Val> {
             };
             ensure(container, path)
         }
-        Val::Arr(items) => {
+        Val::Arr(mut items) => {
             let len = items.len();
             match array_index(key, len) {
+                Some(idx) if idx > MAX_INDEX => Err(Error::str("Array index too large").into()),
                 Some(idx) if idx >= len => {
-                    let padded: Val = items
-                        .iter()
-                        .cloned()
-                        .chain(core::iter::repeat_n(Val::Null, idx + 1 - len))
-                        .collect();
-                    ensure(padded, path)
+                    // In place: the array is copied only when it is shared,
+                    // so building one item by item stays linear.
+                    Rc::make_mut(&mut items).resize(idx + 1, Val::Null);
+                    ensure(Val::Arr(items), path)
                 }
                 _ => Val::Arr(items)
                     .map_index(key, Opt::Essential, |child| once(ensure(child, rest))),
@@ -153,6 +153,12 @@ fn ensure<'a>(v: Val, path: &[Val]) -> ValX<'a, Val> {
         other => Ok(other),
     }
 }
+
+/// The largest index an assignment pads an array up to: jq's own limit.
+/// Past it jq's `jv_array_set` fails with "Array index too large"
+/// (`idx > (INT_MAX >> 2)`), where padding would otherwise allocate
+/// without bound.
+const MAX_INDEX: usize = 536_870_911;
 
 /// Whether [`ensure`] has anything to create along `path`. A read-only
 /// walk, so a path that exists costs no copy.
@@ -827,6 +833,41 @@ mod tests {
             let err = run(filter, input).expect_err(filter);
             assert!(err.contains(message), "{filter} on {input}: {err}");
         }
+    }
+
+    #[test]
+    fn an_index_past_jqs_limit_is_an_error_not_an_allocation() {
+        // jq refuses an index past 536870911 with "Array index too large".
+        for (filter, input) in [
+            (".[536870912] = 1", "null"),
+            (".[4000000000000000000] = 1", "null"),
+            (".a[.n] = 1", r#"{"n":4000000000000000000}"#),
+            ("[1] | .[536870912] |= 1", "null"),
+            ("setpath([536870912]; 1)", "null"),
+        ] {
+            let err = run(filter, input).expect_err(filter);
+            assert!(
+                err.contains("Array index too large"),
+                "{filter} on {input}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn building_an_array_by_index_is_linear() {
+        // Padding copied the whole array on every append: 40k items took
+        // ten seconds (jq: 0.03 s). In place, 100k take well under one,
+        // even unoptimised; copying, they would take minutes.
+        let start = std::time::Instant::now();
+        assert_eq!(
+            one(
+                "reduce range(100000) as $i ([]; .[$i] = $i) | length",
+                "null"
+            ),
+            "100000"
+        );
+        let took = start.elapsed();
+        assert!(took.as_secs() < 15, "took {took:?}");
     }
 
     #[test]

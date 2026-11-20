@@ -137,3 +137,37 @@ fix:
     assert_eq!(read(&dir, "a.yaml"), FIXED);
     assert_eq!(read(&dir, "b.yaml"), FIXED);
 }
+
+/// An index past jq's limit (536870911) is jq's runtime error "Array index
+/// too large", exit 1 — it used to panic on a capacity overflow (exit 101),
+/// or try to allocate gigabytes.
+#[test]
+fn an_index_past_jqs_limit_is_a_jq_runtime_error() {
+    let dir = dir_with(&[("n.json", "{\"n\": 4000000000000000000}\n")]);
+    dq().current_dir(dir.path())
+        .args(["--no-color", "query", ".a[.n] = 1", "n.json"])
+        .assert()
+        .code(1)
+        .stdout("")
+        .stderr(predicates::str::contains("Array index too large"));
+    dq().current_dir(dir.path())
+        .args(["--no-color", "-i", "set", "n.json", "--jq", ".a[.n] = 1"])
+        .assert()
+        .code(1)
+        .stdout("")
+        .stderr(predicates::str::contains("Array index too large"));
+    assert_eq!(read(&dir, "n.json"), "{\"n\": 4000000000000000000}\n");
+    dq().current_dir(dir.path())
+        .args([
+            "--no-color",
+            "query",
+            ".[4000000000000000000] = 1",
+            "-",
+            "--input-format",
+            "json",
+        ])
+        .write_stdin("null")
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("Array index too large"));
+}
