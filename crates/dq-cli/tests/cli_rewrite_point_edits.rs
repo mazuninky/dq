@@ -429,6 +429,46 @@ fn set_and_del_help_say_which_formats_lose_their_comments() {
     }
 }
 
+/// A write that replaces the whole document builds the layout anew from
+/// the value written, as a filter does: the header the file was read with
+/// does not come back.
+#[test]
+fn a_csv_whose_root_is_replaced_takes_the_new_rows_columns() {
+    let src = "a,b\n1,2\n3,4\n";
+    // Was: `a,b,z\n,,1\n`, the old header back.
+    for args in [
+        &["set", "c.csv", "", r#"[{"z": 1}]"#][..],
+        &[
+            "patch",
+            "c.csv",
+            r#"[{"op":"replace","path":"","value":[{"z":1}]}]"#,
+        ],
+        &[
+            "patch",
+            "c.csv",
+            r#"[{"op":"add","path":"","value":[{"z":1}]}]"#,
+        ],
+        &["merge", "c.csv", r#"[{"z": 1}]"#],
+    ] {
+        edits_to("c.csv", src, args, "z\n1\n");
+    }
+    // Not in HCL: a string set over an expression, at the root as below
+    // it, is the string asked for, not the expression it reads as.
+    edits_to(
+        "m.tf",
+        "a = var.x\nb = 1\n",
+        &["set", "m.tf", "", r#"{"a": "${var.x}", "b": 2}"#],
+        "a = \"$${var.x}\"\nb = 2\n",
+    );
+    // A point edit below the root keeps it.
+    edits_to(
+        "c.csv",
+        src,
+        &["set", "c.csv", "/0", r#"{"z": "1"}"#],
+        "a,b,z\n,,1\n3,4,\n",
+    );
+}
+
 /// `#xml` is the declaration at the top level, and nothing below it: an
 /// edit there is written, one that sets it in an element, where the writer
 /// has nowhere to put it, is refused.

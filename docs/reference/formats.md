@@ -315,7 +315,13 @@ and a new key is a new column after them. So `set /0 '{"b": "9", "a": "8"}'`
 leaves the header `a,b`, `del /0/b` leaves the cell empty and the column in
 place, and `set /- '{"a": "1"}'` on a file of the header `a,b` alone writes
 `a,b` / `,1`. A filter (`set --jq`, `fix.jq`) rebuilds the rows, and they
-decide the columns: `map(del(.a))` drops the column `a`. With no rows left,
+decide the columns: `map(del(.a))` drops the column `a`. So do rows set over
+the whole file — `set t.csv '' '[{"z": "1"}]'`, a patch `replace` or `add`
+at `""`, a `merge` of an array — which write `z` / `1`. (Elsewhere a value
+set over the whole document keeps what the file's layout notes, as a point
+edit does: in XML the order of the top-level items, in dotenv `export` on
+the keys still there; an HCL string set over an expression stays the string
+asked for.) With no rows left,
 the header the file was read with is written alone (`dq del t.csv /0` on
 `a,b` / `1,2` writes `a,b`), so a file of its header alone round-trips; a
 tree from another format with no rows writes an empty file. Any other shape is an

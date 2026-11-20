@@ -296,6 +296,21 @@ pub(crate) enum Layout {
 }
 
 impl Layout {
+    /// This layout for a filter's output, a tree built anew from the one it
+    /// was read with ([`Document::with_layout_of`]): in HCL, the
+    /// expressions that still read the same; in CSV and TSV, the header
+    /// only for a tree with no rows left
+    /// ([`crate::parsers::csv::CsvLayout::rebuilt`]); in XML and dotenv the
+    /// order of the top-level items and the `export` keys, which apply by
+    /// index and by key to whatever the new tree holds.
+    fn rebuilt(&self) -> Self {
+        match self {
+            Self::Hcl(layout) => Self::Hcl(layout.moved()),
+            Self::Csv(layout) => Self::Csv(layout.rebuilt()),
+            other => other.clone(),
+        }
+    }
+
     /// Whether this layout, `before`'s after a point edit, no longer notes
     /// every HCL expression `before` does where `before` does: the edit
     /// replaced or removed one, or moved one with an array item.
@@ -1063,11 +1078,7 @@ impl Document {
     #[must_use]
     pub fn with_layout_of(mut self, source: &Document) -> Self {
         if self.format == source.format {
-            self.layout = match &source.layout {
-                Layout::Hcl(layout) => Layout::Hcl(layout.moved()),
-                Layout::Csv(layout) => Layout::Csv(layout.rebuilt()),
-                other => other.clone(),
-            };
+            self.layout = source.layout.rebuilt();
         }
         self
     }
@@ -1541,7 +1552,9 @@ impl Document {
     }
 
     /// The layout to write this document with after the point edit
-    /// `action` (`set`, `delete`, `insert`) at `pointer`: in HCL, the
+    /// `action` (`set`, `delete`, `insert`) at `pointer`: in CSV and TSV,
+    /// at the root, the layout of a filter's rows
+    /// ([`crate::parsers::csv::CsvLayout::rebuilt`]); in HCL, the
     /// expressions the edit replaces or removes go, and those it moves up
     /// or down an array move with their values
     /// ([`crate::parsers::hcl::HclLayout::after_edit`]); in XML, the slots
@@ -1553,6 +1566,10 @@ impl Document {
     /// [`Error::Format`] when `pointer` runs through an HCL expression.
     fn layout_after_edit(&self, action: &'static str, pointer: &Pointer) -> Result<Layout> {
         let layout = match &self.layout {
+            // Rows set over the whole file (`set ''`, a patch `replace` or
+            // `add` at `""`, a merge of no object) decide the columns, as a
+            // filter's do: the header read with the file is not theirs.
+            Layout::Csv(layout) if pointer.is_root() => return Ok(Layout::Csv(layout.rebuilt())),
             Layout::Hcl(layout) => layout,
             Layout::Xml(layout) => {
                 return Ok(Layout::Xml(layout.after_edit(action, pointer, &self.value)));
