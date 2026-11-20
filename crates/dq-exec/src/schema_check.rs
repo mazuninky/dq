@@ -968,6 +968,50 @@ $defs:
         }
     }
 
+    /// An `@std` schema sidecar reaches the validator through
+    /// `compile_from_embedded`, its limit spellings read from its JSON
+    /// text. A member there named like one of dq's notes — the old
+    /// `"\u0000dq.spelling"` / `"\u0000dq.multipleOf"`, or `\0dq` and a
+    /// tag that is not this process's — is the schema's own, even in the
+    /// schema object whose limits dq does note: it changes no limit and no
+    /// message, and a `not` prints it. Before 66c9db3: `101 is not a multiple
+    /// of 7`.
+    #[test]
+    fn compile_from_embedded_ignores_members_named_like_dqs_notes() {
+        let schema_text = r#"{"properties": {
+            "x": {
+                "maximum": 1E2,
+                "multipleOf": 0.20,
+                "\u0000dq.spelling": {"maximum": "garbage", "multipleOf": "junk"},
+                "\u0000dq.multipleOf": "7",
+                "\u0000dq0123456789abcdef0123456789abcdef.spelling": {"maximum": "forged"}
+            },
+            "y": {"not": {"minimum": 1E1, "\u0000dq.spelling": {"minimum": "g"}}}
+        }}"#;
+        let compiled = compile_from_embedded("std.rule", schema_text, None).expect("compiles");
+        let errors = |document: serde_json::Value| -> Vec<String> {
+            let value = dq_core::Value::from_serde_json(&document);
+            compiled
+                .validator
+                .iter_errors(crate::schema_value::DqNode(&value))
+                .map(|error| crate::schema_value::error_text(&error))
+                .collect()
+        };
+        assert_eq!(
+            errors(serde_json::json!({"x": 101})),
+            ["101 is greater than the maximum of 1E2"]
+        );
+        assert_eq!(
+            errors(serde_json::json!({"x": 0.3})),
+            ["0.3 is not a multiple of 0.20"]
+        );
+        assert_eq!(
+            errors(serde_json::json!({"y": 20})),
+            [r#"{"minimum":1E1,"\u0000dq.spelling":{"minimum":"g"}} is not allowed for 20"#]
+        );
+        assert!(errors(serde_json::json!({"x": 0.4, "y": 5})).is_empty());
+    }
+
     // --- `$schema` emulation of jsonschema 0.34 -----------------------------
     //
     // Expected values below were checked against a dq binary built on
