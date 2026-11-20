@@ -176,6 +176,10 @@ pub struct FrontmatterPayload {
     pub kind: FrontmatterKind,
     /// Body bytes following the closing delimiter, preserved verbatim.
     pub body: Vec<u8>,
+    /// Whether a UTF-8 byte order mark stood before the opening
+    /// delimiter: the writer puts it back. (Without a header the mark
+    /// stays in [`Self::body`].)
+    pub bom: bool,
 }
 
 /// Inner format used to parse a frontmatter header.
@@ -878,12 +882,27 @@ impl Document {
             spans: SpanMap::new(),
             format: FormatTag::Frontmatter,
             multi_doc: false,
-            frontmatter_payload: Some(FrontmatterPayload { kind, body }),
+            frontmatter_payload: Some(FrontmatterPayload {
+                kind,
+                body,
+                bom: false,
+            }),
             provenance: ProvenanceMap::new(),
             write_aware: false,
             layout: Layout::None,
             rewrite: RewriteState::default(),
         }
+    }
+
+    /// [`Document::frontmatter`] for a file that starts with a UTF-8 byte
+    /// order mark before its header: the writer writes the mark back.
+    #[must_use]
+    pub fn frontmatter_after_bom(value: Value, body: Vec<u8>, kind: FrontmatterKind) -> Self {
+        let mut doc = Self::frontmatter(value, body, kind);
+        if let Some(payload) = doc.frontmatter_payload.as_mut() {
+            payload.bom = true;
+        }
+        doc
     }
 
     // -------------------------------------------------------------------

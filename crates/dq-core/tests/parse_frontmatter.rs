@@ -177,3 +177,50 @@ fn every_frontmatter_kind_writes_a_float_in_its_shortest_form() {
         assert_eq!(String::from_utf8(out).expect("UTF-8"), expected, "{input}");
     }
 }
+
+#[test]
+fn frontmatter_after_a_bom_is_read_and_the_bom_written_back() {
+    for input in [
+        "\u{feff}---\ntitle: Hello\n---\n# Body\n",
+        "\u{feff}+++\ntitle = \"Hello\"\n+++\n# Body\n",
+        "\u{feff}{\"title\": \"Hello\"}\n\n# Body\n",
+    ] {
+        let doc = parse_md(input);
+        let Value::Map(m) = doc.value() else {
+            panic!("{input:?}: expected a map, got {:?}", doc.value());
+        };
+        assert_eq!(
+            m.get("title"),
+            Some(&Value::String("Hello".into())),
+            "{input:?}"
+        );
+        let payload = doc.frontmatter_payload().expect("payload must exist");
+        assert_eq!(payload.body, b"# Body\n", "{input:?}");
+
+        let mut out = Vec::new();
+        frontmatter().write(&doc, &mut out).expect("write");
+        assert!(out.starts_with("\u{feff}".as_bytes()), "{input:?}: {out:?}");
+        assert_eq!(
+            parse_md(std::str::from_utf8(&out).expect("utf-8")).value(),
+            doc.value(),
+            "{input:?}"
+        );
+    }
+    // The YAML header is written as it was read.
+    let input = "\u{feff}---\ntitle: Hello\n---\n# Body\n";
+    let mut out = Vec::new();
+    frontmatter()
+        .write(&parse_md(input), &mut out)
+        .expect("write");
+    assert_eq!(String::from_utf8(out).expect("utf-8"), input);
+}
+
+#[test]
+fn a_bom_without_frontmatter_stays_in_the_body() {
+    let input = "\u{feff}# Title\n";
+    let doc = parse_md(input);
+    assert_eq!(doc.value(), &Value::Map(indexmap::IndexMap::new()));
+    let mut out = Vec::new();
+    frontmatter().write(&doc, &mut out).expect("write");
+    assert_eq!(out, input.as_bytes());
+}

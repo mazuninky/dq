@@ -41,6 +41,9 @@ use crate::parsers::{Json, Toml, Yaml};
 /// same scan-limit constant.
 pub(crate) const FRONTMATTER_SCAN_LIMIT: usize = 64 * 1024;
 
+/// The UTF-8 byte order mark.
+const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
+
 /// Markdown frontmatter format implementation.
 #[derive(Debug, Clone, Copy)]
 pub struct Frontmatter;
@@ -55,28 +58,40 @@ impl Format for Frontmatter {
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<Document> {
+        // A UTF-8 byte order mark before the opening delimiter does not
+        // hide the header (as in the Markdown parser); the writer puts it
+        // back. Without a header the mark stays in the body.
+        let (header_start, after_bom) = match bytes.strip_prefix(UTF8_BOM) {
+            Some(rest) => (rest, true),
+            None => (bytes, false),
+        };
+        let document = if after_bom {
+            Document::frontmatter_after_bom
+        } else {
+            Document::frontmatter
+        };
         // Detect leading delimiter. Each branch returns either a parsed
         // (header_value, body_bytes, kind) triple or `None` — in which case
         // we fall through to the no-frontmatter empty-map default.
-        if let Some((header_bytes, body_bytes)) = detect_yaml_frontmatter(bytes) {
+        if let Some((header_bytes, body_bytes)) = detect_yaml_frontmatter(header_start) {
             let header_doc = Yaml.parse(header_bytes)?;
-            return Ok(Document::frontmatter(
+            return Ok(document(
                 header_doc.value().clone(),
                 body_bytes.to_vec(),
                 FrontmatterKind::Yaml,
             ));
         }
-        if let Some((header_bytes, body_bytes)) = detect_toml_frontmatter(bytes) {
+        if let Some((header_bytes, body_bytes)) = detect_toml_frontmatter(header_start) {
             let header_doc = Toml.parse(header_bytes)?;
-            return Ok(Document::frontmatter(
+            return Ok(document(
                 header_doc.value().clone(),
                 body_bytes.to_vec(),
                 FrontmatterKind::Toml,
             ));
         }
-        if let Some((header_bytes, body_bytes)) = detect_json_frontmatter(bytes) {
+        if let Some((header_bytes, body_bytes)) = detect_json_frontmatter(header_start) {
             let header_doc = Json.parse(header_bytes)?;
-            return Ok(Document::frontmatter(
+            return Ok(document(
                 header_doc.value().clone(),
                 body_bytes.to_vec(),
                 FrontmatterKind::Json,
@@ -108,6 +123,9 @@ impl Format for Frontmatter {
             return write_io(w, &payload.body);
         }
 
+        if payload.bom {
+            write_io(w, UTF8_BOM)?;
+        }
         match payload.kind {
             FrontmatterKind::Yaml => {
                 write_io(w, b"---\n")?;

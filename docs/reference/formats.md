@@ -355,7 +355,8 @@ written by `convert -F frontmatter`): the value is the frontmatter header (YAML,
 TOML or JSON, detected by delimiter) and the body is kept as opaque bytes.
 No frontmatter within the first 64 KiB gives an empty map and the whole file
 as body. Re-emitting serialises the header through its own format and
-appends the body verbatim.
+appends the body verbatim. A UTF-8 byte order mark before the header is
+skipped when reading, as in the Markdown parser, and written back before it.
 
 ### XML
 
