@@ -168,7 +168,12 @@ line feed included), DEL and every C1 control (U+0080–U+009F, among them
 U+009B CSI, which starts a terminal escape sequence on its own, and U+0085
 NEL) in a key, a value or a `validate` snippet prints as `\xNN`, `NN` being
 the code point in lowercase hex — `\x1b`, `\x0a`, `\x9b` — as YAML spells
-it. Other non-ASCII text (`é`, NBSP, emoji) prints as is.
+it. The invisible direction controls (U+200E LRM, U+200F RLM, U+202A–U+202E,
+U+2066–U+2069 — the characters of a Trojan Source attack, which reorder the
+text a terminal shows) and the line and paragraph separators U+2028 and
+U+2029 print as `\uNNNN` in four lowercase hex digits — `\u202e`, `\u2028`
+— as a YAML double-quoted string reads them. Other non-ASCII text (`é`,
+NBSP, ZWJ, emoji) prints as is.
 
 `sarif`, `junit` and `tap` only render the diagnostics shape produced by
 `lint`, `check`, `fix` and `validate`:

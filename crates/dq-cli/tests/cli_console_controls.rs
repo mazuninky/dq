@@ -5,7 +5,10 @@
 //! U+009B (CSI) starts a terminal control sequence on its own, the way
 //! `ESC [` does. They are now escaped the same way, `\xNN` with the code
 //! point (`\x9b`, as dq's YAML writer spells it), in values, in keys and in
-//! the snippet `validate` prints. Other non-ASCII text stays raw.
+//! the snippet `validate` prints. The invisible direction controls of
+//! Trojan Source and the line / paragraph separators went through raw as
+//! well; they print as `\uNNNN`, as a YAML double-quoted string reads them.
+//! Other non-ASCII text stays raw.
 
 use std::path::Path;
 
@@ -81,6 +84,61 @@ fn validate_escapes_c1_controls_in_the_snippet() {
     );
     assert!(
         stderr.contains("snippet: {\"a\": \"x\\x9by\" oops}"),
+        "expected the escaped snippet, got: {stderr:?}"
+    );
+}
+
+/// The invisible direction controls of Trojan Source — LRM, RLM, the
+/// embeddings and overrides U+202A–U+202E, the isolates U+2066–U+2069 —
+/// and the line and paragraph separators print as `\uNNNN`, lowercase hex,
+/// as a YAML double-quoted string reads them: they reorder or break the
+/// line a terminal shows without being visible themselves.
+#[test]
+fn get_escapes_direction_controls_and_separators_in_values_and_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = write(
+        dir.path(),
+        "bidi.json",
+        "{\"k\\u202ex\": \"a\\u200eb\\u200fc\\u202ad\\u202be\\u202cf\\u202dg\\u2066h\\u2067i\\u2068j\\u2069k\\u2028l\\u2029m\"}",
+    );
+    assert_eq!(
+        stdout_of(&["--no-color", "get", &file, "/k\u{202e}x"]),
+        "a\\u200eb\\u200fc\\u202ad\\u202be\\u202cf\\u202dg\\u2066h\\u2067i\\u2068j\\u2069k\\u2028l\\u2029m\n"
+    );
+    let whole = stdout_of(&["--no-color", "get", &file, ""]);
+    assert!(
+        whole.starts_with("k\\u202ex: a\\u200eb"),
+        "a key is escaped too, got: {whole:?}"
+    );
+    // Neighbours stay raw: ZWJ (U+200D) in an emoji sequence, U+2065
+    // (unassigned) and U+206A are not in the set.
+    let file = write(
+        dir.path(),
+        "near.json",
+        "{\"v\": \"\\u200d\\u2065\\u206a\"}",
+    );
+    assert_eq!(
+        stdout_of(&["--no-color", "get", &file, "/v"]),
+        "\u{200d}\u{2065}\u{206a}\n"
+    );
+}
+
+/// The `validate` snippet escapes them as well.
+#[test]
+fn validate_escapes_direction_controls_in_the_snippet() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = write(dir.path(), "bad.json", "{\"a\": \"x\u{202e}y\" oops}\n");
+    let out = dq()
+        .args(["--no-color", "validate", &file])
+        .assert()
+        .code(4);
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).expect("UTF-8 stderr");
+    assert!(
+        !stderr.contains('\u{202e}'),
+        "raw U+202E reached the terminal: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("snippet: {\"a\": \"x\\u202ey\" oops}"),
         "expected the escaped snippet, got: {stderr:?}"
     );
 }

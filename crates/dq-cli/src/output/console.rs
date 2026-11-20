@@ -47,18 +47,30 @@ impl Reporter for ConsoleReporter {
 /// `c2 9b`. A C1 control is escaped for the same reason as ESC: U+009B
 /// starts a terminal control sequence on its own.
 ///
+/// The invisible direction controls (U+200E LRM, U+200F RLM, U+202A–U+202E
+/// embeddings and overrides, U+2066–U+2069 isolates — the characters of
+/// Trojan Source) and the separators U+2028 / U+2029 print as `\uNNNN`, four
+/// lowercase hex digits, as a YAML double-quoted string reads them
+/// (`\u202e`): they reorder or break the line a terminal shows while being
+/// invisible themselves.
+///
 /// Returns the borrowed input when no escaping is needed. Otherwise
 /// allocates a new `String`. Every other character, non-ASCII included
 /// (é, NBSP, emoji), is copied whole: the walk is over chars, not bytes,
 /// so a multi-byte character next to an escaped control stays intact.
 fn escape_control(s: &str) -> Cow<'_, str> {
-    if !s.chars().any(is_escaped_control) {
+    if !s
+        .chars()
+        .any(|c| is_escaped_control(c) || is_invisible_layout(c))
+    {
         return Cow::Borrowed(s);
     }
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         if is_escaped_control(c) {
             out.push_str(&format!("\\x{:02x}", u32::from(c)));
+        } else if is_invisible_layout(c) {
+            out.push_str(&format!("\\u{:04x}", u32::from(c)));
         } else {
             out.push(c);
         }
@@ -70,6 +82,16 @@ fn escape_control(s: &str) -> Cow<'_, str> {
 /// `char::is_control` tests, spelled out so the ranges are visible.
 fn is_escaped_control(c: char) -> bool {
     matches!(c, '\u{0}'..='\u{1f}' | '\u{7f}'..='\u{9f}')
+}
+
+/// A bidi control that changes the order a terminal shows text in (LRM,
+/// RLM, the embeddings, overrides and isolates) or a line / paragraph
+/// separator.
+fn is_invisible_layout(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{2028}' | '\u{2029}'
+    )
 }
 
 /// A number as the console prints it: an integer as its literal, a float
@@ -280,6 +302,16 @@ mod tests {
             escape_control("\u{80}a\u{85}\u{9b}31m\u{9f}").into_owned(),
             "\\x80a\\x85\\x9b31m\\x9f"
         );
+    }
+
+    #[test]
+    fn escape_control_escapes_direction_controls_as_u_escapes() {
+        assert_eq!(
+            escape_control("a\u{202e}b\u{2066}c\u{2028}\u{1b}").into_owned(),
+            "a\\u202eb\\u2066c\\u2028\\x1b"
+        );
+        let near = "\u{200d}\u{2065}\u{206a}\u{202f}";
+        assert!(matches!(escape_control(near), Cow::Borrowed(b) if b == near));
     }
 
     #[test]
