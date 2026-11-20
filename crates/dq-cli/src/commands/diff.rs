@@ -73,10 +73,20 @@ pub fn run(
         // `preserve_order`) and unified-diff the textual forms. JSON is the
         // lowest-common-denominator stable representation that both YAML and
         // TOML inputs can be normalised through.
-        let a_json = pretty_json(&doc_a.value().to_serde_json())?;
-        let b_json = pretty_json(&doc_b.value().to_serde_json())?;
-        let label = format!("{} -> {}", args.a, args.b);
-        let unified = crate::diff::render_unified(&a_json, &b_json, &label, use_color);
+        //
+        // Each text ends with a line break: they are dq's renderings, not
+        // the files, so a `\ No newline at end of file` marker would say
+        // something about the files that is not so. The labels are the
+        // paths as given, as `diff -u FILE1 FILE2` prints them.
+        let a_json = pretty_json(&doc_a.value().to_serde_json())? + "\n";
+        let b_json = pretty_json(&doc_b.value().to_serde_json())? + "\n";
+        let unified = crate::diff::render_unified_files(
+            &a_json,
+            &b_json,
+            args.a.as_str(),
+            args.b.as_str(),
+            use_color,
+        );
         out.write_all(unified.as_bytes())?;
         return Ok(());
     }
@@ -319,8 +329,18 @@ mod tests {
         };
         let reporter = JsonReporter;
         let mut out: Vec<u8> = Vec::new();
+        let (label_a, label_b) = (args.a.to_string(), args.b.to_string());
         run(&cli, &args, None, false, &reporter, &mut out).expect("unified diff");
         let stdout = String::from_utf8(out).expect("utf-8 stdout");
+        // The paths as given label the two sides; the JSON texts end with a
+        // line break, so no `\ No newline at end of file` marker.
+        assert_eq!(
+            stdout,
+            format!(
+                "--- {label_a}\n+++ {label_b}\n@@ -1,5 +1,5 @@\n {{\n   \"server\": {{\n\
+                 -    \"port\": 8080\n+    \"port\": 9090\n   }}\n }}\n"
+            )
+        );
         assert!(
             stdout.contains("---"),
             "unified diff must contain `---` header, got:\n{stdout}",

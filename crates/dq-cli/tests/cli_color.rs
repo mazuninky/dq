@@ -156,10 +156,7 @@ fn diff_unified_when_piped_is_no_color() {
     let stdout = String::from_utf8(out.get_output().stdout.clone()).expect("UTF-8");
     assert_eq!(
         stdout,
-        format!(
-            "--- a/{a} -> {b}\n+++ b/{a} -> {b}\n@@ -1,3 +1,3 @@\n {{\n-  \"x\": 1\n+  \"x\": 2\n }}\n\
-             \\ No newline at end of file\n"
-        ),
+        format!("--- {a}\n+++ {b}\n@@ -1,3 +1,3 @@\n {{\n-  \"x\": 1\n+  \"x\": 2\n }}\n"),
     );
 }
 

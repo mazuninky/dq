@@ -49,7 +49,10 @@ Exactly one of:
 - **default** — the changed document goes to stdout; the file is untouched.
 - `-i` / `--in-place` — the file is replaced atomically; stdout stays empty.
 - `--diff` — a unified diff (original vs. changed) on stdout; the file is
-  untouched.
+  untouched. The headers are `--- a/<path>` and `+++ b/<path>`, the path as
+  given, as `git diff` writes them; a shown line that ends the file without a
+  line break is followed by `\ No newline at end of file`, as in GNU diff
+  and git.
 - `--check` — nothing is written or printed except `would modify: <path>`
   lines and a count; exit 1 if any file would change, 0 otherwise.
 
@@ -172,8 +175,11 @@ Read-only; compares two files structurally (each format detected from its
 name, so YAML can be compared with JSON). By default the result is a minimal
 RFC 6902 patch from `a` to `b` — equal subtrees produce nothing, a replaced
 parent is not followed by child ops — rendered through the reporter. `--unified`
-prints a textual unified diff of the two documents rendered as JSON. Equal
-documents give an empty list. Feeding the output of `diff -F json` to
+prints a textual unified diff of the two documents rendered as JSON, each
+text ending with a line break (so never a `\ No newline at end of file`
+marker: that would describe dq's rendering, not the files), under the two
+paths as given on the command line, as `diff -u` labels them (`--- a.yaml`,
+`+++ b.json`, no timestamps). Equal documents give an empty list. Feeding the output of `diff -F json` to
 `patch` turns `a` into `b`. Big numbers print as numbers, and `1e400` equals
 `1e+400`.
 

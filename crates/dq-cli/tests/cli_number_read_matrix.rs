@@ -350,11 +350,8 @@ fn diff_and_convert_spell_a_toml_nan_as_yaml_does() {
             (vec!["convert", "a.toml"], ok("x: .nan\ny: 1\n")),
             (
                 vec!["diff", "--unified", "a.toml", "b.toml"],
-                ok(
-                    "--- a/a.toml -> b.toml\n+++ b/a.toml -> b.toml\n@@ -1,4 +1,4 @@\n {\n\
-                    -  \"x\": \".nan\",\n-  \"y\": 1\n+  \"x\": \".inf\",\n+  \"y\": 2\n }\n\
-                    \\ No newline at end of file\n",
-                ),
+                ok("--- a.toml\n+++ b.toml\n@@ -1,4 +1,4 @@\n {\n\
+                    -  \"x\": \".nan\",\n-  \"y\": 1\n+  \"x\": \".inf\",\n+  \"y\": 2\n }\n"),
             ),
         ],
     );
@@ -1577,11 +1574,9 @@ fn diff_spells_a_patch_float_as_its_output_format_does() {
             ),
             (
                 diff(&["--unified"]),
-                ok(
-                    "--- a/a.yaml -> b.yaml\n+++ b/a.yaml -> b.yaml\n@@ -1,4 +1,5 @@\n {\n\
+                ok("--- a.yaml\n+++ b.yaml\n@@ -1,4 +1,5 @@\n {\n\
                     -  \"a\": 1,\n-  \"b\": 3.0\n+  \"a\": 1e300,\n+  \"b\": 1.5e20,\n\
-                    +  \"c\": 1e-7\n }\n\\ No newline at end of file\n",
-                ),
+                    +  \"c\": 1e-7\n }\n"),
             ),
         ],
     );
