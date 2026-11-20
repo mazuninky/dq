@@ -135,9 +135,14 @@ impl<'a> FileOp for FmtFileOp<'a> {
         // write each so it reads back as the same string, and still not
         // change the reading.
         if dq_core::template_guard::detect_templates(doc.original_bytes()).is_some() {
-            dq_core::template_guard::check_templates_kept(doc.value(), &[], None, &buf, |b| {
-                input_fmt.parse(b)
-            })
+            dq_core::template_guard::check_templates_kept(
+                doc.value(),
+                &[],
+                doc.original_bytes(),
+                false,
+                &buf,
+                |b| input_fmt.parse(b),
+            )
             .map_err(anyhow::Error::new)?;
         }
 

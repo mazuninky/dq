@@ -328,7 +328,8 @@ impl<'a> FileOp for FixFileOp<'a> {
             dq_core::template_guard::check_templates_kept(
                 document.value(),
                 &[],
-                None,
+                &original_bytes,
+                false,
                 &final_bytes,
                 |b| super::io_helpers::parse_for_edit(format, b),
             )

@@ -295,13 +295,130 @@ impl<'de> Visitor<'de> for PatchOpVisitor {
 ///
 /// [D2]: ../../../../docs/decisions.md
 pub fn apply_patch(doc: &mut Document, ops: &[PatchOp]) -> Result<()> {
+    apply_patch_edits(doc, ops).map(drop)
+}
+
+/// [`apply_patch`], returning the nodes of `doc` as it was before the
+/// patch that the patch replaced or removed — the pointers whose templates
+/// the template guard lets go.
+///
+/// Each op addresses the document the ops before it left, so its pointer
+/// is carried back through their index shifts, as RFC 6902 sequences the
+/// ops: after an `add` at `/l/0`, `/l/2` names the original `/l/1`, and
+/// `/l/0` the new item, no original node. An `add` (or the `path` of a
+/// `copy` / `move`) into an array inserts and replaces nothing; into a map
+/// it replaces the member. A `remove` (or the `from` of a `move`) removes
+/// its node, a `replace` replaces it.
+///
+/// # Errors
+///
+/// As [`apply_patch`]; `doc` is left as it was.
+pub fn apply_patch_edits(doc: &mut Document, ops: &[PatchOp]) -> Result<Vec<Pointer>> {
     let mut working = doc.clone();
     let stream = working.values().is_some();
+    let mut shifts: Vec<Shift> = Vec::new();
+    let mut edited = Vec::new();
     for op in ops {
+        let removed = match op {
+            PatchOp::Remove { path } => Some(path),
+            PatchOp::Move { from, .. } => Some(from),
+            _ => None,
+        };
+        let removed_at = removed.and_then(|path| array_slot(&working, path, false));
         apply_one(&mut working, op, stream)?;
+        if let Some(path) = removed {
+            edited.extend(to_original(path, &shifts));
+            if let Some(index) = removed_at {
+                shifts.push(Shift::new(path, index, false));
+            }
+        }
+        match op {
+            PatchOp::Replace { path, .. } => edited.extend(to_original(path, &shifts)),
+            PatchOp::Add { path, .. } | PatchOp::Copy { path, .. } | PatchOp::Move { path, .. } => {
+                match array_slot(&working, path, true) {
+                    Some(index) => shifts.push(Shift::new(path, index, true)),
+                    None => edited.extend(to_original(path, &shifts)),
+                }
+            }
+            PatchOp::Remove { .. } | PatchOp::Test { .. } => {}
+        }
     }
     *doc = working;
-    Ok(())
+    Ok(edited)
+}
+
+/// An item an op inserted into or removed from an array, moving the items
+/// after it.
+struct Shift {
+    /// The array's pointer, as segments.
+    array: Vec<String>,
+    /// The item's index.
+    index: usize,
+    /// Inserted (`true`) or removed.
+    insert: bool,
+}
+
+impl Shift {
+    fn new(path: &Pointer, index: usize, insert: bool) -> Self {
+        let mut array = tokens(path);
+        array.pop();
+        Self {
+            array,
+            index,
+            insert,
+        }
+    }
+}
+
+/// The segments of `pointer` as text.
+fn tokens(pointer: &Pointer) -> Vec<String> {
+    pointer
+        .segments()
+        .iter()
+        .map(|segment| match segment {
+            Segment::Key(key) => key.clone(),
+            Segment::Index(index) => index.to_string(),
+        })
+        .collect()
+}
+
+/// The index of the item `path` names in its parent array in `doc`; `None`
+/// when the parent is not an array. `-` is the length — the slot an append
+/// fills, which is the last item once it is filled (`filled`).
+fn array_slot(doc: &Document, path: &Pointer, filled: bool) -> Option<usize> {
+    let (last, parent) = path.segments().split_last()?;
+    let Ok(Value::Array(items)) = Pointer::new(parent.to_vec()).resolve(doc.value()) else {
+        return None;
+    };
+    match last {
+        Segment::Index(index) => Some(*index),
+        Segment::Key(key) if key == "-" => Some(items.len() - usize::from(filled)),
+        Segment::Key(key) => key.parse().ok(),
+    }
+}
+
+/// `pointer`, which names a node after `shifts`, as it names the node
+/// before them; `None` when one of them inserted the node or a node above
+/// it.
+fn to_original(pointer: &Pointer, shifts: &[Shift]) -> Option<Pointer> {
+    let mut tokens = tokens(pointer);
+    for shift in shifts.iter().rev() {
+        let depth = shift.array.len();
+        if tokens.len() <= depth || tokens[..depth] != shift.array[..] {
+            continue;
+        }
+        let Ok(index) = tokens[depth].parse::<usize>() else {
+            continue;
+        };
+        let index = match (shift.insert, index.cmp(&shift.index)) {
+            (true, std::cmp::Ordering::Equal) => return None,
+            (true, std::cmp::Ordering::Greater) => index - 1,
+            (false, std::cmp::Ordering::Equal | std::cmp::Ordering::Greater) => index + 1,
+            (_, std::cmp::Ordering::Less) => index,
+        };
+        tokens[depth] = index.to_string();
+    }
+    Some(Pointer::new(tokens.into_iter().map(Segment::Key).collect()))
 }
 
 /// RFC 6902 §4.1: the target of an `add` (and of a `copy` / `move`) is
@@ -962,5 +1079,59 @@ mod tests {
             other => panic!("expected Path/MissingKey, got {other:?}"),
         }
         assert_eq!(doc.original_bytes(), original.as_slice());
+    }
+
+    fn edits(text: &str, ops: &str) -> Vec<String> {
+        let mut doc = crate::parse_yaml_stream_with_spans(text.as_bytes()).unwrap();
+        let ops: Vec<PatchOp> = serde_json::from_str(ops).unwrap();
+        apply_patch_edits(&mut doc, &ops)
+            .unwrap()
+            .iter()
+            .map(Pointer::as_canonical)
+            .collect()
+    }
+
+    #[test]
+    fn edits_carry_each_path_back_through_earlier_index_shifts() {
+        let text = "l: [a, b, c]\nm: {k: 1}\n";
+        // An insert replaces nothing; the item after it is the original one
+        // before it.
+        assert_eq!(
+            edits(
+                text,
+                r#"[{"op":"add","path":"/l/0","value":"x"},
+                    {"op":"replace","path":"/l/2","value":"y"}]"#
+            ),
+            ["/l/1"]
+        );
+        // The inserted item itself is no original node.
+        assert!(
+            edits(
+                text,
+                r#"[{"op":"add","path":"/l/1","value":"x"},
+                    {"op":"replace","path":"/l/1","value":"y"}]"#
+            )
+            .is_empty()
+        );
+        // After a removal the index names the item that moved down; `-`
+        // appends.
+        assert_eq!(
+            edits(
+                text,
+                r#"[{"op":"remove","path":"/l/0"},
+                    {"op":"remove","path":"/l/0"},
+                    {"op":"add","path":"/l/-","value":"z"}]"#
+            ),
+            ["/l/0", "/l/1"]
+        );
+        // A move removes its `from`; into a map its `path` is a member set.
+        assert_eq!(
+            edits(
+                text,
+                r#"[{"op":"move","from":"/l/0","path":"/m/k"},
+                    {"op":"replace","path":"/l/0","value":"y"}]"#
+            ),
+            ["/l/0", "/m/k", "/l/1"]
+        );
     }
 }

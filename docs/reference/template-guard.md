@@ -17,12 +17,20 @@ Every command that parses a file runs the guard — `get`, `exists`, `keys`,
 reads — on the format `--input-format` or the file name picks, stdin
 included. It refuses a file only when its templates change what the parser
 reads. When the detection below matches, the file is parsed twice: as it
-is, and with every template block swapped for a placeholder. If both parse
-and hold the same data once each placeholder is put back as the template
-text, the templates do not matter to the reading and the command goes on
-with the file as it is. A GitHub Actions workflow
-(`run: echo ${{ github.ref }}`, a plain scalar) and a `{{ … }}` inside a
-quoted string pass this way, in every format. A Helm
+is, and with every template block swapped for a placeholder (letters only,
+so that no format reads it as markup). If both parse and hold the same data,
+each placeholder standing where the string read as it is holds one template
+block, the templates do not matter to the reading and the command goes on
+with the file as it is. The block's text is not compared: a quoted string
+reads its escapes out of the block (`'${{ a == ''b'' }}'` in YAML,
+`"${{ f(\"y\") }}"` in YAML, JSON or TOML), so the block as read is not the
+block as written. The `position` of every Markdown node is left out of the
+comparison: a placeholder longer or shorter than its block moves it. A GitHub
+Actions workflow (`run: echo ${{ github.ref }}`, a plain scalar), a
+`{{ … }}` inside a quoted string, with escapes or without, and a template in
+the text, a code span or a fenced block of a Markdown file pass this way, in
+every format. A template that changes what Markdown frontmatter reads is
+refused as in a YAML file. A Helm
 `port: {{ .Values.port }}`, which YAML reads as a flow mapping, or a
 `{{- if … }}` line, on which the parser fails, is refused (`TemplatedFile`,
 exit 3).
@@ -44,9 +52,21 @@ with a template changed:
   remove the node a template is in, `merge` the members its patch names, and
   a value set may bring a template of its own.
 - A textual edit (YAML, JSON, TOML) must leave every template block it did
-  not target byte for byte as it was.
+  not target byte for byte as it was. A block is told apart by where it
+  stands in the file, not by its text, so the same block on two lines is two
+  blocks. The blocks of a targeted node may go, and so may those in the
+  comments on its lines (`del /k` on `k: 1 # ${{ c }}`), and those in the
+  comments of its key line when the edit removes that line.
+- `patch` applies its ops in sequence, as RFC 6902 says: an op's path names
+  the document the ops before it left. The guard carries each path back
+  through the index shifts of those ops, so after `add /steps/0`,
+  `replace /steps/3/name` targets the original `/steps/2`; an `add` (or the
+  `path` of a `copy` or `move`) into an array inserts and targets no original
+  node.
 
-The message names the template's line and says the edit would not keep it.
+The message names the line of the template not kept — the one the edit
+would lose, not the first block with the same text — and says the edit
+would not keep it.
 
 `lint` and `check` treat a refused file as they treat a file that fails to
 parse: the run stops with exit 3. There is no lint diagnostic of its own for

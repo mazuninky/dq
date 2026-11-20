@@ -105,12 +105,15 @@ impl<'a> FileOp for PatchFileOp<'a> {
 
         // Apply the patch atomically — on any failure (including a failing
         // `test`), the engine leaves `document` untouched (clone-on-apply).
-        dq_core::apply_patch(&mut document, self.ops).map_err(anyhow::Error::new)?;
+        // `edited` are the nodes of the file as read that the ops replaced
+        // or removed, each op's path carried back through the index shifts
+        // of the ops before it.
+        let edited =
+            dq_core::apply_patch_edits(&mut document, self.ops).map_err(anyhow::Error::new)?;
 
         // Compute final bytes: placeholders put back, or the templates
-        // checked as kept outside the paths the ops name.
-        let final_bytes =
-            finish_edit(&guard, format, &document, &patch_targets(self.ops), textual)?;
+        // checked as kept outside the nodes the ops replaced or removed.
+        let final_bytes = finish_edit(&guard, format, &document, &edited, textual)?;
 
         // The bulk driver handles `-i` and `--check` uniformly — we only
         // need to compute the diff string when `--diff` mode is active so
@@ -133,28 +136,6 @@ impl<'a> FileOp for PatchFileOp<'a> {
             diff,
         })
     }
-}
-
-/// The pointers `ops` change on purpose — every op's `path`, and the
-/// `from` a `move` empties — whose templates the template guard lets go.
-fn patch_targets(ops: &[PatchOp]) -> Vec<dq_core::Pointer> {
-    let mut targets = Vec::new();
-    for op in ops {
-        match op {
-            PatchOp::Add { path, .. }
-            | PatchOp::Remove { path }
-            | PatchOp::Replace { path, .. } => {
-                targets.push(path.clone());
-            }
-            PatchOp::Move { from, path } => {
-                targets.push(from.clone());
-                targets.push(path.clone());
-            }
-            PatchOp::Copy { path, .. } => targets.push(path.clone()),
-            PatchOp::Test { .. } => {}
-        }
-    }
-    targets
 }
 
 /// Resolve the patch source (inline / stdin / `@<path>` / `--ops-from`) into

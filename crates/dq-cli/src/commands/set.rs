@@ -362,7 +362,8 @@ impl<'a> FileOp for JqFileOp<'a> {
             dq_core::template_guard::check_templates_kept(
                 new_doc.value(),
                 &[],
-                None,
+                &original_bytes,
+                false,
                 &final_bytes,
                 |b| parse_for_edit(format, b),
             )

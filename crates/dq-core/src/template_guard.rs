@@ -212,17 +212,137 @@ pub fn guarded_parse(
             };
             let refuse = || crate::Error::templated_file(marker.clone());
             let as_is = parse(bytes).map_err(|_| refuse())?;
-            let (substituted, map) = substitute_placeholders(bytes);
-            let mut placeheld = parse(&substituted).map_err(|_| refuse())?;
-            restore_in_value(placeheld.value_mut(), &map);
+            let held = Held::new(bytes);
+            let placeheld = parse(&held.text).map_err(|_| refuse())?;
+            let positions = as_is.format() == crate::FormatTag::Markdown;
             if as_is.is_multi() == placeheld.is_multi()
-                && as_is.value().same_data(placeheld.value())
+                && same_reading(as_is.value(), placeheld.value(), positions)
             {
                 Ok(as_is)
             } else {
                 Err(refuse())
             }
         }
+    }
+}
+
+/// What the guard's placeholders start with: letters only, so that no
+/// format reads one as anything but plain text (Markdown reads the
+/// underscores of `__DQ_TPL_0__` as strong emphasis), and a placeholder
+/// is a word in YAML, a bare key in TOML.
+const HELD_PREFIX: &str = "DQtplxq";
+/// What the guard's placeholders end with.
+const HELD_SUFFIX: &str = "qx";
+
+/// The text a reading is compared in, with every template block of the
+/// file swapped for a placeholder `DQtplxq<N>qx` — the guard's own; the
+/// `--raw-template-strings` ones are [`substitute_placeholders`].
+struct Held {
+    /// The text with placeholders.
+    text: Vec<u8>,
+    /// Every block in order, `N` of placeholder `N`.
+    blocks: Vec<HeldBlock>,
+}
+
+/// A template block of the text [`Held`] holds.
+struct HeldBlock {
+    /// The block as written.
+    text: String,
+    /// Its 1-based line.
+    line: u32,
+    /// Where its placeholder starts in [`Held::text`].
+    at: usize,
+}
+
+impl Held {
+    fn new(bytes: &[u8]) -> Self {
+        let mut text = Vec::with_capacity(bytes.len());
+        let mut blocks = Vec::new();
+        let mut last_end = 0usize;
+        let mut line = 1u32;
+        for (n, m) in substitution_regex().find_iter(bytes).enumerate() {
+            let before = &bytes[last_end..m.start()];
+            line +=
+                u32::try_from(before.iter().filter(|&&b| b == b'\n').count()).unwrap_or(u32::MAX);
+            text.extend_from_slice(before);
+            blocks.push(HeldBlock {
+                text: String::from_utf8_lossy(m.as_bytes()).into_owned(),
+                line,
+                at: text.len(),
+            });
+            text.extend_from_slice(format!("{HELD_PREFIX}{n}{HELD_SUFFIX}").as_bytes());
+            last_end = m.end();
+        }
+        text.extend_from_slice(&bytes[last_end..]);
+        Self { text, blocks }
+    }
+}
+
+/// The guard's placeholders in a string.
+fn held_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(&format!("{HELD_PREFIX}([0-9]+){HELD_SUFFIX}"))
+            .expect("placeholder regex must compile")
+    })
+}
+
+/// A template block in a string as read — the parser has already taken
+/// the quoting's escapes out, and an escaped `\n` is a line break.
+fn read_block_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?s)\$?\{\{.*?\}\}").expect("block regex must compile"))
+}
+
+/// The numbers of the guard's placeholders in `s`, in order.
+fn held_in(s: &str) -> Vec<usize> {
+    held_regex()
+        .captures_iter(s.as_bytes())
+        .filter_map(|c| std::str::from_utf8(&c[1]).ok()?.parse().ok())
+        .collect()
+}
+
+/// Mark that stands for one template block in [`same_text`].
+const BLOCK_MARK: &str = "\u{0}";
+
+/// Whether `as_is`, a string read from the file as it is, and `held`, the
+/// same string read with placeholders, say the same once each template
+/// block is set aside — every placeholder of `held` standing where `as_is`
+/// holds one block. The block's text is not compared: the parser reads
+/// the escapes of a quoted string (`''`, `\"`) out of the block in
+/// `as_is`, and the placeholder stood for the text before that.
+fn same_text(as_is: &str, held: &str) -> bool {
+    if as_is == held {
+        return true;
+    }
+    let as_is = read_block_regex().replace_all(as_is.as_bytes(), BLOCK_MARK.as_bytes());
+    let held = held_regex().replace_all(held.as_bytes(), BLOCK_MARK.as_bytes());
+    let held = read_block_regex().replace_all(&held, BLOCK_MARK.as_bytes());
+    as_is == held
+}
+
+/// Whether `as_is` and `held` (read with placeholders) hold the same data,
+/// strings and keys compared by [`same_text`], map entries in order. With
+/// `positions` the `position` member of a map — where the Markdown tree
+/// keeps a node's line and column, which a placeholder longer or shorter
+/// than its block moves — is not compared.
+fn same_reading(as_is: &crate::Value, held: &crate::Value, positions: bool) -> bool {
+    use crate::Value;
+    match (as_is, held) {
+        (Value::String(a), Value::String(h)) => same_text(a, h),
+        (Value::Array(a), Value::Array(h)) => {
+            a.len() == h.len() && a.iter().zip(h).all(|(a, h)| same_reading(a, h, positions))
+        }
+        (Value::Map(a), Value::Map(h)) => {
+            let kept = |(key, _): &(&String, &Value)| !(positions && key.as_str() == "position");
+            let a: Vec<_> = a.iter().filter(kept).collect();
+            let h: Vec<_> = h.iter().filter(kept).collect();
+            a.len() == h.len()
+                && a.iter().zip(&h).all(|((ak, av), (hk, hv))| {
+                    same_text(ak, hk) && same_reading(av, hv, positions)
+                })
+        }
+        (a, h) => a.same_data(h),
     }
 }
 
@@ -368,13 +488,7 @@ impl WriteGuard {
             return Ok(restore_placeholders(&written, map));
         }
         if let Some((before, original)) = &self.kept {
-            check_templates_kept(
-                before,
-                edited,
-                textual.then_some(original.as_slice()),
-                &written,
-                parse,
-            )?;
+            check_templates_kept(before, edited, original, textual, &written, parse)?;
         }
         Ok(written)
     }
@@ -384,7 +498,8 @@ impl WriteGuard {
 ///
 /// `before` is the data the templates were read in, `edited` the pointers
 /// whose subtrees the edit changed on purpose (their templates may go or
-/// change), `written` the bytes the edit produced, `parse` how to read them.
+/// change), `original` the text `before` was read from, `written` the
+/// bytes the edit produced, `parse` how to read them.
 ///
 /// 1. The written text must still read the same with its templates as
 ///    placeholders ([`guarded_parse`]): no edit may turn a template that
@@ -394,67 +509,178 @@ impl WriteGuard {
 ///    writer that re-quotes or escapes a template must leave its data alone.
 ///    Strings are counted, not located, so items that move up an array
 ///    after a removal still match.
-/// 3. With `original` — the text before a textual edit — every template
-///    block of that text outside `edited` must stand in `written` byte for
-///    byte.
+/// 3. With `textual` — the edit spliced `original` rather than rewriting
+///    it — every template block of `original` must stand in `written` byte
+///    for byte, but for the blocks in the nodes under `edited` and in the
+///    comments on the lines those nodes take up. A block is told apart by
+///    where it stands in `original`, not by its text: a quoted block reads
+///    as other text than it is written as (`'${{ f(''x'') }}'`).
 ///
 /// # Errors
 ///
-/// [`crate::Error::TemplatedFile`] naming the first template not kept.
+/// [`crate::Error::TemplatedFile`] naming the line in `original` of the
+/// first template not kept.
 pub fn check_templates_kept(
     before: &crate::Value,
     edited: &[crate::Pointer],
-    original: Option<&[u8]>,
+    original: &[u8],
+    textual: bool,
     written: &[u8],
     parse: impl Fn(&[u8]) -> crate::Result<crate::Document>,
 ) -> crate::Result<()> {
     let edited: Vec<String> = edited.iter().map(crate::Pointer::as_canonical).collect();
-    let mut outside = Vec::new();
-    let mut inside = Vec::new();
-    template_strings(
+    let held = Held::new(original);
+    let held_doc = parse(&held.text).ok();
+    let mut found = Found::default();
+    collect(
         before,
-        &mut String::new(),
+        held_doc.as_ref().map(crate::Document::value),
+        &mut Pointers::default(),
         &edited,
-        &mut outside,
-        &mut inside,
+        &mut found,
     );
+
     let after = guarded_parse(written, TemplateMode::Guard, &parse).map_err(|err| match err {
         crate::Error::TemplatedFile { line, snippet, .. } => not_kept(line, snippet),
         other => other,
     })?;
-
-    let mut read_back = Vec::new();
-    template_strings(
+    let mut read_back = Found::default();
+    collect(
         after.value(),
-        &mut String::new(),
+        None,
+        &mut Pointers::default(),
         &[],
         &mut read_back,
-        &mut Vec::new(),
     );
-    let mut read_back = counts(read_back);
-    for s in &outside {
-        if !take(&mut read_back, s) {
-            return Err(not_kept_in(written, original, s));
+    let mut read_back = counts(read_back.strings.into_iter().map(|s| s.text).collect());
+    for s in found.strings.iter().filter(|s| !s.edited) {
+        if !take(&mut read_back, &s.text) {
+            let line = s
+                .held
+                .first()
+                .and_then(|&n| held.blocks.get(n))
+                .map(|b| b.line);
+            return Err(not_kept_in(written, original, line, &s.text));
         }
     }
 
-    if let Some(original) = original {
-        let mut left = counts(blocks(original));
-        for s in &inside {
-            for block in blocks(s.as_bytes()) {
-                take(&mut left, &block);
+    if textual {
+        check_blocks_kept(&held, held_doc.as_ref(), &found, original, written)?;
+    }
+    Ok(())
+}
+
+/// Step 3 of [`check_templates_kept`]: every block of `original` (`held`,
+/// read as `held_doc`) the edit did not target stands in `written`.
+fn check_blocks_kept(
+    held: &Held,
+    held_doc: Option<&crate::Document>,
+    found: &Found,
+    original: &[u8],
+    written: &[u8],
+) -> crate::Result<()> {
+    let original_lines: Vec<&[u8]> = original.split(|&b| b == b'\n').collect();
+    let written_lines: std::collections::HashSet<&[u8]> = written.split(|&b| b == b'\n').collect();
+    // Whether the line `block` is on in `original` is gone from `written`.
+    let line_gone = |block: &HeldBlock| {
+        original_lines
+            .get(block.line as usize - 1)
+            .is_some_and(|line| !written_lines.contains(line))
+    };
+    let mut exempt = vec![false; held.blocks.len()];
+    if let Some(doc) = held_doc {
+        let mut in_data = vec![false; held.blocks.len()];
+        for s in &found.strings {
+            for &n in &s.held {
+                if let Some(slot) = in_data.get_mut(n) {
+                    *slot = true;
+                    exempt[n] |= s.edited;
+                }
             }
         }
-        let mut found = counts(blocks(written));
-        for (block, n) in left {
-            for _ in 0..n {
-                if !take(&mut found, &block) {
-                    return Err(not_kept_in(written, Some(original), &block));
+        // A block in a comment goes with the node whose lines it is on —
+        // and, when the edit removed its line, with the node's key line and
+        // the comments above it: the lines between the content before the
+        // node and the node.
+        let mut regions = Vec::new();
+        for edited in &found.edited_nodes {
+            let (inside, outside): (Vec<_>, Vec<_>) = doc
+                .spans()
+                .iter()
+                .partition(|(pointer, _)| under(pointer, edited));
+            let Some(start) = inside.iter().map(|(_, s)| s.line_range.start).min() else {
+                continue;
+            };
+            let end = inside
+                .iter()
+                .map(|(_, s)| s.line_range.end)
+                .max()
+                .unwrap_or(start);
+            let before = outside
+                .iter()
+                .map(|(_, s)| s.line_range.end)
+                .filter(|&e| e <= start)
+                .max()
+                .unwrap_or(0);
+            regions.push((before, start, end));
+        }
+        for (n, block) in held.blocks.iter().enumerate() {
+            if in_data[n] {
+                continue;
+            }
+            for &(before, start, end) in &regions {
+                if (start..end).contains(&block.at)
+                    || ((before..start).contains(&block.at) && line_gone(block))
+                {
+                    exempt[n] = true;
+                }
+            }
+        }
+    } else {
+        // No reading with placeholders to tell the blocks apart: exempt
+        // one block of each text an edited string holds.
+        for s in found.strings.iter().filter(|s| s.edited) {
+            for text in blocks(s.text.as_bytes()) {
+                if let Some(n) =
+                    (0..held.blocks.len()).find(|&n| !exempt[n] && held.blocks[n].text == text)
+                {
+                    exempt[n] = true;
                 }
             }
         }
     }
-    Ok(())
+
+    let mut left = counts(blocks(written));
+    let mut lost = Vec::new();
+    for (n, block) in held.blocks.iter().enumerate() {
+        if !exempt[n] && !take(&mut left, &block.text) {
+            lost.push(block.text.as_str());
+        }
+    }
+    let Some(&first) = lost.first() else {
+        return Ok(());
+    };
+    // Counted, a lost block is one of those with its text: name the first
+    // one whose line is gone from `written`.
+    let candidates = held
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(n, b)| !exempt[*n] && lost.contains(&b.text.as_str()));
+    let gone = candidates.clone().find(|(_, b)| line_gone(b));
+    let line = gone
+        .or_else(|| candidates.clone().next())
+        .map(|(_, b)| b.line);
+    Err(not_kept_in(written, original, line, first))
+}
+
+/// Whether `pointer` is `edited` or under it.
+fn under(pointer: &str, edited: &str) -> bool {
+    edited.is_empty()
+        || pointer == edited
+        || pointer
+            .strip_prefix(edited)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// Every template block (`{{ … }}`, `${{ … }}`) of `bytes`, in order.
@@ -465,56 +691,102 @@ fn blocks(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// Collect the strings and keys of `value` that hold a template block —
-/// into `inside` under an `edited` pointer, into `outside` elsewhere.
-fn template_strings(
+/// A string (value or key) that holds a template.
+struct TemplateString {
+    /// The string as read.
+    text: String,
+    /// Under an edited pointer.
+    edited: bool,
+    /// The guard's placeholders the string holds when read with them.
+    held: Vec<usize>,
+}
+
+/// What [`collect`] gathers.
+#[derive(Default)]
+struct Found {
+    strings: Vec<TemplateString>,
+    /// The pointers, in the reading with placeholders, of the nodes an
+    /// edited pointer names.
+    edited_nodes: Vec<String>,
+}
+
+/// The pointer of a node as read, and of the same node read with
+/// placeholders — where a key holds a template the two differ.
+#[derive(Default)]
+struct Pointers {
+    as_is: String,
+    held: String,
+}
+
+impl Pointers {
+    fn push(&mut self, as_is: &str, held: &str) -> (usize, usize) {
+        let lens = (self.as_is.len(), self.held.len());
+        for (pointer, segment) in [(&mut self.as_is, as_is), (&mut self.held, held)] {
+            pointer.push('/');
+            pointer.push_str(&segment.replace('~', "~0").replace('/', "~1"));
+        }
+        lens
+    }
+
+    fn truncate(&mut self, (as_is, held): (usize, usize)) {
+        self.as_is.truncate(as_is);
+        self.held.truncate(held);
+    }
+}
+
+/// Gather into `found` the strings and keys of `value` that hold a template
+/// block, each with the placeholders of its counterpart in `held` (the same
+/// data read with placeholders, walked alongside while its shape matches),
+/// and the nodes `edited` names.
+fn collect(
     value: &crate::Value,
-    pointer: &mut String,
+    held: Option<&crate::Value>,
+    at: &mut Pointers,
     edited: &[String],
-    outside: &mut Vec<String>,
-    inside: &mut Vec<String>,
+    found: &mut Found,
 ) {
     use crate::Value;
-    let under_edit = edited
-        .iter()
-        .any(|e| pointer == e || pointer.starts_with(&format!("{e}/")) || e.is_empty());
-    let mut keep = |s: &str| {
-        if substitution_regex().is_match(s.as_bytes()) {
-            if under_edit {
-                inside.push(s.to_owned());
-            } else {
-                outside.push(s.to_owned());
-            }
-        }
-    };
+    if held.is_some() && edited.contains(&at.as_is) {
+        found.edited_nodes.push(at.held.clone());
+    }
     match value {
-        Value::String(s) => keep(s),
+        Value::String(s) => {
+            let h = match held {
+                Some(Value::String(h)) => Some(h.as_str()),
+                _ => None,
+            };
+            keep(found, edited, s, h, &at.as_is);
+        }
         Value::Array(items) => {
+            let held = match held {
+                Some(Value::Array(h)) if h.len() == items.len() => Some(h),
+                _ => None,
+            };
             for (i, item) in items.iter().enumerate() {
-                let len = pointer.len();
-                pointer.push('/');
-                pointer.push_str(&i.to_string());
-                template_strings(item, pointer, edited, outside, inside);
-                pointer.truncate(len);
+                let index = i.to_string();
+                let lens = at.push(&index, &index);
+                collect(item, held.map(|h| &h[i]), at, edited, found);
+                at.truncate(lens);
             }
         }
         Value::Map(entries) => {
-            for (key, item) in entries {
-                let len = pointer.len();
-                pointer.push('/');
-                pointer.push_str(&key.replace('~', "~0").replace('/', "~1"));
-                let key_edited = edited
-                    .iter()
-                    .any(|e| pointer == e || pointer.starts_with(&format!("{e}/")) || e.is_empty());
-                if substitution_regex().is_match(key.as_bytes()) {
-                    if key_edited {
-                        inside.push(key.clone());
-                    } else {
-                        outside.push(key.clone());
-                    }
-                }
-                template_strings(item, pointer, edited, outside, inside);
-                pointer.truncate(len);
+            let held = match held {
+                Some(Value::Map(h)) if h.len() == entries.len() => Some(h),
+                _ => None,
+            };
+            for (i, (key, item)) in entries.iter().enumerate() {
+                let held_entry = held.and_then(|h| h.get_index(i));
+                let lens = at.push(key, held_entry.map_or(key.as_str(), |(k, _)| k.as_str()));
+                let pointer = at.as_is.clone();
+                keep(
+                    found,
+                    edited,
+                    key,
+                    held_entry.map(|(k, _)| k.as_str()),
+                    &pointer,
+                );
+                collect(item, held_entry.map(|(_, v)| v), at, edited, found);
+                at.truncate(lens);
             }
         }
         Value::Null
@@ -523,6 +795,21 @@ fn template_strings(
         | Value::BigInt(_)
         | Value::Float(_)
         | Value::BigFloat(_) => {}
+    }
+}
+
+/// Add `text`, read with placeholders as `held`, at `pointer` to `found`
+/// when it holds a template block.
+fn keep(found: &mut Found, edited: &[String], text: &str, held: Option<&str>, pointer: &str) {
+    if read_block_regex().is_match(text.as_bytes()) {
+        found.strings.push(TemplateString {
+            text: text.to_owned(),
+            edited: edited.iter().any(|e| under(pointer, e)),
+            held: held
+                .filter(|h| same_text(text, h))
+                .map(held_in)
+                .unwrap_or_default(),
+        });
     }
 }
 
@@ -547,25 +834,33 @@ fn take(counts: &mut HashMap<String, usize>, item: &str) -> bool {
 }
 
 /// [`crate::Error::TemplatedFile`] for a template `s` the edit would not
-/// keep, at the line of its first block in the text before the edit (or in
-/// the written text, or line 1).
-fn not_kept_in(written: &[u8], original: Option<&[u8]>, s: &str) -> crate::Error {
+/// keep, at `line` of `original` when it is known; else at the line of its
+/// first block in `original` (or in `written`, or line 1).
+fn not_kept_in(written: &[u8], original: &[u8], line: Option<u32>, s: &str) -> crate::Error {
+    let line_of = |text: &[u8], line: usize| {
+        String::from_utf8_lossy(text)
+            .lines()
+            .nth(line.checked_sub(1)?)
+            .map(|l| l.trim().chars().take(80).collect::<String>())
+    };
+    if let Some(line) = line
+        && let Some(snippet) = line_of(original, line as usize)
+    {
+        return not_kept(line, snippet);
+    }
     let block = blocks(s.as_bytes())
         .into_iter()
         .next()
         .unwrap_or_else(|| s.to_owned());
     let locate = |text: &[u8]| {
-        let text = String::from_utf8_lossy(text);
-        let at = text.find(&block)?;
-        let line = text[..at].matches('\n').count() + 1;
-        let snippet = text.lines().nth(line - 1).unwrap_or_default();
+        let at = String::from_utf8_lossy(text).find(&block)?;
+        let line = String::from_utf8_lossy(&text[..at]).matches('\n').count() + 1;
         Some((
             u32::try_from(line).unwrap_or(u32::MAX),
-            snippet.trim().chars().take(80).collect::<String>(),
+            line_of(text, line)?,
         ))
     };
-    let (line, snippet) = original
-        .and_then(locate)
+    let (line, snippet) = locate(original)
         .or_else(|| locate(written))
         .unwrap_or((1, block.chars().take(80).collect()));
     not_kept(line, snippet)
@@ -611,7 +906,8 @@ mod tests {
         check_templates_kept(
             &data,
             &[ptr("/b")],
-            Some(text.as_bytes()),
+            text.as_bytes(),
+            true,
             written.as_bytes(),
             yaml_stream,
         )
@@ -621,7 +917,8 @@ mod tests {
         check_templates_kept(
             &data,
             &[ptr("/l/0")],
-            Some(text.as_bytes()),
+            text.as_bytes(),
+            true,
             written.as_bytes(),
             yaml_stream,
         )
@@ -634,7 +931,8 @@ mod tests {
         let err = check_templates_kept(
             &before(text),
             &[ptr("/b")],
-            None,
+            text.as_bytes(),
+            false,
             b"a: \"${{ x  }}\"\nb: 2\n",
             yaml_stream,
         )
@@ -649,8 +947,15 @@ mod tests {
     #[test]
     fn a_template_written_where_it_changes_the_reading_is_refused() {
         let text = "a: \"{{ .x }}\"\n";
-        let err = check_templates_kept(&before(text), &[], None, b"a: {{ .x }}\n", yaml_stream)
-            .expect_err("refused");
+        let err = check_templates_kept(
+            &before(text),
+            &[],
+            text.as_bytes(),
+            false,
+            b"a: {{ .x }}\n",
+            yaml_stream,
+        )
+        .expect_err("refused");
         assert!(matches!(err, crate::Error::TemplatedFile { .. }), "{err:?}");
     }
 
@@ -660,12 +965,20 @@ mod tests {
         // text.
         let text = "a: '${{ f(''x'') }}'\nb: 1\n";
         let written = b"a: \"${{ f('x') }}\"\nb: 2\n";
-        check_templates_kept(&before(text), &[ptr("/b")], None, written, yaml_stream)
-            .expect("same data");
+        check_templates_kept(
+            &before(text),
+            &[ptr("/b")],
+            text.as_bytes(),
+            false,
+            written,
+            yaml_stream,
+        )
+        .expect("same data");
         let err = check_templates_kept(
             &before(text),
             &[ptr("/b")],
-            Some(text.as_bytes()),
+            text.as_bytes(),
+            true,
             written,
             yaml_stream,
         )
@@ -674,6 +987,71 @@ mod tests {
             matches!(err, crate::Error::TemplatedFile { line: 1, .. }),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn guarded_parse_passes_templates_whose_quoting_has_escapes() {
+        let doc = guarded_parse(
+            b"a: '${{ f(''x'') }}'\nb: \"${{ g(\\\"y\\\") }} and ${{ h }}\"\n",
+            TemplateMode::Guard,
+            yaml,
+        )
+        .expect("passes");
+        let crate::Value::Map(m) = doc.value() else {
+            panic!("map")
+        };
+        assert_eq!(
+            m.get("a"),
+            Some(&crate::Value::String("${{ f('x') }}".into()))
+        );
+        let json = |b: &[u8]| crate::by_name("json").expect("json").parse(b);
+        guarded_parse(br#"{"a": "${{ g(\"y\") }}"}"#, TemplateMode::Guard, json).expect("passes");
+        // Two blocks read as one string where the file holds two: refused.
+        assert!(!same_text("{{ a }}", "DQtplxq0qxDQtplxq1qx"));
+        assert!(same_text(
+            "x {{ a }} y {{ b }}",
+            "x DQtplxq0qx y DQtplxq1qx"
+        ));
+    }
+
+    #[test]
+    fn guarded_parse_leaves_markdown_positions_out() {
+        let md = |b: &[u8]| crate::by_name("markdown").expect("markdown").parse(b);
+        guarded_parse(
+            b"# T {{ .x }}\n\nSee `{{ .Values.long.path }}` and ${{ github.ref }}.\n",
+            TemplateMode::Guard,
+            md,
+        )
+        .expect("templates in text");
+        let err = guarded_parse(b"---\nname: {{ .n }}\n---\n# T\n", TemplateMode::Guard, md)
+            .expect_err("a template that changes the frontmatter");
+        assert!(
+            matches!(err, crate::Error::TemplatedFile { line: 2, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_refusal_names_the_line_of_the_template_lost() {
+        // The same block on lines 1 and 3; the one on line 3 is lost.
+        let text = "a: ${{ m }}\nb: 1\nc: ${{ m }} build\n";
+        let written = b"a: ${{ m }}\nb: 2\nc: x build\n";
+        for textual in [false, true] {
+            let err = check_templates_kept(
+                &before(text),
+                &[ptr("/b")],
+                text.as_bytes(),
+                textual,
+                written,
+                yaml_stream,
+            )
+            .expect_err("lost");
+            assert!(
+                matches!(&err, crate::Error::TemplatedFile { line: 3, snippet, .. }
+                    if snippet == "c: ${{ m }} build"),
+                "{err:?}"
+            );
+        }
     }
 
     #[test]

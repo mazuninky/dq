@@ -26,7 +26,7 @@ pub use ir::{
 };
 pub use parsers::{parse_json_with_spans, parse_yaml_stream_with_spans, parse_yaml_with_spans};
 pub use pointer::{Pointer, Segment};
-pub use transform::{PatchOp, apply_merge, apply_patch, diff};
+pub use transform::{PatchOp, apply_merge, apply_patch, apply_patch_edits, diff};
 pub use write_options::{WriteOptions, canonicalize_keys};
 
 /// Convenience alias used throughout `dq-core`.
