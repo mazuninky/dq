@@ -191,3 +191,114 @@ fn validate_json_names_the_rule_id() {
         "the rule catalogue is SARIF's alone: {report}"
     );
 }
+
+/// A file that does not parse is a result of its own, `lint.parse`, and
+/// every other file is still linted and reported. Before, the run stopped
+/// at the file with exit 3 and wrote no report at all, so a CI upload of
+/// the SARIF file found nothing.
+#[test]
+fn lint_reports_a_file_that_does_not_parse_and_lints_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "port.yml", PORT);
+    write(dir.path(), "a.yaml", "port: 8080\n");
+    write(dir.path(), "broken.yaml", "a: [\n");
+    write(dir.path(), "b.yaml", "port: 9090\n");
+    let lint = |format: &str| {
+        dq(dir.path())
+            .args([
+                "-F",
+                format,
+                "lint",
+                "--rules",
+                "port.yml",
+                "a.yaml",
+                "broken.yaml",
+                "b.yaml",
+            ])
+            .assert()
+            .code(3)
+    };
+    let out = lint("sarif");
+    let sarif = json_of(&out.get_output().stdout);
+    let results: Vec<(&str, &str)> = sarif["runs"][0]["results"]
+        .as_array()
+        .expect("results")
+        .iter()
+        .map(|r| {
+            (
+                r["ruleId"].as_str().expect("ruleId"),
+                r["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+                    .as_str()
+                    .expect("uri"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        results,
+        [
+            ("t.port", "a.yaml"),
+            ("lint.parse", "broken.yaml"),
+            ("t.port", "b.yaml"),
+        ]
+    );
+    assert_eq!(
+        sarif["runs"][0]["tool"]["driver"]["rules"][1],
+        json!({
+            "id": "lint.parse",
+            "shortDescription": { "text": "The file does not parse in its format." },
+        })
+    );
+    assert_indexes_match(&sarif);
+    // The parse error is on stderr too, as it was.
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(stderr.contains("broken.yaml"), "{stderr}");
+
+    let report = json_of(&lint("json").get_output().stdout);
+    let diagnostic = &report["diagnostics"][1];
+    assert_eq!(
+        (
+            diagnostic["rule_id"].as_str(),
+            diagnostic["path"].as_str(),
+            diagnostic["severity"].as_str(),
+            diagnostic["line"].as_u64(),
+        ),
+        (
+            Some("lint.parse"),
+            Some("broken.yaml"),
+            Some("error"),
+            Some(2)
+        )
+    );
+    assert_eq!(report["diagnostics"].as_array().map(Vec::len), Some(3));
+
+    // The console prints the other files' findings and the parse error as
+    // it did, once.
+    let out = lint("console");
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("a.yaml") && stdout.contains("b.yaml") && !stdout.contains("lint.parse"),
+        "{stdout}"
+    );
+
+    // `check` does the same.
+    let out = dq(dir.path())
+        .args([
+            "-F",
+            "json",
+            "check",
+            "--rule",
+            "port.yml",
+            "a.yaml",
+            "broken.yaml",
+        ])
+        .assert()
+        .code(3);
+    let report = json_of(&out.get_output().stdout);
+    let ids: Vec<&str> = report["diagnostics"]
+        .as_array()
+        .expect("diagnostics")
+        .iter()
+        .map(|d| d["rule_id"].as_str().expect("rule_id"))
+        .collect();
+    assert_eq!(ids, ["t.port", "lint.parse"]);
+}

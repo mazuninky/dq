@@ -20,7 +20,10 @@ use crate::output::Reporter;
 /// - [`crate::error::LintFail`] (exit 4) on any error-severity diagnostic.
 /// - [`crate::error::LintWarnStrict`] (exit 1) on warn-severity diagnostics
 ///   under `--strict`.
-/// - `dq_core::Error::*` for the usual file-load failures.
+/// - `dq_core::Error::*` for the usual file-load failures; a file that does
+///   not parse (or is templated) is reported as a `lint.parse`
+///   (`lint.templated_file`) result with the others, every other file still
+///   linted, and its error is returned once the report is written (exit 3).
 pub fn run(
     cli: &Cli,
     args: &LintArgs,

@@ -201,8 +201,9 @@ Every SARIF result names its rule: `ruleId` is the diagnostic's `rule_id`
 and `ruleIndex` its position in `tool.driver.rules`. GitHub Code Scanning
 groups alerts by `ruleId`, so the ids are stable: a rule's `id:`
 (`k8s.no-latest-tag`, a `.dq/rules/` rule's own id), a plugin's id, a
-composite's `<outer-id>.parse-failed`, and `validate.parse` for a file
-`validate` cannot parse. `tool.driver.rules` describes each rule the results
+composite's `<outer-id>.parse-failed`, `validate.parse` for a file
+`validate` cannot parse, and `lint.parse` for a file `lint` or `check` cannot
+parse (`lint.templated_file` for a templated one). `tool.driver.rules` describes each rule the results
 name, once, in order of first appearance (empty when there are no results):
 
 ```json

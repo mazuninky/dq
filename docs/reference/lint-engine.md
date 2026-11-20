@@ -26,7 +26,14 @@ exits 6.
 Exit status of `lint` / `check`: 4 if any diagnostic has severity `error`;
 with `--strict`, 1 if there are `warn` findings and no errors; otherwise 0.
 `info` never fails a run. Rule-loading problems exit 3 (bad rule) or 6
-(unknown rule / namespace).
+(unknown rule / namespace). A file that does not parse (or holds template
+syntax with no escape hatch) does not stop the run: every other file is
+linted and the report written, the file a result of its own under
+`lint.parse` (`lint.templated_file`), severity `error`, at the error's line
+and column — in every structured format, so a SARIF upload in CI gets the
+full report — and the run then exits 3. The console prints the other
+files' findings and the parse error on stderr, as before. `dq fix` still
+stops at such a file: it writes files.
 
 ## Rule files
 

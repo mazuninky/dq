@@ -8,7 +8,9 @@
 //! 3. Resolve `--rules` (or auto-bind on empty) into a `Vec<RuleSet>`.
 //! 4. Compile every rule via [`Evaluator::new`].
 //! 5. Per-file: load + parse the document, evaluate each rule, collect
-//!    diagnostics.
+//!    diagnostics; a file that does not parse is a `lint.parse` diagnostic
+//!    of its own (structured reporters only — the console prints the error)
+//!    and the run goes on to the next file.
 //! 6. Hand the canonical `{ "diagnostics": [...] }` shape to the configured
 //!    reporter.
 //! 7. Compute the lint exit code:
@@ -33,7 +35,7 @@ use crate::commands::io_helpers::{
 };
 use crate::commands::plugin_loader::{self, LoadedPlugins};
 use crate::error::{InvalidInput, LintFail, LintWarnStrict};
-use crate::output::Reporter;
+use crate::output::{OutputFormat, Reporter};
 
 /// Run the lint pipeline once a caller has produced the input rulesets.
 ///
@@ -60,7 +62,10 @@ use crate::output::Reporter;
 ///
 /// - [`InvalidInput`] (exit 6) when `--rules` references an unknown
 ///   `@std/<ns>` or a non-existent path.
-/// - `dq_core::Error::*` for the usual file-load failures.
+/// - `dq_core::Error::*` for the usual file-load failures; a file that does
+///   not parse (or is templated) is reported as a `lint.parse`
+///   (`lint.templated_file`) result with the others, every other file still
+///   linted, and its error is returned once the report is written (exit 3).
 /// - [`LintFail`] (exit 4) when any error-severity diagnostic is emitted.
 /// - [`LintWarnStrict`] (exit 1) when warnings are emitted under `--strict`.
 // 8 args is one over clippy's default `too_many_arguments` threshold. The
@@ -132,6 +137,11 @@ pub(crate) fn run_with_rulesets(
     };
 
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
+    // Files that do not parse: each is a `lint.<kind>` result of its own
+    // in a structured report (the console prints the error itself), and
+    // the run still lints every other file before it fails with exit 3.
+    let console = matches!(cli.format, OutputFormat::Console);
+    let mut unparsed: Vec<anyhow::Error> = Vec::new();
     let several = expanded.len() > 1;
     let mut missing = Vec::new();
     for file in &expanded {
@@ -142,7 +152,20 @@ pub(crate) fn run_with_rulesets(
         // populated provenance map, which `Ir::line_col_for(&Pointer)` (used
         // by the evaluator's `loc.pointer` chain) needs to resolve to a
         // real `(line, col)`. See `load_document_for_lint` for the rationale.
-        let (_doc_fmt, doc) = load_document_for_lint(file, input_format, cli.template_mode())?;
+        let (_doc_fmt, doc) = match load_document_for_lint(file, input_format, cli.template_mode())
+        {
+            Ok(loaded) => loaded,
+            Err(err) => match unparsed_diagnostic(file, &err) {
+                Some(diagnostic) => {
+                    if !console {
+                        diagnostics.push(diagnostic);
+                    }
+                    unparsed.push(err);
+                    continue;
+                }
+                None => return Err(err),
+            },
+        };
         // Each document of a multi-document stream is linted as a document
         // of its own — `match.filter`, `check`, `loc.*`, composite
         // `extract` and plugins all see one document, as they would in a
@@ -195,11 +218,78 @@ pub(crate) fn run_with_rulesets(
 
     let mut envelope = build_envelope(&diagnostics);
     if reporter.wants_rule_catalog() {
-        envelope["rules"] = rule_catalog(evaluator.rules());
+        let mut catalog = rule_catalog(evaluator.rules());
+        if let Some(rules) = catalog.as_array_mut() {
+            rules.extend(unparsed_catalog(&diagnostics));
+        }
+        envelope["rules"] = catalog;
     }
-    reporter.report(&envelope, out)?;
+    // The console with nothing but parse errors prints them alone, as it
+    // did before the other files were linted on.
+    if !(console && diagnostics.is_empty() && !unparsed.is_empty()) {
+        reporter.report(&envelope, out)?;
+    }
 
+    let mut unparsed = unparsed.into_iter();
+    if let Some(first) = unparsed.next() {
+        // The first is printed as the run's error; the console names the
+        // others here, as it names a file skipped.
+        for err in unparsed {
+            tracing::warn!("{err}");
+        }
+        return Err(first);
+    }
     classify_exit(&diagnostics, cli.strict)
+}
+
+/// The diagnostic for `file`, which did not load with `err`, when that is
+/// a parse error or a templated file (exit 3): `lint.<kind>` — `lint.parse`,
+/// `lint.templated_file` — as `validate` reports under `validate.<kind>`,
+/// at the error's line and column. `None` for any other error.
+fn unparsed_diagnostic(file: &Utf8Path, err: &anyhow::Error) -> Option<Diagnostic> {
+    let core = err.downcast_ref::<dq_core::Error>()?;
+    let (line, col, message) = match core {
+        dq_core::Error::Parse {
+            line, col, message, ..
+        } => (*line, *col, message.clone()),
+        dq_core::Error::TemplatedFile { line, .. } => (*line, 0, core.to_string()),
+        _ => return None,
+    };
+    Some(Diagnostic {
+        rule_id: format!("lint.{}", core.kind_name()),
+        severity: Severity::Error,
+        message,
+        file: Some(file.to_path_buf()),
+        line,
+        col,
+        span: None,
+        references: Vec::new(),
+        fix: None,
+    })
+}
+
+/// The rule catalogue entries of the `lint.<kind>` ids
+/// [`unparsed_diagnostic`] reports under, one per id `diagnostics` holds.
+fn unparsed_catalog(diagnostics: &[Diagnostic]) -> Vec<serde_json::Value> {
+    let mut ids: IndexSet<&str> = IndexSet::new();
+    for diagnostic in diagnostics {
+        if let Some(kind) = diagnostic.rule_id.strip_prefix("lint.")
+            && matches!(kind, "parse" | "templated_file")
+        {
+            ids.insert(&diagnostic.rule_id);
+        }
+    }
+    ids.into_iter()
+        .map(|id| {
+            let description = if id == "lint.parse" {
+                "The file does not parse in its format."
+            } else {
+                "The file holds template syntax dq reads only with --allow-templates or \
+                 --raw-template-strings."
+            };
+            serde_json::json!({ "id": id, "description": description, "references": [] })
+        })
+        .collect()
 }
 
 /// Lint one document — a whole file, or one document of a stream — with
