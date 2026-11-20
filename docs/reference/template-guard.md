@@ -35,6 +35,14 @@ refused as in a YAML file. A Helm
 `{{- if … }}` line, on which the parser fails, is refused (`TemplatedFile`,
 exit 3).
 
+The refusal names the line of a template that changes the reading: of the
+templates whose placeholder stands where the two readings first differ (a
+value, a key, or a collection of another length), the first. A GitHub
+Actions `${{ … }}` above a Helm `port: {{ .p }}` is not the one cited. When
+the file does not parse as it is (or reads as another number of documents),
+nothing tells which template is to blame, and the first template of the
+file is cited.
+
 ### Edits keep the templates
 
 An edit of a file the guard let through (`set`, `del`, `patch`, `merge`,

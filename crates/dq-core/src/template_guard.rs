@@ -89,12 +89,7 @@ pub fn detect_templates(bytes: &[u8]) -> Option<TemplateMarker> {
         .position(|&b| b == b'\n')
         .map_or(bytes.len(), |p| match_start + p);
 
-    let raw_line = &bytes[line_start..line_end];
-    let snippet = String::from_utf8_lossy(raw_line)
-        .trim()
-        .chars()
-        .take(80)
-        .collect::<String>();
+    let snippet = snippet_of(&bytes[line_start..line_end]);
 
     Some(TemplateMarker {
         line: line_number,
@@ -215,13 +210,19 @@ pub fn guarded_parse(
             let held = Held::new(bytes);
             let placeheld = parse(&held.text).map_err(|_| refuse())?;
             let positions = as_is.format() == crate::FormatTag::Markdown;
-            if as_is.is_multi() == placeheld.is_multi()
-                && same_reading(as_is.value(), placeheld.value(), positions)
-            {
-                Ok(as_is)
-            } else {
-                Err(refuse())
+            if as_is.is_multi() != placeheld.is_multi() {
+                return Err(refuse());
             }
+            if same_reading(as_is.value(), placeheld.value(), positions) {
+                return Ok(as_is);
+            }
+            // Cite a template that changes the reading: the first whose
+            // placeholder sits where the two readings first differ.
+            let culprit = differing_blocks(as_is.value(), placeheld.value(), positions)
+                .and_then(|found| found.into_iter().min())
+                .and_then(|n| held.blocks.get(n))
+                .and_then(|block| marker_on_line(bytes, block.line));
+            Err(culprit.map_or_else(refuse, crate::Error::templated_file))
         }
     }
 }
@@ -344,6 +345,82 @@ fn same_reading(as_is: &crate::Value, held: &crate::Value, positions: bool) -> b
         }
         (a, h) => a.same_data(h),
     }
+}
+
+/// The guard's placeholders (their numbers) in the first part of `held`
+/// that reads differently from `as_is`, walking both in document order;
+/// `None` when they read the same. A string, or a key, that differs gives
+/// its own placeholders; a collection whose length or kind differs gives
+/// all of those inside it.
+fn differing_blocks(
+    as_is: &crate::Value,
+    held: &crate::Value,
+    positions: bool,
+) -> Option<Vec<usize>> {
+    use crate::Value;
+    if same_reading(as_is, held, positions) {
+        return None;
+    }
+    match (as_is, held) {
+        (Value::String(_), Value::String(h)) => Some(held_in(h)),
+        (Value::Array(a), Value::Array(h)) if a.len() == h.len() => a
+            .iter()
+            .zip(h)
+            .find_map(|(a, h)| differing_blocks(a, h, positions)),
+        (Value::Map(a), Value::Map(h)) => {
+            let kept = |(key, _): &(&String, &Value)| !(positions && key.as_str() == "position");
+            let a: Vec<_> = a.iter().filter(kept).collect();
+            let h: Vec<_> = h.iter().filter(kept).collect();
+            if a.len() != h.len() {
+                return Some(blocks_within(held));
+            }
+            a.iter().zip(&h).find_map(|((ak, av), (hk, hv))| {
+                if same_text(ak, hk) {
+                    differing_blocks(av, hv, positions)
+                } else {
+                    let mut found = held_in(hk);
+                    found.extend(blocks_within(hv));
+                    Some(found)
+                }
+            })
+        }
+        _ => Some(blocks_within(held)),
+    }
+}
+
+/// The guard's placeholders in every string and key of `v`.
+fn blocks_within(v: &crate::Value) -> Vec<usize> {
+    use crate::Value;
+    match v {
+        Value::String(s) => held_in(s),
+        Value::Array(items) => items.iter().flat_map(blocks_within).collect(),
+        Value::Map(map) => map
+            .iter()
+            .flat_map(|(k, v)| held_in(k).into_iter().chain(blocks_within(v)))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// A [`TemplateMarker`] for 1-based `line` of `bytes`, as
+/// [`detect_templates`] makes one; `None` past the last line.
+fn marker_on_line(bytes: &[u8], line: u32) -> Option<TemplateMarker> {
+    let raw = bytes
+        .split(|&b| b == b'\n')
+        .nth(usize::try_from(line).ok()?.checked_sub(1)?)?;
+    Some(TemplateMarker {
+        line,
+        snippet: snippet_of(raw),
+    })
+}
+
+/// A line as a [`TemplateMarker::snippet`]: trimmed, at most 80 characters.
+fn snippet_of(raw_line: &[u8]) -> String {
+    String::from_utf8_lossy(raw_line)
+        .trim()
+        .chars()
+        .take(80)
+        .collect()
 }
 
 /// Put the template text back in place of every placeholder in the strings
@@ -1082,6 +1159,40 @@ mod tests {
         assert!(
             matches!(err, crate::Error::TemplatedFile { line: 2, .. }),
             "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_refusal_cites_the_template_that_changes_the_reading() {
+        // The first template reads the same either way; the refusal names
+        // the one whose value differs, not the first.
+        for (text, line) in [
+            (
+                "run: echo ${{ github.ref }}\nq: \"{{ .x }}\"\nport: {{ .p }}\n",
+                3,
+            ),
+            ("a: \"{{ .x }}\"\nb:\n  - x\n  - {{ .y }}\n", 4),
+            ("a: \"{{ .x }}\"\n{{ .k }}: v\n", 2),
+            ("a: \"{{ .x }}\"\nb: [1, {{ .y }}]\n", 2),
+        ] {
+            let err =
+                guarded_parse(text.as_bytes(), TemplateMode::Guard, yaml).expect_err("refused");
+            assert!(
+                matches!(&err, crate::Error::TemplatedFile { line: l, .. } if *l == line),
+                "{text:?}: {err:?}"
+            );
+        }
+        // When the file does not parse as it is, nothing tells which
+        // template is to blame: the first one is cited.
+        let err = guarded_parse(
+            b"a: \"{{ .x }}\"\n{{- if .y }}\nb: 1\n",
+            TemplateMode::Guard,
+            yaml,
+        )
+        .expect_err("refused");
+        assert!(
+            matches!(err, crate::Error::TemplatedFile { line: 1, .. }),
+            "{err:?}"
         );
     }
 
