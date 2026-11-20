@@ -38,7 +38,9 @@ fails there with "cannot use null as iterable". dq follows jq, for `=`, `|=`,
 A null becomes `{}` before a string key and `[]` before an index; an array is
 padded with nulls up to an index past its end, in place (building an array
 item by item stays linear). As in jq, an index past 536870911 is the runtime
-error "Array index too large" (exit 1) rather than an allocation of that size. What jq refuses stays refused
+error "Array index too large" (exit 1) rather than an allocation of that size
+— whatever the spelling of the integral number (`.[1e300] = 1`,
+`.[100000000000000000000] = 1` on `[1]` included). What jq refuses stays refused
 (exit 1): a key into a string or a number (`.a.b = 1` on `{"a":"x"}`), a
 negative index past the start, iterating null (`.a[] = 1` on `{}`), and
 `null - 1` for `.a.b -= 1` on `{}`. The right-hand side of `=` and `op=` sees

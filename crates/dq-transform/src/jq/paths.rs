@@ -210,7 +210,11 @@ fn int_key(key: &Val) -> Option<isize> {
 
 /// `v`, or the integer it is when it is a float with an integral value in
 /// `isize` range: what `_dq_index` gives an index on the left-hand side
-/// of an assignment, which jaq's update would refuse as a float.
+/// of an assignment, which jaq's update would refuse as a float. A
+/// positive one past that range (`1e300`, `100000000000000000000`) is
+/// `isize::MAX`: into an array that is past [`MAX_INDEX`], jq's "Array
+/// index too large", where jaq would say it cannot index the array with
+/// a float.
 fn integral(v: Val) -> Val {
     if !matches!(v, Val::Num(Num::Float(_) | Num::Dec(_))) {
         return v;
@@ -220,6 +224,7 @@ fn integral(v: Val) -> Val {
         Some(f) if f.fract() == 0.0 && f >= isize::MIN as f64 && f < isize::MAX as f64 => {
             Val::Num(Num::Int(f as isize))
         }
+        Some(f) if f.is_finite() && f.fract() == 0.0 && f > 0.0 => Val::Num(Num::Int(isize::MAX)),
         _ => v,
     }
 }
@@ -984,6 +989,13 @@ mod tests {
             (".a[.n] = 1", r#"{"n":4000000000000000000}"#),
             ("[1] | .[536870912] |= 1", "null"),
             ("setpath([536870912]; 1)", "null"),
+            // Into an array, an integral number past `isize` in any
+            // spelling — not "cannot index [1] with 1e300".
+            ("[1] | .[1e300] = 1", "null"),
+            ("[1] | .[1E300] |= 1", "null"),
+            ("[1] | .[1e+300] = 1", "null"),
+            ("[1] | .[100000000000000000000] = 1", "null"),
+            (".a[.n] = 1", r#"{"a":[1],"n":1e300}"#),
         ] {
             let err = run(filter, input).expect_err(filter);
             assert!(
