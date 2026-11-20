@@ -130,12 +130,37 @@ fn run_to_stdout(
     opts: &WriteOptions,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
-    let (input_fmt, doc) = load_document_with_path(&args.file, input_format)?;
-    let doc = select_for_convert(doc, doc_arg, &args.file)?;
+    let file = single_stdout_input(&args.file)?;
+    let (input_fmt, doc) = load_document_with_path(&file, input_format)?;
+    let doc = select_for_convert(doc, doc_arg, &file)?;
     maybe_warn_lossy(input_fmt.name(), output_format);
     let bytes = render_to_format(&doc, output_format, use_color, opts)?;
     out.write_all(&bytes)?;
     Ok(())
+}
+
+/// Resolve the one file `convert` writes to stdout.
+///
+/// A glob is expanded like any other (zero matches is exit 5) and must
+/// match exactly one file: the documents of several files written back to
+/// back are no longer one document of the output format, so more matches
+/// are refused instead of framed. `-i` converts every match.
+///
+/// # Errors
+///
+/// - [`InvalidInput`] (exit 6) when the glob matches more than one file.
+/// - The [`bulk::expand_glob`] errors (exit 5 on zero matches or a missing
+///   walk root).
+fn single_stdout_input(arg: &Utf8Path) -> anyhow::Result<Utf8PathBuf> {
+    let mut files = bulk::expand_glob(arg)?;
+    if files.len() > 1 {
+        return Err(anyhow::Error::new(InvalidInput::new(format!(
+            "convert to stdout takes one file, but '{arg}' matched {}; \
+             convert them one at a time, or with -i to write each match next to its source",
+            files.len(),
+        ))));
+    }
+    Ok(files.remove(0))
 }
 
 /// Apply `--doc` to the document `convert` writes.

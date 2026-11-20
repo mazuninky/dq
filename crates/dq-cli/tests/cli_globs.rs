@@ -7,6 +7,7 @@
 //!   holds a metacharacter.
 //! - A file whose bytes would not change is neither rewritten nor counted
 //!   as Modified: it lands under Skipped and keeps its mtime.
+//! - `convert` to stdout takes a glob only when it matches one file.
 
 use std::fs;
 use std::path::Path;
@@ -304,5 +305,38 @@ fn bulk_diff_counts_unchanged_files_skipped_and_prints_no_marker_for_them() {
                 .and(predicate::str::contains(
                     "Modified: 1, Skipped: 1, Failed: 0",
                 )),
+        );
+}
+
+// ---------------------------------------------------------------------------
+// Item 4: `convert` to stdout and globs.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn convert_to_stdout_takes_a_glob_that_matches_one_file() {
+    let dir = TempDir::new().expect("tempdir");
+    seed(dir.path(), "g/a.yaml", "a: 1\n");
+
+    dq().current_dir(dir.path())
+        .args(["--no-color", "convert", "g/*.yaml", "-F", "json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"a\": 1"));
+}
+
+#[test]
+fn convert_to_stdout_refuses_a_glob_that_matches_several_files() {
+    let dir = TempDir::new().expect("tempdir");
+    seed(dir.path(), "g/a.yaml", "a: 1\n");
+    seed(dir.path(), "g/b.yaml", "b: 1\n");
+
+    dq().current_dir(dir.path())
+        .args(["--no-color", "convert", "g/*.yaml", "-F", "json"])
+        .assert()
+        .code(6)
+        .stdout("")
+        .stderr(
+            predicate::str::contains("convert to stdout takes one file")
+                .and(predicate::str::contains("matched 2")),
         );
 }

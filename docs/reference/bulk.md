@@ -4,7 +4,11 @@ The write commands `set`, `del`, `patch`, `merge`, `fmt`, `fix` and
 `convert -i` accept a glob instead of a file and then run once per matched
 file through one driver, `crates/dq-cli/src/bulk.rs` (`run_per_file`).
 `lint` and `check` take several files or globs too, through the lint
-pipeline. Read commands and `convert` to stdout take a single file.
+pipeline. Read commands take a single file. `convert` to stdout takes a
+glob only when it matches exactly one file: several files written back to
+back would not be one document of the output format, so more matches are
+refused with exit 6 (`convert to stdout takes one file, but 'g/*.yaml'
+matched 2; …`); `convert -i` converts every match.
 
 A single file — a literal path, or a glob that matches exactly one file —
 behaves byte for byte like a plain single-file invocation: no per-file
