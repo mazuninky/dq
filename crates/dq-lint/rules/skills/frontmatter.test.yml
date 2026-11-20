@@ -138,3 +138,20 @@ tests:
       # T
     expected:
       violations: []
+  - name: empty frontmatter block is skipped
+    input: |
+      ---
+      ---
+      # T
+    expected:
+      violations: []
+  - name: non-string name and description are skipped
+    input: |
+      ---
+      name: [a, b]
+      description: 42
+      when_to_use: {k: v}
+      ---
+      # T
+    expected:
+      violations: []
