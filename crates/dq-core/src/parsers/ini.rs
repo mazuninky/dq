@@ -116,6 +116,10 @@ impl Format for Ini {
             } else {
                 Some(section_name.as_str())
             };
+            // A section with no keys is still a section: `[s]` alone. The
+            // setter below makes the section only when it sets a key.
+            out.entry(section_arg.map(str::to_owned))
+                .or_insert_with(ini::Properties::new);
             // `with_section` borrows the Ini and its setter holds a borrow
             // until dropped; iterate inside the same scope.
             let mut setter = out.with_section(section_arg.map(str::to_owned));
@@ -232,5 +236,20 @@ mod tests {
         let pos_b = out.find("[b]").expect("[b] missing");
         assert!(pos_c < pos_a, "c before a");
         assert!(pos_a < pos_b, "a before b");
+    }
+
+    #[test]
+    fn deleting_the_last_key_of_a_section_keeps_the_section() {
+        let pointer = |p: &str| crate::pointer::Pointer::parse(p).unwrap();
+        let mut doc = Ini.parse(b"[s]\nk = v\n[t]\nx = 1\n").expect("parse");
+        doc.del_at(&pointer("/s/k")).expect("del");
+        assert_eq!(doc.original_bytes(), b"[s]\n[t]\nx=1\n");
+        let Value::Map(top) = doc.value() else {
+            panic!()
+        };
+        assert_eq!(top.get("s"), Some(&Value::Map(IndexMap::new())));
+        // Deleting the section is what removes it.
+        doc.del_at(&pointer("/s")).expect("del");
+        assert_eq!(doc.original_bytes(), b"[t]\nx=1\n");
     }
 }

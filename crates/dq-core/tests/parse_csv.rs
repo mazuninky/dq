@@ -112,25 +112,32 @@ fn write_rejects_non_array_top_level_with_format_error() {
 }
 
 #[test]
-fn write_rejects_inconsistent_keys_with_message_naming_offending_row() {
-    // Per implementation: the header is the key set of `items[0]`. A
-    // subsequent row whose keys differ is rejected with a message naming the
-    // offending row index — pin that contract so the diagnostic stays
-    // actionable for users.
+fn write_takes_the_union_of_the_keys_and_names_the_row_of_a_nested_value() {
+    // The header is every key of every row in the order first seen; a row
+    // with a key the first lacks used to be refused.
     let mut row0 = IndexMap::new();
     row0.insert("a".into(), Value::String("1".into()));
     let mut row1_extra = IndexMap::new();
     row1_extra.insert("a".into(), Value::String("2".into()));
-    row1_extra.insert("b".into(), Value::String("rogue".into()));
-    let arr = Value::Array(vec![Value::Map(row0), Value::Map(row1_extra)]);
+    row1_extra.insert("b".into(), Value::String("more".into()));
+    let arr = Value::Array(vec![Value::Map(row0.clone()), Value::Map(row1_extra)]);
     let doc = Document::value_only(arr, FormatTag::Csv);
     let mut buf: Vec<u8> = Vec::new();
-    let err = csv()
+    csv()
         .write(&doc, &mut buf)
-        .expect_err("non-uniform keys must surface as Error::Format");
+        .expect("rows of different keys write");
+    assert_eq!(String::from_utf8(buf).unwrap(), "a,b\n1,\n2,more\n");
+
+    // A nested value is refused with a message naming its row.
+    let mut row1_nested = IndexMap::new();
+    row1_nested.insert("a".into(), Value::Array(vec![]));
+    let arr = Value::Array(vec![Value::Map(row0), Value::Map(row1_nested)]);
+    let doc = Document::value_only(arr, FormatTag::Csv);
+    let err = csv()
+        .write(&doc, &mut Vec::new())
+        .expect_err("a nested value must surface as Error::Format");
     match err {
         dq_core::Error::Format { message, .. } => {
-            // Row index 1 carries the rogue key.
             assert!(
                 message.contains("row 1"),
                 "error message must name the offending row index, got: {message:?}",
@@ -158,19 +165,18 @@ impl Write for FailingWriter {
 fn tsv_write_format_error_carries_tsv_label_not_csv() {
     // Regression for the M5 bug where the private write-error helper
     // hardcoded `"csv"`, mislabeling write failures raised from the TSV
-    // path. The shape-mismatch path (extra key in row 1) reliably reaches
-    // `Error::Format`; pin its `format` field to `"tsv"`.
+    // path. A nested value in row 1 reliably reaches `Error::Format`; pin
+    // its `format` field to `"tsv"`.
     let mut row0 = IndexMap::new();
     row0.insert("a".to_string(), Value::String("1".into()));
     let mut row1 = IndexMap::new();
-    row1.insert("a".to_string(), Value::String("2".into()));
-    row1.insert("b".to_string(), Value::String("rogue".into()));
+    row1.insert("a".to_string(), Value::Array(vec![]));
     let arr = Value::Array(vec![Value::Map(row0), Value::Map(row1)]);
     let doc = Document::value_only(arr, FormatTag::Tsv);
     let mut buf: Vec<u8> = Vec::new();
     let err = tsv()
         .write(&doc, &mut buf)
-        .expect_err("non-uniform keys must surface as Error::Format");
+        .expect_err("a nested value must surface as Error::Format");
     match err {
         dq_core::Error::Format { format, .. } => {
             assert_eq!(

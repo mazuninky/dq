@@ -279,8 +279,9 @@ block has its own pointer for when they do.
 `rust-ini`. Shape: `{section: {key: string}}`, sections in source order; keys
 before the first header go under the section `""`. `=` and `:` both separate
 keys from values. All values are strings. Comments and quoting style are not
-kept on write. The writer writes no empty section: `del` of the last key of
-a section (or `set` of a section to `{}`) takes the section out of the file.
+kept on write. A section with no keys is written as its header alone: `del`
+of the last key of `[s]` leaves `[s]` in the file (as does `set` of a
+section to `{}`); `del /s` removes the section.
 
 ### dotenv
 
@@ -288,15 +289,19 @@ A flat `{KEY: string}` map. Handles `KEY=value`, `export KEY=value`,
 double-quoted values with `\\ \" \n \t` escapes, single-quoted literal values,
 comments and blank lines. No `${VAR}` interpolation: values are stored as
 written. The writer double-quotes values containing whitespace, `#`, `=`,
-`$`, `\`, `"` or non-printable characters.
+`$`, `\`, `"` or non-printable characters, and writes `export` before each
+key that had it in the file it rewrites (its last assignment decides); a
+key added by the edit has none.
 
 ### CSV / TSV
 
 The `csv` crate, header row required. The document is an array of maps keyed
 by the header; every cell is a string (no type inference). TSV is the same
 with a tab delimiter. Writing needs an array of maps; the header is the union
-of keys in first-seen order. Any other shape is an error naming the offending
-type.
+of the keys of every row in first-seen order, and a row without one of them
+has an empty cell there (`dq set t.csv /- '{"a": "3", "c": "4"}'` on `a,b` /
+`1,2` writes `a,b,c` / `1,2,` / `3,,4`). Any other shape is an error naming
+the offending type, a nested value one naming its row.
 
 ### Markdown
 

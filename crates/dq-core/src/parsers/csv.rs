@@ -142,22 +142,10 @@ fn write_with_delimiter(
         });
     }
 
-    // Header is taken from the first map's keys in order. Subsequent maps
-    // must share the header set; missing keys emit empty cells, extra keys
-    // surface as Error::Format so callers see a clean diagnostic.
-    let Value::Map(first) = &items[0] else {
-        return Err(Error::Format {
-            format: format_name,
-            message: format!(
-                "expected array of objects at top level; row 0 is {}",
-                items[0].type_name(),
-            ),
-        });
-    };
-    let headers: Vec<String> = first.keys().cloned().collect();
-    wtr.write_record(&headers)
-        .map_err(|e| map_delim_write_err(format_name, e))?;
-
+    // The header is every key of every row, in the order first seen; a
+    // row without one of them has an empty cell there.
+    let mut columns: IndexMap<&str, ()> = IndexMap::new();
+    let mut rows = Vec::with_capacity(items.len());
     for (idx, row) in items.iter().enumerate() {
         let Value::Map(map) = row else {
             return Err(Error::Format {
@@ -168,9 +156,19 @@ fn write_with_delimiter(
                 ),
             });
         };
+        for key in map.keys() {
+            columns.entry(key.as_str()).or_insert(());
+        }
+        rows.push(map);
+    }
+    let headers: Vec<&str> = columns.into_keys().collect();
+    wtr.write_record(&headers)
+        .map_err(|e| map_delim_write_err(format_name, e))?;
+
+    for (idx, map) in rows.into_iter().enumerate() {
         let mut cells: Vec<String> = Vec::with_capacity(headers.len());
         for h in &headers {
-            match map.get(h) {
+            match map.get(*h) {
                 Some(Value::String(s)) => cells.push(s.clone()),
                 Some(Value::Bool(b)) => cells.push(b.to_string()),
                 Some(Value::Int(n)) => cells.push(n.to_string()),
@@ -182,20 +180,11 @@ fn write_with_delimiter(
                         format: format_name,
                         message: format!(
                             "row {idx} key '{h}': nested {} cannot be serialized to {format_name}",
-                            map.get(h).expect("just matched").type_name(),
+                            map.get(*h).expect("just matched").type_name(),
                         ),
                     });
                 }
                 None => cells.push(String::new()),
-            }
-        }
-        // Surface unexpected extra keys (header is the set of keys from row 0).
-        for k in map.keys() {
-            if !headers.iter().any(|h| h == k) {
-                return Err(Error::Format {
-                    format: format_name,
-                    message: format!("row {idx} has key '{k}' not present in header {headers:?}",),
-                });
             }
         }
         wtr.write_record(&cells)
@@ -251,5 +240,40 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         let err = Csv.write(&doc, &mut buf).expect_err("must error");
         assert_eq!(err.kind_name(), "format");
+    }
+
+    #[test]
+    fn the_header_is_the_union_of_the_keys_in_first_seen_order() {
+        let row = |cells: &[(&str, &str)]| {
+            Value::Map(
+                cells
+                    .iter()
+                    .map(|(k, v)| ((*k).to_owned(), Value::String((*v).to_owned())))
+                    .collect(),
+            )
+        };
+        let rows = Value::Array(vec![
+            row(&[("a", "1"), ("b", "2")]),
+            row(&[("a", "3"), ("c", "4")]),
+            row(&[("c", "5")]),
+        ]);
+        for (format, delimited) in [
+            (&Csv as &dyn Format, "a,b,c\n1,2,\n3,,4\n,,5\n"),
+            (&Tsv, "a\tb\tc\n1\t2\t\n3\t\t4\n\t\t5\n"),
+        ] {
+            let mut buf: Vec<u8> = Vec::new();
+            format
+                .write(&Document::single(rows.clone()), &mut buf)
+                .expect("write");
+            assert_eq!(String::from_utf8(buf).unwrap(), delimited);
+        }
+        // And through a point edit that appends a row with a new column.
+        let mut doc = Csv.parse(b"a,b\n1,2\n").expect("parse");
+        doc.set_at(
+            &crate::pointer::Pointer::parse("/-").unwrap(),
+            row(&[("a", "3"), ("c", "4")]),
+        )
+        .expect("set");
+        assert_eq!(doc.original_bytes(), b"a,b,c\n1,2,\n3,,4\n");
     }
 }
