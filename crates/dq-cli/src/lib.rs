@@ -72,6 +72,15 @@ fn dispatch(
     {
         return Err(cli.doc_usage_error(cli.command.name(), why));
     }
+    // Stdin can be read once: a command given `-` for two inputs would
+    // find it empty for the second.
+    let stdin_inputs = cli.command.stdin_inputs();
+    if stdin_inputs.len() > 1 {
+        return Err(cli::stdin_read_twice_error(
+            cli.command.name(),
+            &stdin_inputs,
+        ));
+    }
     let doc_arg = cli.doc;
     // M4 §3: snapshot the global re-emit flags into a `WriteOptions` so
     // every handler that touches `Format::write_with_options` shares the

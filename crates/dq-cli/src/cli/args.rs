@@ -448,6 +448,31 @@ pub fn usage_error(kind: clap::error::ErrorKind, message: impl std::fmt::Display
     anyhow::Error::new(<Cli as clap::CommandFactory>::command().error(kind, message))
 }
 
+/// The usage error (exit 2) for `dq {command}` given stdin (`-`) for each
+/// of `inputs` ([`Command::stdin_inputs`], more than one): the first read
+/// would drain it, and every other input would read nothing.
+#[must_use]
+pub fn stdin_read_twice_error(command: &str, inputs: &[&str]) -> anyhow::Error {
+    let named = match inputs {
+        [first, rest @ ..] if rest.iter().all(|name| name == first) => {
+            if inputs.len() == 2 {
+                format!("{first} twice")
+            } else {
+                format!("{first} {} times", inputs.len())
+            }
+        }
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+        [] => String::new(),
+    };
+    usage_error(
+        clap::error::ErrorKind::ArgumentConflict,
+        format!(
+            "stdin (`-`) can be read only once, but `dq {command}` is given it for {named}: \
+             pass all but one of them as a file"
+        ),
+    )
+}
+
 /// Subcommand surface for M1.
 ///
 /// Variants beyond M1 (e.g. `set`, `del`, `lint`) are deliberately omitted —
@@ -574,6 +599,77 @@ impl Command {
             | Self::Rules(_)
             | Self::GenerateDocs(_) => Some("it reads no data file"),
         }
+    }
+
+    /// The inputs this command is asked to read from stdin, named as its
+    /// usage line names them — one entry per `-` (`FILES` once for every
+    /// `-` among them). The dispatcher refuses more than one
+    /// ([`stdin_read_twice_error`]): stdin can be read only once.
+    #[must_use]
+    pub fn stdin_inputs(&self) -> Vec<&'static str> {
+        let dash = |p: &camino::Utf8Path| p == "-";
+        let mut inputs = Vec::new();
+        let mut file = |p: &camino::Utf8Path, name: &'static str| {
+            if dash(p) {
+                inputs.push(name);
+            }
+        };
+        match self {
+            Self::Get(GetArgs { file: f, .. })
+            | Self::Exists(ExistsArgs { file: f, .. })
+            | Self::Keys(KeysArgs { file: f, .. })
+            | Self::Values(ValuesArgs { file: f, .. })
+            | Self::Len(LenArgs { file: f, .. })
+            | Self::Type(TypeArgs { file: f, .. })
+            | Self::Paths(PathsArgs { file: f, .. })
+            | Self::Select(SelectArgs { file: f, .. })
+            | Self::Query(QueryArgs { file: f, .. })
+            | Self::Convert(ConvertArgs { file: f, .. })
+            | Self::Fmt(FmtArgs { file: f, .. })
+            | Self::Validate(ValidateArgs { file: f, .. })
+            | Self::Del(DelArgs { file: f, .. }) => file(f, "FILE"),
+            Self::Diff(args) => {
+                file(&args.a, "A");
+                file(&args.b, "B");
+            }
+            Self::Set(args) => {
+                file(&args.file, "FILE");
+                // `@-` names the file `-`, which is stdin.
+                if matches!(args.value.as_deref(), Some("-" | "@-")) {
+                    inputs.push("VALUE");
+                }
+                if args.value_from.as_deref().is_some_and(dash) {
+                    inputs.push("--value-from");
+                }
+            }
+            Self::Patch(args) => {
+                file(&args.file, "FILE");
+                if args.ops.as_deref() == Some("-") {
+                    inputs.push("OPS");
+                }
+            }
+            Self::Merge(args) => {
+                file(&args.file, "FILE");
+                if args.patch.as_deref() == Some("-") {
+                    inputs.push("PATCH");
+                }
+            }
+            Self::Lint(LintArgs { files, .. })
+            | Self::Check(CheckArgs { files, .. })
+            | Self::Fix(FixArgs { files, .. }) => {
+                for f in files {
+                    file(f, "FILES");
+                }
+            }
+            Self::Completions(_)
+            | Self::Man(_)
+            | Self::Self_(_)
+            | Self::Test(_)
+            | Self::Explain(_)
+            | Self::Rules(_)
+            | Self::GenerateDocs(_) => {}
+        }
+        inputs
     }
 
     /// The command's name as typed on the command line.
@@ -880,5 +976,22 @@ mod tests {
         let opts = cli.write_options();
         assert!(!opts.sort_keys);
         assert!(opts.indent.is_none());
+    }
+
+    #[test]
+    fn stdin_inputs_name_every_input_given_dash() {
+        let cli = Cli::try_parse_from(["dq", "lint", "-", "a.json", "-", "-"]).unwrap();
+        assert_eq!(cli.command.stdin_inputs(), ["FILES"; 3]);
+        let err = stdin_read_twice_error("lint", &cli.command.stdin_inputs());
+        assert!(err.to_string().contains("for FILES 3 times"), "{err}");
+
+        let cli = Cli::try_parse_from(["dq", "set", "-", "/a", "@-"]).unwrap();
+        assert_eq!(cli.command.stdin_inputs(), ["FILE", "VALUE"]);
+        let err = stdin_read_twice_error("x", &["A", "B", "C"]);
+        assert!(err.to_string().contains("for A, B and C"), "{err}");
+        assert_eq!(crate::exit_code::exit_code_for_error(&err), 2);
+
+        let cli = Cli::try_parse_from(["dq", "get", "x.json", "/a"]).unwrap();
+        assert!(cli.command.stdin_inputs().is_empty());
     }
 }

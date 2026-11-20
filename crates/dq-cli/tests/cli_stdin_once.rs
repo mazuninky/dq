@@ -112,3 +112,40 @@ fn every_command_reads_stdin_once() {
         assert_eq!(code, 0, "dq {args:?}: stdout {stdout} stderr {stderr}");
     }
 }
+
+/// A command given `-` for two inputs would read stdin for the first and
+/// find it empty for the second: refused before anything is read.
+#[test]
+fn two_stdin_inputs_are_refused() {
+    for (args, named) in [
+        (&["diff", "-", "-"][..], "A and B"),
+        (&["patch", "-", "-"][..], "FILE and OPS"),
+        (&["merge", "-", "-"][..], "FILE and PATCH"),
+        (&["set", "-", "/name", "-"][..], "FILE and VALUE"),
+        (&["set", "-", "/name", "@-"][..], "FILE and VALUE"),
+        (
+            &["set", "-", "/name", "--value-from", "-"][..],
+            "FILE and --value-from",
+        ),
+        (
+            &["lint", "-", "-", "--rules", "@std/npm"][..],
+            "FILES twice",
+        ),
+        (
+            &["check", "-", "-", "--rule", "npm.has-license"][..],
+            "FILES twice",
+        ),
+        (&["fix", "-", "-", "--rules", "@std/npm"][..], "FILES twice"),
+    ] {
+        let mut args = args.to_vec();
+        args.extend(["--input-format", "json"]);
+        let (code, stdout, stderr) = run(&args, PACKAGE);
+        assert_eq!(code, 2, "dq {args:?}: stdout {stdout} stderr {stderr}");
+        assert!(
+            stderr.contains("stdin (`-`) can be read only once")
+                && stderr.contains(&format!("for {named}")),
+            "dq {args:?}: {stderr}"
+        );
+        assert_eq!(stdout, "", "dq {args:?}");
+    }
+}
