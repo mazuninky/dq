@@ -52,8 +52,9 @@ pub fn terminal_text(text: &str) -> Cow<'_, str> {
 /// fields a line logged through the `log` crate carries (`log.target`,
 /// `log.module_path`, `log.file`, `log.line`: jaq's `stderr`, globset,
 /// ureq) are left out, as the default formatter leaves them: `log.file`
-/// is a path on the machine dq was built on. The level's colour is the
-/// event formatter's, outside the fields, and stays.
+/// is a path on the machine dq was built on. With colour on, a field's
+/// name is in italics and its `=` dimmed, as the default formatter writes
+/// them; the level's colour is the event formatter's, outside the fields.
 #[must_use]
 pub fn log_fields() -> LogFields {
     LogFields
@@ -96,8 +97,16 @@ impl tracing::field::Visit for LogVisitor<'_> {
         let text = terminal_text(&text);
         let sep = if self.first { "" } else { " " };
         self.first = false;
+        let name = name.strip_prefix("r#").unwrap_or(name);
         self.result = if name == "message" {
             write!(self.writer, "{sep}{text}")
+        } else if self.writer.has_ansi_escapes() {
+            // With colour, as tracing-subscriber's own formatter writes a
+            // field: the name in italics, the `=` dimmed.
+            write!(
+                self.writer,
+                "{sep}\x1b[3m{name}\x1b[0m\x1b[2m=\x1b[0m{text}"
+            )
         } else {
             write!(self.writer, "{sep}{name}={text}")
         };
@@ -331,6 +340,50 @@ pub fn from_serde_value(v: &serde_json::Value) -> dq_core::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fields of one `warn!` with a field, as the log line writes them
+    /// with colour (`ansi`) or not.
+    fn log_line(ansi: bool) -> String {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let sink = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(ansi)
+            .without_time()
+            .with_target(false)
+            .with_level(false)
+            .fmt_fields(log_fields())
+            .with_writer(move || SharedSink(sink.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(path = "a\nb", r#type = 1, "skipped");
+        });
+        let out = buf.lock().expect("lock").clone();
+        String::from_utf8(out).expect("utf-8")
+    }
+
+    struct SharedSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for SharedSink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("lock").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn log_fields_are_styled_with_colour_and_plain_without() {
+        assert_eq!(log_line(false), "skipped path=\"a\\nb\" type=1\n");
+        // Was, with colour: the same plain text. Field names are italic and
+        // the `=` dimmed, as tracing-subscriber's own formatter writes them.
+        assert_eq!(
+            log_line(true),
+            "skipped \u{1b}[3mpath\u{1b}[0m\u{1b}[2m=\u{1b}[0m\"a\\nb\" \
+             \u{1b}[3mtype\u{1b}[0m\u{1b}[2m=\u{1b}[0m1\n"
+        );
+    }
 
     #[test]
     fn output_format_default_is_console() {
