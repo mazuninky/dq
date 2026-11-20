@@ -378,8 +378,19 @@ fn array_positions<'a>(
 // rewrite
 // ---------------------------------------------------------------------------
 
-/// The variable the right-hand side of a rewritten assignment is bound to.
-const RHS: &str = "$__dq_rhs";
+/// The variable the right-hand side of a rewritten assignment is bound to,
+/// with a number appended when `code` already holds the name: the
+/// left-hand side is evaluated inside the binding, so a variable of the
+/// program by that name would be captured.
+fn rhs_var(code: &str) -> String {
+    let mut name = String::from("$__dq_rhs");
+    let mut n = 0_u32;
+    while code.contains(name.as_str()) {
+        n += 1;
+        name = format!("$__dq_rhs{n}");
+    }
+    name
+}
 
 /// `code` with each assignment `L op R` preceded by `_dq_vivify(L)`, or
 /// `None` when `code` holds no assignment operator or does not parse as a
@@ -391,6 +402,7 @@ pub(super) fn rewrite(code: &str) -> Option<String> {
     }
     let mut printer = Printer {
         out: String::with_capacity(code.len() * 2),
+        rhs: rhs_var(code),
         lhs: false,
     };
     printer.term(&term);
@@ -513,6 +525,9 @@ fn visit_pattern<'s>(p: &Pattern<&'s str>, f: &mut impl FnMut(&Term<&'s str>)) {
 /// assignment rewritten.
 struct Printer {
     out: String,
+    /// The variable the right-hand side of an assignment is bound to: one
+    /// the program does not hold ([`rhs_var`]).
+    rhs: String,
     /// Printing the left-hand side of an assignment: each index on its
     /// paths goes through `_dq_index`, so an integral float (`.[2.0]`)
     /// indexes an array as the integer it is, as in jq — jaq's update
@@ -668,7 +683,7 @@ impl Printer {
     fn assign(&mut self, l: &Term<&str>, op: &str, r: &Term<&str>) {
         self.paren(r);
         self.out.push_str(" as ");
-        self.out.push_str(RHS);
+        self.out.push_str(&self.rhs);
         self.out.push_str(" | _dq_vivify");
         self.lhs(l);
         self.out.push_str(" | ");
@@ -676,7 +691,7 @@ impl Printer {
         self.out.push(' ');
         self.out.push_str(op);
         self.out.push(' ');
-        self.out.push_str(RHS);
+        self.out.push_str(&self.rhs);
     }
 
     fn binop(&mut self, l: &Term<&str>, op: &BinaryOp<&str>, r: &Term<&str>) {
@@ -939,6 +954,25 @@ mod tests {
         for (filter, input) in [(".[1.5] = 1", "null"), (".[1.5] = 9", "[1,2,3]")] {
             assert!(run(filter, input).is_err(), "{filter} on {input}");
         }
+    }
+
+    #[test]
+    fn a_user_variable_is_not_captured_by_the_rewrite() {
+        // The left-hand side is evaluated inside the binding of the
+        // right-hand side: a variable of the program with that name must
+        // still be the program's.
+        for (filter, want) in [
+            (r#""k" as $__dq_rhs | .[$__dq_rhs] = 1"#, r#"{"k":1}"#),
+            (r#""k" as $__dq_rhs | .[$__dq_rhs] |= 1"#, r#"{"k":1}"#),
+            (
+                r#""k" as $__dq_rhs | "j" as $__dq_rhs1 | .[$__dq_rhs, $__dq_rhs1] = 1"#,
+                r#"{"k":1,"j":1}"#,
+            ),
+        ] {
+            assert_eq!(one(filter, "{}"), want, "{filter}");
+        }
+        let rewritten = rewrite(r#""k" as $__dq_rhs | .a = 1"#).unwrap_or_default();
+        assert!(rewritten.contains("(1) as $__dq_rhs1 |"), "{rewritten}");
     }
 
     #[test]

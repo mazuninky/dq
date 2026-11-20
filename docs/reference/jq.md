@@ -47,7 +47,9 @@ the input as it was (`.a.b = .a` on `{}` gives `{"a":{"b":null}}`).
 How: `JqEngine::compile` parses the program and, when it holds an assignment
 operator, prints it back with each `L op R` turned into
 `(R) as $__dq_rhs | _dq_vivify(L) | L op $__dq_rhs` (`L |= F` into
-`_dq_vivify(L) | L |= F`); `_dq_vivify` creates the containers every path of
+`_dq_vivify(L) | L |= F`); the variable gets a number appended (`$__dq_rhs1`, …)
+when the program already holds the name, so a variable of the program is
+never captured; `_dq_vivify` creates the containers every path of
 `L` needs, then jaq's own update runs. On `L`, every index and slice bound
 but a string literal goes through `_dq_index`, which turns a float with an
 integral value into the integer (jaq's update refuses a float index).
