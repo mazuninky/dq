@@ -3134,8 +3134,9 @@ fn json_byte_order_mark_is_dropped_by_a_writer_rewrite() {
         (
             "f.json",
             "\u{feff}{\"a\":1}\n",
+            // fmt re-emits JSON with no option too, so the mark goes.
             &["fmt", "f.json"][..],
-            "\u{feff}{\"a\":1}\n",
+            "{\n  \"a\": 1\n}\n",
         ),
         (
             "f.yaml",

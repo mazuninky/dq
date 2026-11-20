@@ -517,9 +517,9 @@ pub enum Command {
     Select(SelectArgs),
     /// Convert between formats.
     Convert(ConvertArgs),
-    /// Re-emit FILE through its native writer. Without --sort-keys or
-    /// --indent this is a no-op pass — only structural normalisation runs.
-    /// Pass --indent N to canonicalise JSON whitespace.
+    /// Re-emit FILE through its native writer, dropping comments. JSON gets
+    /// a two-space indent (--indent N to change it); TOML is kept as it is
+    /// unless --sort-keys.
     Fmt(FmtArgs),
     /// Parse the file and report parse errors.
     Validate(ValidateArgs),

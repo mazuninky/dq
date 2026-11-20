@@ -15,10 +15,13 @@
 //!    [`dq_core::Format::write_with_options`], passing the
 //!    [`dq_core::WriteOptions`] snapshot built from the global flags by
 //!    [`crate::cli::Cli::write_options`].
-//! 3. Compare the rendered bytes against [`dq_core::Document::original_bytes`].
-//!    If equal → [`FileOpResult::Unchanged`]. Else →
-//!    [`FileOpResult::Modified`] with the new bytes (and an optional
-//!    unified-diff string when `--diff` mode is active).
+//!    JSON is handed over as a value tree, so it is re-emitted rather than
+//!    copied (see [`FmtFileOp::apply`]).
+//! 3. Return [`FileOpResult::Modified`] with the new bytes (and an optional
+//!    unified-diff string when `--diff` mode is active and they differ),
+//!    even when they equal the file's: stdout mode prints the document
+//!    either way, and the driver treats equal bytes as unchanged for `-i`,
+//!    `--diff` and `--check`.
 //! 4. The bulk driver handles `-i` (atomic write), `--check` (compare-only
 //!    gate), and `--diff` (stdout printing) uniformly — fmt itself only
 //!    produces a `FileOpResult`.
@@ -26,8 +29,8 @@
 use std::io::Write;
 
 use camino::Utf8Path;
-use dq_core::WriteOptions;
 use dq_core::template_guard::TemplateMode;
+use dq_core::{Document, FormatTag, WriteOptions};
 
 use super::io_helpers::load_document_with_path;
 use crate::bulk::{self, FileOp, FileOpResult};
@@ -104,13 +107,28 @@ impl<'a> FileOp for FmtFileOp<'a> {
         let (input_fmt, doc) =
             load_document_with_path(path, self.input_format, TemplateMode::Guard)?;
 
+        // The JSON writer copies a document read from bytes verbatim (the
+        // textual-edit contract) unless an option forces a re-emit. fmt is
+        // the canonicaliser, so it always hands JSON over as a value tree:
+        // two-space indent, one final line break, as every JSON re-emit.
+        let value_tree;
+        let to_emit = if doc.format() == FormatTag::Json {
+            value_tree = match doc.values() {
+                Some(values) => Document::multi_value_only(values.to_vec(), FormatTag::Json),
+                None => Document::value_only(doc.value().clone(), FormatTag::Json),
+            };
+            &value_tree
+        } else {
+            &doc
+        };
+
         // 2. Render through `write_with_options`. The format's default
         //    impl forwards to `write` (M2-baseline preserved) when neither
         //    `sort_keys` nor `indent` is set — overriding impls in
         //    json/jsonl/yaml/toml honour the knobs they understand.
         let mut buf: Vec<u8> = Vec::new();
         input_fmt
-            .write_with_options(&doc, &mut buf, self.opts)
+            .write_with_options(to_emit, &mut buf, self.opts)
             .map_err(anyhow::Error::new)?;
 
         // The guard let the file's templates through: the rewrite must
@@ -123,20 +141,23 @@ impl<'a> FileOp for FmtFileOp<'a> {
             .map_err(anyhow::Error::new)?;
         }
 
-        // 3. Idempotency check: if the rendered bytes equal the source's
-        //    on-disk bytes, the file is already canonically formatted and
-        //    we report `Unchanged`. The bulk driver translates that into
-        //    a `Skipped` count (no per-file output, no `would modify`
-        //    line in `--check`).
-        let original = doc.original_bytes();
-        if buf == original {
-            return Ok(FileOpResult::Unchanged);
-        }
-
+        // 3. Always `Modified`, even when the bytes equal the file's: in
+        //    stdout mode the output is the command's result and is printed
+        //    either way. The bulk driver compares the bytes with the file
+        //    for `-i` (no write, no `.bak`), `--diff` and `--check`, and
+        //    counts an unchanged file under Skipped.
         // 4. Diff string is only required when `--diff` mode is active;
-        //    skip the unified-diff cost otherwise.
+        //    skip the unified-diff cost otherwise. It compares against the
+        //    file's bytes: several readers keep no source bytes in the
+        //    document, and a diff against nothing would show every line
+        //    as added.
         let diff = if self.diff_enabled {
-            let original_str = String::from_utf8_lossy(original);
+            let source = if path == "-" {
+                doc.original_bytes().to_vec()
+            } else {
+                super::io_helpers::read_bytes(path)?
+            };
+            let original_str = String::from_utf8_lossy(&source);
             let modified_str = String::from_utf8_lossy(&buf);
             Some(crate::diff::render_unified(
                 &original_str,
@@ -176,12 +197,10 @@ mod tests {
 
     #[test]
     fn fmt_smoke_emits_output_for_yaml_file() {
-        // Smoke test: fmt against a YAML file produces non-empty stdout
-        // (or, when the file is already canonical, leaves stdout empty
-        // because the bulk driver short-circuits on `Unchanged`). The
-        // assertion is intentionally lenient — comprehensive coverage is
-        // the test-writer agent's job; this only proves the wiring runs
-        // end-to-end without panicking.
+        // Smoke test: fmt against an already canonical YAML file prints the
+        // document to stdout (stdout mode prints whether or not anything
+        // changed) and leaves the file alone. Comprehensive coverage lives
+        // in the integration tests.
         let tmp = write_yaml("a: 1\nb: 2\n");
         let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
         let cli = Cli::try_parse_from(["dq", "fmt", path.as_str()]).unwrap();
@@ -189,16 +208,7 @@ mod tests {
         let opts = cli.write_options();
         let mut out: Vec<u8> = Vec::new();
         run(&cli, &args, None, false, &opts, &mut out).expect("fmt should succeed");
-        // Either the file was already canonical (stdout empty, no error)
-        // or the writer reformatted it (stdout contains the rendered
-        // YAML). Both are acceptable smoke outcomes.
-        let s = String::from_utf8(out).expect("stdout must be UTF-8");
-        if !s.is_empty() {
-            assert!(
-                s.contains("a:") && s.contains("b:"),
-                "expected YAML keys in re-emitted output, got: {s}",
-            );
-        }
+        assert_eq!(String::from_utf8(out).unwrap(), "a: 1\nb: 2\n");
         // File on disk untouched (no `-i`).
         let on_disk = std::fs::read_to_string(&path).unwrap();
         assert_eq!(on_disk, "a: 1\nb: 2\n");

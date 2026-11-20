@@ -405,3 +405,89 @@ fn fmt_diff_with_glob_produces_per_file_markers() {
         "missing `=== <path> ===` marker for {p2_str} in:\n{s}",
     );
 }
+
+/// Run `dq <args>` in-process and return its stdout, or the error.
+fn run_args(args: &[&str]) -> anyhow::Result<Vec<u8>> {
+    let cli = Cli::try_parse_from(args).expect("clap parse");
+    let mut out: Vec<u8> = Vec::new();
+    let mut err: Vec<u8> = Vec::new();
+    dq::run(&cli, false, &mut out, &mut err)?;
+    Ok(out)
+}
+
+#[test]
+fn fmt_stdout_prints_an_already_canonical_file_in_every_format() {
+    // Stdout mode prints the document whether or not it changes: `dq fmt
+    // f > g` must never produce an empty `g` because `f` was already
+    // canonical. `--check` and `-i` keep their no-op semantics on such a
+    // file: exit 0, no output, no write, no `.bak`.
+    let dir = tempfile::tempdir().expect("tempdir");
+    for (name, src) in [
+        ("f.yaml", "a: 1\n"),
+        ("f.json", "{\"a\": 1}\n"),
+        ("f.jsonl", "{\"a\":1}\n"),
+        ("f.toml", "a = 1\n"),
+        ("f.ini", "[s]\nk = v\n"),
+        ("f.env", "A=1\n"),
+        ("f.csv", "a,b\n1,2\n"),
+        ("f.xml", "<a>\n  <b>1</b>\n</a>"),
+        ("f.tf", "a = 1\n"),
+        ("f.md", "# T\n"),
+    ] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, src).unwrap();
+        let p = path.to_str().unwrap();
+        // Settle the file to its canonical bytes first.
+        let canonical = run_args(&["dq", "fmt", p]).expect("fmt to stdout");
+        std::fs::write(&path, &canonical).unwrap();
+
+        let out = run_args(&["dq", "fmt", p]).expect("fmt to stdout");
+        assert!(!out.is_empty(), "{name}: stdout empty for a canonical file");
+        assert_eq!(out, canonical, "{name}: fmt is not idempotent");
+
+        let out = run_args(&["dq", "--check", "fmt", p]).expect("--check passes");
+        assert!(out.is_empty(), "{name}: --check printed {out:?}");
+
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let out = run_args(&["dq", "-i", "--backup", "fmt", p]).expect("-i passes");
+        assert!(out.is_empty(), "{name}: -i printed {out:?}");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            canonical,
+            "{name}: rewritten"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            mtime,
+            "{name}: an unchanged file was written"
+        );
+        assert!(
+            !dir.path().join(format!("{name}.bak")).exists(),
+            "{name}: .bak written for an unchanged file"
+        );
+    }
+}
+
+#[test]
+fn fmt_diff_compares_against_the_file_in_every_format() {
+    // Readers that keep no source bytes (INI, HCL, dotenv, XML) must still
+    // diff against the file, not against nothing: the diff shows the line
+    // removed and the line added, never `@@ -0,0`.
+    let dir = tempfile::tempdir().expect("tempdir");
+    for (name, src, removed, added) in [
+        ("f.ini", "[s]\nk = v\n", "-k = v", "+k=v"),
+        ("f.tf", "a   = 1\n", "-a   = 1", "+a = 1"),
+        ("f.env", "A = 1\n", "-A = 1", "+A=1"),
+        ("f.xml", "<a><b>1</b></a>\n", "-<a><b>1</b></a>", "+<a>"),
+        ("f.json", "{\"a\":1}\n", "-{\"a\":1}", "+  \"a\": 1"),
+    ] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, src).unwrap();
+        let out = run_args(&["dq", "--diff", "fmt", path.to_str().unwrap()]).expect("--diff");
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains(removed) && out.contains(added) && !out.contains("@@ -0,0"),
+            "{name}: diff against the file expected, got:\n{out}"
+        );
+    }
+}

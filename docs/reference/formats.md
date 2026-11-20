@@ -163,7 +163,7 @@ compact output).
 
 Layout of what dq writes:
 
-- A re-emit (`convert -F json`, `set --jq`, `fmt --indent` / `--sort-keys`,
+- A re-emit (`convert -F json`, `set --jq`, `fmt` with or without options,
   on stdout or with `-i`) and a read command's JSON (`get`, `query`, `diff`,
   `lint` with `-F json`) end with exactly one line break.
   Indentation is two spaces; `--indent N` changes it on re-emit paths only.

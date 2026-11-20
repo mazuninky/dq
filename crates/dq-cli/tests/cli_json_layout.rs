@@ -285,3 +285,40 @@ fn patch_move_lays_the_value_out_as_add_and_copy_do() {
         );
     }
 }
+
+#[test]
+fn fmt_without_options_re_emits_json_through_the_writer() {
+    // `fmt` is the canonicaliser: with no option it re-emits JSON as a
+    // re-emit does — two-space indent, exactly one final line break —
+    // instead of copying the file's bytes.
+    let canonical = "{\n  \"a\": 1,\n  \"b\": [\n    1,\n    2\n  ]\n}\n";
+    for src in [
+        "{\"a\":   1, \"b\": [1,2]}\n\n",
+        "{\"a\": 1, \"b\": [1, 2]}",
+        "{\n    \"a\": 1,\n    \"b\": [1, 2]\n}\n",
+        "{\"a\": 1, \"b\": [1, 2]}\r\n",
+    ] {
+        assert_eq!(
+            stdout_of(&[("f.json", src)], &["fmt", "f.json"]),
+            canonical,
+            "fmt on {src:?}"
+        );
+        assert_eq!(
+            file_after("f.json", src, &["fmt", "f.json"]),
+            canonical,
+            "fmt -i on {src:?}"
+        );
+        let dir = dir_with(&[("f.json", src)]);
+        dq().current_dir(dir.path())
+            .args(["--no-color", "--check", "fmt", "f.json"])
+            .assert()
+            .code(1)
+            .stdout("would modify: f.json\n");
+    }
+    let dir = dir_with(&[("f.json", canonical)]);
+    dq().current_dir(dir.path())
+        .args(["--no-color", "--check", "fmt", "f.json"])
+        .assert()
+        .success()
+        .stdout("");
+}

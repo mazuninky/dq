@@ -1,14 +1,26 @@
 # `dq fmt`, `--sort-keys`, `--indent`
 
 `dq fmt <file-or-glob>` parses a file and writes it back through its own
-format's writer: YAML stays YAML, TOML stays TOML (cross-format conversion
+format's writer: YAML stays YAML, JSON stays JSON (cross-format conversion
 is `convert -i`). It is the explicit canonicaliser, so it **drops comments,
 anchor names and quote style** on purpose; preserving them is the contract of
 the textual-edit commands (`set`, `del`, `patch`, `merge`), not of `fmt`.
 
+Per format:
+
+- YAML, JSON, JSONL, INI, `.env`, CSV/TSV, XML and HCL are re-emitted from
+  the parsed value. JSON gets a two-space indent and exactly one final line
+  break, as every JSON re-emit ([formats.md](formats.md)); `--indent`
+  changes the indent.
+- TOML is kept byte for byte, comments included, unless `--sort-keys` is
+  given; then it is re-emitted and its comments are dropped.
+- Markdown is kept verbatim.
+- A Dockerfile is refused: its writer is read-only.
+
 - Output modes as for every write command: stdout by default, `-i`,
   `--diff`, `--check`, `--backup` (see
-  [write-commands.md](write-commands.md#output-modes)).
+  [write-commands.md](write-commands.md#output-modes)). Stdout mode always
+  prints the document, also when it is already canonical.
 - Globs, `--parallel`, `--continue-on-error` and the summary come from the
   bulk driver ([bulk.md](bulk.md)).
 - `--check` exits 0 when the file is already canonical (re-emitted bytes
@@ -16,7 +28,7 @@ the textual-edit commands (`set`, `del`, `patch`, `merge`), not of `fmt`.
   is what the `dq-fmt-check` pre-commit hook runs.
 - `-i --backup` writes `<file>.bak` only when the file actually changes.
 - `--doc` is refused (exit 2): `fmt` re-emits the whole file.
-- Without `--sort-keys` or `--indent`, only structural normalisation happens.
+- `--diff` compares the output with the file's bytes.
 
 ## `--sort-keys`
 
