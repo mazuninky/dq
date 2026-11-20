@@ -272,3 +272,34 @@ fn the_test_runner_escapes_case_names() {
     );
     assert!(!out.stdout.contains('\u{1b}'), "{:?}", out.stdout);
 }
+
+/// A line logged through the `log` crate (jaq's `stderr`, here) prints its
+/// message alone. Was: `ERROR ab log.target="jaq_std" log.module_path=…
+/// log.file="/…/.cargo/registry/…/lib.rs" log.line=790`, the build
+/// machine's paths included.
+#[test]
+fn a_log_crate_line_prints_no_log_fields() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = dir.path();
+    std::fs::write(dir.join("x.yaml"), "a: 1\n").expect("seed");
+    for verbose in [None, Some("-vv")] {
+        let mut args = vec!["--no-color"];
+        args.extend(verbose);
+        args.extend(["query", "\"ab\" | stderr", "x.yaml"]);
+        let out = run(dir, &args);
+        assert_eq!(out.code, 0, "{:?}", out.stderr);
+        // Past the timestamp, the level and the message.
+        let errors: Vec<&str> = out
+            .stderr
+            .lines()
+            .filter_map(|line| line.split_once(' ').map(|(_, rest)| rest.trim_start()))
+            .filter(|rest| rest.starts_with("ERROR"))
+            .collect();
+        assert_eq!(errors, ["ERROR ab"], "{verbose:?}: {:?}", out.stderr);
+        assert!(
+            !out.stderr.contains("log."),
+            "{verbose:?}: {:?}",
+            out.stderr
+        );
+    }
+}

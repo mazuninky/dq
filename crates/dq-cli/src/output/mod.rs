@@ -49,20 +49,59 @@ pub fn terminal_text(text: &str) -> Cow<'_, str> {
 /// id a warning quotes cannot break the line or reach the terminal raw —
 /// the message alone, any other field as `name=value`, separated by a
 /// space, as `tracing_subscriber`'s default formatter writes them. The
-/// level's colour is the event formatter's, outside the fields, and stays.
+/// fields a line logged through the `log` crate carries (`log.target`,
+/// `log.module_path`, `log.file`, `log.line`: jaq's `stderr`, globset,
+/// ureq) are left out, as the default formatter leaves them: `log.file`
+/// is a path on the machine dq was built on. The level's colour is the
+/// event formatter's, outside the fields, and stays.
 #[must_use]
-pub fn log_fields() -> impl for<'writer> tracing_subscriber::fmt::FormatFields<'writer> + 'static {
-    use tracing_subscriber::field::MakeExt;
-    tracing_subscriber::fmt::format::debug_fn(|writer, field, value| {
+pub fn log_fields() -> LogFields {
+    LogFields
+}
+
+/// See [`log_fields`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LogFields;
+
+impl<'writer> tracing_subscriber::fmt::FormatFields<'writer> for LogFields {
+    fn format_fields<R: tracing_subscriber::field::RecordFields>(
+        &self,
+        writer: tracing_subscriber::fmt::format::Writer<'writer>,
+        fields: R,
+    ) -> std::fmt::Result {
+        let mut visitor = LogVisitor {
+            writer,
+            first: true,
+            result: Ok(()),
+        };
+        fields.record(&mut visitor);
+        visitor.result
+    }
+}
+
+/// Writes the fields of one log line for [`LogFields`].
+struct LogVisitor<'writer> {
+    writer: tracing_subscriber::fmt::format::Writer<'writer>,
+    first: bool,
+    result: std::fmt::Result,
+}
+
+impl tracing::field::Visit for LogVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        let name = field.name();
+        if self.result.is_err() || name.starts_with("log.") {
+            return;
+        }
         let text = format!("{value:?}");
         let text = terminal_text(&text);
-        if field.name() == "message" {
-            write!(writer, "{text}")
+        let sep = if self.first { "" } else { " " };
+        self.first = false;
+        self.result = if name == "message" {
+            write!(self.writer, "{sep}{text}")
         } else {
-            write!(writer, "{field}={text}")
-        }
-    })
-    .delimited(" ")
+            write!(self.writer, "{sep}{name}={text}")
+        };
+    }
 }
 
 /// Output format selectable via the global `-F/--format` flag.
