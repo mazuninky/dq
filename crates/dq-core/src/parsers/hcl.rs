@@ -845,12 +845,16 @@ impl<'a> BodyWriter<'a> {
             self.out
                 .push_str(&hcl_text(&hcl::Expression::String((*label).to_owned()))?);
         }
-        if body.is_empty() {
+        self.out.push_str(" {\n");
+        let start = self.out.len();
+        self.body(body, depth + 1)?;
+        // A body whose keys all wrote nothing (block types with no body
+        // left) is an empty block.
+        if self.out.len() == start {
+            self.out.truncate(start - " {\n".len());
             self.out.push_str(" {}\n");
             return Ok(());
         }
-        self.out.push_str(" {\n");
-        self.body(body, depth + 1)?;
         indent(&mut self.out, depth);
         self.out.push_str("}\n");
         Ok(())
@@ -999,18 +1003,16 @@ impl<'a> BodyWriter<'a> {
 }
 
 /// Whether `value` can be written as the blocks of a type with `labels`
-/// labels and read back as itself: `labels` levels of non-empty maps, then
-/// a body (a map) or a list of two or more bodies — one body in a list
-/// would read back as the body alone.
+/// labels: `labels` levels of maps, then a body (a map) or a list of
+/// bodies. A key read as a block stays one with any number of bodies left:
+/// a list of one is written as one block, which reads back as the body
+/// alone, and an empty list or label map as no block, which removes the
+/// key.
 fn has_block_shape(value: &Value, labels: usize) -> bool {
     match value {
-        Value::Map(map) if labels > 0 => {
-            !map.is_empty() && map.values().all(|v| has_block_shape(v, labels - 1))
-        }
+        Value::Map(map) if labels > 0 => map.values().all(|v| has_block_shape(v, labels - 1)),
         Value::Map(_) => true,
-        Value::Array(bodies) if labels == 0 => {
-            bodies.len() >= 2 && bodies.iter().all(|b| matches!(b, Value::Map(_)))
-        }
+        Value::Array(bodies) if labels == 0 => bodies.iter().all(|b| matches!(b, Value::Map(_))),
         _ => false,
     }
 }
@@ -1504,6 +1506,50 @@ mod tests {
             "hcl format error: cannot set '/m/k': '/m' is the expression `d`, whose value HCL \
              computes; dq can replace the whole expression, not edit inside it"
         );
+    }
+
+    #[test]
+    fn a_block_type_stays_blocks_with_one_body_left_and_goes_with_none() {
+        let pointer = |p: &str| crate::pointer::Pointer::parse(p).unwrap();
+        let src =
+            "r \"sg\" \"app\" {\n  ingress {\n    p = 80\n  }\n  ingress {\n    p = 443\n  }\n}\n";
+        let mut doc = Hcl.parse(src.as_bytes()).expect("parse");
+        doc.del_at(&pointer("/r/sg/app/ingress/0")).expect("del");
+        assert_eq!(
+            String::from_utf8(doc.original_bytes().to_vec()).unwrap(),
+            "r \"sg\" \"app\" {\n  ingress {\n    p = 443\n  }\n}\n"
+        );
+        // A transform that leaves one body in a list, or none, or no label.
+        let doc = Hcl.parse(src.as_bytes()).expect("parse");
+        for (filter, want) in [
+            (
+                &["r", "sg", "app", "ingress"][..],
+                "r \"sg\" \"app\" {\n  ingress {\n    p = 80\n  }\n}\n",
+            ),
+            (&["r", "sg", "app"], "r \"sg\" \"app\" {}\n"),
+            (&["r", "sg"], ""),
+        ] {
+            let mut tree = doc.value().clone();
+            let mut at = &mut tree;
+            for key in filter {
+                let Value::Map(map) = at else { panic!() };
+                at = map.get_mut(*key).unwrap();
+            }
+            *at = match at {
+                Value::Array(bodies) => Value::Array(bodies[..1].to_vec()),
+                Value::Map(_) if filter.len() == 3 => {
+                    Value::Map([("ingress".to_owned(), Value::Array(vec![]))].into())
+                }
+                _ => Value::Map(IndexMap::new()),
+            };
+            let mut out = Vec::new();
+            Hcl.write(
+                &Document::value_only(tree, FormatTag::Hcl).with_layout_of(&doc),
+                &mut out,
+            )
+            .expect("write");
+            assert_eq!(String::from_utf8(out).unwrap(), want, "{filter:?}");
+        }
     }
 
     #[test]

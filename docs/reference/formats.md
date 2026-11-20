@@ -230,10 +230,13 @@ Writing lays attribute values out as `hcl::to_string` does — two-space
 indents, one array item or object member per line, object keys quoted —
 and writes every key read from an HCL file as a block back as blocks,
 `type "label" { … }`, one per body of a list: `fmt`, `convert -F hcl` of
-an HCL file, `set --jq` and `fix` keep blocks blocks, and the output reads
-back to the same tree. A key whose value a filter turned into something a
-block cannot hold back (a scalar, an empty label map, a list of one body,
-which would read back as the body alone) is written as an attribute; so
+an HCL file, point edits, `set --jq` and `fix` keep blocks blocks. A key
+read as blocks stays blocks with any number of bodies left: one body left
+of a repeated block (`dq del sg.tf /resource/aws_security_group/app/ingress/0`)
+is one block, which reads back as the body alone rather than a list of
+one; an empty list or label map is no block, so the key goes. A key whose
+value a filter turned into something no block holds (a scalar, a list of
+scalars) is written as an attribute; so
 is every key of a document read from another format, which records no
 blocks (`convert -F hcl` of YAML writes `resource = { … }`). Comments,
 spacing and layout are not kept.

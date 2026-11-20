@@ -503,10 +503,10 @@ fn an_attribute_holding_a_list_of_objects_stays_an_attribute() {
 }
 
 #[test]
-fn a_block_value_that_lost_its_block_shape_is_written_as_an_attribute() {
+fn a_key_read_as_blocks_stays_blocks_unless_it_lost_the_shape() {
     // What a `set --jq` may leave at a key read as blocks: one body left in
-    // the list, an empty label map, a scalar. Each is written as an
-    // attribute, which reads back as the same tree.
+    // the list is one block, which reads back as the body alone; an empty
+    // label map is no block, so the key goes; a scalar is an attribute.
     let mut doc = parse_hcl("x {\n  a = 1\n}\nx {\n  a = 2\n}\np \"l\" {}\ns {}\n");
     let Value::Map(top) = doc.value_mut() else {
         panic!()
@@ -514,13 +514,15 @@ fn a_block_value_that_lost_its_block_shape_is_written_as_an_attribute() {
     top.insert("x".into(), Value::Array(vec![map1("a", Value::Int(1))]));
     top.insert("p".into(), map(vec![]));
     top.insert("s".into(), Value::String("v".into()));
-    let expected = doc.value().clone();
     let written = write_hcl(&doc);
+    assert_eq!(written, "x {\n  a = 1\n}\ns = \"v\"\n");
     assert_eq!(
-        written,
-        "x = [\n  {\n    \"a\" = 1\n  }\n]\np = {}\ns = \"v\"\n"
+        parse_hcl(&written).value(),
+        &map(vec![
+            ("x", map1("a", Value::Int(1))),
+            ("s", Value::String("v".into())),
+        ])
     );
-    assert_eq!(parse_hcl(&written).value(), &expected);
     // A third body appended to two is three blocks.
     let Value::Map(top) = doc.value_mut() else {
         panic!()
@@ -531,7 +533,7 @@ fn a_block_value_that_lost_its_block_shape_is_written_as_an_attribute() {
     );
     assert_eq!(
         write_hcl(&doc),
-        "x {\n  a = 1\n}\nx {\n  a = 2\n}\nx {\n  a = 3\n}\np = {}\ns = \"v\"\n"
+        "x {\n  a = 1\n}\nx {\n  a = 2\n}\nx {\n  a = 3\n}\ns = \"v\"\n"
     );
 }
 
