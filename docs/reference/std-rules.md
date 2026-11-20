@@ -16,8 +16,10 @@ JSON Schema sidecars (`*.schema.json`) live there too.
   description, severity and references.
 - `dq rules list [--namespace NS]` lists them; `dq rules add @std/<ns>` copies
   a namespace into `./.dq/rules/<ns>/` to override or vendor it.
-- `dq test crates/dq-lint/rules/` runs every fixture (436 cases at the time
-  of writing); `cargo test -p dq-lint` runs the same suite.
+- `dq test @std` runs every embedded fixture (436 cases at the time of
+  writing), `dq test @std/<ns>` one namespace's; in a checkout,
+  `dq test crates/dq-lint/rules/` runs them from the source tree, and
+  `cargo test -p dq-lint` runs the same suite.
 
 ## Conventions
 

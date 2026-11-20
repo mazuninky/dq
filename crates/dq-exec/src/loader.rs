@@ -123,10 +123,16 @@ fn resolve_one(arg: &str, cwd: &Utf8Path) -> Result<RuleSet> {
     if candidate.exists() {
         return RuleSet::from_path(&candidate);
     }
-    Err(ExecError::UnknownRule {
+    Err(unknown_rule(arg))
+}
+
+/// [`ExecError::UnknownRule`] for `arg`, with the `@std/<ns>` names
+/// within a Levenshtein distance of 2 as suggestions.
+pub(crate) fn unknown_rule(arg: &str) -> ExecError {
+    ExecError::UnknownRule {
         id: arg.to_owned(),
         did_you_mean: did_you_mean(arg, &std_candidate_strings()),
-    })
+    }
 }
 
 /// Resolve the implicit auto-bind form (the rules list is empty).

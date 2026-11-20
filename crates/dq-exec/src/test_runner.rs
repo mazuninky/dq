@@ -4,6 +4,8 @@
 //! `*.test.yaml` files, parses them as [`RuleTestFile`], and executes
 //! each test case against the matching rule (a sibling `*.yml` file
 //! with the same stem minus the `.test` suffix).
+//! [`RuleTester::run_std`] does the same over the fixtures embedded in
+//! `dq-lint` for one `@std/<namespace>` (`dq test @std/k8s`).
 //!
 //! The comparison policy is described in design D10: every expected
 //! violation must match at least one actual diagnostic, and every actual
@@ -28,7 +30,7 @@ use serde::Deserialize;
 use crate::diagnostic::Diagnostic;
 use crate::error::{ExecError, Result};
 use crate::evaluator::{Evaluation, Evaluator};
-use crate::ruleset::RuleSet;
+use crate::ruleset::{RuleSet, RuleSource};
 
 /// Top-level fixture file shape.
 #[derive(Debug, Deserialize)]
@@ -170,6 +172,37 @@ impl RuleTester {
         }
         Ok(outcomes)
     }
+
+    /// Execute every fixture embedded for the standard rule namespace
+    /// `namespace` (`"k8s"`, without the `@std/` prefix), in file-name
+    /// order, against the embedded rules — what [`RuleTester::run_dir`]
+    /// does on `crates/dq-lint/rules/<namespace>/`, without the source
+    /// tree. Outcomes name a fixture `@std/<namespace>/<file>.test.yml`.
+    ///
+    /// # Errors
+    ///
+    /// - [`ExecError::UnknownRule`] (id `@std/<namespace>`, with typo
+    ///   suggestions) when `dq-lint` has no such namespace.
+    pub fn run_std(namespace: &str) -> Result<Vec<TestOutcome>> {
+        let arg = format!("@std/{namespace}");
+        let Some(namespace) = dq_lint::list_std_rulesets()
+            .iter()
+            .copied()
+            .find(|ns| *ns == namespace)
+        else {
+            return Err(crate::loader::unknown_rule(&arg));
+        };
+        let mut fixtures: Vec<(&str, &str)> = dq_lint::std_test_files(namespace)
+            .unwrap_or_default()
+            .to_vec();
+        fixtures.sort_unstable_by_key(|(name, _)| *name);
+        let mut outcomes = Vec::new();
+        for (name, text) in fixtures {
+            let label = Utf8PathBuf::from(format!("{arg}/{name}"));
+            outcomes.extend(run_std_fixture(namespace, &label, text));
+        }
+        Ok(outcomes)
+    }
 }
 
 /// Returns `true` for `*.test.yml` / `*.test.yaml` files.
@@ -183,73 +216,87 @@ fn is_fixture_file(path: &Utf8Path) -> bool {
 /// Run one fixture file and emit one [`TestOutcome`] per test case.
 fn run_fixture(fixture: &Utf8Path) -> Vec<TestOutcome> {
     // 1. Locate the parent rule file (same stem minus `.test`).
-    let rule_path = match parent_rule_path(fixture) {
-        Some(p) => p,
-        None => {
-            return vec![TestOutcome::Error {
-                fixture: fixture.to_path_buf(),
-                name: "<file>".to_owned(),
-                error: format!("could not derive parent rule path from fixture: {fixture}"),
-            }];
-        }
+    let Some(rule_path) = parent_rule_path(fixture) else {
+        return file_error(
+            fixture,
+            format!("could not derive parent rule path from fixture: {fixture}"),
+        );
     };
     if !rule_path.is_file() {
-        return vec![TestOutcome::Error {
-            fixture: fixture.to_path_buf(),
-            name: "<file>".to_owned(),
-            error: format!("rule file not found: {rule_path}"),
-        }];
+        return file_error(fixture, format!("rule file not found: {rule_path}"));
     }
-
-    // 2. Parse the fixture.
     let fixture_yaml = match std::fs::read_to_string(fixture) {
         Ok(s) => s,
-        Err(err) => {
-            return vec![TestOutcome::Error {
-                fixture: fixture.to_path_buf(),
-                name: "<file>".to_owned(),
-                error: format!("failed to read fixture: {err}"),
-            }];
-        }
+        Err(err) => return file_error(fixture, format!("failed to read fixture: {err}")),
     };
-    let fixture_file: RuleTestFile = match serde_norway::from_str(&fixture_yaml) {
+    run_fixture_text(fixture, &fixture_yaml, &rule_path, || {
+        RuleSet::from_path(&rule_path)
+    })
+}
+
+/// Run one embedded `@std/<namespace>` fixture. `fixture` is the
+/// `@std/<namespace>/<file>.test.yml` label outcomes carry; the rule is
+/// the embedded sibling file, loaded as `RuleSource::Std` so a
+/// `schema_file` resolves to the embedded sidecar, as in `dq lint`.
+fn run_std_fixture(
+    namespace: &'static str,
+    fixture: &Utf8Path,
+    fixture_yaml: &str,
+) -> Vec<TestOutcome> {
+    let Some(rule_path) = parent_rule_path(fixture) else {
+        return file_error(
+            fixture,
+            format!("could not derive parent rule path from fixture: {fixture}"),
+        );
+    };
+    let rule_name = rule_path.file_name().unwrap_or_default();
+    let rule_text = dq_lint::std_rule_files(namespace)
+        .unwrap_or_default()
+        .iter()
+        .find(|(name, _)| *name == rule_name)
+        .map(|(_, text)| *text);
+    let Some(rule_text) = rule_text else {
+        return file_error(fixture, format!("rule file not found: {rule_path}"));
+    };
+    run_fixture_text(fixture, fixture_yaml, &rule_path, || {
+        RuleSet::from_str(rule_text, RuleSource::Std(namespace))
+    })
+}
+
+/// One [`TestOutcome::Error`] for a fixture that could not run at all.
+fn file_error(fixture: &Utf8Path, error: String) -> Vec<TestOutcome> {
+    vec![TestOutcome::Error {
+        fixture: fixture.to_path_buf(),
+        name: "<file>".to_owned(),
+        error,
+    }]
+}
+
+/// Parse `fixture_yaml`, load its rule with `load_rule` (`rule_path`
+/// names it in errors) and run every case.
+fn run_fixture_text(
+    fixture: &Utf8Path,
+    fixture_yaml: &str,
+    rule_path: &Utf8Path,
+    load_rule: impl FnOnce() -> Result<RuleSet>,
+) -> Vec<TestOutcome> {
+    // 2. Parse the fixture.
+    let fixture_file: RuleTestFile = match serde_norway::from_str(fixture_yaml) {
         Ok(f) => f,
-        Err(err) => {
-            return vec![TestOutcome::Error {
-                fixture: fixture.to_path_buf(),
-                name: "<file>".to_owned(),
-                error: format!("fixture parse error: {err}"),
-            }];
-        }
+        Err(err) => return file_error(fixture, format!("fixture parse error: {err}")),
     };
 
     // 3. Load the rule and build a one-rule evaluator.
-    let ruleset = match RuleSet::from_path(&rule_path) {
+    let ruleset = match load_rule() {
         Ok(s) => s,
-        Err(err) => {
-            return vec![TestOutcome::Error {
-                fixture: fixture.to_path_buf(),
-                name: "<file>".to_owned(),
-                error: format!("rule load error: {err}"),
-            }];
-        }
+        Err(err) => return file_error(fixture, format!("rule load error: {err}")),
     };
     if ruleset.rules.is_empty() {
-        return vec![TestOutcome::Error {
-            fixture: fixture.to_path_buf(),
-            name: "<file>".to_owned(),
-            error: format!("rule file produced no rules: {rule_path}"),
-        }];
+        return file_error(fixture, format!("rule file produced no rules: {rule_path}"));
     }
     let evaluator = match Evaluator::new(vec![ruleset.clone()]) {
         Ok(e) => e,
-        Err(err) => {
-            return vec![TestOutcome::Error {
-                fixture: fixture.to_path_buf(),
-                name: "<file>".to_owned(),
-                error: format!("rule compile error: {err}"),
-            }];
-        }
+        Err(err) => return file_error(fixture, format!("rule compile error: {err}")),
     };
     // The rule's primary format — used as a default when a test case
     // omits the `format:` field.
@@ -788,6 +835,31 @@ tests:
                 );
             }
             other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_std_runs_the_embedded_fixtures_of_a_namespace() {
+        let outcomes = RuleTester::run_std("npm").expect("known namespace");
+        assert!(!outcomes.is_empty());
+        for outcome in &outcomes {
+            match outcome {
+                TestOutcome::Pass { fixture, .. } => {
+                    assert!(fixture.as_str().starts_with("@std/npm/"), "{fixture}");
+                }
+                other => panic!("expected Pass, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn run_std_rejects_an_unknown_namespace_with_suggestions() {
+        match RuleTester::run_std("k8z") {
+            Err(ExecError::UnknownRule { id, did_you_mean }) => {
+                assert_eq!(id, "@std/k8z");
+                assert_eq!(did_you_mean, vec!["@std/k8s".to_owned()]);
+            }
+            other => panic!("expected UnknownRule, got {other:?}"),
         }
     }
 }

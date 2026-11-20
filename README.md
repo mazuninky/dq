@@ -171,6 +171,7 @@ severity: error
 match: { format: yaml }
 check: { jq: ".spec | has(\"replicas\")", message: "no replicas" }' f.yaml
 dq test crates/dq-lint/rules/            # run *.test.yml fixtures
+dq test @std/k8s                        # run the fixtures embedded for @std/k8s
 dq explain k8s.no-latest-tag             # rule description / severity / refs
 dq rules list                            # all available rulesets
 dq rules add @std/k8s                    # materialise @std/k8s under .dq/rules/k8s/

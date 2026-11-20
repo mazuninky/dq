@@ -14,7 +14,7 @@ the `dq-exec` crate (`crates/dq-exec/src/`); the standard library of rules is
 | `dq lint <files/globs>… [--rules SRC]…` | Run rule sets over files. |
 | `dq check (--rule ID-OR-PATH \| --inline YAML) <files>…` | Run one rule. No auto-binding. |
 | `dq fix <files/globs>… [--rules SRC]…` | Apply rule fixes; write modes as in [write-commands.md](write-commands.md). |
-| `dq test <dir>` | Run every `*.test.yml` fixture under a directory. |
+| `dq test <dir \| @std/NS \| @std>` | Run every `*.test.yml` fixture under a directory, or the embedded fixtures of a standard namespace (`@std`: of every namespace). |
 | `dq explain <rule-id>` | Description, severity, references of a rule (`console` or `json`). |
 | `dq rules list [--namespace NS]` | List `@std` rules (id, namespace, severity, source). |
 | `dq rules add <@std/NS \| path> [--force] [--symlink]` | Copy (or symlink, Unix) a rule set into `./.dq/rules/<ns>/` for local override or vendoring. |
@@ -187,8 +187,12 @@ reports the real one. Failures print the missing and the extra diagnostics
 and each rule error as `raised: rule=<id> <field>: <jq error>` (a `raised`
 list in `-F json` and `-F tap`), so a fixture case catches a rule that
 raises even when it expects no violation. The summary line reads `summary: N passed, F failed, E errored,
-T total`. `dq test` takes a directory; to test the built-in rules run it on
-`crates/dq-lint/rules/` (the `cargo test -p dq-lint` suite does the same).
+T total`. `dq test @std/<ns>` runs the fixtures embedded in the binary for one
+standard namespace against the embedded rules (labelled
+`@std/<ns>/<rule>.test.yml`), and `dq test @std` those of every namespace; an
+unknown namespace is `unknown rule @std/<ns>` (exit 6). In a checkout,
+`dq test crates/dq-lint/rules/` runs the same fixtures from the source tree;
+the `cargo test -p dq-lint` suite runs both.
 
 ## Fixes
 

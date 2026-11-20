@@ -38,16 +38,10 @@ use crate::output::OutputFormat;
 ///   contains no fixtures, or when an unsupported output format is set.
 /// - [`LintFail`] (exit 4) when at least one test outcome is `Fail` or
 ///   `Error`.
-/// - `dq_exec::ExecError` when the directory walk itself fails.
+/// - `dq_exec::ExecError` when the directory walk itself fails, or
+///   `UnknownRule` (exit 6) for an `@std/<ns>` that does not exist.
 pub fn run(cli: &Cli, args: &TestArgs, out: &mut dyn Write) -> anyhow::Result<()> {
-    if !args.rules_dir.as_std_path().is_dir() {
-        return Err(anyhow::Error::new(InvalidInput::new(format!(
-            "rules directory does not exist or is not a directory: {dir}",
-            dir = args.rules_dir,
-        ))));
-    }
-
-    let outcomes = RuleTester::run_dir(&args.rules_dir).map_err(anyhow::Error::new)?;
+    let outcomes = collect_outcomes(args)?;
 
     if outcomes.is_empty() {
         return Err(anyhow::Error::new(InvalidInput::new(format!(
@@ -75,6 +69,30 @@ pub fn run(cli: &Cli, args: &TestArgs, out: &mut dyn Write) -> anyhow::Result<()
         return Err(anyhow::Error::new(LintFail { count: failures }));
     }
     Ok(())
+}
+
+/// Run the fixtures `args.rules_dir` names: `@std` (every standard
+/// namespace, in order), `@std/<ns>` (one), or a directory on disk. The
+/// `@std` prefix wins over a directory of that name, as in `--rules`.
+fn collect_outcomes(args: &TestArgs) -> anyhow::Result<Vec<TestOutcome>> {
+    let arg = args.rules_dir.as_str();
+    if arg == "@std" {
+        let mut outcomes = Vec::new();
+        for ns in dq_lint::list_std_rulesets() {
+            outcomes.extend(RuleTester::run_std(ns).map_err(anyhow::Error::new)?);
+        }
+        return Ok(outcomes);
+    }
+    if let Some(ns) = arg.strip_prefix("@std/") {
+        return RuleTester::run_std(ns).map_err(anyhow::Error::new);
+    }
+    if !args.rules_dir.as_std_path().is_dir() {
+        return Err(anyhow::Error::new(InvalidInput::new(format!(
+            "rules directory does not exist or is not a directory: {dir}",
+            dir = args.rules_dir,
+        ))));
+    }
+    RuleTester::run_dir(&args.rules_dir).map_err(anyhow::Error::new)
 }
 
 fn render_console(outcomes: &[TestOutcome], out: &mut dyn Write) -> std::io::Result<()> {

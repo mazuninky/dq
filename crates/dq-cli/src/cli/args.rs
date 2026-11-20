@@ -438,7 +438,7 @@ pub enum Command {
     Lint(LintArgs),
     /// Run a single rule against files (or `--inline` an ad-hoc rule) (M8).
     Check(CheckArgs),
-    /// Run rule fixture tests under a directory (M8).
+    /// Run rule fixture tests under a directory or of `@std/<ns>` (M8).
     Test(TestArgs),
     /// Print a rule's description, severity, and references (M8).
     Explain(ExplainArgs),
