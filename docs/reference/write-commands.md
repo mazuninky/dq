@@ -157,8 +157,10 @@ documents give an empty list. Feeding the output of `diff -F json` to
 `patch` turns `a` into `b`. Big numbers print as numbers, and `1e400` equals
 `1e+400`.
 
-Known issue: `--unified` colours its output even when stdout is not a
-terminal (only `--no-color` turns it off).
+`--unified` colours its output (red removals, green additions, cyan hunk
+headers) by the rule every command follows — `--no-color`, then `NO_COLOR`,
+then `CLICOLOR_FORCE`, then whether stdout is a terminal (see
+[cli.md](cli.md#colour)) — so piped output is plain text.
 
 ## `convert -i`
 

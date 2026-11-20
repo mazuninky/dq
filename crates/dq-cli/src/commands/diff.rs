@@ -47,6 +47,10 @@ use crate::output::{OutputFormat, Reporter};
 /// always passes `None` — `-F` for `diff` controls the OUTPUT renderer, not
 /// the input parser, mirroring `convert`'s behaviour.
 ///
+/// `use_color` is the dispatcher's colour decision
+/// ([`crate::output::resolve_color`]: `--no-color`, `NO_COLOR`,
+/// `CLICOLOR_FORCE`, stdout a terminal); it colours the `--unified` text.
+///
 /// # Errors
 ///
 /// - [`crate::error::InvalidInput`] (exit 6) when any write-mode flag is set —
@@ -57,6 +61,7 @@ pub fn run(
     cli: &Cli,
     args: &DiffArgs,
     input_format: Option<&str>,
+    use_color: bool,
     reporter: &dyn Reporter,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
@@ -73,7 +78,7 @@ pub fn run(
         let a_json = pretty_json(&doc_a.value().to_serde_json())?;
         let b_json = pretty_json(&doc_b.value().to_serde_json())?;
         let label = format!("{} -> {}", args.a, args.b);
-        let unified = crate::diff::render_unified(&a_json, &b_json, &label, !cli.no_color);
+        let unified = crate::diff::render_unified(&a_json, &b_json, &label, use_color);
         out.write_all(unified.as_bytes())?;
         return Ok(());
     }
@@ -203,7 +208,7 @@ mod tests {
         };
         let reporter = JsonReporter;
         let mut out: Vec<u8> = Vec::new();
-        run(&cli, &args, None, &reporter, &mut out).expect("equal files diff");
+        run(&cli, &args, None, false, &reporter, &mut out).expect("equal files diff");
         let stdout = String::from_utf8(out).expect("utf-8 stdout");
         // JsonReporter emits pretty-printed JSON with a trailing newline; the
         // empty array renders as `[]\n`.
@@ -230,7 +235,7 @@ mod tests {
         };
         let reporter = JsonReporter;
         let mut out: Vec<u8> = Vec::new();
-        run(&cli, &args, None, &reporter, &mut out).expect("single replace diff");
+        run(&cli, &args, None, false, &reporter, &mut out).expect("single replace diff");
         let stdout = String::from_utf8(out).expect("utf-8 stdout");
         let parsed: serde_json::Value =
             serde_json::from_str(&stdout).expect("output must be JSON array");
@@ -259,7 +264,7 @@ mod tests {
         };
         let reporter = JsonReporter;
         let mut out: Vec<u8> = Vec::new();
-        run(&cli, &args, None, &reporter, &mut out).expect("type-change diff");
+        run(&cli, &args, None, false, &reporter, &mut out).expect("type-change diff");
         let stdout = String::from_utf8(out).expect("utf-8 stdout");
         let parsed: serde_json::Value =
             serde_json::from_str(&stdout).expect("output must be JSON array");
@@ -291,7 +296,7 @@ mod tests {
         };
         let reporter = JsonReporter;
         let mut out: Vec<u8> = Vec::new();
-        run(&cli, &args, None, &reporter, &mut out).expect("cross-format diff");
+        run(&cli, &args, None, false, &reporter, &mut out).expect("cross-format diff");
         let stdout = String::from_utf8(out).expect("utf-8 stdout");
         assert_eq!(
             stdout.trim(),
@@ -316,7 +321,7 @@ mod tests {
         };
         let reporter = JsonReporter;
         let mut out: Vec<u8> = Vec::new();
-        run(&cli, &args, None, &reporter, &mut out).expect("unified diff");
+        run(&cli, &args, None, false, &reporter, &mut out).expect("unified diff");
         let stdout = String::from_utf8(out).expect("utf-8 stdout");
         assert!(
             stdout.contains("---"),
@@ -333,6 +338,27 @@ mod tests {
     }
 
     #[test]
+    fn diff_unified_colours_by_use_color_not_the_flag() {
+        // The colour decision is the caller's `use_color`; without
+        // `--no-color` the text is plain when `use_color` is false.
+        let a = write_tmp("x: 1\n", ".yaml");
+        let b = write_tmp("x: 2\n", ".yaml");
+        let (a_path, b_path) = (utf8_path(&a), utf8_path(&b));
+        let cli = cli_for(&a_path, &b_path, &[]);
+        let args = DiffArgs {
+            a: a_path,
+            b: b_path,
+            unified: true,
+        };
+        for (use_color, coloured) in [(false, false), (true, true)] {
+            let mut out: Vec<u8> = Vec::new();
+            run(&cli, &args, None, use_color, &JsonReporter, &mut out).expect("unified diff");
+            let stdout = String::from_utf8(out).expect("utf-8 stdout");
+            assert_eq!(stdout.contains('\x1b'), coloured, "{use_color}: {stdout:?}");
+        }
+    }
+
+    #[test]
     fn diff_rejects_in_place_flag() {
         // `diff` is a read-only subcommand: passing `-i` must be rejected
         // with `INVALID_INPUT` (exit 6) before any I/O happens.
@@ -345,7 +371,7 @@ mod tests {
         };
         let reporter = JsonReporter;
         let mut out: Vec<u8> = Vec::new();
-        let err = run(&cli, &args, None, &reporter, &mut out).expect_err("must reject -i");
+        let err = run(&cli, &args, None, false, &reporter, &mut out).expect_err("must reject -i");
         assert!(
             err.downcast_ref::<crate::error::InvalidInput>().is_some(),
             "rejection must carry InvalidInput so exit-code mapper picks 6, got: {err:?}",

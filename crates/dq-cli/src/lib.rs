@@ -108,7 +108,7 @@ fn dispatch(
         // their extensions — same special-case as `convert`. Passing
         // `cli.format` as the input override would force `dq diff a.yaml
         // b.yaml -F json` to parse the YAML files as JSON and fail.
-        Command::Diff(args) => commands::diff::run(cli, args, None, reporter, out),
+        Command::Diff(args) => commands::diff::run(cli, args, None, use_color, reporter, out),
         Command::Set(args) => commands::set::run(cli, args, input_format, use_color, out),
         Command::Del(args) => commands::del::run(cli, args, input_format, use_color, out),
         Command::Patch(args) => commands::patch::run(cli, args, input_format, use_color, out),
