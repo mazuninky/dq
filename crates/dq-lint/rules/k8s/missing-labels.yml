@@ -8,7 +8,13 @@ match:
   format: yaml
   filter: 'type == "object" and (.kind == "Deployment" or .kind == "StatefulSet" or .kind == "DaemonSet" or .kind == "Service" or .kind == "Job" or .kind == "CronJob")'
 check:
-  jq: 'select((.metadata.labels // {})["app.kubernetes.io/name"] == null) | {kind: .kind, name: (.metadata.name // "<unnamed>"), pointer: "/metadata/name"}'
+  jq: |
+    # A string `metadata` or `labels` yields nothing instead of raising; a
+    # missing one reads as empty.
+    (.metadata // {} | objects) as $meta
+    | ($meta.labels // {} | objects) as $labels
+    | select($labels["app.kubernetes.io/name"] == null)
+    | {kind: .kind, name: ($meta.name // "<unnamed>"), pointer: "/metadata/name"}
   message: "{{ .kind }} '{{ .name }}' is missing label app.kubernetes.io/name"
 loc:
   pointer: '.pointer'

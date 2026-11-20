@@ -38,3 +38,19 @@ tests:
     input: ""
     expected:
       violations: []
+  - name: string metadata produces no violations
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata: x
+    expected:
+      violations: []
+  - name: string labels produce no violations
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: app
+        labels: x
+    expected:
+      violations: []

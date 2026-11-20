@@ -9,22 +9,26 @@ match:
   filter: 'type == "object" and (.kind == "Deployment" or .kind == "StatefulSet" or .kind == "DaemonSet" or .kind == "Pod")'
 check:
   jq: |
-    if (.spec.template // null) != null
-    then
-      (.spec.template.spec.containers // [])
-      | to_entries[]
-      | select(.value.image | tostring | test(":latest$") or (test(":") | not))
-      | { name: .value.name,
-          image: .value.image,
-          pointer: ("/spec/template/spec/containers/" + (.key | tostring) + "/image") }
-    else
-      (.spec.containers // [])
-      | to_entries[]
-      | select(.value.image | tostring | test(":latest$") or (test(":") | not))
-      | { name: .value.name,
-          image: .value.image,
-          pointer: ("/spec/containers/" + (.key | tostring) + "/image") }
-    end
+    # The pod spec of a workload (`.spec.template.spec`) or of a Pod
+    # (`.spec`); `containers` streams its container objects. Any step
+    # whose value has the wrong type (a string `spec`, a `containers`
+    # that is not an array, a container that is not a map) yields nothing
+    # instead of raising.
+    def pod:
+      (.spec // {} | objects) as $s
+      | if ($s.template // null) != null
+        then ($s.template | objects | .spec // {} | objects) as $p
+             | {spec: $p, ptr: "/spec/template/spec"}
+        else {spec: $s, ptr: "/spec"}
+        end;
+    def containers:
+      pod | .ptr as $ptr
+      | (.spec.containers // [] | arrays | to_entries[])
+      | select(.value | type == "object")
+      | {c: .value, at: ($ptr + "/containers/" + (.key | tostring))};
+    containers
+    | select(.c.image | tostring | test(":latest$") or (test(":") | not))
+    | { name: .c.name, image: .c.image, pointer: (.at + "/image") }
   message: "Container '{{ .name }}' uses :latest tag (image: {{ .image }})"
 loc:
   pointer: '.pointer'

@@ -41,3 +41,27 @@ tests:
     input: ""
     expected:
       violations: []
+  - name: a string spec produces no violations
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+      spec: x
+    expected:
+      violations: []
+  - name: a string template produces no violations
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+      spec:
+        template: x
+    expected:
+      violations: []
+  - name: a number template spec produces no violations
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+      spec:
+        template:
+          spec: 1
+    expected:
+      violations: []

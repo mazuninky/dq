@@ -54,3 +54,12 @@ tests:
       violations:
         - rule: k8s.service-no-selector
           message_contains: "web"
+  - name: string metadata produces no violations
+    input: |
+      apiVersion: v1
+      kind: Service
+      metadata: x
+      spec:
+        selector: { app: api }
+    expected:
+      violations: []

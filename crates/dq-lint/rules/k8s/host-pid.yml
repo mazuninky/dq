@@ -9,10 +9,17 @@ match:
   filter: 'type == "object" and (.kind == "Deployment" or .kind == "StatefulSet" or .kind == "DaemonSet" or .kind == "Pod")'
 check:
   jq: |
-    if (.spec.template // null) != null
-    then { spec: .spec.template.spec, ptr: "/spec/template/spec" }
-    else { spec: .spec,               ptr: "/spec" }
-    end
+    # The pod spec of a workload (`.spec.template.spec`) or of a Pod
+    # (`.spec`). Any step whose value has the wrong type (a string `spec`, a
+    # `template` that is not a map) yields nothing instead of raising.
+    def pod:
+      (.spec // {} | objects) as $s
+      | if ($s.template // null) != null
+        then ($s.template | objects | .spec // {} | objects) as $p
+             | {spec: $p, ptr: "/spec/template/spec"}
+        else {spec: $s, ptr: "/spec"}
+        end;
+    pod
     | select(.spec.hostPID == true)
     | { pointer: (.ptr + "/hostPID") }
   message: "Pod uses hostPID: true"

@@ -8,7 +8,13 @@ match:
   format: yaml
   filter: 'type == "object" and .kind == "Service" and (.spec.type? // "ClusterIP") != "ExternalName"'
 check:
-  jq: 'select((.spec.selector? // {}) | length == 0) | {name: (.metadata.name // "<unnamed>"), pointer: "/spec"}'
+  jq: |
+    # A string `metadata` yields nothing instead of raising. A non-map
+    # `spec` still reads as a Service without a selector (an existing
+    # fixture pins it).
+    (.metadata // {} | objects) as $meta
+    | select((.spec.selector? // {}) | length == 0)
+    | {name: ($meta.name // "<unnamed>"), pointer: "/spec"}
   message: "Service '{{ .name }}' has no selector (manual endpoints?)"
 loc:
   pointer: '.pointer'

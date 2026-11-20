@@ -10,15 +10,20 @@ match:
   filter: 'type == "object" and (.kind == "Deployment" or .kind == "StatefulSet" or .kind == "DaemonSet" or .kind == "Pod")'
 check:
   jq: |
+    # A step whose value has the wrong type (a string `spec`, `metadata` or
+    # `securityContext`) yields nothing instead of raising; a missing one
+    # reads as empty.
     . as $doc
-    | if (.spec.template // null) != null
-      then { spec: .spec.template.spec, ptr: "/spec/template/spec" }
-      else { spec: .spec,               ptr: "/spec" }
+    | (.spec // {} | objects) as $s
+    | if ($s.template // null) != null
+      then ($s.template | objects | .spec // {} | objects) as $p
+           | {spec: $p, ptr: "/spec/template/spec"}
+      else {spec: $s, ptr: "/spec"}
       end
     | . as $ctx
-    | select(($ctx.spec.securityContext.runAsNonRoot // null) != true)
+    | select(($ctx.spec.securityContext // {} | objects | .runAsNonRoot // null) != true)
     | { kind: "pod",
-        name: ($doc.metadata.name // "<unnamed>"),
+        name: (($doc.metadata // {} | objects | .name) // "<unnamed>"),
         pointer: ($ctx.ptr + "/containers/0/name") }
   message: "Pod-spec '{{ .name }}' does not set securityContext.runAsNonRoot=true"
 loc:

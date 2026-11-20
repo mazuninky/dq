@@ -44,3 +44,38 @@ tests:
     input: ""
     expected:
       violations: []
+  - name: a string spec produces no violations
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+      spec: x
+    expected:
+      violations: []
+  - name: a string template produces no violations
+    input: |
+      apiVersion: apps/v1
+      kind: Deployment
+      spec:
+        template: x
+    expected:
+      violations: []
+  - name: a string securityContext produces no violations
+    input: |
+      apiVersion: v1
+      kind: Pod
+      spec:
+        securityContext: x
+    expected:
+      violations: []
+  - name: string metadata still reports the pod, unnamed
+    input: |
+      apiVersion: v1
+      kind: Pod
+      metadata: x
+      spec:
+        containers:
+          - name: app
+    expected:
+      violations:
+        - rule: k8s.run-as-root
+          message_contains: "<unnamed>"
