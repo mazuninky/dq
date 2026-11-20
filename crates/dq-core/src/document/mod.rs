@@ -1071,10 +1071,16 @@ impl Document {
     /// `Document::try_mkdir_p`); the node it hangs from must be a mapping,
     /// else [`Error::Path`] with `kind = MissingKey`.
     ///
-    /// Formats whose [`Format::insertion_renderer`] returns `None` (XML,
-    /// CSV, INI, .env, Dockerfile, ignore-list, markdown body) remain
-    /// strictly read-only for mkdir-p and continue to return
-    /// [`Error::Path`].
+    /// # Formats without textual edits
+    ///
+    /// A document of XML, HCL, INI, dotenv, CSV or TSV
+    /// ([`Document::edits_by_rewrite`]) takes `value` into its tree, with
+    /// the same mkdir-p, and is written whole anew through its format's
+    /// writer: layout and comments (but XML's) go, and the tree becomes what the
+    /// written bytes read back as. A tree the writer refuses is its error
+    /// ([`Error::Format`]), and the document is left as it was. Any other
+    /// format with no textual edits (Markdown, JSONL, Dockerfile, …) is
+    /// [`Error::WriteUnavailable`].
     ///
     /// # Read-back check
     ///
@@ -1091,9 +1097,14 @@ impl Document {
     ///   read-only (no spans or no renderer registered).
     /// - [`Error::Path`] when the pointer addresses a non-existent path
     ///   that cannot be created via the mkdir-p path.
+    /// - [`Error::Format`] when the writer of a document of a format
+    ///   without textual edits refuses the tree with `value` in it.
     /// - [`Error::EditRejected`] when the edited bytes fail the read-back
     ///   check.
     pub fn set_at(&mut self, pointer: &Pointer, value: Value) -> Result<()> {
+        if self.edits_by_rewrite() {
+            return self.rewrite_edit("set", pointer, |tree| set_value_at(tree, pointer, value));
+        }
         self.with_lf_line_breaks("set", pointer, |doc| {
             if doc.format == FormatTag::Yaml && doc.write_aware {
                 // A whole document: one of a stream whose content is a
@@ -1200,6 +1211,78 @@ impl Document {
                 })
             }
         }
+    }
+
+    /// Whether [`Document::set_at`], [`Document::del_at`] and
+    /// [`Document::insert_at`] change this document by writing it whole
+    /// anew through its format's writer, as `set --jq` does, rather than
+    /// by a textual edit: a document of XML, HCL, INI, dotenv, CSV or TSV,
+    /// formats dq writes but has no textual edits for. Layout is not kept,
+    /// nor are comments but XML's, which its tree holds; an HCL document
+    /// keeps writing its blocks as blocks.
+    #[must_use]
+    pub fn edits_by_rewrite(&self) -> bool {
+        !self.write_aware
+            && !self.multi_doc
+            && matches!(
+                self.format,
+                FormatTag::Xml
+                    | FormatTag::Hcl
+                    | FormatTag::Ini
+                    | FormatTag::DotEnv
+                    | FormatTag::Csv
+                    | FormatTag::Tsv
+            )
+    }
+
+    /// Whether [`Document::set_at`], [`Document::del_at`] and
+    /// [`Document::insert_at`] can change this document at all: by a
+    /// textual edit ([`Document::is_write_aware`]) or by a rewrite
+    /// ([`Document::edits_by_rewrite`]).
+    #[must_use]
+    pub fn is_editable(&self) -> bool {
+        self.write_aware || self.edits_by_rewrite()
+    }
+
+    /// Apply `edit` to a copy of the value tree and write the result whole
+    /// through the format's writer, with the layout this document was read
+    /// with ([`Document::with_layout_of`]). The written bytes become the
+    /// document's, and its tree is what they read back as — an INI, dotenv
+    /// or CSV value is a string, so `2` reads back as `"2"`. On any error
+    /// `self` is left as it was.
+    ///
+    /// # Errors
+    ///
+    /// The error of `edit` (an [`Error::Path`]); the writer's error for a
+    /// tree it cannot write ([`Error::Format`]: a nested value in INI,
+    /// dotenv or CSV, a second XML root, …); [`Error::EditRejected`] when
+    /// the written bytes would not read back.
+    fn rewrite_edit(
+        &mut self,
+        action: &'static str,
+        pointer: &Pointer,
+        edit: impl FnOnce(&mut Value) -> Result<()>,
+    ) -> Result<()> {
+        let name = self.format.name();
+        let Some(format) = crate::format::by_name(name) else {
+            return Err(self.no_textual_edits("write it"));
+        };
+        let mut tree = self.value.clone();
+        edit(&mut tree)?;
+        let mut bytes = Vec::new();
+        format.write(
+            &Document::value_only(tree, self.format).with_layout_of(self),
+            &mut bytes,
+        )?;
+        let fresh = format.parse(&bytes).map_err(|err| Error::EditRejected {
+            action,
+            pointer: pointer.as_canonical(),
+            reason: format!("the {name} dq would write does not read back: {err}"),
+        })?;
+        self.value = fresh.value;
+        self.hcl_blocks = fresh.hcl_blocks;
+        self.original_bytes = bytes;
+        Ok(())
     }
 
     /// The refusal of a textual edit — `what` it would do, as "set a value
@@ -2739,18 +2822,27 @@ impl Document {
     ///   to is refused: the alias would dangle, or resolve to an earlier
     ///   definition of the same name.
     ///
+    /// A document of XML, HCL, INI, dotenv, CSV or TSV
+    /// ([`Document::edits_by_rewrite`]) loses the node from its tree and is
+    /// written whole anew, as [`Document::set_at`] describes.
+    ///
     /// # Errors
     ///
     /// - [`Error::WriteUnavailable`] when the document was loaded
     ///   read-only.
     /// - [`Error::Path`] with `kind = TypeMismatch` when `pointer` is
     ///   the root (the root is never deletable — it would empty the file).
+    /// - [`Error::Format`] when the writer of a document of a format
+    ///   without textual edits refuses the tree left.
     /// - [`Error::Path`] with `kind = MissingKey` when no span exists for
     ///   the pointer (and, for YAML, it is no removable collection).
     /// - [`Error::EditRejected`] when the YAML bytes to remove define an
     ///   anchor that an alias outside them refers to, or when the edited
     ///   bytes fail the read-back check [`Document::set_at`] describes.
     pub fn del_at(&mut self, pointer: &Pointer) -> Result<()> {
+        if self.edits_by_rewrite() {
+            return self.rewrite_edit("delete", pointer, |tree| delete_value_at(tree, pointer));
+        }
         self.with_lf_line_breaks("delete", pointer, |doc| {
             // A document of a stream goes with its `---` line.
             if let Some(index) = doc.stream_document_index(pointer) {
@@ -6231,6 +6323,72 @@ mod tests {
             err.to_string().contains("markdown has no textual edits"),
             "{err}"
         );
+    }
+
+    fn parsed(format: &dyn crate::format::Format, src: &str) -> Document {
+        format.parse(src.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn formats_without_textual_edits_that_dq_writes_are_edited_by_rewrite() {
+        let ini = parsed(&crate::parsers::Ini, "; c\n[s]\nk = v\n");
+        assert!(ini.edits_by_rewrite() && ini.is_editable() && !ini.is_write_aware());
+        let markdown = parsed(&crate::parsers::Markdown, "# T\n");
+        assert!(!markdown.edits_by_rewrite() && !markdown.is_editable());
+        let yaml = crate::parsers::parse_yaml_with_spans(b"a: 1\n").unwrap();
+        assert!(!yaml.edits_by_rewrite() && yaml.is_editable());
+    }
+
+    #[test]
+    fn set_at_rewrites_an_ini_document_and_reads_it_back() {
+        let mut doc = parsed(&crate::parsers::Ini, "; c\n[s]\nk = v\n");
+        doc.set_at(&Pointer::parse("/s/k").unwrap(), Value::Int(2))
+            .unwrap();
+        assert_eq!(doc.original_bytes(), b"[s]\nk=2\n");
+        // The tree is what the bytes read back as: INI values are strings.
+        assert_eq!(
+            Pointer::parse("/s/k")
+                .unwrap()
+                .resolve(doc.value())
+                .unwrap(),
+            &Value::String("2".to_owned())
+        );
+    }
+
+    #[test]
+    fn del_at_and_insert_at_rewrite_a_csv_document() {
+        let mut doc = parsed(&crate::parsers::Csv, "n,a\nx,1\ny,2\n");
+        doc.del_at(&Pointer::parse("/0").unwrap()).unwrap();
+        assert_eq!(doc.original_bytes(), b"n,a\ny,2\n");
+        let mut row = IndexMap::new();
+        row.insert("n".to_owned(), Value::String("w".to_owned()));
+        row.insert("a".to_owned(), Value::Int(0));
+        doc.insert_at(&Pointer::parse("/0").unwrap(), Value::Map(row))
+            .unwrap();
+        assert_eq!(doc.original_bytes(), b"n,a\nw,0\ny,2\n");
+    }
+
+    #[test]
+    fn a_tree_the_writer_refuses_leaves_the_document_as_it_was() {
+        let mut doc = parsed(&crate::parsers::DotEnv, "A=1\n");
+        let before = doc.clone();
+        let err = doc
+            .set_at(
+                &Pointer::parse("/A").unwrap(),
+                Value::Array(vec![Value::Int(1)]),
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::Format { .. }), "{err:?}");
+        assert_eq!(doc.original_bytes(), before.original_bytes());
+        assert_eq!(doc.value(), before.value());
+    }
+
+    #[test]
+    fn a_missing_pointer_is_a_path_error_on_a_rewritten_document() {
+        let mut doc = parsed(&crate::parsers::DotEnv, "A=1\n");
+        let err = doc.del_at(&Pointer::parse("/B").unwrap()).unwrap_err();
+        assert!(matches!(err, Error::Path { .. }), "{err:?}");
+        assert!(doc.original_bytes().is_empty());
     }
 
     #[test]

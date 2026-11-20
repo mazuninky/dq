@@ -228,7 +228,7 @@ impl EditScript {
                     // Skip the pre-resolve on the read-only sentinel so
                     // `set_at` returns `WriteUnavailable` instead of
                     // `MissingKey` for those documents.
-                    if doc.is_write_aware() {
+                    if doc.is_editable() {
                         path.resolve(doc.value())?;
                     }
                     doc.set_at(path, value.clone())?;

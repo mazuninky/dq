@@ -70,13 +70,13 @@ guess. stdin (`-`) has no name, so it needs `-F`.
 | JSON (`json`) | `.json` | yes | yes, textual | yes |
 | JSON Lines (`jsonl`) | `.jsonl`, `.ndjson` | yes, as an array of records | no (exit 7) | yes, one record per line |
 | TOML (`toml`) | `.toml` | yes | yes, textual, comments kept | yes, comments dropped |
-| HCL (`hcl`) | `.hcl`, `.tf`, `.tfvars` | yes | no (exit 7) | yes, best effort |
-| INI / properties (`ini`) | `.ini`, `.properties`, `.cfg` | yes | no (exit 7) | yes, comments dropped |
-| dotenv (`dotenv`, `-F dot-env`) | `.env`, `.env.*` (names), `*.env` | yes | no (exit 7) | yes, comments dropped |
-| CSV / TSV (`csv`, `tsv`) | `.csv`, `.tsv` | yes, array of records | no (exit 7) | yes, tabular values only |
+| HCL (`hcl`) | `.hcl`, `.tf`, `.tfvars` | yes | yes, rewritten, comments dropped | yes, best effort |
+| INI / properties (`ini`) | `.ini`, `.properties`, `.cfg` | yes | yes, rewritten, comments dropped | yes, comments dropped |
+| dotenv (`dotenv`, `-F dot-env`) | `.env`, `.env.*` (names), `*.env` | yes | yes, rewritten, comments dropped | yes, comments dropped |
+| CSV / TSV (`csv`, `tsv`) | `.csv`, `.tsv` | yes, array of records | yes, rewritten | yes, tabular values only |
 | Markdown (`markdown`) | `.md`, `.markdown` | yes, CommonMark + GFM tree | no (exit 7) | unmodified documents only |
 | Markdown frontmatter (`frontmatter`) | same extensions, only via `-F frontmatter` | yes, header only | no (exit 7) | yes, body kept byte for byte |
-| XML (`xml`) | `.xml`, `.pom`, `.xsd` | yes | no (exit 7) | yes, partial round trip |
+| XML (`xml`) | `.xml`, `.pom`, `.xsd` | yes | yes, rewritten, comments kept | yes, partial round trip |
 | Dockerfile (`dockerfile`) | `Dockerfile`, `Containerfile` (names), `*.dockerfile`, `*.containerfile` | yes | no | no (read-only) |
 | ignore-list (`ignore-list`) | `.gitignore`, `.dockerignore`, `.npmignore`, `.eslintignore` | yes | no | no (read-only) |
 | TOON (`toon`) | — | no | — | output only |
@@ -84,9 +84,14 @@ guess. stdin (`-`) has no name, so it needs `-F`.
 Notes on the table:
 
 - "Point edits" are the textual edits described in
-  [write-commands.md](write-commands.md); on any other format they fail with
-  `write operation unavailable: <format> has no textual edits` (exit 7). Use
-  `set --jq` to change such a file through its writer.
+  [write-commands.md](write-commands.md) on YAML, JSON and TOML. On HCL, INI,
+  dotenv, CSV/TSV and XML ("rewritten") they change the value tree and write
+  the whole file anew through the format's writer, as `set --jq` does: the
+  layout is the writer's, and comments go (XML keeps its comments, which are
+  in its tree). A value the writer cannot hold is refused with its error
+  (exit 1) and the file is left alone. On JSON Lines, Markdown and
+  frontmatter point edits fail with `write operation unavailable: <format>
+  has no textual edits` (exit 7); use `set --jq` on JSON Lines.
 - `-F dockerfile` and `-F ignore-list` do not exist as output formats; clap
   rejects them (exit 2).
 - Markdown with frontmatter is parsed by the Markdown tree parser by default
@@ -241,7 +246,8 @@ block has its own pointer for when they do.
 `rust-ini`. Shape: `{section: {key: string}}`, sections in source order; keys
 before the first header go under the section `""`. `=` and `:` both separate
 keys from values. All values are strings. Comments and quoting style are not
-kept on write.
+kept on write. The writer writes no empty section: `del` of the last key of
+a section (or `set` of a section to `{}`) takes the section out of the file.
 
 ### dotenv
 

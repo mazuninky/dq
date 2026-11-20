@@ -5,7 +5,7 @@ use std::ops::Range;
 
 use super::{
     Document, FormatTag, JQ_REWRITE_HINT, LayoutCache, Value, first_difference, line_column,
-    line_start, parse_again, with_line_ending_at,
+    line_start, parse_again, set_value_at, with_line_ending_at,
 };
 use crate::Result;
 use crate::error::{Error, PathErrorKind};
@@ -35,6 +35,9 @@ impl Document {
     ///   array's length (`OutOfBounds`) or no index.
     /// - [`Error::WriteUnavailable`] — the document was loaded read-only,
     ///   or its format has no textual edits.
+    /// - [`Error::Format`] — the writer of a document of a format without
+    ///   textual edits ([`Document::edits_by_rewrite`]), which takes the
+    ///   item into its tree and is written whole anew, refuses the tree.
     /// - [`Error::EditRejected`] — the item cannot be written here as a
     ///   textual edit, or the edit would not read back.
     pub fn insert_at(&mut self, pointer: &Pointer, value: Value) -> Result<()> {
@@ -63,6 +66,16 @@ impl Document {
             }
         };
         let index = array_index(last, len, &canonical, &parent)?;
+        if self.edits_by_rewrite() {
+            return self.rewrite_edit("insert", pointer, |tree| {
+                // An array: resolved above, on the same tree.
+                let mut array = parent.resolve(tree)?.clone();
+                if let Value::Array(items) = &mut array {
+                    items.insert(index, value);
+                }
+                set_value_at(tree, &parent, array)
+            });
+        }
         if self.format == FormatTag::Yaml && self.values().is_some() && parent.is_root() {
             return self.insert_stream_document(index, value);
         }

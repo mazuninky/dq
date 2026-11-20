@@ -10,7 +10,10 @@
 //!
 //! As of M2 §5 the YAML, TOML, and JSON renderers are wired up. JSONL
 //! remains line-oriented and has no in-place mutation use case in M2.
-//! Formats without a registered renderer surface
+//! XML, HCL, INI, dotenv, CSV and TSV have no renderer either: `Document::set_at`
+//! writes them whole anew through their writer instead
+//! (`Document::edits_by_rewrite`). Other formats without a registered
+//! renderer surface
 //! [`Error::WriteUnavailable`](crate::error::Error::WriteUnavailable) from
 //! `Document::set_at`, which the CLI maps to the documented
 //! `WRITE_FAILED` exit code.

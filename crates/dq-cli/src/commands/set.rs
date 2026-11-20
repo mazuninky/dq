@@ -233,7 +233,7 @@ impl<'a> FileOp for SetFileOp<'a> {
         //    by the Bug #1 mkdir-p path.
         // Skip pre-resolve on the read-only sentinel so `set_at` returns the
         // more accurate `WriteUnavailable` instead of `MissingKey`.
-        if self.no_create && document.is_write_aware() {
+        if self.no_create && document.is_editable() {
             pointer
                 .resolve(document.value())
                 .map_err(anyhow::Error::new)?;

@@ -161,6 +161,8 @@ dq fix -i --rules @std/k8s deploy.yaml
 
 Format is auto-detected from extension or filename and can be forced with `-F`.
 
+Point edits (`set` and `del` with a pointer, `patch`, `merge`) change YAML, JSON and TOML in place, keeping comments and formatting. On HCL, XML, INI, dotenv and CSV/TSV they change the value and write the whole file anew through the format's writer, as `set --jq` does: formatting is not kept, nor are comments (XML keeps its own). A value the format cannot hold (a nested map in INI, dotenv or CSV, a second XML root) is refused with exit 1 and the file is left as it was. JSON Lines and Markdown take no point edits (exit 7); use `set --jq` on JSON Lines.
+
 ## Linting
 
 `dq lint` matches each input file against rulesets and emits diagnostics with file/line/column anchors. Auto-binding picks `@std/<namespace>` based on filename heuristics (`*.tf` → `@std/terraform`, `Dockerfile` → `@std/dockerfile`, etc.) and adds anything under `./.dq/rules/`.

@@ -11,11 +11,11 @@
 //! document records which keys were blocks ([`HclBlocks`]), and the writer
 //! writes those back as blocks.
 //!
-//! This parser produces a read-only [`Document`] (no spans, no `set_at`/
-//! `del_at` round-trip) — `set_at` against an HCL document returns
-//! [`Error::WriteUnavailable`] until a future milestone wires up a
-//! span-aware path. For M5 the value-tree edits go through
-//! [`Format::write`] re-emission instead.
+//! This parser produces a document with no spans, so no textual edits:
+//! `Document::set_at` / `del_at` against an HCL document change its value
+//! tree and write it whole anew through [`Format::write`], blocks kept
+//! blocks, comments and layout dropped (see
+//! `Document::edits_by_rewrite`).
 
 use std::collections::HashMap;
 use std::io::Write;

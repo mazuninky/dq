@@ -120,9 +120,10 @@ pub struct EditScript(Vec<EditOp>); // new, push, ops, len, is_empty, is_noop, u
   decision. (`dq patch` has its own full `PatchOp` engine in
   `crates/dq-core/src/transform/`.)
 - `apply(&mut Document)` runs each op in order through `Document::set_at` /
-  `del_at` — the textual-edit path — so comments and layout survive exactly as
-  with `dq set`. A `Replace` built from the same pointer and value as a
-  `set_at` produces identical bytes.
+  `del_at` — the textual-edit path on YAML, JSON and TOML, the rewrite through
+  the writer on HCL, XML, INI, dotenv and CSV/TSV (`Document::edits_by_rewrite`)
+  — so comments and layout fare exactly as with `dq set`. A `Replace` built
+  from the same pointer and value as a `set_at` produces identical bytes.
 - Each op is atomic; the script is not. On failure the document is left
   partially applied; callers that need all-or-nothing clone the document
   first (the fixer does).
