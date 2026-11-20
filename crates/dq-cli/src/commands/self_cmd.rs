@@ -20,7 +20,8 @@
 //!   rate-limit hits (`403` with `X-RateLimit-Remaining: 0`) emit a hint
 //!   pointing to the `GITHUB_TOKEN` workaround before bubbling the error.
 //! - `dq self update` exits 0 on success, 4 when the checksum gate refuses
-//!   the archive ([`ChecksumError`]), 5 on network errors (incl. the
+//!   the archive ([`ChecksumError`], also a `dq-checksums.txt` over its
+//!   size cap), 5 on network errors (incl. the
 //!   `dq-checksums.txt` download), 6 when the target binary path is
 //!   read-only by the current user (with a `sudo dq self update` hint), 7 on
 //!   atomic-replace failure. `--dry-run` runs the same gate and stops before
@@ -488,7 +489,14 @@ fn archive_verdict(archive_path: &std::path::Path, checksums_url: Option<&str>) 
     };
     let checksums = match checksums_url.map(fetch_checksums).transpose() {
         Ok(checksums) => checksums,
-        Err(err) => return Verdict::Failed(map_self_update_error(err)),
+        Err(ChecksumsFetchError::TooLarge) => {
+            return Verdict::Refused(ChecksumError::Malformed {
+                detail: format!("larger than the {CHECKSUMS_MAX_BYTES}-byte limit"),
+            });
+        }
+        Err(ChecksumsFetchError::Download(err)) => {
+            return Verdict::Failed(map_self_update_error(err));
+        }
     };
     match verify_archive_checksum(archive_name, &archive, checksums.as_deref()) {
         Ok(sha256) => Verdict::Verified {
@@ -499,10 +507,48 @@ fn archive_verdict(archive_path: &std::path::Path, checksums_url: Option<&str>) 
     }
 }
 
+/// Why `dq-checksums.txt` could not be fetched.
+#[derive(Debug)]
+enum ChecksumsFetchError {
+    /// The body outgrew [`CHECKSUMS_MAX_BYTES`]: the release serves a file
+    /// that is no checksums list, which `self_update` reports as an
+    /// `Error::Io` no different from a failed write.
+    TooLarge,
+    /// The download itself failed.
+    Download(self_update::errors::Error),
+}
+
+/// A buffer that takes at most [`CHECKSUMS_MAX_BYTES`] and remembers that
+/// it was offered more.
+#[derive(Default)]
+struct CappedBody {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
+
+impl Write for CappedBody {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let held = u64::try_from(self.bytes.len()).unwrap_or(u64::MAX);
+        let offered = u64::try_from(data.len()).unwrap_or(u64::MAX);
+        if held.saturating_add(offered) > CHECKSUMS_MAX_BYTES {
+            self.exceeded = true;
+            return Err(std::io::Error::other(format!(
+                "`{CHECKSUMS_ASSET}` is larger than {CHECKSUMS_MAX_BYTES} bytes"
+            )));
+        }
+        self.bytes.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Download `dq-checksums.txt` with the headers the archive download sends.
-fn fetch_checksums(url: &str) -> Result<Vec<u8>, self_update::errors::Error> {
-    let mut body = Vec::new();
-    self_update::Download::from_url(url)
+fn fetch_checksums(url: &str) -> Result<Vec<u8>, ChecksumsFetchError> {
+    let mut body = CappedBody::default();
+    let downloaded = self_update::Download::from_url(url)
         .request_header(
             self_update::http::header::USER_AGENT,
             SELF_UPDATE_USER_AGENT,
@@ -511,10 +557,13 @@ fn fetch_checksums(url: &str) -> Result<Vec<u8>, self_update::errors::Error> {
             self_update::http::header::ACCEPT,
             "application/octet-stream",
         )
-        .max_download_size(CHECKSUMS_MAX_BYTES)
         .show_download_progress(false)
-        .download_to(&mut body)?;
-    Ok(body)
+        .download_to(&mut body);
+    match downloaded {
+        Ok(()) => Ok(body.bytes),
+        Err(_) if body.exceeded => Err(ChecksumsFetchError::TooLarge),
+        Err(err) => Err(ChecksumsFetchError::Download(err)),
+    }
 }
 
 /// The GitHub-backend builder `dq self update` runs, pinned to `tag` when
@@ -1295,6 +1344,29 @@ mod tests {
             "{err:#}"
         );
         assert!(out.is_empty(), "no dry-run report: {out:?}");
+    }
+
+    #[test]
+    fn oversized_checksums_asset_is_refused_with_exit_4_and_keeps_the_binary() {
+        // One byte over the cap: self_update stops reading at the cap, which
+        // is no write failure and no network failure but an unusable file.
+        let huge = "0".repeat(usize::try_from(CHECKSUMS_MAX_BYTES).expect("fits") + 1);
+        let (mut builder, _archive_name) = gated_release("archive bytes", Sums::Served(&huge));
+        let (_dir, installed) = installed_binary();
+        builder.bin_install_path(&installed);
+        let mut out: Vec<u8> = Vec::new();
+        let err = run_gated_update(&mut builder, false, &installed, &mut out)
+            .expect_err("an oversized checksums file must be refused");
+        assert_eq!(
+            crate::exit_code::exit_code_for_error(&err),
+            crate::exit_code::VALIDATE_FAIL,
+            "{err:#}"
+        );
+        let text = format!("{err:#}");
+        assert!(text.contains(CHECKSUMS_ASSET), "names the asset: {text}");
+        assert!(text.contains("65536"), "names the cap: {text}");
+        assert!(out.is_empty(), "nothing on stdout: {out:?}");
+        assert_eq!(std::fs::read(&installed).expect("read"), b"installed");
     }
 
     #[test]
