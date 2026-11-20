@@ -111,8 +111,8 @@ Tracked in [../roadmap.md](../roadmap.md):
 
 - Rules that raise a jq runtime error on nested fields of an unexpected type
   (`kind: Pod` with `spec: x`) are skipped with a warning instead of staying
-  silent by design, and the fixture runner counts such a rule as zero
-  violations, so a fixture cannot catch it.
+  silent by design. The fixture runner fails a case whose rule raises, but no
+  fixture covers these shapes yet.
 - `github-actions.no-pull-request-target-with-checkout` does not recognise a
   checkout of `${{ github.head_ref }}`.
 - Terraform findings report line 1.

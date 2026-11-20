@@ -81,11 +81,17 @@ violation stream (for composite rules: extract item order, then the nested
 rule's own order).
 
 A rule whose jq raises a runtime error on a particular input (a filter or
-check that assumed a field's type) is logged with `tracing::warn!` and skipped
-for that file, so one bad rule cannot sink a whole run. The flip side, noted
-in [../roadmap.md](../roadmap.md): `@std` rules that raise on unexpected
-shapes (e.g. `kind: Pod` with `spec: x`) silently report nothing, and the
-fixture runner counts such a rule as zero violations.
+check that assumed a field's type) is skipped for that file, so one bad rule
+cannot sink a whole run; a `loc.file` or `loc.line` that raises falls back to
+the file under check or the document start. The evaluator returns each of
+these as a rule error beside the diagnostics (`Evaluator::evaluate`). `dq lint`
+prints one warning per rule error on stderr
+(`WARN check.jq raised a runtime error; skipping rule for this file
+rule_id=… error=jq runtime error: …`) and does not change its exit code;
+`dq test` fails the case (see below). The flip side, noted in
+[../roadmap.md](../roadmap.md): `@std` rules that raise on unexpected shapes
+(e.g. `kind: Pod` with `spec: x`) report nothing for that file beyond the
+warning.
 
 ### Diagnostics
 
@@ -172,12 +178,15 @@ tests:
 parses `input`, evaluates, and compares order-insensitively: a case passes
 when every expected violation matches an actual diagnostic (same rule id,
 and `message_contains` / `message_equals` / `line` when given) and no actual
-diagnostic is left unmatched. `input` is read by the format's reader as a
-file would be, so a `line` resolved through `loc.pointer` is the one
-`dq lint` reports where that reader records positions (Dockerfile); the
-YAML and JSON readers it uses do not, and such a line stays 1 in a fixture
-even though `dq lint` reports the real one. Failures print the missing and
-the extra diagnostics. The summary line reads `summary: N passed, F failed, E errored,
+diagnostic is left unmatched and no rule raised a jq runtime error on the
+input. `input` is read by the format's reader as a file would be, so a
+`line` resolved through `loc.pointer` is the one `dq lint` reports where
+that reader records positions (Dockerfile); the YAML and JSON readers it
+uses do not, and such a line stays 1 in a fixture even though `dq lint`
+reports the real one. Failures print the missing and the extra diagnostics
+and each rule error as `raised: rule=<id> <field>: <jq error>` (a `raised`
+list in `-F json` and `-F tap`), so a fixture case catches a rule that
+raises even when it expects no violation. The summary line reads `summary: N passed, F failed, E errored,
 T total`. `dq test` takes a directory; to test the built-in rules run it on
 `crates/dq-lint/rules/` (the `cargo test -p dq-lint` suite does the same).
 

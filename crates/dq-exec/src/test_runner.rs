@@ -27,7 +27,7 @@ use serde::Deserialize;
 
 use crate::diagnostic::Diagnostic;
 use crate::error::{ExecError, Result};
-use crate::evaluator::Evaluator;
+use crate::evaluator::{Evaluation, Evaluator};
 use crate::ruleset::RuleSet;
 
 /// Top-level fixture file shape.
@@ -98,7 +98,9 @@ pub enum TestOutcome {
     },
     /// Test failed — `missing` lists expected violations that didn't
     /// match any actual diagnostic; `extra` lists actual diagnostics
-    /// that weren't expected.
+    /// that weren't expected; `raised` lists the rule expressions that
+    /// raised a runtime error on the input. Any one of them non-empty
+    /// fails the case.
     Fail {
         /// Fixture file that produced this outcome.
         fixture: Utf8PathBuf,
@@ -110,6 +112,11 @@ pub enum TestOutcome {
         /// Human-readable descriptions of actual diagnostics that
         /// weren't expected.
         extra: Vec<String>,
+        /// One [`crate::RuleError`] per rule expression that raised,
+        /// rendered as `rule=<id> <field>: <jq error>`. A rule that
+        /// raises is a bug in the rule even when no violation is
+        /// expected: `dq lint` would skip it on such a file.
+        raised: Vec<String>,
     },
     /// The runner couldn't even attempt the comparison — fixture parse
     /// error, missing rule file, unsupported format, etc. The `error`
@@ -301,7 +308,7 @@ fn run_case(
     // to the `line:col` `dq lint` reports, so a fixture's `line:` holds;
     // elsewhere (the span-less YAML and JSON readers) it falls through to
     // `(1, 1)`.
-    let actual = evaluator.evaluate_file(fixture, &doc.as_ir(), &format);
+    let actual = evaluator.evaluate(fixture, &doc.as_ir(), &format);
     compare(
         fixture.to_path_buf(),
         case.name,
@@ -344,8 +351,9 @@ fn compare(
     fixture: Utf8PathBuf,
     name: String,
     expected: &[ExpectedViolation],
-    actual: &[Diagnostic],
+    evaluation: &Evaluation,
 ) -> TestOutcome {
+    let actual = &evaluation.diagnostics;
     let mut actual_matched = vec![false; actual.len()];
     let mut missing: Vec<String> = Vec::new();
     for exp in expected {
@@ -371,7 +379,13 @@ fn compare(
         .map(|(_, d)| describe_actual(d))
         .collect();
 
-    if missing.is_empty() && extra.is_empty() {
+    let raised: Vec<String> = evaluation
+        .rule_errors
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+
+    if missing.is_empty() && extra.is_empty() && raised.is_empty() {
         TestOutcome::Pass { fixture, name }
     } else {
         TestOutcome::Fail {
@@ -379,6 +393,7 @@ fn compare(
             name,
             missing,
             extra,
+            raised,
         }
     }
 }
@@ -723,5 +738,56 @@ tests:
             Some(Utf8PathBuf::from("/d/foo.yaml"))
         );
         assert_eq!(parent_rule_path(Utf8Path::new("/d/foo.yml")), None);
+    }
+
+    /// A rule that raises on a case's input fails the case even when the
+    /// case expects no violation, naming the rule, the field and the jq
+    /// error. Before, the runner counted the raised rule as zero
+    /// violations and passed the case.
+    #[test]
+    fn rule_that_raises_fails_the_case() {
+        let (_t, dir) = tempdir_utf8();
+        let rule = r#"
+id: test.spec-template
+description: indexes spec as an object
+severity: error
+match:
+  format: yaml
+check:
+  jq: '.spec.template | select(. == null)'
+  message: no template
+"#;
+        let fixture = r#"
+tests:
+  - name: wrong-type spec
+    input: |
+      spec: x
+    expected:
+      violations: []
+"#;
+        write_rule_and_fixture(&dir, rule, fixture);
+
+        let outcomes = RuleTester::run_dir(&dir).expect("run");
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0] {
+            TestOutcome::Fail {
+                name,
+                missing,
+                extra,
+                raised,
+                ..
+            } => {
+                assert_eq!(name, "wrong-type spec");
+                assert!(missing.is_empty() && extra.is_empty());
+                assert_eq!(
+                    raised,
+                    &vec![
+                        "rule=test.spec-template check.jq: jq runtime error: cannot index \"x\" with \"template\""
+                            .to_owned()
+                    ]
+                );
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
     }
 }

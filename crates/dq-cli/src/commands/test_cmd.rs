@@ -13,6 +13,10 @@
 //! Other formats produce an `InvalidInput` rejection so the user gets a
 //! clear error rather than malformed output.
 //!
+//! A failed case lists its `missing` and `extra` violations and the rule
+//! expressions that `raised` a jq runtime error on the input — a rule
+//! that raises fails its case even when no violation is expected.
+//!
 //! Exit-code policy:
 //! - Zero failures → exit 0.
 //! - Any fail/error → exit 4 via [`crate::error::LintFail`].
@@ -89,6 +93,7 @@ fn render_console(outcomes: &[TestOutcome], out: &mut dyn Write) -> std::io::Res
                 name,
                 missing,
                 extra,
+                raised,
             } => {
                 fail += 1;
                 writeln!(out, "FAIL {fixture}: {name}")?;
@@ -97,6 +102,9 @@ fn render_console(outcomes: &[TestOutcome], out: &mut dyn Write) -> std::io::Res
                 }
                 for e in extra {
                     writeln!(out, "  extra: {e}")?;
+                }
+                for r in raised {
+                    writeln!(out, "  raised: {r}")?;
                 }
             }
             TestOutcome::Error {
@@ -136,12 +144,14 @@ fn outcome_to_json(outcome: &TestOutcome) -> serde_json::Value {
             name,
             missing,
             extra,
+            raised,
         } => serde_json::json!({
             "fixture": fixture.as_str(),
             "name": name,
             "outcome": "fail",
             "missing": missing,
             "extra": extra,
+            "raised": raised,
         }),
         TestOutcome::Error {
             fixture,
@@ -170,6 +180,7 @@ fn render_tap(outcomes: &[TestOutcome], out: &mut dyn Write) -> std::io::Result<
                 name,
                 missing,
                 extra,
+                raised,
             } => {
                 writeln!(out, "not ok {n} - {fixture}: {name}")?;
                 writeln!(out, "  ---")?;
@@ -183,6 +194,12 @@ fn render_tap(outcomes: &[TestOutcome], out: &mut dyn Write) -> std::io::Result<
                     writeln!(out, "  extra:")?;
                     for e in extra {
                         writeln!(out, "    - {e}")?;
+                    }
+                }
+                if !raised.is_empty() {
+                    writeln!(out, "  raised:")?;
+                    for r in raised {
+                        writeln!(out, "    - {r}")?;
                     }
                 }
                 writeln!(out, "  ...")?;

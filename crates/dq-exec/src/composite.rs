@@ -56,7 +56,7 @@ use dq_transform::JqEngine;
 
 use crate::diagnostic::{Diagnostic, Severity};
 use crate::error::{ExecError, Result};
-use crate::evaluator::{CompiledRule, JqCache, compile_rule_to_depth, run_on_document};
+use crate::evaluator::{CompiledRule, Evaluation, JqCache, compile_rule_to_depth, run_on_document};
 use crate::rule::Rule;
 use crate::ruleset::RuleSource;
 
@@ -193,11 +193,11 @@ pub(crate) fn run_composite(
     ir: &dq_core::Ir<'_>,
     current_depth: usize,
     max_depth: usize,
-    out: &mut Vec<Diagnostic>,
+    out: &mut Evaluation,
 ) {
     let outer_id = outer_rule.rule.id.as_str();
     if current_depth >= max_depth {
-        out.push(error_diagnostic(
+        out.diagnostics.push(error_diagnostic(
             outer_rule,
             path,
             ir,
@@ -217,7 +217,7 @@ pub(crate) fn run_composite(
                 error = %err,
                 "composite extract jq raised a runtime error; emitting composite-error diagnostic",
             );
-            out.push(error_diagnostic(
+            out.diagnostics.push(error_diagnostic(
                 outer_rule,
                 path,
                 ir,
@@ -235,7 +235,7 @@ pub(crate) fn run_composite(
                 shape = %describe_value_shape(other),
                 "composite extract did not return an array",
             );
-            out.push(error_diagnostic(
+            out.diagnostics.push(error_diagnostic(
                 outer_rule,
                 path,
                 ir,
@@ -249,7 +249,7 @@ pub(crate) fn run_composite(
                 rule_id = %outer_id,
                 "composite extract produced empty stream; expected one array",
             );
-            out.push(error_diagnostic(
+            out.diagnostics.push(error_diagnostic(
                 outer_rule,
                 path,
                 ir,
@@ -265,7 +265,7 @@ pub(crate) fn run_composite(
                 count,
                 "composite extract produced multiple outputs; expected exactly one array",
             );
-            out.push(error_diagnostic(
+            out.diagnostics.push(error_diagnostic(
                 outer_rule,
                 path,
                 ir,
@@ -302,7 +302,7 @@ fn process_extract_item(
     item: &dq_core::Value,
     current_depth: usize,
     max_depth: usize,
-    out: &mut Vec<Diagnostic>,
+    out: &mut Evaluation,
 ) {
     let outer_id = outer_rule.rule.id.as_str();
     let map = match item {
@@ -313,7 +313,7 @@ fn process_extract_item(
                 shape = %describe_value_shape(item),
                 "composite extract item is not an object",
             );
-            out.push(error_diagnostic(
+            out.diagnostics.push(error_diagnostic(
                 outer_rule,
                 path,
                 outer_ir,
@@ -331,7 +331,7 @@ fn process_extract_item(
                 .into_iter()
                 .find_map(std::result::Result::err)
                 .unwrap_or_default();
-            out.push(error_diagnostic(
+            out.diagnostics.push(error_diagnostic(
                 outer_rule,
                 path,
                 outer_ir,
@@ -343,7 +343,7 @@ fn process_extract_item(
     };
 
     if FormatTag::from_name(format_str).is_none() {
-        out.push(error_diagnostic(
+        out.diagnostics.push(error_diagnostic(
             outer_rule,
             path,
             outer_ir,
@@ -359,7 +359,7 @@ fn process_extract_item(
             // registered — defensive catch (e.g. feature-gated format
             // disabled at build time). Surfaced as an unknown-format
             // diagnostic so the user gets the same actionable message.
-            out.push(error_diagnostic(
+            out.diagnostics.push(error_diagnostic(
                 outer_rule,
                 path,
                 outer_ir,
@@ -390,7 +390,7 @@ fn process_extract_item(
             } else {
                 format!("{prefix}: {raw_message}")
             };
-            out.push(Diagnostic {
+            out.diagnostics.push(Diagnostic {
                 rule_id: format!("{outer_id}.parse-failed"),
                 severity: Severity::Error,
                 message,
@@ -410,7 +410,7 @@ fn process_extract_item(
     let inner_ir = inner_doc.as_ir();
     let inner_format = parser.name();
 
-    let mut inner_diags: Vec<Diagnostic> = Vec::new();
+    let mut inner_evaluation = Evaluation::default();
     crate::evaluator::evaluate_one_rule_at_depth(
         &composite.nested,
         path,
@@ -418,12 +418,15 @@ fn process_extract_item(
         inner_format,
         current_depth + 1,
         max_depth,
-        &mut inner_diags,
+        &mut inner_evaluation,
     );
+    // A nested rule that raised is reported under its own id, as a
+    // top-level rule would be.
+    out.rule_errors.append(&mut inner_evaluation.rule_errors);
 
     // Project every inner diagnostic onto outer-file coordinates and
     // prepend the outer message prefix.
-    for inner in inner_diags {
+    for inner in inner_evaluation.diagnostics {
         let projected_line = match anchor_position.span_line {
             Some(span_line) => span_line.saturating_add(inner.line).saturating_sub(1),
             None => inner.line,
@@ -451,7 +454,7 @@ fn process_extract_item(
         } else {
             format!("{prefix}: {}", inner.message)
         };
-        out.push(Diagnostic {
+        out.diagnostics.push(Diagnostic {
             rule_id: inner.rule_id,
             severity: inner.severity,
             message: projected_message,
@@ -1069,5 +1072,45 @@ check:
         // which is the default for IRs without source bytes.
         assert_eq!(diags[0].line, 1);
         assert_eq!(diags[0].col, 1);
+    }
+
+    /// A nested rule that raises is a rule error under the nested
+    /// rule's id, as it would be at the top level.
+    #[test]
+    fn nested_rule_that_raises_reports_a_rule_error() {
+        let yaml = r#"
+id: test.outer
+description: x
+severity: error
+match:
+  format: yaml
+check:
+  extract: '[{value: "spec: x", format: "yaml", anchor: ""}]'
+  nested:
+    id: test.outer.inner
+    description: i
+    severity: error
+    match:
+      format: yaml
+    check:
+      jq: '.spec.template'
+      message: m
+  message: 'outer'
+"#;
+        let eval = evaluator(yaml);
+        let owned = ir_for_test(&json!({}));
+        let evaluation =
+            eval.evaluate(&Utf8PathBuf::from("doc.yaml"), &owned.to_borrowed(), "yaml");
+        assert!(evaluation.diagnostics.is_empty());
+        assert_eq!(
+            evaluation
+                .rule_errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec![
+                "rule=test.outer.inner check.jq: jq runtime error: cannot index \"x\" with \"template\""
+            ]
+        );
     }
 }

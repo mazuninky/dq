@@ -40,7 +40,7 @@ pub mod test_runner;
 
 pub use diagnostic::{Diagnostic, Severity};
 pub use error::{ExecError, Result};
-pub use evaluator::Evaluator;
+pub use evaluator::{Evaluation, Evaluator, RuleError, RuleErrorStage};
 pub use fixer::{FixOutcome, Fixer};
 pub use loader::{LoaderArgs, RuleLoader};
 pub use rule::{Check, Rule, RuleCheck, RuleFix, RuleLoc, RuleMatch, SchemaNotes};

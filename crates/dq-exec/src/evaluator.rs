@@ -35,13 +35,17 @@
 //! ## Robustness
 //!
 //! Compile-time failures (jq parse errors, glob parse errors) surface as
-//! [`crate::error::ExecError`] from [`Evaluator::new`]. Runtime failures
-//! during [`Evaluator::evaluate_file`] (a `check.jq` that crashes on a
-//! particular input shape, a `loc.line` expression that returns a
-//! non-integer, a `loc.pointer` expression that fails to parse) are
-//! logged via `tracing::warn!` / `tracing::trace!` and the offending
-//! rule falls through to the next step in the chain — the principle is
-//! that one badly-written rule must not crash the entire run.
+//! [`crate::error::ExecError`] from [`Evaluator::new`]. A rule that raises
+//! at run time does not crash the run: a `match.filter` or `check.jq` that
+//! raises on a particular input shape skips the rule for that document,
+//! and a `loc.file` / `loc.line` that raises falls back to the file under
+//! check / the document start. Each of these is a [`RuleError`], returned
+//! beside the diagnostics by [`Evaluator::evaluate`] so a caller can act
+//! on it: the fixture runner fails the case, while
+//! [`Evaluator::evaluate_file`] (what `dq lint` runs) logs each one as a
+//! `tracing::warn!` and keeps going. Fall-through cases that are normal
+//! (a `loc.pointer` with no span, a `loc.line` that returns a
+//! non-integer) are `tracing::trace!` only and not rule errors.
 
 use std::sync::Arc;
 
@@ -76,6 +80,102 @@ pub struct Evaluator {
     /// [`Evaluator::with_max_extract_depth`] for unit tests only — the
     /// CLI does not surface this knob.
     max_extract_depth: usize,
+}
+
+/// The jq expression of a rule that raised at run time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RuleErrorStage {
+    /// `match.filter` raised; the rule was skipped for the document.
+    MatchFilter,
+    /// `check.jq` raised; the rule was skipped for the document.
+    CheckJq,
+    /// `loc.file` raised; the diagnostic names the file under check.
+    LocFile,
+    /// `loc.line` raised; the diagnostic points at the document start.
+    LocLine,
+}
+
+impl RuleErrorStage {
+    /// The rule field that raised, as a rule author writes it
+    /// (`"check.jq"`).
+    #[must_use]
+    pub fn field(self) -> &'static str {
+        match self {
+            Self::MatchFilter => "match.filter",
+            Self::CheckJq => "check.jq",
+            Self::LocFile => "loc.file",
+            Self::LocLine => "loc.line",
+        }
+    }
+
+    /// What the evaluator did about it, worded for the `dq lint` warning.
+    fn consequence(self) -> &'static str {
+        match self {
+            Self::MatchFilter | Self::CheckJq => "skipping rule for this file",
+            Self::LocFile => "falling back to file under check",
+            Self::LocLine => "defaulting to line 1",
+        }
+    }
+}
+
+impl std::fmt::Display for RuleErrorStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.field())
+    }
+}
+
+/// A rule's jq expression raised a runtime error on a document — a bug
+/// in the rule (it indexes a field of a type it did not expect), not in
+/// the document. The evaluator recovers (see [`RuleErrorStage`]) and
+/// reports it here instead of failing the run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleError {
+    /// Id of the rule that raised (for a composite rule's `nested` rule,
+    /// the nested rule's id).
+    pub rule_id: String,
+    /// Which of the rule's expressions raised.
+    pub stage: RuleErrorStage,
+    /// The jq error, as `jq runtime error: …`.
+    pub error: String,
+}
+
+impl RuleError {
+    fn new(rule: &CompiledRule, stage: RuleErrorStage, error: &dq_transform::JqError) -> Self {
+        Self {
+            rule_id: rule.rule.id.clone(),
+            stage,
+            error: error.to_string(),
+        }
+    }
+
+    /// Log the error as `dq lint` reports it: a `tracing::warn!` naming
+    /// the field, what the evaluator did, the rule id and the jq error.
+    pub fn warn(&self) {
+        tracing::warn!(
+            rule_id = %self.rule_id,
+            error = %self.error,
+            "{} raised a runtime error; {}",
+            self.stage.field(),
+            self.stage.consequence(),
+        );
+    }
+}
+
+impl std::fmt::Display for RuleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "rule={} {}: {}", self.rule_id, self.stage, self.error)
+    }
+}
+
+/// What [`Evaluator::evaluate`] found in one document: the diagnostics,
+/// and the rules that raised on the way (in rule order).
+#[derive(Debug, Clone, Default)]
+pub struct Evaluation {
+    /// One per violation, in rule order.
+    pub diagnostics: Vec<Diagnostic>,
+    /// One per rule expression that raised. Non-empty means some rule
+    /// did not (fully) run on this document.
+    pub rule_errors: Vec<RuleError>,
 }
 
 /// Per-[`Evaluator::new`] cache for compiled jq filters.
@@ -323,6 +423,10 @@ impl Evaluator {
     /// is a jq number there); the borrowed `Ir` also carries the metadata
     /// needed for span-aware diagnostic positions without forcing every
     /// caller onto a span-preserving jaq fork.
+    ///
+    /// A rule that raises is logged as a `tracing::warn!` (see
+    /// [`RuleError::warn`]) and otherwise ignored; [`Evaluator::evaluate`]
+    /// returns those errors instead.
     #[must_use]
     pub fn evaluate_file(
         &self,
@@ -330,12 +434,25 @@ impl Evaluator {
         ir: &dq_core::Ir<'_>,
         format_name: &str,
     ) -> Vec<Diagnostic> {
+        let evaluation = self.evaluate(path, ir, format_name);
+        for error in &evaluation.rule_errors {
+            error.warn();
+        }
+        evaluation.diagnostics
+    }
+
+    /// Run every applicable rule against `ir`, as
+    /// [`Evaluator::evaluate_file`] does, and return the diagnostics
+    /// together with every [`RuleError`] — a rule expression that raised
+    /// on this document. Nothing is logged.
+    #[must_use]
+    pub fn evaluate(&self, path: &Utf8Path, ir: &dq_core::Ir<'_>, format_name: &str) -> Evaluation {
         // The jq engines and the JSON Schema validator both run over
         // `ir.value()` itself (see [`run_on_document`] and
         // [`crate::schema_value`]); the `Ir` also gives the per-rule
         // helpers [`dq_core::Ir::line_col_for`] for `loc.pointer`
         // resolution.
-        let mut diagnostics = Vec::new();
+        let mut evaluation = Evaluation::default();
         for rule in &self.rules {
             evaluate_one_rule_at_depth(
                 rule,
@@ -344,10 +461,10 @@ impl Evaluator {
                 format_name,
                 0,
                 self.max_extract_depth,
-                &mut diagnostics,
+                &mut evaluation,
             );
         }
-        diagnostics
+        evaluation
     }
 
     /// Iterate over the rules compiled into this evaluator.
@@ -541,7 +658,7 @@ fn compile_check(
 }
 
 /// Run the per-rule pipeline against `(path, ir, format_name)` and
-/// push any resulting diagnostics into `out`. `current_depth` /
+/// push any resulting diagnostics and rule errors into `out`. `current_depth` /
 /// `max_depth` carry the composite-recursion budget so a `Composite`
 /// dispatch can recurse into its `nested` rule and trip the bound
 /// without crashing. Every check runs over `ir.value()` itself.
@@ -558,7 +675,7 @@ pub(crate) fn evaluate_one_rule_at_depth(
     format_name: &str,
     current_depth: usize,
     max_depth: usize,
-    out: &mut Vec<Diagnostic>,
+    out: &mut Evaluation,
 ) {
     // 1. Format match.
     if !rule.rule.match_.format.iter().any(|f| f == format_name) {
@@ -584,11 +701,8 @@ pub(crate) fn evaluate_one_rule_at_depth(
                 }
             }
             Err(err) => {
-                tracing::warn!(
-                    rule_id = %rule.rule.id,
-                    error = %err,
-                    "match.filter raised a runtime error; skipping rule for this file",
-                );
+                out.rule_errors
+                    .push(RuleError::new(rule, RuleErrorStage::MatchFilter, &err));
                 return;
             }
         }
@@ -600,16 +714,15 @@ pub(crate) fn evaluate_one_rule_at_depth(
             let violations = match run_on_document(engine, ir.value()) {
                 Ok(v) => v,
                 Err(err) => {
-                    tracing::warn!(
-                        rule_id = %rule.rule.id,
-                        error = %err,
-                        "check.jq raised a runtime error; skipping rule for this file",
-                    );
+                    out.rule_errors
+                        .push(RuleError::new(rule, RuleErrorStage::CheckJq, &err));
                     return;
                 }
             };
             for violation in &violations {
-                out.push(build_jq_diagnostic(rule, path, ir, violation, message));
+                let diagnostic =
+                    build_jq_diagnostic(rule, path, ir, violation, message, &mut out.rule_errors);
+                out.diagnostics.push(diagnostic);
             }
         }
         CompiledCheck::Schema(compiled) => {
@@ -652,10 +765,11 @@ fn build_jq_diagnostic(
     ir: &dq_core::Ir<'_>,
     violation: &dq_core::Value,
     message_template: &str,
+    rule_errors: &mut Vec<RuleError>,
 ) -> Diagnostic {
     let message = template::render(message_template, violation);
-    let file = resolve_loc_file(rule, path, violation);
-    let (line, col) = resolve_loc_position(rule, ir, violation);
+    let file = resolve_loc_file(rule, path, violation, rule_errors);
+    let (line, col) = resolve_loc_position(rule, ir, violation, rule_errors);
     Diagnostic {
         rule_id: rule.rule.id.clone(),
         severity: rule.rule.severity,
@@ -693,7 +807,7 @@ fn run_schema_check(
     compiled: &CompiledSchemaCheck,
     path: &Utf8Path,
     ir: &dq_core::Ir<'_>,
-    out: &mut Vec<Diagnostic>,
+    out: &mut Evaluation,
 ) {
     let value = ir.value();
     // Dedup key per `run_schema_check` invocation. JSON Schemas may
@@ -738,12 +852,12 @@ fn run_schema_check(
             .ok()
             .and_then(|pointer| pointer.resolve(value).ok().cloned())
             .unwrap_or(dq_core::Value::Null);
-        let file = resolve_loc_file(rule, path, &violation);
+        let file = resolve_loc_file(rule, path, &violation, &mut out.rule_errors);
         let (line, col) = if rule.has_position_override() {
             // The user opted into overrides; trust whatever the chain
             // returned, including the (1, 1) default that signals an
             // override miss.
-            resolve_loc_position(rule, ir, &violation)
+            resolve_loc_position(rule, ir, &violation, &mut out.rule_errors)
         } else {
             // No override set — fall back to the intrinsic
             // `instance_path → span` lookup the schema check used
@@ -772,7 +886,7 @@ fn run_schema_check(
         // dq's own keywords get theirs from `EvaluationPaths`.
         let keyword = evaluation_path.as_str();
         let message = format!("{prefix}{keyword}: {error_text}");
-        out.push(Diagnostic {
+        out.diagnostics.push(Diagnostic {
             rule_id: rule.rule.id.clone(),
             severity: rule.rule.severity,
             message,
@@ -788,11 +902,13 @@ fn run_schema_check(
 
 /// Resolve the `file` field for the diagnostic. When `loc.file` is set
 /// and produces a non-empty string, use that; otherwise default to the
-/// file under check.
+/// file under check. A `loc.file` that raises is a [`RuleError`] pushed
+/// to `rule_errors`.
 fn resolve_loc_file(
     rule: &CompiledRule,
     path: &Utf8Path,
     violation: &dq_core::Value,
+    rule_errors: &mut Vec<RuleError>,
 ) -> Option<Utf8PathBuf> {
     if let Some(engine) = rule.loc_file_engine.as_ref() {
         match engine.run_value(violation) {
@@ -804,11 +920,7 @@ fn resolve_loc_file(
                 }
             }
             Err(err) => {
-                tracing::warn!(
-                    rule_id = %rule.rule.id,
-                    error = %err,
-                    "loc.file raised a runtime error; falling back to file under check",
-                );
+                rule_errors.push(RuleError::new(rule, RuleErrorStage::LocFile, &err));
             }
         }
     }
@@ -842,6 +954,7 @@ fn resolve_loc_position(
     rule: &CompiledRule,
     ir: &dq_core::Ir<'_>,
     violation: &dq_core::Value,
+    rule_errors: &mut Vec<RuleError>,
 ) -> (u32, u32) {
     // Step 1: loc.pointer.
     if let Some(engine) = rule.loc_pointer_engine.as_ref() {
@@ -925,11 +1038,7 @@ fn resolve_loc_position(
                 }
             }
             Err(err) => {
-                tracing::warn!(
-                    rule_id = %rule.rule.id,
-                    error = %err,
-                    "loc.line raised a runtime error; defaulting to line 1",
-                );
+                rule_errors.push(RuleError::new(rule, RuleErrorStage::LocLine, &err));
             }
         }
     }
@@ -1946,5 +2055,86 @@ check:
             !Arc::ptr_eq(a, b),
             "cache must not persist across two `Evaluator::new` invocations",
         );
+    }
+
+    /// A rule expression that raises comes back as a [`RuleError`] per
+    /// stage — the rule id, the field, the jq error — beside whatever
+    /// diagnostics the other rules produced.
+    #[test]
+    fn evaluate_returns_a_rule_error_per_raising_expression() {
+        let eval = evaluator_from_yaml(
+            r#"
+id: t.filter
+description: d
+severity: error
+match:
+  format: yaml
+  filter: '.spec.x'
+check:
+  jq: '.'
+  message: m
+---
+id: t.check
+description: d
+severity: error
+match:
+  format: yaml
+check:
+  jq: '.spec.x'
+  message: m
+---
+id: t.loc
+description: d
+severity: error
+match:
+  format: yaml
+check:
+  jq: '.'
+  message: fired
+loc:
+  file: '.spec.x'
+  line: '.spec.y'
+"#,
+        );
+        let owned = ir_for_test(&json!({"spec": "s"}), "yaml");
+        let path = Utf8PathBuf::from("doc.yaml");
+        let evaluation = eval.evaluate(&path, &owned.to_borrowed(), "yaml");
+        let error = |rule: &str, stage, field: &str| RuleError {
+            rule_id: rule.to_owned(),
+            stage,
+            error: format!("jq runtime error: cannot index \"s\" with \"{field}\""),
+        };
+        assert_eq!(
+            evaluation.rule_errors,
+            vec![
+                error("t.filter", RuleErrorStage::MatchFilter, "x"),
+                error("t.check", RuleErrorStage::CheckJq, "x"),
+                error("t.loc", RuleErrorStage::LocFile, "x"),
+                error("t.loc", RuleErrorStage::LocLine, "y"),
+            ]
+        );
+        // `loc.*` raising degrades the position; the diagnostic stays.
+        assert_eq!(evaluation.diagnostics.len(), 1);
+        assert_eq!(evaluation.diagnostics[0].rule_id, "t.loc");
+        assert_eq!(evaluation.diagnostics[0].file, Some(path.clone()));
+        assert_eq!(
+            evaluation.rule_errors[1].to_string(),
+            "rule=t.check check.jq: jq runtime error: cannot index \"s\" with \"x\""
+        );
+        // `evaluate_file` logs the same errors and returns the same
+        // diagnostics.
+        let logged = eval.evaluate_file(&path, &owned.to_borrowed(), "yaml");
+        assert_eq!(logged.len(), 1);
+        assert_eq!(logged[0].message, evaluation.diagnostics[0].message);
+    }
+
+    #[test]
+    fn evaluate_reports_no_rule_error_for_a_clean_run() {
+        let eval = evaluator_from_yaml(RULE_NAME_NOT_EMPTY);
+        let owned = ir_for_test(&json!({"name": ""}), "yaml");
+        let evaluation =
+            eval.evaluate(&Utf8PathBuf::from("doc.yaml"), &owned.to_borrowed(), "yaml");
+        assert_eq!(evaluation.diagnostics.len(), 1);
+        assert!(evaluation.rule_errors.is_empty());
     }
 }
