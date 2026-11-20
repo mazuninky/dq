@@ -18,9 +18,9 @@
 //!    bulk driver can dispatch it; never write to disk here — `--check`,
 //!    `--diff`, and `-i` are all driver concerns.
 
-use std::io::{Read, Write};
+use std::io::Write;
 
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::Utf8Path;
 use dq_core::Value;
 
 use crate::bulk::{self, FileOp, FileOpResult};
@@ -149,26 +149,14 @@ impl<'a> FileOp for MergeFileOp<'a> {
 /// `-` reads stdin, leading `@` reads a file path, and anything else is the
 /// inline JSON literal.
 fn resolve_patch(args: &MergeArgs) -> anyhow::Result<Value> {
+    // `-` is stdin wherever a source is named: `-`, `@-` and `--patch-from -`.
     let bytes = if let Some(path) = &args.patch_from {
-        std::fs::read(path.as_std_path()).map_err(|source| {
-            anyhow::Error::new(dq_core::Error::Io {
-                path: path.clone(),
-                source,
-            })
-        })?
+        read_bytes(path)?
     } else if let Some(s) = &args.patch {
         if s == "-" {
-            let mut buf = Vec::new();
-            std::io::stdin().lock().read_to_end(&mut buf)?;
-            buf
+            read_bytes(Utf8Path::new("-"))?
         } else if let Some(path_str) = s.strip_prefix('@') {
-            let path = Utf8PathBuf::from(path_str);
-            std::fs::read(path.as_std_path()).map_err(|source| {
-                anyhow::Error::new(dq_core::Error::Io {
-                    path: path.clone(),
-                    source,
-                })
-            })?
+            read_bytes(Utf8Path::new(path_str))?
         } else {
             s.as_bytes().to_vec()
         }
@@ -214,6 +202,7 @@ fn merge_targets(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use camino::Utf8PathBuf;
     use clap::Parser;
     use tempfile::NamedTempFile;
 

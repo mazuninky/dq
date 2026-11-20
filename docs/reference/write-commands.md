@@ -160,7 +160,8 @@ Applies an RFC 6902 JSON Patch through textual edits (YAML, JSON, TOML), or
 through the writer on HCL, XML, INI, dotenv, CSV/TSV and JSON Lines (see
 [Two ways to write a file](#two-ways-to-write-a-file)).
 
-- Ops from: inline JSON array, `-` (stdin), `@path`, or `--ops-from <path>`.
+- Ops from: inline JSON array, `-` (stdin), `@path`, or `--ops-from <path>`;
+  `@-` and `--ops-from -` read stdin too.
 - `--line-format` accepts one op per line, `<op> <pointer> [json-value]`
   (`replace /a 5`, `remove /l/2`).
 - `add`, `remove`, `replace`, `move`, `copy`, `test`. The patch is atomic: if
@@ -181,7 +182,8 @@ through the writer on HCL, XML, INI, dotenv, CSV/TSV and JSON Lines (see
 
 Applies an RFC 7396 Merge Patch through textual edits (through the writer on
 HCL, XML, INI, dotenv, CSV/TSV and JSON Lines). Patch from inline
-JSON, `-`, `@path` or `--patch-from <path>`.
+JSON, `-`, `@path` or `--patch-from <path>`; `@-` and `--patch-from -` read
+stdin too.
 
 - `null` removes a key; objects merge recursively; arrays and scalars
   replace.

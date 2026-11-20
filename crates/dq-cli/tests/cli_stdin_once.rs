@@ -188,3 +188,136 @@ fn set_reads_its_value_from_stdin_as_an_inline_value() {
         assert_eq!(set(&forced, "42"), serde_json::json!("42"));
     }
 }
+
+/// Run `dq --no-color ARGS` in `dir` with `stdin`; return (exit code,
+/// stdout, stderr).
+fn run_in(dir: &std::path::Path, args: &[&str], stdin: &str) -> (i32, String, String) {
+    let out = dq()
+        .current_dir(dir)
+        .arg("--no-color")
+        .args(args)
+        .write_stdin(stdin)
+        .output()
+        .expect("run dq");
+    (
+        out.status.code().expect("exit code"),
+        String::from_utf8(out.stdout).expect("utf-8 stdout"),
+        String::from_utf8(out.stderr).expect("utf-8 stderr"),
+    )
+}
+
+/// Only a `-` argument means stdin: a glob that matches a file named `-`
+/// names that file (`./-`), so `fix - '*'` reads stdin once and the file
+/// once, and `fmt '*'` formats the file rather than reading stdin.
+#[test]
+fn a_glob_never_expands_to_stdin() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(dir.path().join("-"), "{\"name\":\"x\",\"version\":\"1\"}\n").unwrap();
+    let (code, stdout, stderr) = run_in(
+        dir.path(),
+        &[
+            "fix",
+            "--input-format",
+            "json",
+            "--rules",
+            "@std/npm",
+            "-",
+            "*",
+            "--diff",
+        ],
+        "{\"name\":\"y\",\"version\":\"1\"}\n",
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("=== - ===\n"), "{stdout}");
+    assert!(stdout.contains("=== ./- ===\n"), "{stdout}");
+    assert!(stdout.contains("+{\"name\":\"x\""), "{stdout}");
+    assert!(stdout.contains("+{\"name\":\"y\""), "{stdout}");
+
+    let (code, stdout, stderr) = run_in(
+        dir.path(),
+        &[
+            "lint",
+            "-F",
+            "json",
+            "--input-format",
+            "json",
+            "--rules",
+            "@std/npm",
+            "-",
+            "*",
+        ],
+        "{\"name\":\"y\",\"version\":\"1\"}\n",
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("JSON");
+    let mut paths: Vec<&str> = report["diagnostics"]
+        .as_array()
+        .expect("diagnostics")
+        .iter()
+        .map(|d| d["path"].as_str().unwrap())
+        .collect();
+    paths.dedup();
+    assert_eq!(paths, ["-", "./-"]);
+
+    std::fs::write(dir.path().join("-"), "a:   1\n").unwrap();
+    let (code, stdout, stderr) = run_in(
+        dir.path(),
+        &["fmt", "--input-format", "yaml", "*", "--diff"],
+        "stdin: never read\n",
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("+a: 1\n"), "{stdout}");
+    assert!(!stdout.contains("stdin"), "{stdout}");
+}
+
+/// `-` is stdin wherever `patch` and `merge` name their source: `@-`,
+/// `--ops-from -` and `--patch-from -` read it, as `-` does.
+#[test]
+fn patch_and_merge_read_stdin_through_at_dash_and_from_dash() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(dir.path().join("a.yaml"), "b: 2\n").unwrap();
+    let ops = "[{\"op\":\"replace\",\"path\":\"/b\",\"value\":3}]";
+    for args in [
+        ["patch", "a.yaml", "@-"],
+        ["patch", "a.yaml", "--ops-from=-"],
+    ] {
+        let (code, stdout, stderr) = run_in(dir.path(), &args, ops);
+        assert_eq!(code, 0, "{args:?}: {stderr}");
+        assert_eq!(stdout, "b: 3\n", "{args:?}");
+    }
+    for args in [
+        ["merge", "a.yaml", "@-"],
+        ["merge", "a.yaml", "--patch-from=-"],
+    ] {
+        let (code, stdout, stderr) = run_in(dir.path(), &args, "{\"b\":5}");
+        assert_eq!(code, 0, "{args:?}: {stderr}");
+        assert_eq!(stdout, "b: 5\n", "{args:?}");
+    }
+}
+
+/// Stdin named twice through the new spellings is refused before any read.
+#[test]
+fn stdin_twice_through_at_dash_or_from_dash_is_refused() {
+    for (args, inputs) in [
+        (
+            &["patch", "-", "--input-format", "yaml", "--ops-from", "-"][..],
+            "FILE and --ops-from",
+        ),
+        (
+            &["patch", "-", "--input-format", "yaml", "@-"][..],
+            "FILE and OPS",
+        ),
+        (
+            &["merge", "-", "--input-format", "yaml", "--patch-from", "-"][..],
+            "FILE and --patch-from",
+        ),
+        (
+            &["merge", "-", "--input-format", "yaml", "@-"][..],
+            "FILE and PATCH",
+        ),
+    ] {
+        let (code, _, stderr) = run(args, "a: 1\n");
+        assert_eq!(code, 2, "{args:?}: {stderr}");
+        assert!(stderr.contains(inputs), "{args:?}: {stderr}");
+    }
+}

@@ -136,6 +136,15 @@ pub(crate) fn expand(pattern: &Utf8Path) -> Result<Vec<Utf8PathBuf>, GlobError> 
             Utf8PathBuf::from_path_buf(candidate).ok()
         })
         .filter(|path| matcher.is_match(path.as_std_path()))
+        // Only a `-` argument means stdin: a file named `-` the walk finds
+        // is a path, so it is named as one.
+        .map(|path| {
+            if path == "-" {
+                Utf8PathBuf::from("./-")
+            } else {
+                path
+            }
+        })
         .collect();
 
     if matches.is_empty() {

@@ -665,6 +665,11 @@ impl Command {
     /// usage line names them — one entry per `-` (`FILES` once for every
     /// `-` among them). The dispatcher refuses more than one
     /// ([`stdin_read_twice_error`]): stdin can be read only once.
+    ///
+    /// Only an argument that is `-` itself (or `@-`) names stdin: a glob
+    /// never expands to it ([`crate::glob::expand`] yields a file named
+    /// `-` as `./-`), so the arguments as given are the inputs that read
+    /// it.
     #[must_use]
     pub fn stdin_inputs(&self) -> Vec<&'static str> {
         let dash = |p: &camino::Utf8Path| p == "-";
@@ -704,14 +709,20 @@ impl Command {
             }
             Self::Patch(args) => {
                 file(&args.file, "FILE");
-                if args.ops.as_deref() == Some("-") {
+                if matches!(args.ops.as_deref(), Some("-" | "@-")) {
                     inputs.push("OPS");
+                }
+                if args.ops_from.as_deref().is_some_and(dash) {
+                    inputs.push("--ops-from");
                 }
             }
             Self::Merge(args) => {
                 file(&args.file, "FILE");
-                if args.patch.as_deref() == Some("-") {
+                if matches!(args.patch.as_deref(), Some("-" | "@-")) {
                     inputs.push("PATCH");
+                }
+                if args.patch_from.as_deref().is_some_and(dash) {
+                    inputs.push("--patch-from");
                 }
             }
             Self::Lint(LintArgs { files, .. })

@@ -128,9 +128,12 @@ it needs `--input-format`; without it the command fails with a usage error
 naming the flag (exit 2). That includes `lint -`, `check -` and `fix -`, whose
 `-F` picks the reporter: `dq lint - --input-format yaml -F sarif < f.yaml`.
 Stdin can be read once, so a command given `-` for more than one input —
-`diff - -`, `patch - -`, `merge - -`, `set - /a -` (or `@-`, `--value-from -`),
-`-` twice among the files of `lint`, `check` or `fix` — is refused with a
-usage error naming them (exit 2) before anything is read.
+`diff - -`, `patch - -` (or `@-`, `--ops-from -`), `merge - -` (or `@-`,
+`--patch-from -`), `set - /a -` (or `@-`, `--value-from -`), `-` twice among
+the files of `lint`, `check` or `fix` — is refused with a usage error naming
+them (exit 2) before anything is read. Only an argument that is `-` itself
+means stdin: a glob that matches a file named `-` names it `./-`, so
+`dq lint - '*'` reads stdin once and that file once.
 
 `set`, `del`, `patch`, `merge`, `fmt` and `fix` keep a file in its own format
 — the one it was read in — whether they write it back (`-i`), print it or
