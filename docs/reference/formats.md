@@ -36,8 +36,8 @@ Numbers keep their exact value:
   in JSON Schema checks. Read output spells them one way per output format,
   whatever the source: `.nan` / `.inf` / `-.inf` on the console, in YAML and
   TOON, `nan` / `inf` in TOML. JSON cannot hold them, so writing one as JSON
-  or JSONL fails with exit 1 (`convert`, `get` / `query -F json`) or exit 7
-  (`set` on a JSON file). HCL cannot hold them either: `convert -F hcl`,
+  or JSONL fails with exit 1 (`convert`, `get` / `query -F json`, and
+  `set --jq` / `fix` on a JSON file). HCL cannot hold them either: `convert -F hcl`,
   `set` and `fix` on an HCL file fail with exit 1 naming the value
   (`HCL cannot represent non-finite number .nan`) and write nothing.
   Plugins reading the document as JSON get the strings `".nan"`, `".inf"`,

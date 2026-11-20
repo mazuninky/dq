@@ -346,6 +346,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- XML: the declaration is read by its grammar.
+  `<?xml version="1.0" standalone="yes" encoding="UTF-8"?>` was accepted;
+  it is now exit 3, `XML parse error at line 1, column 38: the XML
+  declaration gives 'encoding' after 'standalone': …`. Also refused: a
+  missing, repeated or unknown pseudo-attribute, `standalone` other than
+  `yes`/`no`, a `version` other than `1.` and digits, a declaration not at
+  the very start of the document, and `<?XML …?>`.
+- XML: parse errors are in dq's words, placed at the fault, without
+  quick-xml's wording or byte offsets. `<c a="1" a="2"/>` used to give
+  `malformed attribute: position 8: duplicated attribute, previous
+  declaration at position 2`; it now gives `XML parse error at line 2,
+  column 12: attribute 'a' appears twice on <c>`.
+- YAML: textual `set` writes a value or key holding a C1 control, DEL,
+  U+FEFF, U+FFFE or U+FFFF double-quoted with escapes, whatever scalar it
+  replaces. It used to refuse the edit (exit 7), or write U+FEFF raw:
+  `dq set f.yaml /a $'a\u0080b'` now writes `a: "a\x80b"`.
+- HCL output refuses NaN and infinity with exit 1 and writes nothing
+  (`hcl format error: HCL cannot represent non-finite number .nan`).
+  `dq set s.tf --jq '.a = nan'` wrote `a = null`, and `convert -F hcl` of a
+  YAML `.nan` wrote the string `a = ".nan"`; `fix` and `convert -i` are
+  refused the same way.
+- Console output keeps non-ASCII text whole next to an escaped control
+  character. `{"a": "é\u0001"}` printed `{a: Ã©\x01}` and now prints
+  `{a: é\x01}`; `validate` snippets broke the same way.
 - A JSON Schema member named like one of dq's internal notes is the
   user's own data. It used to be read as dq's note and could change a
   message: `maximum: 5` with a forged spelling note printed `greater than

@@ -41,46 +41,23 @@ the fix.
   - YAML: LS and PS are written escaped (`\L`, `\P`), including by textual
     `set`.
   - TOON: tie floats are spelled the same whatever strings the document holds.
-
-## In progress
-
-A last round on numbers, XML and YAML. Item 1 is committed; items 2–5 are
-open, in this order.
-
-1. **Schema notes are in band.** Done 2026-11-19, not reviewed yet. dq kept
-   its notes inside the schema JSON: limit spellings (`"\u0000dq.spelling"`)
-   and stand-ins for infinities and divisors below the smallest float. A user
-   schema member with the same name was read as dq's note: `maximum: 5` plus
-   a forged note printed `greater than the maximum of garbage`. Now the
-   rule's schema holds only what the rule wrote, and the notes live in a
-   `SchemaNotes` table beside it (`Check::Schema.notes`), keyed by RFC 6901
-   place. A note still sits in band in one spot: the private copy the
-   validator compiles (`compiled_json`), behind a random per-process tag,
-   because jsonschema's own `Location` is not a reliable key behind `$ref`
-   and `$id`. Still to do for this item: tests for a forged member in an
-   `@std` embedded schema, inside a composite `nested:` rule and behind a
-   `$ref`, then the review.
-2. **Console escaping.** Console output mangles non-ASCII text next to an
-   escaped control character (`é\u0001` prints as `Ã©\x01`), and so do
-   `validate` snippets. `escape_control` in
-   [console.rs](../../crates/dq-cli/src/output/console.rs) pushes bytes as
-   chars. The regression test is in place and `#[ignore]`d:
-   `console_keeps_non_ascii_next_to_an_escaped_control_character` in
-   `crates/dq-cli/tests/cli_smoke.rs`. Drop the `ignore` with the fix.
-3. **XML declaration order.** An XML declaration with its pseudo-attributes
-   out of order (`standalone` before `encoding`) is accepted, while libxml2
-   refuses it. Also to check: a missing `version`, an unknown or duplicate
-   pseudo-attribute, and a `standalone` other than `yes`/`no`.
-4. **YAML control characters.** Textual `set` refuses a value that holds a
-   C1 control (exit 7), and U+FEFF is handled differently by scalar style.
-   Both YAML write paths should write them double-quoted with escapes
-   (`\x80`, `﻿`).
-5. **quick-xml wording.** quick-xml's wording and byte offsets leak into XML
-   error messages ("malformed attribute: position 8: …"). Map these errors
-   to dq's own wording.
-
-After this round come the tests for it and an independent review of the whole
-range since the dependency update. Then a push.
+- **Last round: schema notes, console, XML declaration, YAML controls, HCL
+  non-finite** (2026-11-20).
+  - Schema notes live out of band in a `SchemaNotes` table beside the rule's
+    schema, keyed by RFC 6901 place; a user member named like a note is data.
+    Tests cover a project rule, a `schema_file` sidecar, the embedded `@std`
+    path, a composite `nested:` rule and limits behind `$ref`, `$id` and
+    `$anchor`.
+  - Console output and `validate` snippets keep non-ASCII text whole next to
+    an escaped control character.
+  - XML: the declaration is read by its grammar (§2.8), and parse errors are
+    in dq's words at the fault, without quick-xml's wording or byte offsets.
+  - YAML: textual `set` writes C1 controls, DEL, U+FEFF, U+FFFE and U+FFFF
+    double-quoted with escapes; the native writer already did.
+  - HCL output refuses NaN and infinity (exit 1) instead of writing `null` or
+    a string.
+  - The whole range since the dependency update was reviewed independently
+    (Dockerfile/lint/schema, XML/HCL/TOON/numbers, YAML/jq/edit/patch).
 
 ## Next, in order
 
@@ -113,6 +90,12 @@ range since the dependency update. Then a push.
 - JSON Schema rejects two references as external that should resolve: a
   relative `$ref` to an embedded `$id`, and an absolute reference to the
   schema's own `$id`.
+- A schema limit is not quoted as written in two places (tests in
+  `cli_schema_forged_notes.rs`, `#[ignore]`d): behind a `$ref` that reaches
+  outside the schema keywords (`$ref: '#/x-limits/a'` prints `1e+2` for
+  `1E2`), and behind a YAML alias (`*lim` prints `100.0`).
+- Console output lets C1 controls (U+0080–U+009F, e.g. U+009B CSI) through to
+  the terminal; only C0 and DEL are escaped.
 
 ### Formats, reporters, globs
 

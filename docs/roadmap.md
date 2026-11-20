@@ -15,8 +15,8 @@ Each has its own page with the design and the remaining steps.
 
 - **[Fix everything found on `fix/after-deps-update`](plans/after-deps-update-fixes.md)
   — in progress.** Streams, big numbers, textual edits, non-finite numbers,
-  and the numbers/HCL/XML/YAML round are done. A last round on schema notes,
-  console escaping and XML declarations is in progress. After it come the
+  the numbers/HCL/XML/YAML round and the last round on schema notes, console
+  escaping, XML declarations and YAML controls are done. Next come the
   `@std` rules and the fixture runner, positions and schemas, formats and
   reporters, and the README checked against the code, in that order.
 
