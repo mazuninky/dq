@@ -65,3 +65,14 @@ tests:
           message_contains: "title"
         - rule: markdown.frontmatter-required-fields
           message_contains: "date"
+  - name: empty frontmatter block has none of the required fields
+    input: |
+      ---
+      ---
+      # T
+    expected:
+      violations:
+        - rule: markdown.frontmatter-required-fields
+          message_contains: "title"
+        - rule: markdown.frontmatter-required-fields
+          message_contains: "date"

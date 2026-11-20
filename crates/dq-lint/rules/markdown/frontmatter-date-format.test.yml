@@ -52,3 +52,18 @@ tests:
       # T
     expected:
       violations: []
+  - name: boolean date is skipped
+    input: |
+      ---
+      date: false
+      ---
+      # T
+    expected:
+      violations: []
+  - name: empty frontmatter block is skipped
+    input: |
+      ---
+      ---
+      # T
+    expected:
+      violations: []

@@ -8,7 +8,8 @@ match:
   format: markdown
 check:
   jq: |
-    .children[]?
+    def kids: .children? | arrays | .[] | objects;
+    kids
     | select(.type == "code_block" and .fenced == true)
     | select(.lang == null or .lang == "")
     | { position: .position }
@@ -16,4 +17,4 @@ check:
 references:
   - https://github.github.com/gfm/#fenced-code-blocks
 loc:
-  line: '.position.start.line // 1'
+  line: '(objects | .position | objects | .start | objects | .line) // 1'

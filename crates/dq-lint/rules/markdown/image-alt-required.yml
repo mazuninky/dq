@@ -8,9 +8,10 @@ match:
   format: markdown
 check:
   jq: |
+    def kids: .children? | arrays | .[] | objects;
     [.. | objects | select(.type? == "paragraph" or .type? == "heading" or .type? == "list_item" or .type? == "table_cell" or .type? == "block_quote")][]
     | . as $block
-    | [$block | recurse(.children?[]?) | select(.type? == "image")][]
+    | [$block | recurse(kids) | select(.type == "image")][]
     | . as $img
     | ($img.alt // "" | tostring | gsub("^\\s+|\\s+$"; ""))
     | select(. == "")
@@ -19,4 +20,4 @@ check:
 references:
   - https://www.w3.org/WAI/tutorials/images/
 loc:
-  line: '.position.start.line // 1'
+  line: '(objects | .position | objects | .start | objects | .line) // 1'

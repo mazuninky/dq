@@ -7,15 +7,17 @@ match:
   format: markdown
 check:
   jq: |
-    .children[]?
+    def kids: .children? | arrays | .[] | objects;
+    def text: [recurse(kids) | select(.type == "text") | .value | strings] | join("");
+    kids
     | select(.type == "paragraph")
     | . as $p
-    | ([$p | recurse(.children?[]?) | select(.type? == "image" or .type? == "link" or .type? == "code" or .type? == "html_inline")] | length) as $non_text_count
-    | ([$p | recurse(.children?[]?) | select(.type? == "text") | .value] | join("") | gsub("^\\s+|\\s+$"; "")) as $text
+    | ([$p | recurse(kids) | select(.type == "image" or .type == "link" or .type == "code" or .type == "html_inline")] | length) as $non_text_count
+    | ($p | text | gsub("^\\s+|\\s+$"; "")) as $text
     | select($non_text_count == 0 and $text == "")
     | { position: $p.position }
   message: "Empty paragraph"
 references:
   - https://commonmark.org/help/
 loc:
-  line: '.position.start.line // 1'
+  line: '(objects | .position | objects | .start | objects | .line) // 1'

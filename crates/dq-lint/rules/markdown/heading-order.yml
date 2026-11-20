@@ -8,14 +8,17 @@ match:
   format: markdown
 check:
   jq: |
-    [.children[]? | select(.type == "heading")] as $hs
+    def kids: .children? | arrays | .[] | objects;
+    [kids | select(.type == "heading")] as $hs
     | range(1; $hs | length) as $i
     | $hs[$i-1] as $prev
     | $hs[$i] as $cur
-    | select($cur.level > $prev.level + 1)
+    | ($prev.level | numbers) as $p
+    | ($cur.level | numbers) as $c
+    | select($c > $p + 1)
     | { previous: $prev.level, current: $cur.level, position: $cur.position }
   message: "Heading level jumps from H{{ .previous }} to H{{ .current }} (skipped at least one level)"
 references:
   - https://www.w3.org/WAI/tutorials/page-structure/headings/
 loc:
-  line: '.position.start.line // 1'
+  line: '(objects | .position | objects | .start | objects | .line) // 1'

@@ -8,9 +8,10 @@ match:
   format: markdown
 check:
   jq: |
+    def kids: .children? | arrays | .[] | objects;
     [.. | objects | select(.type? == "paragraph" or .type? == "heading" or .type? == "list_item" or .type? == "table_cell" or .type? == "block_quote")][]
     | . as $block
-    | .children[]?
+    | kids
     | select(.type == "text")
     | select(.value | tostring | test("https?://[^\\s<>)\\]\"]+"))
     | { snippet: (.value | tostring), position: $block.position }
@@ -18,4 +19,4 @@ check:
 references:
   - https://commonmark.org/help/
 loc:
-  line: '.position.start.line // 1'
+  line: '(objects | .position | objects | .start | objects | .line) // 1'
