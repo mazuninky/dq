@@ -124,7 +124,7 @@ use std::io::{Cursor, Write};
 use camino::Utf8PathBuf;
 use encoding_rs::{Encoding, REPLACEMENT, UTF_8, UTF_16BE, UTF_16LE};
 use indexmap::IndexMap;
-use quick_xml::events::attributes::Attribute;
+use quick_xml::events::attributes::{AttrError, Attribute};
 use quick_xml::events::{
     BytesCData, BytesDecl, BytesEnd, BytesPI, BytesRef, BytesStart, BytesText, Event,
 };
@@ -316,16 +316,8 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
             Err(e) => {
                 // The start of the markup the error is in (its `<`), where
                 // `buffer_position` would be wherever reading stopped.
-                let pos = reader.error_position() as usize;
-                let (line, col) = byte_pos_to_line_col(text, pos);
-                return Err(Error::Parse {
-                    file: None,
-                    line,
-                    col,
-                    span: pos..pos,
-                    snippet: snippet_for_pos(text, pos),
-                    message: format!("XML parse error: {e}"),
-                });
+                let (pos, message) = reader_refusal(&e, text, reader.error_position() as usize);
+                return Err(parse_error_at(text, pos, message));
             }
             Ok(Event::Eof) => break,
             Ok(Event::Decl(_)) => {
@@ -385,8 +377,7 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
             }
             Ok(Event::Start(start)) => {
                 check_attribute_references(text, &start, xml11)?;
-                let mut frame =
-                    build_start_frame(&start, xml11).map_err(|e| place(e, text, event_start))?;
+                let mut frame = build_start_frame(&start, text, event_start, xml11)?;
                 check_namespaces(&stack, &mut frame, xml11).map_err(|(message, attr)| {
                     let pos = name_offset(text, &start, event_start, attr.as_deref());
                     parse_error_at(text, pos, message)
@@ -407,8 +398,7 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
             }
             Ok(Event::Empty(start)) => {
                 check_attribute_references(text, &start, xml11)?;
-                let mut frame =
-                    build_start_frame(&start, xml11).map_err(|e| place(e, text, event_start))?;
+                let mut frame = build_start_frame(&start, text, event_start, xml11)?;
                 check_namespaces(&stack, &mut frame, xml11).map_err(|(message, attr)| {
                     let pos = name_offset(text, &start, event_start, attr.as_deref());
                     parse_error_at(text, pos, message)
@@ -1066,20 +1056,143 @@ fn name_offset(
         .unwrap_or(tag_name)
 }
 
-/// `e` placed at `pos` in `text` when it was raised with no position
-/// (line 0) — a malformed attribute, found while the start tag at `pos` is
-/// taken apart.
-fn place(e: Error, text: &str, pos: usize) -> Error {
-    match e {
-        Error::Parse {
-            line: 0, message, ..
-        } => {
-            let message = message
-                .strip_prefix("XML parse error: ")
-                .map_or(message.clone(), str::to_owned);
-            parse_error_at(text, pos, message)
+/// quick-xml's reading error `e`, raised at `at` in `text` (the `<` of the
+/// markup, or the `&` of a reference), in dq's words: where to place it,
+/// and what is wrong. quick-xml's own wording and byte offsets stay out
+/// of the message.
+fn reader_refusal(e: &quick_xml::Error, text: &str, at: usize) -> (usize, String) {
+    use quick_xml::errors::{IllFormedError, SyntaxError};
+    let message = match e {
+        quick_xml::Error::Syntax(e) => match e {
+            SyntaxError::InvalidBangMarkup => {
+                "markup that begins '<!' is no comment, CDATA section or DOCTYPE declaration"
+            }
+            SyntaxError::UnclosedPI => "the processing instruction has no closing '?>'",
+            SyntaxError::UnclosedXmlDecl => "the XML declaration has no closing '?>'",
+            SyntaxError::UnclosedComment => "the comment has no closing '-->'",
+            SyntaxError::UnclosedDoctype => "the DOCTYPE declaration has no closing '>'",
+            SyntaxError::UnclosedCData => "the CDATA section has no closing ']]>'",
+            SyntaxError::UnclosedTag => "the tag has no closing '>'",
+            SyntaxError::UnclosedSingleQuotedAttributeValue
+            | SyntaxError::UnclosedDoubleQuotedAttributeValue => {
+                // quick-xml points at the tag; the value begins at the
+                // quote that is still open at the end of the input.
+                let mut open = None;
+                for (i, b) in text.get(at..).unwrap_or_default().bytes().enumerate() {
+                    match open {
+                        None if matches!(b, b'"' | b'\'') => open = Some((b, i)),
+                        Some((quote, _)) if b == quote => open = None,
+                        _ => {}
+                    }
+                }
+                let (quote, pos) = open.map_or((b'"', 0), |(quote, i)| (quote, at + i));
+                return (
+                    pos,
+                    format!(
+                        "the attribute value has no closing quote ({})",
+                        char::from(quote)
+                    ),
+                );
+            }
         }
-        other => other,
+        .to_owned(),
+        quick_xml::Error::IllFormed(e) => match e {
+            IllFormedError::MissingDeclVersion(_) => {
+                "the XML declaration must begin with its version (version=\"1.0\")".to_owned()
+            }
+            IllFormedError::UnknownVersion => {
+                "the XML declaration's version is not a version number".to_owned()
+            }
+            IllFormedError::MissingDoctypeName => {
+                "the DOCTYPE declaration names no root element".to_owned()
+            }
+            IllFormedError::MissingEndTag(tag) => format!("element <{tag}> is not closed"),
+            IllFormedError::UnmatchedEndTag(tag) => format!("unexpected closing tag </{tag}>"),
+            IllFormedError::MismatchedEndTag { expected, found } => {
+                format!("closing tag </{found}> does not match <{expected}>")
+            }
+            IllFormedError::DoubleHyphenInComment => "a comment holds '--'".to_owned(),
+            IllFormedError::UnclosedReference => "the reference has no closing ';'".to_owned(),
+        },
+        // Raised by attribute and reference decoding, which dq does
+        // itself (`build_start_frame`, `resolve_general_ref`); input that
+        // is a `&str` cannot fail to read or decode.
+        quick_xml::Error::InvalidAttr(_) => "a malformed attribute".to_owned(),
+        quick_xml::Error::Escape(_) => "a malformed reference".to_owned(),
+        quick_xml::Error::Namespace(_) => "a malformed namespace prefix".to_owned(),
+        quick_xml::Error::Io(_) | quick_xml::Error::Encoding(_) => {
+            "the document could not be read".to_owned()
+        }
+    };
+    (at, message)
+}
+
+/// The attribute name that ends before `at` in the tag content `content`,
+/// past white space and, when `eq`, an `=` and white space; and the
+/// offset it begins at.
+fn key_before(content: &str, at: usize, eq: bool) -> (usize, &str) {
+    let bytes = content.as_bytes();
+    let mut i = at.min(bytes.len());
+    let skip_space = |mut i: usize| {
+        while i > 0 && is_xml_space(bytes[i - 1]) {
+            i -= 1;
+        }
+        i
+    };
+    i = skip_space(i);
+    if eq && i > 0 && bytes[i - 1] == b'=' {
+        i = skip_space(i - 1);
+    }
+    let end = i;
+    while i > 0 && !is_xml_space(bytes[i - 1]) && !matches!(bytes[i - 1], b'=' | b'"' | b'\'') {
+        i -= 1;
+    }
+    (i, &content[i..end])
+}
+
+/// quick-xml's attribute error `e` in the start tag `<{tag} …>` whose
+/// content (past the `<`) is `content`, in dq's words: the offset in
+/// `content` to place it at — the attribute's name, or its value — and
+/// what is wrong.
+fn attr_refusal(e: &AttrError, content: &str, tag: &str) -> (usize, String) {
+    match *e {
+        AttrError::ExpectedEq(at) => {
+            let (pos, key) = key_before(content, at, false);
+            (
+                pos,
+                format!("attribute '{key}' on <{tag}> has no '=' and value"),
+            )
+        }
+        AttrError::ExpectedValue(at) => {
+            let (pos, key) = key_before(content, at, true);
+            (
+                pos,
+                format!("attribute '{key}' on <{tag}> has '=' but no value"),
+            )
+        }
+        AttrError::UnquotedValue(at) => {
+            let (_, key) = key_before(content, at, true);
+            (
+                at,
+                format!("the value of attribute '{key}' on <{tag}> must be quoted, with \" or '"),
+            )
+        }
+        AttrError::ExpectedQuote(at, quote) => (
+            at,
+            format!(
+                "an attribute value on <{tag}> has no closing quote ({})",
+                char::from(quote)
+            ),
+        ),
+        AttrError::Duplicated(at, _) => {
+            let key = content
+                .get(at..)
+                .unwrap_or_default()
+                .split(|c: char| c == '=' || c.is_ascii_whitespace())
+                .next()
+                .unwrap_or_default();
+            (at, format!("attribute '{key}' appears twice on <{tag}>"))
+        }
     }
 }
 
@@ -1172,20 +1285,41 @@ fn check_namespaces(
     Ok(())
 }
 
-fn build_start_frame(start: &BytesStart<'_>, xml11: bool) -> Result<Frame> {
+/// The frame of the start tag `start`, which begins at `event_start` (its
+/// `<`) in `text`. A malformed attribute is placed at its name (or its
+/// value), in dq's words.
+fn build_start_frame(
+    start: &BytesStart<'_>,
+    text: &str,
+    event_start: usize,
+    xml11: bool,
+) -> Result<Frame> {
     let tag = start.name().as_ref().to_owned();
+    // quick-xml counts an attribute error's position from past the `<`.
+    let content_start = event_start + "<".len();
+    let content = text.get(content_start..).unwrap_or_default();
     let mut frame = Frame::new(tag);
     for attr in start.attributes() {
-        let attr = attr.map_err(|e| Error::Parse {
-            file: None,
-            line: 0,
-            col: 0,
-            span: 0..0,
-            snippet: String::new(),
-            message: format!("XML parse error: malformed attribute: {e}"),
+        let attr = attr.map_err(|e| {
+            let (pos, message) = attr_refusal(&e, content, &frame.tag);
+            parse_error_at(text, content_start + pos, message)
         })?;
         let name = attr.key.as_ref().to_owned();
-        let value = decode_attr(&attr, xml11)?;
+        let value = decode_attr(&attr, xml11).map_err(|()| {
+            let base = text.as_ptr() as usize;
+            let pos = (attr.value.as_ptr() as usize)
+                .checked_sub(base)
+                .filter(|&offset| offset < text.len())
+                .unwrap_or(event_start);
+            parse_error_at(
+                text,
+                pos,
+                format!(
+                    "the value of attribute '{name}' on <{}> is malformed",
+                    frame.tag
+                ),
+            )
+        })?;
         frame.attrs.insert(name, Value::String(value));
     }
     Ok(frame)
@@ -1237,21 +1371,17 @@ fn normalize_line_ends(s: &str, xml11: bool) -> String {
     out
 }
 
-fn decode_attr(attr: &Attribute<'_>, xml11: bool) -> Result<String> {
+/// The value of `attr`, its references resolved and normalized as the
+/// version has it. `Err` only for a reference
+/// [`check_attribute_references`] lets through, which it should not.
+fn decode_attr(attr: &Attribute<'_>, xml11: bool) -> std::result::Result<String, ()> {
     // `unescape_value` was deprecated in quick-xml 0.38 in favour of
     // `normalized_value`, which does the same predefined-entity resolution
     // plus the spec-mandated whitespace normalisation. The wire-level output
     // is the same for the predefined-entity set we care about.
     attr.normalized_value(xml_version(xml11))
         .map(|c| c.into_owned())
-        .map_err(|e| Error::Parse {
-            file: None,
-            line: 0,
-            col: 0,
-            span: 0..0,
-            snippet: String::new(),
-            message: format!("XML parse error: malformed attribute value: {e}"),
-        })
+        .map_err(|_| ())
 }
 
 /// Refuse a character `text`, a document of XML 1.1 when `xml11` (else
@@ -1286,20 +1416,35 @@ fn check_raw_chars(text: &str, xml11: bool) -> Result<()> {
 }
 
 /// Why the reference `&name;` is not well-formed in XML 1.1 when `xml11`
-/// (else 1.0): a character reference to NUL, a surrogate, U+FFFE or
-/// U+FFFF, or in 1.0 to a C0 control but tab, LF and CR. `None` for any
-/// other reference — an entity, or a malformed number, which the reader
-/// refuses in its own words.
+/// (else 1.0), or not one dq can resolve: an entity other than the five
+/// XML predefines (there is no DTD to declare one); a character reference
+/// that is no number (`&#X41;`: only a lowercase `x` makes a hex one) or
+/// one past U+10FFFF; one to NUL, a surrogate, U+FFFE or U+FFFF, or in
+/// 1.0 to a C0 control but tab, LF and CR. `None` when it resolves.
 fn reference_refusal(name: &str, xml11: bool) -> Option<String> {
-    let number = name.strip_prefix('#')?;
+    let Some(number) = name.strip_prefix('#') else {
+        return quick_xml::escape::resolve_predefined_entity(name)
+            .is_none()
+            .then(|| format!("undeclared entity reference '&{name};'"));
+    };
     let (digits, radix) = match number.strip_prefix('x') {
         Some(hex) => (hex, 16),
         None => (number, 10),
     };
     if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
-        return None;
+        return Some(format!(
+            "the character reference '&{name};' is no number: it takes decimal digits \
+             (&#65;) or, after a lowercase x, hex digits (&#x41;)"
+        ));
     }
-    let code = u32::from_str_radix(digits, radix).ok()?;
+    let Some(code) = u32::from_str_radix(digits, radix)
+        .ok()
+        .filter(|&code| code <= 0x10_FFFF)
+    else {
+        return Some(format!(
+            "the character reference '&{name};' is past U+10FFFF, the last Unicode code point"
+        ));
+    };
     let allowed = match code {
         0 | 0xD800..=0xDFFF | 0xFFFE | 0xFFFF => false,
         0x9 | 0xA | 0xD => true,
@@ -1315,9 +1460,9 @@ fn reference_refusal(name: &str, xml11: bool) -> Option<String> {
     })
 }
 
-/// Refuse a character reference in an attribute value of `start` that
-/// [`reference_refusal`] refuses, at its `&`. The reader borrows the
-/// value from `text`.
+/// Refuse a reference in an attribute value of `start` that
+/// [`reference_refusal`] refuses, or one with no closing `;`, at its `&`.
+/// The reader borrows the value from `text`.
 fn check_attribute_references(text: &str, start: &BytesStart<'_>, xml11: bool) -> Result<()> {
     let base = text.as_ptr() as usize;
     for attr in start.attributes().flatten() {
@@ -1325,7 +1470,11 @@ fn check_attribute_references(text: &str, start: &BytesStart<'_>, xml11: bool) -
         let at = (value.as_ptr() as usize).saturating_sub(base);
         for (index, _) in value.match_indices('&') {
             let Some(end) = value[index..].find(';') else {
-                continue;
+                return Err(parse_error_at(
+                    text,
+                    at + index,
+                    "the reference has no closing ';'".to_owned(),
+                ));
             };
             if let Some(message) = reference_refusal(&value[index + 1..index + end], xml11) {
                 return Err(parse_error_at(text, at + index, message));
@@ -1342,39 +1491,30 @@ fn check_attribute_references(text: &str, start: &BytesStart<'_>, xml11: bool) -
 /// `apos`) plus numeric character references (`&#48;` / `&#x30;`). Anything
 /// else is an undeclared entity — without a DTD we cannot resolve it, so we
 /// surface a `Error::Parse` rather than silently swallowing the reference.
+/// [`reference_refusal`] words every refusal, placed at the `&` (`pos`).
 fn resolve_general_ref(r: &BytesRef<'_>, text: &str, pos: usize, xml11: bool) -> Result<String> {
-    let make_parse_err = |msg: String| {
-        let (line, col) = byte_pos_to_line_col(text, pos);
-        Error::Parse {
-            file: None,
-            line,
-            col,
-            span: pos..pos,
-            snippet: snippet_for_pos(text, pos),
-            message: msg,
-        }
-    };
     // quick-xml 0.42: `BytesRef` derefs to the entity name as `str`; the
     // fallible `decode()` step (UTF-8 only, so it never failed for us) is gone.
     let name: &str = r;
     if let Some(message) = reference_refusal(name, xml11) {
         return Err(parse_error_at(text, pos, message));
     }
-    if r.is_char_ref() {
+    let resolved = if r.is_char_ref() {
         // Numeric character reference — `&#48;` or `&#x30;`.
-        let ch = r.resolve_char_ref().map_err(|e| {
-            make_parse_err(format!(
-                "XML parse error: malformed character reference: {e}",
-            ))
-        })?;
-        return Ok(ch.map_or_else(String::new, |c| c.to_string()));
-    }
-    if let Some(resolved) = quick_xml::escape::resolve_predefined_entity(name) {
-        return Ok(resolved.to_owned());
-    }
-    Err(make_parse_err(format!(
-        "XML parse error: undeclared entity reference '&{name};'",
-    )))
+        r.resolve_char_ref()
+            .ok()
+            .map(|ch| ch.map_or_else(String::new, |c| c.to_string()))
+    } else {
+        quick_xml::escape::resolve_predefined_entity(name).map(str::to_owned)
+    };
+    // `reference_refusal` lets through only a reference that resolves.
+    resolved.ok_or_else(|| {
+        parse_error_at(
+            text,
+            pos,
+            format!("the reference '&{name};' does not resolve"),
+        )
+    })
 }
 
 fn push_pi(stack: &mut [Frame], top_pi: &mut Vec<String>, raw: String) {
@@ -2794,8 +2934,14 @@ mod tests {
             ("#65535", true, true),
             ("#x7F", false, false),
             ("amp", false, false),
-            ("#x", false, false),
-            ("#-1", false, false),
+            // No number, past U+10FFFF, an entity there is no DTD for.
+            ("#x", false, true),
+            ("#-1", false, true),
+            ("#X41", false, true),
+            ("#x110000", false, true),
+            ("#99999999999", false, true),
+            ("#x10FFFF", false, false),
+            ("bogus", false, true),
         ] {
             assert_eq!(
                 reference_refusal(name, xml11).is_some(),
@@ -3289,9 +3435,13 @@ mod tests {
         // A second root, where it begins; a closing tag that does not match.
         assert_eq!(place("<r/>\n <s/>"), (2, 2));
         assert_eq!(place("<r>\n <a></b></r>"), (2, 5));
-        // An entity, at its `&`; a malformed attribute, at its tag.
+        // An entity, at its `&`; a malformed attribute, at its name, or
+        // at its value; an unclosed value, at its quote.
         assert_eq!(place("<r>\n x&bogus;</r>"), (2, 3));
-        assert_eq!(place("<r>\n<k a=\"1\" a=\"2\"/></r>"), (2, 1));
+        assert_eq!(place("<r>\n<k a=\"1\" a=\"2\"/></r>"), (2, 10));
+        assert_eq!(place("<r>\n<k  a = /></r>"), (2, 5));
+        assert_eq!(place("<r>\n<k a=1/></r>"), (2, 6));
+        assert_eq!(place("<r>\n<k b='1' a=\"x"), (2, 12));
         // A refused encoding, at its label — past a BOM, on the line the
         // label stands on.
         let (line, col, message) = at("<?xml version=\"1.0\" encoding=\"UTF-32\"?><r/>");

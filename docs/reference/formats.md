@@ -320,6 +320,12 @@ in `<?xml version="1.0" encoding="UTF-32"?>`, a BOM not counted), as
 `dq validate` does in its `line` / `col` fields. Bytes the encoding
 cannot read name their byte index instead:
 
+- malformed markup, in dq's words at the markup, attribute or reference
+  at fault: a tag, comment, CDATA section, PI, attribute value or
+  reference left open; an attribute repeated, with no value, or unquoted
+  (`attribute 'a' appears twice on <c>`); an entity XML does not
+  predefine; a character reference that is no number (`&#X41;`) or past
+  U+10FFFF; a closing tag that does not match;
 - an XML declaration its grammar (XML 1.0 §2.8) rules out, at the
   pseudo-attribute or value at fault: `version` missing or not first,
   `standalone` before `encoding`, a pseudo-attribute given twice or one

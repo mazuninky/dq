@@ -2090,7 +2090,9 @@ fn a_raw_character_is_refused_in_markup_and_placed_by_characters() {
 /// A malformed reference and a malformed attribute are placed: a
 /// reference at its `&` — `&#X41;` (only a lowercase `x` makes a hex
 /// reference) and one split across lines alike — and an attribute error
-/// at its tag's `<`. Before (c7bb838), none had a position.
+/// at the attribute: a repeated one at its second name, an unquoted value
+/// at the value. Before (c7bb838), none had a position; until the
+/// messages became dq's own, attribute errors stood at the tag's `<`.
 #[test]
 fn a_malformed_reference_or_attribute_is_placed() {
     let dir = dir_with(&[
@@ -2102,22 +2104,26 @@ fn a_malformed_reference_or_attribute_is_placed() {
         ("unquoted.xml", b"<r>\n  <c a=1/></r>"),
         ("ok.xml", b"<r>&#x41;&#65;</r>"),
     ]);
-    let malformed_ref =
-        "malformed character reference: invalid character reference: invalid digit found in string";
+    let no_number = |reference: &str| {
+        format!(
+            "the character reference '{reference}' is no number: it takes decimal digits \
+             (&#65;) or, after a lowercase x, hex digits (&#x41;)"
+        )
+    };
     assert_cases(
         &dir,
         &[
             (
                 convert("upper_x.xml", "json"),
-                unreadable_at("upper_x.xml", 1, 4, malformed_ref),
+                unreadable_at("upper_x.xml", 1, 4, &no_number("&#X41;")),
             ),
             (
                 convert("upper_x_11.xml", "json"),
-                unreadable_at("upper_x_11.xml", 1, 25, malformed_ref),
+                unreadable_at("upper_x_11.xml", 1, 25, &no_number("&#X1;")),
             ),
             (
                 convert("split.xml", "json"),
-                unreadable_at("split.xml", 1, 4, malformed_ref),
+                unreadable_at("split.xml", 1, 4, &no_number("&#x\n41;")),
             ),
             (
                 convert("split_name.xml", "json"),
@@ -2130,22 +2136,15 @@ fn a_malformed_reference_or_attribute_is_placed() {
             ),
             (
                 convert("duplicate.xml", "json"),
-                unreadable_at(
-                    "duplicate.xml",
-                    2,
-                    3,
-                    "malformed attribute: position 8: duplicated attribute, previous \
-                     declaration at position 2",
-                ),
+                unreadable_at("duplicate.xml", 2, 12, "attribute 'a' appears twice on <c>"),
             ),
             (
                 convert("unquoted.xml", "json"),
                 unreadable_at(
                     "unquoted.xml",
                     2,
-                    3,
-                    "malformed attribute: position 4: attribute value must be enclosed in \
-                     `\"` or `'`",
+                    8,
+                    "the value of attribute 'a' on <c> must be quoted, with \" or '",
                 ),
             ),
             (convert("ok.xml", "xml"), ok("<r>AA</r>")),
@@ -2227,13 +2226,7 @@ fn validate_reports_the_line_and_column_its_message_names() {
             13,
             "the XML declaration's encoding \"UTF-32\" is one dq does not know",
         ),
-        (
-            "attr.xml",
-            2,
-            3,
-            "malformed attribute: position 8: duplicated attribute, previous declaration at \
-             position 2",
-        ),
+        ("attr.xml", 2, 12, "attribute 'a' appears twice on <c>"),
     ] {
         let (code, stdout, stderr) = run(&dir, &["validate", file]);
         assert_eq!((code, stdout.as_slice()), (4, &b""[..]), "{file}: {stderr}");
@@ -2450,4 +2443,107 @@ fn a_declaration_its_grammar_rules_out_is_a_parse_error() {
             ),
         ],
     );
+}
+
+/// Every malformed-XML error quick-xml raises reaches the user in dq's
+/// words, placed by line and column, with exit 3: no quick-xml wording
+/// (`syntax error:`, `ill-formed document:`, backquoted tokens) and
+/// no byte offsets (`position 8`, `at 1..4`). Before, each of these
+/// printed quick-xml's Display, e.g. `malformed attribute: position 4:
+/// attribute key must be directly followed by `=` or space`.
+#[test]
+fn malformed_xml_is_reported_in_dqs_words() {
+    let cases: &[(&str, &[u8], u32, u32, &str)] = &[
+        (
+            "no_eq.xml",
+            b"<r a/>",
+            1,
+            4,
+            "attribute 'a' on <r> has no '=' and value",
+        ),
+        (
+            "no_value.xml",
+            b"<r>\n  <c a = /></r>",
+            2,
+            6,
+            "attribute 'a' on <c> has '=' but no value",
+        ),
+        (
+            "entity_in_attr.xml",
+            b"<r a=\"x&foo;\"/>",
+            1,
+            8,
+            "undeclared entity reference '&foo;'",
+        ),
+        (
+            "open_ref_in_attr.xml",
+            b"<r a=\"&amp\"/>",
+            1,
+            7,
+            "the reference has no closing ';'",
+        ),
+        (
+            "past_unicode.xml",
+            b"<r>&#x110000;</r>",
+            1,
+            4,
+            "the character reference '&#x110000;' is past U+10FFFF, the last Unicode code \
+             point",
+        ),
+        (
+            "open_ref.xml",
+            b"<r>&amp</r>",
+            1,
+            4,
+            "the reference has no closing ';'",
+        ),
+        (
+            "open_comment.xml",
+            b"<r>\n<!-- x",
+            2,
+            1,
+            "the comment has no closing '-->'",
+        ),
+        (
+            "open_value.xml",
+            b"<r b='1' a=\"x/>",
+            1,
+            12,
+            "the attribute value has no closing quote (\")",
+        ),
+        ("open_tag.xml", b"<r", 1, 1, "the tag has no closing '>'"),
+        (
+            "bang.xml",
+            b"<r><!x></r>",
+            1,
+            4,
+            "markup that begins '<!' is no comment, CDATA section or DOCTYPE declaration",
+        ),
+        (
+            "mismatch.xml",
+            b"<r>\n  <a></r>",
+            2,
+            6,
+            "closing tag </r> does not match <a>",
+        ),
+        (
+            "unmatched.xml",
+            b"</r>",
+            1,
+            1,
+            "unexpected closing tag </r>",
+        ),
+    ];
+    let files: Vec<(&str, &[u8])> = cases.iter().map(|&(f, b, ..)| (f, b)).collect();
+    let dir = dir_with(&files);
+    let expected: Vec<(Vec<&str>, Outcome)> = cases
+        .iter()
+        .map(|&(file, _, line, col, message)| {
+            (
+                convert(file, "json"),
+                unreadable_at(file, line, col, message),
+            )
+        })
+        .collect();
+    assert_cases(&dir, &expected);
 }
