@@ -99,13 +99,20 @@ csv = "1.4"
 # its `ureq` client with rustls (no native-tls / OpenSSL): `github` is the
 # backend, `archive-tar` + `compression-tar-gz` unpack the release
 # `.tar.gz`, `archive-zip` keeps stored-zip extraction. The `checksums`
-# feature (SHA256 verification against the GitHub asset digest) is NOT
-# enabled — it was not available before 1.x either. `ureq` is the same
-# blocking HTTP client, used directly by `self check` to hit the GitHub API
+# feature is NOT enabled: `dq self update` verifies the archive itself, in
+# a `verify_archive` hook, against the release's `dq-checksums.txt` (SHA-256
+# via `ring` below). The crate's own sums parser takes a bare digest that
+# names no file, and it would pull sha2 0.11 into the graph. `ureq` is the
+# same blocking HTTP client, used directly by `self check` to hit the GitHub API
 # without dragging in tokio; one ureq 3 serves both. Both are MIT/Apache-2.0
 # dual-licensed so the default `cargo deny` policy passes without amendment.
 self_update = { version = "1.3", default-features = false, features = ["ureq", "rustls", "github", "archive-tar", "compression-tar-gz", "archive-zip"] }
 ureq = { version = "3.5", default-features = false, features = ["rustls"] }
+# SHA-256 of the archive `dq self update` downloads, checked against the
+# release's `dq-checksums.txt` before anything is extracted. Already compiled
+# into every build through rustls (ureq), so no new crate enters the graph.
+# License: Apache-2.0 AND ISC.
+ring = { version = "0.17", default-features = false }
 
 # M9 markdown — `comrak` is the CommonMark+GFM parser used by
 # `dq-core/src/parsers/markdown.rs`. Default features pull in the standalone

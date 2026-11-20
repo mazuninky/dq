@@ -23,7 +23,7 @@ other reference pages (linked from the command table below).
 | `fix` | Apply rule fixes | [lint-engine.md](lint-engine.md) |
 | `completions <shell>` | Shell completion script on stdout (bash, zsh, fish, powershell, elvish) | below |
 | `man [PAGE]` | troff man page on stdout (`dq man`, `dq man get`) | below |
-| `self check`, `self update [--to VER]` | Check for / install a newer release | [distribution.md](distribution.md) |
+| `self check`, `self update [--to VER] [--dry-run]` | Check for / install a newer release (SHA-256 checked against `dq-checksums.txt`) | [distribution.md](distribution.md) |
 | `generate-docs --output-dir DIR` | Hidden; writes completions and man pages for packaging | [distribution.md](distribution.md) |
 
 `dq config` and `dq init` from the original plan do not exist; see
@@ -194,8 +194,8 @@ defined as named constants in `crates/dq-cli/src/exit_code.rs`.
 | 1 | `GENERIC` | Unclassified failure; `exists` answering "no"; `--check` with changes pending; `lint --strict` with warnings; a failed `patch` `test` op; a jq runtime error; a value the output format cannot hold (NaN or infinity in JSON or HCL, a number HCL/TOON cannot represent); `keys` / `values` / `len` on a node of the wrong type; a composite-rule extract error. |
 | 2 | `NOT_FOUND` | A JSON Pointer that does not resolve; a `--doc N` the file does not have (or no file of the run has); **any clap usage error** (unknown flag, conflicting flags, invalid value, `--doc` on a command that cannot honour it). |
 | 3 | `PARSE_ERROR` | The input does not parse; a templated file without an escape hatch; a jq compile error; an invalid rule file (bad YAML, unknown field, bad `check`, schema compile failure, unsafe `schema_file`); a failing `fix` script; a plugin with the wrong ABI major or a malformed fix. |
-| 4 | `VALIDATE_FAIL` | `validate` found a parse error; `lint` / `check` found an error-severity diagnostic; a plugin trapped, ran out of fuel or memory, or failed to load. |
-| 5 | `IO_ERROR` | Read-side I/O (missing file, unreadable file, a glob root that does not exist or a glob that matched nothing); network errors in `self check` / `self update`. |
+| 4 | `VALIDATE_FAIL` | `validate` found a parse error; `lint` / `check` found an error-severity diagnostic; a plugin trapped, ran out of fuel or memory, or failed to load; `self update` refused a downloaded archive at its SHA-256 check. |
+| 5 | `IO_ERROR` | Read-side I/O (missing file, unreadable file, a glob root that does not exist or a glob that matched nothing); network errors in `self check` / `self update` (incl. downloading `dq-checksums.txt`). |
 | 6 | `INVALID_INPUT` | A flag combination a handler refuses; write flags on a read command; stdin without `-F`; unsupported format or file extension; a reporter that does not fit the command; unknown rule id or `@std` namespace; bad fixture file; `--plugins` without the `plugins` feature; `dq merge` on a stream; `self update` into a path the user cannot write. |
 | 7 | `WRITE_FAILED` | Writing failed (temp file, rename, backup); the format has no textual edits (`set` on INI, XML, Markdown, …); a textual edit refused because the file would not read back as the change (`edit_rejected`); a bulk run with `--continue-on-error` where any file failed; `self update` could not replace the binary. |
 

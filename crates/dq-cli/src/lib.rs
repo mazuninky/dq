@@ -130,7 +130,7 @@ fn dispatch(
             cli.ensure_no_write_flags()?;
             match &args.command {
                 cli::SelfCommand::Check => commands::self_cmd::run_check(out),
-                cli::SelfCommand::Update(u) => commands::self_cmd::run_update(u),
+                cli::SelfCommand::Update(u) => commands::self_cmd::run_update(u, out),
             }
         }
         // M8 Stage 6: lint engine. The `lint` and `check` handlers route

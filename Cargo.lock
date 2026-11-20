@@ -1026,6 +1026,7 @@ dependencies = [
  "pretty_assertions",
  "proptest",
  "rayon",
+ "ring",
  "self_update",
  "serde",
  "serde_json",

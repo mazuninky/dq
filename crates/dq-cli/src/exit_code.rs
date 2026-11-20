@@ -16,7 +16,8 @@
 //!   that cannot honour it.
 //! - 3 — `PARSE_ERROR` — source could not be parsed (includes Go-template
 //!   guard rejections from [`dq_core::Error::TemplatedFile`]).
-//! - 4 — `VALIDATE_FAIL` — `validate` reports the document is invalid.
+//! - 4 — `VALIDATE_FAIL` — `validate` reports the document is invalid;
+//!   also `self update` refusing a downloaded archive at its checksum gate.
 //! - 5 — `IO_ERROR` — read-side IO failure (couldn't read source file).
 //! - 6 — `INVALID_INPUT` — bad CLI usage / unsupported flag combination.
 //! - 7 — `WRITE_FAILED` — read+resolve+render succeeded but writing the
@@ -102,6 +103,14 @@ pub fn exit_code_for_error(err: &anyhow::Error) -> i32 {
     }
     if err.downcast_ref::<LintWarnStrict>().is_some() {
         return GENERIC;
+    }
+    // `dq self update` refused the downloaded archive at its checksum gate:
+    // the download failed a verification, the "failed a check" family.
+    if err
+        .downcast_ref::<crate::commands::self_cmd::ChecksumError>()
+        .is_some()
+    {
+        return VALIDATE_FAIL;
     }
     if err.downcast_ref::<InvalidInput>().is_some() {
         return INVALID_INPUT;

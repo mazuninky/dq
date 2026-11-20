@@ -85,15 +85,44 @@ version" — exit 0 in all three cases, 5 on network errors. A rate-limited
 response (403 with `X-RateLimit-Remaining: 0`) adds a hint to set
 `GITHUB_TOKEN`.
 
-`self update [--to VER]` downloads the release archive for the running
-platform through the `self_update` crate and replaces the binary atomically.
-Exit 0 on success, 5 on network errors, 6 when the binary lives where the
-user cannot write (with a `sudo dq self update` hint), 7 when the replace
-fails. `--to` may also install an older release.
+`self update [--to VER] [--dry-run]` downloads the release archive for the
+running platform through the `self_update` crate (the `.tar.gz` / `.zip`
+asset whose name carries the target; `.sha256` and `.sig` sidecars are never
+taken for the archive), checks its SHA-256 and replaces the binary
+atomically. `--to` may also install an older release.
 
-**No checksum is verified** by `self update` today: the `self_update`
-crate's `checksums` feature is not enabled, contrary to what the README
-says. This is an open item in [../roadmap.md](../roadmap.md).
+The SHA-256 check runs after the download and before anything is
+extracted. `self update` downloads the release's `dq-checksums.txt` — not
+the per-archive `.sha256` sidecar: the release job computes it over the
+exact archives it publishes, `scripts/install.sh` verifies against it, and
+it is the file cosign signs — and requires exactly one digest for the
+archive's file name. The file is parsed strictly as `sha256sum` output:
+every non-blank line is 64 hex digits (either case), two spaces (or a space
+and `*`), then the file name, matched exactly (no path prefix). The update
+is refused, nothing extracted and the installed binary left untouched, when
+the release has no `dq-checksums.txt`, the file is empty, not UTF-8 or has
+a line of another shape, it has no line for the archive, it lists the
+archive twice with different digests, or the digests differ.
+
+What is not verified: the checksum comes from the same release as the
+archive, so it catches a corrupted or swapped download but not a
+compromised release. Cosign signatures (`*.sig`, published only when the
+release job has a signing key) and the build-provenance attestation are
+not checked; `gh attestation verify` does the latter.
+
+`--dry-run` resolves the release, downloads the archive and
+`dq-checksums.txt`, runs the same check, prints the archive it would
+install, the path it would replace and the verified digest, and replaces
+nothing. It skips the confirmation prompt and the install-directory
+writability probe; when no newer release exists it prints
+`dq v<VERSION> is up to date; nothing to install`.
+
+Exit 0 on success, 4 when the SHA-256 check refuses the archive, 5 on
+network errors (incl. downloading `dq-checksums.txt`), 6 when the binary
+lives where the user cannot write (with a `sudo dq self update` hint), 7
+when the replace fails. `self update` does not detect how dq was installed
+and treats a Homebrew or other package-manager install like any other;
+prefer the package manager's own upgrade there.
 
 ## CI (`.github/workflows/`)
 

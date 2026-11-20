@@ -4,8 +4,10 @@
 //! a single GitHub API call via [`ureq`] and compares the released
 //! `tag_name` with `env!("CARGO_PKG_VERSION")`; the update path delegates
 //! the download → extract → atomic replace dance to the `self_update`
-//! crate's GitHub backend. No SHA256 verification runs: `self_update`'s
-//! `checksums` feature is not enabled (see the workspace `Cargo.toml`).
+//! crate's GitHub backend, with one gate of dq's own between download and
+//! extraction: the archive's SHA-256 must match its entry in the release's
+//! `dq-checksums.txt` ([`checksum`]). `self_update`'s `checksums` feature
+//! stays off (see the workspace `Cargo.toml`).
 //!
 //! Module file is named `self_cmd` because `self` is a Rust keyword. The
 //! subcommand still surfaces as `dq self` — see `cli/args/self_cmd.rs`.
@@ -17,16 +19,23 @@
 //!   exit 5 (`IO_ERROR`) via a [`dq_core::Error::Io`] wrapper. GitHub API
 //!   rate-limit hits (`403` with `X-RateLimit-Remaining: 0`) emit a hint
 //!   pointing to the `GITHUB_TOKEN` workaround before bubbling the error.
-//! - `dq self update` exits 0 on success, 5 on network errors, 6 when the
-//!   target binary path is read-only by the current user (with a
-//!   `sudo dq self update` hint), 7 on atomic-replace failure.
+//! - `dq self update` exits 0 on success, 4 when the checksum gate refuses
+//!   the archive ([`ChecksumError`]), 5 on network errors (incl. the
+//!   `dq-checksums.txt` download), 6 when the target binary path is
+//!   read-only by the current user (with a `sudo dq self update` hint), 7 on
+//!   atomic-replace failure. `--dry-run` runs the same gate and stops before
+//!   extraction.
+
+mod checksum;
 
 use std::io::Write;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use camino::Utf8PathBuf;
 use tracing::{info, warn};
 use ureq::ResponseExt;
 
+pub use self::checksum::{CHECKSUMS_ASSET, ChecksumError, verify_archive_checksum};
 use crate::cli::SelfUpdateArgs;
 use crate::error::InvalidInput;
 
@@ -266,40 +275,246 @@ fn version_is_newer(a: &str, b: &str) -> bool {
     false
 }
 
-/// Run `dq self update` — download the configured release artifact and
-/// atomically replace the running binary.
+/// Run `dq self update` — download the configured release artifact, verify
+/// its SHA-256 against the release's `dq-checksums.txt` and atomically
+/// replace the running binary. With `--dry-run`, stop after the
+/// verification and report what would be installed to `out`.
 ///
 /// # Errors
 ///
 /// - [`InvalidInput`] (exit 6) when the running binary's parent directory
 ///   is not writable for the current user — surfaced before any download
-///   attempt with a `sudo dq self update` hint.
+///   attempt with a `sudo dq self update` hint. Not probed under
+///   `--dry-run`, which writes nothing next to the binary.
+/// - [`ChecksumError`] (exit 4) when the archive fails the checksum gate;
+///   nothing is extracted or replaced.
 /// - [`dq_core::Error::Io`] (exit 5) for network errors.
 /// - [`dq_core::Error::WriteIo`] (exit 7) for atomic-replace failures.
-pub fn run_update(args: &SelfUpdateArgs) -> anyhow::Result<()> {
+pub fn run_update(args: &SelfUpdateArgs, out: &mut dyn Write) -> anyhow::Result<()> {
     let current_exe = std::env::current_exe().map_err(|source| {
         anyhow::Error::new(dq_core::Error::Io {
             path: Utf8PathBuf::from(":self-update"),
             source,
         })
     })?;
-    ensure_writable_install_dir(&current_exe)?;
+    if !args.dry_run {
+        ensure_writable_install_dir(&current_exe)?;
+    }
 
     info!(
         "starting self-update; current binary: {}",
         current_exe.display()
     );
 
-    let updater = update_builder(args.to.as_deref())
-        .build()
-        .map_err(map_self_update_error)?;
-    let status = updater.update().map_err(map_self_update_error)?;
-    if status.is_updated() {
-        info!("dq updated to v{}", status.version());
-    } else {
-        info!("dq is already up to date (v{})", status.version());
+    let mut builder = update_builder(args.to.as_deref());
+    if args.dry_run {
+        // The prompt announces that the binary will be replaced; a dry run
+        // replaces nothing, so it neither asks nor prints that block.
+        builder.no_confirm(true);
     }
-    Ok(())
+    run_gated_update(&mut builder, args.dry_run, &current_exe, out)
+}
+
+/// Install the checksum gate on `builder`, run the update and turn the
+/// gate's verdict into the command's result.
+///
+/// Split out of [`run_update`] so tests can point `builder` at a local
+/// server and a throwaway install path.
+fn run_gated_update(
+    builder: &mut self_update::backends::github::UpdateBuilder,
+    dry_run: bool,
+    install_path: &std::path::Path,
+    out: &mut dyn Write,
+) -> anyhow::Result<()> {
+    let gate = Arc::new(Mutex::new(GateState::default()));
+    install_checksum_gate(builder, &gate, dry_run);
+    let updater = builder.build().map_err(map_self_update_error)?;
+    let result = updater.update();
+    let verdict = lock(&gate).verdict.take();
+    match (result, verdict) {
+        (Ok(status), _) => {
+            if status.is_updated() {
+                info!("dq updated to v{}", status.version());
+            } else if dry_run {
+                writeln!(
+                    out,
+                    "dq v{} is up to date; nothing to install",
+                    status.version()
+                )?;
+            } else {
+                info!("dq is already up to date (v{})", status.version());
+            }
+            Ok(())
+        }
+        // The gate stops a dry run by rejecting the verified archive; that
+        // rejection is the success path.
+        (Err(_), Some(Verdict::Verified { archive, sha256 })) if dry_run => {
+            writeln!(
+                out,
+                "would install {archive} over {}",
+                install_path.display()
+            )?;
+            writeln!(
+                out,
+                "sha256 {sha256} matches {CHECKSUMS_ASSET}; nothing replaced (--dry-run)"
+            )?;
+            Ok(())
+        }
+        (Err(_), Some(Verdict::Refused(refusal))) => Err(anyhow::Error::new(refusal)),
+        (Err(_), Some(Verdict::Failed(err))) => Err(err),
+        (Err(err), _) => Err(map_self_update_error(err)),
+    }
+}
+
+/// What the asset matcher and the archive gate share across one update.
+#[derive(Debug, Default)]
+struct GateState {
+    /// Download URL of the release's `dq-checksums.txt`, recorded by the
+    /// asset matcher; `None` when the release has none.
+    checksums_url: Option<String>,
+    /// The gate's decision; `None` until the archive was downloaded.
+    verdict: Option<Verdict>,
+}
+
+/// The checksum gate's decision on a downloaded archive.
+#[derive(Debug)]
+enum Verdict {
+    /// The archive matches its `dq-checksums.txt` entry.
+    Verified { archive: String, sha256: String },
+    /// The archive was refused; nothing gets extracted.
+    Refused(ChecksumError),
+    /// The gate could not run: reading the downloaded archive or
+    /// downloading `dq-checksums.txt` failed. Already mapped to its exit
+    /// code's error shape.
+    Failed(anyhow::Error),
+}
+
+/// Reason the gate hands `self_update` to stop a dry run after a
+/// successful verification. Never shown: [`run_gated_update`] turns it
+/// into the dry-run report.
+const DRY_RUN_STOP: &str = "dry run: verified, not installing";
+
+/// Cap on the size of `dq-checksums.txt` (one short line per target).
+const CHECKSUMS_MAX_BYTES: u64 = 64 * 1024;
+
+fn lock(gate: &Mutex<GateState>) -> MutexGuard<'_, GateState> {
+    gate.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Hook the checksum gate into `builder`.
+///
+/// The asset matcher picks the archive for this target (the built-in
+/// matching, restricted to `.tar.gz` / `.zip` names so a `.sha256` or `.sig`
+/// sidecar is never taken for the archive) and records where the release's
+/// `dq-checksums.txt` lives. The `verify_archive` hook runs after the
+/// download and before extraction: it fetches `dq-checksums.txt`, checks the
+/// archive against it and records the verdict in `gate`. A refusal — or a
+/// successful verification under `dry_run` — aborts the update with nothing
+/// extracted.
+fn install_checksum_gate(
+    builder: &mut self_update::backends::github::UpdateBuilder,
+    gate: &Arc<Mutex<GateState>>,
+    dry_run: bool,
+) {
+    let target = self_update::get_target();
+    let matcher_gate = Arc::clone(gate);
+    builder.asset_matcher(move |assets| {
+        lock(&matcher_gate).checksums_url = assets
+            .iter()
+            .find(|asset| asset.name() == CHECKSUMS_ASSET)
+            .map(|asset| asset.download_url().to_owned());
+        select_archive(assets, target)
+    });
+    let hook_gate = Arc::clone(gate);
+    builder.verify_archive(move |archive_path| {
+        let checksums_url = lock(&hook_gate).checksums_url.clone();
+        let verdict = archive_verdict(archive_path, checksums_url.as_deref());
+        let result = match &verdict {
+            Verdict::Verified { .. } if dry_run => Err(
+                self_update::errors::Error::archive_verification_rejected(DRY_RUN_STOP),
+            ),
+            Verdict::Verified { .. } => Ok(()),
+            Verdict::Refused(refusal) => Err(
+                self_update::errors::Error::archive_verification_rejected(refusal.to_string()),
+            ),
+            Verdict::Failed(err) => Err(self_update::errors::Error::archive_verification_rejected(
+                format!("{err:#}"),
+            )),
+        };
+        lock(&hook_gate).verdict = Some(verdict);
+        result
+    });
+}
+
+/// The release archive for `target`: `self_update`'s own matching
+/// ([`self_update::Release::asset_for`]) over the `.tar.gz` / `.zip` assets
+/// only.
+fn select_archive(
+    assets: &[self_update::ReleaseAsset],
+    target: &str,
+) -> Option<self_update::ReleaseAsset> {
+    let archives = assets.iter().filter(|asset| {
+        let name = asset.name();
+        name.ends_with(".tar.gz") || name.ends_with(".zip")
+    });
+    // `asset_for` lives on `Release`; the version is a placeholder the
+    // matching never reads.
+    self_update::Release::builder()
+        .version("0.0.0")
+        .assets(archives.cloned())
+        .build()
+        .ok()?
+        .asset_for(target, None)
+}
+
+/// Run the checksum gate on the archive `self_update` downloaded to
+/// `archive_path` (a temp file named after the release asset).
+fn archive_verdict(archive_path: &std::path::Path, checksums_url: Option<&str>) -> Verdict {
+    let io_failure = |source: std::io::Error| {
+        Verdict::Failed(anyhow::Error::new(dq_core::Error::Io {
+            path: Utf8PathBuf::from(":self-update"),
+            source,
+        }))
+    };
+    let Some(archive_name) = archive_path.file_name().and_then(|name| name.to_str()) else {
+        return io_failure(std::io::Error::other(format!(
+            "downloaded archive has no UTF-8 file name: {}",
+            archive_path.display()
+        )));
+    };
+    let archive = match std::fs::read(archive_path) {
+        Ok(bytes) => bytes,
+        Err(source) => return io_failure(source),
+    };
+    let checksums = match checksums_url.map(fetch_checksums).transpose() {
+        Ok(checksums) => checksums,
+        Err(err) => return Verdict::Failed(map_self_update_error(err)),
+    };
+    match verify_archive_checksum(archive_name, &archive, checksums.as_deref()) {
+        Ok(sha256) => Verdict::Verified {
+            archive: archive_name.to_owned(),
+            sha256,
+        },
+        Err(refusal) => Verdict::Refused(refusal),
+    }
+}
+
+/// Download `dq-checksums.txt` with the headers the archive download sends.
+fn fetch_checksums(url: &str) -> Result<Vec<u8>, self_update::errors::Error> {
+    let mut body = Vec::new();
+    self_update::Download::from_url(url)
+        .request_header(
+            self_update::http::header::USER_AGENT,
+            SELF_UPDATE_USER_AGENT,
+        )
+        .request_header(
+            self_update::http::header::ACCEPT,
+            "application/octet-stream",
+        )
+        .max_download_size(CHECKSUMS_MAX_BYTES)
+        .show_download_progress(false)
+        .download_to(&mut body)?;
+    Ok(body)
 }
 
 /// The GitHub-backend builder `dq self update` runs, pinned to `tag` when
@@ -611,9 +826,11 @@ mod tests {
     // release listing and the asset download, failing with 404 before
     // anything is extracted or the binary is replaced. The
     // `ensure_writable_install_dir` helper is covered indirectly by the
-    // integration test below. Still untested: `run_update` itself
-    // (`current_exe`, the replacement step) — it needs a real release, so the
-    // trait-based seam from spec §4.5 remains a follow-up.
+    // integration test below. The checksum gate is driven end to end through
+    // [`run_gated_update`] (the `gated_release` tests): every refusal stops
+    // before extraction, and the dry run stops after verification, so no
+    // binary is replaced. Still untested: `run_update` itself (`current_exe`)
+    // and a successful replacement — it needs a real release.
     // ---------------------------------------------------------------------
 
     /// Minimal one-shot HTTP server backed by a `TcpListener`. Reads the
@@ -921,6 +1138,178 @@ mod tests {
             vec!["application/octet-stream"],
             "download request was: {asset_raw:?}"
         );
+    }
+
+    /// Where the served release keeps its `dq-checksums.txt`.
+    enum Sums<'a> {
+        /// Served with this text.
+        Served(&'a str),
+        /// Listed at this URL (nothing serves it).
+        At(String),
+        /// Not in the release.
+        Absent,
+    }
+
+    /// Serve one release, `v99999.0.0`, whose archive for this target holds
+    /// `archive_body`, with `sums` as its `dq-checksums.txt`. Returns the
+    /// builder `dq self update` would run against it (no prompt) and the
+    /// archive's name.
+    fn gated_release(
+        archive_body: &str,
+        sums: Sums<'_>,
+    ) -> (self_update::backends::github::UpdateBuilder, String) {
+        let archive_name = format!("dq-99999.0.0-{}.tar.gz", self_update::get_target());
+        let (archive_url, _archive_req) =
+            spawn_one_shot_http_at("/asset/1", http_response("200 OK", &[], archive_body));
+        let mut assets = vec![
+            // A sidecar listed first must not be taken for the archive.
+            serde_json::json!({
+                "name": format!("{archive_name}.sha256"),
+                "url": "http://127.0.0.1:9/never-fetched",
+            }),
+            serde_json::json!({ "name": archive_name, "url": archive_url }),
+        ];
+        let sums_url = match sums {
+            Sums::Served(text) => {
+                Some(spawn_one_shot_http_at("/asset/2", http_response("200 OK", &[], text)).0)
+            }
+            Sums::At(url) => Some(url),
+            Sums::Absent => None,
+        };
+        if let Some(url) = sums_url {
+            assets.push(serde_json::json!({ "name": CHECKSUMS_ASSET, "url": url }));
+        }
+        let listing = serde_json::json!([{
+            "tag_name": "v99999.0.0",
+            "created_at": "2026-01-01T00:00:00Z",
+            "assets": assets,
+        }])
+        .to_string();
+        let (list_url, _list_req) = spawn_one_shot_http_at(
+            "/repos/mazuninky/dq/releases",
+            http_response("200 OK", &["Content-Type: application/json"], &listing),
+        );
+        let base = list_url
+            .strip_suffix("/repos/mazuninky/dq/releases")
+            .expect("helper URL ends with the requested path");
+        let mut builder = update_builder(None);
+        builder.api_base_url(base).no_confirm(true);
+        (builder, archive_name)
+    }
+
+    /// A stand-in installed binary in a temp dir; the update must leave its
+    /// bytes alone whenever the gate refuses.
+    fn installed_binary() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("dq");
+        std::fs::write(&path, b"installed").expect("write stand-in binary");
+        (dir, path)
+    }
+
+    #[test]
+    fn dry_run_verifies_and_reports_without_replacing() {
+        let sha = checksum::sha256_hex(b"archive bytes");
+        let target = self_update::get_target();
+        let sums = format!(
+            "{zero}  dq-99999.0.0-other-target.tar.gz\n{sha}  dq-99999.0.0-{target}.tar.gz\n",
+            zero = "0".repeat(64),
+        );
+        let (mut builder, archive_name) = gated_release("archive bytes", Sums::Served(&sums));
+        let (_dir, installed) = installed_binary();
+        builder.bin_install_path(&installed);
+        let mut out: Vec<u8> = Vec::new();
+        run_gated_update(&mut builder, true, &installed, &mut out).expect("dry run succeeds");
+        assert_eq!(
+            String::from_utf8(out).expect("utf-8"),
+            format!(
+                "would install {archive_name} over {}\n\
+                 sha256 {sha} matches dq-checksums.txt; nothing replaced (--dry-run)\n",
+                installed.display()
+            )
+        );
+        assert_eq!(std::fs::read(&installed).expect("read"), b"installed");
+    }
+
+    #[test]
+    fn checksum_mismatch_refuses_with_exit_4_and_keeps_the_binary() {
+        let target = self_update::get_target();
+        let sums = format!("{}  dq-99999.0.0-{target}.tar.gz\n", "0".repeat(64));
+        let (mut builder, archive_name) = gated_release("tampered bytes", Sums::Served(&sums));
+        let (_dir, installed) = installed_binary();
+        builder.bin_install_path(&installed);
+        let mut out: Vec<u8> = Vec::new();
+        let err = run_gated_update(&mut builder, false, &installed, &mut out)
+            .expect_err("a mismatching archive must be refused");
+        assert_eq!(
+            err.downcast_ref::<ChecksumError>(),
+            Some(&ChecksumError::Mismatch {
+                archive: archive_name,
+                expected: "0".repeat(64),
+                actual: checksum::sha256_hex(b"tampered bytes"),
+            })
+        );
+        assert_eq!(
+            crate::exit_code::exit_code_for_error(&err),
+            crate::exit_code::VALIDATE_FAIL
+        );
+        assert!(out.is_empty(), "nothing on stdout: {out:?}");
+        assert_eq!(std::fs::read(&installed).expect("read"), b"installed");
+    }
+
+    #[test]
+    fn release_without_checksums_asset_is_refused() {
+        let (mut builder, _archive_name) = gated_release("archive bytes", Sums::Absent);
+        let (_dir, installed) = installed_binary();
+        builder.bin_install_path(&installed);
+        let mut out: Vec<u8> = Vec::new();
+        let err = run_gated_update(&mut builder, false, &installed, &mut out)
+            .expect_err("an unverifiable archive must be refused");
+        assert_eq!(
+            err.downcast_ref::<ChecksumError>(),
+            Some(&ChecksumError::MissingAsset)
+        );
+        assert_eq!(
+            crate::exit_code::exit_code_for_error(&err),
+            crate::exit_code::VALIDATE_FAIL
+        );
+        assert_eq!(std::fs::read(&installed).expect("read"), b"installed");
+    }
+
+    #[test]
+    fn checksums_download_failure_is_a_network_failure() {
+        // The listed checksums asset sits on a port nothing listens on.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind")
+            .local_addr()
+            .expect("addr");
+        let (mut builder, _archive_name) =
+            gated_release("archive bytes", Sums::At(format!("http://{closed}/sums")));
+        let (_dir, installed) = installed_binary();
+        builder.bin_install_path(&installed);
+        let mut out: Vec<u8> = Vec::new();
+        let err = run_gated_update(&mut builder, true, &installed, &mut out)
+            .expect_err("no checksums, no install");
+        assert_eq!(
+            crate::exit_code::exit_code_for_error(&err),
+            crate::exit_code::IO_ERROR,
+            "{err:#}"
+        );
+        assert!(out.is_empty(), "no dry-run report: {out:?}");
+    }
+
+    #[test]
+    fn select_archive_skips_sidecars() {
+        let target = self_update::get_target();
+        let archive = format!("dq-1.0.0-{target}.tar.gz");
+        let assets = [
+            self_update::ReleaseAsset::new(format!("{archive}.sha256"), "u1"),
+            self_update::ReleaseAsset::new(format!("{archive}.sig"), "u2"),
+            self_update::ReleaseAsset::new(CHECKSUMS_ASSET, "u3"),
+            self_update::ReleaseAsset::new(archive.clone(), "u4"),
+        ];
+        let selected = select_archive(&assets, target).expect("archive found");
+        assert_eq!(selected.name(), archive);
+        assert!(select_archive(&assets[..3], target).is_none());
     }
 
     #[test]

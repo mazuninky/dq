@@ -850,6 +850,52 @@ fn smoke_fmt_ini_in_place_with_sort_keys_completes() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn self_update_dry_run_flag_parses() {
+    // `--dry-run` reaches the handler next to `--to`; without it the flag is
+    // off. The gate itself is covered in `commands::self_cmd::tests`.
+    use clap::Parser;
+    let parse = |argv: &[&str]| -> dq::cli::SelfUpdateArgs {
+        let cli = dq::Cli::try_parse_from(argv).expect("clap parse");
+        match cli.command {
+            dq::Command::Self_(dq::cli::SelfArgs {
+                command: dq::cli::SelfCommand::Update(args),
+            }) => args,
+            other => panic!("expected `self update`, got {other:?}"),
+        }
+    };
+    let args = parse(&["dq", "self", "update", "--dry-run", "--to", "v2026.20.1"]);
+    assert!(args.dry_run);
+    assert_eq!(args.to.as_deref(), Some("v2026.20.1"));
+    assert!(!parse(&["dq", "self", "update"]).dry_run);
+}
+
+#[test]
+fn self_update_dry_run_rejects_a_value() {
+    // A boolean flag: `--dry-run=yes` is a usage error (exit 2), not a
+    // silently ignored value.
+    dq().args(["self", "update", "--dry-run=yes"])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn self_update_help_documents_dry_run_and_checksum() {
+    let out = dq()
+        .args(["self", "update", "--help"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let help = String::from_utf8(out).expect("help is UTF-8");
+    assert!(help.contains("--dry-run"), "help lacks --dry-run:\n{help}");
+    assert!(
+        help.contains("dq-checksums.txt"),
+        "help must say what the SHA-256 is checked against:\n{help}"
+    );
+}
+
+#[test]
 fn smoke_completions_bash_writes_complete_directive() {
     // M6 §2: `dq completions bash` exits 0 with the bash `complete -F`
     // directive on stdout. The full per-shell coverage lives in the

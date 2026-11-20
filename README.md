@@ -96,7 +96,10 @@ Once installed, `dq` can update itself from GitHub Releases:
 dq self check                  # is a newer release available?
 dq self update                 # download + verify SHA256 + atomic replace
 dq self update --to v2026.20.1 # pin to a specific YYYY.WW.BUILD release
+dq self update --dry-run       # download + verify SHA256, replace nothing
 ```
+
+Before anything is extracted, `self update` checks the archive's SHA-256 against its line in the release's `dq-checksums.txt`. A mismatch, a release without `dq-checksums.txt`, a malformed file or one with no line for the archive refuses the update with exit 4 and leaves the installed binary untouched. The checksum comes from the same release as the archive, so it catches a corrupted or swapped download, not a compromised release; cosign signatures and build-provenance attestations are not checked — use `gh attestation verify` for that (see [Installation](#installation)).
 
 ## Quick start
 
@@ -277,7 +280,7 @@ Bulk multi-file mode prints `Modified: N, Skipped: M, Failed: K`. Single-file in
 | 1 | generic (`--check` changes pending, `PatchTestFailed`, a value a read command, `convert` or `set --jq` cannot write in the output format, such as NaN or Infinity in JSON; `keys` / `values` / `len` on a node of the wrong type) |
 | 2 | not found (a JSON Pointer or a `--doc N` the file does not have); usage error (incl. `--doc` on a command that cannot honour it) |
 | 3 | parse error (incl. templated file) |
-| 4 | validate fail |
+| 4 | validate fail; `self update` refused an archive at its SHA-256 check |
 | 5 | I/O error (read; `self check` / `update` network errors) |
 | 6 | invalid input |
 | 7 | write failed (write IO, renderer unavailable, textual edit refused because the file would not read back as the change (`edit_rejected`), bulk partial-failure, self-update atomic-replace failure) |
