@@ -14,8 +14,10 @@ check:
       | select(.key | tostring | startswith("aws_"))
       | .key as $type
       | .value | objects | to_entries[]
-      | select(.value.tags? == null)
-      | {type: $type, name: .key}][]
+      | .key as $name
+      | .value | (if type == "array" then .[] else . end)
+      | select(.tags? == null)
+      | {type: $type, name: $name}][]
   message: "Resource {{ .type }}.{{ .name }} has no tags"
 references:
   - https://docs.aws.amazon.com/general/latest/gr/aws_tagging.html

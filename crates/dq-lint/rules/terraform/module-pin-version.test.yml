@@ -56,3 +56,16 @@ tests:
       provider = "x"
     expected:
       violations: []
+  - name: the unpinned one of two repeated module blocks fires
+    input: |
+      module "vpc" {
+        source = "terraform-aws-modules/vpc/aws"
+      }
+      module "vpc" {
+        source  = "terraform-aws-modules/vpc/aws"
+        version = "5.0.0"
+      }
+    expected:
+      violations:
+        - rule: terraform.module-pin-version
+          message_contains: "vpc"

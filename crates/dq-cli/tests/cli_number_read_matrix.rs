@@ -1641,9 +1641,10 @@ fn fmt_and_set_jq_re_emit_a_float_in_its_shortest_form() {
 }
 
 /// HCL reads big integers and whole floats exactly at any depth: inside
-/// labelled blocks, blocks merged by name, object attributes with a quoted
-/// key, arrays and objects in arrays. Writing keeps a whole float a float
-/// and still refuses a big integer, wherever it sits.
+/// labelled blocks, repeated blocks, object attributes with a quoted key,
+/// arrays and objects in arrays. Writing keeps a whole float a float,
+/// writes blocks back as blocks, and still refuses a big integer, wherever
+/// it sits.
 #[test]
 fn hcl_keeps_big_integers_and_whole_floats_inside_blocks() {
     let blocks = "resource \"aws_x\" \"a\" {\n  big = 18446744073709551617\n  w   = 3.0\n  \
@@ -1651,20 +1652,14 @@ fn hcl_keeps_big_integers_and_whole_floats_inside_blocks() {
                   inner = [1.0, 18446744073709551618, { z = -0.0 }]\n  }\n}\n\
                   resource \"aws_x\" \"b\" {\n  w = 4.0\n}\nlocals {\n  n = 5.0\n}\n\
                   locals {\n  m = 7\n}\n";
+    // Already laid out as dq writes it.
     let small = "resource \"aws_x\" \"a\" {\n  w = 3.0\n  e = 1e16\n  nested = {\n    \
                  \"quoted key\" = 2.0\n  }\n}\nresource \"aws_x\" \"b\" {\n  w = 4.0\n}\n\
                  locals {\n  n = 5.0\n}\nlocals {\n  m = 7\n}\n";
     let dir = dir_with(&[("h.tf", blocks), ("s.tf", small)]);
-    let small_hcl = |b_w: &str, extra: &str| {
-        format!(
-            "resource = {{\n  \"aws_x\" = {{\n    \"a\" = {{\n      \"w\" = 3.0\n      \
-             \"e\" = 1e16\n      \"nested\" = {{\n        \"quoted key\" = 2.0\n      }}\n    \
-             }}\n    \"b\" = {{\n      \"w\" = {b_w}\n    }}\n  }}\n}}\nlocals = {{\n  \
-             \"n\" = 5.0\n  \"m\" = 7\n{extra}}}\n"
-        )
-    };
-    let converted = small_hcl("4.0", "");
-    let set = small_hcl("1e300", "  \"q\" = 2.0\n");
+    let set = small
+        .replace("  w = 4.0\n", "  w = 1e300\n")
+        .replace("  m = 7\n", "  m = 7\n  q = 2.0\n");
     assert_cases(
         &dir,
         &[
@@ -1676,12 +1671,12 @@ fn hcl_keeps_big_integers_and_whole_floats_inside_blocks() {
                     \"nested\": {\n          \"quoted key\": 2.0,\n          \"inner\": [\n            \
                     1.0,\n            18446744073709551618,\n            {\n              \
                     \"z\": -0.0\n            }\n          ]\n        }\n      },\n      \
-                    \"b\": {\n        \"w\": 4.0\n      }\n    }\n  },\n  \"locals\": {\n    \
-                    \"n\": 5.0,\n    \"m\": 7\n  }\n}\n",
+                    \"b\": {\n        \"w\": 4.0\n      }\n    }\n  },\n  \"locals\": [\n    \
+                    {\n      \"n\": 5.0\n    },\n    {\n      \"m\": 7\n    }\n  ]\n}\n",
                 ),
             ),
-            (vec!["type", "h.tf", "/locals/n"], ok("float\n")),
-            (vec!["type", "h.tf", "/locals/m"], ok("int\n")),
+            (vec!["type", "h.tf", "/locals/0/n"], ok("float\n")),
+            (vec!["type", "h.tf", "/locals/1/m"], ok("int\n")),
             (
                 vec!["type", "h.tf", "/resource/aws_x/a/nested/quoted key"],
                 ok("float\n"),
@@ -1707,13 +1702,13 @@ fn hcl_keeps_big_integers_and_whole_floats_inside_blocks() {
                      18446744073709551617\n",
                 ),
             ),
-            (vec!["convert", "s.tf", "-F", "hcl"], ok(&converted)),
+            (vec!["convert", "s.tf", "-F", "hcl"], ok(small)),
             (
                 vec![
                     "set",
                     "s.tf",
                     "--jq",
-                    ".locals.q = 2.0 | .resource.aws_x.b.w = 1e300",
+                    ".locals[1].q = 2.0 | .resource.aws_x.b.w = 1e300",
                 ],
                 ok(&set),
             ),
@@ -1721,13 +1716,12 @@ fn hcl_keeps_big_integers_and_whole_floats_inside_blocks() {
     );
 }
 
-/// Blocks repeated with the same type keep the last block's number, also
-/// when the earlier literal reads as the same `f64` as the later one: the
-/// later `0.1` wins over `0.10000000000000000001`, and the later long
-/// literal wins, exact, over `0.1`. Before, the first block's literal was
-/// put back over the last block's number.
+/// Blocks repeated with the same type each keep their own number, also
+/// when the two literals read as the same `f64`: `0.10000000000000000001`
+/// stays exact next to a `0.1`, in either order. Before, the blocks were
+/// merged and only the last block's number was left.
 #[test]
-fn hcl_repeated_blocks_keep_the_last_blocks_number() {
+fn hcl_repeated_blocks_keep_each_blocks_number() {
     let long = "0.10000000000000000001";
     let blocks =
         |first: &str, last: &str| format!("x {{\n  a = {first}\n}}\nx {{\n  a = {last}\n}}\n");
@@ -1735,18 +1729,25 @@ fn hcl_repeated_blocks_keep_the_last_blocks_number() {
         ("short_last.tf", &blocks(long, "0.1")),
         ("long_last.tf", &blocks("0.1", long)),
     ]);
+    let json = |first: &str, last: &str| {
+        format!(
+            "{{\n  \"x\": [\n    {{\n      \"a\": {first}\n    }},\n    {{\n      \"a\": {last}\n    \
+             }}\n  ]\n}}\n"
+        )
+    };
     assert_cases(
         &dir,
         &[
             (
                 vec!["convert", "short_last.tf", "-F", "json"],
-                ok("{\n  \"x\": {\n    \"a\": 0.1\n  }\n}\n"),
+                ok(&json(long, "0.1")),
             ),
             (
                 vec!["convert", "long_last.tf", "-F", "json"],
-                ok("{\n  \"x\": {\n    \"a\": 0.10000000000000000001\n  }\n}\n"),
+                ok(&json("0.1", long)),
             ),
-            (vec!["type", "short_last.tf", "/x/a"], ok("float\n")),
+            (vec!["type", "short_last.tf", "/x/0/a"], ok("float\n")),
+            (vec!["type", "short_last.tf", "/x/1/a"], ok("float\n")),
         ],
     );
 }

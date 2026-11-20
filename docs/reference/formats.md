@@ -176,21 +176,54 @@ CR-only line ends are invalid per the TOML spec and are not supported.
 HCL 2 through `hcl-rs`. Blocks map to nested maps with labels as keys:
 `terraform { backend "s3" { region = "x" } }` becomes
 `{terraform: {backend: {s3: {region: x}}}}`; each extra label nests one
-level. Object keys `a` and `"a"` are a duplicate (exit 3). Numbers are read
-as their literal spells them: a whole float (`3.0`, `1e16`) stays a float
-and is written back as `3.0` / `1e16`, not `3`; an integer past 64 bits or
-a decimal with more digits than an `f64` holds keeps its exact value, which
-`-F hcl` cannot write back (exit 1, see the value model above). Writing
-lays a body out as `hcl::to_string` does: comments, spacing and layout are
-not kept. An HCL file is a body of attributes, so only a map can be written
-as one: `-F hcl` of an array, a string, a number, a boolean or null exits 1
-("an HCL document is a body of attributes, so its root is a map, not an
-array").
+level. Blocks repeated with the same type and labels in one body become a
+list of their bodies, in source order, where the single body would be:
+
+```hcl
+resource "aws_security_group" "app" {
+  ingress { from_port = 80 }
+  ingress { from_port = 443 }
+}
+provider "aws" { region = "us-east-1" }
+provider "aws" { alias = "west" }
+```
+
+reads as
+`{resource: {aws_security_group: {app: {ingress: [{from_port: 80}, {from_port: 443}]}}}, provider: {aws: [{region: us-east-1}, {alias: west}]}}`,
+so `/resource/aws_security_group/app/ingress/1` is the second block. A
+block type that occurs once keeps the map shape above, so a query over one
+that may repeat normalises both: `.ingress | if type == "array" then .[]
+else . end`. Blocks of one type with different labels stay keys of one map
+(`provider "aws"` and `provider "google"` are `{provider: {aws: …,
+google: …}}`). Repeats are grouped at the place of the first one, so their
+order among the blocks of other types is not kept. A body in which one
+name is both an attribute and a block (`x = 1` and `x {}`), or blocks of
+one type carry different numbers of labels (`x "a" {}` and `x {}`), has no
+lossless map and exits 3, naming the line of the second one. Object keys
+`a` and `"a"` are a duplicate (exit 3). Numbers are read as their literal
+spells them: a whole float (`3.0`, `1e16`) stays a float and is written
+back as `3.0` / `1e16`, not `3`; an integer past 64 bits or a decimal with
+more digits than an `f64` holds keeps its exact value, which `-F hcl`
+cannot write back (exit 1, see the value model above).
+
+Writing lays attribute values out as `hcl::to_string` does — two-space
+indents, one array item or object member per line, object keys quoted —
+and writes every key read from an HCL file as a block back as blocks,
+`type "label" { … }`, one per body of a list: `fmt`, `convert -F hcl` of
+an HCL file, `set --jq` and `fix` keep blocks blocks, and the output reads
+back to the same tree. A key whose value a filter turned into something a
+block cannot hold back (a scalar, an empty label map, a list of one body,
+which would read back as the body alone) is written as an attribute; so
+is every key of a document read from another format, which records no
+blocks (`convert -F hcl` of YAML writes `resource = { … }`). Comments,
+spacing and layout are not kept. An HCL file is a body of attributes and
+blocks, so only a map can be written as one: `-F hcl` of an array, a
+string, a number, a boolean or null exits 1 ("an HCL document is a body of
+attributes, so its root is a map, not an array").
 
 Limits: HCL documents carry no spans, so every Terraform diagnostic reports
-line 1; repeated blocks with the same type and labels (`x { a = 1 }` twice)
-keep only the last one, silently. Both are open items in
-[../roadmap.md](../roadmap.md).
+line 1 (an open item in [../roadmap.md](../roadmap.md)); each repeated
+block has its own pointer for when they do.
 
 ### INI / properties
 

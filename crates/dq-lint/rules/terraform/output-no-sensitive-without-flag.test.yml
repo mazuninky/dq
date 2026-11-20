@@ -51,3 +51,16 @@ tests:
       provider = "x"
     expected:
       violations: []
+  - name: the unflagged one of two repeated output blocks fires
+    input: |
+      output "db_password" {
+        value = var.db_password
+      }
+      output "db_password" {
+        value     = var.db_password
+        sensitive = true
+      }
+    expected:
+      violations:
+        - rule: terraform.output-no-sensitive-without-flag
+          message_contains: "db_password"

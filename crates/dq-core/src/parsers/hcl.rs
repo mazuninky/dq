@@ -5,7 +5,11 @@
 //! design D1 / D11. Block syntax `block_type "label" { ... }` becomes
 //! `Map { block_type: { label: { ... } } }` (one nesting level per label),
 //! per the format-support spec scenario "HCL backend block parses to
-//! nested map".
+//! nested map". Blocks repeated with the same type and labels become a
+//! list of their bodies, in source order, under that same key:
+//! `ingress { p = 1 }` twice is `{ ingress: [{ p: 1 }, { p: 2 }] }`. The
+//! document records which keys were blocks ([`HclBlocks`]), and the writer
+//! writes those back as blocks.
 //!
 //! This parser produces a read-only [`Document`] (no spans, no `set_at`/
 //! `del_at` round-trip) — `set_at` against an HCL document returns
@@ -13,9 +17,11 @@
 //! span-aware path. For M5 the value-tree edits go through
 //! [`Format::write`] re-emission instead.
 
+use std::collections::HashMap;
 use std::io::Write;
 
 use camino::Utf8PathBuf;
+use hcl::edit::Span as _;
 use hcl::edit::structure::{
     Block as EditBlock, BlockLabel as EditLabel, Body as EditBody, Structure as EditStructure,
 };
@@ -54,8 +60,13 @@ impl Format for Hcl {
         let body: EditBody = text
             .parse()
             .map_err(|e: hcl::edit::parser::Error| map_hcl_parse_error(e.into()))?;
-        let value = body_to_value(&body)?;
-        Ok(Document::value_only(value, FormatTag::Hcl))
+        let mut reader = Reader {
+            text,
+            path: Vec::new(),
+            blocks: HclBlocks::default(),
+        };
+        let value = reader.body_to_value(&body)?;
+        Ok(Document::value_only(value, FormatTag::Hcl).with_hcl_blocks(reader.blocks))
     }
 
     fn write(&self, doc: &Document, w: &mut dyn Write) -> Result<()> {
@@ -63,7 +74,7 @@ impl Format for Hcl {
         // cannot carry an arbitrary-precision literal: a big number past
         // `u64` / `f64` is refused rather than written as another value.
         let serialized = match doc.value() {
-            Value::Map(map) => write_body(map)?,
+            Value::Map(map) => write_body(map, doc.hcl_blocks())?,
             other => {
                 return Err(Error::Format {
                     format: "hcl",
@@ -79,43 +90,246 @@ impl Format for Hcl {
     }
 }
 
-/// Convert a body (top-level or nested block body), as `hcl-edit` reads it,
-/// into our `Value`.
+/// Which keys of an HCL document the reader read as blocks, and with how
+/// many labels, so the writer writes them back as blocks.
 ///
-/// Each attribute in the body becomes a `key → value` entry in the result
-/// map: its expression is turned into `hcl-rs` types as `hcl::parse` would
-/// (`From<hcl_edit::expr::Expression>`), then into a `Value`, and every
-/// number literal that `hcl-rs` misreads is put back
-/// ([`restore_in_expression`]). Each block is grouped under its identifier;
-/// if the block has labels, one level of nesting is added per label (per
-/// the `HCL backend block parses to nested map` spec scenario).
-///
-/// Multiple blocks sharing the same identifier+label path get their bodies
-/// merged into the same map (e.g. two `provider "aws" {}` blocks become a
-/// single `{ "provider": { "aws": { ... } } }`), the last attribute winning
-/// with the number its own literal holds; a future milestone may surface
-/// duplicates explicitly. For M5 this matches the typical Terraform-style
-/// usage where labels are unique per identifier.
-///
-/// # Errors
-///
-/// [`Error::Parse`] from [`check_expression_keys`].
-fn body_to_value(body: &EditBody) -> Result<Value> {
-    let mut out: IndexMap<String, Value> = IndexMap::new();
-    for structure in body.iter() {
-        match structure {
-            EditStructure::Attribute(attr) => {
-                let key = attr.key.as_str().to_owned();
-                let expr = Expression::from(attr.value.clone());
-                check_expression_keys(&expr)?;
-                let mut val = hcl_value_to_value(HclValue::from(expr));
-                restore_in_expression(&attr.value, &mut val);
-                out.insert(key, val);
+/// A key is addressed by its path from the root: the keys down to the
+/// body it is in — block types, labels and attribute names, but not the
+/// index of a repeated block, so every repeat shares one path — then the
+/// key itself. Bodies that share a path because their blocks repeat may
+/// disagree on a key's label count (`x { y "a" {} }`, `x { y {} }`); such a
+/// key is written as an attribute, which reads back as the same tree.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct HclBlocks {
+    labels: HashMap<Vec<String>, Option<usize>>,
+}
+
+impl HclBlocks {
+    /// Note that the key `path` ends in is a block type with `labels`
+    /// labels.
+    fn record(&mut self, path: &[String], labels: usize) {
+        self.labels
+            .entry(path.to_vec())
+            .and_modify(|seen| {
+                if *seen != Some(labels) {
+                    *seen = None;
+                }
+            })
+            .or_insert(Some(labels));
+    }
+
+    /// How many labels the blocks of the key `path` ends in carry, if that
+    /// key was read as a block type with one label count.
+    fn labels_at(&self, path: &[String]) -> Option<usize> {
+        self.labels.get(path).copied().flatten()
+    }
+}
+
+/// How a key of one body was read.
+#[derive(Clone, Copy)]
+enum Slot {
+    Attribute,
+    /// Blocks carrying this many labels.
+    Block(usize),
+}
+
+/// One read of an HCL body tree into a [`Value`].
+struct Reader<'a> {
+    /// The source, for the line and column of an error.
+    text: &'a str,
+    /// The keys from the root down to the body being read (see
+    /// [`HclBlocks`]).
+    path: Vec<String>,
+    blocks: HclBlocks,
+}
+
+impl Reader<'_> {
+    /// Convert a body (top-level or nested block body), as `hcl-edit` reads
+    /// it, into our `Value`.
+    ///
+    /// Each attribute in the body becomes a `key → value` entry in the
+    /// result map: its expression is turned into `hcl-rs` types as
+    /// `hcl::parse` would (`From<hcl_edit::expr::Expression>`), then into a
+    /// `Value`, and every number literal that `hcl-rs` misreads is put back
+    /// ([`restore_in_expression`]). Each block is grouped under its
+    /// identifier, one level of nesting per label (per the `HCL backend
+    /// block parses to nested map` spec scenario); blocks repeated with the
+    /// same type and labels become a list of their bodies
+    /// ([`Reader::insert_block`]).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Parse`] from [`check_expression_keys`], and for a body
+    /// whose keys one map cannot hold apart: an attribute and a block of
+    /// one name, or blocks of one type with different label counts.
+    fn body_to_value(&mut self, body: &EditBody) -> Result<Value> {
+        let mut out: IndexMap<String, Value> = IndexMap::new();
+        let mut slots: HashMap<String, Slot> = HashMap::new();
+        for structure in body.iter() {
+            match structure {
+                EditStructure::Attribute(attr) => {
+                    let key = attr.key.as_str().to_owned();
+                    // `hcl-edit` refuses an attribute defined twice.
+                    if let Some(Slot::Block(_)) = slots.get(&key) {
+                        return Err(self.clash(
+                            attr.span(),
+                            &format!(
+                                "attribute {key:?} has the name of a block of the same body; \
+                                 dq reads both as the key {key:?} and would lose one"
+                            ),
+                        ));
+                    }
+                    let expr = Expression::from(attr.value.clone());
+                    check_expression_keys(&expr)?;
+                    let mut val = hcl_value_to_value(HclValue::from(expr));
+                    restore_in_expression(&attr.value, &mut val);
+                    slots.insert(key.clone(), Slot::Attribute);
+                    out.insert(key, val);
+                }
+                EditStructure::Block(block) => self.insert_block(&mut out, &mut slots, block)?,
             }
-            EditStructure::Block(block) => insert_block(&mut out, block)?,
+        }
+        Ok(Value::Map(out))
+    }
+
+    /// Insert a block into `parent` honouring the labels-as-keys nesting
+    /// rule.
+    ///
+    /// `block_type "a" "b" {}` becomes `parent[block_type] → Map[a] →
+    /// Map[b] → body_value`. A block whose type and labels an earlier block
+    /// of this body had turns that body into a list of both, in source
+    /// order; later repeats are appended. A body is always a map, so a list
+    /// at that place is always a list of repeated blocks.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Parse`] when the block's type is an attribute of this body,
+    /// or a type earlier blocks of this body carried a different number of
+    /// labels for: a map level cannot hold both labels and a body.
+    fn insert_block(
+        &mut self,
+        parent: &mut IndexMap<String, Value>,
+        slots: &mut HashMap<String, Slot>,
+        block: &EditBlock,
+    ) -> Result<()> {
+        let identifier = block.ident.as_str().to_owned();
+        let labels: Vec<String> = block
+            .labels
+            .iter()
+            .map(|l| match l {
+                EditLabel::Ident(id) => id.as_str().to_owned(),
+                EditLabel::String(s) => s.as_str().to_owned(),
+            })
+            .collect();
+        match slots.get(&identifier) {
+            Some(Slot::Attribute) => {
+                return Err(self.clash(
+                    block.span(),
+                    &format!(
+                        "block {identifier:?} has the name of an attribute of the same body; \
+                         dq reads both as the key {identifier:?} and would lose one"
+                    ),
+                ));
+            }
+            Some(Slot::Block(count)) if *count != labels.len() => {
+                return Err(self.clash(
+                    block.span(),
+                    &format!(
+                        "block {identifier:?} has {} here and {} on an earlier {identifier:?} \
+                         block of the same body; dq nests one map level per label and would \
+                         lose one",
+                        label_count(labels.len()),
+                        label_count(*count),
+                    ),
+                ));
+            }
+            _ => {}
+        }
+        slots.insert(identifier.clone(), Slot::Block(labels.len()));
+
+        let depth = self.path.len();
+        self.path.push(identifier.clone());
+        self.blocks.record(&self.path, labels.len());
+        self.path.extend(labels.iter().cloned());
+        let body = self.body_to_value(&block.body);
+        self.path.truncate(depth);
+        let body = body?;
+
+        // Walk into `parent[identifier]`, then one map per label but the
+        // last: label maps hold nothing but labels, as the slot check above
+        // keeps every block of this type at one label count.
+        let Some((last, inner)) = labels.split_last() else {
+            add_repeat(parent, identifier, body);
+            return Ok(());
+        };
+        let mut map = label_map(parent, identifier);
+        for label in inner {
+            map = label_map(map, label.clone());
+        }
+        add_repeat(map, last.clone(), body);
+        Ok(())
+    }
+
+    /// An [`Error::Parse`] at the start of `span`.
+    fn clash(&self, span: Option<std::ops::Range<usize>>, message: &str) -> Error {
+        let span = span.unwrap_or(0..0);
+        let (line, col) = line_col(self.text, span.start);
+        Error::Parse {
+            file: None,
+            line,
+            col,
+            span,
+            snippet: String::new(),
+            message: format!("HCL error in line {line}, column {col}: {message}"),
         }
     }
-    Ok(Value::Map(out))
+}
+
+/// `1 label`, `0 labels`.
+fn label_count(count: usize) -> String {
+    if count == 1 {
+        "1 label".to_owned()
+    } else {
+        format!("{count} labels")
+    }
+}
+
+/// The 1-based line and column of byte `offset` of `text`, the column
+/// counted in characters.
+fn line_col(text: &str, offset: usize) -> (u32, u32) {
+    let before = text.get(..offset).unwrap_or(text);
+    let line = before.matches('\n').count() + 1;
+    let col = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+    (
+        u32::try_from(line).unwrap_or(u32::MAX),
+        u32::try_from(col).unwrap_or(u32::MAX),
+    )
+}
+
+/// The map of labels at `parent[key]`, made if it is not there yet.
+fn label_map(parent: &mut IndexMap<String, Value>, key: String) -> &mut IndexMap<String, Value> {
+    match parent
+        .entry(key)
+        .or_insert_with(|| Value::Map(IndexMap::new()))
+    {
+        Value::Map(map) => map,
+        other => unreachable!("a label level holds only labels, not {other:?}"),
+    }
+}
+
+/// Put the block body `body` at `parent[key]`: alone if no block got there
+/// first, else after the bodies there, as a list.
+fn add_repeat(parent: &mut IndexMap<String, Value>, key: String, body: Value) {
+    match parent.get_mut(&key) {
+        None => {
+            parent.insert(key, body);
+        }
+        Some(Value::Array(bodies)) => bodies.push(body),
+        Some(first) => {
+            let first = std::mem::replace(first, Value::Null);
+            parent.insert(key, Value::Array(vec![first, body]));
+        }
+    }
 }
 
 /// Fail on an object whose keys repeat once they are the strings a
@@ -152,85 +366,6 @@ fn check_expression_keys(expr: &Expression) -> Result<()> {
         }
         _ => Ok(()),
     }
-}
-
-/// Insert a block into `parent` honouring the labels-as-keys nesting rule.
-///
-/// `block_type "a" "b" {}` becomes `parent[block_type] → Map[a] → Map[b] →
-/// body_value`. Existing maps at any depth are reused so multi-block sources
-/// merge cleanly.
-fn insert_block(parent: &mut IndexMap<String, Value>, block: &EditBlock) -> Result<()> {
-    let body_value = body_to_value(&block.body)?;
-    let identifier = block.ident.as_str().to_owned();
-    if block.labels.is_empty() {
-        // Bare block (no labels): merge into existing entry if present, else
-        // insert directly.
-        merge_into(parent, identifier, body_value);
-        return Ok(());
-    }
-    let labels: Vec<String> = block
-        .labels
-        .iter()
-        .map(|l| match l {
-            EditLabel::Ident(id) => id.as_str().to_owned(),
-            EditLabel::String(s) => s.as_str().to_owned(),
-        })
-        .collect();
-    // Walk into `parent[identifier]`, creating intermediate maps as needed.
-    let entry = parent
-        .entry(identifier)
-        .or_insert_with(|| Value::Map(IndexMap::new()));
-    let mut cursor = entry;
-    for (i, label) in labels.iter().enumerate() {
-        let is_last = i + 1 == labels.len();
-        let map = match cursor {
-            Value::Map(m) => m,
-            // If the existing entry is not a map, replace it. This is a rare
-            // edge-case (an earlier attribute clashed with a block label
-            // path) — the block wins because blocks are structural.
-            other => {
-                *other = Value::Map(IndexMap::new());
-                let Value::Map(m) = other else {
-                    unreachable!("just assigned a Map");
-                };
-                m
-            }
-        };
-        if is_last {
-            merge_into(map, label.clone(), body_value);
-            return Ok(());
-        }
-        let next = map
-            .entry(label.clone())
-            .or_insert_with(|| Value::Map(IndexMap::new()));
-        cursor = next;
-    }
-    Ok(())
-}
-
-/// Merge `incoming` into `parent[key]`. If `parent[key]` already holds a Map
-/// and `incoming` is a Map, their entries are union'd (right-biased on key
-/// collision); otherwise `incoming` replaces the previous value.
-fn merge_into(parent: &mut IndexMap<String, Value>, key: String, incoming: Value) {
-    // Two-pass to satisfy the borrow checker: peek to decide the branch,
-    // then take action. `parent.contains_key` is a cheap hash lookup.
-    let can_merge = matches!(
-        (parent.get(&key), &incoming),
-        (Some(Value::Map(_)), Value::Map(_)),
-    );
-    if can_merge {
-        let Some(Value::Map(existing)) = parent.get_mut(&key) else {
-            unreachable!("checked above")
-        };
-        let Value::Map(new_map) = incoming else {
-            unreachable!("checked above")
-        };
-        for (k, v) in new_map {
-            existing.insert(k, v);
-        }
-        return;
-    }
-    parent.insert(key, incoming);
 }
 
 fn hcl_value_to_value(v: HclValue) -> Value {
@@ -345,11 +480,14 @@ fn serialize_error(e: hcl::Error) -> Error {
     }
 }
 
-/// `map` as an HCL body of attributes, laid out as `hcl::to_string` lays
-/// out an `hcl::Value` — two-space indents, one array item or object
-/// member per line, object keys quoted — with each float spelled by
+/// `map` as an HCL body, laid out as `hcl::to_string` lays out an
+/// `hcl::Value` — two-space indents, one array item or object member per
+/// line, object keys quoted — with each float spelled by
 /// [`shortest_float`](crate::document::shortest_float) and strings and keys
-/// quoted by `hcl-rs` itself.
+/// quoted by `hcl-rs` itself. Each key `blocks` says the reader read as a
+/// block type is written as blocks, `type "label" { … }`, one per body —
+/// a list of two or more bodies is a block repeated — as long as its value
+/// still has that shape; every other key is an attribute.
 ///
 /// Written here rather than by `hcl-rs` because it writes a whole `f64`
 /// that fits 64 bits as an integer (`3.0` → `3`), which reads back as an
@@ -360,23 +498,152 @@ fn serialize_error(e: hcl::Error) -> Error {
 ///
 /// [`Error::Format`] naming the first big number, NaN or infinity HCL
 /// cannot hold, else the first key that is no HCL identifier.
-fn write_body(map: &IndexMap<String, Value>) -> Result<String> {
-    let mut out = String::new();
-    let mut bad_key = None;
-    for (key, value) in map {
-        match hcl::Identifier::new(key.as_str()) {
-            Ok(ident) => out.push_str(ident.as_str()),
+fn write_body(map: &IndexMap<String, Value>, blocks: Option<&HclBlocks>) -> Result<String> {
+    let mut writer = BodyWriter {
+        out: String::new(),
+        blocks,
+        path: Vec::new(),
+        bad_key: None,
+    };
+    writer.body(map, 0)?;
+    match writer.bad_key {
+        Some(e) => Err(serialize_error(e)),
+        None => Ok(writer.out),
+    }
+}
+
+/// One write of a body tree (see [`write_body`]).
+struct BodyWriter<'a> {
+    out: String,
+    blocks: Option<&'a HclBlocks>,
+    /// The keys from the root down to the key being written, as
+    /// [`HclBlocks`] addresses them.
+    path: Vec<String>,
+    /// The first key that is no HCL identifier, reported once every number
+    /// has been checked.
+    bad_key: Option<hcl::Error>,
+}
+
+impl BodyWriter<'_> {
+    /// Append the attributes and blocks of `map`, `depth` indents deep.
+    fn body(&mut self, map: &IndexMap<String, Value>, depth: usize) -> Result<()> {
+        for (key, value) in map {
+            self.path.push(key.clone());
+            let written = match self.blocks.and_then(|b| b.labels_at(&self.path)) {
+                Some(labels) if has_block_shape(value, labels) => {
+                    self.blocks_of(key, value, labels, &mut Vec::new(), depth)
+                }
+                _ => self.attribute(key, value, depth),
+            };
+            self.path.pop();
+            written?;
+        }
+        Ok(())
+    }
+
+    /// Append `key = value`.
+    fn attribute(&mut self, key: &str, value: &Value, depth: usize) -> Result<()> {
+        indent(&mut self.out, depth);
+        self.identifier(key);
+        self.out.push_str(" = ");
+        write_expression(&mut self.out, value, depth + 1)?;
+        self.out.push('\n');
+        Ok(())
+    }
+
+    /// Append the blocks of type `key` that `value` holds below `labels`,
+    /// `remaining` label levels deep: a body is one block, a list of them
+    /// one block each.
+    fn blocks_of<'v>(
+        &mut self,
+        key: &str,
+        value: &'v Value,
+        remaining: usize,
+        labels: &mut Vec<&'v str>,
+        depth: usize,
+    ) -> Result<()> {
+        match value {
+            Value::Map(map) if remaining > 0 => {
+                for (label, inner) in map {
+                    self.path.push(label.clone());
+                    labels.push(label);
+                    let written = self.blocks_of(key, inner, remaining - 1, labels, depth);
+                    labels.pop();
+                    self.path.pop();
+                    written?;
+                }
+            }
+            Value::Map(body) => self.block(key, labels, body, depth)?,
+            Value::Array(bodies) => {
+                for body in bodies {
+                    if let Value::Map(body) = body {
+                        self.block(key, labels, body, depth)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Append `key "label" … { body }`.
+    fn block(
+        &mut self,
+        key: &str,
+        labels: &[&str],
+        body: &IndexMap<String, Value>,
+        depth: usize,
+    ) -> Result<()> {
+        indent(&mut self.out, depth);
+        self.identifier(key);
+        for label in labels {
+            self.out.push(' ');
+            self.out
+                .push_str(&hcl_text(&hcl::Expression::String((*label).to_owned()))?);
+        }
+        if body.is_empty() {
+            self.out.push_str(" {}\n");
+            return Ok(());
+        }
+        self.out.push_str(" {\n");
+        self.body(body, depth + 1)?;
+        indent(&mut self.out, depth);
+        self.out.push_str("}\n");
+        Ok(())
+    }
+
+    /// Append `key` if it is an HCL identifier, else remember it.
+    fn identifier(&mut self, key: &str) {
+        match hcl::Identifier::new(key) {
+            Ok(ident) => self.out.push_str(ident.as_str()),
             Err(e) => {
-                bad_key.get_or_insert(e);
+                self.bad_key.get_or_insert(e);
             }
         }
-        out.push_str(" = ");
-        write_expression(&mut out, value, 1)?;
-        out.push('\n');
     }
-    match bad_key {
-        Some(e) => Err(serialize_error(e)),
-        None => Ok(out),
+}
+
+/// Whether `value` can be written as the blocks of a type with `labels`
+/// labels and read back as itself: `labels` levels of non-empty maps, then
+/// a body (a map) or a list of two or more bodies — one body in a list
+/// would read back as the body alone.
+fn has_block_shape(value: &Value, labels: usize) -> bool {
+    match value {
+        Value::Map(map) if labels > 0 => {
+            !map.is_empty() && map.values().all(|v| has_block_shape(v, labels - 1))
+        }
+        Value::Map(_) => true,
+        Value::Array(bodies) if labels == 0 => {
+            bodies.len() >= 2 && bodies.iter().all(|b| matches!(b, Value::Map(_)))
+        }
+        _ => false,
+    }
+}
+
+/// Append `depth` two-space indents to `out`.
+fn indent(out: &mut String, depth: usize) {
+    for _ in 0..depth {
+        out.push_str("  ");
     }
 }
 
@@ -387,11 +654,6 @@ fn write_body(map: &IndexMap<String, Value>) -> Result<String> {
 /// [`Error::Format`] naming the first big number, NaN or infinity of
 /// `value`: HCL has no literal for any of them.
 fn write_expression(out: &mut String, value: &Value, depth: usize) -> Result<()> {
-    let indent = |out: &mut String, depth: usize| {
-        for _ in 0..depth {
-            out.push_str("  ");
-        }
-    };
     // A NaN or an infinity, held as a float or as its literal (`.nan` read
     // from YAML): HCL has no literal for one, so writing `null` or the
     // string `".nan"` would change the value without a word.
@@ -578,34 +840,33 @@ mod tests {
             panic!("{:?}", b["lbl"]);
         };
         assert_eq!(lbl["y"], int("36893488147419103232"));
-        // A block merged over another keeps the last block's number.
-        let doc = Hcl
-            .parse(b"b {\n  x = 18446744073709551617\n}\nb {\n  x = 2.5\n}\n")
-            .expect("parse");
-        let Value::Map(map) = doc.value() else {
-            panic!("{:?}", doc.value());
-        };
-        assert_eq!(
-            map["b"],
-            Value::Map([("x".to_owned(), Value::Float(2.5))].into_iter().collect())
-        );
-        // ... also when the earlier literal reads as the same `f64`, or the
-        // last one is a big number too.
-        for (text, path, last) in [
+        // Each of two blocks of one type keeps its own number, also when
+        // the two literals read as the same `f64`, or both are big.
+        let one = |x: Value| Value::Map([("x".to_owned(), x)].into_iter().collect());
+        for (text, path, first, second) in [
+            (
+                "b {\n  x = 18446744073709551617\n}\nb {\n  x = 2.5\n}\n",
+                &["b"][..],
+                one(int("18446744073709551617")),
+                one(Value::Float(2.5)),
+            ),
             (
                 "b {\n x = 18446744073709551617\n}\nb {\n x = 18446744073709551616\n}\n",
-                &["b", "x"][..],
-                int("18446744073709551616"),
+                &["b"],
+                one(int("18446744073709551617")),
+                one(int("18446744073709551616")),
             ),
             (
                 "b {x = 18446744073709551617}\nb {x = 1.8446744073709552e19}\n",
-                &["b", "x"],
-                Value::Float(1.844_674_407_370_955_2e19),
+                &["b"],
+                one(int("18446744073709551617")),
+                one(Value::Float(1.844_674_407_370_955_2e19)),
             ),
             (
-                "p \"a\" {\n v = 0.10000000000000000001\n}\np \"a\" {\n v = 0.1\n}\n",
-                &["p", "a", "v"],
-                Value::Float(0.1),
+                "p \"a\" {\n x = 0.10000000000000000001\n}\np \"a\" {\n x = 0.1\n}\n",
+                &["p", "a"],
+                one(Value::BigFloat("0.10000000000000000001".into())),
+                one(Value::Float(0.1)),
             ),
         ] {
             let doc = Hcl.parse(text.as_bytes()).expect("parse");
@@ -613,7 +874,7 @@ mod tests {
                 Value::Map(map) => map.get(*key),
                 _ => None,
             });
-            assert_eq!(found, Some(&last), "{text}");
+            assert_eq!(found, Some(&Value::Array(vec![first, second])), "{text}");
         }
     }
 
@@ -741,7 +1002,7 @@ mod tests {
             unreachable!()
         };
         let expected = hcl::to_string(&value_to_hcl_value(&value).unwrap()).unwrap();
-        assert_eq!(write_body(body).unwrap(), expected);
+        assert_eq!(write_body(body, None).unwrap(), expected);
     }
 
     #[test]

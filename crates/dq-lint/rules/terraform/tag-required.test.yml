@@ -55,3 +55,16 @@ tests:
       resource = { aws_instance = "x" }
     expected:
       violations: []
+  - name: the untagged one of two repeated resource blocks fires
+    input: |
+      resource "aws_s3_bucket" "logs" {
+        bucket = "logs"
+      }
+      resource "aws_s3_bucket" "logs" {
+        bucket = "logs"
+        tags   = { team = "infra" }
+      }
+    expected:
+      violations:
+        - rule: terraform.tag-required
+          message_contains: "aws_s3_bucket.logs"

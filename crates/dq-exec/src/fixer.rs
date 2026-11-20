@@ -653,7 +653,7 @@ fn apply_jq_branch(
             documents[index] = new_value;
             Document::multi_value_only(documents, doc.format())
         }
-        _ => Document::value_only(new_value, doc.format()),
+        _ => Document::value_only(new_value, doc.format()).with_layout_of(doc),
     };
     audit.applied_rules.push(rule.rule.id.clone());
     Ok(true)

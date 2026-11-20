@@ -401,7 +401,7 @@ fn rebuild_document(
     path: &Utf8Path,
 ) -> anyhow::Result<Document> {
     let Some(values) = document.values() else {
-        return Ok(Document::value_only(output, document.format()));
+        return Ok(Document::value_only(output, document.format()).with_layout_of(document));
     };
     match (target, output) {
         (Some(index), output) => {

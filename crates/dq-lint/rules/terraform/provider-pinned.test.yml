@@ -91,3 +91,58 @@ tests:
       provider = "x"
     expected:
       violations: []
+  - name: an unpinned aliased provider fires next to a pinned one
+    input: |
+      provider "aws" {
+        alias  = "eu"
+        region = "eu-west-1"
+      }
+      provider "aws" {
+        region  = "us-east-1"
+        version = "~> 5.0"
+      }
+    expected:
+      violations:
+        - rule: terraform.provider-pinned
+          message_contains: "aws"
+  - name: a version-less required_providers in a second terraform block fires
+    input: |
+      terraform {
+        required_version = ">= 1.6"
+      }
+      terraform {
+        required_providers {
+          aws = {
+            source = "hashicorp/aws"
+          }
+        }
+      }
+      provider "aws" {
+        region = "us-east-1"
+      }
+    expected:
+      violations:
+        - rule: terraform.provider-pinned
+          message_contains: "aws"
+  - name: required_providers in a second terraform block exempts every alias
+    input: |
+      terraform {
+        required_version = ">= 1.6"
+      }
+      terraform {
+        required_providers {
+          aws = {
+            source  = "hashicorp/aws"
+            version = "~> 5.0"
+          }
+        }
+      }
+      provider "aws" {
+        region = "us-east-1"
+      }
+      provider "aws" {
+        alias  = "eu"
+        region = "eu-west-1"
+      }
+    expected:
+      violations: []

@@ -233,6 +233,11 @@ pub struct Document {
     /// edits apply to it. Not the same as having bytes: an empty YAML file
     /// parsed write-aware has neither bytes nor spans.
     write_aware: bool,
+    /// Which keys the HCL reader read as blocks, so the HCL writer writes
+    /// them back as blocks rather than as attributes. `None` for every
+    /// document no HCL reader built; carried over a value-only rebuild by
+    /// [`Document::with_layout_of`].
+    hcl_blocks: Option<crate::parsers::hcl::HclBlocks>,
 }
 
 /// The not-a-number or infinite float a number literal spells in YAML
@@ -669,6 +674,7 @@ impl Document {
             frontmatter_payload: None,
             provenance: ProvenanceMap::new(),
             write_aware: false,
+            hcl_blocks: None,
         }
     }
 
@@ -691,6 +697,7 @@ impl Document {
             frontmatter_payload: None,
             provenance: ProvenanceMap::new(),
             write_aware: false,
+            hcl_blocks: None,
         }
     }
 
@@ -717,6 +724,7 @@ impl Document {
             frontmatter_payload: None,
             provenance,
             write_aware: true,
+            hcl_blocks: None,
         }
     }
 
@@ -754,6 +762,7 @@ impl Document {
             frontmatter_payload: None,
             provenance,
             write_aware: true,
+            hcl_blocks: None,
         }
     }
 
@@ -786,6 +795,7 @@ impl Document {
             frontmatter_payload: None,
             provenance,
             write_aware: false,
+            hcl_blocks: None,
         }
     }
 
@@ -803,6 +813,7 @@ impl Document {
             frontmatter_payload: Some(FrontmatterPayload { kind, body }),
             provenance: ProvenanceMap::new(),
             write_aware: false,
+            hcl_blocks: None,
         }
     }
 
@@ -949,6 +960,33 @@ impl Document {
     #[must_use]
     pub fn format(&self) -> FormatTag {
         self.format
+    }
+
+    /// This document, written with the layout `source` was read with,
+    /// when both are of one format that has one: today which keys of an
+    /// HCL document are blocks, so a value-only document rebuilt from a
+    /// transformed HCL document (`set --jq`, `fix`) still writes its
+    /// blocks as blocks. A key whose new value no longer has a block's
+    /// shape is written as an attribute; any other document is returned
+    /// as it is.
+    #[must_use]
+    pub fn with_layout_of(mut self, source: &Document) -> Self {
+        if self.format == FormatTag::Hcl && source.format == FormatTag::Hcl {
+            self.hcl_blocks.clone_from(&source.hcl_blocks);
+        }
+        self
+    }
+
+    /// Record which keys the HCL reader read as blocks.
+    pub(crate) fn with_hcl_blocks(mut self, blocks: crate::parsers::hcl::HclBlocks) -> Self {
+        self.hcl_blocks = Some(blocks);
+        self
+    }
+
+    /// Which keys the HCL reader read as blocks, if an HCL reader built
+    /// this document.
+    pub(crate) fn hcl_blocks(&self) -> Option<&crate::parsers::hcl::HclBlocks> {
+        self.hcl_blocks.as_ref()
     }
 
     /// Borrow this `Document` as an [`Ir<'_>`] — the read-only IR view used

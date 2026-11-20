@@ -49,3 +49,31 @@ tests:
       provider = "x"
     expected:
       violations: []
+  - name: two terraform blocks without a backend fire
+    input: |
+      terraform {
+        required_version = ">= 1.6"
+      }
+      terraform {
+        required_providers {
+          aws = {
+            source = "hashicorp/aws"
+          }
+        }
+      }
+    expected:
+      violations:
+        - rule: terraform.state-backend-required
+          message_contains: "no backend"
+  - name: a backend in the first of two terraform blocks passes
+    input: |
+      terraform {
+        backend "s3" {
+          bucket = "tfstate"
+        }
+      }
+      terraform {
+        required_version = ">= 1.6"
+      }
+    expected:
+      violations: []

@@ -55,3 +55,16 @@ tests:
       variable = { v = 1 }
     expected:
       violations: []
+  - name: the undocumented one of two repeated variable blocks fires
+    input: |
+      variable "region" {
+        type = string
+      }
+      variable "region" {
+        type        = string
+        description = "AWS region"
+      }
+    expected:
+      violations:
+        - rule: terraform.variable-has-description
+          message_contains: "region"
