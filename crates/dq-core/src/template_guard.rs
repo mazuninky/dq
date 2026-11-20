@@ -113,8 +113,12 @@ pub fn detect_templates(bytes: &[u8]) -> Option<TemplateMarker> {
 /// downstream parser sees a syntactically valid string scalar.
 #[must_use]
 pub fn substitute_placeholders(bytes: &[u8]) -> (Vec<u8>, HashMap<String, String>) {
+    substitute_with(bytes, &Marks::for_bytes(bytes))
+}
+
+/// [`substitute_placeholders`] with the placeholders of `marks`.
+fn substitute_with(bytes: &[u8], marks: &Marks) -> (Vec<u8>, HashMap<String, String>) {
     let re = substitution_regex();
-    let marks = Marks::for_bytes(bytes);
     let mut out = Vec::with_capacity(bytes.len());
     let mut map = HashMap::new();
     let mut last_end = 0usize;
@@ -201,8 +205,7 @@ pub fn guarded_parse(
     match mode {
         TemplateMode::Allow => parse(bytes),
         TemplateMode::RawStrings => {
-            let (substituted, map) = substitute_placeholders(bytes);
-            let mut doc = parse(&substituted)?;
+            let (mut doc, map) = parse_placeheld(bytes, parse)?;
             if !map.is_empty() {
                 restore_in_value(doc.value_mut(), &map);
             }
@@ -243,9 +246,13 @@ pub fn guarded_parse(
 /// Where the file holds `DQtplxq` already, one more `x` (`DQtplxxq…`) — as
 /// many as it takes to name a prefix the file does not hold — so text in
 /// the file is never taken for a placeholder, nor put back as a template.
+/// Text that spells one only once its escapes are read is caught by
+/// reading the file twice ([`parse_placeheld`]).
 struct Marks {
     /// What every placeholder of the file starts with.
     prefix: String,
+    /// How many fill letters (`x`) the prefix has.
+    fill: usize,
     /// A placeholder, its number captured.
     re: Regex,
 }
@@ -257,13 +264,34 @@ impl Marks {
     /// The placeholders for `bytes`: the first of `DQtplxq`, `DQtplxxq`, …
     /// they do not hold.
     fn for_bytes(bytes: &[u8]) -> Self {
-        let mut prefix = String::from("DQtplxq");
-        while bytes.windows(prefix.len()).any(|w| w == prefix.as_bytes()) {
-            prefix.insert(5, 'x');
-        }
+        let fill = (1..)
+            .find(|&n| !holds(bytes, &Self::prefix_of('x', n)))
+            .expect("a long enough prefix is not in the bytes");
+        Self::new('x', fill)
+    }
+
+    /// Placeholders that start with `DQtpl`, `fill` times `letter`, `q`.
+    fn new(letter: char, fill: usize) -> Self {
+        let prefix = Self::prefix_of(letter, fill);
         let re = Regex::new(&format!("{prefix}([0-9]+){MARK_SUFFIX}"))
             .expect("placeholder regex must compile");
-        Self { prefix, re }
+        Self { prefix, fill, re }
+    }
+
+    fn prefix_of(letter: char, fill: usize) -> String {
+        format!("DQtpl{}q", letter.to_string().repeat(fill))
+    }
+
+    /// Two sets of placeholders of one length, `DQtplx…q` and `DQtply…q`,
+    /// neither of which `bytes` hold, with at least `min_fill` fill
+    /// letters: [`parse_placeheld`] reads the file with each.
+    fn pair(bytes: &[u8], min_fill: usize) -> (Self, Self) {
+        let fill = (min_fill..)
+            .find(|&n| {
+                !holds(bytes, &Self::prefix_of('x', n)) && !holds(bytes, &Self::prefix_of('y', n))
+            })
+            .expect("a long enough prefix is not in the bytes");
+        (Self::new('x', fill), Self::new('y', fill))
     }
 
     /// Placeholder `n`.
@@ -277,6 +305,68 @@ impl Marks {
             .captures_iter(s.as_bytes())
             .filter_map(|c| std::str::from_utf8(&c[1]).ok()?.parse().ok())
             .collect()
+    }
+}
+
+/// Whether `bytes` hold `text`.
+fn holds(bytes: &[u8], text: &str) -> bool {
+    bytes.windows(text.len()).any(|w| w == text.as_bytes())
+}
+
+/// How many times [`parse_placeheld`] tries a longer prefix before it
+/// takes the reading it has.
+const MAX_FILL: usize = 8;
+
+/// `bytes` parsed with every template block swapped for a placeholder,
+/// and the map from placeholder to block — what `--raw-template-strings`
+/// reads. A prefix the bytes do not hold may still be in the data once
+/// the parser reads an escape (`DQtpl\x78q0qx` in YAML, `\u0078` in JSON),
+/// where it would pass for a placeholder: the bytes are read a second time
+/// with placeholders of the same length spelled with `y`, and the two
+/// readings must say the same once the placeholders are set aside. Where
+/// they do not, the data holds a prefix's text, and both are tried again
+/// one fill letter longer.
+fn parse_placeheld(
+    bytes: &[u8],
+    parse: impl Fn(&[u8]) -> crate::Result<crate::Document>,
+) -> crate::Result<(crate::Document, HashMap<String, String>)> {
+    let mut min_fill = 1;
+    loop {
+        let (marks, twin) = Marks::pair(bytes, min_fill);
+        let (text, map) = substitute_with(bytes, &marks);
+        let doc = parse(&text)?;
+        if map.is_empty() || marks.fill >= MAX_FILL {
+            return Ok((doc, map));
+        }
+        let (twin_text, _) = substitute_with(bytes, &twin);
+        let alike = parse(&twin_text)
+            .is_ok_and(|other| alike_but_marks(&marks, doc.value(), &twin, other.value()));
+        if alike {
+            return Ok((doc, map));
+        }
+        min_fill = marks.fill + 1;
+    }
+}
+
+/// Whether `a`, read with the placeholders of `ma`, and `b`, read with
+/// those of `mb`, hold the same data once every placeholder is taken out
+/// of their strings and keys: a placeholder's text the data held besides
+/// stays in one and not in the other.
+fn alike_but_marks(ma: &Marks, a: &crate::Value, mb: &Marks, b: &crate::Value) -> bool {
+    use crate::Value;
+    let text = |m: &Marks, s: &str| m.re.replace_all(s.as_bytes(), &b""[..]).into_owned();
+    match (a, b) {
+        (Value::String(a), Value::String(b)) => text(ma, a) == text(mb, b),
+        (Value::Array(a), Value::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| alike_but_marks(ma, a, mb, b))
+        }
+        (Value::Map(a), Value::Map(b)) => {
+            a.len() == b.len()
+                && a.iter().zip(b).all(|((ak, av), (bk, bv))| {
+                    text(ma, ak) == text(mb, bk) && alike_but_marks(ma, av, mb, bv)
+                })
+        }
+        (a, b) => a.same_data(b),
     }
 }
 
@@ -574,8 +664,7 @@ pub fn parse_for_write(
 ) -> crate::Result<(crate::Document, WriteGuard)> {
     match mode {
         TemplateMode::RawStrings => {
-            let (substituted, map) = substitute_placeholders(original);
-            let doc = parse(&substituted)?;
+            let (doc, map) = parse_placeheld(original, parse)?;
             Ok((
                 doc,
                 WriteGuard {

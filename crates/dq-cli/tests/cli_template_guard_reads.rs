@@ -253,3 +253,52 @@ fn raw_template_strings_leave_placeholder_text_in_the_file_alone() {
         format!("{guarded}z: 1\n")
     );
 }
+
+/// Text that spells a placeholder only once its escapes are read — YAML's
+/// `\x78`, JSON's `x` for `x` — is the file's text too. Was: `d` read
+/// as the template `{{ .x }}`, exit 0, since the bytes do not hold
+/// `DQtplxq`.
+#[test]
+fn raw_template_strings_leave_escaped_placeholder_text_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, src) in [
+        ("e.yaml", "a: \"{{ .x }}\"\nd: \"DQtpl\\x78q0qx\"\n"),
+        (
+            "e.json",
+            "{\"a\": \"{{ .x }}\", \"d\": \"DQtpl\\u0078q0qx\"}\n",
+        ),
+    ] {
+        let file = write(dir.path(), name, src);
+        let get = |pointer: &str| {
+            let out = dq()
+                .args([
+                    "--no-color",
+                    "--raw-template-strings",
+                    "get",
+                    &file,
+                    pointer,
+                ])
+                .assert()
+                .success();
+            String::from_utf8_lossy(&out.get_output().stdout).into_owned()
+        };
+        assert_eq!(get("/d"), "DQtplxq0qx\n", "{name}");
+        assert_eq!(get("/a"), "{{ .x }}\n", "{name}");
+        dq().args([
+            "--no-color",
+            "--raw-template-strings",
+            "-i",
+            "set",
+            &file,
+            "/z",
+            "1",
+        ])
+        .assert()
+        .success();
+        let written = std::fs::read_to_string(&file).unwrap();
+        assert!(written.contains("{{ .x }}"), "{name}: {written:?}");
+        assert!(!written.contains("DQtplxx"), "{name}: {written:?}");
+        assert_eq!(get("/d"), "DQtplxq0qx\n", "{name}: {written:?}");
+        assert_eq!(get("/z"), "1\n", "{name}: {written:?}");
+    }
+}
