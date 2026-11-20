@@ -382,7 +382,6 @@ fn read_cases(
 /// worker thread per available core; each input is swept through every
 /// rule of its namespace. The report does not depend on the scheduling.
 #[test]
-#[ignore = "red until the @std rules tolerate wrong-type fields (PR #40 plan)"]
 fn no_std_rule_raises_on_a_wrong_type_field() {
     let namespaces = dq_lint::list_std_rulesets();
     let evaluators: Vec<Evaluator> = namespaces
