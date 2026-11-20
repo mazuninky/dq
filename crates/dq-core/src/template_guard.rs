@@ -13,7 +13,8 @@
 //!    reads a file.
 //! 2. [`substitute_placeholders`] / [`restore_placeholders`] — a substitute /
 //!    restore pair that swaps every template block for an opaque placeholder
-//!    (`DQtplxq<N>qx`) so the remaining bytes are valid YAML/JSON for the
+//!    (`DQtplxq<N>qx`, with more `x` when the file holds that text) so the
+//!    remaining bytes are valid YAML/JSON for the
 //!    parser, then puts the originals back after the textual edit. Quoting
 //!    around the block is preserved (the placeholder takes the place of just
 //!    the `{{...}}` substring, not any quotes wrapping it).
@@ -98,8 +99,9 @@ pub fn detect_templates(bytes: &[u8]) -> Option<TemplateMarker> {
 }
 
 /// Replace every `{{...}}` / `${{...}}` block in `bytes` with a unique
-/// placeholder of the form `DQtplxq<N>qx` (N is a 0-based, stable counter):
-/// letters and digits only, so that every format reads it as plain text —
+/// placeholder of the form `DQtplxq<N>qx` (N is a 0-based, stable counter;
+/// more `x` where `bytes` hold that text already, see [`Marks`]): letters
+/// and digits only, so that every format reads it as plain text —
 /// Markdown read the underscores of the former `__DQ_TPL_<N>__` as strong
 /// emphasis.
 ///
@@ -112,13 +114,14 @@ pub fn detect_templates(bytes: &[u8]) -> Option<TemplateMarker> {
 #[must_use]
 pub fn substitute_placeholders(bytes: &[u8]) -> (Vec<u8>, HashMap<String, String>) {
     let re = substitution_regex();
+    let marks = Marks::for_bytes(bytes);
     let mut out = Vec::with_capacity(bytes.len());
     let mut map = HashMap::new();
     let mut last_end = 0usize;
 
     for (counter, m) in re.find_iter(bytes).enumerate() {
         out.extend_from_slice(&bytes[last_end..m.start()]);
-        let placeholder = format!("{HELD_PREFIX}{counter}{HELD_SUFFIX}");
+        let placeholder = marks.name(counter);
         out.extend_from_slice(placeholder.as_bytes());
         // The original block bytes are not guaranteed UTF-8 in pathological
         // inputs, but YAML/JSON template files in practice are; round-trip
@@ -217,12 +220,13 @@ pub fn guarded_parse(
             if as_is.is_multi() != placeheld.is_multi() {
                 return Err(refuse());
             }
-            if same_reading(as_is.value(), placeheld.value(), positions) {
+            let marks = &held.marks;
+            if same_reading(marks, as_is.value(), placeheld.value(), positions) {
                 return Ok(as_is);
             }
             // Cite a template that changes the reading: the first whose
             // placeholder sits where the two readings first differ.
-            let culprit = differing_blocks(as_is.value(), placeheld.value(), positions)
+            let culprit = differing_blocks(marks, as_is.value(), placeheld.value(), positions)
                 .and_then(|found| found.into_iter().min())
                 .and_then(|n| held.blocks.get(n))
                 .and_then(|block| marker_on_line(bytes, block.line));
@@ -231,21 +235,59 @@ pub fn guarded_parse(
     }
 }
 
-/// What the guard's placeholders, and those of `--raw-template-strings`
-/// ([`substitute_placeholders`]), start with: letters only, so that no
-/// format reads one as anything but plain text (Markdown reads the
-/// underscores of `__DQ_TPL_0__` as strong emphasis), and a placeholder
-/// is a word in YAML, a bare key in TOML.
-const HELD_PREFIX: &str = "DQtplxq";
-/// What the guard's placeholders end with.
-const HELD_SUFFIX: &str = "qx";
+/// The placeholders of one file, the guard's and those of
+/// `--raw-template-strings` ([`substitute_placeholders`]): `DQtplxq<N>qx`,
+/// letters and digits only, so that no format reads one as anything but
+/// plain text (Markdown reads the underscores of `__DQ_TPL_0__` as strong
+/// emphasis), and a placeholder is a word in YAML, a bare key in TOML.
+/// Where the file holds `DQtplxq` already, one more `x` (`DQtplxxq…`) — as
+/// many as it takes to name a prefix the file does not hold — so text in
+/// the file is never taken for a placeholder, nor put back as a template.
+struct Marks {
+    /// What every placeholder of the file starts with.
+    prefix: String,
+    /// A placeholder, its number captured.
+    re: Regex,
+}
+
+/// What every placeholder ends with.
+const MARK_SUFFIX: &str = "qx";
+
+impl Marks {
+    /// The placeholders for `bytes`: the first of `DQtplxq`, `DQtplxxq`, …
+    /// they do not hold.
+    fn for_bytes(bytes: &[u8]) -> Self {
+        let mut prefix = String::from("DQtplxq");
+        while bytes.windows(prefix.len()).any(|w| w == prefix.as_bytes()) {
+            prefix.insert(5, 'x');
+        }
+        let re = Regex::new(&format!("{prefix}([0-9]+){MARK_SUFFIX}"))
+            .expect("placeholder regex must compile");
+        Self { prefix, re }
+    }
+
+    /// Placeholder `n`.
+    fn name(&self, n: usize) -> String {
+        format!("{}{n}{MARK_SUFFIX}", self.prefix)
+    }
+
+    /// The numbers of the placeholders in `s`, in order.
+    fn numbers_in(&self, s: &str) -> Vec<usize> {
+        self.re
+            .captures_iter(s.as_bytes())
+            .filter_map(|c| std::str::from_utf8(&c[1]).ok()?.parse().ok())
+            .collect()
+    }
+}
 
 /// The text a reading is compared in, with every template block of the
-/// file swapped for a placeholder `DQtplxq<N>qx` — the form
+/// file swapped for a placeholder ([`Marks`]) — the form
 /// [`substitute_placeholders`] uses for `--raw-template-strings` too.
 struct Held {
     /// The text with placeholders.
     text: Vec<u8>,
+    /// The placeholders of the text.
+    marks: Marks,
     /// Every block in order, `N` of placeholder `N`.
     blocks: Vec<HeldBlock>,
 }
@@ -262,6 +304,7 @@ struct HeldBlock {
 
 impl Held {
     fn new(bytes: &[u8]) -> Self {
+        let marks = Marks::for_bytes(bytes);
         let mut text = Vec::with_capacity(bytes.len());
         let mut blocks = Vec::new();
         let mut last_end = 0usize;
@@ -276,21 +319,16 @@ impl Held {
                 line,
                 at: text.len(),
             });
-            text.extend_from_slice(format!("{HELD_PREFIX}{n}{HELD_SUFFIX}").as_bytes());
+            text.extend_from_slice(marks.name(n).as_bytes());
             last_end = m.end();
         }
         text.extend_from_slice(&bytes[last_end..]);
-        Self { text, blocks }
+        Self {
+            text,
+            marks,
+            blocks,
+        }
     }
-}
-
-/// The guard's placeholders in a string.
-fn held_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(&format!("{HELD_PREFIX}([0-9]+){HELD_SUFFIX}"))
-            .expect("placeholder regex must compile")
-    })
 }
 
 /// A template block in a string as read — the parser has already taken
@@ -298,14 +336,6 @@ fn held_regex() -> &'static Regex {
 fn read_block_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(?s)\$?\{\{.*?\}\}").expect("block regex must compile"))
-}
-
-/// The numbers of the guard's placeholders in `s`, in order.
-fn held_in(s: &str) -> Vec<usize> {
-    held_regex()
-        .captures_iter(s.as_bytes())
-        .filter_map(|c| std::str::from_utf8(&c[1]).ok()?.parse().ok())
-        .collect()
 }
 
 /// Mark that stands for one template block in [`same_text`].
@@ -317,12 +347,12 @@ const BLOCK_MARK: &str = "\u{0}";
 /// holds one block. The block's text is not compared: the parser reads
 /// the escapes of a quoted string (`''`, `\"`) out of the block in
 /// `as_is`, and the placeholder stood for the text before that.
-fn same_text(as_is: &str, held: &str) -> bool {
+fn same_text(marks: &Marks, as_is: &str, held: &str) -> bool {
     if as_is == held {
         return true;
     }
     let as_is = read_block_regex().replace_all(as_is.as_bytes(), BLOCK_MARK.as_bytes());
-    let held = held_regex().replace_all(held.as_bytes(), BLOCK_MARK.as_bytes());
+    let held = marks.re.replace_all(held.as_bytes(), BLOCK_MARK.as_bytes());
     let held = read_block_regex().replace_all(&held, BLOCK_MARK.as_bytes());
     as_is == held
 }
@@ -332,12 +362,15 @@ fn same_text(as_is: &str, held: &str) -> bool {
 /// `positions` the `position` member of a map — where the Markdown tree
 /// keeps a node's line and column, which a placeholder longer or shorter
 /// than its block moves — is not compared.
-fn same_reading(as_is: &crate::Value, held: &crate::Value, positions: bool) -> bool {
+fn same_reading(marks: &Marks, as_is: &crate::Value, held: &crate::Value, positions: bool) -> bool {
     use crate::Value;
     match (as_is, held) {
-        (Value::String(a), Value::String(h)) => same_text(a, h),
+        (Value::String(a), Value::String(h)) => same_text(marks, a, h),
         (Value::Array(a), Value::Array(h)) => {
-            a.len() == h.len() && a.iter().zip(h).all(|(a, h)| same_reading(a, h, positions))
+            a.len() == h.len()
+                && a.iter()
+                    .zip(h)
+                    .all(|(a, h)| same_reading(marks, a, h, positions))
         }
         (Value::Map(a), Value::Map(h)) => {
             let kept = |(key, _): &(&String, &Value)| !(positions && key.as_str() == "position");
@@ -345,7 +378,7 @@ fn same_reading(as_is: &crate::Value, held: &crate::Value, positions: bool) -> b
             let h: Vec<_> = h.iter().filter(kept).collect();
             a.len() == h.len()
                 && a.iter().zip(&h).all(|((ak, av), (hk, hv))| {
-                    same_text(ak, hk) && same_reading(av, hv, positions)
+                    same_text(marks, ak, hk) && same_reading(marks, av, hv, positions)
                 })
         }
         (a, h) => a.same_data(h),
@@ -358,50 +391,59 @@ fn same_reading(as_is: &crate::Value, held: &crate::Value, positions: bool) -> b
 /// its own placeholders; a collection whose length or kind differs gives
 /// all of those inside it.
 fn differing_blocks(
+    marks: &Marks,
     as_is: &crate::Value,
     held: &crate::Value,
     positions: bool,
 ) -> Option<Vec<usize>> {
     use crate::Value;
-    if same_reading(as_is, held, positions) {
+    if same_reading(marks, as_is, held, positions) {
         return None;
     }
     match (as_is, held) {
-        (Value::String(_), Value::String(h)) => Some(held_in(h)),
+        (Value::String(_), Value::String(h)) => Some(marks.numbers_in(h)),
         (Value::Array(a), Value::Array(h)) if a.len() == h.len() => a
             .iter()
             .zip(h)
-            .find_map(|(a, h)| differing_blocks(a, h, positions)),
+            .find_map(|(a, h)| differing_blocks(marks, a, h, positions)),
         (Value::Map(a), Value::Map(h)) => {
             let kept = |(key, _): &(&String, &Value)| !(positions && key.as_str() == "position");
             let a: Vec<_> = a.iter().filter(kept).collect();
             let h: Vec<_> = h.iter().filter(kept).collect();
             if a.len() != h.len() {
-                return Some(blocks_within(held));
+                return Some(blocks_within(marks, held));
             }
             a.iter().zip(&h).find_map(|((ak, av), (hk, hv))| {
-                if same_text(ak, hk) {
-                    differing_blocks(av, hv, positions)
+                if same_text(marks, ak, hk) {
+                    differing_blocks(marks, av, hv, positions)
                 } else {
-                    let mut found = held_in(hk);
-                    found.extend(blocks_within(hv));
+                    let mut found = marks.numbers_in(hk);
+                    found.extend(blocks_within(marks, hv));
                     Some(found)
                 }
             })
         }
-        _ => Some(blocks_within(held)),
+        _ => Some(blocks_within(marks, held)),
     }
 }
 
 /// The guard's placeholders in every string and key of `v`.
-fn blocks_within(v: &crate::Value) -> Vec<usize> {
+fn blocks_within(marks: &Marks, v: &crate::Value) -> Vec<usize> {
     use crate::Value;
     match v {
-        Value::String(s) => held_in(s),
-        Value::Array(items) => items.iter().flat_map(blocks_within).collect(),
+        Value::String(s) => marks.numbers_in(s),
+        Value::Array(items) => items
+            .iter()
+            .flat_map(|item| blocks_within(marks, item))
+            .collect(),
         Value::Map(map) => map
             .iter()
-            .flat_map(|(k, v)| held_in(k).into_iter().chain(blocks_within(v)))
+            .flat_map(|(k, v)| {
+                marks
+                    .numbers_in(k)
+                    .into_iter()
+                    .chain(blocks_within(marks, v))
+            })
             .collect(),
         _ => Vec::new(),
     }
@@ -445,7 +487,7 @@ pub fn restore_in_value(value: &mut crate::Value, map: &HashMap<String, String>)
             }
         }
         Value::Map(entries) => {
-            let keyed = entries.keys().any(|k| k.contains(PLACEHOLDER_PREFIX));
+            let keyed = entries.keys().any(|k| holds_placeholder(k, map));
             if keyed {
                 let old = std::mem::take(entries);
                 for (key, mut item) in old {
@@ -468,8 +510,11 @@ pub fn restore_in_value(value: &mut crate::Value, map: &HashMap<String, String>)
     }
 }
 
-/// What every placeholder starts with.
-const PLACEHOLDER_PREFIX: &str = HELD_PREFIX;
+/// Whether `s` holds one of the placeholders of `map`.
+fn holds_placeholder(s: &str, map: &HashMap<String, String>) -> bool {
+    map.keys()
+        .any(|placeholder| s.contains(placeholder.as_str()))
+}
 
 /// `s` with each placeholder replaced by its template text; `None` when `s`
 /// holds no placeholder.
@@ -478,7 +523,7 @@ const PLACEHOLDER_PREFIX: &str = HELD_PREFIX;
 /// HCL reads a bare placeholder (`a = {{ .x }}`) as an expression and
 /// spells it `${placeholder}`.
 fn restore_in_str(s: &str, map: &HashMap<String, String>) -> Option<String> {
-    if !s.contains(PLACEHOLDER_PREFIX) {
+    if !holds_placeholder(s, map) {
         return None;
     }
     if let Some(original) = s
@@ -626,6 +671,7 @@ pub fn check_templates_kept(
     let held_doc = parse(&held.text).ok();
     let mut found = Found::default();
     collect(
+        &held.marks,
         before,
         held_doc.as_ref().map(crate::Document::value),
         &mut Pointers::default(),
@@ -639,6 +685,7 @@ pub fn check_templates_kept(
     })?;
     let mut read_back = Found::default();
     collect(
+        &held.marks,
         after.value(),
         None,
         &mut Pointers::default(),
@@ -832,6 +879,7 @@ impl Pointers {
 /// data read with placeholders, walked alongside while its shape matches),
 /// and the nodes `edited` names.
 fn collect(
+    marks: &Marks,
     value: &crate::Value,
     held: Option<&crate::Value>,
     at: &mut Pointers,
@@ -848,7 +896,7 @@ fn collect(
                 Some(Value::String(h)) => Some(h.as_str()),
                 _ => None,
             };
-            keep(found, edited, s, h, &at.as_is);
+            keep(marks, found, edited, s, h, &at.as_is);
         }
         Value::Array(items) => {
             let held = match held {
@@ -858,7 +906,7 @@ fn collect(
             for (i, item) in items.iter().enumerate() {
                 let index = i.to_string();
                 let lens = at.push(&index, &index);
-                collect(item, held.map(|h| &h[i]), at, edited, found);
+                collect(marks, item, held.map(|h| &h[i]), at, edited, found);
                 at.truncate(lens);
             }
         }
@@ -872,13 +920,14 @@ fn collect(
                 let lens = at.push(key, held_entry.map_or(key.as_str(), |(k, _)| k.as_str()));
                 let pointer = at.as_is.clone();
                 keep(
+                    marks,
                     found,
                     edited,
                     key,
                     held_entry.map(|(k, _)| k.as_str()),
                     &pointer,
                 );
-                collect(item, held_entry.map(|(_, v)| v), at, edited, found);
+                collect(marks, item, held_entry.map(|(_, v)| v), at, edited, found);
                 at.truncate(lens);
             }
         }
@@ -893,14 +942,21 @@ fn collect(
 
 /// Add `text`, read with placeholders as `held`, at `pointer` to `found`
 /// when it holds a template block.
-fn keep(found: &mut Found, edited: &[String], text: &str, held: Option<&str>, pointer: &str) {
+fn keep(
+    marks: &Marks,
+    found: &mut Found,
+    edited: &[String],
+    text: &str,
+    held: Option<&str>,
+    pointer: &str,
+) {
     if read_block_regex().is_match(text.as_bytes()) {
         found.strings.push(TemplateString {
             text: text.to_owned(),
             edited: edited.iter().any(|e| under(pointer, e)),
             held: held
-                .filter(|h| same_text(text, h))
-                .map(held_in)
+                .filter(|h| same_text(marks, text, h))
+                .map(|h| marks.numbers_in(h))
                 .unwrap_or_default(),
         });
     }
@@ -1100,8 +1156,10 @@ mod tests {
         let json = |b: &[u8]| crate::by_name("json").expect("json").parse(b);
         guarded_parse(br#"{"a": "${{ g(\"y\") }}"}"#, TemplateMode::Guard, json).expect("passes");
         // Two blocks read as one string where the file holds two: refused.
-        assert!(!same_text("{{ a }}", "DQtplxq0qxDQtplxq1qx"));
+        let marks = Marks::for_bytes(b"");
+        assert!(!same_text(&marks, "{{ a }}", "DQtplxq0qxDQtplxq1qx"));
         assert!(same_text(
+            &marks,
             "x {{ a }} y {{ b }}",
             "x DQtplxq0qx y DQtplxq1qx"
         ));
@@ -1384,6 +1442,18 @@ mod tests {
             String::from_utf8_lossy(&substituted),
             String::from_utf8_lossy(&restored),
         );
+    }
+
+    #[test]
+    fn marks_pick_a_prefix_the_file_does_not_hold() {
+        assert_eq!(Marks::for_bytes(b"a: {{ .x }}").name(0), "DQtplxq0qx");
+        assert_eq!(Marks::for_bytes(b"d: DQtplxq0qx").name(3), "DQtplxxq3qx");
+        let marks = Marks::for_bytes(b"DQtplxq DQtplxxq");
+        assert_eq!(marks.name(0), "DQtplxxxq0qx");
+        assert_eq!(marks.numbers_in("DQtplxq1qx DQtplxxxq2qx"), vec![2]);
+        let (text, map) = substitute_placeholders(b"a: \"{{ .x }}\"\nd: DQtplxq0qx\n");
+        assert_eq!(text, b"a: \"DQtplxxq0qx\"\nd: DQtplxq0qx\n");
+        assert_eq!(map.get("DQtplxxq0qx").map(String::as_str), Some("{{ .x }}"));
     }
 
     #[test]

@@ -199,3 +199,57 @@ fn fmt_refuses_both_escape_hatches() {
         assert!(stderr.contains(flag), "{flag}: got:\n{stderr}");
     }
 }
+
+/// Text in the file that spells a placeholder is the file's text: the
+/// placeholders are picked so that none of them is in the file. Was:
+/// `d` read, and written back, as the template `{{ .x }}`.
+#[test]
+fn raw_template_strings_leave_placeholder_text_in_the_file_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = "a: \"{{ .x }}\"\nd: \"DQtplxq0qx\"\ne: DQtplxxq0qx\n";
+    let file = write(dir.path(), "v.yaml", src);
+    let out = dq()
+        .args([
+            "--no-color",
+            "--raw-template-strings",
+            "-F",
+            "json",
+            "get",
+            &file,
+            "",
+        ])
+        .assert()
+        .success();
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.get_output().stdout).expect("JSON output");
+    assert_eq!(
+        json,
+        serde_json::json!({"a": "{{ .x }}", "d": "DQtplxq0qx", "e": "DQtplxxq0qx"})
+    );
+    dq().args([
+        "--no-color",
+        "--raw-template-strings",
+        "-i",
+        "set",
+        &file,
+        "/z",
+        "1",
+    ])
+    .assert()
+    .success();
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        format!("{src}z: 1\n")
+    );
+    // The guard reads the file twice, the second time with placeholders:
+    // the text that spells one is not taken for a template either.
+    let guarded = "a: \"x {{ .x }}\"\nd: \"DQtplxq0qx\"\n";
+    let file = write(dir.path(), "g.yaml", guarded);
+    dq().args(["--no-color", "-i", "set", &file, "/z", "1"])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        format!("{guarded}z: 1\n")
+    );
+}

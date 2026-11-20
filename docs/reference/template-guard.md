@@ -108,7 +108,11 @@ each costs.
 
 Every `{{ … }}` / `${{ … }}` / `{{- … -}}` span is replaced by a placeholder
 `DQtplxq<N>qx` (N counts from 0, unique in the file, the surrounding YAML /
-JSON quoting kept) before parsing, and restored on output. The placeholder is
+JSON quoting kept) before parsing, and restored on output. A file that holds
+the text `DQtplxq` already gets placeholders with one more `x` (`DQtplxxq0qx`,
+and so on until the file holds none of them), so text in the file is never
+read, nor written back, as a template; the guard's second reading uses the
+same placeholders. The placeholder is
 letters and digits only, so every format reads it as plain text: Markdown
 took the former `__DQ_TPL_<N>__` for strong emphasis, and a template alone in
 a paragraph came back as a `strong` node holding `DQ_TPL_0`. HCL reads a bare
