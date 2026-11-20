@@ -107,8 +107,13 @@ each costs.
 ## `--raw-template-strings`
 
 Every `{{ … }}` / `${{ … }}` / `{{- … -}}` span is replaced by a placeholder
-`__DQ_TPL_<N>__` (N counts from 0, unique in the file, the surrounding YAML /
-JSON quoting kept) before parsing, and restored on output. The file round
+`DQtplxq<N>qx` (N counts from 0, unique in the file, the surrounding YAML /
+JSON quoting kept) before parsing, and restored on output. The placeholder is
+letters and digits only, so every format reads it as plain text: Markdown
+took the former `__DQ_TPL_<N>__` for strong emphasis, and a template alone in
+a paragraph came back as a `strong` node holding `DQ_TPL_0`. HCL reads a bare
+template (`a = {{ .x }}`) as an expression; it reads back as the template,
+`{{ .x }}`. The file round
 trips: `dq set values.yaml /image/tag v1.2.3 -i --raw-template-strings`
 changes the tag and leaves every template line byte-identical. Placeholders
 never reach the disk.

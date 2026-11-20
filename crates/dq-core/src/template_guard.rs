@@ -13,7 +13,7 @@
 //!    reads a file.
 //! 2. [`substitute_placeholders`] / [`restore_placeholders`] — a substitute /
 //!    restore pair that swaps every template block for an opaque placeholder
-//!    (`__DQ_TPL_<N>__`) so the remaining bytes are valid YAML/JSON for the
+//!    (`DQtplxq<N>qx`) so the remaining bytes are valid YAML/JSON for the
 //!    parser, then puts the originals back after the textual edit. Quoting
 //!    around the block is preserved (the placeholder takes the place of just
 //!    the `{{...}}` substring, not any quotes wrapping it).
@@ -98,13 +98,16 @@ pub fn detect_templates(bytes: &[u8]) -> Option<TemplateMarker> {
 }
 
 /// Replace every `{{...}}` / `${{...}}` block in `bytes` with a unique
-/// placeholder of the form `__DQ_TPL_<N>__` (N is a 0-based, stable counter).
+/// placeholder of the form `DQtplxq<N>qx` (N is a 0-based, stable counter):
+/// letters and digits only, so that every format reads it as plain text —
+/// Markdown read the underscores of the former `__DQ_TPL_<N>__` as strong
+/// emphasis.
 ///
 /// Returns the substituted bytes and a map from placeholder → original
 /// substring. Use [`restore_placeholders`] to reverse the substitution.
 ///
 /// Quotes around a block are NOT included in the placeholder — `"{{ .x }}"`
-/// becomes `"__DQ_TPL_0__"`, preserving the YAML/JSON-level quoting so the
+/// becomes `"DQtplxq0qx"`, preserving the YAML/JSON-level quoting so the
 /// downstream parser sees a syntactically valid string scalar.
 #[must_use]
 pub fn substitute_placeholders(bytes: &[u8]) -> (Vec<u8>, HashMap<String, String>) {
@@ -115,7 +118,7 @@ pub fn substitute_placeholders(bytes: &[u8]) -> (Vec<u8>, HashMap<String, String
 
     for (counter, m) in re.find_iter(bytes).enumerate() {
         out.extend_from_slice(&bytes[last_end..m.start()]);
-        let placeholder = format!("__DQ_TPL_{counter}__");
+        let placeholder = format!("{HELD_PREFIX}{counter}{HELD_SUFFIX}");
         out.extend_from_slice(placeholder.as_bytes());
         // The original block bytes are not guaranteed UTF-8 in pathological
         // inputs, but YAML/JSON template files in practice are; round-trip
@@ -133,8 +136,9 @@ pub fn substitute_placeholders(bytes: &[u8]) -> (Vec<u8>, HashMap<String, String
 /// Restore every placeholder in `bytes` to its original template block.
 ///
 /// Iterates the map and replaces all occurrences of each placeholder. Because
-/// placeholders are constructed with a unique counter and an unambiguous
-/// `__DQ_TPL_*__` prefix, no overlap or collision is possible across the map.
+/// placeholders are constructed with a unique counter between an
+/// unambiguous prefix and suffix (`DQtplxq<N>qx`), no overlap or collision
+/// is possible across the map.
 #[must_use]
 pub fn restore_placeholders(bytes: &[u8], map: &HashMap<String, String>) -> Vec<u8> {
     // Decode lossily — placeholders are pure ASCII, so any non-UTF-8 bytes in
@@ -227,7 +231,8 @@ pub fn guarded_parse(
     }
 }
 
-/// What the guard's placeholders start with: letters only, so that no
+/// What the guard's placeholders, and those of `--raw-template-strings`
+/// ([`substitute_placeholders`]), start with: letters only, so that no
 /// format reads one as anything but plain text (Markdown reads the
 /// underscores of `__DQ_TPL_0__` as strong emphasis), and a placeholder
 /// is a word in YAML, a bare key in TOML.
@@ -236,8 +241,8 @@ const HELD_PREFIX: &str = "DQtplxq";
 const HELD_SUFFIX: &str = "qx";
 
 /// The text a reading is compared in, with every template block of the
-/// file swapped for a placeholder `DQtplxq<N>qx` — the guard's own; the
-/// `--raw-template-strings` ones are [`substitute_placeholders`].
+/// file swapped for a placeholder `DQtplxq<N>qx` — the form
+/// [`substitute_placeholders`] uses for `--raw-template-strings` too.
 struct Held {
     /// The text with placeholders.
     text: Vec<u8>,
@@ -464,13 +469,24 @@ pub fn restore_in_value(value: &mut crate::Value, map: &HashMap<String, String>)
 }
 
 /// What every placeholder starts with.
-const PLACEHOLDER_PREFIX: &str = "__DQ_TPL_";
+const PLACEHOLDER_PREFIX: &str = HELD_PREFIX;
 
 /// `s` with each placeholder replaced by its template text; `None` when `s`
 /// holds no placeholder.
+///
+/// A string that is a placeholder in `${…}` alone is the template alone:
+/// HCL reads a bare placeholder (`a = {{ .x }}`) as an expression and
+/// spells it `${placeholder}`.
 fn restore_in_str(s: &str, map: &HashMap<String, String>) -> Option<String> {
     if !s.contains(PLACEHOLDER_PREFIX) {
         return None;
+    }
+    if let Some(original) = s
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .and_then(|placeholder| map.get(placeholder))
+    {
+        return Some(original.clone());
     }
     let mut text = s.to_owned();
     for (placeholder, original) in map {
@@ -1141,7 +1157,7 @@ mod tests {
         let (_, guard) = parse_for_write(helm, TemplateMode::RawStrings, yaml).expect("parses");
         assert_eq!(
             guard
-                .finish(b"port: __DQ_TPL_0__\n".to_vec(), &[], true, yaml)
+                .finish(b"port: DQtplxq0qx\n".to_vec(), &[], true, yaml)
                 .expect("restored"),
             helm
         );
@@ -1160,6 +1176,61 @@ mod tests {
             matches!(err, crate::Error::TemplatedFile { line: 2, .. }),
             "got: {err:?}"
         );
+    }
+
+    /// Every string and key of `v`.
+    fn strings_in(v: &crate::Value) -> Vec<String> {
+        use crate::Value;
+        match v {
+            Value::String(s) => vec![s.clone()],
+            Value::Array(items) => items.iter().flat_map(strings_in).collect(),
+            Value::Map(map) => map
+                .iter()
+                .flat_map(|(k, v)| std::iter::once(k.clone()).chain(strings_in(v)))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn raw_template_strings_read_a_template_as_text_in_every_format() {
+        // The placeholder must read as plain text wherever the template
+        // stands: Markdown took `__DQ_TPL_0__` for strong emphasis, HCL a
+        // bare one for an expression.
+        for (format, text, template) in [
+            ("yaml", "a: {{ .x }}\n", "{{ .x }}"),
+            ("json", "{\"a\": \"{{ .x }}\"}\n", "{{ .x }}"),
+            ("toml", "a = \"{{ .x }}\"\n", "{{ .x }}"),
+            ("hcl", "a = {{ .x }}\n", "{{ .x }}"),
+            ("hcl", "a = \"{{ .x }}\"\n", "{{ .x }}"),
+            ("ini", "[s]\na = {{ .x }}\n", "{{ .x }}"),
+            ("dotenv", "A={{ .x }}\n", "{{ .x }}"),
+            ("csv", "a\n{{ .x }}\n", "{{ .x }}"),
+            ("xml", "<a>{{ .x }}</a>\n", "{{ .x }}"),
+            ("dockerfile", "FROM {{ .x }}\n", "{{ .x }}"),
+            ("markdown", "# T\n\n{{ .x }}\n", "{{ .x }}"),
+            ("markdown", "Hello {{ .x }}!\n", "Hello {{ .x }}!"),
+            (
+                "markdown",
+                "- {{ .x }} and {{ .y }}\n",
+                "{{ .x }} and {{ .y }}",
+            ),
+        ] {
+            let parser = crate::by_name(format).expect("format");
+            let doc = guarded_parse(text.as_bytes(), TemplateMode::RawStrings, |b| {
+                parser.parse(b)
+            })
+            .unwrap_or_else(|e| panic!("{format} {text:?}: {e}"));
+            let strings = strings_in(doc.value());
+            assert!(
+                strings.iter().any(|s| s == template),
+                "{format} {text:?}: {strings:?}"
+            );
+            assert!(
+                !strings.iter().any(|s| s == "strong"),
+                "{format} {text:?}: {strings:?}"
+            );
+        }
     }
 
     #[test]
@@ -1321,7 +1392,7 @@ mod tests {
         let (substituted, _map) = substitute_placeholders(original);
         let s = std::str::from_utf8(&substituted).expect("ascii output");
         assert!(
-            s.contains("\"__DQ_TPL_0__\""),
+            s.contains("\"DQtplxq0qx\""),
             "quotes must remain around the placeholder, got: {s}"
         );
     }
