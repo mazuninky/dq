@@ -11,4 +11,6 @@ pre-commit:
 pre-push:
   commands:
     deny:
-      run: cargo deny check
+      # Git exports GIT_DIR (and friends) to hooks. cargo deny updates its advisory
+      # database with git, which would then fetch and reset *this* repo instead.
+      run: env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR cargo deny check
