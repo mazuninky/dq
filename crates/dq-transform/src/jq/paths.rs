@@ -34,23 +34,37 @@ use jaq_core::data::JustLut;
 use jaq_core::load::lex::StrPart;
 use jaq_core::load::parse::{BinaryOp, Def, Pattern, Term};
 use jaq_core::native::{Fun, run, v};
-use jaq_core::path::{Opt, Part, Path};
+use jaq_core::path::{Opt, Part};
 use jaq_core::{Cv, Error, ValT as _, ValX};
 use jaq_json::{Map, Num, Rc, Val};
 use jaq_std::ValT as _;
+
+use super::keys;
 
 /// Definitions chained after jaq's own, so these shadow jaq's.
 ///
 /// `setpath` creates the path, then assigns through jaq's own `=` (an
 /// integral float in the path taken as the integer, as jq takes it);
-/// `delpaths` and `del` are jq's definitions.
+/// `delpaths` and `del` are jq's definitions. `getpath`, `has`,
+/// `from_entries` and `pick` refuse a non-string object key, as jq does
+/// (see [`super::keys`]); `in` and `with_entries` are repeated so they call
+/// these and not jaq's. `from_entries` takes the key and value names jq
+/// 1.8 takes.
 pub(super) const DEFS: &str = r#"
 def _dq_vivify(f): _dq_ensure([path(f)]);
+def getpath($path): reduce $path[] as $p (.; _dq_objkey($p) | .[$p]);
 def setpath($p; $x):
   (if $p | type == "array" then $p | map(_dq_index) else $p end) as $p
-  | _dq_ensure([$p]) | getpath($p) = $x;
+  | _dq_ensure([$p]) | reduce $p[] as $k (.; .[$k]) = $x;
 def delpaths($ps): _dq_delpaths($ps);
 def del(f): delpaths([path(f)]);
+def has($k): _dq_has($k);
+def in(xs): . as $x | xs | has($x);
+def pick(f): . as $top | reduce path(f) as $p (null; setpath($p; $top | getpath($p)));
+def from_entries: reduce .[] as $x ({};
+  . + { ($x | .key // .Key // .name // .Name | _dq_key):
+        ($x | if has("value") then .value else .Value end) });
+def with_entries(f): to_entries | map(f) | from_entries;
 "#;
 
 /// The definitions in [`DEFS`], parsed.
@@ -124,8 +138,10 @@ fn ensure_all<'a>(mut v: Val, paths: &Val) -> ValX<'a, Val> {
 /// [`MAX_INDEX`], past which it is jq's "Array index too large".
 ///
 /// A missing object key at the end of the path is left for the assignment
-/// to insert. What jq refuses (a string key into a number, say) is left as
-/// it is: the assignment then fails the way jaq reports it.
+/// to insert. A key that is not a string, into an object, is jq's "Cannot
+/// index object with …". What else jq refuses (a string key into a number,
+/// say) is left as it is: the assignment then fails the way jaq reports
+/// it.
 fn ensure<'a>(v: Val, path: &[Val]) -> ValX<'a, Val> {
     if !needs_change(&v, path) {
         return Ok(v);
@@ -156,6 +172,7 @@ fn ensure<'a>(v: Val, path: &[Val]) -> ValX<'a, Val> {
                     .map_index(key, Opt::Essential, |child| once(ensure(child, rest))),
             }
         }
+        Val::Obj(_) if !is_str(key) => Err(keys::index_error(key).into()),
         v @ Val::Obj(_) => v.map_index(key, Opt::Essential, |child| once(ensure(child, rest))),
         other => Ok(other),
     }
@@ -179,6 +196,8 @@ fn needs_change(v: &Val, path: &[Val]) -> bool {
             || needs_change(&Val::Null, rest),
             |child| needs_change(child, rest),
         ),
+        // Not a change: `ensure` refuses the key.
+        Val::Obj(_) => true,
         Val::Arr(items) => match array_index(key, items.len()) {
             Some(idx) => items.get(idx).is_none_or(|child| needs_change(child, rest)),
             None => false,
@@ -293,6 +312,7 @@ fn child_at<'a>(v: &Val, key: &Val) -> ValX<'a, Val> {
     match (v, key) {
         (Val::Null, _) => Ok(Val::Null),
         (Val::Obj(map), _) if is_str(key) => Ok(map.get(key).cloned().unwrap_or_default()),
+        (Val::Obj(_), _) => Err(keys::index_error(key).into()),
         (Val::Arr(items), _) if int_key(key).is_some() => Ok(array_index(key, items.len())
             .and_then(|idx| items.get(idx))
             .cloned()
@@ -314,7 +334,11 @@ fn delete_keys<'a>(v: Val, keys: &[Val]) -> ValX<'a, Val> {
         Val::Null => Ok(Val::Null),
         Val::Obj(map) => {
             if let Some(key) = keys.iter().find(|k| !is_str(k)) {
-                return Err(Error::str(format_args!("cannot delete {key} from an object")).into());
+                return Err(Error::str(format_args!(
+                    "Cannot delete {} field of object",
+                    keys::type_name(key)
+                ))
+                .into());
             }
             let keys: HashSet<&Val> = keys.iter().collect();
             Ok(Val::obj(
@@ -354,7 +378,11 @@ fn array_positions<'a>(
             .map_or(0..0, |idx| idx..idx + 1));
     }
     let Val::Obj(bounds) = key else {
-        return Err(Error::str(format_args!("cannot delete {key} from an array")).into());
+        return Err(Error::str(format_args!(
+            "Cannot delete {} element of array",
+            keys::type_name(key)
+        ))
+        .into());
     };
     let bound = |name: &str, default: usize| -> Result<usize, jaq_core::Exn<'a, Val>> {
         match bounds.get(&Val::utf8_str(name.to_owned())) {
@@ -388,43 +416,81 @@ fn array_positions<'a>(
 /// left-hand side is evaluated inside the binding, so a variable of the
 /// program by that name would be captured.
 fn rhs_var(code: &str) -> String {
-    let mut name = String::from("$__dq_rhs");
+    fresh_var(code, "$__dq_rhs")
+}
+
+/// `base`, with a number appended until `code` does not hold it.
+fn fresh_var(code: &str, base: &str) -> String {
+    let mut name = base.to_owned();
     let mut n = 0_u32;
     while code.contains(name.as_str()) {
         n += 1;
-        name = format!("$__dq_rhs{n}");
+        name = format!("{base}{n}");
     }
     name
 }
 
-/// `code` with each assignment `L op R` preceded by `_dq_vivify(L)`, or
-/// `None` when `code` holds no assignment operator or does not parse as a
-/// single term (a module header, say — jaq reports that itself).
+/// `code` rewritten, or `None` when it needs no rewrite or does not parse
+/// as a single term (a module header, say — jaq reports that itself).
+///
+/// The rewrite precedes each assignment `L op R` with `_dq_vivify(L)`, and
+/// checks each index that is not a string literal, and each computed
+/// object key, against jq's rule that an object key is a string (see
+/// [`super::keys`]).
 pub(super) fn rewrite(code: &str) -> Option<String> {
     let term = jaq_core::load::parse(code, |p| p.term())?;
-    if !has_assignment(&term) {
+    if !needs_rewrite(&term) {
         return None;
     }
     let mut printer = Printer {
         out: String::with_capacity(code.len() * 2),
         rhs: rhs_var(code),
+        key: fresh_var(code, "$__dq_key"),
+        keys: 0,
         lhs: false,
+        update: false,
     };
     printer.term(&term);
     Some(printer.out)
 }
 
-fn has_assignment(t: &Term<&str>) -> bool {
+/// Whether `t` holds an assignment, an index that is not a string literal
+/// or a computed object key.
+fn needs_rewrite(t: &Term<&str>) -> bool {
     let mut found = false;
-    visit(t, &mut |t| {
-        if let Term::BinOp(_, op, _) = t {
+    visit(t, &mut |t| match t {
+        Term::BinOp(_, op, _) => {
             found |= matches!(
                 op,
                 BinaryOp::Assign | BinaryOp::Update | BinaryOp::UpdateMath(_) | BinaryOp::UpdateAlt
             );
         }
+        Term::Path(_, path) => {
+            found |= path
+                .0
+                .iter()
+                .any(|(part, _)| matches!(part, Part::Index(i) if checked_index(i)));
+        }
+        Term::Obj(entries) => found |= entries.iter().any(|(k, v)| computed_key(k, v.as_ref())),
+        _ => {}
     });
     found
+}
+
+/// Whether an index goes through `_dq_objkey`: anything but a string,
+/// which an object takes as it is.
+fn checked_index(i: &Term<&str>) -> bool {
+    !matches!(i, Term::Str(..))
+}
+
+/// Whether an object-construction key `k` is computed, so it goes through
+/// `_dq_key`: a string literal or `{$x}` (the key `"x"`) is a string.
+fn computed_key(k: &Term<&str>, v: Option<&Term<&str>>) -> bool {
+    match k {
+        Term::Str(..) => false,
+        Term::Var(_) => v.is_some(),
+        _ => true,
+    }
 }
 
 /// Call `f` on `t` and on every term inside it.
@@ -533,6 +599,19 @@ struct Printer {
     /// The variable the right-hand side of an assignment is bound to: one
     /// the program does not hold ([`rhs_var`]).
     rhs: String,
+    /// The prefix of the variables a checked index is bound to: one the
+    /// program does not hold, so no name with a number appended is in it.
+    key: String,
+    /// The number of index variables made so far.
+    keys: usize,
+    /// Printing the left-hand side the update itself runs on, after
+    /// `_dq_vivify` walked it in path mode. A native called there would
+    /// copy the whole document: jaq keeps the value a native's arguments
+    /// were bound on alive while the update runs, so `Rc::make_mut`
+    /// finds it shared. `_dq_vivify` has already refused a non-string
+    /// object key on the way, so an index needs no check here, and `.[k]?`
+    /// is checked with `if`, which jaq evaluates before the update.
+    update: bool,
     /// Printing the left-hand side of an assignment: each index on its
     /// paths goes through `_dq_index`, so an integral float (`.[2.0]`)
     /// indexes an array as the integer it is, as in jq — jaq's update
@@ -559,9 +638,12 @@ impl Printer {
                     if i > 0 {
                         self.out.push_str(", ");
                     }
-                    match k {
-                        Term::Var(_) | Term::Str(..) => self.term(k),
-                        _ => self.paren(k),
+                    if computed_key(k, v.as_ref()) {
+                        self.out.push_str("((");
+                        self.term(k);
+                        self.out.push_str(") | _dq_key)");
+                    } else {
+                        self.term(k);
                     }
                     if let Some(v) = v {
                         self.out.push_str(": ");
@@ -627,8 +709,10 @@ impl Printer {
                     // A definition's body is not the left-hand side of the
                     // assignment it may sit in.
                     let lhs = core::mem::replace(&mut self.lhs, false);
+                    let update = core::mem::replace(&mut self.update, false);
                     self.paren(&d.body);
                     self.lhs = lhs;
+                    self.update = update;
                     self.out.push_str("; ");
                 }
                 self.paren(t);
@@ -637,14 +721,89 @@ impl Printer {
                 self.out.push_str(name);
                 self.args(args);
             }
-            Term::Path(t, path) => {
-                match **t {
-                    Term::Id => self.out.push('.'),
-                    _ => self.paren(t),
-                }
-                self.path(path);
-            }
+            Term::Path(t, path) => self.path_term(t, &path.0),
         }
+    }
+
+    /// `t` followed by `parts`. The last index that is not a string
+    /// literal, `t[...][e]`, becomes
+    /// `((e) as $k | t[...] | _dq_objkey($k) | .[$k])`: `e` sees the
+    /// input `t` sees, as in jq, and the check sees the value indexed.
+    /// A number literal or a variable needs no binding. The parts after it
+    /// follow as they are.
+    fn path_term(&mut self, t: &Term<&str>, parts: &[(Part<Term<&str>>, Opt)]) {
+        let checked = parts
+            .iter()
+            .rposition(|(part, _)| matches!(part, Part::Index(i) if checked_index(i)));
+        let Some(at) = checked else {
+            match t {
+                Term::Id => self.out.push('.'),
+                _ => self.paren(t),
+            }
+            self.parts(parts);
+            return;
+        };
+        let (Part::Index(i), opt) = &parts[at] else {
+            unreachable!("rposition found an index");
+        };
+        if self.lhs && self.update && matches!(opt, Opt::Essential) {
+            // `_dq_vivify` checked this key already.
+            match t {
+                Term::Id => self.out.push('.'),
+                _ => self.paren(t),
+            }
+            self.parts(parts);
+            return;
+        }
+        self.out.push('(');
+        let key = match i {
+            Term::Num(n) | Term::Var(n) => (*n).to_owned(),
+            _ => {
+                let key = format!("{}_{}", self.key, self.keys);
+                self.keys += 1;
+                // The key expression is not on the left-hand side: it
+                // computes a value, not a path.
+                let lhs = core::mem::replace(&mut self.lhs, false);
+                self.paren(i);
+                self.lhs = lhs;
+                self.out.push_str(" as ");
+                self.out.push_str(&key);
+                self.out.push_str(" | ");
+                key
+            }
+        };
+        self.out.push('(');
+        self.path_term(t, &parts[..at]);
+        self.out.push_str(") | ");
+        if self.lhs && self.update {
+            self.out.push_str("if _dq_badkey(");
+            self.out.push_str(&key);
+            self.out.push_str(") then empty else ");
+        } else {
+            self.out.push_str(match opt {
+                Opt::Optional => "_dq_objkey_opt(",
+                Opt::Essential => "_dq_objkey(",
+            });
+            self.out.push_str(&key);
+            self.out.push_str(") | ");
+        }
+        self.out.push_str(".[");
+        if self.lhs {
+            self.out.push('(');
+            self.out.push_str(&key);
+            self.out.push_str(" | _dq_index)");
+        } else {
+            self.out.push_str(&key);
+        }
+        self.out.push(']');
+        if matches!(opt, Opt::Optional) {
+            self.out.push('?');
+        }
+        if self.lhs && self.update {
+            self.out.push_str(" end");
+        }
+        self.out.push(')');
+        self.parts(&parts[at + 1..]);
     }
 
     fn paren(&mut self, t: &Term<&str>) {
@@ -653,11 +812,14 @@ impl Printer {
         self.out.push(')');
     }
 
-    /// `t`, printed as the left-hand side of an assignment.
-    fn lhs(&mut self, t: &Term<&str>) {
+    /// `t`, printed as the left-hand side of an assignment, as
+    /// `_dq_vivify` walks it (`update` false) or as the update runs on it.
+    fn lhs(&mut self, t: &Term<&str>, update: bool) {
         let lhs = core::mem::replace(&mut self.lhs, true);
+        let was = core::mem::replace(&mut self.update, update);
         self.paren(t);
         self.lhs = lhs;
+        self.update = was;
     }
 
     fn args(&mut self, args: &[Term<&str>]) {
@@ -690,9 +852,9 @@ impl Printer {
         self.out.push_str(" as ");
         self.out.push_str(&self.rhs);
         self.out.push_str(" | _dq_vivify");
-        self.lhs(l);
+        self.lhs(l, false);
         self.out.push_str(" | ");
-        self.lhs(l);
+        self.lhs(l, true);
         self.out.push(' ');
         self.out.push_str(op);
         self.out.push(' ');
@@ -721,9 +883,9 @@ impl Printer {
             // `L |= F` needs no binding: F sees the value at the path.
             BinaryOp::Update => {
                 self.out.push_str("_dq_vivify");
-                self.lhs(l);
+                self.lhs(l, false);
                 self.out.push_str(" | ");
-                self.lhs(l);
+                self.lhs(l, true);
                 self.out.push_str(" |= ");
                 self.paren(r);
             }
@@ -758,8 +920,8 @@ impl Printer {
         }
     }
 
-    fn path(&mut self, path: &Path<Term<&str>>) {
-        for (part, opt) in &path.0 {
+    fn parts(&mut self, parts: &[(Part<Term<&str>>, Opt)]) {
+        for (part, opt) in parts {
             self.out.push('[');
             match part {
                 Part::Index(i) => self.index(i),
@@ -954,6 +1116,135 @@ mod tests {
     }
 
     #[test]
+    fn an_object_takes_only_a_string_key() {
+        // jaq looks any value up as an object key; jq 1.8.2 refuses each of
+        // these with the message given.
+        for (filter, input, message) in [
+            (".[1]", "{}", "Cannot index object with number (1)"),
+            (
+                r#".[1]"#,
+                r#"{"1":2}"#,
+                "Cannot index object with number (1)",
+            ),
+            (".[null]", "{}", "Cannot index object with null (null)"),
+            (".[true]", "{}", "Cannot index object with boolean (true)"),
+            (".[[1]]", "{}", "Cannot index object with array ([1])"),
+            (r#".[1, "a"]"#, "{}", "Cannot index object with number (1)"),
+            (
+                ".a[.n]",
+                r#"{"a":{},"n":1}"#,
+                "Cannot index object with number (1)",
+            ),
+            (".[1] = 1", "{}", "Cannot index object with number (1)"),
+            (".[1e300] = 1", "{}", "Cannot index object with number"),
+            (".[1] |= 1", "{}", "Cannot index object with number (1)"),
+            (
+                ".a[1] += 1",
+                r#"{"a":{}}"#,
+                "Cannot index object with number (1)",
+            ),
+            (".[1] //= 3", "{}", "Cannot index object with number (1)"),
+            ("path(.[1])", "{}", "Cannot index object with number (1)"),
+            (
+                "setpath([1]; 1)",
+                "{}",
+                "Cannot index object with number (1)",
+            ),
+            ("getpath([1])", "{}", "Cannot index object with number (1)"),
+            ("del(.[1])", "{}", "Cannot index object with number (1)"),
+            (
+                "delpaths([[1]])",
+                "{}",
+                "Cannot delete number field of object",
+            ),
+            ("pick(.[1])", "{}", "Cannot index object with number (1)"),
+            (
+                "has(1)",
+                "{}",
+                "Cannot check whether object has a number key",
+            ),
+            (
+                "has(\"a\")",
+                "[1]",
+                "Cannot check whether array has a string key",
+            ),
+            (
+                "1 | in({})",
+                "null",
+                "Cannot check whether object has a number key",
+            ),
+            ("{(1): 2}", "null", "Cannot use number (1) as object key"),
+            (
+                "1 as $x | {$x: 2}",
+                "null",
+                "Cannot use number (1) as object key",
+            ),
+            (
+                "from_entries",
+                r#"[{"key":1,"value":2}]"#,
+                "Cannot use number (1) as object key",
+            ),
+            (
+                "with_entries(.key |= 1)",
+                r#"{"a":1}"#,
+                "Cannot use number (1) as object key",
+            ),
+        ] {
+            let err = run(filter, input).expect_err(filter);
+            assert!(err.contains(message), "{filter} on {input}: {err}");
+        }
+    }
+
+    #[test]
+    fn string_keys_and_optional_indices_on_objects_still_work() {
+        // Each expectation is what jq 1.8.2 prints for the same program.
+        for (filter, input, want) in [
+            ("[.[1]?]", "{}", "[]"),
+            (".[1]? = 1", "{}", "{}"),
+            ("[.[1]?, .a]", "{}", "[null]"),
+            (
+                "try .[1] catch .",
+                "{}",
+                r#""Cannot index object with number (1)""#,
+            ),
+            (".[0]", "[5]", "5"),
+            (".[1]", "null", "null"),
+            (r#".["a"]"#, "{}", "null"),
+            (r#""a" as $k | .[$k] = 1"#, "{}", r#"{"a":1}"#),
+            (r#"has("a")"#, r#"{"a":1}"#, "true"),
+            ("has(0)", "[1]", "true"),
+            (
+                "[has(-1), has(0.5), has(1.5), has(nan)]",
+                "[1]",
+                "[false,true,false,false]",
+            ),
+            ("has(1)", "null", "false"),
+            (r#""a" | in({"a":1})"#, "null", "true"),
+            (
+                "to_entries | from_entries",
+                r#"{"a":1,"b":[2]}"#,
+                r#"{"a":1,"b":[2]}"#,
+            ),
+            ("with_entries(.value += 1)", r#"{"a":1}"#, r#"{"a":2}"#),
+            ("from_entries", r#"[{"name":"a","value":1}]"#, r#"{"a":1}"#),
+            ("from_entries", r#"[{"Key":"a","Value":3}]"#, r#"{"a":3}"#),
+            ("from_entries", r#"[{"key":"a"}]"#, r#"{"a":null}"#),
+            (
+                "from_entries",
+                r#"[{"key":"a","value":null,"Value":2}]"#,
+                r#"{"a":null}"#,
+            ),
+            ("pick(.a[1])", r#"{"a":[1,2]}"#, r#"{"a":[null,2]}"#),
+            ("pick(.[1])", "null", "[null,null]"),
+            (r#"getpath(["a", "b"])"#, "{}", "null"),
+            // jq evaluates the last index outermost.
+            ("[.[0, 1][0, 1]]", "[[1,2],[3,4]]", "[1,3,2,4]"),
+        ] {
+            assert_eq!(one(filter, input), want, "{filter} on {input}");
+        }
+    }
+
+    #[test]
     fn a_fractional_index_stays_refused() {
         // jq truncates (`.[1.5] = 1` is `[null,1]`); jaq refuses it.
         for (filter, input) in [(".[1.5] = 1", "null"), (".[1.5] = 9", "[1,2,3]")] {
@@ -1040,10 +1331,53 @@ mod tests {
             rewrite(".a |= . + 1").as_deref(),
             Some("_dq_vivify(.[(\"a\")]) | (.[(\"a\")]) |= ((.) + (1))")
         );
-        // An index that is not a string literal goes through `_dq_index`.
+        // An index that is not a string literal goes through `_dq_index`,
+        // and `_dq_vivify` checks it is no key an object refuses.
         assert_eq!(
             rewrite(".[$i] |= 1").as_deref(),
-            Some("_dq_vivify(.[(($i) | _dq_index)]) | (.[(($i) | _dq_index)]) |= (1)")
+            Some(
+                "_dq_vivify(((.) | _dq_objkey($i) | .[($i | _dq_index)])) \
+                 | (.[(($i) | _dq_index)]) |= (1)"
+            )
+        );
+        // `.[k]?` is checked on the update side too, without a native.
+        assert_eq!(
+            rewrite(".[0]? = 1").as_deref(),
+            Some(
+                "(1) as $__dq_rhs | _dq_vivify(((.) | _dq_objkey_opt(0) | .[(0 | _dq_index)]?)) \
+                 | (((.) | if _dq_badkey(0) then empty else .[(0 | _dq_index)]? end)) = $__dq_rhs"
+            )
+        );
+    }
+
+    #[test]
+    fn rewrite_checks_each_index_that_is_not_a_string_literal() {
+        assert_eq!(rewrite(".a.b"), None);
+        assert_eq!(rewrite(r#".["a"]"#), None);
+        assert_eq!(
+            rewrite(".[0]").as_deref(),
+            Some("((.) | _dq_objkey(0) | .[0])")
+        );
+        // The key is computed once, from the input the indexed term sees;
+        // the last index binds outermost, as jq evaluates it.
+        assert_eq!(
+            rewrite(".a[.k][1]").as_deref(),
+            Some(
+                "((((.[(\"k\")]) as $__dq_key_0 | (.[(\"a\")]) | _dq_objkey($__dq_key_0) \
+                 | .[$__dq_key_0])) | _dq_objkey(1) | .[1])"
+            )
+        );
+        // A variable the program holds is not captured.
+        assert_eq!(
+            rewrite(".[.k] as $__dq_key | $__dq_key").as_deref(),
+            Some(
+                "(((.[(\"k\")]) as $__dq_key1_0 | (.) | _dq_objkey($__dq_key1_0) \
+                 | .[$__dq_key1_0])) as $__dq_key | ($__dq_key)"
+            )
+        );
+        assert_eq!(
+            rewrite("{(.k): 1, $x, $y: 2}").as_deref(),
+            Some("{((.[(\"k\")]) | _dq_key): (1), $x, (($y) | _dq_key): (2)}")
         );
     }
 

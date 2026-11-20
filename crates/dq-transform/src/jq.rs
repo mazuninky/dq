@@ -192,6 +192,8 @@ pub use stub::{JqEngine, ir_to_val, serde_to_val, val_to_owned_ir, val_to_serde}
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "embedded-jq")]
+mod keys;
+#[cfg(feature = "embedded-jq")]
 mod paths;
 
 #[cfg(feature = "embedded-jq")]
@@ -340,8 +342,9 @@ mod imp {
     }
 
     /// Load and compile `expression` with jaq's definitions and natives,
-    /// then dq's (see [`paths`]), which shadow jaq's `setpath`,
-    /// `delpaths` and `del`.
+    /// then dq's (see [`paths`] and [`super::keys`]), which shadow jaq's
+    /// `setpath`, `getpath`, `delpaths`, `del`, `has`, `in`, `pick`,
+    /// `from_entries` and `with_entries`.
     fn compile_filter(expression: &str) -> Result<jaq_core::Filter<data::JustLut<Val>>, JqError> {
         let defs = jaq_core::defs()
             .chain(jaq_std::defs())
@@ -350,7 +353,8 @@ mod imp {
         let funs = jaq_core::funs::<data::JustLut<Val>>()
             .chain(jaq_std::funs())
             .chain(jaq_json::funs())
-            .chain(paths::funs());
+            .chain(paths::funs())
+            .chain(super::keys::funs());
 
         let loader = Loader::new(defs);
         let arena = Arena::default();

@@ -13,9 +13,9 @@ lives in `crates/dq-transform/src/jq.rs` and is used by `dq query`,
 are `Send + Sync`). The standard definitions are loaded: `map`, `select`,
 `length`, `sort_by`, `group_by`, `keys`, `values`, `del`, `to_entries` /
 `from_entries`, regex (`test`, `sub`, …), formats, math, time, `tojson` /
-`fromjson`. Differences from jq 1.7 are jaq's, except path assignment, which
-dq makes behave as in jq (below); dq adds no functions of its own beyond
-the internal `_dq_*` helpers this relies on.
+`fromjson`. Differences from jq 1.7 are jaq's, except path assignment and
+object keys, which dq makes behave as in jq (below); dq adds no functions of
+its own beyond the internal `_dq_*` helpers this relies on.
 Command-line variables (`--arg`, `--argjson`, `--slurpfile`) are not
 available.
 
@@ -69,6 +69,44 @@ jq gives `{"a":[1]}`) and a fractional index fail (jq truncates: `.[1.5] = 1`
 gives `[null,1]`); an integral float index outside an assignment's left-hand
 side still fails as in jaq (`.[2.0]` read from an array, `del(.[1.0])`); `.a.b |= empty` on `{}`
 gives `{"a":{}}` where jq gives `{}`.
+
+## Object keys
+
+An object key is a string, as in jq; jaq would take any value as one. Each of
+these is a jq runtime error (exit 1), with jq's message:
+
+| Program | Input | Error |
+|---|---|---|
+| `.[1]`, `.[1] = 1`, `.[1] \|= 1`, `path(.[1])`, `getpath([1])`, `setpath([1]; 1)`, `del(.[1])`, `pick(.[1])` | `{}` | `Cannot index object with number (1)` |
+| `.[null]`, `.[true]`, `.[[1]]` | `{}` | `Cannot index object with null (null)` (`boolean`, `array`) |
+| `delpaths([[1]])` | `{}` | `Cannot delete number field of object` |
+| `has(1)`, `1 \| in({})` | `{}` | `Cannot check whether object has a number key` |
+| `{(1): 2}`, `1 as $x \| {$x: 2}` | any | `Cannot use number (1) as object key` |
+| `from_entries` | `[{"key":1,"value":2}]` | `Cannot use number (1) as object key` |
+
+Before, jaq read `null` there, and an assignment wrote the key as a string:
+`.[1] = 1` on `{}` gave `{"1":1}`, and `.[1e300] = 1` the key
+`9223372036854775807`. `.[1]?` on an object gives nothing, and
+`.[1]? = 1` leaves the object as it is, as in jq.
+
+`has` is jq's: an array has a number `k` when `0 <= k < length`, null has
+nothing (`false`), any other pairing is an error. `from_entries` takes the
+names jq 1.8 takes — the key from `key`, `Key`, `name` or `Name` (the first
+that is neither null nor false), the value from `value`, else `Value` — so
+`to_entries | from_entries` gives back the object. `pick` is jq's definition
+(`null | pick(.[1])` is `[null,null]`).
+
+How: the rewrite of the program (see Path assignment) also puts every index
+but a string literal through `_dq_objkey`, which fails on an object with a
+key that is not a string: `t[e]` becomes `(e) as $__dq_key_N | t |
+_dq_objkey($__dq_key_N) | .[$__dq_key_N]` (no binding for a number literal or
+a variable). `e` is computed once from the input `t` sees, and the last index
+of a chain binds outermost, so `[.[0,1][0,1]]` on `[[1,2],[3,4]]` gives jq's
+`[1,3,2,4]` (jaq gave `[1,2,3,4]`). On the left-hand side of an assignment the
+check runs in `_dq_vivify`, before the update. A computed key of an object
+construction goes through `_dq_key`. `getpath`, `has`, `in`, `pick`,
+`from_entries` and `with_entries` are redefined. The natives are in
+`crates/dq-transform/src/jq/keys.rs`.
 
 ## API
 
