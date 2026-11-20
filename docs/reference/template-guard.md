@@ -116,7 +116,11 @@ same placeholders. Text that spells a placeholder only once its escapes are
 read (YAML `"DQtpl\x78q0qx"`, JSON `"DQtpl\u0078q0qx"`) is caught too: the
 file is read a second time with placeholders of the same length spelled with
 `y` (`DQtplyq0qx`), and where the two readings differ apart from the
-placeholders, both get one more letter. The placeholder is
+placeholders, both get one more letter, up to eight. A file that spells the
+placeholder text at every one of those lengths is refused (exit 3,
+`file contains Go template syntax`, with a hint naming the placeholder text),
+never read wrongly. A file with no `\` and no `&` spells nothing with
+escapes, and is read once. The placeholder is
 letters and digits only, so every format reads it as plain text: Markdown
 took the former `__DQ_TPL_<N>__` for strong emphasis, and a template alone in
 a paragraph came back as a `strong` node holding `DQ_TPL_0`. HCL reads a bare

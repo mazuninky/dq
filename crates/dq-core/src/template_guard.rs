@@ -148,14 +148,57 @@ fn substitute_with(bytes: &[u8], marks: &Marks) -> (Vec<u8>, HashMap<String, Str
 /// is possible across the map.
 #[must_use]
 pub fn restore_placeholders(bytes: &[u8], map: &HashMap<String, String>) -> Vec<u8> {
-    // Decode lossily — placeholders are pure ASCII, so any non-UTF-8 bytes in
-    // the surrounding text round-trip through the lossy path unchanged in the
-    // common case (and template files are UTF-8 in practice).
-    let mut text = String::from_utf8_lossy(bytes).into_owned();
-    for (placeholder, original) in map {
-        text = text.replace(placeholder, original);
+    match Restorer::new(map) {
+        Some(restorer) => restorer.restore(bytes).into_owned(),
+        None => bytes.to_vec(),
     }
-    text.into_bytes()
+}
+
+/// Puts the template text back in place of the placeholders of one map, in
+/// one scan of the text: every match of the placeholder pattern looked up
+/// by its text, rather than every placeholder looked for in turn — a file
+/// of thousands of templates would cost thousands of scans per string.
+struct Restorer<'m> {
+    /// A placeholder of the map's prefix (all of a map's share it).
+    re: Regex,
+    map: &'m HashMap<String, String>,
+}
+
+impl<'m> Restorer<'m> {
+    /// `None` for an empty map, which has nothing to put back.
+    fn new(map: &'m HashMap<String, String>) -> Option<Self> {
+        let any = map.keys().next()?;
+        let prefix = any
+            .strip_suffix(MARK_SUFFIX)
+            .unwrap_or(any)
+            .trim_end_matches(|c: char| c.is_ascii_digit());
+        let re = Regex::new(&format!("{}[0-9]+{MARK_SUFFIX}", regex::escape(prefix)))
+            .expect("placeholder regex must compile");
+        Some(Self { re, map })
+    }
+
+    /// Whether `text` holds a placeholder of the map.
+    fn holds(&self, text: &str) -> bool {
+        self.re
+            .find_iter(text.as_bytes())
+            .any(|m| self.map.contains_key(lossy(m.as_bytes()).as_ref()))
+    }
+
+    /// `text` with every placeholder of the map its template text.
+    fn restore<'t>(&self, text: &'t [u8]) -> std::borrow::Cow<'t, [u8]> {
+        self.re
+            .replace_all(text, |caps: &regex::bytes::Captures<'_>| {
+                let found = &caps[0];
+                self.map
+                    .get(lossy(found).as_ref())
+                    .map_or_else(|| found.to_vec(), |original| original.as_bytes().to_vec())
+            })
+    }
+}
+
+/// `bytes` as text: placeholders are ASCII.
+fn lossy(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
+    String::from_utf8_lossy(bytes)
 }
 
 /// How a command that reads a file treats the templates in it — the guard
@@ -325,17 +368,26 @@ const MAX_FILL: usize = 8;
 /// with placeholders of the same length spelled with `y`, and the two
 /// readings must say the same once the placeholders are set aside. Where
 /// they do not, the data holds a prefix's text, and both are tried again
-/// one fill letter longer.
+/// one fill letter longer — up to [`MAX_FILL`] letters, past which the
+/// file is refused rather than read wrongly. Bytes with no escape character
+/// (`\\`, or `&` for an XML or Markdown character reference) spell no
+/// prefix the bytes do not hold, and are read once.
+///
+/// # Errors
+///
+/// The error of `parse`; [`crate::Error::TemplatedFile`] for bytes that
+/// spell every prefix tried.
 fn parse_placeheld(
     bytes: &[u8],
     parse: impl Fn(&[u8]) -> crate::Result<crate::Document>,
 ) -> crate::Result<(crate::Document, HashMap<String, String>)> {
+    let escapes = bytes.iter().any(|&b| b == b'\\' || b == b'&');
     let mut min_fill = 1;
     loop {
         let (marks, twin) = Marks::pair(bytes, min_fill);
         let (text, map) = substitute_with(bytes, &marks);
         let doc = parse(&text)?;
-        if map.is_empty() || marks.fill >= MAX_FILL {
+        if map.is_empty() || !escapes {
             return Ok((doc, map));
         }
         let (twin_text, _) = substitute_with(bytes, &twin);
@@ -344,7 +396,33 @@ fn parse_placeheld(
         if alike {
             return Ok((doc, map));
         }
+        if marks.fill >= MAX_FILL {
+            return Err(spells_every_placeholder(bytes));
+        }
         min_fill = marks.fill + 1;
+    }
+}
+
+/// The refusal of `bytes` that spell, with escapes, the placeholder text
+/// of every prefix [`parse_placeheld`] tries: the first template's line.
+fn spells_every_placeholder(bytes: &[u8]) -> crate::Error {
+    let at = substitution_regex().find(bytes).map_or(0, |m| m.start());
+    let line = 1 + bytes[..at].iter().filter(|&&b| b == b'\n').count();
+    let marker = u32::try_from(line)
+        .ok()
+        .and_then(|line| marker_on_line(bytes, line))
+        .unwrap_or(TemplateMarker {
+            line: 1,
+            snippet: String::new(),
+        });
+    crate::Error::TemplatedFile {
+        line: marker.line,
+        snippet: marker.snippet,
+        hint: format!(
+            "the file spells dq's placeholder text (`DQtplxq0qx`, with up to {MAX_FILL} `x`) \
+             with escapes, so --raw-template-strings cannot tell its templates apart from it; \
+             use --allow-templates to parse anyway"
+        ),
     }
 }
 
@@ -564,30 +642,37 @@ fn snippet_of(raw_line: &[u8]) -> String {
 /// and keys of `value` — the read-side counterpart of
 /// [`restore_placeholders`], which works on bytes. Key order is kept.
 pub fn restore_in_value(value: &mut crate::Value, map: &HashMap<String, String>) {
+    if let Some(restorer) = Restorer::new(map) {
+        restore_value(value, &restorer);
+    }
+}
+
+/// [`restore_in_value`] with the map's [`Restorer`].
+fn restore_value(value: &mut crate::Value, restorer: &Restorer<'_>) {
     use crate::Value;
     match value {
         Value::String(s) => {
-            if let Some(restored) = restore_in_str(s, map) {
+            if let Some(restored) = restore_in_str(s, restorer) {
                 *s = restored;
             }
         }
         Value::Array(items) => {
             for item in items {
-                restore_in_value(item, map);
+                restore_value(item, restorer);
             }
         }
         Value::Map(entries) => {
-            let keyed = entries.keys().any(|k| holds_placeholder(k, map));
+            let keyed = entries.keys().any(|k| restorer.holds(k));
             if keyed {
                 let old = std::mem::take(entries);
                 for (key, mut item) in old {
-                    restore_in_value(&mut item, map);
-                    let key = restore_in_str(&key, map).unwrap_or(key);
+                    restore_value(&mut item, restorer);
+                    let key = restore_in_str(&key, restorer).unwrap_or(key);
                     entries.insert(key, item);
                 }
             } else {
                 for item in entries.values_mut() {
-                    restore_in_value(item, map);
+                    restore_value(item, restorer);
                 }
             }
         }
@@ -600,36 +685,24 @@ pub fn restore_in_value(value: &mut crate::Value, map: &HashMap<String, String>)
     }
 }
 
-/// Whether `s` holds one of the placeholders of `map`.
-fn holds_placeholder(s: &str, map: &HashMap<String, String>) -> bool {
-    map.keys()
-        .any(|placeholder| s.contains(placeholder.as_str()))
-}
-
 /// `s` with each placeholder replaced by its template text; `None` when `s`
 /// holds no placeholder.
 ///
 /// A string that is a placeholder in `${…}` alone is the template alone:
 /// HCL reads a bare placeholder (`a = {{ .x }}`) as an expression and
 /// spells it `${placeholder}`.
-fn restore_in_str(s: &str, map: &HashMap<String, String>) -> Option<String> {
-    if !holds_placeholder(s, map) {
+fn restore_in_str(s: &str, restorer: &Restorer<'_>) -> Option<String> {
+    if !restorer.holds(s) {
         return None;
     }
     if let Some(original) = s
         .strip_prefix("${")
         .and_then(|rest| rest.strip_suffix('}'))
-        .and_then(|placeholder| map.get(placeholder))
+        .and_then(|placeholder| restorer.map.get(placeholder))
     {
         return Some(original.clone());
     }
-    let mut text = s.to_owned();
-    for (placeholder, original) in map {
-        if text.contains(placeholder.as_str()) {
-            text = text.replace(placeholder.as_str(), original);
-        }
-    }
-    Some(text)
+    Some(String::from_utf8_lossy(&restorer.restore(s.as_bytes())).into_owned())
 }
 
 /// The template guard of one write: what [`parse_for_write`] decided, and
@@ -1531,6 +1604,38 @@ mod tests {
             String::from_utf8_lossy(&substituted),
             String::from_utf8_lossy(&restored),
         );
+    }
+
+    #[test]
+    fn restoring_many_templates_is_linear() {
+        // Each string used to be checked against every placeholder: 20 000
+        // templates took tens of seconds in a debug build. One scan per
+        // string takes milliseconds; the bound is generous.
+        let n = 20_000;
+        let text: String = (0..n)
+            .map(|i| format!("k{i}: \"a {{{{ .v{i} }}}} b\"\n"))
+            .collect();
+        let (substituted, map) = substitute_placeholders(text.as_bytes());
+        let mut value = crate::Value::Array(
+            std::str::from_utf8(&substituted)
+                .expect("ascii")
+                .lines()
+                .map(|line| crate::Value::String(line.to_owned()))
+                .collect(),
+        );
+        let started = std::time::Instant::now();
+        restore_in_value(&mut value, &map);
+        let restored = restore_placeholders(&substituted, &map);
+        let took = started.elapsed();
+        assert_eq!(restored, text.as_bytes());
+        let crate::Value::Array(items) = &value else {
+            panic!("an array")
+        };
+        assert_eq!(
+            items[7],
+            crate::Value::String("k7: \"a {{ .v7 }} b\"".into())
+        );
+        assert!(took < std::time::Duration::from_secs(5), "{took:?}");
     }
 
     #[test]

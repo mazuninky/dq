@@ -302,3 +302,38 @@ fn raw_template_strings_leave_escaped_placeholder_text_alone() {
         assert_eq!(get("/z"), "1\n", "{name}: {written:?}");
     }
 }
+
+/// A file that spells a placeholder with escapes at every length dq tries
+/// is refused (exit 3), never read wrongly. Was: exit 0, `a8` read as the
+/// template `{{ .X }}`.
+#[test]
+fn raw_template_strings_refuse_a_file_that_spells_every_placeholder() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut src = String::new();
+    for k in 1..=8 {
+        src.push_str(&format!("a{k}: \"DQtpl{}q0qx\"\n", "\\x78".repeat(k)));
+    }
+    src.push_str("b: \"{{ .X }}\"\n");
+    let file = write(dir.path(), "e.yaml", &src);
+    let out = dq()
+        .args(["--no-color", "--raw-template-strings", "get", &file, "/a8"])
+        .assert()
+        .code(3);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+    assert!(
+        stderr.starts_with("file contains Go template syntax (line 9): b: \"{{ .X }}\"\n  hint: "),
+        "{stderr}"
+    );
+    assert!(stderr.contains("DQtplxq"), "{stderr}");
+    // Below the cap the file reads as it is.
+    let src: String = src.lines().skip(1).map(|l| format!("{l}\n")).collect();
+    let file = write(dir.path(), "f.yaml", &src);
+    let out = dq()
+        .args(["--no-color", "--raw-template-strings", "get", &file, "/a8"])
+        .assert()
+        .success();
+    assert_eq!(
+        String::from_utf8_lossy(&out.get_output().stdout),
+        "DQtplxxxxxxxxq0qx\n"
+    );
+}
