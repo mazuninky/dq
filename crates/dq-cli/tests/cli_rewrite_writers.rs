@@ -188,6 +188,16 @@ fn hcl_point_edits_write_every_expression_back_as_its_source() {
         ],
         &tf_expressions_written("\"x\""),
     );
+    edits_to(
+        "main.tf",
+        TF_EXPRESSIONS,
+        &[
+            "merge",
+            "main.tf",
+            r#"{"variable": {"ami": {"default": "x"}}}"#,
+        ],
+        &tf_expressions_written("\"x\""),
+    );
 }
 
 #[test]
@@ -278,6 +288,76 @@ fn hcl_an_edit_no_writer_can_keep_an_expression_through_is_refused() {
     );
 }
 
+#[test]
+fn hcl_an_object_with_expression_keys_keeps_them_through_a_jq_edit() {
+    // Was: `"(var.k)" = 1`, a literal key, exit 0.
+    edits_to(
+        "a.tf",
+        "tags = { (var.k) = 1, b = 2 }\n",
+        &["set", "a.tf", "--jq", ".tags.b = 3"],
+        "tags = {\n  (var.k) = 1\n  \"b\" = 3\n}\n",
+    );
+    // A member read from an expression keeps it too, and an object moved
+    // whole keeps its one expression key.
+    edits_to(
+        "a.tf",
+        "tags = { (var.k) = var.v, b = 2 }\n",
+        &["set", "a.tf", "--jq", ".t = .tags | .tags.b = 3"],
+        "tags = {\n  (var.k) = var.v\n  \"b\" = 3\n}\nt = {\n  (var.k) = var.v\n  \"b\" = 2\n}\n",
+    );
+    // Two keys of different source that read as one string: dq cannot tell
+    // which to write where the filter moved it.
+    refused(
+        "a.tf",
+        "a = { (var.k) = 1 }\nb = { (var.k ) = 2 }\n",
+        &["set", "a.tf", "--jq", ".c = .a | .a.x = 1"],
+        1,
+        "hcl format error: '/c': the key \"(var.k)\" is what more than one expression key of \
+         the file reads as, and the edit moved it; dq cannot tell which expression to write \
+         there\n",
+    );
+}
+
+#[test]
+fn hcl_a_string_set_over_an_expression_that_reads_as_it_is_written_as_a_string() {
+    // Was: the file left as it was (`x = var.a`), exit 0: the string set
+    // reads as what the expression reads as.
+    for args in [
+        &["set", "s.tf", "/x", "${var.a}"][..],
+        &["set", "s.tf", "/x", "--value-string", "${var.a}"],
+        &[
+            "patch",
+            "s.tf",
+            r#"[{"op": "replace", "path": "/x", "value": "${var.a}"}]"#,
+        ],
+    ] {
+        edits_to("s.tf", "x = var.a\n", args, "x = \"$${var.a}\"\n");
+    }
+}
+
+#[test]
+fn hcl_a_moved_string_two_sources_read_as_is_refused_even_at_its_own_path() {
+    let src = "a = \"$${var.x}\"\nb = var.x\n";
+    // Was: `a = "$${var.x}"`, exit 0 — the expression moved into `a` came
+    // out as the literal read there.
+    refused(
+        "m.tf",
+        src,
+        &["set", "m.tf", "--jq", ".a = .b | .b = \"z\""],
+        1,
+        "hcl format error: '/a': the string \"${var.x}\" is what more than one expression of \
+         the file reads as, and the edit moved it; dq cannot tell which expression to write \
+         there\n",
+    );
+    // Nothing moved: each stays what it was.
+    edits_to(
+        "m.tf",
+        src,
+        &["set", "m.tf", "--jq", ".c = 1"],
+        "a = \"$${var.x}\"\nb = var.x\nc = 1\n",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // An edit that changes nothing leaves the bytes alone
 // ---------------------------------------------------------------------------
@@ -338,8 +418,8 @@ fn a_rewrite_edit_that_changes_nothing_leaves_the_file_as_it_was() {
     );
     let env = "# keep me\nexport A=1\n";
     edits_to(".env", env, &["set", ".env", "/A", "1"], env);
-    let tf = "# keep me\nami = var.ami\n";
-    edits_to("a.tf", tf, &["set", "a.tf", "/ami", "${var.ami}"], tf);
+    let tf = "# keep me\nami = var.ami\nn = 1\n";
+    edits_to("a.tf", tf, &["set", "a.tf", "/n", "1"], tf);
     let csv = "n,a\nx,1\n";
     edits_to("t.csv", csv, &["set", "t.csv", "/0/a", "1"], csv);
 }

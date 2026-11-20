@@ -257,6 +257,18 @@ pub(crate) enum Layout {
     Xml(crate::parsers::xml::XmlLayout),
 }
 
+impl Layout {
+    /// Whether this layout, `before`'s after a point edit, no longer notes
+    /// every HCL expression `before` does where `before` does: the edit
+    /// replaced or removed one, or moved one with an array item.
+    fn drops_expressions_of(&self, before: &Self) -> bool {
+        match (before, self) {
+            (Self::Hcl(before), Self::Hcl(after)) => before.notes_differ(after),
+            _ => false,
+        }
+    }
+}
+
 /// The not-a-number or infinite float a number literal spells in YAML
 /// (`.nan`, `-.inf`, `.Inf`) or TOML (`nan`, `+inf`) — how a
 /// [`Value::BigFloat`] carries one; `None` for any other literal.
@@ -1301,8 +1313,10 @@ impl Document {
         let mut tree = self.value.clone();
         edit(&mut tree)?;
         // An edit that changes no data leaves the bytes — comments, layout
-        // — as they are, as long as there are bytes to leave.
-        let keep = !self.original_bytes.is_empty();
+        // — as they are, as long as there are bytes to leave, and it
+        // replaces no HCL expression: the string `${var.a}` set over
+        // `var.a`, which reads as it, is a string the user asked for.
+        let keep = !self.original_bytes.is_empty() && !layout.drops_expressions_of(&self.layout);
         if keep && tree.same_data(&self.value) {
             return Ok(());
         }

@@ -250,18 +250,25 @@ its source is recorded at its pointer. A rewrite (a point edit, `patch`,
 `merge`, `fix.ops`, `set --jq`, `fix.jq`, `fmt`) writes a value that still
 reads as what its expression read as back as that source, byte for byte;
 an object with a key that is an expression (`{ (var.k) = 1 }`) is kept
-whole the same way. A point edit moves the expressions of the items after
+whole the same way, and when a filter edits it, each expression key
+(`(var.k)`, which reads as the string `(var.k)`) and each member read from
+an expression is still written as its source, never as a literal key. A
+point edit moves the expressions of the items after
 one it deletes or inserts along with them; after `set --jq` or `fix.jq` a
 string that is what an expression of the file read as is written as that
-expression wherever the filter put it. A string you set is a string:
-`dq set a.tf /x '${y}'` writes `x = "$${y}"`. What no writer can keep is
+expression wherever the filter put it, and so is an object key. A string you set is a string:
+`dq set a.tf /x '${y}'` writes `x = "$${y}"`, even over an expression that
+reads as it (`x = var.a` and `dq set a.tf /x '${var.a}'` write
+`x = "$${var.a}"`). What no writer can keep is
 refused, exit 1, the file untouched: a point edit into an expression
 (`dq set a.tf /tags/Name x` where `tags = merge(…)`: "cannot set
 '/tags/Name': '/tags' is the expression `merge(…)`, whose value HCL
 computes; dq can replace the whole expression, not edit inside it"), a
 filter that turns the string of an expression into another one holding
-`${` or `%{` (`.name |= sub("web"; "api")`), and a moved string that two
-expressions of different source read as (`var.a` and `"${var.a}"`). Only
+`${` or `%{` (`.name |= sub("web"; "api")`), and a moved string or object
+key that two expressions of different source read as (`var.a` and
+`"$${var.a}"`, both `${var.a}`) — even at a place one of them was read at,
+unless every such string is still at exactly the places they were read at. Only
 the expression is kept, not the spacing around it: `ami   = var.ami` is
 written `ami = var.ami`; a comma after a heredoc item goes on the line
 after its closing marker.

@@ -67,8 +67,17 @@ impl Format for Hcl {
             path: Vec::new(),
             layout: HclLayout::default(),
         };
-        let (value, exprs) = reader.body_to_value(&body)?;
-        reader.layout.exprs = exprs.into_iter().collect();
+        let (value, notes) = reader.body_to_value(&body)?;
+        for (at, note) in notes {
+            match note {
+                Note::Expr(expr) => {
+                    reader.layout.exprs.insert(at, expr);
+                }
+                Note::Key(source) => {
+                    reader.layout.keys.insert(at, source);
+                }
+            }
+        }
         Ok(Document::value_only(value, FormatTag::Hcl)
             .with_layout(Layout::Hcl(reader.layout))
             .with_source_bytes(bytes))
@@ -123,6 +132,11 @@ pub(crate) struct HclLayout {
     /// path from the root (the index of a repeated block or of an array
     /// item included): what it read as, and its source text.
     exprs: HashMap<Vec<String>, Expr>,
+    /// The source of every object key read from an expression
+    /// (`(var.k) = 1`), by the exact path of its member — the key is the
+    /// string it read as, the last segment. Written as a string, such a key
+    /// would be a literal key, no longer the expression.
+    keys: HashMap<Vec<String>, String>,
     /// Whether the tree written may have moved values since they were
     /// read (`set --jq`, `fix.jq`): an expression's value is then also
     /// looked for away from its place. A point edit moves nothing it does
@@ -194,18 +208,15 @@ impl HclLayout {
                 ),
             });
         }
-        let mut out = Self {
-            blocks: self.blocks.clone(),
-            exprs: HashMap::with_capacity(self.exprs.len()),
-            moved: false,
-        };
         let shift = match (in_array, path.split_last()) {
             (true, Some((last, parent))) => last.parse::<usize>().ok().map(|i| (parent, i)),
             _ => None,
         };
-        for (at, expr) in &self.exprs {
+        // Where the note at `at` is after the edit: gone with a value set or
+        // deleted, moved with an array item shifted.
+        let after = |at: &Vec<String>| -> Option<Vec<String>> {
             if action != "insert" && at.starts_with(path) {
-                continue;
+                return None;
             }
             let mut at = at.clone();
             if let Some((parent, i)) = shift
@@ -219,9 +230,29 @@ impl HclLayout {
                     _ => {}
                 }
             }
-            out.exprs.insert(at, expr.clone());
-        }
-        Ok(out)
+            Some(at)
+        };
+        Ok(Self {
+            blocks: self.blocks.clone(),
+            exprs: self
+                .exprs
+                .iter()
+                .filter_map(|(at, expr)| Some((after(at)?, expr.clone())))
+                .collect(),
+            keys: self
+                .keys
+                .iter()
+                .filter_map(|(at, source)| Some((after(at)?, source.clone())))
+                .collect(),
+            moved: false,
+        })
+    }
+
+    /// Whether `other`, this layout after an edit, notes its expressions and
+    /// expression keys elsewhere or not at all: the edit replaced, removed or
+    /// moved one.
+    pub(crate) fn notes_differ(&self, other: &Self) -> bool {
+        self.exprs != other.exprs || self.keys != other.keys
     }
 }
 
@@ -260,8 +291,17 @@ struct Reader<'a> {
     layout: HclLayout,
 }
 
+/// What the reader notes of an expression: what it read as and its source
+/// ([`HclLayout::exprs`]), or the source of an object key
+/// ([`HclLayout::keys`]).
+#[derive(Debug, Clone)]
+enum Note {
+    Expr(Expr),
+    Key(String),
+}
+
 /// The expressions of a body, each by its path from that body.
-type BodyExprs = Vec<(Vec<String>, Expr)>;
+type BodyExprs = Vec<(Vec<String>, Note)>;
 
 impl Reader<'_> {
     /// Convert a body (top-level or nested block body), as `hcl-edit` reads
@@ -529,8 +569,11 @@ fn check_expression_keys(expr: &Expression) -> Result<()> {
 /// its body) that a value cannot spell, with its source: an expression
 /// other than a literal, an array or an object of literal keys — and a
 /// string holding `${` or `%{`, which the writer would escape. The items
-/// of an array and the members of an object are looked into; an object
-/// with a key that is an expression is noted whole.
+/// of an array and the members of an object are looked into. An object
+/// with a key that is an expression is noted whole, so a point edit inside
+/// it is refused, and each such key's source is noted by its member's
+/// path; its members are looked into as well, for a transform that edits
+/// the object to write each key and member that stays as it was.
 fn collect_exprs(
     text: &str,
     expr: &hcl::edit::expr::Expression,
@@ -564,17 +607,44 @@ fn collect_exprs(
                 path.pop();
             }
         }
-        _ => {
-            if let Some(source) = expr.span().and_then(|span| text.get(span)) {
-                out.push((
-                    path.clone(),
-                    Expr {
-                        value: value.clone(),
-                        source: source.to_owned(),
-                    },
-                ));
+        (EditExpression::Object(object), Value::Map(map)) if object.len() == map.len() => {
+            note_whole(text, expr, value, path, out);
+            for ((object_key, member), (key, value)) in object.iter().zip(map) {
+                path.push(key.clone());
+                // A number key reads as the same key written as a string.
+                if let ObjectKey::Expression(key_expr) = object_key
+                    && !matches!(
+                        key_expr,
+                        EditExpression::String(_) | EditExpression::Number(_)
+                    )
+                    && let Some(source) = object_key.span().and_then(|span| text.get(span))
+                {
+                    out.push((path.clone(), Note::Key(source.to_owned())));
+                }
+                collect_exprs(text, member.expr(), value, path, out);
+                path.pop();
             }
         }
+        _ => note_whole(text, expr, value, path, out),
+    }
+}
+
+/// Note in `out` the expression `expr`, read as `value` at `path`, whole.
+fn note_whole(
+    text: &str,
+    expr: &hcl::edit::expr::Expression,
+    value: &Value,
+    path: &[String],
+    out: &mut BodyExprs,
+) {
+    if let Some(source) = expr.span().and_then(|span| text.get(span)) {
+        out.push((
+            path.to_vec(),
+            Note::Expr(Expr {
+                value: value.clone(),
+                source: source.to_owned(),
+            }),
+        ));
     }
 }
 
@@ -713,26 +783,44 @@ fn write_body(map: &IndexMap<String, Value>, layout: Option<&HclLayout>) -> Resu
     // looked for by the string it read as: each such string, with the one
     // source it was read from, or `None` when two sources read as it.
     let mut by_string: HashMap<&str, Option<&str>> = HashMap::new();
+    // The same for an object key read from an expression, by the string
+    // it read as.
+    let mut by_key: HashMap<&str, Option<&str>> = HashMap::new();
+    // The strings two sources read as that are no longer each at a place
+    // one of them was read at.
+    let mut unsettled = std::collections::HashSet::new();
     if let Some(layout) = layout.filter(|layout| layout.moved) {
+        let one_source = |seen: &mut Option<&str>, source: &str| {
+            if *seen != Some(source) {
+                *seen = None;
+            }
+        };
         for expr in layout.exprs.values() {
             if let Value::String(s) = &expr.value
                 && has_template_marker(s)
             {
                 by_string
                     .entry(s.as_str())
-                    .and_modify(|seen| {
-                        if *seen != Some(expr.source.as_str()) {
-                            *seen = None;
-                        }
-                    })
+                    .and_modify(|seen| one_source(seen, &expr.source))
                     .or_insert(Some(expr.source.as_str()));
             }
         }
+        for (at, source) in &layout.keys {
+            if let Some(key) = at.last() {
+                by_key
+                    .entry(key.as_str())
+                    .and_modify(|seen| one_source(seen, source))
+                    .or_insert(Some(source.as_str()));
+            }
+        }
+        unsettled = unsettled_strings(map, layout, &by_string);
     }
     let mut writer = BodyWriter {
         out: String::new(),
         layout,
         by_string,
+        by_key,
+        unsettled,
         path: Vec::new(),
         exact: Vec::new(),
         bad_key: None,
@@ -744,12 +832,92 @@ fn write_body(map: &IndexMap<String, Value>, layout: Option<&HclLayout>) -> Resu
     }
 }
 
+/// Of the strings more than one source read as (`None` in `by_string`),
+/// those a transform may have moved: the places `map` holds one at are not
+/// the very places the layout read one at. Where they are, each holds what
+/// was read there — or two equal strings swapped, which reads as the same
+/// file — and the source read at a place is the one to write there.
+fn unsettled_strings<'a>(
+    map: &IndexMap<String, Value>,
+    layout: &HclLayout,
+    by_string: &HashMap<&'a str, Option<&'a str>>,
+) -> std::collections::HashSet<&'a str> {
+    let mut read_at: HashMap<&str, Vec<&[String]>> = HashMap::new();
+    for (at, expr) in &layout.exprs {
+        if let Value::String(s) = &expr.value
+            && let Some((&key, None)) = by_string.get_key_value(s.as_str())
+        {
+            read_at.entry(key).or_default().push(at.as_slice());
+        }
+    }
+    if read_at.is_empty() {
+        return std::collections::HashSet::new();
+    }
+    let mut now_at: HashMap<&str, Vec<Vec<String>>> = HashMap::new();
+    let mut path = Vec::new();
+    for (key, value) in map {
+        path.push(key.clone());
+        strings_at(value, &mut path, &read_at, &mut now_at);
+        path.pop();
+    }
+    read_at
+        .into_iter()
+        .filter(|(s, read)| {
+            let mut read: Vec<&[String]> = read.clone();
+            let mut now: Vec<&[String]> = now_at
+                .get(s)
+                .map(|places| places.iter().map(Vec::as_slice).collect())
+                .unwrap_or_default();
+            read.sort_unstable();
+            now.sort_unstable();
+            read != now
+        })
+        .map(|(s, _)| s)
+        .collect()
+}
+
+/// Note in `now_at` the path of every string of `value` (at `path`) that
+/// `read_at` has.
+fn strings_at<'a>(
+    value: &Value,
+    path: &mut Vec<String>,
+    read_at: &HashMap<&'a str, Vec<&[String]>>,
+    now_at: &mut HashMap<&'a str, Vec<Vec<String>>>,
+) {
+    match value {
+        Value::String(s) => {
+            if let Some((&key, _)) = read_at.get_key_value(s.as_str()) {
+                now_at.entry(key).or_default().push(path.clone());
+            }
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                path.push(index.to_string());
+                strings_at(item, path, read_at, now_at);
+                path.pop();
+            }
+        }
+        Value::Map(members) => {
+            for (key, member) in members {
+                path.push(key.clone());
+                strings_at(member, path, read_at, now_at);
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
 /// One write of a body tree (see [`write_body`]).
 struct BodyWriter<'a> {
     out: String,
     layout: Option<&'a HclLayout>,
     /// See [`write_body`].
     by_string: HashMap<&'a str, Option<&'a str>>,
+    /// See [`write_body`].
+    by_key: HashMap<&'a str, Option<&'a str>>,
+    /// See [`unsettled_strings`].
+    unsettled: std::collections::HashSet<&'a str>,
     /// The keys from the root down to the key being written, as
     /// [`HclLayout::blocks`] addresses them.
     path: Vec<String>,
@@ -872,16 +1040,17 @@ impl<'a> BodyWriter<'a> {
 
     /// The source to write for `value`, at [`BodyWriter::exact`], if it is
     /// an expression the reader saw: the one read there, when `value` is
-    /// still what it read as, else — where a transform may have moved
-    /// values — the one the string `value` was read from anywhere.
+    /// still what it read as — unless a transform may have moved it, and
+    /// another source read as it too — else, where a transform may have
+    /// moved values, the one the string `value` was read from anywhere.
     ///
     /// # Errors
     ///
     /// [`Error::Format`] when the string `value` holds `${` or `%{` and is
-    /// what two expressions of different source read as, or replaces an
-    /// expression it does not read as: written as a string it would turn
-    /// what was an expression into a string, and dq cannot tell an edited
-    /// expression from a new string.
+    /// what two expressions of different source read as, and a transform
+    /// may have moved it, or replaces an expression it does not read as:
+    /// written as a string it would turn what was an expression into a
+    /// string, and dq cannot tell an edited expression from a new string.
     fn source_of(&self, value: &Value) -> Result<Option<&'a str>> {
         let Some(layout) = self.layout else {
             return Ok(None);
@@ -889,6 +1058,7 @@ impl<'a> BodyWriter<'a> {
         let here = layout.exprs.get(&self.exact);
         if let Some(expr) = here
             && expr.value.same_data(value)
+            && !matches!(value, Value::String(s) if self.unsettled.contains(s.as_str()))
         {
             return Ok(Some(expr.source.as_str()));
         }
@@ -920,6 +1090,46 @@ impl<'a> BodyWriter<'a> {
             }),
             (None, None) => Ok(None),
         }
+    }
+
+    /// Append the object key `key`, at [`BodyWriter::exact`] and a member
+    /// of it: the source of the expression key read there, else — where a
+    /// transform may have moved values — the one expression key read as
+    /// `key` anywhere, else `key` as a string.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Format`] when a transform may have moved the key, and
+    /// expression keys of different source read as it: written as a string
+    /// it would be a literal key, no longer the expression.
+    fn object_key(&mut self, key: &str) -> Result<()> {
+        if let Some(layout) = self.layout {
+            self.exact.push(key.to_owned());
+            let here = layout.keys.get(&self.exact);
+            self.exact.pop();
+            let source = match (here, layout.moved, self.by_key.get(key)) {
+                (Some(source), _, _) => Some(source.as_str()),
+                (None, true, Some(Some(source))) => Some(*source),
+                (None, true, Some(None)) => {
+                    return Err(Error::Format {
+                        format: "hcl",
+                        message: format!(
+                            "{}: the key {key:?} is what more than one expression key of the \
+                             file reads as, and the edit moved it; dq cannot tell which \
+                             expression to write there",
+                            pointer_text(&self.exact),
+                        ),
+                    });
+                }
+                _ => None,
+            };
+            if let Some(source) = source {
+                self.out.push_str(source);
+                return Ok(());
+            }
+        }
+        self.out.push_str(&hcl_text(&hcl::ObjectKey::from(key))?);
+        Ok(())
     }
 
     /// Append `value`, whose members go `depth` indents deep: the source
@@ -985,8 +1195,7 @@ impl<'a> BodyWriter<'a> {
                 for (key, member) in map {
                     self.out.push('\n');
                     indent(&mut self.out, depth);
-                    self.out
-                        .push_str(&hcl_text(&hcl::ObjectKey::from(key.as_str()))?);
+                    self.object_key(key)?;
                     self.out.push_str(" = ");
                     self.exact.push(key.clone());
                     let written = self.expression(member, depth + 1);
@@ -1467,6 +1676,31 @@ mod tests {
                 (path(&["r", "t", "0", "e"]), "x.y".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn the_reader_notes_an_expression_key_and_the_object_it_is_in() {
+        let layout = layout_of("t = { (var.k) = var.v, 1 = 2, \"s\" = 3, b = 4 }\n");
+        assert_eq!(
+            sources(&layout),
+            vec![
+                (
+                    path(&["t"]),
+                    "{ (var.k) = var.v, 1 = 2, \"s\" = 3, b = 4 }".to_owned()
+                ),
+                (path(&["t", "(var.k)"]), "var.v".to_owned()),
+            ]
+        );
+        // A number or string key reads as what it writes as.
+        let keys: Vec<_> = layout.keys.iter().collect();
+        assert_eq!(
+            keys,
+            vec![(&path(&["t", "(var.k)"]), &"(var.k)".to_owned())]
+        );
+        // Gone with the object replaced.
+        let set = layout.after_edit("set", &path(&["t"]), false).unwrap();
+        assert!(set.keys.is_empty() && layout.notes_differ(&set));
+        assert!(!layout.notes_differ(&layout.moved()));
     }
 
     #[test]
