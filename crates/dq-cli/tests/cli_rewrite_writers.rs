@@ -358,6 +358,47 @@ fn hcl_a_moved_string_two_sources_read_as_is_refused_even_at_its_own_path() {
     );
 }
 
+#[test]
+fn hcl_a_patch_on_repeated_blocks_sees_every_op_on_the_tree_before_it() {
+    let src = "ingress {\n  p = 1\n}\ningress {\n  p = 2\n}\ningress {\n  p = 3\n}\n";
+    // Was: exit 2, "path '/ingress/0' not found": each op re-read the file,
+    // and the one block left read back as a map.
+    edits_to(
+        "r.tf",
+        src,
+        &[
+            "patch",
+            "r.tf",
+            r#"[{"op":"remove","path":"/ingress/2"},{"op":"remove","path":"/ingress/1"},
+                {"op":"replace","path":"/ingress/0/p","value":9}]"#,
+        ],
+        "ingress {\n  p = 9\n}\n",
+    );
+    edits_to(
+        "r.tf",
+        "ingress {\n  p = 1\n}\ningress {\n  p = 2\n}\nx = 1\n",
+        &[
+            "patch",
+            "r.tf",
+            r#"[{"op":"remove","path":"/ingress/1"},{"op":"remove","path":"/ingress/0"}]"#,
+        ],
+        "x = 1\n",
+    );
+    // A failing op leaves the file as it was, the ops before it too.
+    refused(
+        "r.tf",
+        src,
+        &[
+            "patch",
+            "r.tf",
+            r#"[{"op":"remove","path":"/ingress/2"},{"op":"remove","path":"/ingress/5"}]"#,
+        ],
+        2,
+        "path '/ingress/5' not found (matched up to '/ingress')\n  matched prefix: /ingress\n  \
+         pointer: /ingress/5\n",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // An edit that changes nothing leaves the bytes alone
 // ---------------------------------------------------------------------------

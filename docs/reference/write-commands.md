@@ -26,7 +26,12 @@ HCL, XML, INI, dotenv, CSV/TSV and JSON Lines have no textual edits, so a point 
 made to the value tree and the whole file is re-emitted, exactly as
 `set --jq` would: `dq set app.ini /server/port 8080` writes
 `[server]\nhost=a\nport=8080\n` for `; c\n[server]\nhost = a\nport = 80\n`.
-The comments go (XML keeps its own, which are in its tree), an HCL file keeps
+The ops of a `patch`, a `merge` or a `fix.ops` script are all made to the
+tree and the file is written once, after the last, so each op sees the tree
+the op before it left, as RFC 6902 says: removing `/ingress/1` and then
+`/ingress/0` of two repeated HCL blocks removes both, though one block left
+alone would read back as its body rather than a list of one; a failing op
+leaves the file untouched. The comments go (XML keeps its own, which are in its tree), an HCL file keeps
 its blocks as blocks and every expression the edit does not change as its
 source (`ami = var.ami` stays; see [formats.md](formats.md#hcl)), and the
 value is read back as the file holds it (an

@@ -205,10 +205,21 @@ impl EditScript {
     /// clone the document before invoking `apply`. This is exactly what
     /// `Fixer::apply` does in Phase 4 of the IR-foundation change.
     ///
+    /// On a format dq rewrites whole (HCL, XML, INI, …) every op is made to
+    /// the value tree and the file is written once, after the last
+    /// ([`Document::edit_batch`]); a failing op leaves the document as it
+    /// was before the script.
+    ///
     /// [`Document::set_at`]: crate::document::Document::set_at
     /// [`Document::del_at`]: crate::document::Document::del_at
+    /// [`Document::edit_batch`]: crate::document::Document::edit_batch
     /// [`SpanMap`]: crate::document
     pub fn apply(&self, doc: &mut Document) -> Result<()> {
+        doc.edit_batch(|doc| self.apply_each(doc))
+    }
+
+    /// Apply every op to `doc` in declaration order, each on its own.
+    fn apply_each(&self, doc: &mut Document) -> Result<()> {
         for op in &self.0 {
             match op {
                 EditOp::Add { path, value } => {

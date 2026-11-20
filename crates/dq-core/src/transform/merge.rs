@@ -37,6 +37,10 @@ use super::patch::read_value_at;
 /// - [`Error::WriteUnavailable`] when the document was loaded read-only.
 ///
 /// `null` against a missing key is intentionally NOT an error (RFC 7396 §1).
+///
+/// On a format dq rewrites whole (HCL, XML, INI, …) the merge is made to
+/// the value tree and the file is written once, at the end
+/// ([`Document::edit_batch`]).
 pub fn apply_merge(doc: &mut Document, patch: &Value) -> Result<()> {
     let mut working = doc.clone();
     // The recursive worker mutates `base` in place via push/pop rather than
@@ -45,7 +49,7 @@ pub fn apply_merge(doc: &mut Document, patch: &Value) -> Result<()> {
     // numbers — without this, deep patches paid an O(depth²) toll on
     // pointer construction alone.
     let mut base = Pointer::default();
-    merge_into(&mut working, &mut base, patch)?;
+    working.edit_batch(|working| merge_into(working, &mut base, patch))?;
     *doc = working;
     Ok(())
 }

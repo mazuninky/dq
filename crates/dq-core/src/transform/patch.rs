@@ -293,6 +293,11 @@ impl<'de> Visitor<'de> for PatchOpVisitor {
 ///   indices encountered during any op.
 /// - [`Error::WriteUnavailable`] when the document was loaded read-only.
 ///
+/// On a format dq rewrites whole (HCL, XML, INI, …) every op is made to the
+/// value tree and the file is written once, after the last
+/// ([`Document::edit_batch`]): each op sees the tree the one before it
+/// left, not that tree as the file would read back.
+///
 /// [D2]: ../../../../docs/decisions.md
 pub fn apply_patch(doc: &mut Document, ops: &[PatchOp]) -> Result<()> {
     apply_patch_edits(doc, ops).map(drop)
@@ -318,31 +323,37 @@ pub fn apply_patch_edits(doc: &mut Document, ops: &[PatchOp]) -> Result<Vec<Poin
     let stream = working.values().is_some();
     let mut shifts: Vec<Shift> = Vec::new();
     let mut edited = Vec::new();
-    for op in ops {
-        let removed = match op {
-            PatchOp::Remove { path } => Some(path),
-            PatchOp::Move { from, .. } => Some(from),
-            _ => None,
-        };
-        let removed_at = removed.and_then(|path| array_slot(&working, path, false));
-        apply_one(&mut working, op, stream)?;
-        if let Some(path) = removed {
-            edited.extend(to_original(path, &shifts));
-            if let Some(index) = removed_at {
-                shifts.push(Shift::new(path, index, false));
-            }
-        }
-        match op {
-            PatchOp::Replace { path, .. } => edited.extend(to_original(path, &shifts)),
-            PatchOp::Add { path, .. } | PatchOp::Copy { path, .. } | PatchOp::Move { path, .. } => {
-                match array_slot(&working, path, true) {
-                    Some(index) => shifts.push(Shift::new(path, index, true)),
-                    None => edited.extend(to_original(path, &shifts)),
+    // One batch: on a format dq rewrites whole each op, and each slot read
+    // for the shifts, sees the tree the ops before it left, not the file
+    // that tree would read back as (`Document::edit_batch`).
+    working.edit_batch(|working| {
+        for op in ops {
+            let removed = match op {
+                PatchOp::Remove { path } => Some(path),
+                PatchOp::Move { from, .. } => Some(from),
+                _ => None,
+            };
+            let removed_at = removed.and_then(|path| array_slot(working, path, false));
+            apply_one(working, op, stream)?;
+            if let Some(path) = removed {
+                edited.extend(to_original(path, &shifts));
+                if let Some(index) = removed_at {
+                    shifts.push(Shift::new(path, index, false));
                 }
             }
-            PatchOp::Remove { .. } | PatchOp::Test { .. } => {}
+            match op {
+                PatchOp::Replace { path, .. } => edited.extend(to_original(path, &shifts)),
+                PatchOp::Add { path, .. }
+                | PatchOp::Copy { path, .. }
+                | PatchOp::Move { path, .. } => match array_slot(working, path, true) {
+                    Some(index) => shifts.push(Shift::new(path, index, true)),
+                    None => edited.extend(to_original(path, &shifts)),
+                },
+                PatchOp::Remove { .. } | PatchOp::Test { .. } => {}
+            }
         }
-    }
+        Ok(())
+    })?;
     *doc = working;
     Ok(edited)
 }

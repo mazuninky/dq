@@ -237,6 +237,37 @@ pub struct Document {
     /// beyond its value tree, for its writer to write back: see [`Layout`].
     /// Carried over a value-only rebuild by [`Document::with_layout_of`].
     layout: Layout,
+    /// The rewrite edits ([`Document::edits_by_rewrite`]) made to the tree
+    /// but not written yet: see [`Document::edit_batch`].
+    rewrite: RewriteState,
+}
+
+/// Where a document of a format dq rewrites whole is in a batch of edits
+/// ([`Document::edit_batch`]).
+#[derive(Debug, Clone, PartialEq, Default)]
+struct RewriteState {
+    /// Whether a batch is open: a rewrite edit changes the tree and the
+    /// layout, and the batch writes them once it ends.
+    batching: bool,
+    /// What the document was before the first edit not written yet.
+    pending: Option<Box<PendingRewrite>>,
+}
+
+/// The document as it was before the rewrite edits not written yet, and
+/// what they were.
+#[derive(Debug, Clone, PartialEq)]
+struct PendingRewrite {
+    /// The tree before them.
+    value: Value,
+    /// The layout before them.
+    layout: Layout,
+    /// Whether one of them replaced or removed an HCL expression: the file
+    /// is then written even when the tree reads as it did.
+    replaces_expression: bool,
+    /// The last of them, to name in a refusal.
+    action: &'static str,
+    /// Where the last of them was made.
+    pointer: Pointer,
 }
 
 /// What a reader saw of a file beyond its value tree, so the writer of a
@@ -704,6 +735,7 @@ impl Document {
             provenance: ProvenanceMap::new(),
             write_aware: false,
             layout: Layout::None,
+            rewrite: RewriteState::default(),
         }
     }
 
@@ -727,6 +759,7 @@ impl Document {
             provenance: ProvenanceMap::new(),
             write_aware: false,
             layout: Layout::None,
+            rewrite: RewriteState::default(),
         }
     }
 
@@ -754,6 +787,7 @@ impl Document {
             provenance,
             write_aware: true,
             layout: Layout::None,
+            rewrite: RewriteState::default(),
         }
     }
 
@@ -792,6 +826,7 @@ impl Document {
             provenance,
             write_aware: true,
             layout: Layout::None,
+            rewrite: RewriteState::default(),
         }
     }
 
@@ -825,6 +860,7 @@ impl Document {
             provenance,
             write_aware: false,
             layout: Layout::None,
+            rewrite: RewriteState::default(),
         }
     }
 
@@ -843,6 +879,7 @@ impl Document {
             provenance: ProvenanceMap::new(),
             write_aware: false,
             layout: Layout::None,
+            rewrite: RewriteState::default(),
         }
     }
 
@@ -1286,59 +1323,153 @@ impl Document {
         self.write_aware || self.edits_by_rewrite()
     }
 
-    /// Apply `edit` to a copy of the value tree and write the result whole
-    /// through the format's writer, with the layout this document was read
-    /// with ([`Document::with_layout_of`]). The written bytes become the
-    /// document's, and its tree is what they read back as — an INI, dotenv
-    /// or CSV value is a string, so `2` reads back as `"2"`. On any error
-    /// `self` is left as it was.
+    /// Run `edits` — point edits, as the ops of one patch — on this
+    /// document as one edit. On a document of a format dq rewrites whole
+    /// ([`Document::edits_by_rewrite`]) each edit changes the value tree
+    /// alone, so the next sees the tree the one before it left, as RFC 6902
+    /// says a patch's ops do: a list of two repeated HCL blocks less one is
+    /// still a list, though the one block left would read back as its body.
+    /// The tree is written and read back once, when `edits` returns; on any
+    /// error the document is left as it was before the batch. Any other
+    /// document is handed to `edits` as it is, each edit textual and
+    /// checked on its own.
     ///
     /// # Errors
     ///
-    /// The error of `edit` (an [`Error::Path`]); the writer's error for a
-    /// tree it cannot write ([`Error::Format`]: a nested value in INI,
-    /// dotenv or CSV, a second XML root, …); [`Error::EditRejected`] when
-    /// the written bytes would not read back.
+    /// The error of `edits`; else the error of writing the tree, as
+    /// [`Document::set_at`] names it.
+    pub fn edit_batch<T>(&mut self, edits: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        if !self.edits_by_rewrite() || self.rewrite.batching {
+            return edits(self);
+        }
+        self.rewrite.batching = true;
+        let result = edits(self);
+        self.rewrite.batching = false;
+        match result {
+            Ok(out) => self.write_pending().map(|()| out),
+            Err(err) => {
+                if let Some(pending) = self.rewrite.pending.take() {
+                    self.value = pending.value;
+                    self.layout = pending.layout;
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Apply `edit` to the value tree, with the layout this document was
+    /// read with ([`Document::with_layout_of`]) moved to match, and write
+    /// the result whole through the format's writer — once the batch ends,
+    /// in a batch ([`Document::edit_batch`]), else now
+    /// ([`Document::write_pending`]). On any error `self` is left as it
+    /// was.
+    ///
+    /// # Errors
+    ///
+    /// The error of `edit` (an [`Error::Path`]); [`Error::Format`] when
+    /// `pointer` runs through an HCL expression; out of a batch, the errors
+    /// of [`Document::write_pending`].
     fn rewrite_edit(
         &mut self,
         action: &'static str,
         pointer: &Pointer,
         edit: impl FnOnce(&mut Value) -> Result<()>,
     ) -> Result<()> {
-        let name = self.format.name();
-        let Some(format) = crate::format::by_name(name) else {
+        if crate::format::by_name(self.format.name()).is_none() {
             return Err(self.no_textual_edits("write it"));
-        };
+        }
         let layout = self.layout_after_edit(action, pointer)?;
         let mut tree = self.value.clone();
         edit(&mut tree)?;
-        // An edit that changes no data leaves the bytes — comments, layout
-        // — as they are, as long as there are bytes to leave, and it
-        // replaces no HCL expression: the string `${var.a}` set over
-        // `var.a`, which reads as it, is a string the user asked for.
-        let keep = !self.original_bytes.is_empty() && !layout.drops_expressions_of(&self.layout);
-        if keep && tree.same_data(&self.value) {
+        let replaces_expression = layout.drops_expressions_of(&self.layout);
+        let pending = self.rewrite.pending.get_or_insert_with(|| {
+            Box::new(PendingRewrite {
+                value: self.value.clone(),
+                layout: self.layout.clone(),
+                replaces_expression: false,
+                action,
+                pointer: pointer.clone(),
+            })
+        });
+        pending.replaces_expression |= replaces_expression;
+        pending.action = action;
+        pending.pointer = pointer.clone();
+        self.value = tree;
+        self.layout = layout;
+        if self.rewrite.batching {
             return Ok(());
         }
-        let mut bytes = Vec::new();
-        format.write(
-            &Document::value_only(tree, self.format).with_layout(layout),
-            &mut bytes,
-        )?;
-        let fresh = format.parse(&bytes).map_err(|err| Error::EditRejected {
+        self.write_pending()
+    }
+
+    /// Write the tree the rewrite edits not written yet left whole through
+    /// the format's writer. The written bytes become the document's, and
+    /// its tree is what they read back as — an INI, dotenv or CSV value is
+    /// a string, so `2` reads back as `"2"`. A tree that reads as the one
+    /// before the edits, when no edit replaced an HCL expression, leaves
+    /// the bytes — comments, layout — as they are, as long as there are
+    /// bytes to leave: `80` set in INI where the file has `80`. On any
+    /// error the document is left as it was before the edits.
+    ///
+    /// # Errors
+    ///
+    /// The writer's error for a tree it cannot write ([`Error::Format`]: a
+    /// nested value in INI, dotenv or CSV, a second XML root, …);
+    /// [`Error::EditRejected`] when the written bytes would not read back.
+    fn write_pending(&mut self) -> Result<()> {
+        let Some(pending) = self.rewrite.pending.take() else {
+            return Ok(());
+        };
+        let PendingRewrite {
+            value: before,
+            layout: before_layout,
+            replaces_expression,
             action,
-            pointer: pointer.as_canonical(),
-            reason: format!("the {name} dq would write does not read back: {err}"),
-        })?;
-        // The value set may read back as what was there: `80` set in INI,
-        // which holds strings, where the file has `80`.
-        if keep && fresh.value.same_data(&self.value) {
-            return Ok(());
+            pointer,
+        } = *pending;
+        // An edit that replaces an HCL expression with a string that reads
+        // as it (`${var.a}` set over `var.a`) set a string the user asked
+        // for, and is written.
+        let keep = !self.original_bytes.is_empty() && !replaces_expression;
+        let name = self.format.name();
+        let written = match crate::format::by_name(name) {
+            _ if keep && self.value.same_data(&before) => Ok(None),
+            None => Err(self.no_textual_edits("write it")),
+            Some(format) => {
+                let doc = Document::value_only(
+                    std::mem::replace(&mut self.value, Value::Null),
+                    self.format,
+                )
+                .with_layout(std::mem::take(&mut self.layout));
+                let mut bytes = Vec::new();
+                let written = format.write(&doc, &mut bytes);
+                self.value = doc.value;
+                self.layout = doc.layout;
+                written.and_then(|()| {
+                    format
+                        .parse(&bytes)
+                        .map(|fresh| Some((fresh, bytes)))
+                        .map_err(|err| Error::EditRejected {
+                            action,
+                            pointer: pointer.as_canonical(),
+                            reason: format!("the {name} dq would write does not read back: {err}"),
+                        })
+                })
+            }
+        };
+        match written {
+            Ok(Some((fresh, bytes))) if !(keep && fresh.value.same_data(&before)) => {
+                self.value = fresh.value;
+                self.layout = fresh.layout;
+                self.original_bytes = bytes;
+                Ok(())
+            }
+            outcome => {
+                self.value = before;
+                self.layout = before_layout;
+                outcome.map(|_| ())
+            }
         }
-        self.value = fresh.value;
-        self.layout = fresh.layout;
-        self.original_bytes = bytes;
-        Ok(())
     }
 
     /// The layout to write this document with after the point edit
@@ -6496,6 +6627,32 @@ mod tests {
         assert_eq!(doc.original_bytes(), src.as_bytes());
         doc.set_at(&k, Value::Int(81)).unwrap();
         assert_eq!(doc.original_bytes(), b"[s]\nk=81\n");
+    }
+
+    #[test]
+    fn an_edit_batch_writes_once_and_rolls_back_whole() {
+        let src = "b {\n  p = 1\n}\nb {\n  p = 2\n}\n";
+        let at = |p: &str| Pointer::parse(p).unwrap();
+        let mut doc = parsed(&crate::parsers::Hcl, src);
+        // The second delete sees the list of one the first left.
+        doc.edit_batch(|doc| {
+            doc.del_at(&at("/b/1"))?;
+            assert_eq!(doc.original_bytes(), src.as_bytes());
+            doc.del_at(&at("/b/0"))
+        })
+        .unwrap();
+        assert_eq!(doc.original_bytes(), b"");
+        // A failing edit takes the ones before it back.
+        let mut doc = parsed(&crate::parsers::Hcl, src);
+        let before = doc.clone();
+        let err = doc
+            .edit_batch(|doc| {
+                doc.del_at(&at("/b/1"))?;
+                doc.del_at(&at("/c"))
+            })
+            .unwrap_err();
+        assert_eq!(err.kind_name(), "path");
+        assert_eq!(doc, before);
     }
 
     #[test]
