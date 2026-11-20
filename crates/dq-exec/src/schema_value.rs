@@ -654,7 +654,7 @@ fn noted_spelling(
 /// source text of the value at a place in the source. The text is noted
 /// only when it is a JSON number of the limit's value: other text (`+5`,
 /// `.5`) keeps the number's own spelling. Only a schema's limits are
-/// noted ([`walk_schemas`]): in data (`const`, `enum`) `maximum` is no
+/// noted ([`schema_places`]): in data (`const`, `enum`) `maximum` is no
 /// keyword.
 pub(crate) fn note_limit_spellings(
     schema: &serde_json::Value,
@@ -662,25 +662,24 @@ pub(crate) fn note_limit_spellings(
     literal_at: &dyn Fn(&dq_core::Pointer) -> Option<String>,
     notes: &mut SchemaNotes,
 ) {
-    walk_schemas(
-        schema,
-        &mut dq_core::Pointer::default(),
-        &mut |object, inner| {
-            for keyword in LIMIT_KEYWORDS {
-                let Some(limit) = object.get(keyword) else {
-                    continue;
-                };
-                let mut source = at.clone();
-                for segment in inner.segments() {
-                    source.push_segment(segment.clone());
-                }
-                source.push_segment(dq_core::Segment::Key(keyword.to_owned()));
-                if let Some(text) = source_spelling(limit, &literal_at(&source)) {
-                    notes.spellings.insert(limit_place(inner, keyword), text);
-                }
+    for inner in schema_places(schema) {
+        let Some(serde_json::Value::Object(object)) = schema.pointer(&inner.as_canonical()) else {
+            continue;
+        };
+        for keyword in LIMIT_KEYWORDS {
+            let Some(limit) = object.get(keyword) else {
+                continue;
+            };
+            let mut source = at.clone();
+            for segment in inner.segments() {
+                source.push_segment(segment.clone());
             }
-        },
-    );
+            source.push_segment(dq_core::Segment::Key(keyword.to_owned()));
+            if let Some(text) = source_spelling(limit, &literal_at(&source)) {
+                notes.spellings.insert(limit_place(&inner, keyword), text);
+            }
+        }
+    }
 }
 
 /// `text`, the source text of the limit `value`, when it is a JSON number
@@ -716,7 +715,14 @@ pub(crate) fn compiled_json<'s>(
     schema: &'s serde_json::Value,
     notes: &SchemaNotes,
 ) -> Cow<'s, serde_json::Value> {
-    if notes.is_empty() && !has_tiny_divisor(schema) {
+    let places = schema_places(schema);
+    let tiny = |place: &dq_core::Pointer| {
+        schema
+            .pointer(&place.as_canonical())
+            .and_then(|object| object.get("multipleOf"))
+            .is_some_and(is_tiny_divisor)
+    };
+    if notes.is_empty() && !places.iter().any(tiny) {
         return Cow::Borrowed(schema);
     }
     let mut owned = schema.clone();
@@ -725,28 +731,28 @@ pub(crate) fn compiled_json<'s>(
             *value = serde_json::Value::String(marker(spelling));
         }
     }
-    walk_schemas_mut(
-        &mut owned,
-        &mut dq_core::Pointer::default(),
-        &mut |object, at| {
-            let mut noted = serde_json::Map::new();
-            for keyword in LIMIT_KEYWORDS {
-                if !matches!(object.get(keyword), Some(serde_json::Value::Number(_))) {
-                    continue;
-                }
-                if let Some(text) = notes.spelling_at(&limit_place(at, keyword)) {
-                    noted.insert(
-                        keyword.to_owned(),
-                        serde_json::Value::String(text.to_owned()),
-                    );
-                }
+    // dq's members change no place: each schema is found where it was.
+    for at in &places {
+        let Some(serde_json::Value::Object(object)) = owned.pointer_mut(&at.as_canonical()) else {
+            continue;
+        };
+        let mut noted = serde_json::Map::new();
+        for keyword in LIMIT_KEYWORDS {
+            if !matches!(object.get(keyword), Some(serde_json::Value::Number(_))) {
+                continue;
             }
-            if !noted.is_empty() {
-                object.insert(spellings().to_owned(), serde_json::Value::Object(noted));
+            if let Some(text) = notes.spelling_at(&limit_place(at, keyword)) {
+                noted.insert(
+                    keyword.to_owned(),
+                    serde_json::Value::String(text.to_owned()),
+                );
             }
-            stand_in_tiny_divisor(object);
-        },
-    );
+        }
+        if !noted.is_empty() {
+            object.insert(spellings().to_owned(), serde_json::Value::Object(noted));
+        }
+        stand_in_tiny_divisor(object);
+    }
     Cow::Owned(owned)
 }
 
@@ -805,50 +811,104 @@ fn place_of(keyword: &str) -> Place {
     }
 }
 
+/// The place of every schema object in `schema`, as a pointer from its
+/// root, each once: the ones the keywords that take a schema lead to
+/// ([`walk_schemas`]), and the ones a local `$ref` or `$dynamicRef`
+/// (`#/x-limits/a`) points at elsewhere in the document, which the
+/// validator reads as a schema too — and so on from those.
+///
+/// A fragment is resolved against the schema with a `$id` nearest above
+/// the reference, else the root. Neither an anchor (`#low`), which names a
+/// schema object the walk finds anyway, nor a reference to another
+/// resource is followed; nor is a fragment into the data of `const`,
+/// `enum`, `default` or `examples`, whose members a validator compares or
+/// reports: a member dq added there would change them.
+fn schema_places(schema: &serde_json::Value) -> Vec<dq_core::Pointer> {
+    let mut places = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut queue = VecDeque::from([dq_core::Pointer::default()]);
+    while let Some(start) = queue.pop_front() {
+        let Some(node) = schema.pointer(&start.as_canonical()) else {
+            continue;
+        };
+        let mut references = Vec::new();
+        walk_schemas(node, &mut start.clone(), &mut |object, at| {
+            if !seen.insert(at.as_canonical()) {
+                return;
+            }
+            places.push(at.clone());
+            for keyword in ["$ref", "$dynamicRef"] {
+                if let Some(serde_json::Value::String(reference)) = object.get(keyword) {
+                    references.push((at.clone(), reference.clone()));
+                }
+            }
+        });
+        for (at, reference) in references {
+            if let Some(target) = fragment_target(schema, &seen, &at, &reference) {
+                queue.push_back(target);
+            }
+        }
+    }
+    places
+}
+
+/// Where the local `reference`, in the schema at `at`, points when that is
+/// a schema object no place in `seen` is yet ([`schema_places`]).
+fn fragment_target(
+    schema: &serde_json::Value,
+    seen: &std::collections::HashSet<String>,
+    at: &dq_core::Pointer,
+    reference: &str,
+) -> Option<dq_core::Pointer> {
+    let fragment = reference.strip_prefix('#')?;
+    if !fragment.starts_with('/') {
+        return None;
+    }
+    let pointer = dq_core::Pointer::parse(fragment).ok()?;
+    // The resource the fragment is read in: the nearest schema with a
+    // `$id` at or above the reference.
+    let segments = at.segments();
+    let resource = (0..=segments.len())
+        .rev()
+        .map(|len| dq_core::Pointer::new(segments[..len].to_vec()))
+        .find(|prefix| {
+            prefix.is_root()
+                || seen.contains(&prefix.as_canonical())
+                    && schema
+                        .pointer(&prefix.as_canonical())
+                        .and_then(|object| object.get("$id"))
+                        .is_some_and(serde_json::Value::is_string)
+        })?;
+    let mut target = resource;
+    for segment in pointer.segments() {
+        target.push_segment(segment.clone());
+    }
+    if seen.contains(&target.as_canonical()) || !schema.pointer(&target.as_canonical())?.is_object()
+    {
+        return None;
+    }
+    // The keyword below the schema nearest above the target.
+    let segments = target.segments();
+    let keyword = (0..segments.len()).rev().find_map(|len| {
+        seen.contains(&dq_core::Pointer::new(segments[..len].to_vec()).as_canonical())
+            .then(|| &segments[len])
+    })?;
+    match keyword {
+        dq_core::Segment::Key(keyword)
+            if matches!(keyword.as_str(), "const" | "enum" | "default" | "examples") =>
+        {
+            None
+        }
+        _ => Some(target),
+    }
+}
+
 /// Call `visit` on `node`, when it is a schema object, and on every schema
 /// object in it, each with where it sits (`at` is where `node` does).
 ///
 /// Only a value of the shape its keyword takes is walked — an object for
 /// `not`, an array for `allOf` — so a member dq adds never lands in a value
 /// the meta-schema refuses, whose error would print it.
-fn walk_schemas_mut(
-    node: &mut serde_json::Value,
-    at: &mut dq_core::Pointer,
-    visit: &mut dyn FnMut(&mut serde_json::Map<String, serde_json::Value>, &dq_core::Pointer),
-) {
-    let serde_json::Value::Object(schema) = node else {
-        return;
-    };
-    visit(schema, at);
-    for (keyword, value) in schema.iter_mut() {
-        let place = place_of(keyword);
-        if matches!(place, Place::Data) {
-            continue;
-        }
-        at.push_segment(dq_core::Segment::Key(keyword.clone()));
-        match (place, value) {
-            (Place::Schema, value) => walk_schemas_mut(value, at, visit),
-            (Place::Schemas, serde_json::Value::Array(items)) => {
-                for (index, item) in items.iter_mut().enumerate() {
-                    at.push_segment(dq_core::Segment::Index(index));
-                    walk_schemas_mut(item, at, visit);
-                    at.pop_segment();
-                }
-            }
-            (Place::SchemaMap, serde_json::Value::Object(map)) => {
-                for (name, item) in map.iter_mut() {
-                    at.push_segment(dq_core::Segment::Key(name.clone()));
-                    walk_schemas_mut(item, at, visit);
-                    at.pop_segment();
-                }
-            }
-            _ => {}
-        }
-        at.pop_segment();
-    }
-}
-
-/// [`walk_schemas_mut`] without changing `node`.
 fn walk_schemas(
     node: &serde_json::Value,
     at: &mut dq_core::Pointer,
@@ -886,29 +946,6 @@ fn walk_schemas(
     }
 }
 
-/// Whether `node` or a schema in it ([`walk_schemas_mut`]) passes `test`.
-fn any_schema(
-    node: &serde_json::Value,
-    test: &dyn Fn(&serde_json::Map<String, serde_json::Value>) -> bool,
-) -> bool {
-    let serde_json::Value::Object(schema) = node else {
-        return false;
-    };
-    test(schema)
-        || schema
-            .iter()
-            .any(|(keyword, value)| match (place_of(keyword), value) {
-                (Place::Schema, value) => any_schema(value, test),
-                (Place::Schemas, serde_json::Value::Array(items)) => {
-                    items.iter().any(|item| any_schema(item, test))
-                }
-                (Place::SchemaMap, serde_json::Value::Object(map)) => {
-                    map.values().any(|item| any_schema(item, test))
-                }
-                _ => false,
-            })
-}
-
 /// Whether `divisor` is a positive number that its nearest `f64` reads as
 /// zero or less.
 fn is_tiny_divisor(divisor: &serde_json::Value) -> bool {
@@ -917,13 +954,6 @@ fn is_tiny_divisor(divisor: &serde_json::Value) -> bool {
     };
     number.as_f64().is_none_or(|f| f <= 0.0)
         && Value::from_serde_json(divisor).compare_number(&Value::Int(0)) == Some(Ordering::Greater)
-}
-
-/// Whether some schema in `node` has a tiny `multipleOf`.
-fn has_tiny_divisor(node: &serde_json::Value) -> bool {
-    any_schema(node, &|schema| {
-        schema.get("multipleOf").is_some_and(is_tiny_divisor)
-    })
 }
 
 /// Put `1` in place of `schema`'s `multipleOf` when it is a tiny divisor,
@@ -1015,15 +1045,24 @@ fn render_array(items: &[serde_json::Value], place: Place, out: &mut String) {
     out.push(']');
 }
 
-/// [`render`] for an object whose values are each a `place`.
+/// [`render`] for an object whose values are each a `place`. An object a
+/// `$ref` reads as a schema outside the schema keywords (`x-limits`) may
+/// hold dq's members too ([`schema_places`]): they are left out, and a
+/// limit is spelled as noted.
 fn render_object(map: &serde_json::Map<String, serde_json::Value>, place: Place, out: &mut String) {
     out.push('{');
-    for (index, (key, value)) in map.iter().enumerate() {
+    let members = map
+        .iter()
+        .filter(|(key, _)| !key.starts_with(&in_band().member));
+    for (index, (key, value)) in members.enumerate() {
         if index > 0 {
             out.push(',');
         }
         render_key(key, out);
-        render(value, place, out);
+        match (noted_spelling(map, key), value) {
+            (Some(text), serde_json::Value::Number(_)) => out.push_str(&text),
+            _ => render(value, place, out),
+        }
     }
     out.push('}');
 }
@@ -1731,6 +1770,77 @@ mod tests {
             .to_string();
         assert_eq!(restore(&message), r#"-.inf is not of type "string""#);
         assert_eq!(restore("plain"), "plain");
+    }
+
+    #[test]
+    fn a_limit_a_local_ref_reaches_outside_the_schema_keywords_is_noted() {
+        let text = r##"{
+            "x-limits": {"a": {"maximum": 1E2, "x-more": {"minimum": 1E1}, "$ref": "#/x-limits/b"},
+                         "b": {"minimum": 2E1}},
+            "$defs": {"inner": {"$id": "inner.json", "x-own": {"maximum": 3E1},
+                                "properties": {"y": {"$ref": "#/x-own"}}}},
+            "properties": {
+                "x": {"$ref": "#/x-limits/a"},
+                "m": {"$ref": "#/x-limits/a/x-more"},
+                "c": {"const": {"maximum": 1E2}},
+                "d": {"$ref": "#/properties/c/const"},
+                "z": {"$ref": "#/x-unwalked"}
+            },
+            "x-unwalked": {"maximum": 4E1},
+            "x-unreached": {"maximum": 5E1}
+        }"##;
+        let schema: serde_json::Value = serde_json::from_str(text).expect("schema");
+        let notes = file_notes(text, &schema);
+        // A target, a target's target, and a target of a target's own
+        // reference are schemas.
+        assert_eq!(notes.spelling_at("/x-limits/a/maximum"), Some("1E2"));
+        assert_eq!(notes.spelling_at("/x-limits/b/minimum"), Some("2E1"));
+        assert_eq!(notes.spelling_at("/x-limits/a/x-more/minimum"), Some("1E1"));
+        assert_eq!(notes.spelling_at("/x-unwalked/maximum"), Some("4E1"));
+        // A fragment is read in the nearest resource: `inner.json`.
+        assert_eq!(notes.spelling_at("/$defs/inner/x-own/maximum"), Some("3E1"));
+        // `const` data stays data; nothing points at `x-unreached`.
+        assert_eq!(notes.spelling_at("/properties/c/const/maximum"), None);
+        assert_eq!(notes.spelling_at("/x-unreached/maximum"), None);
+
+        // The validator quotes the noted text, and a `const` is untouched.
+        let validator = options()
+            .build(&compiled_json(&schema, &notes))
+            .expect("compiles");
+        let errors = |document: serde_json::Value| -> Vec<String> {
+            let value = Value::from_serde_json(&document);
+            validator
+                .iter_errors(DqNode(&value))
+                .map(|error| error_text(&error))
+                .collect()
+        };
+        assert_eq!(
+            errors(serde_json::json!({"x": 101})),
+            ["101 is greater than the maximum of 1E2"]
+        );
+        assert!(errors(serde_json::json!({"c": {"maximum": 100}})).is_empty());
+    }
+
+    #[test]
+    fn a_not_message_leaves_dqs_members_out_of_a_ref_target_in_it() {
+        let text = r##"{"properties": {
+            "y": {"not": {"x-l": {"maximum": 1E2}, "minimum": 0}},
+            "z": {"$ref": "#/properties/y/not/x-l"}
+        }}"##;
+        let schema: serde_json::Value = serde_json::from_str(text).expect("schema");
+        let notes = file_notes(text, &schema);
+        let validator = options()
+            .build(&compiled_json(&schema, &notes))
+            .expect("compiles");
+        let value = Value::from_serde_json(&serde_json::json!({"y": 5}));
+        let messages: Vec<String> = validator
+            .iter_errors(DqNode(&value))
+            .map(|error| error_text(&error))
+            .collect();
+        assert_eq!(
+            messages,
+            [r#"{"x-l":{"maximum":1E2},"minimum":0} is not allowed for 5"#]
+        );
     }
 
     #[test]

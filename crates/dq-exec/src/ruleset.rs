@@ -242,7 +242,7 @@ fn exact_schemas(yaml: &str, rules: &mut [Rule]) {
         return;
     }
     let spans = dq_core::parse_yaml_with_spans(yaml.as_bytes()).ok();
-    let literals = spans.as_ref().map(|doc| Literals { yaml, doc });
+    let literals = spans.as_ref().map(|doc| Literals::new(yaml, doc));
     for (index, (rule, document)) in rules.iter_mut().zip(documents).enumerate() {
         // The span parse keys a stream's documents `/N/...`, a lone one `/...`.
         let mut at = dq_core::Pointer::default();
@@ -258,13 +258,50 @@ struct Literals<'a> {
     yaml: &'a str,
     /// The rule file as the span parse reads it.
     doc: &'a dq_core::Document,
+    /// Each YAML alias of the rule file and the anchored node it repeats,
+    /// as canonical pointers ([`dq_core::Document::yaml_aliases`]).
+    aliases: Vec<(String, String)>,
 }
 
-impl Literals<'_> {
-    /// The source text of the value at `at`.
+impl<'a> Literals<'a> {
+    fn new(yaml: &'a str, doc: &'a dq_core::Document) -> Self {
+        let aliases = doc
+            .yaml_aliases()
+            .iter()
+            .map(|(alias, anchored)| (alias.as_canonical(), anchored.as_canonical()))
+            .collect();
+        Self { yaml, doc, aliases }
+    }
+
+    /// The source text of the value at `at`. A value at or below an alias
+    /// (`x: *lim`) is written where the anchored node is (`&lim`), at the
+    /// same place below it: its own span is the `*lim`, or none.
     fn text_at(&self, at: &dq_core::Pointer) -> Option<String> {
-        let span = self.doc.span_at(at)?;
+        let span = self.doc.span_at(&self.written_at(at)?)?;
         self.yaml.get(span.value_range.clone()).map(str::to_owned)
+    }
+
+    /// Where the value at `at` is written: `at`, or its place under the
+    /// anchored node of the alias at or above it, aliases inside anchored
+    /// nodes followed. `None` when that place is no pointer dq reads.
+    fn written_at(&self, at: &dq_core::Pointer) -> Option<dq_core::Pointer> {
+        if self.aliases.is_empty() {
+            return Some(at.clone());
+        }
+        let mut place = at.as_canonical();
+        // An alias has no node below it in the source, so at most one alias
+        // is at or above a place; each step moves into an anchored node
+        // written before the alias, so the steps end. The bound guards it.
+        for _ in 0..=self.aliases.len() {
+            let Some(written) = self.aliases.iter().find_map(|(alias, anchored)| {
+                let rest = place.strip_prefix(alias.as_str())?;
+                (rest.is_empty() || rest.starts_with('/')).then(|| format!("{anchored}{rest}"))
+            }) else {
+                break;
+            };
+            place = written;
+        }
+        dq_core::Pointer::parse(&place).ok()
     }
 
     /// `json`, a schema read from the rule file at `at`, with every number
@@ -517,6 +554,34 @@ mod tests {
             r#"{"const":340282366920938463463374607431768211456,"items":[{"maximum":0.00000000001},{"minimum":5}]}"#
         );
         assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn from_str_reads_a_limit_behind_an_alias_where_the_anchor_writes_it() {
+        let rule = "id: n.alias\ndescription: x\nseverity: error\nmatch: { format: yaml }\n\
+                    check:\n  schema:\n    x-m: &m 2E1\n    $defs:\n      \
+                    lim: &lim { maximum: 1E2 }\n      outer: &outer { properties: { q: *lim } }\n    \
+                    properties:\n      x: *lim\n      y: { not: *outer }\n      z: { minimum: *m }\n";
+        let set = RuleSet::from_str(rule, RuleSource::Inline).expect("parse rule");
+        let Check::Schema { schema, notes, .. } = &set.rules[0].check else {
+            panic!("expected a schema check: {:?}", set.rules[0].check);
+        };
+        // Each copy keeps the anchored literal (`1e+2`, not the `100.0`
+        // serde_norway read) and its source text.
+        let at = |place: &str| {
+            (
+                schema.pointer(place).map(ToString::to_string),
+                notes.spelling_at(place),
+            )
+        };
+        let written = (Some("1e+2".to_owned()), Some("1E2"));
+        assert_eq!(at("/$defs/lim/maximum"), written);
+        assert_eq!(at("/properties/x/maximum"), written);
+        assert_eq!(at("/properties/y/not/properties/q/maximum"), written);
+        assert_eq!(
+            at("/properties/z/minimum"),
+            (Some("2e+1".to_owned()), Some("2E1"))
+        );
     }
 
     #[test]

@@ -1236,6 +1236,38 @@ impl Document {
         (index < documents.len()).then_some(index)
     }
 
+    /// Every YAML alias of the document as `(alias, anchored node)`: where
+    /// the alias sits and where the node it repeats does, in the pointers
+    /// [`Document::span_at`] takes. A value at or below an alias has no
+    /// source text of its own (or only the `*name`); it is the anchored
+    /// node's, at the same place below it.
+    ///
+    /// Empty for other formats and for bytes the span parse rejects. An
+    /// alias used as a mapping key, or of an anchored key, is left out: the
+    /// value tree holds it as a key's text.
+    #[must_use]
+    pub fn yaml_aliases(&self) -> Vec<(Pointer, Pointer)> {
+        if self.format != FormatTag::Yaml || !self.original_bytes.contains(&b'*') {
+            return Vec::new();
+        }
+        let layout = match crate::parsers::yaml_spans::edit_layout(&self.original_bytes) {
+            Ok(layout) => layout,
+            Err(err) => {
+                tracing::debug!(%err, "YAML alias layout failed");
+                return Vec::new();
+            }
+        };
+        layout
+            .aliases
+            .iter()
+            .filter_map(|alias| {
+                let at = Pointer::parse(alias.alias_pointer.as_deref()?).ok()?;
+                let anchored = Pointer::parse(alias.anchor_pointer.as_deref()?).ok()?;
+                Some((at, anchored))
+            })
+            .collect()
+    }
+
     /// The YAML edit layout of the bytes as they were before the edit
     /// under way, worked out once per edit through `cache`; `None` for
     /// other formats or bytes saphyr rejects. Call it only before the
@@ -7049,6 +7081,33 @@ mod tests {
         // every document and confusing the writer dispatch.
         let doc = Document::value_only(Value::Null, FormatTag::Yaml);
         assert!(doc.frontmatter_payload().is_none());
+    }
+
+    #[test]
+    fn yaml_aliases_pairs_each_alias_with_its_anchored_node() {
+        let pairs = |doc: &Document| -> Vec<(String, String)> {
+            doc.yaml_aliases()
+                .iter()
+                .map(|(alias, anchored)| (alias.as_canonical(), anchored.as_canonical()))
+                .collect()
+        };
+        let doc = crate::parsers::parse_yaml_with_spans(
+            b"a: &x { n: 1 }\nb: *x\nc: [&y 2, *y]\n&k key: v\nd: { *k : w }\n",
+        )
+        .expect("parse YAML");
+        // An alias used as a key, of an anchored key, is left out.
+        assert_eq!(
+            pairs(&doc),
+            [
+                ("/b".to_owned(), "/a".to_owned()),
+                ("/c/1".to_owned(), "/c/0".to_owned())
+            ]
+        );
+        let stream = crate::parsers::parse_yaml_with_spans(b"a: &x 1\n---\nb: &x 2\nc: *x\n")
+            .expect("parse");
+        assert_eq!(pairs(&stream), [("/1/c".to_owned(), "/1/b".to_owned())]);
+        let json = crate::parsers::parse_json_with_spans(br#"{"a": "*x"}"#).expect("parse JSON");
+        assert!(json.yaml_aliases().is_empty());
     }
 }
 

@@ -35,7 +35,10 @@ validation error becomes one diagnostic:
 - the message is the optional `message` prefix, the `keywordLocation`, and the
   validator's text: `/properties/age/type: "twelve" is not of type
   "integer"`. Values are spelled as the document spells them
-  (`.nan is not of type "string"`). Note that the prefix is glued on without a
+  (`.nan is not of type "string"`), and a limit as the rule or the schema
+  file writes it (`the maximum of 1E2`). That holds wherever the limit sits:
+  behind a YAML alias (`x: *lim`), or in a place a `$ref` reaches outside
+  the schema keywords (`$ref: '#/x-limits/a'`). The prefix is glued on without a
   separator today (`shape/properties/age/type: …`).
 
 Numbers a JSON document cannot hold follow these rules:

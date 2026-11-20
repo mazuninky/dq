@@ -366,15 +366,13 @@ fn a_string_shaped_like_an_infinity_note_stays_a_string() {
     );
 }
 
-/// BUG: a `$ref` may point anywhere in the schema document, and the
-/// validator reads its target as a schema; but dq notes a limit's spelling
-/// only under the keywords that take a schema (`properties`, `$defs`, …),
-/// so a limit a `$ref` reaches elsewhere (`#/x-limits/a`) is quoted as
-/// serde_json reads it, `1e+2`, in a rule and in a `schema_file` alike.
-/// The forged member next to it changes nothing now; before 66c9db3 the
-/// message quoted it (`the maximum of g`).
+/// A `$ref` may point anywhere in the schema document, and the validator
+/// reads its target as a schema: a limit a `$ref` reaches outside the
+/// keywords that take a schema (`#/x-limits/a`) is quoted as written, in a
+/// rule and in a `schema_file` alike. dq used to note spellings only under
+/// those keywords and printed `1e+2`. The forged member next to it changes
+/// nothing; before 66c9db3 the message quoted it (`the maximum of g`).
 #[test]
-#[ignore = "BUG: a limit a $ref reaches outside the schema keywords prints 1e+2, not 1E2"]
 fn a_limit_a_ref_reaches_outside_the_schema_keywords_is_quoted_as_written() {
     let schema = "    x-limits:\n      a: { maximum: 1E2, \"\\0dq.spelling\": { maximum: g } }\n    \
                   properties:\n      x: { $ref: '#/x-limits/a' }\n";
@@ -403,12 +401,11 @@ fn a_limit_a_ref_reaches_outside_the_schema_keywords_is_quoted_as_written() {
     );
 }
 
-/// BUG: a limit a YAML rule reaches through an alias (`*lim`) has no
-/// source text at the alias's place, so dq neither notes its spelling nor
-/// keeps its literal: `maximum: 1E2` prints as `100.0`, in a bound's
-/// message and in a `not`.
+/// A limit a YAML rule reaches through an alias (`*lim`) is written at the
+/// anchored node (`&lim`), not at the alias: dq reads its text there, in a
+/// bound's message and in a `not`. It used to find none and print the
+/// `f64` serde_norway read, `100.0`.
 #[test]
-#[ignore = "BUG: a limit behind a YAML alias prints 100.0, not 1E2"]
 fn a_limit_behind_a_yaml_alias_is_quoted_as_written() {
     let schema = "    $defs:\n      lim: &lim { maximum: 1E2 }\n    properties:\n      \
                   x: *lim\n      y: { not: *lim }\n";
