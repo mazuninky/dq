@@ -65,8 +65,8 @@ pub fn run(
 ) -> anyhow::Result<()> {
     cli.ensure_no_write_flags()?;
 
-    let (_fmt_a, doc_a) = load_document_with_path(&args.a, input_format)?;
-    let (_fmt_b, doc_b) = load_document_with_path(&args.b, input_format)?;
+    let (_fmt_a, doc_a) = load_document_with_path(&args.a, input_format, cli.template_mode())?;
+    let (_fmt_b, doc_b) = load_document_with_path(&args.b, input_format, cli.template_mode())?;
 
     if args.unified {
         // Render both documents as pretty JSON (stable key order via

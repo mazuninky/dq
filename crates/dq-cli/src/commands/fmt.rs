@@ -27,10 +27,12 @@ use std::io::Write;
 
 use camino::Utf8Path;
 use dq_core::WriteOptions;
+use dq_core::template_guard::TemplateMode;
 
 use super::io_helpers::load_document_with_path;
 use crate::bulk::{self, FileOp, FileOpResult};
 use crate::cli::{Cli, FmtArgs};
+use crate::error::InvalidInput;
 
 /// Run `dq fmt`.
 ///
@@ -56,6 +58,20 @@ pub fn run(
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
     cli.ensure_write_flags_consistent()?;
+
+    // fmt re-emits the whole file through the format's writer: neither
+    // escape hatch can keep the templates, so both are refused as `fix`
+    // refuses them. Without them the template guard runs on every file.
+    for (set, flag) in [
+        (cli.allow_templates, "--allow-templates"),
+        (cli.raw_template_strings, "--raw-template-strings"),
+    ] {
+        if set {
+            return Err(anyhow::Error::new(InvalidInput::new(format!(
+                "dq fmt is incompatible with {flag}: re-emitting the file does not preserve template syntax. Use point-edits for templated files."
+            ))));
+        }
+    }
 
     let op = FmtFileOp {
         input_format,
@@ -85,7 +101,8 @@ impl<'a> FileOp for FmtFileOp<'a> {
         //    write-aware (span-collecting) parsers because we are not
         //    splicing — we re-emit the parsed value tree through the
         //    format's native writer.
-        let (input_fmt, doc) = load_document_with_path(path, self.input_format)?;
+        let (input_fmt, doc) =
+            load_document_with_path(path, self.input_format, TemplateMode::Guard)?;
 
         // 2. Render through `write_with_options`. The format's default
         //    impl forwards to `write` (M2-baseline preserved) when neither

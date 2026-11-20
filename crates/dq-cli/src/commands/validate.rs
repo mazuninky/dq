@@ -51,8 +51,12 @@ pub fn run(
     // structured data to format.
     let format = pick_format(&args.file, input_format)?;
     let bytes = read_bytes(&args.file)?;
-    match format.parse(&bytes) {
+    // The template guard runs first: a templated file is neither valid nor
+    // invalid until the user picks an escape hatch, so its refusal keeps
+    // the guard's own exit code (3), not validate's 4.
+    match dq_core::template_guard::guarded_parse(&bytes, cli.template_mode(), |b| format.parse(b)) {
         Ok(_) => Ok(()),
+        Err(e @ dq_core::Error::TemplatedFile { .. }) => Err(anyhow::Error::new(e)),
         Err(e) => {
             // Render the structured error to stderr through the reporter,
             // then propagate the error so exit-code mapping picks 4.

@@ -142,7 +142,7 @@ pub(crate) fn run_with_rulesets(
         // populated provenance map, which `Ir::line_col_for(&Pointer)` (used
         // by the evaluator's `loc.pointer` chain) needs to resolve to a
         // real `(line, col)`. See `load_document_for_lint` for the rationale.
-        let (_doc_fmt, doc) = load_document_for_lint(file, input_format)?;
+        let (_doc_fmt, doc) = load_document_for_lint(file, input_format, cli.template_mode())?;
         // Each document of a multi-document stream is linted as a document
         // of its own — `match.filter`, `check`, `loc.*`, composite
         // `extract` and plugins all see one document, as they would in a

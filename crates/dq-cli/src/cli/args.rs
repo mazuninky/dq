@@ -219,6 +219,21 @@ pub struct Cli {
 }
 
 impl Cli {
+    /// How a command that reads a file treats its templates: the guard,
+    /// unless `--allow-templates` or `--raw-template-strings` picks an
+    /// escape hatch (clap keeps the two flags exclusive).
+    #[must_use]
+    pub fn template_mode(&self) -> dq_core::template_guard::TemplateMode {
+        use dq_core::template_guard::TemplateMode;
+        if self.raw_template_strings {
+            TemplateMode::RawStrings
+        } else if self.allow_templates {
+            TemplateMode::Allow
+        } else {
+            TemplateMode::Guard
+        }
+    }
+
     /// Reject any of the write-mode flags (`-i`/`--in-place`, `--diff`,
     /// `--backup`) — used by **read** subcommands to signal "this verb does
     /// not write, please drop the flag".

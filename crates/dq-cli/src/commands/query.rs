@@ -56,7 +56,7 @@ pub fn run(
 ) -> anyhow::Result<()> {
     cli.ensure_no_write_flags()?;
 
-    let (_fmt, doc) = load_document_with_path(&args.file, input_format)?;
+    let (_fmt, doc) = load_document_with_path(&args.file, input_format, cli.template_mode())?;
     let view = select_document(&doc, doc_arg, &args.file)?;
     // Compile errors → dq_core::Error::Parse → exit 3 (PARSE_ERROR).
     let engine = dq_transform::JqEngine::compile(&args.expression)

@@ -36,6 +36,7 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 
 use camino::Utf8Path;
+use dq_core::template_guard::TemplateMode;
 use dq_core::{Document, Pointer, Value};
 
 use super::io_helpers::{
@@ -138,7 +139,7 @@ pub fn run(
     // sees the same value. (The inline JSON literal heuristic, stdin
     // capture, and `--value-from` file read all happen here, before the
     // per-file loop.)
-    let value = resolve_value(args)?;
+    let value = resolve_value(args, cli.template_mode())?;
 
     // Parse the pointer ONCE — every file uses the same pointer.
     let pointer = Pointer::parse(pointer_str).map_err(anyhow::Error::new)?;
@@ -298,7 +299,14 @@ impl<'a> FileOp for JqFileOp<'a> {
         // Read the original bytes — we need them for the diff comparison and
         // for re-parsing through the value-only path.
         let original_bytes = read_bytes(path)?;
-        let document = format.parse(&original_bytes).map_err(anyhow::Error::new)?;
+        // Both escape hatches are refused up front, so the guard always
+        // runs: re-emitting a file whose templates changed the reading
+        // would write that misreading back.
+        let document =
+            dq_core::template_guard::guarded_parse(&original_bytes, TemplateMode::Guard, |b| {
+                format.parse(b)
+            })
+            .map_err(anyhow::Error::new)?;
 
         // Evaluate the filter. Runtime / Conversion errors stay as plain
         // anyhow (exit 1) — they aren't compile failures and aren't IO
@@ -515,10 +523,11 @@ fn parse_to_document(
 /// Priority is the spec's: `--value-from <path>` wins over the inline
 /// argument; the inline argument's leading `-` reads stdin; a `@`-prefix
 /// treats the rest as a file path; otherwise the inline string is passed
-/// through the JSON-literal heuristic.
-fn resolve_value(args: &SetArgs) -> anyhow::Result<Value> {
+/// through the JSON-literal heuristic. A value file goes through the
+/// template guard as `templates` says, as every file dq reads does.
+fn resolve_value(args: &SetArgs, templates: TemplateMode) -> anyhow::Result<Value> {
     if let Some(path) = &args.value_from {
-        return value_from_file(path);
+        return value_from_file(path, templates);
     }
     let Some(inline) = &args.value else {
         return Err(anyhow::Error::new(InvalidInput::new(
@@ -530,15 +539,15 @@ fn resolve_value(args: &SetArgs) -> anyhow::Result<Value> {
     }
     if let Some(path_str) = inline.strip_prefix('@') {
         let path = camino::Utf8PathBuf::from(path_str);
-        return value_from_file(&path);
+        return value_from_file(&path, templates);
     }
     Ok(parse_inline_value(inline, args.value_string))
 }
 
 /// Parse a file at `path` as a structured document and return its top-level
 /// value. Used by both `--value-from` and the `@<path>` shorthand.
-fn value_from_file(path: &Utf8Path) -> anyhow::Result<Value> {
-    let (_fmt, doc) = load_document_with_path(path, None)?;
+fn value_from_file(path: &Utf8Path, templates: TemplateMode) -> anyhow::Result<Value> {
+    let (_fmt, doc) = load_document_with_path(path, None, templates)?;
     Ok(doc.value().clone())
 }
 

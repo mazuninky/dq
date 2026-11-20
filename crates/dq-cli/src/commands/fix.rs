@@ -50,6 +50,7 @@ use std::io::Write;
 use std::sync::Arc;
 
 use camino::{Utf8Path, Utf8PathBuf};
+use dq_core::template_guard::TemplateMode;
 use dq_core::{Document, Pointer, Segment};
 use dq_exec::{Evaluator, FixOutcome, Fixer, LoaderArgs, RuleLoader};
 use indexmap::IndexSet;
@@ -191,7 +192,8 @@ impl<'a> FileOp for FixFileOp<'a> {
         // The helper re-reads the file internally — accept the 2× I/O
         // for the simpler call site.
         let original_bytes = read_bytes(path)?;
-        let (format, mut document) = load_document_for_lint(path, self.input_format)?;
+        let (format, mut document) =
+            load_document_for_lint(path, self.input_format, TemplateMode::Guard)?;
         // A multi-document stream is fixed one document at a time, and
         // written back with every document; `--doc N` fixes document N
         // alone.

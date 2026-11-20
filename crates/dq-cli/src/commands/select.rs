@@ -52,7 +52,7 @@ pub fn run(
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
     cli.ensure_no_write_flags()?;
-    let (_fmt, doc) = load_document_with_path(&args.file, input_format)?;
+    let (_fmt, doc) = load_document_with_path(&args.file, input_format, cli.template_mode())?;
     // Same view as `get`: document 0 of a stream unless `--doc` says
     // otherwise; `--doc all` queries the array of every document.
     let view = select_document(&doc, cli.doc, &args.file)?;

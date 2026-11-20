@@ -12,6 +12,11 @@ as `-` given `--input-format` (exit 2 without it).
 Every format in [formats.md](formats.md) works with every read command; the
 format plugs in through the registry, the commands do not know about it.
 
+A file whose Go-template or GitHub Actions markers change what the parser
+reads (a Helm `{{ .Values.x }}` YAML reads as a flow mapping) is refused with
+exit 3, unless `--allow-templates` or `--raw-template-strings` says how to
+read it; see [template-guard.md](template-guard.md#where-it-runs).
+
 ## `dq get <file> <pointer>`
 
 Prints the value at the pointer. `''` prints the whole document. A missing

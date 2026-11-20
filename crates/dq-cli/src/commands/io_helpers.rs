@@ -16,6 +16,7 @@ use std::fs;
 use std::io::Read;
 
 use camino::{Utf8Path, Utf8PathBuf};
+use dq_core::template_guard::{TemplateMode, guarded_parse};
 use dq_core::{Document, Format, Pointer, Segment, Value};
 
 use crate::cli::{Cli, DocSelector};
@@ -24,7 +25,6 @@ use crate::error::{DocOutOfRange, DocOutOfRangeEverywhere};
 /// Load and parse a file (or stdin when `file == "-"`), returning the chosen
 /// [`Format`] together with the parsed [`Document`].
 ///
-/// Format selection precedence:
 /// Format selection is [`pick_format`]'s: `format_override` (the global
 /// `--input-format`), else detection; stdin without an override is a usage
 /// error.
@@ -32,11 +32,17 @@ use crate::error::{DocOutOfRange, DocOutOfRangeEverywhere};
 /// `Parse` errors are tagged with the actual file path (or `None` for stdin)
 /// so renderers can include it in diagnostics.
 ///
+/// The template guard runs before the parse is used, as `templates` says
+/// ([`dq_core::template_guard::guarded_parse`]): by default a file whose
+/// templates change what the parser reads is
+/// [`dq_core::Error::TemplatedFile`] (exit 3).
+///
 /// Errors are returned wrapped in `anyhow::Error::new(dq_core::Error::*)` so
 /// the top-level exit-code mapper can downcast and pick the right code.
 pub(crate) fn load_document_with_path(
     file: &Utf8Path,
     format_override: Option<&str>,
+    templates: TemplateMode,
 ) -> anyhow::Result<(&'static dyn Format, Document)> {
     let format = pick_format(file, format_override)?;
     let bytes = read_bytes(file)?;
@@ -45,8 +51,7 @@ pub(crate) fn load_document_with_path(
     } else {
         Some(file.to_path_buf())
     };
-    let doc = format
-        .parse(&bytes)
+    let doc = guarded_parse(&bytes, templates, |b| format.parse(b))
         .map_err(|mut e| {
             if let dq_core::Error::Parse { ref mut file, .. } = e
                 && file.is_none()
@@ -88,6 +93,7 @@ pub(crate) fn load_document_with_path(
 pub(crate) fn load_document_for_lint(
     file: &Utf8Path,
     format_override: Option<&str>,
+    templates: TemplateMode,
 ) -> anyhow::Result<(&'static dyn Format, Document)> {
     let format = pick_format(file, format_override)?;
     let bytes = read_bytes(file)?;
@@ -96,13 +102,13 @@ pub(crate) fn load_document_for_lint(
     } else {
         Some(file.to_path_buf())
     };
-    let doc_result: dq_core::Result<Document> = match format.name() {
+    let doc_result = guarded_parse(&bytes, templates, |b| match format.name() {
         // Stream-aware: a multi-document stream comes back as one, so the
         // lint pipeline and `dq fix` work on each document by itself.
-        "yaml" => dq_core::parse_yaml_stream_with_spans(&bytes),
-        "json" => dq_core::parse_json_with_spans(&bytes),
-        _ => format.parse(&bytes),
-    };
+        "yaml" => dq_core::parse_yaml_stream_with_spans(b),
+        "json" => dq_core::parse_json_with_spans(b),
+        _ => format.parse(b),
+    });
     let doc = doc_result
         .map_err(|mut e| {
             if let dq_core::Error::Parse { ref mut file, .. } = e
@@ -422,7 +428,7 @@ mod tests {
         let mut tmp = NamedTempFile::with_suffix(".yaml").unwrap();
         writeln!(tmp, "a: 1").unwrap();
         let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
-        let (fmt, doc) = load_document_with_path(&path, None).unwrap();
+        let (fmt, doc) = load_document_with_path(&path, None, TemplateMode::Guard).unwrap();
         assert_eq!(fmt.name(), "yaml");
         let Value::Map(m) = doc.value() else { panic!() };
         assert_eq!(m.get("a"), Some(&Value::Int(1)));

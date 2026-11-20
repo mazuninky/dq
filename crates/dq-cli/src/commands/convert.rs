@@ -105,15 +105,7 @@ pub fn run(
         // `ensure_no_write_flags` rejects every flag the read mode forbids
         // (everything except `-i`, which we already filtered above).
         cli.ensure_no_write_flags()?;
-        run_to_stdout(
-            args,
-            cli.doc,
-            input_format,
-            output_format,
-            use_color,
-            opts,
-            out,
-        )
+        run_to_stdout(cli, args, input_format, output_format, use_color, opts, out)
     }
 }
 
@@ -122,8 +114,8 @@ pub fn run(
 /// must keep all golden tests passing. When `--sort-keys` / `--indent` are
 /// set, the rendering path picks them up via `Format::write_with_options`.
 fn run_to_stdout(
+    cli: &Cli,
     args: &ConvertArgs,
-    doc_arg: Option<DocSelector>,
     input_format: Option<&str>,
     output_format: OutputFormat,
     use_color: bool,
@@ -131,8 +123,8 @@ fn run_to_stdout(
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
     let file = single_stdout_input(&args.file)?;
-    let (input_fmt, doc) = load_document_with_path(&file, input_format)?;
-    let doc = select_for_convert(doc, doc_arg, &file)?;
+    let (input_fmt, doc) = load_document_with_path(&file, input_format, cli.template_mode())?;
+    let doc = select_for_convert(doc, cli.doc, &file)?;
     maybe_warn_lossy(input_fmt.name(), output_format);
     let bytes = render_to_format(&doc, output_format, use_color, opts)?;
     out.write_all(&bytes)?;
@@ -285,7 +277,8 @@ fn run_in_place(
         }
 
         // Parse + render.
-        let (input_fmt, doc) = load_document_with_path(source_path, input_format)?;
+        let (input_fmt, doc) =
+            load_document_with_path(source_path, input_format, cli.template_mode())?;
         maybe_warn_lossy(input_fmt.name(), output_format);
         let output_bytes = render_to_format(&doc, output_format, use_color, opts)?;
 
@@ -901,7 +894,9 @@ mod tests {
         // string-keyed map is the simplest shape its writer accepts.
         let tmp = write_yaml("region: eu-west-1\nzone: a\n");
         let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
-        let (_fmt, doc) = super::super::io_helpers::load_document_with_path(&path, None).unwrap();
+        let (_fmt, doc) =
+            super::super::io_helpers::load_document_with_path(&path, None, Default::default())
+                .unwrap();
         let opts = WriteOptions::default();
         let bytes = render_to_format(&doc, OutputFormat::Hcl, false, &opts).unwrap();
         let s = String::from_utf8(bytes).expect("hcl output must be utf-8");
@@ -918,7 +913,9 @@ mod tests {
         // parser produces the right shape.
         let tmp = write_yaml("- name: alice\n  age: 30\n- name: bob\n  age: 25\n");
         let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
-        let (_fmt, doc) = super::super::io_helpers::load_document_with_path(&path, None).unwrap();
+        let (_fmt, doc) =
+            super::super::io_helpers::load_document_with_path(&path, None, Default::default())
+                .unwrap();
         let opts = WriteOptions::default();
         let bytes = render_to_format(&doc, OutputFormat::Csv, false, &opts).unwrap();
         let s = String::from_utf8(bytes).expect("csv output must be utf-8");
@@ -942,7 +939,9 @@ mod tests {
         // document").
         let tmp = write_yaml("title: hello\nauthor: alice\n");
         let path = camino::Utf8PathBuf::from_path_buf(tmp.to_path_buf()).unwrap();
-        let (_fmt, doc) = super::super::io_helpers::load_document_with_path(&path, None).unwrap();
+        let (_fmt, doc) =
+            super::super::io_helpers::load_document_with_path(&path, None, Default::default())
+                .unwrap();
         let opts = WriteOptions::default();
         let bytes = render_to_format(&doc, OutputFormat::Frontmatter, false, &opts).unwrap();
         let s = String::from_utf8(bytes).expect("frontmatter output must be utf-8");

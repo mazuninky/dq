@@ -35,7 +35,7 @@ pub fn run(
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
     cli.ensure_no_write_flags()?;
-    let (_fmt, doc) = load_document_with_path(&args.file, input_format)?;
+    let (_fmt, doc) = load_document_with_path(&args.file, input_format, cli.template_mode())?;
     // Without `--doc` a stream lists every document under its `/N` prefix,
     // as it always has. With `--doc` the listing is of exactly the view
     // `get --doc` reads, so every pointer printed is one `get` accepts

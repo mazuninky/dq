@@ -30,7 +30,7 @@ pub fn run(
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
     cli.ensure_no_write_flags()?;
-    let (_fmt, doc) = load_document_with_path(&args.file, input_format)?;
+    let (_fmt, doc) = load_document_with_path(&args.file, input_format, cli.template_mode())?;
     let view = select_document(&doc, doc_arg, &args.file)?;
     let pointer = Pointer::parse(&args.pointer).map_err(anyhow::Error::new)?;
     let value = pointer.resolve(view.as_ref()).map_err(anyhow::Error::new)?;
