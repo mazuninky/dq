@@ -152,14 +152,26 @@ handled with `serde_json`'s `arbitrary_precision`, so big literals pass
 through untouched. `--indent N` applies on re-emit (`--indent 0` gives
 compact output).
 
-Known issues (see [../roadmap.md](../roadmap.md)): the re-emit writer leaves
-no trailing newline on some paths (`set --jq`, `fmt --indent 2 -i`), and
-`convert -F json` of a JSON file can print an extra blank line.
+Layout of what dq writes:
+
+- A re-emit (`convert -F json`, `set --jq`, `fmt --indent` / `--sort-keys`,
+  on stdout or with `-i`) and a read command's JSON (`get`, `query`, `diff`,
+  `lint` with `-F json`) end with exactly one line break.
+  Indentation is two spaces; `--indent N` changes it on re-emit paths only.
+- `convert -F json` of a JSON file copies the file's bytes (its indentation
+  included) and ends them with one line break: none is added, blank lines
+  after the value are dropped, a `\r\n` ending stays `\r\n`.
+- A textual edit (`set`, `del`, `patch`, `merge` on pointers) keeps the
+  file's layout, including how it ends: no final line break, one, or blank
+  lines after the value. What it inserts is laid out the same for every op:
+  a scalar or a compact `{"k":[1,2]}` value, inside a container written on
+  one line when its parent is, else indented from the line its `{` is on.
+  `patch` `move` and `copy` write the value as `add` does.
 
 ### JSON Lines
 
 One JSON value per line, read as an array (`/0`, `/1`, …). Writing emits one
-compact line per top-level array element.
+compact line per top-level array element, each ending with one line break.
 
 ### TOML
 

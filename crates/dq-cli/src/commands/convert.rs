@@ -429,6 +429,16 @@ fn project_for_cross_format_render(doc: &Document, output_format: OutputFormat) 
     }
 }
 
+/// Make JSON `buf` end with exactly one line break: whitespace after the
+/// value is dropped and one line end put back — `\r\n` when the last one
+/// dropped was, `\n` otherwise.
+fn end_with_one_line_break(buf: &mut Vec<u8>) {
+    let kept = buf.trim_ascii_end().len();
+    let crlf = buf[kept..].ends_with(b"\r\n");
+    buf.truncate(kept);
+    buf.extend_from_slice(if crlf { b"\r\n" } else { b"\n" });
+}
+
 /// Render `doc` to a byte buffer in the requested output format.
 ///
 /// Mirrors the `match output_format` block from the original M2 `run` so
@@ -462,11 +472,10 @@ fn render_to_format(
             let json = dq_core::by_name("json").expect("json format always registered");
             json.write_with_options(doc, &mut buf, opts)
                 .map_err(anyhow::Error::new)?;
-            // A re-emit ends with a line break; source bytes copied as
-            // they are may not, and shell-friendly output gets one.
-            if !buf.ends_with(b"\n") {
-                writeln!(buf)?;
-            }
+            // A re-emit ends with one line break; source bytes copied as
+            // they are may end with none or with blank lines after the
+            // value. JSON output ends with exactly one either way.
+            end_with_one_line_break(&mut buf);
         }
         OutputFormat::Yaml => {
             let yaml = dq_core::by_name("yaml").expect("yaml format always registered");
@@ -866,6 +875,22 @@ mod tests {
     // These are minimal round-trips through `render_to_format`: they prove
     // the dispatcher arm is wired to `dq_core::by_name(...)` correctly. The
     // comprehensive byte-level tests for each format land in Stage 4.
+
+    #[test]
+    fn end_with_one_line_break_keeps_exactly_one() {
+        for (input, want) in [
+            (&b"{}"[..], &b"{}\n"[..]),
+            (b"{}\n", b"{}\n"),
+            (b"{}\n\n", b"{}\n"),
+            (b"{} \t\n \n", b"{}\n"),
+            (b"{}\r\n", b"{}\r\n"),
+            (b"{}\r\n\r\n", b"{}\r\n"),
+        ] {
+            let mut buf = input.to_vec();
+            end_with_one_line_break(&mut buf);
+            assert_eq!(buf, want, "{:?}", String::from_utf8_lossy(input));
+        }
+    }
 
     #[test]
     fn render_to_format_emits_hcl_for_a_simple_map() {
