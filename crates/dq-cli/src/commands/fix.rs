@@ -321,6 +321,21 @@ impl<'a> FileOp for FixFileOp<'a> {
             document.original_bytes().to_vec()
         };
 
+        // The guard let the file's templates through: what is written must
+        // hold every template of the fixed data as the same string, and
+        // still read the same with its templates as placeholders — a
+        // `fix.jq` re-emit or a rewritten format goes through the writer.
+        if dq_core::template_guard::detect_templates(&original_bytes).is_some() {
+            dq_core::template_guard::check_templates_kept(
+                document.value(),
+                &[],
+                None,
+                &final_bytes,
+                |b| super::io_helpers::parse_for_edit(format, b),
+            )
+            .map_err(anyhow::Error::new)?;
+        }
+
         let diff = if self.cli.diff {
             let original_str = String::from_utf8_lossy(&original_bytes);
             let modified_str = String::from_utf8_lossy(&final_bytes);

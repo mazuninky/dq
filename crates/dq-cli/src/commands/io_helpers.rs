@@ -16,7 +16,7 @@ use std::fs;
 use std::io::Read;
 
 use camino::{Utf8Path, Utf8PathBuf};
-use dq_core::template_guard::{TemplateMode, guarded_parse};
+use dq_core::template_guard::{TemplateMode, WriteGuard, guarded_parse, parse_for_write};
 use dq_core::{Document, Format, Pointer, Segment, Value};
 
 use crate::cli::{Cli, DocSelector};
@@ -120,6 +120,74 @@ pub(crate) fn load_document_for_lint(
         })
         .map_err(anyhow::Error::new)?;
     Ok((format, doc))
+}
+
+/// Parse `bytes` as `format` into a document an edit can change: YAML
+/// stream-aware and JSON through their span-collecting parsers (so `--doc
+/// N` tells a stream of documents from a document holding a sequence),
+/// every other format through `Format::parse` (write-aware for TOML,
+/// rewritten whole for XML, HCL, INI, dotenv and CSV, read-only for the
+/// rest). The one parser `set`, `del`, `patch` and `merge` share.
+pub(crate) fn parse_for_edit(
+    format: &'static dyn Format,
+    bytes: &[u8],
+) -> dq_core::Result<Document> {
+    match format.name() {
+        "yaml" => dq_core::parse_yaml_stream_with_spans(bytes),
+        "json" => dq_core::parse_json_with_spans(bytes),
+        _ => format.parse(bytes),
+    }
+}
+
+/// Parse `original`, the bytes of `file`, for an edit, behind the write
+/// side of the template guard ([`parse_for_write`], as `cli`'s template
+/// flags say). A parse error names `file`.
+///
+/// # Errors
+///
+/// [`dq_core::Error::TemplatedFile`] (exit 3) for a file whose templates
+/// change what the parser reads; any parse error.
+pub(crate) fn parse_file_for_edit(
+    cli: &Cli,
+    format: &'static dyn Format,
+    original: &[u8],
+    file: &Utf8Path,
+) -> anyhow::Result<(Document, WriteGuard)> {
+    parse_for_write(original, cli.template_mode(), |b| parse_for_edit(format, b)).map_err(
+        |mut e| {
+            if let dq_core::Error::Parse {
+                file: ref mut at, ..
+            } = e
+                && at.is_none()
+            {
+                *at = Some(file.to_path_buf());
+            }
+            anyhow::Error::new(e)
+        },
+    )
+}
+
+/// The bytes an edit of `document` writes: [`WriteGuard::finish`] over its
+/// bytes, with `edited` the pointers the edit changed on purpose and
+/// `textual` whether it spliced the text (a write-aware document) rather
+/// than rewriting it.
+///
+/// # Errors
+///
+/// [`dq_core::Error::TemplatedFile`] (exit 3) when the edit would not keep
+/// a template as it was.
+pub(crate) fn finish_edit(
+    guard: &WriteGuard,
+    format: &'static dyn Format,
+    document: &Document,
+    edited: &[Pointer],
+    textual: bool,
+) -> anyhow::Result<Vec<u8>> {
+    guard
+        .finish(document.original_bytes().to_vec(), edited, textual, |b| {
+            parse_for_edit(format, b)
+        })
+        .map_err(anyhow::Error::new)
 }
 
 /// Pick a [`Format`] for `file`: the one `--input-format` names

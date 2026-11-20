@@ -113,6 +113,16 @@ impl<'a> FileOp for FmtFileOp<'a> {
             .write_with_options(&doc, &mut buf, self.opts)
             .map_err(anyhow::Error::new)?;
 
+        // The guard let the file's templates through: the rewrite must
+        // write each so it reads back as the same string, and still not
+        // change the reading.
+        if dq_core::template_guard::detect_templates(doc.original_bytes()).is_some() {
+            dq_core::template_guard::check_templates_kept(doc.value(), &[], None, &buf, |b| {
+                input_fmt.parse(b)
+            })
+            .map_err(anyhow::Error::new)?;
+        }
+
         // 3. Idempotency check: if the rendered bytes equal the source's
         //    on-disk bytes, the file is already canonically formatted and
         //    we report `Unchanged`. The bulk driver translates that into

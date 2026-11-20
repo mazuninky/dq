@@ -284,12 +284,417 @@ fn restore_in_str(s: &str, map: &HashMap<String, String>) -> Option<String> {
     Some(text)
 }
 
+/// The template guard of one write: what [`parse_for_write`] decided, and
+/// what [`WriteGuard::finish`] checks or restores once the edit is made.
+#[derive(Debug, Default)]
+pub struct WriteGuard {
+    /// `--raw-template-strings`: the placeholders to put back in the text.
+    placeholders: Option<HashMap<String, String>>,
+    /// The guard let templates through: the data and the bytes as read, to
+    /// check the written text against.
+    kept: Option<(crate::Value, Vec<u8>)>,
+}
+
+/// Parse `original` for a write command, running the template guard as
+/// `mode` says.
+///
+/// - [`TemplateMode::Guard`]: [`guarded_parse`] — a file whose templates
+///   change what the parser reads is refused; one whose templates do not
+///   is parsed as it is, and [`WriteGuard::finish`] then checks that the
+///   edit kept them.
+/// - [`TemplateMode::Allow`]: parsed as it is, no check.
+/// - [`TemplateMode::RawStrings`]: parsed with placeholders, which
+///   [`WriteGuard::finish`] puts back as the template text.
+///
+/// # Errors
+///
+/// [`crate::Error::TemplatedFile`] from the guard; any error of `parse`.
+pub fn parse_for_write(
+    original: &[u8],
+    mode: TemplateMode,
+    parse: impl Fn(&[u8]) -> crate::Result<crate::Document>,
+) -> crate::Result<(crate::Document, WriteGuard)> {
+    match mode {
+        TemplateMode::RawStrings => {
+            let (substituted, map) = substitute_placeholders(original);
+            let doc = parse(&substituted)?;
+            Ok((
+                doc,
+                WriteGuard {
+                    placeholders: Some(map),
+                    kept: None,
+                },
+            ))
+        }
+        TemplateMode::Allow => Ok((parse(original)?, WriteGuard::default())),
+        TemplateMode::Guard => {
+            let doc = guarded_parse(original, TemplateMode::Guard, &parse)?;
+            let kept = detect_templates(original)
+                .is_some()
+                .then(|| (doc.value().clone(), original.to_vec()));
+            Ok((
+                doc,
+                WriteGuard {
+                    placeholders: None,
+                    kept,
+                },
+            ))
+        }
+    }
+}
+
+impl WriteGuard {
+    /// The bytes to write for the edited `written` text.
+    ///
+    /// Under `--raw-template-strings` the placeholders are put back. When
+    /// the guard let templates through, [`check_templates_kept`] runs:
+    /// `edited` are the pointers the edit set, removed or replaced (their
+    /// templates may go), `textual` says the edit spliced the text rather
+    /// than rewriting it through the format's writer, and `parse` reads the
+    /// written bytes back.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::TemplatedFile`] when the edit would not keep a
+    /// template as it was.
+    pub fn finish(
+        &self,
+        written: Vec<u8>,
+        edited: &[crate::Pointer],
+        textual: bool,
+        parse: impl Fn(&[u8]) -> crate::Result<crate::Document>,
+    ) -> crate::Result<Vec<u8>> {
+        if let Some(map) = &self.placeholders {
+            return Ok(restore_placeholders(&written, map));
+        }
+        if let Some((before, original)) = &self.kept {
+            check_templates_kept(
+                before,
+                edited,
+                textual.then_some(original.as_slice()),
+                &written,
+                parse,
+            )?;
+        }
+        Ok(written)
+    }
+}
+
+/// Check that a write keeps the templates of the data it edited.
+///
+/// `before` is the data the templates were read in, `edited` the pointers
+/// whose subtrees the edit changed on purpose (their templates may go or
+/// change), `written` the bytes the edit produced, `parse` how to read them.
+///
+/// 1. The written text must still read the same with its templates as
+///    placeholders ([`guarded_parse`]): no edit may turn a template that
+///    lived inside a value into one that changes the reading.
+/// 2. Every string (value or key) of `before` outside `edited` that holds a
+///    template must read back from `written` as the very same string — a
+///    writer that re-quotes or escapes a template must leave its data alone.
+///    Strings are counted, not located, so items that move up an array
+///    after a removal still match.
+/// 3. With `original` — the text before a textual edit — every template
+///    block of that text outside `edited` must stand in `written` byte for
+///    byte.
+///
+/// # Errors
+///
+/// [`crate::Error::TemplatedFile`] naming the first template not kept.
+pub fn check_templates_kept(
+    before: &crate::Value,
+    edited: &[crate::Pointer],
+    original: Option<&[u8]>,
+    written: &[u8],
+    parse: impl Fn(&[u8]) -> crate::Result<crate::Document>,
+) -> crate::Result<()> {
+    let edited: Vec<String> = edited.iter().map(crate::Pointer::as_canonical).collect();
+    let mut outside = Vec::new();
+    let mut inside = Vec::new();
+    template_strings(
+        before,
+        &mut String::new(),
+        &edited,
+        &mut outside,
+        &mut inside,
+    );
+    let after = guarded_parse(written, TemplateMode::Guard, &parse).map_err(|err| match err {
+        crate::Error::TemplatedFile { line, snippet, .. } => not_kept(line, snippet),
+        other => other,
+    })?;
+
+    let mut read_back = Vec::new();
+    template_strings(
+        after.value(),
+        &mut String::new(),
+        &[],
+        &mut read_back,
+        &mut Vec::new(),
+    );
+    let mut read_back = counts(read_back);
+    for s in &outside {
+        if !take(&mut read_back, s) {
+            return Err(not_kept_in(written, original, s));
+        }
+    }
+
+    if let Some(original) = original {
+        let mut left = counts(blocks(original));
+        for s in &inside {
+            for block in blocks(s.as_bytes()) {
+                take(&mut left, &block);
+            }
+        }
+        let mut found = counts(blocks(written));
+        for (block, n) in left {
+            for _ in 0..n {
+                if !take(&mut found, &block) {
+                    return Err(not_kept_in(written, Some(original), &block));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every template block (`{{ … }}`, `${{ … }}`) of `bytes`, in order.
+fn blocks(bytes: &[u8]) -> Vec<String> {
+    substitution_regex()
+        .find_iter(bytes)
+        .map(|m| String::from_utf8_lossy(m.as_bytes()).into_owned())
+        .collect()
+}
+
+/// Collect the strings and keys of `value` that hold a template block —
+/// into `inside` under an `edited` pointer, into `outside` elsewhere.
+fn template_strings(
+    value: &crate::Value,
+    pointer: &mut String,
+    edited: &[String],
+    outside: &mut Vec<String>,
+    inside: &mut Vec<String>,
+) {
+    use crate::Value;
+    let under_edit = edited
+        .iter()
+        .any(|e| pointer == e || pointer.starts_with(&format!("{e}/")) || e.is_empty());
+    let mut keep = |s: &str| {
+        if substitution_regex().is_match(s.as_bytes()) {
+            if under_edit {
+                inside.push(s.to_owned());
+            } else {
+                outside.push(s.to_owned());
+            }
+        }
+    };
+    match value {
+        Value::String(s) => keep(s),
+        Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                let len = pointer.len();
+                pointer.push('/');
+                pointer.push_str(&i.to_string());
+                template_strings(item, pointer, edited, outside, inside);
+                pointer.truncate(len);
+            }
+        }
+        Value::Map(entries) => {
+            for (key, item) in entries {
+                let len = pointer.len();
+                pointer.push('/');
+                pointer.push_str(&key.replace('~', "~0").replace('/', "~1"));
+                let key_edited = edited
+                    .iter()
+                    .any(|e| pointer == e || pointer.starts_with(&format!("{e}/")) || e.is_empty());
+                if substitution_regex().is_match(key.as_bytes()) {
+                    if key_edited {
+                        inside.push(key.clone());
+                    } else {
+                        outside.push(key.clone());
+                    }
+                }
+                template_strings(item, pointer, edited, outside, inside);
+                pointer.truncate(len);
+            }
+        }
+        Value::Null
+        | Value::Bool(_)
+        | Value::Int(_)
+        | Value::BigInt(_)
+        | Value::Float(_)
+        | Value::BigFloat(_) => {}
+    }
+}
+
+/// `items` as a count per distinct item.
+fn counts(items: Vec<String>) -> HashMap<String, usize> {
+    let mut map = HashMap::new();
+    for item in items {
+        *map.entry(item).or_insert(0) += 1;
+    }
+    map
+}
+
+/// Take one `item` out of `counts`; `false` when there is none left.
+fn take(counts: &mut HashMap<String, usize>, item: &str) -> bool {
+    match counts.get_mut(item) {
+        Some(n) if *n > 0 => {
+            *n -= 1;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// [`crate::Error::TemplatedFile`] for a template `s` the edit would not
+/// keep, at the line of its first block in the text before the edit (or in
+/// the written text, or line 1).
+fn not_kept_in(written: &[u8], original: Option<&[u8]>, s: &str) -> crate::Error {
+    let block = blocks(s.as_bytes())
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| s.to_owned());
+    let locate = |text: &[u8]| {
+        let text = String::from_utf8_lossy(text);
+        let at = text.find(&block)?;
+        let line = text[..at].matches('\n').count() + 1;
+        let snippet = text.lines().nth(line - 1).unwrap_or_default();
+        Some((
+            u32::try_from(line).unwrap_or(u32::MAX),
+            snippet.trim().chars().take(80).collect::<String>(),
+        ))
+    };
+    let (line, snippet) = original
+        .and_then(locate)
+        .or_else(|| locate(written))
+        .unwrap_or((1, block.chars().take(80).collect()));
+    not_kept(line, snippet)
+}
+
+/// The refusal of an edit that would not keep a template as it was.
+fn not_kept(line: u32, snippet: String) -> crate::Error {
+    crate::Error::TemplatedFile {
+        line,
+        snippet,
+        hint: "the edit would not keep this template as written; edit the file by hand, \
+               or use --raw-template-strings to treat template values as opaque strings"
+            .to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn yaml(bytes: &[u8]) -> crate::Result<crate::Document> {
         crate::by_name("yaml").expect("yaml format").parse(bytes)
+    }
+
+    fn yaml_stream(bytes: &[u8]) -> crate::Result<crate::Document> {
+        crate::parse_yaml_stream_with_spans(bytes)
+    }
+
+    fn before(text: &str) -> crate::Value {
+        yaml(text.as_bytes()).expect("parses").value().clone()
+    }
+
+    fn ptr(s: &str) -> crate::Pointer {
+        crate::Pointer::parse(s).expect("pointer")
+    }
+
+    #[test]
+    fn kept_templates_pass_and_edited_ones_may_go() {
+        let text = "a: \"${{ x }}\"\nl:\n  - run ${{ y }}\n  - plain\n  - run ${{ z }}\nb: 1\n";
+        let data = before(text);
+        // `b` changed, every template kept byte for byte.
+        let written = text.replace("b: 1", "b: 2");
+        check_templates_kept(
+            &data,
+            &[ptr("/b")],
+            Some(text.as_bytes()),
+            written.as_bytes(),
+            yaml_stream,
+        )
+        .expect("kept");
+        // `/l/0` removed: its template goes, `/l/2` moves up to `/l/1`.
+        let written = text.replace("  - run ${{ y }}\n", "");
+        check_templates_kept(
+            &data,
+            &[ptr("/l/0")],
+            Some(text.as_bytes()),
+            written.as_bytes(),
+            yaml_stream,
+        )
+        .expect("removed on purpose");
+    }
+
+    #[test]
+    fn a_template_whose_data_changes_is_refused() {
+        let text = "a: \"${{ x }}\"\nb: 1\n";
+        let err = check_templates_kept(
+            &before(text),
+            &[ptr("/b")],
+            None,
+            b"a: \"${{ x  }}\"\nb: 2\n",
+            yaml_stream,
+        )
+        .expect_err("refused");
+        assert!(
+            matches!(err, crate::Error::TemplatedFile { line: 1, .. }),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("would not keep"), "{err}");
+    }
+
+    #[test]
+    fn a_template_written_where_it_changes_the_reading_is_refused() {
+        let text = "a: \"{{ .x }}\"\n";
+        let err = check_templates_kept(&before(text), &[], None, b"a: {{ .x }}\n", yaml_stream)
+            .expect_err("refused");
+        assert!(matches!(err, crate::Error::TemplatedFile { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_textual_edit_must_keep_template_text_byte_for_byte() {
+        // The same data, written with other quoting: fine as data, not as
+        // text.
+        let text = "a: '${{ f(''x'') }}'\nb: 1\n";
+        let written = b"a: \"${{ f('x') }}\"\nb: 2\n";
+        check_templates_kept(&before(text), &[ptr("/b")], None, written, yaml_stream)
+            .expect("same data");
+        let err = check_templates_kept(
+            &before(text),
+            &[ptr("/b")],
+            Some(text.as_bytes()),
+            written,
+            yaml_stream,
+        )
+        .expect_err("text changed");
+        assert!(
+            matches!(err, crate::Error::TemplatedFile { line: 1, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_for_write_modes() {
+        let helm = b"port: {{ .p }}\n";
+        assert!(matches!(
+            parse_for_write(helm, TemplateMode::Guard, yaml),
+            Err(crate::Error::TemplatedFile { .. })
+        ));
+        let (_, guard) = parse_for_write(helm, TemplateMode::RawStrings, yaml).expect("parses");
+        assert_eq!(
+            guard
+                .finish(b"port: __DQ_TPL_0__\n".to_vec(), &[], true, yaml)
+                .expect("restored"),
+            helm
+        );
+        let (_, guard) = parse_for_write(helm, TemplateMode::Allow, yaml).expect("parses");
+        assert_eq!(
+            guard.finish(b"x".to_vec(), &[], true, yaml).expect("as is"),
+            b"x"
+        );
     }
 
     #[test]

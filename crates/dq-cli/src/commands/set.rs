@@ -40,8 +40,8 @@ use dq_core::template_guard::TemplateMode;
 use dq_core::{Document, Pointer, Value};
 
 use super::io_helpers::{
-    checked_index, load_document_with_path, pick_format, pointer_in_document, read_bytes,
-    skip_out_of_range,
+    checked_index, finish_edit, load_document_with_path, parse_file_for_edit, parse_for_edit,
+    pick_format, pointer_in_document, read_bytes, skip_out_of_range,
 };
 use super::query::jq_compile_to_parse;
 use crate::bulk::{self, FileOp, FileOpResult};
@@ -194,28 +194,12 @@ impl<'a> FileOp for SetFileOp<'a> {
         //    sake before being handed to the parser.
         let original_bytes = read_bytes(path)?;
 
-        // 3. Template guard: detect / substitute / pass-through depending
-        //    on which escape-hatch flag is active. Stored as
-        //    `Option<HashMap>` because we only need the restoration map
-        //    when substitution ran.
-        let (parse_input, placeholder_map) = if self.cli.raw_template_strings {
-            let (substituted, map) =
-                dq_core::template_guard::substitute_placeholders(&original_bytes);
-            (substituted, Some(map))
-        } else if self.cli.allow_templates {
-            (original_bytes.clone(), None)
-        } else if let Some(marker) = dq_core::template_guard::detect_templates(&original_bytes) {
-            return Err(anyhow::Error::new(dq_core::Error::templated_file(marker)));
-        } else {
-            (original_bytes.clone(), None)
-        };
-
-        // 4. Parse to a write-aware Document. YAML and JSON have dedicated
-        //    span-collecting entry points; TOML and JSONL go through the
-        //    `Format::parse` trait method (TOML produces a write-aware doc
-        //    via `Toml::parse`; JSONL is read-only, so `set_at` will return
-        //    `WriteUnavailable` and the exit-code mapper picks 7).
-        let mut document = parse_to_document(format, &parse_input, path)?;
+        // Template guard, then parse: a file whose templates change what
+        // the parser reads is refused; `guard` checks below that the edit
+        // keeps the templates of one whose templates do not (or puts the
+        // `--raw-template-strings` placeholders back).
+        let (mut document, guard) = parse_file_for_edit(self.cli, format, &original_bytes, path)?;
+        let textual = document.is_write_aware();
         let pointer = match skip_out_of_range(
             pointer_in_document(&document, self.doc_index, self.pointer, path),
             self.several,
@@ -246,10 +230,13 @@ impl<'a> FileOp for SetFileOp<'a> {
 
         // 6. Compute the final output bytes, restoring template
         //    placeholders if the substitution pass ran.
-        let mut final_bytes = document.original_bytes().to_vec();
-        if let Some(map) = &placeholder_map {
-            final_bytes = dq_core::template_guard::restore_placeholders(&final_bytes, map);
-        }
+        let final_bytes = finish_edit(
+            &guard,
+            format,
+            &document,
+            std::slice::from_ref(&pointer),
+            textual,
+        )?;
 
         // 7. The bulk driver handles `-i` and `--check` uniformly — we
         //    only need to compute the diff string when `--diff` mode is
@@ -368,6 +355,20 @@ impl<'a> FileOp for JqFileOp<'a> {
             .write_with_options(&new_doc, &mut final_bytes, &self.cli.write_options())
             .map_err(anyhow::Error::new)?;
 
+        // The guard let the file's templates through: the writer must
+        // write every template the filter's output holds so that it reads
+        // back as the same string, and still does not change the reading.
+        if dq_core::template_guard::detect_templates(&original_bytes).is_some() {
+            dq_core::template_guard::check_templates_kept(
+                new_doc.value(),
+                &[],
+                None,
+                &final_bytes,
+                |b| parse_for_edit(format, b),
+            )
+            .map_err(anyhow::Error::new)?;
+        }
+
         // Diff handling mirrors the splice path's `SetFileOp::apply`: only
         // compute the diff when `--diff` is set.
         let diff = if self.cli.diff {
@@ -485,37 +486,6 @@ fn run_jq_transform(
     };
     super::io_helpers::check_write_targets(cli, "set", &files, input_format)?;
     bulk::run_per_file(files, &op, cli, out)
-}
-
-/// Parse `parse_input` as `format` into a write-aware [`Document`].
-///
-/// YAML and JSON are routed through the dedicated span-collecting parsers
-/// (`parse_yaml_with_spans` / `parse_json_with_spans`); every other format
-/// falls through to the generic `Format::parse` trait method (which is
-/// write-aware for TOML and read-only for JSONL).
-fn parse_to_document(
-    format: &'static dyn dq_core::Format,
-    parse_input: &[u8],
-    file: &Utf8Path,
-) -> anyhow::Result<Document> {
-    let path_label = camino::Utf8PathBuf::from(file);
-    let doc_result: dq_core::Result<Document> = match format.name() {
-        // Stream-aware, so `--doc N` can tell a stream of documents from a
-        // document holding a sequence; the edit itself is the same.
-        "yaml" => dq_core::parse_yaml_stream_with_spans(parse_input),
-        "json" => dq_core::parse_json_with_spans(parse_input),
-        _ => format.parse(parse_input),
-    };
-    doc_result
-        .map_err(|mut e| {
-            if let dq_core::Error::Parse { ref mut file, .. } = e
-                && file.is_none()
-            {
-                *file = Some(path_label.clone());
-            }
-            e
-        })
-        .map_err(anyhow::Error::new)
 }
 
 /// Resolve the value-source flags into a [`Value`].

@@ -21,11 +21,11 @@
 use std::io::{Read, Write};
 
 use camino::{Utf8Path, Utf8PathBuf};
-use dq_core::{Document, PatchOp, Pointer, Value};
+use dq_core::{PatchOp, Pointer, Value};
 
 use crate::bulk::{self, FileOp, FileOpResult};
 use crate::cli::{Cli, PatchArgs};
-use crate::commands::io_helpers::{pick_format, read_bytes};
+use crate::commands::io_helpers::{finish_edit, parse_file_for_edit, pick_format, read_bytes};
 use crate::error::InvalidInput;
 
 /// Run `dq patch`.
@@ -96,32 +96,21 @@ impl<'a> FileOp for PatchFileOp<'a> {
         let format = pick_format(path, self.input_format)?;
         let original_bytes = read_bytes(path)?;
 
-        // Template guard: detect / substitute / pass-through depending on
-        // which escape-hatch flag is active.
-        let (parse_input, placeholder_map) = if self.cli.raw_template_strings {
-            let (substituted, map) =
-                dq_core::template_guard::substitute_placeholders(&original_bytes);
-            (substituted, Some(map))
-        } else if self.cli.allow_templates {
-            (original_bytes.clone(), None)
-        } else if let Some(marker) = dq_core::template_guard::detect_templates(&original_bytes) {
-            return Err(anyhow::Error::new(dq_core::Error::templated_file(marker)));
-        } else {
-            (original_bytes.clone(), None)
-        };
-
-        let mut document = parse_to_document(format, &parse_input, path)?;
+        // Template guard, then parse: a file whose templates change what
+        // the parser reads is refused; `guard` checks below that the edit
+        // keeps the templates of one whose templates do not (or puts the
+        // `--raw-template-strings` placeholders back).
+        let (mut document, guard) = parse_file_for_edit(self.cli, format, &original_bytes, path)?;
+        let textual = document.is_write_aware();
 
         // Apply the patch atomically — on any failure (including a failing
         // `test`), the engine leaves `document` untouched (clone-on-apply).
         dq_core::apply_patch(&mut document, self.ops).map_err(anyhow::Error::new)?;
 
-        // Compute final bytes, restoring template placeholders when the
-        // substitution pass ran.
-        let mut final_bytes = document.original_bytes().to_vec();
-        if let Some(map) = &placeholder_map {
-            final_bytes = dq_core::template_guard::restore_placeholders(&final_bytes, map);
-        }
+        // Compute final bytes: placeholders put back, or the templates
+        // checked as kept outside the paths the ops name.
+        let final_bytes =
+            finish_edit(&guard, format, &document, &patch_targets(self.ops), textual)?;
 
         // The bulk driver handles `-i` and `--check` uniformly — we only
         // need to compute the diff string when `--diff` mode is active so
@@ -146,36 +135,26 @@ impl<'a> FileOp for PatchFileOp<'a> {
     }
 }
 
-/// Parse `parse_input` as `format` into a write-aware [`Document`].
-///
-/// TODO(M3 §10): this is a near-verbatim copy of
-/// [`crate::commands::set::parse_to_document`]. The merge / diff handlers in
-/// §5 / §6 will produce a third copy; once three call sites exist, extract
-/// to a shared helper module under `commands/io_helpers` (the abstraction
-/// is not yet load-bearing — each handler still owns its own template-guard
-/// dance, so a half-shared helper would obscure rather than simplify).
-fn parse_to_document(
-    format: &'static dyn dq_core::Format,
-    parse_input: &[u8],
-    file: &Utf8Path,
-) -> anyhow::Result<Document> {
-    let path_label = Utf8PathBuf::from(file);
-    let doc_result: dq_core::Result<Document> = match format.name() {
-        // Stream-aware, like `set` and `del`: `/N` is a whole document.
-        "yaml" => dq_core::parse_yaml_stream_with_spans(parse_input),
-        "json" => dq_core::parse_json_with_spans(parse_input),
-        _ => format.parse(parse_input),
-    };
-    doc_result
-        .map_err(|mut e| {
-            if let dq_core::Error::Parse { ref mut file, .. } = e
-                && file.is_none()
-            {
-                *file = Some(path_label.clone());
+/// The pointers `ops` change on purpose — every op's `path`, and the
+/// `from` a `move` empties — whose templates the template guard lets go.
+fn patch_targets(ops: &[PatchOp]) -> Vec<dq_core::Pointer> {
+    let mut targets = Vec::new();
+    for op in ops {
+        match op {
+            PatchOp::Add { path, .. }
+            | PatchOp::Remove { path }
+            | PatchOp::Replace { path, .. } => {
+                targets.push(path.clone());
             }
-            e
-        })
-        .map_err(anyhow::Error::new)
+            PatchOp::Move { from, path } => {
+                targets.push(from.clone());
+                targets.push(path.clone());
+            }
+            PatchOp::Copy { path, .. } => targets.push(path.clone()),
+            PatchOp::Test { .. } => {}
+        }
+    }
+    targets
 }
 
 /// Resolve the patch source (inline / stdin / `@<path>` / `--ops-from`) into

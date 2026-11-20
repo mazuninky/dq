@@ -56,6 +56,15 @@ Exactly one of:
 - `--check` — nothing is written or printed except `would modify: <path>`
   lines and a count; exit 1 if any file would change, 0 otherwise.
 
+A file holding Go-template or GitHub Actions markers is edited when its
+templates do not change what the parser reads (a workflow's
+`run: echo ${{ github.sha }}`), and the edit must keep them: a textual edit
+leaves every template it does not target byte for byte, a rewrite writes
+each so it reads back as the same string — otherwise exit 3, file
+untouched. A Helm values file is refused (exit 3) unless
+`--raw-template-strings` or `--allow-templates` says how to treat it; see
+[template-guard.md](template-guard.md).
+
 `--backup` (only with `-i`) copies the original to `<file>.bak` first,
 overwriting an existing `.bak` without asking. Invalid combinations are listed
 in [cli.md](cli.md#global-flags). A write command keeps the file in its own

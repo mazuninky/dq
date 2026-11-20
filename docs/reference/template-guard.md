@@ -10,26 +10,43 @@ Implementation: `crates/dq-core/src/template_guard.rs`.
 
 ## Where it runs
 
-Every command that parses a file runs the guard, with one rule per kind of
-command:
+Every command that parses a file runs the guard — `get`, `exists`, `keys`,
+`values`, `len`, `type`, `paths`, `select`, `query`, `convert` (to stdout and
+`-i`), `validate`, `diff`, `lint`, `check`, `fmt`, `fix`, `set`, `del`,
+`patch`, `merge`, `set --jq`, and the file `set --value-from` / `@file`
+reads — on the format `--input-format` or the file name picks, stdin
+included. It refuses a file only when its templates change what the parser
+reads. When the detection below matches, the file is parsed twice: as it
+is, and with every template block swapped for a placeholder. If both parse
+and hold the same data once each placeholder is put back as the template
+text, the templates do not matter to the reading and the command goes on
+with the file as it is. A GitHub Actions workflow
+(`run: echo ${{ github.ref }}`, a plain scalar) and a `{{ … }}` inside a
+quoted string pass this way, in every format. A Helm
+`port: {{ .Values.port }}`, which YAML reads as a flow mapping, or a
+`{{- if … }}` line, on which the parser fails, is refused (`TemplatedFile`,
+exit 3).
 
-- **Textual-edit writes** — `set`, `del`, `patch`, `merge` — refuse any file
-  the detection below matches, before parsing: the edit splices text into
-  the file, so the user has to choose how its templates are handled.
-- **Everything else that reads a file** — `get`, `exists`, `keys`,
-  `values`, `len`, `type`, `paths`, `select`, `query`, `convert` (to stdout
-  and `-i`), `validate`, `diff`, `lint`, `check`, `fmt`, `fix`, `set --jq`,
-  and the file
-  `set --value-from` / `@file` reads — refuses a file only when its
-  templates change what the parser reads. When the detection matches, the
-  file is parsed twice: as it is, and with every template block swapped for
-  a placeholder. If both parse and hold the same data once each placeholder
-  is put back as the template text, the templates do not matter to the
-  reading and the command goes on with the file as it is. A GitHub Actions
-  workflow (`run: echo ${{ github.ref }}`, a plain scalar) and a `{{ … }}`
-  inside a quoted string pass this way, in every format. A Helm
-  `port: {{ .Values.port }}`, which YAML reads as a flow mapping, or a
-  `{{- if … }}` line, on which the parser fails, is refused.
+### Edits keep the templates
+
+An edit of a file the guard let through (`set`, `del`, `patch`, `merge`,
+`set --jq`, `fix`, `fmt`) must keep its templates; otherwise it is refused with
+`TemplatedFile` (exit 3) and the file is left alone, rather than written
+with a template changed:
+
+- The written text must still read the same with its templates as
+  placeholders: no edit may move a template to where it changes the reading.
+- Every string (value or key) holding a template must read back from the
+  written text as the same string — through the textual edit, or through
+  the writer when the file is rewritten whole (`set --jq`, a `fix.jq`, `fmt`, and
+  the formats edited by rewriting: XML, HCL, INI, dotenv, CSV/TSV). Strings
+  the edit targets are exempt: `set`, `del` and `patch` may replace or
+  remove the node a template is in, `merge` the members its patch names, and
+  a value set may bring a template of its own.
+- A textual edit (YAML, JSON, TOML) must leave every template block it did
+  not target byte for byte as it was.
+
+The message names the template's line and says the edit would not keep it.
 
 `lint` and `check` treat a refused file as they treat a file that fails to
 parse: the run stops with exit 3. There is no lint diagnostic of its own for
@@ -55,8 +72,9 @@ detected as well. The marker reports its line and the offending line
 
 ## Default: refuse
 
-A detected template makes the command fail with `TemplatedFile` (exit 3). The
-message names both escape hatches and what each costs.
+A template that changes the reading makes the command fail with
+`TemplatedFile` (exit 3). The message names both escape hatches and what
+each costs.
 
 ## `--raw-template-strings`
 

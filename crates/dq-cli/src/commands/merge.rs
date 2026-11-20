@@ -21,11 +21,11 @@
 use std::io::{Read, Write};
 
 use camino::{Utf8Path, Utf8PathBuf};
-use dq_core::{Document, Value};
+use dq_core::Value;
 
 use crate::bulk::{self, FileOp, FileOpResult};
 use crate::cli::{Cli, MergeArgs};
-use crate::commands::io_helpers::{pick_format, read_bytes};
+use crate::commands::io_helpers::{finish_edit, parse_file_for_edit, pick_format, read_bytes};
 use crate::error::InvalidInput;
 
 /// Run `dq merge`.
@@ -92,21 +92,12 @@ impl<'a> FileOp for MergeFileOp<'a> {
         let format = pick_format(path, self.input_format)?;
         let original_bytes = read_bytes(path)?;
 
-        // Template guard: detect / substitute / pass-through depending on
-        // which escape-hatch flag is active.
-        let (parse_input, placeholder_map) = if self.cli.raw_template_strings {
-            let (substituted, map) =
-                dq_core::template_guard::substitute_placeholders(&original_bytes);
-            (substituted, Some(map))
-        } else if self.cli.allow_templates {
-            (original_bytes.clone(), None)
-        } else if let Some(marker) = dq_core::template_guard::detect_templates(&original_bytes) {
-            return Err(anyhow::Error::new(dq_core::Error::templated_file(marker)));
-        } else {
-            (original_bytes.clone(), None)
-        };
-
-        let mut document = parse_to_document(format, &parse_input, path)?;
+        // Template guard, then parse: a file whose templates change what
+        // the parser reads is refused; `guard` checks below that the edit
+        // keeps the templates of one whose templates do not (or puts the
+        // `--raw-template-strings` placeholders back).
+        let (mut document, guard) = parse_file_for_edit(self.cli, format, &original_bytes, path)?;
+        let textual = document.is_write_aware();
         // RFC 7396 merges into one document; a stream is several, and
         // `--doc` is refused here.
         if let Some(documents) = document.values() {
@@ -119,14 +110,13 @@ impl<'a> FileOp for MergeFileOp<'a> {
 
         // Apply the merge patch atomically — on any failure, the engine
         // leaves `document` untouched (clone-on-apply).
+        let mut edited = Vec::new();
+        merge_targets(self.patch, document.value(), &mut Vec::new(), &mut edited);
         dq_core::apply_merge(&mut document, self.patch).map_err(anyhow::Error::new)?;
 
-        // Compute final bytes, restoring template placeholders when the
-        // substitution pass ran.
-        let mut final_bytes = document.original_bytes().to_vec();
-        if let Some(map) = &placeholder_map {
-            final_bytes = dq_core::template_guard::restore_placeholders(&final_bytes, map);
-        }
+        // Compute final bytes: placeholders put back, or the templates
+        // checked as kept outside what the merge patch names.
+        let final_bytes = finish_edit(&guard, format, &document, &edited, textual)?;
 
         // The bulk driver handles `-i` and `--check` uniformly — we only
         // need to compute the diff string when `--diff` mode is active so
@@ -149,37 +139,6 @@ impl<'a> FileOp for MergeFileOp<'a> {
             diff,
         })
     }
-}
-
-/// Parse `parse_input` as `format` into a write-aware [`Document`].
-///
-/// TODO(M3 §10): third copy of `parse_to_document` — extract.
-/// (First copy: `crate::commands::set`. Second copy:
-/// `crate::commands::patch`. This is the third.) Each handler still owns
-/// its own template-guard dance, so a half-shared helper would obscure
-/// rather than simplify until the §10 cleanup pass.
-fn parse_to_document(
-    format: &'static dyn dq_core::Format,
-    parse_input: &[u8],
-    file: &Utf8Path,
-) -> anyhow::Result<Document> {
-    let path_label = Utf8PathBuf::from(file);
-    let doc_result: dq_core::Result<Document> = match format.name() {
-        // Stream-aware, so a stream of documents is told from one document.
-        "yaml" => dq_core::parse_yaml_stream_with_spans(parse_input),
-        "json" => dq_core::parse_json_with_spans(parse_input),
-        _ => format.parse(parse_input),
-    };
-    doc_result
-        .map_err(|mut e| {
-            if let dq_core::Error::Parse { ref mut file, .. } = e
-                && file.is_none()
-            {
-                *file = Some(path_label.clone());
-            }
-            e
-        })
-        .map_err(anyhow::Error::new)
 }
 
 /// Resolve the merge-patch source (inline / stdin / `@<path>` /
@@ -223,6 +182,33 @@ fn resolve_patch(args: &MergeArgs) -> anyhow::Result<Value> {
         anyhow::Error::new(InvalidInput::new(format!("invalid JSON merge patch: {e}")))
     })?;
     Ok(Value::from_serde_json(&json))
+}
+
+/// Collect into `edited` the pointers an RFC 7396 merge `patch` changes on
+/// purpose in `target`: a member whose patch value is not an object (set
+/// or removed), or is an object where `target` holds no object (replaced
+/// whole); an object over an object is merged member by member. `at` is the
+/// path walked so far.
+fn merge_targets(
+    patch: &Value,
+    target: &Value,
+    at: &mut Vec<dq_core::Segment>,
+    edited: &mut Vec<dq_core::Pointer>,
+) {
+    let (Value::Map(members), Value::Map(current)) = (patch, target) else {
+        edited.push(dq_core::Pointer::new(at.clone()));
+        return;
+    };
+    for (key, value) in members {
+        at.push(dq_core::Segment::Key(key.clone()));
+        match current.get(key) {
+            Some(inner) if matches!(value, Value::Map(_)) => {
+                merge_targets(value, inner, at, edited);
+            }
+            _ => edited.push(dq_core::Pointer::new(at.clone())),
+        }
+        at.pop();
+    }
 }
 
 #[cfg(test)]
