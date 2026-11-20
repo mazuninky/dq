@@ -295,7 +295,7 @@ fn console_output_reports_each_finding_at_its_instruction() {
          {path: Dockerfile, line: 4, col: 3, message: ADD used for local copy; prefer COPY, severity: warn, rule_id: dockerfile.no-add-use-copy, references: [https://docs.docker.com/develop/develop-images/dockerfile_best-practices/#add-or-copy]}, \
          {path: Dockerfile, line: 5, col: 1, message: RUN pipes curl/wget into a shell, severity: warn, rule_id: dockerfile.no-curl-pipe-bash, references: [https://www.idontplaydarts.com/2016/04/detecting-curl-pipe-bash-server-side/]}, \
          {path: Dockerfile, line: 7, col: 1, message: RUN pipes curl/wget into a shell, severity: warn, rule_id: dockerfile.no-curl-pipe-bash, references: [https://www.idontplaydarts.com/2016/04/detecting-curl-pipe-bash-server-side/]}, \
-         {path: Dockerfile, line: 2, col: 1, message: FROM line uses :latest (or no tag): ubuntu:latest, severity: error, rule_id: dockerfile.no-latest-base-image, references: [https://docs.docker.com/develop/develop-images/dockerfile_best-practices/]}\
+         {path: Dockerfile, line: 2, col: 1, message: 'FROM line uses :latest (or no tag): ubuntu:latest', severity: error, rule_id: dockerfile.no-latest-base-image, references: [https://docs.docker.com/develop/develop-images/dockerfile_best-practices/]}\
          ]\n"
     );
     assert_eq!(

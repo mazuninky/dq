@@ -1,7 +1,9 @@
 //! Human-readable console reporter.
 //!
 //! Scalars are written as their textual form. Arrays render one element per
-//! line. Objects render `key: value` per line. When `use_color` is `true`,
+//! line. Objects render `key: value` per line. A collection nested in a
+//! line is YAML flow (`{a: [1, '{{ .p }}']}`): a string in it is quoted
+//! where YAML would not read it back as written. When `use_color` is `true`,
 //! object keys are coloured cyan and the type tag (`null`, `bool`, ...) green;
 //! when `use_color` is `false`, no ANSI escapes are emitted under any
 //! conditions, regardless of the surrounding TTY state.
@@ -32,6 +34,14 @@ impl ConsoleReporter {
 
 impl Reporter for ConsoleReporter {
     fn report(&self, value: &serde_json::Value, w: &mut dyn Write) -> anyhow::Result<()> {
+        write_top(&dq_core::Value::from_serde_json(value), w, self.use_color)?;
+        Ok(())
+    }
+
+    /// Renders `value` itself, not its JSON form: a NaN or an infinity
+    /// (`.nan`, `.inf`) is told apart from the string `".nan"`, which a
+    /// collection quotes.
+    fn report_value(&self, value: &dq_core::Value, w: &mut dyn Write) -> anyhow::Result<()> {
         write_top(value, w, self.use_color)?;
         Ok(())
     }
@@ -94,26 +104,34 @@ fn is_invisible_layout(c: char) -> bool {
     )
 }
 
-/// A number as the console prints it: an integer as its literal, a float
-/// as dq's YAML writer spells it (`3.0`, `1.0e+300`, `1.0e+400`), so `get`
-/// and `-F yaml` agree, as they do on `.nan` — not serde_json's `1e+300`.
-fn number_text(n: &serde_json::Number) -> String {
-    let literal = n.to_string();
+/// A number as the console prints it: `.nan`, `.inf`, `-.inf`; an integer
+/// as its literal, a float as dq's YAML writer spells it (`3.0`,
+/// `1.0e+300`, `1.0e+400`), so `get` and `-F yaml` agree — not
+/// serde_json's `1e+300`.
+fn number_text(v: &dq_core::Value) -> String {
+    if let Some(spelling) = v.non_finite_spelling() {
+        return spelling.to_owned();
+    }
+    let literal = match v.to_serde_json() {
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => return s,
+        other => return other.to_string(),
+    };
     dq_core::Value::from_number_literal(&literal)
         .as_ref()
         .and_then(dq_core::parsers::yaml_float_text)
         .unwrap_or(literal)
 }
 
-fn write_top(value: &serde_json::Value, w: &mut dyn Write, use_color: bool) -> std::io::Result<()> {
+fn write_top(value: &dq_core::Value, w: &mut dyn Write, use_color: bool) -> std::io::Result<()> {
     match value {
-        serde_json::Value::Array(items) => {
+        dq_core::Value::Array(items) => {
             for item in items {
                 write_inline(item, w, use_color)?;
                 w.write_all(b"\n")?;
             }
         }
-        serde_json::Value::Object(map) => {
+        dq_core::Value::Map(map) => {
             for (k, v) in map {
                 let safe_key = escape_control(k);
                 if use_color {
@@ -133,50 +151,83 @@ fn write_top(value: &serde_json::Value, w: &mut dyn Write, use_color: bool) -> s
     Ok(())
 }
 
-fn write_inline(
-    value: &serde_json::Value,
-    w: &mut dyn Write,
-    use_color: bool,
-) -> std::io::Result<()> {
+/// `value` on a line of its own or after `key: `: a string as it is (with
+/// controls escaped), a collection as YAML flow ([`write_flow`]).
+fn write_inline(value: &dq_core::Value, w: &mut dyn Write, use_color: bool) -> std::io::Result<()> {
     match value {
-        serde_json::Value::Null => {
+        dq_core::Value::String(s) => w.write_all(escape_control(s).as_bytes()),
+        other => write_flow(other, w, use_color),
+    }
+}
+
+/// `value` inside a collection, as YAML flow: a string is quoted where a
+/// plain scalar would not read back as it (`'{{ .p }}'`, `'a #b'`, `'on'`).
+fn write_flow(value: &dq_core::Value, w: &mut dyn Write, use_color: bool) -> std::io::Result<()> {
+    match value {
+        dq_core::Value::Null => {
             if use_color {
                 w.write_all(b"\x1b[32mnull\x1b[0m")
             } else {
                 w.write_all(b"null")
             }
         }
-        serde_json::Value::Bool(b) => write!(w, "{b}"),
-        serde_json::Value::Number(n) => w.write_all(number_text(n).as_bytes()),
-        serde_json::Value::String(s) => {
-            let safe = escape_control(s);
-            w.write_all(safe.as_bytes())
-        }
-        serde_json::Value::Array(items) => {
+        dq_core::Value::Bool(b) => write!(w, "{b}"),
+        dq_core::Value::Int(_)
+        | dq_core::Value::BigInt(_)
+        | dq_core::Value::Float(_)
+        | dq_core::Value::BigFloat(_) => w.write_all(number_text(value).as_bytes()),
+        dq_core::Value::String(s) => w.write_all(flow_string(s).as_bytes()),
+        dq_core::Value::Array(items) => {
             // Inline arrays compactly so a `key: [...]` row stays on one line.
             w.write_all(b"[")?;
             for (i, item) in items.iter().enumerate() {
                 if i > 0 {
                     w.write_all(b", ")?;
                 }
-                write_inline(item, w, use_color)?;
+                write_flow(item, w, use_color)?;
             }
             w.write_all(b"]")
         }
-        serde_json::Value::Object(map) => {
+        dq_core::Value::Map(map) => {
             w.write_all(b"{")?;
             for (i, (k, v)) in map.iter().enumerate() {
                 if i > 0 {
                     w.write_all(b", ")?;
                 }
-                let safe_key = escape_control(k);
-                w.write_all(safe_key.as_bytes())?;
+                w.write_all(flow_string(k).as_bytes())?;
                 w.write_all(b": ")?;
-                write_inline(v, w, use_color)?;
+                write_flow(v, w, use_color)?;
             }
             w.write_all(b"}")
         }
     }
+}
+
+/// A string inside a collection: as dq's YAML writer spells it in flow
+/// ([`dq_core::parsers::yaml_flow_string`]), or — when it holds a
+/// character the console never prints raw ([`escape_control`]) — a
+/// double-quoted scalar with that character escaped, which reads back as
+/// the same string.
+fn flow_string(s: &str) -> String {
+    if !s
+        .chars()
+        .any(|c| is_escaped_control(c) || is_invisible_layout(c))
+    {
+        return dq_core::parsers::yaml_flow_string(s);
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if is_escaped_control(c) => out.push_str(&format!("\\x{:02x}", u32::from(c))),
+            c if is_invisible_layout(c) => out.push_str(&format!("\\u{:04x}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 #[cfg(test)]
@@ -201,7 +252,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             String::from_utf8(buf).unwrap(),
-            ".nan\n.inf\n[-.inf]\n{t: .inf, y: .nan}\n1.5\n"
+            ".nan\n.inf\n[-.inf]\n{t: .inf, 'y': .nan}\n1.5\n"
         );
     }
 
@@ -252,6 +303,83 @@ mod tests {
     fn renders_object_with_ansi_when_color_on() {
         let out = render(&serde_json::json!({"a": 1}), true);
         assert!(out.contains("\x1b[36m"), "expected cyan key, got: {out:?}");
+    }
+
+    #[test]
+    fn strings_inside_a_collection_are_flow_yaml() {
+        let out = render(
+            &serde_json::json!({"a": {"name": "{{ .p }}", "b": ["x", "{y}", "on", "a #b"]}}),
+            false,
+        );
+        assert_eq!(out, "a: {name: '{{ .p }}', b: [x, '{y}', 'on', 'a #b']}\n");
+        // Outside a collection a string prints as it is.
+        assert_eq!(render(&serde_json::json!("{{ .p }}"), false), "{{ .p }}\n");
+        assert_eq!(
+            render(&serde_json::json!({"a": "{{ .p }}"}), false),
+            "a: {{ .p }}\n"
+        );
+    }
+
+    #[test]
+    fn a_collection_prints_as_flow_yaml_that_reads_back_as_the_same_value() {
+        use dq_core::Format as _;
+        for text in [
+            "{{ .p }}",
+            "{a}",
+            "[b",
+            "x]",
+            "a,b",
+            "#c",
+            "a #b",
+            "- x",
+            "? x",
+            ": x",
+            "a: b",
+            "a:",
+            "!x",
+            "&a",
+            "*a",
+            "|",
+            ">",
+            "%x",
+            "@x",
+            "`x",
+            "'q",
+            "\"q",
+            "",
+            "~",
+            "null",
+            "true",
+            "on",
+            "y",
+            "1e3",
+            "0x1F",
+            ".inf",
+            "1",
+            "a\nb",
+            "\u{1b}[31m",
+            "a\u{202e}b",
+            "é",
+        ] {
+            let value = serde_json::json!([text, {text: text}]);
+            let out = render(&serde_json::json!({ "k": value }), false);
+            let flow = out
+                .strip_prefix("k: ")
+                .and_then(|s| s.strip_suffix('\n'))
+                .unwrap_or_else(|| panic!("{text:?}: {out:?}"));
+            assert!(
+                !flow.contains(['\u{1b}', '\u{202e}', '\n']),
+                "{text:?}: {flow:?}"
+            );
+            let read = dq_core::parsers::Yaml
+                .parse(flow.as_bytes())
+                .unwrap_or_else(|err| panic!("{text:?} as {flow:?}: {err}"));
+            assert_eq!(
+                read.value(),
+                &dq_core::Value::from_serde_json(&value),
+                "{text:?} as {flow:?}"
+            );
+        }
     }
 
     #[test]

@@ -204,11 +204,12 @@ fn query_sees_nan_and_infinity_as_jq_numbers() {
     assert_eq!(query(".z | isnan", "x.yaml"), "false\n");
     assert_eq!(query(".x | type", "s.yaml"), "string\n");
     // Arithmetic and jq's own non-finite numbers run. The console output
-    // spells a non-finite float the YAML way: `.nan`, `.inf`, `-.inf`.
+    // spells a non-finite float the YAML way: `.nan`, `.inf`, `-.inf`;
+    // in a collection a key YAML 1.1 reads as a bool (`y`) is quoted.
     assert_eq!(query(".x + 1", "x.yaml"), ".nan\n");
     assert_eq!(query("nan", "x.yaml"), ".nan\n");
     assert_eq!(query("[infinite, -infinite]", "x.yaml"), "[.inf, -.inf]\n");
-    assert_eq!(query(".", "x.yaml"), "{x: .nan, y: -.inf, z: 1}\n");
+    assert_eq!(query(".", "x.yaml"), "{x: .nan, 'y': -.inf, z: 1}\n");
     // YAML output writes them back as YAML floats.
     assert_eq!(
         stdout_of(&dir, &["query", "-F", "yaml", ".x", "x.yaml"]),

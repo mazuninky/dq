@@ -52,7 +52,8 @@ fn get_escapes_c1_controls_in_a_value() {
 }
 
 /// A key holding a C1 control is escaped too — both as a top-level row
-/// and inside an inline object.
+/// and inside an inline object, where it is a double-quoted YAML scalar
+/// the escape reads back from.
 #[test]
 fn get_escapes_c1_controls_in_keys() {
     let dir = tempfile::tempdir().unwrap();
@@ -63,7 +64,7 @@ fn get_escapes_c1_controls_in_keys() {
     );
     assert_eq!(
         stdout_of(&["--no-color", "get", &file, ""]),
-        "k\\x9bx: {i\\x85j: v}\n"
+        "k\\x9bx: {\"i\\x85j\": v}\n"
     );
 }
 

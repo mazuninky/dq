@@ -171,6 +171,16 @@ names the output alone.
 
 There is no `text` value; the default human format is `console`.
 
+`console` prints a scalar result, and the value after `key: ` on a top-level
+row, as it is (`dq get f.yaml /tag` prints `{{ .p }}`). A collection on a
+line is YAML flow, and a string in it — key or value — is spelled as
+`-F yaml` spells it in flow: quoted where a plain scalar would read as
+something else (`{name: '{{ .p }}', b: ['{y}', 'on', 'a: b']}`), so the line
+reads back as YAML to the same value. A string holding a character
+`console` escapes (below) is double-quoted there, so the escape reads back.
+Lint, check and validate reports print their diagnostics through the same
+rules (`message: 'FROM line uses :latest (or no tag): ubuntu:latest'`).
+
 `console` never writes a control character raw: every C0 control (tab and
 line feed included), DEL and every C1 control (U+0080–U+009F, among them
 U+009B CSI, which starts a terminal escape sequence on its own, and U+0085

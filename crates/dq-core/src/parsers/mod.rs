@@ -33,7 +33,7 @@ pub use markdown::Markdown;
 pub use toml::{Toml, TomlInsertionRenderer, TomlScalarRenderer};
 pub use xml::Xml;
 pub use yaml::Yaml;
-pub use yaml_emit::yaml_float_text;
+pub use yaml_emit::{yaml_float_text, yaml_flow_string};
 pub use yaml_spans::{
     YamlInsertionRenderer, YamlScalarRenderer, parse_with_spans as parse_yaml_with_spans_pair,
     parse_yaml_stream_with_spans, parse_yaml_with_spans,

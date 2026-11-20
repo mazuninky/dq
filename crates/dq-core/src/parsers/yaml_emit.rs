@@ -513,6 +513,17 @@ fn write_flow(v: &Value, out: &mut String) {
     }
 }
 
+/// `s` as a scalar inside a YAML flow collection (`[...]`, `{...}`), as
+/// [`flow_key_text`] writes a string: plain where that reads back as the
+/// same string, else quoted. What `dq get`'s console output spells a string
+/// inside a collection with.
+#[must_use]
+pub fn yaml_flow_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    write_flow_string(s, &mut out);
+    out
+}
+
 /// `s` as a flow scalar: plain when this writer writes it plain, it holds
 /// no flow indicator and starts with no `?` or `:` (in flow, a key or a
 /// value indicator: `[?a]` reads as `[{a: null}]`), else single-quoted,
@@ -661,81 +672,135 @@ mod tests {
         assert_eq!(flow_key_text(&map(&[("", Value::Null)])), "{'': null}");
     }
 
+    /// Strings a plain scalar cannot hold as they are, or would read as
+    /// another type: indicators at the start, `: ` and ` #` inside, a
+    /// trailing `:`, flow indicators, templates, the spellings of other
+    /// types, line breaks and escapes.
+    const TRICKY: &[&str] = &[
+        "?a",
+        ":x",
+        "?x",
+        ":>",
+        "?",
+        ":",
+        "??",
+        "::",
+        "-",
+        "-x",
+        "- x",
+        "-1",
+        "--",
+        "---",
+        "...",
+        "? x",
+        ": x",
+        "a:b",
+        "a: b",
+        "a:",
+        "a?",
+        "#a",
+        "a #b",
+        "a#b",
+        "&a",
+        "*a",
+        "!a",
+        "|",
+        ">",
+        "%a",
+        "@a",
+        "`a",
+        "'",
+        "\"",
+        "a'b",
+        "a\"b",
+        "[",
+        "]",
+        "{",
+        "}",
+        ",",
+        "a,b",
+        "{a}",
+        "[a]",
+        "a: [b]",
+        " a",
+        "a ",
+        "",
+        "~",
+        "null",
+        "true",
+        "on",
+        "y",
+        "1",
+        "1.5",
+        "0x1",
+        "1e400",
+        ".inf",
+        "<<",
+        "=",
+        "2001-12-14",
+        "a\nb",
+        "a\tb",
+        "\u{7}",
+        "é",
+        "\u{FEFF}x",
+        "x\u{85}y",
+        "x\u{2028}y",
+        "a\\b",
+        "\\",
+        "{{ .p }}",
+        "{{",
+        "}}",
+        "{{- if .x }}",
+        "${{ github.ref }}",
+        "a {{ .b }}",
+        "{{ .a }} b",
+        "x}",
+        "x]",
+        "a]b",
+        "a, b",
+        "a:]",
+        "1e3",
+        "0x1F",
+        ".inf",
+        "-.inf",
+        ".nan",
+        "True",
+        "NULL",
+        "0o17",
+        "+1",
+        ".5",
+        "12:30",
+        "1_000",
+        "- ",
+        "? ",
+        ": ",
+        "a\t#b",
+        "%TAG",
+        "a: b: c",
+    ];
+
+    #[test]
+    fn the_writer_reads_back_every_string_in_block_context() {
+        for &text in TRICKY {
+            for v in [
+                s(text),
+                map(&[("k", s(text))]),
+                map(&[(text, s("v"))]),
+                Value::Array(vec![s(text)]),
+                map(&[("k", Value::Array(vec![s(text), map(&[(text, s(text))])]))]),
+            ] {
+                let out = yaml(&v);
+                let read = crate::parsers::Yaml
+                    .parse(out.as_bytes())
+                    .unwrap_or_else(|err| panic!("{text:?} as {out:?}: {err}"));
+                assert_eq!(read.value(), &v, "{text:?} as {out:?}");
+            }
+        }
+    }
+
     #[test]
     fn flow_key_text_reads_back_as_the_same_value() {
-        let tricky = [
-            "?a",
-            ":x",
-            "?x",
-            ":>",
-            "?",
-            ":",
-            "??",
-            "::",
-            "-",
-            "-x",
-            "- x",
-            "-1",
-            "--",
-            "---",
-            "...",
-            "? x",
-            ": x",
-            "a:b",
-            "a: b",
-            "a:",
-            "a?",
-            "#a",
-            "a #b",
-            "a#b",
-            "&a",
-            "*a",
-            "!a",
-            "|",
-            ">",
-            "%a",
-            "@a",
-            "`a",
-            "'",
-            "\"",
-            "a'b",
-            "a\"b",
-            "[",
-            "]",
-            "{",
-            "}",
-            ",",
-            "a,b",
-            "{a}",
-            "[a]",
-            "a: [b]",
-            " a",
-            "a ",
-            "",
-            "~",
-            "null",
-            "true",
-            "on",
-            "y",
-            "1",
-            "1.5",
-            "0x1",
-            "1e400",
-            ".inf",
-            "<<",
-            "=",
-            "2001-12-14",
-            "a\nb",
-            "a\tb",
-            "\u{7}",
-            "é",
-            "\u{FEFF}x",
-            "x\u{85}y",
-            "x\u{2028}y",
-            "a\\b",
-            "\\",
-        ];
-        for text in tricky {
+        for &text in TRICKY {
             for v in [
                 Value::Array(vec![s(text)]),
                 map(&[(text, s(text))]),

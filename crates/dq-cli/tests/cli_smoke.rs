@@ -1114,7 +1114,7 @@ fn console_keeps_non_ascii_next_to_an_escaped_control_character() {
         .args(["--no-color", "query", ".", "m.json"])
         .assert()
         .success()
-        .stdout("{a: é\\x01, b: é}\n");
+        .stdout("{a: \"é\\x01\", b: é}\n");
 }
 
 /// A `validate` snippet goes through the same escaping: a raw control

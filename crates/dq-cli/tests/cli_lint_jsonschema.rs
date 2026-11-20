@@ -170,7 +170,7 @@ fn lint_schema_message_prefix_is_separated_from_the_keyword_location() {
         .code(4);
     let stdout = String::from_utf8(out.get_output().stdout.clone()).expect("UTF-8");
     assert!(
-        stdout.contains(r#"message: shape: /required: "name" is a required property,"#),
+        stdout.contains(r#"message: 'shape: /required: "name" is a required property',"#),
         "expected the separated prefix, got: {stdout}"
     );
 }
