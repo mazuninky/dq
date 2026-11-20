@@ -88,7 +88,9 @@
 //! comments, PIs and white space after it (XML 1.0 §2.1): a second root,
 //! text, CDATA or a reference outside the root, a misplaced or second
 //! DOCTYPE, and an element the input leaves open are parse errors. So are
-//! `]]>` in text (§2.4) and a raw `<` in an attribute value (§3.1).
+//! `]]>` in text (§2.4), a raw `<` in an attribute value (§3.1), and the
+//! names the writer refuses: an element or attribute name that is no
+//! `QName`, and a PI target that is no `NCName`.
 //!
 //! ## Encodings
 //!
@@ -398,6 +400,25 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                 );
             }
             Ok(Event::PI(pi)) => {
+                // A target is an `NCName` (XML 1.0 §2.6, Namespaces in XML
+                // §7), right after the `<?`.
+                let target = pi.target();
+                if !is_ncname(target) {
+                    let message = if target.is_empty() {
+                        "a processing instruction must name its target right after '<?'".to_owned()
+                    } else {
+                        let hint = if target.contains(':') {
+                            " (a target holds no ':')"
+                        } else {
+                            ""
+                        };
+                        format!(
+                            "'{target}' is not a valid XML name for a processing-instruction \
+                             target{hint}"
+                        )
+                    };
+                    return Err(parse_error_at(text, event_start + "<?".len(), message));
+                }
                 // `<?XML …?>` and the like: XML reserves the target, in any
                 // case, for the declaration (§2.6), and the writer refuses it.
                 if pi.target().eq_ignore_ascii_case("xml") {
@@ -419,6 +440,7 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                 push_comment(&mut stack, &mut top_comments, txt);
             }
             Ok(Event::Start(start)) => {
+                check_names(text, &start, event_start)?;
                 if stack.is_empty() {
                     take_root(&mut root, &start, text, event_start)?;
                 }
@@ -437,6 +459,7 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
                 stack.push(frame);
             }
             Ok(Event::Empty(start)) => {
+                check_names(text, &start, event_start)?;
                 if stack.is_empty() {
                     take_root(&mut root, &start, text, event_start)?;
                 }
@@ -622,6 +645,33 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
         }
     }
     Ok(Value::Map(top))
+}
+
+/// Refuse the name of `start`, a start or empty-element tag at
+/// `event_start` in `text`, or of one of its attributes, at the name, when
+/// it is no namespace-well-formed `QName` ([`name_refusal`]): the writer
+/// would refuse it.
+fn check_names(text: &str, start: &BytesStart<'_>, event_start: usize) -> Result<()> {
+    let name = start.name();
+    let tag: &str = name.as_ref();
+    if tag.is_empty() {
+        return Err(parse_error_at(
+            text,
+            event_start + "<".len(),
+            "a tag must begin with its name right after '<'".to_owned(),
+        ));
+    }
+    if let Some(message) = name_refusal(tag, "an element") {
+        return Err(parse_error_at(text, event_start + "<".len(), message));
+    }
+    for attr in start.attributes().flatten() {
+        let key: &str = attr.key.as_ref();
+        if let Some(message) = name_refusal(key, &format!("an attribute (on <{tag}>)")) {
+            let pos = name_offset(text, start, event_start, Some(key));
+            return Err(parse_error_at(text, pos, message));
+        }
+    }
+    Ok(())
 }
 
 /// Record `start`, a start or empty-element tag at the top level (at
@@ -2590,18 +2640,30 @@ fn check_item(key: &str, owner: &str, text: &str, xml11: bool) -> Result<()> {
 /// names (`an element`, `an attribute (on <r>)`). Whether a prefix is
 /// declared is not checked.
 fn check_name(name: &str, what: &str) -> Result<()> {
+    name_refusal(name, what).map_or(Ok(()), |message| {
+        Err(Error::Format {
+            format: "xml",
+            message: format!("XML write: {message}"),
+        })
+    })
+}
+
+/// Why `name` cannot name `what`, the reader's and the writer's words:
+/// it is no namespace-well-formed `QName`. `None` when it can.
+fn name_refusal(name: &str, what: &str) -> Option<String> {
     if is_qname(name) {
-        return Ok(());
+        return None;
     }
-    let hint = if name.contains(':') {
+    // The hint only where a colon is at fault: `xmlns:1p` is refused for
+    // its `1`.
+    let colon_at_fault =
+        name.matches(':').count() > 1 || name.starts_with(':') || name.ends_with(':');
+    let hint = if colon_at_fault {
         " (a name holds at most one ':', between a prefix and a local name)"
     } else {
         ""
     };
-    Err(Error::Format {
-        format: "xml",
-        message: format!("XML write: '{name}' is not a valid XML name for {what}{hint}"),
-    })
+    Some(format!("'{name}' is not a valid XML name for {what}{hint}"))
 }
 
 /// Namespaces in XML 1.0 `QName`: `NCName` or `NCName ':' NCName`.

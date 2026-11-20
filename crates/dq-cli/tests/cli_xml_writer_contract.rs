@@ -2742,3 +2742,87 @@ fn cdata_end_in_text_and_a_raw_lt_in_a_value_are_refused() {
         )],
     );
 }
+
+/// A name that is no namespace-well-formed XML name is refused at the
+/// name, in the writer's words: an element's, an attribute's (namespace
+/// declarations too), and a PI target, which is an `NCName`. Before, each
+/// read with exit 0 into a tree the writer refused with exit 1.
+#[test]
+fn a_name_that_is_no_xml_name_is_refused_on_read() {
+    const COLONS: &str = " (a name holds at most one ':', between a prefix and a local name)";
+    let element = |name: &str| format!("'{name}' is not a valid XML name for an element");
+    let (digit, hyphen, non_name, colons, slash) = (
+        element("1r"),
+        element("-a"),
+        element("a\u{a1}"),
+        format!("{}{COLONS}", element("a:b:c")),
+        element("c/"),
+    );
+    assert_unreadable(&[
+        ("digit.xml", b"<1r/>", 1, 2, &digit),
+        ("hyphen.xml", b"<-a/>", 1, 2, &hyphen),
+        // U+00A1 is no NameChar.
+        ("non_name.xml", b"<a\xc2\xa1/>", 1, 2, &non_name),
+        ("colons.xml", b"<a:b:c xmlns:a=\"u\"/>", 1, 2, &colons),
+        ("slash.xml", b"<r><c/ ></r>", 1, 5, &slash),
+        (
+            "nameless.xml",
+            b"< r/>",
+            1,
+            2,
+            "a tag must begin with its name right after '<'",
+        ),
+        (
+            "attribute.xml",
+            b"<r><c\n  1b=\"x\"/></r>",
+            2,
+            3,
+            "'1b' is not a valid XML name for an attribute (on <c>)",
+        ),
+        (
+            "declaration.xml",
+            b"<r xmlns:1p=\"u\"/>",
+            1,
+            4,
+            "'xmlns:1p' is not a valid XML name for an attribute (on <r>)",
+        ),
+        (
+            "pi_digit.xml",
+            b"<?1p x?><r/>",
+            1,
+            3,
+            "'1p' is not a valid XML name for a processing-instruction target",
+        ),
+        (
+            "pi_colon.xml",
+            b"<r><?a:b x?></r>",
+            1,
+            6,
+            "'a:b' is not a valid XML name for a processing-instruction target (a target holds \
+             no ':')",
+        ),
+        (
+            "pi_nameless.xml",
+            b"<? p?><r/>",
+            1,
+            3,
+            "a processing instruction must name its target right after '<?'",
+        ),
+    ]);
+    let dir = dir_with(&[(
+        "names.xml",
+        "<?xml version=\"1.1\"?><?pi-x.1 d?><_r xmlns:p\u{e9}=\"u\" p\u{e9}:a\u{300}=\"1\" \
+         x.y-z\u{b7}=\"2\"><\u{4e2d}/></_r>"
+            .as_bytes(),
+    )]);
+    assert_cases(
+        &dir,
+        &[(
+            convert("names.xml", "xml"),
+            ok(
+                "<?xml version=\"1.1\"?><?pi-x.1 d?><_r xmlns:p\u{e9}=\"u\" p\u{e9}:a\u{300}=\"1\" \
+                x.y-z\u{b7}=\"2\">\n  <\u{4e2d}/>\n</_r>",
+            ),
+        )],
+    );
+}

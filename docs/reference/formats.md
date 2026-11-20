@@ -338,6 +338,12 @@ cannot read name their byte index instead:
 - `]]>` in text, which only ends a CDATA section (XML 1.0 §2.4; write
   `]]&gt;`), and a raw `<` in an attribute value (§3.1; write `&lt;`).
   `]]>` in an attribute value is well-formed and kept;
+- a name that is no namespace-well-formed XML name, at the name, in the
+  writer's words: an element or attribute name that is no `QName` (`<1r/>`,
+  `<a 1b="x"/>`, `<a:b:c/>`, `xmlns:1p`), a tag with no name right after
+  `<`, and a PI target that is no `NCName` (`<?1p x?>`, `<?a:b x?>`) or
+  does not follow `<?` at once. XML 1.0 (fifth edition) and 1.1 share the
+  `Name` production;
 - an XML declaration its grammar (XML 1.0 §2.8) rules out, at the
   pseudo-attribute or value at fault: `version` missing or not first,
   `standalone` before `encoding`, a pseudo-attribute given twice or one
