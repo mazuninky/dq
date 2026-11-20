@@ -1055,12 +1055,12 @@ fn smoke_set_jq_diff_renders_unified_diff_for_replicas_bump() {
     assert_eq!(after, original, "--diff must NOT modify the fixture");
 }
 
-/// BUG (uncommitted): the console escapes a control character in a string
-/// and then writes every other byte of that string as a char of its own,
-/// so a non-ASCII character next to it comes out as Latin-1 mojibake:
-/// `é\u0001` prints `Ã©\x01`, though `é` alone prints `é`.
+/// The console escapes a control character in a string and copies every
+/// other character whole. It used to write every other byte as a char of
+/// its own, so a non-ASCII character next to the escape came out as
+/// Latin-1 mojibake: `é\u0001` printed `Ã©\x01`, though `é` alone printed
+/// `é`.
 #[test]
-#[ignore = "red until item 2 of docs/plans/after-deps-update-fixes.md lands; drop with the fix"]
 fn console_keeps_non_ascii_next_to_an_escaped_control_character() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     std::fs::write(dir.path().join("m.json"), r#"{"a": "é\u0001", "b": "é"}"#).expect("write");
@@ -1069,4 +1069,23 @@ fn console_keeps_non_ascii_next_to_an_escaped_control_character() {
         .assert()
         .success()
         .stdout("{a: é\\x01, b: é}\n");
+}
+
+/// A `validate` snippet goes through the same escaping: a raw control
+/// character in a JSON string is a parse error, and the snippet line keeps
+/// the `é` beside it whole (it printed `Ã©\x01`).
+#[test]
+fn validate_snippet_keeps_non_ascii_next_to_an_escaped_control_character() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(dir.path().join("bad.json"), "{\"a\": \"é\u{1}\"}\n").expect("write");
+    let out = dq()
+        .current_dir(dir.path())
+        .args(["--no-color", "validate", "bad.json"])
+        .assert()
+        .code(4);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("snippet: {\"a\": \"é\\x01\"}\n"),
+        "expected the snippet with `é` intact, got:\n{stderr}",
+    );
 }

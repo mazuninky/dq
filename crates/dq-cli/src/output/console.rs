@@ -37,27 +37,26 @@ impl Reporter for ConsoleReporter {
     }
 }
 
-/// Escape every control byte (`< 0x20`, `0x7f`, including `\n`/`\t`/`\r`/`\x1b`)
-/// in `s` using a Rust-style `\xNN` form.
+/// Escape every control character (`< 0x20`, `0x7f`, including
+/// `\n`/`\t`/`\r`/`\x1b`) in `s` using a Rust-style `\xNN` form.
 ///
-/// Returns the borrowed input when no escaping is needed (no control bytes).
-/// Otherwise allocates a new `String`. Non-ASCII bytes are passed through
-/// unchanged — they participate in valid UTF-8 multi-byte sequences and the
-/// shell renders them safely.
+/// Returns the borrowed input when no escaping is needed (no control
+/// characters). Otherwise allocates a new `String`. Every other character,
+/// non-ASCII included, is copied whole: the walk is over chars, not bytes,
+/// so a multi-byte character next to an escaped control stays intact.
 fn escape_control(s: &str) -> Cow<'_, str> {
-    // Escape every C0 control byte (`< 0x20`, includes `\x1b` ESC, `\n`, `\t`,
-    // `\r`) plus DEL (`0x7f`). Non-ASCII bytes (`>= 0x80`) pass through —
-    // they participate in valid UTF-8 multi-byte sequences.
+    // A C0 control or DEL is always a single byte in UTF-8, and no byte of a
+    // multi-byte sequence is below 0x80, so a byte scan finds them all.
     let needs_escape = s.bytes().any(|b| b < 0x20 || b == 0x7f);
     if !needs_escape {
         return Cow::Borrowed(s);
     }
     let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b < 0x20 || b == 0x7f {
-            out.push_str(&format!("\\x{b:02x}"));
+    for c in s.chars() {
+        if c < '\u{20}' || c == '\u{7f}' {
+            out.push_str(&format!("\\x{:02x}", u32::from(c)));
         } else {
-            out.push(b as char);
+            out.push(c);
         }
     }
     Cow::Owned(out)
@@ -255,6 +254,14 @@ mod tests {
         let s = "a\nb\tc\rd";
         let escaped = escape_control(s).into_owned();
         assert_eq!(escaped, "a\\x0ab\\x09c\\x0dd");
+    }
+
+    #[test]
+    fn escape_control_keeps_multi_byte_characters_whole() {
+        assert_eq!(
+            escape_control("é\u{1}ж\u{7f}🦀").into_owned(),
+            "é\\x01ж\\x7f🦀"
+        );
     }
 
     #[test]
