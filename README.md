@@ -159,7 +159,7 @@ dq fix -i --rules @std/k8s deploy.yaml
 | Dockerfile | `Dockerfile`, `*.Dockerfile` | ✅ | — | read-only |
 | ignore-lists | `.gitignore`, `.dockerignore` | ✅ | — | flat array |
 
-Format is auto-detected from extension or filename and can be forced with `-F`.
+Format is auto-detected from extension or filename and can be forced with `--input-format <format>`, which stdin (`-`) always needs: `cat deploy.yaml | dq get - /kind --input-format yaml`, `dq lint - --input-format yaml -F sarif < deploy.yaml`. `-F` is the output format on every command and never picks the parser, so `dq paths config.yaml -F json` reads YAML and prints JSON. `set`, `del`, `patch`, `merge`, `fmt` and `fix` keep a file in its own format: a `-F` naming another one is a usage error (exit 2), the same one is accepted; `convert` is how a file changes format.
 
 Point edits (`set` and `del` with a pointer, `patch`, `merge`) change YAML, JSON and TOML in place, keeping comments and formatting. On HCL, XML, INI, dotenv and CSV/TSV they change the value and write the whole file anew through the format's writer, as `set --jq` does: formatting is not kept, nor are comments (XML keeps its own). A value the format cannot hold (a nested map in INI, dotenv or CSV, a second XML root) is refused with exit 1 and the file is left as it was. JSON Lines and Markdown take no point edits (exit 7); use `set --jq` on JSON Lines.
 
@@ -280,7 +280,7 @@ Bulk multi-file mode prints `Modified: N, Skipped: M, Failed: K`; Skipped counts
 |---|---|
 | 0 | success |
 | 1 | generic (`--check` changes pending, `PatchTestFailed`, a value a read command, `convert` or `set --jq` cannot write in the output format, such as NaN or Infinity in JSON; `keys` / `values` / `len` on a node of the wrong type) |
-| 2 | not found (a JSON Pointer or a `--doc N` the file does not have); usage error (incl. `--doc` on a command that cannot honour it) |
+| 2 | not found (a JSON Pointer or a `--doc N` the file does not have); usage error (incl. `--doc` on a command that cannot honour it, stdin without `--input-format`, a `-F` naming another format than the file a write command keeps, `-i` or `--check` on stdin) |
 | 3 | parse error (incl. templated file) |
 | 4 | validate fail; `self update` refused an archive at its SHA-256 check |
 | 5 | I/O error (read; `self check` / `update` network errors) |

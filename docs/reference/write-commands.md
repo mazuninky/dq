@@ -55,8 +55,12 @@ Exactly one of:
 
 `--backup` (only with `-i`) copies the original to `<file>.bak` first,
 overwriting an existing `.bak` without asking. Invalid combinations are listed
-in [cli.md](cli.md#global-flags). With `-i`, the output format is the file's
-own; `-F` is refused except on `convert -i`.
+in [cli.md](cli.md#global-flags). A write command keeps the file in its own
+format — the one it was read in, from its name or `--input-format` — in all
+three modes: a `-F` naming another format is a usage error (exit 2), the same
+format is accepted, and only `convert -i` takes `-F` as a target. Stdin (`-`,
+with `--input-format`) works in plain stdout mode and with `--diff`; `-i` and
+`--check` on it are usage errors (exit 2).
 
 ## Atomic writes
 
@@ -147,7 +151,7 @@ through the writer on HCL, XML, INI, dotenv and CSV/TSV (see
   work before the first item of a compact YAML sequence, and through an
   anchored YAML array that an alias shares (the alias sees the new item);
   inserting *under* the alias is refused as with `set`.
-- `-i` with `-F` is refused.
+- A `-F` naming another format than the file's is refused (exit 2).
 
 ## `dq merge <file> <patch>`
 

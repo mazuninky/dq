@@ -68,7 +68,7 @@ dq lint -F sarif 'k8s/**/*.yaml' 2> lint.sarif
 dq lint -F tap 'src/**/*.yml'
 ```
 
-> **Beware `-F` cross-talk.** `-F` always sets the output format, but on several read commands (`get`, `select`, `keys`, `values`, `len`, `type`, `exists`, `paths`) it ALSO acts as the input-format override. `dq -F json select deploy.yaml '$.x'` tries to parse the YAML as JSON → exit 3. Rule of thumb: when the file has a normal extension, omit `-F` and let detection drive — or pass `-F` matching the file's actual format. `-F` is only required up front when reading from `-` (stdin), e.g. `cat f.yaml | dq -F yaml query '.x' -`.
+> **`-F` is the output, `--input-format` the input.** `-F` only ever picks how the result is printed; it never picks the parser, so `dq paths deploy.yaml -F json` reads YAML and prints JSON. The input format comes from the file name, or from `--input-format <format>` (`json`, `yaml`, `toml`, `jsonl`, `hcl`, `ini`, `dotenv`, `csv`, `tsv`, `dockerfile`, `ignore-list`, `markdown`, `frontmatter`, `xml`) — required for stdin (`-`), exit 2 without it: `cat f.yaml | dq query '.x' - --input-format yaml`, `dq lint - --input-format yaml -F sarif < f.yaml`. Write commands (`set`, `del`, `patch`, `merge`, `fmt`, `fix`) keep the file in its own format: a `-F` naming another one is exit 2 (use `convert` to change the format), the same one is accepted.
 
 ## Read & query
 
@@ -98,10 +98,10 @@ dq query '.spec.containers[].image' deploy.yaml -F json
 dq query '.items[] | select(.kind=="Deployment") | .metadata.name' k8s.yaml
 
 # Read from stdin
-cat deploy.yaml | dq query '.metadata.name' - -F yaml
+cat deploy.yaml | dq query '.metadata.name' - --input-format yaml
 ```
 
-`dq query` argument order is `EXPR FILE` (mirrors `jq`). Stdin requires `-F` since there's no extension to sniff.
+`dq query` argument order is `EXPR FILE` (mirrors `jq`). Stdin requires `--input-format` since there's no extension to detect from (exit 2 without it).
 
 ### Multi-document YAML (`---` streams)
 

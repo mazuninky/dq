@@ -4,9 +4,10 @@
 `query`, `convert` (to stdout) and `validate` never write to disk. They
 refuse write-mode flags (`-i`, `--diff`, `--backup`, `--check`,
 `--continue-on-error`, `--parallel`) with exit 6; `validate` accepts
-`--check` as a no-op. Output goes through the reporter chosen by `-F` — and
-remember that on most of these commands `-F` also picks the input parser
-(see [cli.md](cli.md#the-two-roles-of--f)).
+`--check` as a no-op. Output goes through the reporter chosen by `-F`; the
+format a file is read in comes from its name or `--input-format`, never from
+`-F` (see [cli.md](cli.md#input-and-output-formats)). Each of them reads stdin
+as `-` given `--input-format` (exit 2 without it).
 
 Every format in [formats.md](formats.md) works with every read command; the
 format plugs in through the registry, the commands do not know about it.
@@ -74,8 +75,8 @@ order; an empty match is an empty list, exit 0.
 
 Runs a jq expression (jaq dialect, see [jq.md](jq.md)) over the document.
 The argument order mirrors `jq EXPR FILE`. `-` reads stdin and then needs
-`-F` for the input format; for a named file the input format always comes
-from the file name and `-F` only picks the output.
+`--input-format`; a named file is read in the format its name implies unless
+`--input-format` says otherwise. `-F` only picks the output.
 
 - The result is a stream. Console output prints one value per line; the
   structured reporters (`json`, `yaml`, `toml`, `jsonl`, `toon`) print the
@@ -89,7 +90,8 @@ from the file name and `-F` only picks the output.
 
 ## `dq convert <file> -F <format>`
 
-Parses the file (format from its name; `-F` is the output) and re-emits it in
+Parses the file (format from its name or `--input-format`; `-F` is the
+output) and re-emits it in
 the target format through that format's writer, honouring `--sort-keys` and
 `--indent`. A conversion that loses formatting metadata (comments, anchors,
 quote style) logs a warning and still exits 0. A value the target cannot hold
@@ -103,8 +105,7 @@ Markdown input. `convert -i` is a write command, see
 Parses the file. Exit 0 and no output when it parses; exit 4 when it does
 not, with the parse error rendered as a diagnostic — on **stderr**, in
 whatever reporter `-F` selects (console, `json` → `{"diagnostics": [...]}`,
-`sarif`, …). Note that `-F json` also makes the file be parsed as JSON; use
-`-F sarif` / `junit` / `tap` for machine-readable output of non-JSON files.
+`sarif`, …); `-F json` on a YAML file still parses it as YAML.
 The diagnostic's `rule_id` (SARIF's `ruleId`) is `validate.parse`; the id is
 `validate.<kind>` with the error's `kind`, and `parse` is the kind a file
 that does not parse reports.

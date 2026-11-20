@@ -51,8 +51,9 @@ Numbers keep their exact value:
 
 The input format is chosen by, in order:
 
-1. `-F <format>` on commands where `-F` doubles as the input override (see
-   [cli.md](cli.md#the-two-roles-of--f));
+1. `--input-format <format>`, on every command that reads data (see
+   [cli.md](cli.md#input-and-output-formats)); `-F` is the output format and
+   never picks the parser;
 2. the file extension, case-insensitively;
 3. the file name, case-insensitively, for files without a telling extension:
    `Dockerfile`, `Containerfile` → dockerfile; `.gitignore`,
@@ -62,7 +63,8 @@ The input format is chosen by, in order:
    is JSON); `.envrc` is not dotenv.
 
 An unknown extension is an error ("unsupported format 'sh'", exit 6), never a
-guess. stdin (`-`) has no name, so it needs `-F`.
+guess. stdin (`-`) has no name, so it needs `--input-format` (exit 2 without
+it).
 
 | Format (`name`) | Extensions / names | Read | Point edits (`set`, `del`, `patch`, `merge`) | Re-emit (`convert`, `fmt`, `set --jq`, `fix.jq`) |
 |---|---|---|---|---|
@@ -72,10 +74,10 @@ guess. stdin (`-`) has no name, so it needs `-F`.
 | TOML (`toml`) | `.toml` | yes | yes, textual, comments kept | yes, comments dropped |
 | HCL (`hcl`) | `.hcl`, `.tf`, `.tfvars` | yes | yes, rewritten, comments dropped | yes, best effort |
 | INI / properties (`ini`) | `.ini`, `.properties`, `.cfg` | yes | yes, rewritten, comments dropped | yes, comments dropped |
-| dotenv (`dotenv`, `-F dot-env`) | `.env`, `.env.*` (names), `*.env` | yes | yes, rewritten, comments dropped | yes, comments dropped |
+| dotenv (`dotenv`; `-F dot-env`) | `.env`, `.env.*` (names), `*.env` | yes | yes, rewritten, comments dropped | yes, comments dropped |
 | CSV / TSV (`csv`, `tsv`) | `.csv`, `.tsv` | yes, array of records | yes, rewritten | yes, tabular values only |
 | Markdown (`markdown`) | `.md`, `.markdown` | yes, CommonMark + GFM tree | no (exit 7) | unmodified documents only |
-| Markdown frontmatter (`frontmatter`) | same extensions, only via `-F frontmatter` | yes, header only | no (exit 7) | yes, body kept byte for byte |
+| Markdown frontmatter (`frontmatter`) | same extensions, only via `--input-format frontmatter` | yes, header only | no (exit 7) | yes, body kept byte for byte |
 | XML (`xml`) | `.xml`, `.pom`, `.xsd` | yes | yes, rewritten, comments kept | yes, partial round trip |
 | Dockerfile (`dockerfile`) | `Dockerfile`, `Containerfile` (names), `*.dockerfile`, `*.containerfile` | yes | no | no (read-only) |
 | ignore-list (`ignore-list`) | `.gitignore`, `.dockerignore`, `.npmignore`, `.eslintignore` | yes | no | no (read-only) |
@@ -93,10 +95,12 @@ Notes on the table:
   frontmatter point edits fail with `write operation unavailable: <format>
   has no textual edits` (exit 7); use `set --jq` on JSON Lines.
 - `-F dockerfile` and `-F ignore-list` do not exist as output formats; clap
-  rejects them (exit 2).
+  rejects them (exit 2). `--input-format dockerfile` and `ignore-list` read
+  them.
 - Markdown with frontmatter is parsed by the Markdown tree parser by default
-  (it precedes the frontmatter parser in the registry); `-F frontmatter`
-  selects the header-only parser.
+  (it precedes the frontmatter parser in the registry); `--input-format
+  frontmatter` selects the header-only parser (`-F frontmatter` is the
+  `convert` target).
 
 ## Per-format behaviour
 
@@ -299,9 +303,10 @@ one is refused, and `convert -F markdown` only accepts Markdown input.
 Fenced code blocks carry an inline offset so composite rules can place
 findings inside them (see [rule-checks.md](rule-checks.md)).
 
-### Markdown frontmatter (`-F frontmatter`)
+### Markdown frontmatter (`--input-format frontmatter`)
 
-The older header-only parser: the value is the frontmatter header (YAML,
+The older header-only parser, read with `--input-format frontmatter` (and
+written by `convert -F frontmatter`): the value is the frontmatter header (YAML,
 TOML or JSON, detected by delimiter) and the body is kept as opaque bytes.
 No frontmatter within the first 64 KiB gives an empty map and the whole file
 as body. Re-emitting serialises the header through its own format and

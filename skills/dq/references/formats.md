@@ -20,7 +20,7 @@ Per-format details, write-mode semantics, and the contract behind every output f
 | ignore-lists      | `.gitignore`, `.dockerignore`    | ✓    | —     | `/0`, `/1`, …                                                        | Flat array. Read-only.                                        |
 | TOON              | n/a                              | —    | ✓     | n/a                                                                  | Output-only; agent-friendly compact token format.             |
 
-Format is auto-detected from extension or filename. Force with `-F <format>`. `-F` is mandatory when reading from `-` (stdin) — no extension to sniff.
+Format is auto-detected from extension or filename. Force with `--input-format <format>`. `--input-format` is mandatory when reading from `-` (stdin) — no extension to detect from (exit 2 without it). `-F` is the output format only.
 
 ## Write modes
 
@@ -127,21 +127,21 @@ Bulk uses one tempfile per target file, processed in parallel under `--parallel`
 
 ## Output formats
 
-`-F <format>` is global — every command honours it. Available values: `console` (default), `json`, `yaml`, `toml`, `jsonl`, `toon`, `sarif`, `junit`, `tap`.
+`-F <format>` is global and is the output format on every command. Available values: `console` (default), `json`, `yaml`, `toml`, `jsonl`, `toon`, `sarif`, `junit`, `tap`.
 
-**`-F` has cross-talk with input parsing.** It always sets the output format, but on several read commands (`get`, `select`, `keys`, `values`, `len`, `type`, `exists`, `paths`) it ALSO overrides input-format detection. `query` is currently more forgiving — it uses `-F` only as an input hint when needed. Treat the strict behaviour as the contract: when reading from a file with a normal extension, either omit `-F` or pass a value matching the file's actual format.
+**`-F` never picks the parser.** The input format comes from the file name or from `--input-format`; `-F` only picks how the result is printed. Write commands (`set`, `del`, `patch`, `merge`, `fmt`, `fix`) keep a file in its own format: a `-F` naming another one is refused (exit 2), the same one is accepted.
 
 ```bash
-# WRONG — forces JSON input parser on a YAML file; some commands exit 3
-dq -F json select deploy.yaml '$.spec.replicas'    # parse error, exit 3
-dq -F json get deploy.yaml /spec/replicas          # parse error, exit 3
+# YAML in (by extension), JSON / TOON out
+dq -F json get deploy.yaml /spec/replicas
+dq query '.spec.replicas' deploy.yaml -F toon
 
-# RIGHT — let extension drive input format; use -F only on output stages
-dq select deploy.yaml '$.spec.replicas'                # default console output
-dq query '.spec.replicas' deploy.yaml -F toon          # YAML in (by extension), TOON out
+# A file with an unhelpful name: name its format
+dq get settings.conf /server/port --input-format ini
 
-# Stdin needs -F because there's no extension to sniff
-cat deploy.yaml | dq -F yaml query '.spec.replicas' -
+# Stdin needs --input-format because there's no extension to detect from
+cat deploy.yaml | dq query '.spec.replicas' - --input-format yaml
+dq lint - --input-format yaml -F sarif < deploy.yaml > lint.sarif
 ```
 
 | Format    | Use case                                                       | Notes |

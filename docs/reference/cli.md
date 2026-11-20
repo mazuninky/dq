@@ -60,11 +60,11 @@ harmless) or refuses it, as noted.
 
 | Flag | Meaning |
 |---|---|
-| `-F, --format <FMT>` | Output format, and on most commands also the input parser override; see [The two roles of `-F`](#the-two-roles-of--f). Default `console`. |
+| `-F, --format <FMT>` | Output format, on every command; never the format a file is read in. See [Input and output formats](#input-and-output-formats). Default `console`. |
+| `--input-format <FMT>` | The format to read files, globs and stdin (`-`) in, instead of detecting it from the file name. Needed for stdin. No short form (`-i` is in-place). |
 | `-v, --verbose` (repeatable) | Log level: default WARN, `-v` INFO, `-vv` DEBUG, `-vvv` TRACE. `RUST_LOG` overrides. |
 | `-q, --quiet` | Log level ERROR. Conflicts with `-v` (clap usage error). |
 | `--no-color` | No ANSI colour. |
-| `--no-pager` | Accepted and ignored: dq never starts a pager. |
 | `--doc <N\|all>` | Pick a document of a multi-document YAML stream; see [read-commands.md](read-commands.md#multi-document-yaml-and---doc). |
 | `-i, --in-place` | Write the result back atomically (write commands only). |
 | `--diff` | Print a unified diff instead of writing. |
@@ -88,9 +88,14 @@ on reads because people put them in shell aliases.
 Write-mode combinations refused by the handlers (exit 6):
 
 - `-i` with `--diff`, `-i` with `--check`, `--diff` with `--check`;
-- `--backup` without `-i`, `--backup` with `--check`;
-- `-i` with `-F` on `set` / `del` / `patch` / `merge` (the output format is
-  the file's own; only `convert -i` takes `-F`).
+- `--backup` without `-i`, `--backup` with `--check`.
+
+Refused as usage errors (exit 2), before any file is written:
+
+- a `-F` naming another format than the file's on `set`, `del`, `patch`,
+  `merge`, `fmt` and `fix` (see below);
+- `-i` or `--check` on stdin (`-`), which has no file to write back to or
+  compare with.
 
 `--parallel N` on a single file is accepted and simply runs sequentially (the
 original design wanted it refused; the code downgrades silently).
@@ -100,24 +105,38 @@ Environment variables honoured: `RUST_LOG`, `NO_COLOR`, `CLICOLOR_FORCE`, and
 overrides sketched in the original plan (`DQ_FORMAT`, `DQ_IN_PLACE`,
 `DQ_NO_COLOR`, `DQ_CONFIG`) are not implemented.
 
-### The two roles of `-F`
+`--no-pager` is accepted for compatibility and does nothing: dq has no pager.
+It is hidden from `--help`.
 
-`-F` picks the reporter (how the result is printed), and on most commands it
-also forces the input parser when the format has one. On the commands that
-read a file through the common loader — `get`, `exists`, `keys`, `values`,
-`len`, `type`, `paths`, `select`, `validate`, `fmt`, `set`, `del`, `patch`,
-`merge`, `lint`, `check`, `fix` — `-F json` means "parse this file as JSON and
-print JSON". So `dq get config.yaml /a -F json` fails with a parse error
-(exit 3), while `dq -F json get config.json /a` works.
+### Input and output formats
 
-Three commands use `-F` for output only and always detect the input from the
-file name: `convert`, `diff`, and `query` on a file (`query` reading stdin
-uses `-F` as the input format). Output-only formats (`console`, `toon`,
-`sarif`, `junit`, `tap`) never select a parser.
+`-F` is the output format on every command: the reporter a read command
+prints through, the format `convert` writes, the diagnostics format of
+`lint`, `check` and `validate`. It never picks the parser, so
+`dq paths config.yaml -F json` reads YAML and prints JSON.
 
-This dual role is surprising and is tracked in [../roadmap.md](../roadmap.md).
-Reading stdin (`-` as the file) always needs `-F`; without it the command
-fails with "stdin requires -F <format>" (exit 6).
+The format a file is read in comes from its extension or name (see
+[formats.md](formats.md#detection)); `--input-format <FMT>` overrides that on
+every command that reads data — a file, every match of a glob, and stdin. Its
+values are the parser names: `json`, `yaml`, `toml`, `jsonl`, `hcl`, `ini`,
+`dotenv` (alias `dot-env`), `csv`, `tsv`, `dockerfile`, `ignore-list`,
+`markdown`, `frontmatter`, `xml`; anything else is a usage error (exit 2).
+`diff` reads both files in it.
+
+Stdin (`-` as the file) has no name to detect from, so every command reading
+it needs `--input-format`; without it the command fails with a usage error
+naming the flag (exit 2). That includes `lint -`, `check -` and `fix -`, whose
+`-F` picks the reporter: `dq lint - --input-format yaml -F sarif < f.yaml`.
+
+`set`, `del`, `patch`, `merge`, `fmt` and `fix` keep a file in its own format
+— the one it was read in — whether they write it back (`-i`), print it or
+print a diff. A `-F` naming another format is refused with a usage error
+(exit 2) that points to `--input-format` and `dq convert`; the same format is
+accepted, so `dq set -F yaml -i config.yaml /a 1` works as it always did.
+`convert -i` is the exception: it writes a sibling file in the `-F` format.
+
+`exists`, `test`, `completions`, `man`, `self` and `rules add` print no
+formatted value and do not use `-F`.
 
 ### Colour
 
@@ -131,13 +150,16 @@ parameter; nothing mutates the environment.
 | Value | Kind | Notes |
 |---|---|---|
 | `console` (default) | output | Human-readable; collections print in compact YAML-flow style. |
-| `json` | in/out | Pretty JSON; `--indent` applies on re-emit paths. |
-| `yaml`, `toml`, `jsonl` | in/out | |
+| `json` | file format | Pretty JSON; `--indent` applies on re-emit paths. |
+| `yaml`, `toml`, `jsonl` | file format | |
 | `toon` | output only | Token-Oriented Object Notation via the `toon-format` crate. |
-| `hcl`, `ini`, `dot-env`, `csv`, `tsv`, `frontmatter`, `markdown`, `xml` | in/out | `convert` targets and parser overrides; see [formats.md](formats.md). |
+| `hcl`, `ini`, `dot-env`, `csv`, `tsv`, `frontmatter`, `markdown`, `xml` | file format | `convert` targets; see [formats.md](formats.md). |
 | `sarif` | output only | SARIF 2.1.0, one `run` with `dq` as the driver. |
 | `junit` | output only | JUnit XML, one `<testcase>` per diagnostic. |
 | `tap` | output only | TAP version 13. |
+
+A "file format" can also be read, but only `--input-format` reads it: `-F`
+names the output alone.
 
 There is no `text` value; the default human format is `console`.
 
@@ -200,8 +222,9 @@ path '/server/prot' not found (matched up to '/server')
 
 Parse errors carry the file, line, column, message and the offending source
 line. clap usage errors are rendered the way clap renders them (`error: …`,
-usage line, `--help` hint), including the `--doc` refusals raised by
-handlers.
+usage line, `--help` hint), including the usage errors raised by handlers
+(`--doc` refusals, stdin without `--input-format`, a `-F` a write command
+cannot keep a file in).
 
 Not implemented yet, although the original design asked for them: a caret
 under the offending byte, and a JSON error object on stderr under `-F json`
@@ -219,16 +242,17 @@ defined as named constants in `crates/dq-cli/src/exit_code.rs`.
 |---|---|---|
 | 0 | `SUCCESS` | Done. |
 | 1 | `GENERIC` | Unclassified failure; `exists` answering "no"; `--check` with changes pending; `lint --strict` with warnings; a failed `patch` `test` op; a jq runtime error; a value the output format cannot hold (NaN or infinity in JSON or HCL, a number HCL/TOON cannot represent); `keys` / `values` / `len` on a node of the wrong type; a composite-rule extract error. |
-| 2 | `NOT_FOUND` | A JSON Pointer that does not resolve; a `--doc N` the file does not have (or no file of the run has); **any clap usage error** (unknown flag, conflicting flags, invalid value, `--doc` on a command that cannot honour it). |
+| 2 | `NOT_FOUND` | A JSON Pointer that does not resolve; a `--doc N` the file does not have (or no file of the run has); **any clap usage error** (unknown flag, conflicting flags, invalid value, `--doc` on a command that cannot honour it, stdin without `--input-format`, a `-F` a write command cannot keep the file in, `-i` or `--check` on stdin). |
 | 3 | `PARSE_ERROR` | The input does not parse; a templated file without an escape hatch; a jq compile error; an invalid rule file (bad YAML, unknown field, bad `check`, schema compile failure, unsafe `schema_file`); a failing `fix` script; a plugin with the wrong ABI major or a malformed fix. |
 | 4 | `VALIDATE_FAIL` | `validate` found a parse error; `lint` / `check` found an error-severity diagnostic; a plugin trapped, ran out of fuel or memory, or failed to load; `self update` refused a downloaded archive at its SHA-256 check. |
 | 5 | `IO_ERROR` | Read-side I/O (missing file, unreadable file, a glob root that does not exist or a glob that matched nothing); network errors in `self check` / `self update` (incl. downloading `dq-checksums.txt`). |
-| 6 | `INVALID_INPUT` | A flag combination a handler refuses; write flags on a read command; stdin without `-F`; unsupported format or file extension; a reporter that does not fit the command; unknown rule id or `@std` namespace; bad fixture file; `--plugins` without the `plugins` feature; `dq merge` on a stream; `self update` into a path the user cannot write. |
+| 6 | `INVALID_INPUT` | A flag combination a handler refuses; write flags on a read command; unsupported format or file extension; a reporter that does not fit the command; unknown rule id or `@std` namespace; bad fixture file; `--plugins` without the `plugins` feature; `dq merge` on a stream; `self update` into a path the user cannot write. |
 | 7 | `WRITE_FAILED` | Writing failed (temp file, rename, backup); the format takes no point edits (`set` on JSON Lines, Markdown, Dockerfile, …); a textual edit refused because the file would not read back as the change (`edit_rejected`); a bulk run with `--continue-on-error` where any file failed; `self update` could not replace the binary. |
 
 The split between 2 and 6 follows who raises the error: anything clap rejects
-while parsing (and the `--doc` refusals, built as clap errors) exits 2, clap's
-own code; validation a handler performs after parsing exits 6. Older design
+while parsing (and the usage errors handlers build as clap errors: `--doc`
+refusals, stdin without `--input-format`, a `-F` a write command cannot keep
+a file in, `-i` or `--check` on stdin) exits 2, clap's own code; validation a handler performs after parsing exits 6. Older design
 documents said clap errors exit 6; that was never true once clap's own exit
 path was used.
 
