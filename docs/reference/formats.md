@@ -93,8 +93,12 @@ Notes on the table:
   its comments, which are in its tree). A JSON Lines record is addressed by
   its index (`/0/level`), as `get` addresses it. A value the writer cannot
   hold is refused with its error (exit 1) and the file is left alone. On
-  Markdown and frontmatter point edits fail with `write operation
-  unavailable: <format> has no textual edits` (exit 7).
+  Markdown and frontmatter point edits (`set` with a pointer, `del`,
+  `patch`, `merge`) fail with `write operation unavailable: <format> has no
+  textual edits` (exit 7). A filter rewrites a frontmatter header:
+  `dq --input-format frontmatter set post.md --jq '.draft = false'` writes the
+  header anew through its own format and keeps the body, the delimiters and
+  a byte order mark (`fix.jq` the same).
 - `-F dockerfile` and `-F ignore-list` do not exist as output formats; clap
   rejects them (exit 2). `--input-format dockerfile` and `ignore-list` read
   them.

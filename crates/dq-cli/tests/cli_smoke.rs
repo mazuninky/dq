@@ -1173,3 +1173,90 @@ fn smoke_fmt_writes_an_empty_frontmatter_header_back_empty() {
         );
     }
 }
+
+/// `set --jq` rewrites a frontmatter file's header and keeps its body, its
+/// delimiters and its BOM. Was: "frontmatter format error: document is not
+/// a frontmatter document (no payload)", exit 1. A point edit (`set`,
+/// `del`, `patch`, `merge` with a pointer or patch) stays refused, exit 7:
+/// frontmatter has no textual edits.
+#[test]
+fn smoke_frontmatter_takes_filters_and_refuses_point_edits() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let fm = |args: &[&str]| {
+        let mut argv = vec!["--no-color", "--input-format", "frontmatter"];
+        argv.extend_from_slice(args);
+        let out = dq()
+            .current_dir(dir.path())
+            .args(&argv)
+            .output()
+            .expect("run dq");
+        (
+            out.status.code().expect("exit code"),
+            String::from_utf8(out.stdout).expect("utf-8"),
+            String::from_utf8(out.stderr).expect("utf-8"),
+            std::fs::read_to_string(dir.path().join("p.md")).expect("read p.md"),
+        )
+    };
+    let seed = |src: &str| std::fs::write(dir.path().join("p.md"), src).expect("seed");
+    for (src, want) in [
+        (
+            "---\ntitle: Hi\n---\nbody\n",
+            "---\ntitle: Hi\nt: 1\n---\nbody\n",
+        ),
+        (
+            "\u{feff}---\ntitle: Hi\n---\nbody\n",
+            "\u{feff}---\ntitle: Hi\nt: 1\n---\nbody\n",
+        ),
+        (
+            "+++\ntitle = \"Hi\"\n+++\nbody\n",
+            "+++\ntitle = \"Hi\"\nt = 1\n+++\nbody\n",
+        ),
+        ("---\n---\nbody\n", "---\nt: 1\n---\nbody\n"),
+        ("+++\n+++\nbody\n", "+++\nt = 1\n+++\nbody\n"),
+        // No header: one is written once the value holds something.
+        ("body\n", "---\nt: 1\n---\nbody\n"),
+    ] {
+        seed(src);
+        assert_eq!(
+            fm(&["-i", "set", "p.md", "--jq", ".t = 1"]),
+            (0, String::new(), String::new(), want.to_owned()),
+            "{src:?}"
+        );
+        seed(src);
+        assert_eq!(
+            fm(&["--check", "set", "p.md", "--jq", ".t = 1"]).0,
+            1,
+            "{src:?}"
+        );
+        seed(src);
+        let (code, diff, ..) = fm(&["--diff", "set", "p.md", "--jq", ".t = 1"]);
+        assert_eq!(code, 0, "{src:?}");
+        assert!(diff.contains("+t"), "{src:?}: {diff:?}");
+    }
+
+    let src = "---\ntitle: Hi\n---\nbody\n";
+    for args in [
+        &["-i", "set", "p.md", "/t", "1"][..],
+        &["-i", "del", "p.md", "/title"],
+        &[
+            "-i",
+            "patch",
+            "p.md",
+            r#"[{"op":"add","path":"/t","value":1}]"#,
+        ],
+        &["-i", "merge", "p.md", r#"{"t":1}"#],
+    ] {
+        seed(src);
+        let (code, _, stderr, file) = fm(args);
+        assert_eq!((code, file.as_str()), (7, src), "{args:?}: {stderr}");
+        assert!(
+            stderr.starts_with("write operation unavailable: frontmatter has no textual edits"),
+            "{args:?}: {stderr}"
+        );
+    }
+    seed(src);
+    assert_eq!(
+        fm(&["-i", "fmt", "p.md"]),
+        (0, String::new(), String::new(), src.to_owned())
+    );
+}

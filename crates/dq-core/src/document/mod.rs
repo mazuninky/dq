@@ -1093,11 +1093,17 @@ impl Document {
     /// same is written as that expression's source — at its place, or
     /// wherever the transform moved it. In CSV and TSV: the header, for a
     /// tree with no rows left; the rows decide the columns of any other.
-    /// Any other document is returned as it is.
+    /// In frontmatter: the body, the delimiters and the byte order mark
+    /// the header was read with ([`FrontmatterPayload`]), which the writer
+    /// needs to write the file at all. Any other document is returned as
+    /// it is.
     #[must_use]
     pub fn with_layout_of(mut self, source: &Document) -> Self {
         if self.format == source.format {
             self.layout = source.layout.rebuilt();
+            if self.frontmatter_payload.is_none() {
+                self.frontmatter_payload = source.frontmatter_payload.clone();
+            }
         }
         self
     }
