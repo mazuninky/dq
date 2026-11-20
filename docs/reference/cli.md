@@ -223,8 +223,11 @@ present when it says more; `helpUri` is the first `http(s)://` entry of
 
 ## Errors
 
-Errors are printed on stderr. A path error names the pointer, the deepest
-prefix that exists and up to three close sibling keys:
+Errors are printed on stderr, escaped as `console` escapes text (see
+above): a pointer, a key in `did_you_mean`, a path — what the user typed or
+the file holds — never reaches the terminal with a raw control or direction
+character; the message keeps its own line breaks. A path error names the
+pointer, the deepest prefix that exists and up to three close sibling keys:
 
 ```
 path '/server/prot' not found (matched up to '/server')

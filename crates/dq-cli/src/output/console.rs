@@ -58,7 +58,7 @@ impl Reporter for ConsoleReporter {
 /// allocates a new `String`. Every other character, non-ASCII included
 /// (é, NBSP, emoji), is copied whole: the walk is over chars, not bytes,
 /// so a multi-byte character next to an escaped control stays intact.
-fn escape_control(s: &str) -> Cow<'_, str> {
+pub(crate) fn escape_control(s: &str) -> Cow<'_, str> {
     if !s
         .chars()
         .any(|c| is_escaped_control(c) || is_invisible_layout(c))

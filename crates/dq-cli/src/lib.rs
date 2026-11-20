@@ -276,9 +276,29 @@ impl Reporter for BannedReporter {
 ///   reporter; printing again would duplicate the message.
 /// - For all other errors, the standard anyhow chain (`{:?}`) is written.
 ///
+/// Every line is written escaped as the console reporter escapes text
+/// ([`output::console`]): a message echoes what the user typed and what
+/// the file holds — a pointer, a `did_you_mean` key, a path — and a
+/// control character or a bidi override in it must not reach the terminal
+/// raw. The message's own line breaks stay.
+///
 /// Called from `main.rs` after `run` returns an error; tests can call it
 /// directly with a `Vec<u8>` writer to assert on the rendered shape.
 pub fn render_error(err: &anyhow::Error, w: &mut dyn Write) -> std::io::Result<()> {
+    let mut raw = Vec::new();
+    render_error_raw(err, &mut raw)?;
+    let text = String::from_utf8_lossy(&raw);
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            w.write_all(b"\n")?;
+        }
+        w.write_all(output::console::escape_control(line).as_bytes())?;
+    }
+    Ok(())
+}
+
+/// [`render_error`] before the escaping.
+fn render_error_raw(err: &anyhow::Error, w: &mut dyn Write) -> std::io::Result<()> {
     if err.downcast_ref::<ValidateFail>().is_some() {
         // The validate handler already wrote a structured error through its
         // reporter to the caller-supplied stderr writer. Don't print again.

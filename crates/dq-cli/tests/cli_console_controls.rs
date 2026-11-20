@@ -142,3 +142,43 @@ fn validate_escapes_direction_controls_in_the_snippet() {
         "expected the escaped snippet, got: {stderr:?}"
     );
 }
+
+fn stderr_of(args: &[&str]) -> String {
+    let out = dq().args(args).assert().failure();
+    String::from_utf8(out.get_output().stderr.clone()).expect("stderr is UTF-8")
+}
+
+/// The error on stderr escapes what the user or the file put in it, as the
+/// console reporter does: the `did_you_mean:` key from the file (a U+202E
+/// override), the pointer echoed back (ESC, a C1 CSI, a tab). The message's
+/// own line breaks stay.
+#[test]
+fn errors_escape_controls_in_did_you_mean_and_the_pointer() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = write(dir.path(), "k.json", "{\"ab\u{202e}c\": 1}\n");
+    let err = stderr_of(&["--no-color", "get", &file, "/abc"]);
+    assert!(err.contains("did_you_mean: ab\\u202ec\n"), "{err:?}");
+    assert!(!err.contains('\u{202e}'), "{err:?}");
+
+    let err = stderr_of(&["--no-color", "get", &file, "/x\u{1b}[31m\u{9b}2J\ty"]);
+    assert!(
+        err.contains("pointer: /x\\x1b[31m\\x9b2J\\x09y\n"),
+        "{err:?}"
+    );
+    assert!(
+        !err.contains(['\u{1b}', '\u{9b}', '\t']),
+        "no raw control on stderr: {err:?}"
+    );
+    assert!(err.lines().count() >= 2, "line breaks kept: {err:?}");
+}
+
+/// Any other error the anyhow chain renders — here the I/O error naming a
+/// missing file — escapes the same way.
+#[test]
+fn errors_escape_controls_in_any_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("no\u{1b}]0;t\u{7}.json");
+    let err = stderr_of(&["--no-color", "get", missing.to_str().unwrap(), "/a"]);
+    assert!(err.contains("no\\x1b]0;t\\x07.json"), "{err:?}");
+    assert!(!err.contains(['\u{1b}', '\u{7}']), "{err:?}");
+}
