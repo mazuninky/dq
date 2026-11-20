@@ -87,7 +87,7 @@ impl Format for DotEnv {
             let value = parse_value(raw_val, line_no, line)?;
             out.insert(key, Value::String(value));
         }
-        Ok(Document::value_only(Value::Map(out), FormatTag::DotEnv))
+        Ok(Document::value_only(Value::Map(out), FormatTag::DotEnv).with_source_bytes(bytes))
     }
 
     fn write(&self, doc: &Document, w: &mut dyn Write) -> Result<()> {

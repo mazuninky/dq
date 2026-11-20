@@ -69,7 +69,9 @@ impl Format for Hcl {
         };
         let (value, exprs) = reader.body_to_value(&body)?;
         reader.layout.exprs = exprs.into_iter().collect();
-        Ok(Document::value_only(value, FormatTag::Hcl).with_layout(Layout::Hcl(reader.layout)))
+        Ok(Document::value_only(value, FormatTag::Hcl)
+            .with_layout(Layout::Hcl(reader.layout))
+            .with_source_bytes(bytes))
     }
 
     fn write(&self, doc: &Document, w: &mut dyn Write) -> Result<()> {

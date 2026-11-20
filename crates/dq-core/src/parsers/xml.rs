@@ -184,7 +184,7 @@ impl Format for Xml {
 
     fn parse(&self, bytes: &[u8]) -> Result<Document> {
         let value = parse_xml(bytes).map_err(with_position)?;
-        Ok(Document::value_only(value, FormatTag::Xml))
+        Ok(Document::value_only(value, FormatTag::Xml).with_source_bytes(bytes))
     }
 
     fn write(&self, doc: &Document, w: &mut dyn Write) -> Result<()> {

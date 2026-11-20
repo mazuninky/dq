@@ -36,7 +36,7 @@ impl Format for Csv {
 
     fn parse(&self, bytes: &[u8]) -> Result<Document> {
         let value = parse_with_delimiter(bytes, b',', "csv")?;
-        Ok(Document::value_only(value, FormatTag::Csv))
+        Ok(Document::value_only(value, FormatTag::Csv).with_source_bytes(bytes))
     }
 
     fn write(&self, doc: &Document, w: &mut dyn Write) -> Result<()> {
@@ -55,7 +55,7 @@ impl Format for Tsv {
 
     fn parse(&self, bytes: &[u8]) -> Result<Document> {
         let value = parse_with_delimiter(bytes, b'\t', "tsv")?;
-        Ok(Document::value_only(value, FormatTag::Tsv))
+        Ok(Document::value_only(value, FormatTag::Tsv).with_source_bytes(bytes))
     }
 
     fn write(&self, doc: &Document, w: &mut dyn Write) -> Result<()> {

@@ -277,3 +277,124 @@ fn hcl_an_edit_no_writer_can_keep_an_expression_through_is_refused() {
          there\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// An edit that changes nothing leaves the bytes alone
+// ---------------------------------------------------------------------------
+
+/// Run `dq <args>` in a fresh directory holding `files`; the outcome's
+/// `file` is the first of them afterwards.
+fn run_in(files: &[(&str, &str)], args: &[&str]) -> Outcome {
+    let dir = TempDir::new().expect("tempdir");
+    for (name, src) in files {
+        let path = dir.path().join(name);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, src).expect("seed");
+    }
+    let out = dq()
+        .current_dir(dir.path())
+        .args(args)
+        .output()
+        .expect("run dq");
+    Outcome {
+        code: out.status.code().expect("exit code"),
+        stdout: String::from_utf8(out.stdout).expect("utf-8 stdout"),
+        stderr: String::from_utf8(out.stderr).expect("utf-8 stderr"),
+        file: std::fs::read_to_string(dir.path().join(files[0].0)).expect("read back"),
+    }
+}
+
+#[test]
+fn a_rewrite_edit_that_changes_nothing_leaves_the_file_as_it_was() {
+    let ini = "; keep me\n[s]\nk = v\nn = 80\n";
+    // Was: exit 1, "would modify: a.ini".
+    assert_eq!(
+        run("a.ini", ini, &["--check", "set", "a.ini", "/s/k", "v"]),
+        Outcome {
+            code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            file: ini.to_owned(),
+        }
+    );
+    // Was: the comment stripped. `80` reads back from INI as the string
+    // the file holds already.
+    for args in [
+        &["set", "a.ini", "/s/k", "v"][..],
+        &["set", "a.ini", "/s/n", "80"],
+        &["merge", "a.ini", r#"{"s": {"k": "v"}}"#],
+        &[
+            "patch",
+            "a.ini",
+            r#"[{"op": "replace", "path": "/s/k", "value": "v"}]"#,
+        ],
+    ] {
+        edits_to("a.ini", ini, args, ini);
+    }
+    // Printed without `-i`, the file is printed as it is.
+    assert_eq!(
+        run("a.ini", ini, &["set", "a.ini", "/s/k", "v"]).stdout,
+        ini
+    );
+    let env = "# keep me\nexport A=1\n";
+    edits_to(".env", env, &["set", ".env", "/A", "1"], env);
+    let tf = "# keep me\nami = var.ami\n";
+    edits_to("a.tf", tf, &["set", "a.tf", "/ami", "${var.ami}"], tf);
+    let csv = "n,a\nx,1\n";
+    edits_to("t.csv", csv, &["set", "t.csv", "/0/a", "1"], csv);
+}
+
+#[test]
+fn a_bulk_rewrite_counts_a_file_it_does_not_change_as_skipped() {
+    let out = run_in(
+        &[("a.ini", "; keep\n[s]\nk = v\n"), ("b.ini", "[s]\nk = w\n")],
+        &["-i", "set", "*.ini", "/s/k", "v"],
+    );
+    // Was: Modified: 2.
+    assert_eq!(
+        (out.code, out.stdout.as_str(), out.file.as_str()),
+        (
+            0,
+            "Modified: 1, Skipped: 1, Failed: 0\n",
+            "; keep\n[s]\nk = v\n"
+        )
+    );
+}
+
+#[test]
+fn a_fix_op_that_sets_a_value_already_there_leaves_the_file_alone() {
+    let rule = "id: t.port\ndescription: port is 80\nseverity: warn\nmatch:\n  format: ini\n\
+                check:\n  jq: 'select(.s.port != 80)'\n  message: port\nfix:\n  ops: |\n    \
+                [{\"op\":\"replace\",\"path\":\"/s/port\",\"value\":80}]\n";
+    let ini = "; keep\n[s]\nport = 80\n";
+    let out = run_in(
+        &[("a.ini", ini), ("rules/port.yml", rule)],
+        &["-i", "fix", "--rules", "rules/port.yml", "a.ini"],
+    );
+    // The fixer's idempotency check already kept this file: a second run
+    // of the ops after a change that changed nothing asks for the same
+    // change again. Pinned so the rewrite never takes it over.
+    assert_eq!((out.code, out.file.as_str()), (0, ini), "{out:?}");
+}
+
+#[test]
+fn a_textual_edit_that_changes_nothing_already_left_the_file_alone() {
+    for (name, src, pointer, value) in [
+        ("a.yaml", "# c\nk: 'v'\nn: 1\n", "/k", "v"),
+        ("a.yaml", "# c\nk: 'v'\nn: 1\n", "/n", "1"),
+        ("a.toml", "# c\nk = 'v'\nn = 1\n", "/k", "v"),
+        ("a.toml", "# c\nk = 'v'\nn = 1\n", "/n", "1"),
+        ("a.json", "{\"k\":  \"v\"}\n", "/k", "v"),
+    ] {
+        assert_eq!(
+            run(name, src, &["--check", "set", name, pointer, value]),
+            Outcome {
+                code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                file: src.to_owned(),
+            },
+            "{name} {pointer}"
+        );
+    }
+}

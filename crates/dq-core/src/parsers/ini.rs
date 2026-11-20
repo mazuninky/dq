@@ -86,7 +86,7 @@ impl Format for Ini {
                 }
             }
         }
-        Ok(Document::value_only(Value::Map(top), FormatTag::Ini))
+        Ok(Document::value_only(Value::Map(top), FormatTag::Ini).with_source_bytes(bytes))
     }
 
     fn write(&self, doc: &Document, w: &mut dyn Write) -> Result<()> {

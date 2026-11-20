@@ -34,7 +34,11 @@ INI, dotenv or CSV value is a string). A tree the writer cannot hold — a
 nested map or list in INI, dotenv or CSV, a scalar where XML wants an
 element, a number HCL cannot write — is refused with the writer's error
 (`ini format error: …`, exit 1) and the file is untouched; in a bulk run it
-counts as `Failed`. `--sort-keys` and `--indent` stay no-ops on point
+counts as `Failed`. An edit that leaves the data as it was — a value set
+to what is there, or to one that reads back as it (`80` in INI, whose
+`80` is a string) — leaves the file's bytes alone, comments included:
+`--check` exits 0, and a bulk run counts the file as `Skipped`. Textual
+edits behave the same. `--sort-keys` and `--indent` stay no-ops on point
 edits, as on the textual ones (`dq fmt` applies them). Point edits on JSON
 Lines and Markdown fail with exit 7 ("has no textual edits"); use
 `set --jq` to rewrite a JSON Lines file.

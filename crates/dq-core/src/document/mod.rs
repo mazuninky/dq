@@ -1005,6 +1005,14 @@ impl Document {
         &self.layout
     }
 
+    /// Keep `bytes`, the file this document was read from, as its bytes:
+    /// a rewrite edit that changes nothing ([`Document::edits_by_rewrite`])
+    /// leaves them as they are.
+    pub(crate) fn with_source_bytes(mut self, bytes: &[u8]) -> Self {
+        self.original_bytes = bytes.to_vec();
+        self
+    }
+
     /// Borrow this `Document` as an [`Ir<'_>`] — the read-only IR view used
     /// by the lint pipeline (Phase 2+ of `add-ir-foundation`) to resolve
     /// per-pointer provenance and source spans.
@@ -1286,6 +1294,12 @@ impl Document {
         let layout = self.layout_after_edit(action, pointer)?;
         let mut tree = self.value.clone();
         edit(&mut tree)?;
+        // An edit that changes no data leaves the bytes — comments, layout
+        // — as they are, as long as there are bytes to leave.
+        let keep = !self.original_bytes.is_empty();
+        if keep && tree.same_data(&self.value) {
+            return Ok(());
+        }
         let mut bytes = Vec::new();
         format.write(
             &Document::value_only(tree, self.format).with_layout(layout),
@@ -1296,6 +1310,11 @@ impl Document {
             pointer: pointer.as_canonical(),
             reason: format!("the {name} dq would write does not read back: {err}"),
         })?;
+        // The value set may read back as what was there: `80` set in INI,
+        // which holds strings, where the file has `80`.
+        if keep && fresh.value.same_data(&self.value) {
+            return Ok(());
+        }
         self.value = fresh.value;
         self.layout = fresh.layout;
         self.original_bytes = bytes;
@@ -6443,7 +6462,20 @@ mod tests {
         let mut doc = parsed(&crate::parsers::DotEnv, "A=1\n");
         let err = doc.del_at(&Pointer::parse("/B").unwrap()).unwrap_err();
         assert!(matches!(err, Error::Path { .. }), "{err:?}");
-        assert!(doc.original_bytes().is_empty());
+        assert_eq!(doc.original_bytes(), b"A=1\n");
+    }
+
+    #[test]
+    fn a_rewrite_edit_that_changes_no_data_keeps_the_bytes() {
+        let src = "; c\n[s]\nk = 80\n";
+        let mut doc = parsed(&crate::parsers::Ini, src);
+        let k = Pointer::parse("/s/k").unwrap();
+        // The same string, and a number that reads back as it.
+        doc.set_at(&k, Value::String("80".to_owned())).unwrap();
+        doc.set_at(&k, Value::Int(80)).unwrap();
+        assert_eq!(doc.original_bytes(), src.as_bytes());
+        doc.set_at(&k, Value::Int(81)).unwrap();
+        assert_eq!(doc.original_bytes(), b"[s]\nk=81\n");
     }
 
     #[test]
