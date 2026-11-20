@@ -48,13 +48,22 @@ How: `JqEngine::compile` parses the program and, when it holds an assignment
 operator, prints it back with each `L op R` turned into
 `(R) as $__dq_rhs | _dq_vivify(L) | L op $__dq_rhs` (`L |= F` into
 `_dq_vivify(L) | L |= F`); `_dq_vivify` creates the containers every path of
-`L` needs, then jaq's own update runs. `setpath`, `delpaths` and `del` are
-redefined as jq defines them, on two natives (`_dq_ensure`, `_dq_delpaths`).
+`L` needs, then jaq's own update runs. On `L`, every index and slice bound
+but a string literal goes through `_dq_index`, which turns a float with an
+integral value into the integer (jaq's update refuses a float index).
+`setpath`, `delpaths` and `del` are redefined as jq defines them, on the
+natives `_dq_ensure` and `_dq_delpaths`.
 Compile errors still point into the program as written. The code is in
 `crates/dq-transform/src/jq/paths.rs`.
 
+An index that is a float with an integral value is the integer, as in jq:
+`.[2.0] = 1` and `.[1e3] = 1` on `null` give `[null,null,1]` and an array of
+1001 items, `setpath([2.0]; 1)` and `delpaths([[1.0]])` take it too.
+
 Left as jaq has it: a slice of null on the path (`.a[1:2] = [1]` on `{}`,
-jq gives `{"a":[1]}`) and a fractional index fail; `.a.b |= empty` on `{}`
+jq gives `{"a":[1]}`) and a fractional index fail (jq truncates: `.[1.5] = 1`
+gives `[null,1]`); an integral float index outside an assignment's left-hand
+side still fails as in jaq (`.[2.0]` read from an array, `del(.[1.0])`); `.a.b |= empty` on `{}`
 gives `{"a":{}}` where jq gives `{}`.
 
 ## API

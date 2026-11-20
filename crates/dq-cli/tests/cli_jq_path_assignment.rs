@@ -44,6 +44,7 @@ fn set_jq_assigns_through_a_missing_key_with_every_operator() {
         (r#"setpath(["a", "b"]; 1)"#, A_B_1),
         (".a[0] = 1", "{\n  \"a\": [\n    1\n  ]\n}\n"),
         (".a[1] = 1", "{\n  \"a\": [\n    null,\n    1\n  ]\n}\n"),
+        (".a[1.0] = 1", "{\n  \"a\": [\n    null,\n    1\n  ]\n}\n"),
         ("del(.a.b)", "{}\n"),
         ("del(.a[0])", "{}\n"),
     ] {

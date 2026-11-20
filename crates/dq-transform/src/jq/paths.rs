@@ -13,7 +13,9 @@
 //! - [`rewrite`] parses the program and, when it holds an assignment
 //!   operator (`=`, `|=`, `+=` and the other arithmetic ones, `//=`),
 //!   prints it back with every `L op R` preceded by `_dq_vivify(L)`, which
-//!   creates the containers the paths of `L` need. The right-hand side is
+//!   creates the containers the paths of `L` need, and every index on `L`
+//!   through `_dq_index`, which takes a float with an integral value as the
+//!   integer it is (jaq's update refuses a float). The right-hand side is
 //!   bound to a variable first, so it still sees the input as it was.
 //!   jaq's native update then runs on a document it can walk.
 //! - [`DEFS`] redefines `setpath`, `delpaths` and `del` the way jq defines
@@ -34,16 +36,19 @@ use jaq_core::load::parse::{BinaryOp, Def, Pattern, Term};
 use jaq_core::native::{Fun, run, v};
 use jaq_core::path::{Opt, Part, Path};
 use jaq_core::{Cv, Error, ValT as _, ValX};
-use jaq_json::{Map, Rc, Val};
+use jaq_json::{Map, Num, Rc, Val};
 use jaq_std::ValT as _;
 
 /// Definitions chained after jaq's own, so these shadow jaq's.
 ///
-/// `setpath` creates the path, then assigns through jaq's own `=`;
+/// `setpath` creates the path, then assigns through jaq's own `=` (an
+/// integral float in the path taken as the integer, as jq takes it);
 /// `delpaths` and `del` are jq's definitions.
 pub(super) const DEFS: &str = r#"
 def _dq_vivify(f): _dq_ensure([path(f)]);
-def setpath($p; $x): _dq_ensure([$p]) | getpath($p) = $x;
+def setpath($p; $x):
+  (if $p | type == "array" then $p | map(_dq_index) else $p end) as $p
+  | _dq_ensure([$p]) | getpath($p) = $x;
 def delpaths($ps): _dq_delpaths($ps);
 def del(f): delpaths([path(f)]);
 "#;
@@ -61,7 +66,7 @@ pub(super) fn defs() -> impl Iterator<Item = Def<&'static str>> {
 
 type D = JustLut<Val>;
 
-/// The natives [`DEFS`] calls.
+/// The natives [`DEFS`] and the rewritten programs ([`rewrite`]) call.
 pub(super) fn funs() -> impl Iterator<Item = Fun<D>> {
     let ensure: jaq_core::RunPtr<D> = |cv| {
         let (v, paths) = pop1(cv);
@@ -71,9 +76,11 @@ pub(super) fn funs() -> impl Iterator<Item = Fun<D>> {
         let (v, paths) = pop1(cv);
         box_once(delpaths(v, &paths))
     };
+    let index: jaq_core::RunPtr<D> = |cv| box_once(Ok(integral(cv.1)));
     [
         run::<D>(("_dq_ensure", v(1), ensure)),
         run::<D>(("_dq_delpaths", v(1), delpaths)),
+        run::<D>(("_dq_index", v(0), index)),
     ]
     .into_iter()
 }
@@ -184,10 +191,36 @@ fn is_str(key: &Val) -> bool {
     matches!(key, Val::TStr(_))
 }
 
+/// The integer a number `key` is: an integer, or a float with an integral
+/// value (`2.0`, `1e3`), as jq takes it. One too large for `isize` comes
+/// back saturated, so it is past [`MAX_INDEX`] rather than not an index.
+/// `None` for anything else — a fractional, infinite or NaN number, which
+/// jaq refuses as an index.
 fn int_key(key: &Val) -> Option<isize> {
-    match key {
-        Val::Num(_) => key.as_isize(),
-        _ => None,
+    if !matches!(key, Val::Num(_)) {
+        return None;
+    }
+    if let Some(i) = key.as_isize() {
+        return Some(i);
+    }
+    let f = key.as_f64()?;
+    // `as` saturates; a big integer comes here as its float.
+    (f.is_finite() && f.fract() == 0.0).then_some(f as isize)
+}
+
+/// `v`, or the integer it is when it is a float with an integral value in
+/// `isize` range: what `_dq_index` gives an index on the left-hand side
+/// of an assignment, which jaq's update would refuse as a float.
+fn integral(v: Val) -> Val {
+    if !matches!(v, Val::Num(Num::Float(_) | Num::Dec(_))) {
+        return v;
+    }
+    match v.as_f64() {
+        // `isize::MAX as f64` rounds up to 2^63, hence `<`.
+        Some(f) if f.fract() == 0.0 && f >= isize::MIN as f64 && f < isize::MAX as f64 => {
+            Val::Num(Num::Int(f as isize))
+        }
+        _ => v,
     }
 }
 
@@ -356,9 +389,12 @@ pub(super) fn rewrite(code: &str) -> Option<String> {
     if !has_assignment(&term) {
         return None;
     }
-    let mut out = String::with_capacity(code.len() * 2);
-    print_term(&term, &mut out);
-    Some(out)
+    let mut printer = Printer {
+        out: String::with_capacity(code.len() * 2),
+        lhs: false,
+    };
+    printer.term(&term);
+    Some(printer.out)
 }
 
 fn has_assignment(t: &Term<&str>) -> bool {
@@ -473,257 +509,296 @@ fn visit_pattern<'s>(p: &Pattern<&'s str>, f: &mut impl FnMut(&Term<&'s str>)) {
     }
 }
 
-/// Print `t` as jq source, every sub-term parenthesised, every assignment
-/// rewritten.
-fn print_term(t: &Term<&str>, out: &mut String) {
-    match t {
-        Term::Id => out.push('.'),
-        Term::Recurse => out.push_str(".."),
-        Term::Num(n) | Term::Var(n) => out.push_str(n),
-        Term::Str(fmt, parts) => print_str(*fmt, parts, out),
-        Term::Arr(None) => out.push_str("[]"),
-        Term::Arr(Some(t)) => {
-            out.push('[');
-            paren(t, out);
-            out.push(']');
-        }
-        Term::Obj(entries) => {
-            out.push('{');
-            for (i, (k, v)) in entries.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
-                }
-                match k {
-                    Term::Var(_) | Term::Str(..) => print_term(k, out),
-                    _ => paren(k, out),
-                }
-                if let Some(v) = v {
-                    out.push_str(": ");
-                    paren(v, out);
-                }
-            }
-            out.push('}');
-        }
-        Term::Neg(t) => {
-            out.push('-');
-            paren(t, out);
-        }
-        Term::BinOp(l, op, r) => print_binop(l, op, r, out),
-        Term::Label(x, t) => {
-            out.push_str("label ");
-            out.push_str(x);
-            out.push_str(" | ");
-            paren(t, out);
-        }
-        Term::Break(x) => {
-            out.push_str("break ");
-            out.push_str(x);
-        }
-        Term::Fold(kind, xs, p, args) => {
-            out.push_str(kind);
-            out.push(' ');
-            paren(xs, out);
-            out.push_str(" as ");
-            print_pattern(p, out);
-            print_args(args, out);
-        }
-        Term::TryCatch(t, c) => {
-            out.push_str("try ");
-            paren(t, out);
-            if let Some(c) = c {
-                out.push_str(" catch ");
-                paren(c, out);
-            }
-        }
-        Term::IfThenElse(branches, els) => {
-            for (i, (c, t)) in branches.iter().enumerate() {
-                out.push_str(if i == 0 { "if " } else { " elif " });
-                paren(c, out);
-                out.push_str(" then ");
-                paren(t, out);
-            }
-            if let Some(e) = els {
-                out.push_str(" else ");
-                paren(e, out);
-            }
-            out.push_str(" end");
-        }
-        Term::Def(defs, t) => {
-            for d in defs {
-                out.push_str("def ");
-                out.push_str(d.name);
-                if !d.args.is_empty() {
-                    out.push('(');
-                    out.push_str(&d.args.join("; "));
-                    out.push(')');
-                }
-                out.push_str(": ");
-                paren(&d.body, out);
-                out.push_str("; ");
-            }
-            paren(t, out);
-        }
-        Term::Call(name, args) => {
-            out.push_str(name);
-            print_args(args, out);
-        }
-        Term::Path(t, path) => {
-            match **t {
-                Term::Id => out.push('.'),
-                _ => paren(t, out),
-            }
-            print_path(path, out);
-        }
-    }
+/// Prints a term back as jq source, every sub-term parenthesised, every
+/// assignment rewritten.
+struct Printer {
+    out: String,
+    /// Printing the left-hand side of an assignment: each index on its
+    /// paths goes through `_dq_index`, so an integral float (`.[2.0]`)
+    /// indexes an array as the integer it is, as in jq — jaq's update
+    /// refuses a float index.
+    lhs: bool,
 }
 
-fn paren(t: &Term<&str>, out: &mut String) {
-    out.push('(');
-    print_term(t, out);
-    out.push(')');
-}
-
-fn print_args(args: &[Term<&str>], out: &mut String) {
-    if args.is_empty() {
-        return;
-    }
-    out.push('(');
-    for (i, a) in args.iter().enumerate() {
-        if i > 0 {
-            out.push_str("; ");
-        }
-        paren(a, out);
-    }
-    out.push(')');
-}
-
-fn print_binop(l: &Term<&str>, op: &BinaryOp<&str>, r: &Term<&str>, out: &mut String) {
-    let infix = |l: &Term<&str>, op: &str, r: &Term<&str>, out: &mut String| {
-        paren(l, out);
-        out.push(' ');
-        out.push_str(op);
-        out.push(' ');
-        paren(r, out);
-    };
-    // `L op R` becomes `(R) as $rhs | _dq_vivify(L) | (L) op $rhs`: the
-    // right-hand side sees the input before any path is created, as it
-    // sees it in jq. `L |= F` needs no binding: F sees the value at the
-    // path.
-    let assign = |op: &str, out: &mut String| {
-        paren(r, out);
-        out.push_str(" as ");
-        out.push_str(RHS);
-        out.push_str(" | _dq_vivify");
-        paren(l, out);
-        out.push_str(" | ");
-        paren(l, out);
-        out.push(' ');
-        out.push_str(op);
-        out.push(' ');
-        out.push_str(RHS);
-    };
-    match op {
-        BinaryOp::Pipe(None) => infix(l, "|", r, out),
-        BinaryOp::Pipe(Some(p)) => {
-            paren(l, out);
-            out.push_str(" as ");
-            print_pattern(p, out);
-            out.push_str(" | ");
-            paren(r, out);
-        }
-        BinaryOp::Comma => infix(l, ",", r, out),
-        BinaryOp::Alt => infix(l, "//", r, out),
-        BinaryOp::Or => infix(l, "or", r, out),
-        BinaryOp::And => infix(l, "and", r, out),
-        BinaryOp::Math(m) => infix(l, m.as_str(), r, out),
-        BinaryOp::Cmp(c) => infix(l, c.as_str(), r, out),
-        BinaryOp::Assign => assign("=", out),
-        BinaryOp::UpdateMath(m) => assign(&format!("{}=", m.as_str()), out),
-        BinaryOp::UpdateAlt => assign("//=", out),
-        BinaryOp::Update => {
-            out.push_str("_dq_vivify");
-            paren(l, out);
-            out.push_str(" | ");
-            infix(l, "|=", r, out);
-        }
-    }
-}
-
-fn print_pattern(p: &Pattern<&str>, out: &mut String) {
-    match p {
-        Pattern::Var(x) => out.push_str(x),
-        Pattern::Arr(items) => {
-            out.push('[');
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
-                }
-                print_pattern(item, out);
+impl Printer {
+    fn term(&mut self, t: &Term<&str>) {
+        match t {
+            Term::Id => self.out.push('.'),
+            Term::Recurse => self.out.push_str(".."),
+            Term::Num(n) | Term::Var(n) => self.out.push_str(n),
+            Term::Str(fmt, parts) => self.str_lit(*fmt, parts),
+            Term::Arr(None) => self.out.push_str("[]"),
+            Term::Arr(Some(t)) => {
+                self.out.push('[');
+                self.paren(t);
+                self.out.push(']');
             }
-            out.push(']');
-        }
-        Pattern::Obj(entries) => {
-            out.push('{');
-            for (i, (k, v)) in entries.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
+            Term::Obj(entries) => {
+                self.out.push('{');
+                for (i, (k, v)) in entries.iter().enumerate() {
+                    if i > 0 {
+                        self.out.push_str(", ");
+                    }
+                    match k {
+                        Term::Var(_) | Term::Str(..) => self.term(k),
+                        _ => self.paren(k),
+                    }
+                    if let Some(v) = v {
+                        self.out.push_str(": ");
+                        self.paren(v);
+                    }
                 }
-                paren(k, out);
-                out.push_str(": ");
-                print_pattern(v, out);
+                self.out.push('}');
             }
-            out.push('}');
-        }
-    }
-}
-
-fn print_path(path: &Path<Term<&str>>, out: &mut String) {
-    for (part, opt) in &path.0 {
-        out.push('[');
-        match part {
-            Part::Index(i) => paren(i, out),
-            Part::Range(from, to) => {
-                if let Some(from) = from {
-                    paren(from, out);
-                }
-                if from.is_some() || to.is_some() {
-                    out.push(':');
-                }
-                if let Some(to) = to {
-                    paren(to, out);
+            Term::Neg(t) => {
+                self.out.push('-');
+                self.paren(t);
+            }
+            Term::BinOp(l, op, r) => self.binop(l, op, r),
+            Term::Label(x, t) => {
+                self.out.push_str("label ");
+                self.out.push_str(x);
+                self.out.push_str(" | ");
+                self.paren(t);
+            }
+            Term::Break(x) => {
+                self.out.push_str("break ");
+                self.out.push_str(x);
+            }
+            Term::Fold(kind, xs, p, args) => {
+                self.out.push_str(kind);
+                self.out.push(' ');
+                self.paren(xs);
+                self.out.push_str(" as ");
+                self.pattern(p);
+                self.args(args);
+            }
+            Term::TryCatch(t, c) => {
+                self.out.push_str("try ");
+                self.paren(t);
+                if let Some(c) = c {
+                    self.out.push_str(" catch ");
+                    self.paren(c);
                 }
             }
-        }
-        out.push(']');
-        if matches!(opt, Opt::Optional) {
-            out.push('?');
-        }
-    }
-}
-
-/// Print a string literal: the parts without escapes as they were, an
-/// escaped character re-escaped where it has to be, an interpolation
-/// rewritten.
-fn print_str(fmt: Option<&str>, parts: &[StrPart<&str, Term<&str>>], out: &mut String) {
-    if let Some(fmt) = fmt {
-        out.push_str(fmt);
-        out.push(' ');
-    }
-    out.push('"');
-    for part in parts {
-        match part {
-            StrPart::Str(s) => out.push_str(s),
-            StrPart::Char('"') => out.push_str("\\\""),
-            StrPart::Char('\\') => out.push_str("\\\\"),
-            StrPart::Char(c) => out.push(*c),
-            StrPart::Term(t) => {
-                out.push_str("\\(");
-                print_term(t, out);
-                out.push(')');
+            Term::IfThenElse(branches, els) => {
+                for (i, (c, t)) in branches.iter().enumerate() {
+                    self.out.push_str(if i == 0 { "if " } else { " elif " });
+                    self.paren(c);
+                    self.out.push_str(" then ");
+                    self.paren(t);
+                }
+                if let Some(e) = els {
+                    self.out.push_str(" else ");
+                    self.paren(e);
+                }
+                self.out.push_str(" end");
+            }
+            Term::Def(defs, t) => {
+                for d in defs {
+                    self.out.push_str("def ");
+                    self.out.push_str(d.name);
+                    if !d.args.is_empty() {
+                        self.out.push('(');
+                        self.out.push_str(&d.args.join("; "));
+                        self.out.push(')');
+                    }
+                    self.out.push_str(": ");
+                    // A definition's body is not the left-hand side of the
+                    // assignment it may sit in.
+                    let lhs = core::mem::replace(&mut self.lhs, false);
+                    self.paren(&d.body);
+                    self.lhs = lhs;
+                    self.out.push_str("; ");
+                }
+                self.paren(t);
+            }
+            Term::Call(name, args) => {
+                self.out.push_str(name);
+                self.args(args);
+            }
+            Term::Path(t, path) => {
+                match **t {
+                    Term::Id => self.out.push('.'),
+                    _ => self.paren(t),
+                }
+                self.path(path);
             }
         }
     }
-    out.push('"');
+
+    fn paren(&mut self, t: &Term<&str>) {
+        self.out.push('(');
+        self.term(t);
+        self.out.push(')');
+    }
+
+    /// `t`, printed as the left-hand side of an assignment.
+    fn lhs(&mut self, t: &Term<&str>) {
+        let lhs = core::mem::replace(&mut self.lhs, true);
+        self.paren(t);
+        self.lhs = lhs;
+    }
+
+    fn args(&mut self, args: &[Term<&str>]) {
+        if args.is_empty() {
+            return;
+        }
+        self.out.push('(');
+        for (i, a) in args.iter().enumerate() {
+            if i > 0 {
+                self.out.push_str("; ");
+            }
+            self.paren(a);
+        }
+        self.out.push(')');
+    }
+
+    fn infix(&mut self, l: &Term<&str>, op: &str, r: &Term<&str>) {
+        self.paren(l);
+        self.out.push(' ');
+        self.out.push_str(op);
+        self.out.push(' ');
+        self.paren(r);
+    }
+
+    /// `L op R` becomes `(R) as $rhs | _dq_vivify(L) | (L) op $rhs`: the
+    /// right-hand side sees the input before any path is created, as it
+    /// sees it in jq.
+    fn assign(&mut self, l: &Term<&str>, op: &str, r: &Term<&str>) {
+        self.paren(r);
+        self.out.push_str(" as ");
+        self.out.push_str(RHS);
+        self.out.push_str(" | _dq_vivify");
+        self.lhs(l);
+        self.out.push_str(" | ");
+        self.lhs(l);
+        self.out.push(' ');
+        self.out.push_str(op);
+        self.out.push(' ');
+        self.out.push_str(RHS);
+    }
+
+    fn binop(&mut self, l: &Term<&str>, op: &BinaryOp<&str>, r: &Term<&str>) {
+        match op {
+            BinaryOp::Pipe(None) => self.infix(l, "|", r),
+            BinaryOp::Pipe(Some(p)) => {
+                self.paren(l);
+                self.out.push_str(" as ");
+                self.pattern(p);
+                self.out.push_str(" | ");
+                self.paren(r);
+            }
+            BinaryOp::Comma => self.infix(l, ",", r),
+            BinaryOp::Alt => self.infix(l, "//", r),
+            BinaryOp::Or => self.infix(l, "or", r),
+            BinaryOp::And => self.infix(l, "and", r),
+            BinaryOp::Math(m) => self.infix(l, m.as_str(), r),
+            BinaryOp::Cmp(c) => self.infix(l, c.as_str(), r),
+            BinaryOp::Assign => self.assign(l, "=", r),
+            BinaryOp::UpdateMath(m) => self.assign(l, &format!("{}=", m.as_str()), r),
+            BinaryOp::UpdateAlt => self.assign(l, "//=", r),
+            // `L |= F` needs no binding: F sees the value at the path.
+            BinaryOp::Update => {
+                self.out.push_str("_dq_vivify");
+                self.lhs(l);
+                self.out.push_str(" | ");
+                self.lhs(l);
+                self.out.push_str(" |= ");
+                self.paren(r);
+            }
+        }
+    }
+
+    fn pattern(&mut self, p: &Pattern<&str>) {
+        match p {
+            Pattern::Var(x) => self.out.push_str(x),
+            Pattern::Arr(items) => {
+                self.out.push('[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        self.out.push_str(", ");
+                    }
+                    self.pattern(item);
+                }
+                self.out.push(']');
+            }
+            Pattern::Obj(entries) => {
+                self.out.push('{');
+                for (i, (k, v)) in entries.iter().enumerate() {
+                    if i > 0 {
+                        self.out.push_str(", ");
+                    }
+                    self.paren(k);
+                    self.out.push_str(": ");
+                    self.pattern(v);
+                }
+                self.out.push('}');
+            }
+        }
+    }
+
+    fn path(&mut self, path: &Path<Term<&str>>) {
+        for (part, opt) in &path.0 {
+            self.out.push('[');
+            match part {
+                Part::Index(i) => self.index(i),
+                Part::Range(from, to) => {
+                    if let Some(from) = from {
+                        self.index(from);
+                    }
+                    if from.is_some() || to.is_some() {
+                        self.out.push(':');
+                    }
+                    if let Some(to) = to {
+                        self.index(to);
+                    }
+                }
+            }
+            self.out.push(']');
+            if matches!(opt, Opt::Optional) {
+                self.out.push('?');
+            }
+        }
+    }
+
+    /// An index or a slice bound, through `_dq_index` on the left-hand
+    /// side of an assignment — but a string literal, which it would leave
+    /// as it is.
+    fn index(&mut self, i: &Term<&str>) {
+        if !self.lhs || matches!(i, Term::Str(None, _)) {
+            self.paren(i);
+            return;
+        }
+        self.out.push_str("((");
+        self.term(i);
+        self.out.push_str(") | _dq_index)");
+    }
+
+    /// Print a string literal: the parts without escapes as they were, an
+    /// escaped character re-escaped where it has to be, an interpolation
+    /// rewritten.
+    fn str_lit(&mut self, fmt: Option<&str>, parts: &[StrPart<&str, Term<&str>>]) {
+        if let Some(fmt) = fmt {
+            self.out.push_str(fmt);
+            self.out.push(' ');
+        }
+        self.out.push('"');
+        for part in parts {
+            match part {
+                StrPart::Str(s) => self.out.push_str(s),
+                StrPart::Char('"') => self.out.push_str("\\\""),
+                StrPart::Char('\\') => self.out.push_str("\\\\"),
+                StrPart::Char(c) => self.out.push(*c),
+                StrPart::Term(t) => {
+                    self.out.push_str("\\(");
+                    self.term(t);
+                    self.out.push(')');
+                }
+            }
+        }
+        self.out.push('"');
+    }
 }
 
 #[cfg(test)]
@@ -836,6 +911,37 @@ mod tests {
     }
 
     #[test]
+    fn an_integral_float_index_is_the_integer_it_is() {
+        // Each expectation is what jq 1.8 prints for the same program.
+        for (filter, input, want) in [
+            (".[2.0] = 1", "null", "[null,null,1]"),
+            (".[1e3] = 1 | length", "null", "1001"),
+            ("[1,2,3] | .[2.0] = 9", "null", "[1,2,9]"),
+            (".a[2.0] |= 3", "null", r#"{"a":[null,null,3]}"#),
+            (r#"{"a":[1,2]} | .a[-1.0] += 1"#, "null", r#"{"a":[1,3]}"#),
+            ("2.0 as $i | .[$i] = 1", "null", "[null,null,1]"),
+            ("[1,2,3] | .[1.0:2.0] = [\"x\"]", "null", r#"[1,"x",3]"#),
+            ("setpath([2.0]; 1)", "null", "[null,null,1]"),
+            ("[1,2,3] | delpaths([[1.0]])", "null", "[1,3]"),
+        ] {
+            assert_eq!(one(filter, input), want, "{filter} on {input}");
+        }
+        // Integral, but past the limit.
+        for filter in [".[1e19] = 1", ".[1e300] = 1"] {
+            let err = run(filter, "null").expect_err(filter);
+            assert!(err.contains("Array index too large"), "{filter}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_fractional_index_stays_refused() {
+        // jq truncates (`.[1.5] = 1` is `[null,1]`); jaq refuses it.
+        for (filter, input) in [(".[1.5] = 1", "null"), (".[1.5] = 9", "[1,2,3]")] {
+            assert!(run(filter, input).is_err(), "{filter} on {input}");
+        }
+    }
+
+    #[test]
     fn an_index_past_jqs_limit_is_an_error_not_an_allocation() {
         // jq refuses an index past 536870911 with "Array index too large".
         for (filter, input) in [
@@ -887,6 +993,11 @@ mod tests {
         assert_eq!(
             rewrite(".a |= . + 1").as_deref(),
             Some("_dq_vivify(.[(\"a\")]) | (.[(\"a\")]) |= ((.) + (1))")
+        );
+        // An index that is not a string literal goes through `_dq_index`.
+        assert_eq!(
+            rewrite(".[$i] |= 1").as_deref(),
+            Some("_dq_vivify(.[(($i) | _dq_index)]) | (.[(($i) | _dq_index)]) |= (1)")
         );
     }
 
