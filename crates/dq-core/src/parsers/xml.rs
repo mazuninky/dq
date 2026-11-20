@@ -2760,8 +2760,10 @@ fn scalar_text(v: &Value) -> Option<String> {
 /// where a list of comments, PIs or CDATA belongs as a list of it; CDATA
 /// holding `]]>` as the sections the writer splits it into; a child
 /// element given as a scalar as an element of that text, as a null as an
-/// empty element. The declaration (`#xml`) is left out: the writer checks
-/// it against its grammar, and an empty one reads back with its version.
+/// empty element; the declaration (`#xml`) as [`declaration_form`]. An
+/// `#xml` below the root, where the writer has nowhere to put it, is kept
+/// as it is but for a null, so it never reads back: an edit that sets one
+/// is refused, not dropped.
 pub(crate) fn read_back_form(top: &Value) -> Value {
     let Value::Map(top) = top else {
         return top.clone();
@@ -2769,8 +2771,9 @@ pub(crate) fn read_back_form(top: &Value) -> Value {
     let mut out = IndexMap::with_capacity(top.len());
     for (key, value) in top {
         let form = match key.as_str() {
+            KEY_XML_DECL => declaration_form(value),
             // The writer refuses any of these at the top level but empty.
-            KEY_XML_DECL | KEY_ATTRS | KEY_TEXT | KEY_CDATA => None,
+            KEY_ATTRS | KEY_TEXT | KEY_CDATA => None,
             KEY_PI | KEY_COMMENTS => items_form(value, false),
             _ => children_form(value),
         };
@@ -2779,6 +2782,27 @@ pub(crate) fn read_back_form(top: &Value) -> Value {
         }
     }
     Value::Map(out)
+}
+
+/// The top-level `#xml` `entry` as it reads back: the version, the
+/// encoding and the standalone of the declaration the writer writes for
+/// it, each as its text (a missing version is `1.0`, a boolean standalone
+/// `yes` / `no`); `None` when it writes none — no `#xml`, a null, a `bom`
+/// or `detected` alone — or refuses it. The byte order mark and the
+/// encoding told from the bytes are left out: the writer picks the bytes,
+/// and the reader tells them from those.
+fn declaration_form(entry: &Value) -> Option<Value> {
+    let decl = declaration(Some(entry)).ok()??;
+    if !decl.written {
+        return None;
+    }
+    let mut out = IndexMap::from([("version".to_owned(), Value::String(decl.version))]);
+    for (field, text) in [("encoding", decl.encoding), ("standalone", decl.standalone)] {
+        if let Some(text) = text {
+            out.insert(field.to_owned(), Value::String(text));
+        }
+    }
+    Some(Value::Map(out))
 }
 
 /// The element `body` as it reads back: see [`read_back_form`].
@@ -2804,7 +2828,7 @@ fn element_form(body: &IndexMap<String, Value>) -> Value {
                 .map(Value::String),
             KEY_CDATA => items_form(value, true),
             KEY_PI | KEY_COMMENTS => items_form(value, false),
-            KEY_XML_DECL => None,
+            KEY_XML_DECL => (*value != Value::Null).then(|| value.clone()),
             _ => children_form(value),
         };
         if let Some(form) = form {

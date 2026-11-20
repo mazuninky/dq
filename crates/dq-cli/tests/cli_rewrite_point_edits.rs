@@ -428,3 +428,52 @@ fn set_and_del_help_say_which_formats_lose_their_comments() {
         );
     }
 }
+
+/// `#xml` is the declaration at the top level, and nothing below it: an
+/// edit there is written, one that sets it in an element, where the writer
+/// has nowhere to put it, is refused.
+#[test]
+fn an_xml_declaration_edit_is_written_or_refused_never_dropped() {
+    let src = "<?xml version=\"1.0\"?>\n<r>\n  <c>1</c>\n</r>\n";
+    // Was: exit 0, the file unchanged.
+    refused(
+        "g.xml",
+        src,
+        &["set", "g.xml", "/r/0/c/0/#xml/v", "1"],
+        7,
+        "cannot set '/r/0/c/0/#xml/v': the xml dq would write reads back as another value \
+         at '/r/0/c/0/#xml'\n",
+    );
+    refused(
+        "g.xml",
+        src,
+        &["set", "g.xml", "/r/0/#xml", r#"{"version": "1.0"}"#],
+        7,
+        "cannot set '/r/0/#xml': the xml dq would write reads back as another value \
+         at '/r/0/#xml'\n",
+    );
+    // At the top level: the declaration, written as asked.
+    edits_to(
+        "g.xml",
+        src,
+        &["set", "g.xml", "/#xml/encoding", "UTF-8"],
+        &src.replace("?>", " encoding=\"UTF-8\"?>"),
+    );
+    edits_to(
+        "g.xml",
+        "<r/>\n",
+        &["set", "g.xml", "/#xml", "{}"],
+        "<?xml version=\"1.0\"?>\n<r/>\n",
+    );
+    edits_to(
+        "g.xml",
+        "<?xml version=\"1.0\" standalone=\"yes\"?>\n<r/>\n",
+        &["set", "g.xml", "/#xml", "{}"],
+        "<?xml version=\"1.0\"?>\n<r/>\n",
+    );
+    // `{}` asks for a declaration of the default version, which the file
+    // has: nothing to write.
+    edits_to("g.xml", src, &["set", "g.xml", "/#xml", "{}"], src);
+    // A null below the root carries nothing, as anywhere in XML.
+    edits_to("g.xml", src, &["set", "g.xml", "/r/0/#xml", "null"], src);
+}

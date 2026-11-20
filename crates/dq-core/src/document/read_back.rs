@@ -128,7 +128,7 @@ mod tests {
     #[test]
     fn xml_and_hcl_read_back_in_their_writers_shapes() {
         let xml = tree(serde_json::json!({
-            "#xml": {"version": "1.0"},
+            "#xml": {"standalone": true, "bom": "UTF-8"},
             "#comments": "top",
             "r": [{"@attrs": {"k": 1, "z": null}, "#text": "", "#cdata": ["a]]>b"],
                    "a": ["x", null, {"#text": 2}], "b": []}]
@@ -136,6 +136,7 @@ mod tests {
         assert_eq!(
             read_back_form(FormatTag::Xml, &Layout::None, &xml),
             tree(serde_json::json!({
+                "#xml": {"version": "1.0", "standalone": "yes"},
                 "#comments": ["top"],
                 "r": [{"@attrs": {"k": "1", "z": ""}, "#cdata": ["a]]", ">b"],
                        "a": [{"#text": "x"}, {}, {"#text": "2"}]}]
