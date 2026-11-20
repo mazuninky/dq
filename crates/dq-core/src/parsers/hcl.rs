@@ -1211,6 +1211,77 @@ impl<'a> BodyWriter<'a> {
     }
 }
 
+/// `body` as [`write_body`] writes it with `layout` reads back: a key it
+/// writes as blocks ([`has_block_shape`]) as their bodies — a list of one
+/// as the body alone, a label with no body left, and a key with none, gone.
+/// Every other value is written as what it reads back as.
+pub(crate) fn read_back_form(body: &IndexMap<String, Value>, layout: &HclLayout) -> Value {
+    Value::Map(body_form(body, layout, &mut Vec::new()))
+}
+
+/// See [`read_back_form`]: `path` is [`BodyWriter::path`] of `body`.
+fn body_form(
+    body: &IndexMap<String, Value>,
+    layout: &HclLayout,
+    path: &mut Vec<String>,
+) -> IndexMap<String, Value> {
+    let mut out = IndexMap::with_capacity(body.len());
+    for (key, value) in body {
+        path.push(key.clone());
+        let form = match layout.labels_at(path) {
+            Some(labels) if has_block_shape(value, labels) => {
+                blocks_form(value, labels, layout, path)
+            }
+            _ => Some(value.clone()),
+        };
+        path.pop();
+        if let Some(form) = form {
+            out.insert(key.clone(), form);
+        }
+    }
+    out
+}
+
+/// The blocks `value` holds `remaining` label levels deep, as they read
+/// back; `None` when there are none.
+fn blocks_form(
+    value: &Value,
+    remaining: usize,
+    layout: &HclLayout,
+    path: &mut Vec<String>,
+) -> Option<Value> {
+    match value {
+        Value::Map(labels) if remaining > 0 => {
+            let mut out = IndexMap::with_capacity(labels.len());
+            for (label, inner) in labels {
+                path.push(label.clone());
+                let form = blocks_form(inner, remaining - 1, layout, path);
+                path.pop();
+                if let Some(form) = form {
+                    out.insert(label.clone(), form);
+                }
+            }
+            (!out.is_empty()).then_some(Value::Map(out))
+        }
+        Value::Map(body) => Some(Value::Map(body_form(body, layout, path))),
+        Value::Array(bodies) => {
+            let mut forms: Vec<Value> = bodies
+                .iter()
+                .filter_map(|body| match body {
+                    Value::Map(body) => Some(Value::Map(body_form(body, layout, path))),
+                    _ => None,
+                })
+                .collect();
+            match forms.len() {
+                0 => None,
+                1 => forms.pop(),
+                _ => Some(Value::Array(forms)),
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Whether `value` can be written as the blocks of a type with `labels`
 /// labels: `labels` levels of maps, then a body (a map) or a list of
 /// bodies. A key read as a block stays one with any number of bodies left:

@@ -2576,6 +2576,108 @@ fn scalar_text(v: &Value) -> Option<String> {
     }
 }
 
+/// `top`, a tree the writer writes, as the XML it writes reads back where
+/// nothing is lost — the same form for a tree the reader built: every
+/// scalar its [`scalar_text`]; a null, an empty list or map, and text of
+/// no characters as nothing; a lone scalar
+/// where a list of comments, PIs or CDATA belongs as a list of it; CDATA
+/// holding `]]>` as the sections the writer splits it into; a child
+/// element given as a scalar as an element of that text, as a null as an
+/// empty element. The declaration (`#xml`) is left out: the writer checks
+/// it against its grammar, and an empty one reads back with its version.
+pub(crate) fn read_back_form(top: &Value) -> Value {
+    let Value::Map(top) = top else {
+        return top.clone();
+    };
+    let mut out = IndexMap::with_capacity(top.len());
+    for (key, value) in top {
+        let form = match key.as_str() {
+            // The writer refuses any of these at the top level but empty.
+            KEY_XML_DECL | KEY_ATTRS | KEY_TEXT | KEY_CDATA => None,
+            KEY_PI | KEY_COMMENTS => items_form(value, false),
+            _ => children_form(value),
+        };
+        if let Some(form) = form {
+            out.insert(key.clone(), form);
+        }
+    }
+    Value::Map(out)
+}
+
+/// The element `body` as it reads back: see [`read_back_form`].
+fn element_form(body: &IndexMap<String, Value>) -> Value {
+    let mut out = IndexMap::with_capacity(body.len());
+    for (key, value) in body {
+        let form = match key.as_str() {
+            KEY_ATTRS => match value {
+                Value::Map(attrs) if !attrs.is_empty() => Some(Value::Map(
+                    attrs
+                        .iter()
+                        .map(|(name, v)| {
+                            let text = scalar_text(v).unwrap_or_default();
+                            (name.clone(), Value::String(text))
+                        })
+                        .collect(),
+                )),
+                _ => None,
+            },
+            // Whitespace alone is written as references, which read back.
+            KEY_TEXT => scalar_text(value)
+                .filter(|text| !text.is_empty())
+                .map(Value::String),
+            KEY_CDATA => items_form(value, true),
+            KEY_PI | KEY_COMMENTS => items_form(value, false),
+            KEY_XML_DECL => None,
+            _ => children_form(value),
+        };
+        if let Some(form) = form {
+            out.insert(key.clone(), form);
+        }
+    }
+    Value::Map(out)
+}
+
+/// A child entry as it reads back: its elements, `None` for none.
+fn children_form(value: &Value) -> Option<Value> {
+    let Value::Array(items) = value else {
+        return None;
+    };
+    let forms: Vec<Value> = items
+        .iter()
+        .map(|item| match item {
+            Value::Map(body) => element_form(body),
+            Value::Null => Value::Map(IndexMap::new()),
+            scalar => element_form(&IndexMap::from([(KEY_TEXT.to_owned(), scalar.clone())])),
+        })
+        .collect();
+    (!forms.is_empty()).then_some(Value::Array(forms))
+}
+
+/// A `#comments` / `#pi` / `#cdata` entry as it reads back (see
+/// [`item_texts`]); CDATA (`cdata`) split where the writer splits it.
+fn items_form(entry: &Value, cdata: bool) -> Option<Value> {
+    let items = match entry {
+        Value::Null => return None,
+        Value::Array(items) => items.as_slice(),
+        lone => std::slice::from_ref(lone),
+    };
+    let mut texts = Vec::with_capacity(items.len());
+    for text in items.iter().filter_map(scalar_text) {
+        if !cdata {
+            texts.push(Value::String(text));
+            continue;
+        }
+        // `a]]>b` is written `<![CDATA[a]]]]><![CDATA[>b]]>`.
+        let mut rest = text.as_str();
+        while let Some(at) = rest.find("]]>") {
+            texts.push(Value::String(rest[..at + 2].to_owned()));
+            rest = &rest[at + 2..];
+        }
+        texts.push(Value::String(rest.to_owned()));
+    }
+    (!texts.is_empty()).then_some(Value::Array(texts))
+}
+
 /// The texts of a `#comments` / `#pi` / `#cdata` entry, in order. The
 /// reader always produces a list of strings; a tree from elsewhere may hold
 /// any scalar there, written as its [`scalar_text`], and a lone scalar

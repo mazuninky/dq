@@ -56,6 +56,19 @@ and requires that they read back as exactly the requested change. If the
 splice would change anything else (an edit dq cannot express in place), it is
 refused as `edit_rejected`, exit 7, and the file is untouched.
 
+A rewrite is checked the same way: the bytes the writer would write must read
+back as the edited tree, as the format reads any tree back — a number, a
+boolean or a null as its text in INI, dotenv and CSV (and XML), a cell a CSV
+row lacks as an empty one, an HCL list of one block as the block's body, an
+XML element given as a scalar as an element holding it. Anything else is
+refused as `edit_rejected`, exit 7, the file untouched: `dq set a.ini /s/k ' v '`
+("cannot set '/s/k': the ini dq would write reads back as another value at
+'/s/k'": INI trims the value), or a key `k=x` that would read back as the key
+`k`. A JSON Lines file is a list of records, so a point edit that would leave
+it a map or a scalar (`dq set l.jsonl '' '{"x":1}'`, `dq merge l.jsonl
+'{"x":1}'`) is refused up front, exit 1 ("a JSON Lines file is a list of
+records, one per line, so its root is an array, not a map").
+
 ## Output modes
 
 Exactly one of:

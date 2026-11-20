@@ -23,6 +23,7 @@
 
 mod insert;
 mod number;
+mod read_back;
 pub mod spans;
 mod stream;
 
@@ -1167,7 +1168,11 @@ impl Document {
     /// alias of an anchored node at or above `pointer`, which shares the
     /// edit. Otherwise the document is left as it was and the edit fails.
     /// On success the value tree, spans and provenance are the fresh
-    /// parse's.
+    /// parse's. A document written whole is held to the same, as its format
+    /// reads any tree back (an INI value as its text, an HCL list of one
+    /// block as the body): see `Document::write_pending`. A JSON Lines root
+    /// that is no array is refused before it is written
+    /// ([`Error::Format`]).
     ///
     /// # Errors
     ///
@@ -1381,6 +1386,18 @@ impl Document {
         let layout = self.layout_after_edit(action, pointer)?;
         let mut tree = self.value.clone();
         edit(&mut tree)?;
+        // The JSON Lines writer would write any other root as one line,
+        // which reads back as a list of one record.
+        if self.format == FormatTag::Jsonl && !matches!(tree, Value::Array(_)) {
+            return Err(Error::Format {
+                format: "jsonl",
+                message: format!(
+                    "a JSON Lines file is a list of records, one per line, so its root is an \
+                     array, not {}; set a record at /0 or append one at /-",
+                    tree.kind_with_article()
+                ),
+            });
+        }
         let replaces_expression = layout.drops_expressions_of(&self.layout);
         let pending = self.rewrite.pending.get_or_insert_with(|| {
             Box::new(PendingRewrite {
@@ -1411,11 +1428,22 @@ impl Document {
     /// bytes to leave: `80` set in INI where the file has `80`. On any
     /// error the document is left as it was before the edits.
     ///
+    /// # Read-back check
+    ///
+    /// The written bytes must read back as the tree written, as the format
+    /// reads any such tree back ([`read_back::read_back_form`]): a
+    /// number, a boolean or a null as its text in INI, dotenv and CSV,
+    /// which hold strings (and in XML); a missing CSV cell as an empty
+    /// one; an HCL list of one block as the block's body. Anything else —
+    /// INI that trims ` v ` to `v`, a key `k=x` that reads back as the key
+    /// `k` — is refused.
+    ///
     /// # Errors
     ///
     /// The writer's error for a tree it cannot write ([`Error::Format`]: a
     /// nested value in INI, dotenv or CSV, a second XML root, …);
-    /// [`Error::EditRejected`] when the written bytes would not read back.
+    /// [`Error::EditRejected`] when the written bytes would not read back,
+    /// or read back as another tree.
     fn write_pending(&mut self) -> Result<()> {
         let Some(pending) = self.rewrite.pending.take() else {
             return Ok(());
@@ -1432,31 +1460,46 @@ impl Document {
         // for, and is written.
         let keep = !self.original_bytes.is_empty() && !replaces_expression;
         let name = self.format.name();
-        let written = match crate::format::by_name(name) {
-            _ if keep && self.value.same_data(&before) => Ok(None),
-            None => Err(self.no_textual_edits("write it")),
-            Some(format) => {
-                let doc = Document::value_only(
-                    std::mem::replace(&mut self.value, Value::Null),
-                    self.format,
-                )
-                .with_layout(std::mem::take(&mut self.layout));
-                let mut bytes = Vec::new();
-                let written = format.write(&doc, &mut bytes);
-                self.value = doc.value;
-                self.layout = doc.layout;
-                written.and_then(|()| {
-                    format
-                        .parse(&bytes)
-                        .map(|fresh| Some((fresh, bytes)))
-                        .map_err(|err| Error::EditRejected {
-                            action,
-                            pointer: pointer.as_canonical(),
-                            reason: format!("the {name} dq would write does not read back: {err}"),
+        let written =
+            match crate::format::by_name(name) {
+                _ if keep && self.value.same_data(&before) => Ok(None),
+                None => Err(self.no_textual_edits("write it")),
+                Some(format) => {
+                    let doc = Document::value_only(
+                        std::mem::replace(&mut self.value, Value::Null),
+                        self.format,
+                    )
+                    .with_layout(std::mem::take(&mut self.layout));
+                    let mut bytes = Vec::new();
+                    let written = format.write(&doc, &mut bytes);
+                    self.value = doc.value;
+                    self.layout = doc.layout;
+                    let rejected = |reason: String| Error::EditRejected {
+                        action,
+                        pointer: pointer.as_canonical(),
+                        reason,
+                    };
+                    written
+                    .and_then(|()| {
+                        format.parse(&bytes).map_err(|err| {
+                            rejected(format!("the {name} dq would write does not read back: {err}"))
                         })
-                })
-            }
-        };
+                    })
+                    .and_then(|fresh| {
+                        // The bytes must read back as the tree written, as
+                        // the format reads every such tree back.
+                        let form = |value: &Value| {
+                            read_back::read_back_form(self.format, &self.layout, value)
+                        };
+                        match first_difference(&form(&self.value), &form(&fresh.value), "") {
+                            None => Ok(Some((fresh, bytes))),
+                            Some(at) => Err(rejected(format!(
+                                "the {name} dq would write reads back as another value at '{at}'"
+                            ))),
+                        }
+                    })
+                }
+            };
         match written {
             Ok(Some((fresh, bytes))) if !(keep && fresh.value.same_data(&before)) => {
                 self.value = fresh.value;

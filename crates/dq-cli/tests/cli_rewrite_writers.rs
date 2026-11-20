@@ -559,3 +559,67 @@ fn jsonl_point_edits_address_records_by_index_and_rewrite_the_file() {
     // A value already there leaves the file as it is.
     edits_to("a.jsonl", src, &["set", "a.jsonl", "/1/a", "2"], src);
 }
+
+#[test]
+fn a_jsonl_root_that_is_no_array_is_refused() {
+    let src = "{\"a\":1}\n{\"a\":2}\n";
+    // Was: every record dropped and one line written that reads back as
+    // `[{"x":1}]` (or `[5]`), exit 0.
+    let refusal = |kind: &str| {
+        format!(
+            "jsonl format error: a JSON Lines file is a list of records, one per line, so its \
+             root is an array, not {kind}; set a record at /0 or append one at /-\n"
+        )
+    };
+    for (args, kind) in [
+        (&["set", "l.jsonl", "", r#"{"x":1}"#][..], "a map"),
+        (&["set", "l.jsonl", "", "5"], "an integer"),
+        (&["merge", "l.jsonl", r#"{"x":1}"#], "a map"),
+    ] {
+        refused("l.jsonl", src, args, 1, &refusal(kind));
+    }
+    // An array is a list of records.
+    edits_to(
+        "l.jsonl",
+        src,
+        &["set", "l.jsonl", "", r#"[{"x":1}]"#],
+        "{\"x\":1}\n",
+    );
+}
+
+#[test]
+fn a_rewrite_that_would_not_read_back_as_the_edit_is_refused() {
+    let ini = "; c\n[s]\nk = v\n";
+    // Was: exit 0, the file left as it was — the value set reads back
+    // trimmed, as what was there.
+    refused(
+        "a.ini",
+        ini,
+        &["set", "a.ini", "/s/k", " v "],
+        7,
+        "cannot set '/s/k': the ini dq would write reads back as another value at '/s/k'\n",
+    );
+    // Was: exit 0, `k=v` and `k=x=y`, which read back as `k = x=y`: the
+    // key set clobbered another.
+    refused(
+        "a.ini",
+        ini,
+        &["set", "a.ini", "/s/k=x", "y"],
+        7,
+        "cannot set '/s/k=x': the ini dq would write reads back as another value at '/s/k'\n",
+    );
+    // What a format reads every value back as is not a change: a number
+    // set in INI, dotenv or CSV reads back as its text.
+    edits_to(
+        "a.ini",
+        ini,
+        &["set", "a.ini", "/s/n", "1.50"],
+        "[s]\nk=v\nn=1.5\n",
+    );
+    edits_to(
+        "t.csv",
+        "a,b\n1,2\n",
+        &["set", "t.csv", "/-", r#"{"c": null}"#],
+        "a,b,c\n1,2,\n,,\n",
+    );
+}
