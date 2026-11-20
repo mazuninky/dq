@@ -191,7 +191,7 @@ defined as named constants in `crates/dq-cli/src/exit_code.rs`.
 | Code | Name | Meaning |
 |---|---|---|
 | 0 | `SUCCESS` | Done. |
-| 1 | `GENERIC` | Unclassified failure; `exists` answering "no"; `--check` with changes pending; `lint --strict` with warnings; a failed `patch` `test` op; a jq runtime error; a value the output format cannot hold (NaN or infinity in JSON, a number HCL/TOON cannot represent); `keys` / `values` / `len` on a node of the wrong type; a composite-rule extract error. |
+| 1 | `GENERIC` | Unclassified failure; `exists` answering "no"; `--check` with changes pending; `lint --strict` with warnings; a failed `patch` `test` op; a jq runtime error; a value the output format cannot hold (NaN or infinity in JSON or HCL, a number HCL/TOON cannot represent); `keys` / `values` / `len` on a node of the wrong type; a composite-rule extract error. |
 | 2 | `NOT_FOUND` | A JSON Pointer that does not resolve; a `--doc N` the file does not have (or no file of the run has); **any clap usage error** (unknown flag, conflicting flags, invalid value, `--doc` on a command that cannot honour it). |
 | 3 | `PARSE_ERROR` | The input does not parse; a templated file without an escape hatch; a jq compile error; an invalid rule file (bad YAML, unknown field, bad `check`, schema compile failure, unsafe `schema_file`); a failing `fix` script; a plugin with the wrong ABI major or a malformed fix. |
 | 4 | `VALIDATE_FAIL` | `validate` found a parse error; `lint` / `check` found an error-severity diagnostic; a plugin trapped, ran out of fuel or memory, or failed to load. |

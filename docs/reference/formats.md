@@ -37,8 +37,11 @@ Numbers keep their exact value:
   whatever the source: `.nan` / `.inf` / `-.inf` on the console, in YAML and
   TOON, `nan` / `inf` in TOML. JSON cannot hold them, so writing one as JSON
   or JSONL fails with exit 1 (`convert`, `get` / `query -F json`) or exit 7
-  (`set` on a JSON file). Plugins reading the document as JSON get the
-  strings `".nan"`, `".inf"`, `"-.inf"` ([../plugin-abi.md](../plugin-abi.md)).
+  (`set` on a JSON file). HCL cannot hold them either: `convert -F hcl`,
+  `set` and `fix` on an HCL file fail with exit 1 naming the value
+  (`HCL cannot represent non-finite number .nan`) and write nothing.
+  Plugins reading the document as JSON get the strings `".nan"`, `".inf"`,
+  `"-.inf"` ([../plugin-abi.md](../plugin-abi.md)).
 - A format that cannot hold a number refuses it rather than mangling it:
   `convert -F hcl` / `-F toon` of an arbitrary-precision number exits 1
   naming it; `dq set` on TOML of such a number exits 7 ("TOML cannot

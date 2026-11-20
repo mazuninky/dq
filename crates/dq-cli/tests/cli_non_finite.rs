@@ -453,3 +453,56 @@ fn yaml_writer_keeps_a_big_integer_a_number() {
         .success();
     assert_eq!(stdout_of(&dir, &["type", "f.yaml", "/c"]), "int\n");
 }
+
+/// HCL has no literal for NaN or an infinity, so every path that writes
+/// HCL refuses one with exit 1, naming it, and writes nothing. `set --jq`
+/// used to write `a = null` and `convert -F hcl` the string `a = ".nan"`.
+#[test]
+fn hcl_output_of_nan_or_infinity_exits_1_and_writes_nothing() {
+    const RULE: &str = r#"id: a-is-nan
+description: a must be NaN
+severity: warn
+match:
+  format: [hcl]
+check:
+  jq: 'select(.a | isnan | not) | .'
+  message: 'a is not NaN'
+fix:
+  jq: '.a = nan'
+"#;
+    const TF: &str = "a = 1\n";
+    let dir = dir_with(&[
+        (".dq/rules/a-is-nan.yml", RULE),
+        ("n.yaml", NON_FINITE_YAML),
+        ("s.tf", TF),
+    ]);
+    let refused = |args: &[&str], spelling: &str| {
+        dq().current_dir(dir.path())
+            .arg("--no-color")
+            .args(args)
+            .assert()
+            .code(1)
+            .stdout("")
+            .stderr(format!(
+                "hcl format error: HCL cannot represent non-finite number {spelling}\n"
+            ));
+    };
+    refused(&["-q", "-F", "hcl", "convert", "n.yaml"], ".nan");
+    refused(&["-q", "-F", "hcl", "convert", "-i", "n.yaml"], ".nan");
+    assert_eq!(read(&dir, "n.yaml"), NON_FINITE_YAML);
+    assert!(!dir.path().join("n.hcl").exists(), "convert -i wrote n.hcl");
+    refused(
+        &["set", "--jq", ".a = nan | .b = infinite", "-i", "s.tf"],
+        ".nan",
+    );
+    refused(&["set", "--jq", ".a = [1, -infinite]", "s.tf"], "-.inf");
+    refused(&["set", "--jq", ".a = {k: infinite}", "-i", "s.tf"], ".inf");
+    refused(&["-i", "fix", "s.tf"], ".nan");
+    assert_eq!(read(&dir, "s.tf"), TF);
+    // A finite float through the same path writes.
+    dq().current_dir(dir.path())
+        .args(["--no-color", "set", "--jq", ".a = 1.5", "-i", "s.tf"])
+        .assert()
+        .success();
+    assert_eq!(read(&dir, "s.tf"), "a = 1.5\n");
+}

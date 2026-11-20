@@ -358,8 +358,8 @@ fn serialize_error(e: hcl::Error) -> Error {
 ///
 /// # Errors
 ///
-/// [`Error::Format`] naming the first big number HCL cannot hold, else the
-/// first key that is no HCL identifier.
+/// [`Error::Format`] naming the first big number, NaN or infinity HCL
+/// cannot hold, else the first key that is no HCL identifier.
 fn write_body(map: &IndexMap<String, Value>) -> Result<String> {
     let mut out = String::new();
     let mut bad_key = None;
@@ -381,25 +381,32 @@ fn write_body(map: &IndexMap<String, Value>) -> Result<String> {
 }
 
 /// Append `value`, whose members go `depth` indents deep, to `out`.
+///
+/// # Errors
+///
+/// [`Error::Format`] naming the first big number, NaN or infinity of
+/// `value`: HCL has no literal for any of them.
 fn write_expression(out: &mut String, value: &Value, depth: usize) -> Result<()> {
     let indent = |out: &mut String, depth: usize| {
         for _ in 0..depth {
             out.push_str("  ");
         }
     };
+    // A NaN or an infinity, held as a float or as its literal (`.nan` read
+    // from YAML): HCL has no literal for one, so writing `null` or the
+    // string `".nan"` would change the value without a word.
+    if let Some(spelling) = value.non_finite_spelling() {
+        return Err(non_finite_error(spelling));
+    }
     match value {
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Value::Int(i) => out.push_str(&i.to_string()),
-        Value::Float(f) if f.is_finite() => out.push_str(&crate::document::shortest_float(*f)),
-        Value::Float(_) => out.push_str("null"),
+        Value::Float(f) => out.push_str(&crate::document::shortest_float(*f)),
         Value::BigInt(s) => match s.parse::<u64>() {
             Ok(u) if u.to_string() == *s => out.push_str(s),
             _ => return Err(big_number_error(s)),
         },
-        Value::BigFloat(s) if crate::document::non_finite_literal(s).is_some() => {
-            out.push_str(&hcl_text(&hcl::Expression::String(s.clone()))?);
-        }
         Value::BigFloat(s) => return Err(big_number_error(s)),
         Value::String(s) => out.push_str(&hcl_text(&hcl::Expression::String(s.clone()))?),
         Value::Array(items) if items.is_empty() => out.push_str("[]"),
@@ -456,6 +463,15 @@ fn big_number_error(literal: &str) -> Error {
     }
 }
 
+/// HCL has no literal for a NaN or an infinity. `spelling` is the one dq
+/// gives it everywhere (`.nan`, `.inf`, `-.inf`).
+fn non_finite_error(spelling: &str) -> Error {
+    Error::Format {
+        format: "hcl",
+        message: format!("HCL cannot represent non-finite number {spelling}"),
+    }
+}
+
 /// Map an `hcl::Error` into our structured `Error::Parse`.
 ///
 /// The `Parse` variant exposes `Location { line, column }`; other error
@@ -488,8 +504,7 @@ mod tests {
     /// A [`Value::BigInt`] that fits `u64` becomes that number. Any other
     /// finite big number (`Value::BigInt` / `Value::BigFloat`) has no `hcl-rs`
     /// `Number` — written as a string or the nearest `f64` it would come back
-    /// another value — and fails. A NaN or an infinity spelled as a
-    /// `Value::BigFloat` (`.nan`) is emitted as its textual form, as before.
+    /// another value — and fails, and so does a NaN or an infinity.
     ///
     /// # Errors
     ///
@@ -499,13 +514,16 @@ mod tests {
             Value::Null => HclValue::Null,
             Value::Bool(b) => HclValue::Bool(*b),
             Value::Int(n) => HclValue::Number(Number::from(*n)),
-            Value::Float(n) => Number::from_f64(*n).map_or(HclValue::Null, HclValue::Number),
+            Value::Float(n) => match Number::from_f64(*n) {
+                Some(n) => HclValue::Number(n),
+                None => return Err(non_finite_error(v.non_finite_spelling().unwrap_or("NaN"))),
+            },
             Value::BigInt(s) => match s.parse::<u64>() {
                 Ok(u) if u.to_string() == *s => HclValue::Number(Number::from(u)),
                 _ => return Err(big_number_error(s)),
             },
-            Value::BigFloat(s) if crate::document::non_finite_literal(s).is_some() => {
-                HclValue::String(s.clone())
+            Value::BigFloat(_) if v.non_finite_float().is_some() => {
+                return Err(non_finite_error(v.non_finite_spelling().unwrap_or("NaN")));
             }
             Value::BigFloat(s) => return Err(big_number_error(s)),
             Value::String(s) => HclValue::String(s.clone()),
@@ -702,7 +720,6 @@ mod tests {
             ("b", Value::Bool(true)),
             ("i", Value::Int(-7)),
             ("u", Value::BigInt("18446744073709551615".into())),
-            ("nan", Value::BigFloat(".nan".into())),
             (
                 "deep",
                 map(vec![
@@ -737,7 +754,6 @@ mod tests {
                     Value::Array(vec![
                         Value::Float(1_658_206_780_088_562.2),
                         Value::Map([("k".to_owned(), Value::Float(-0.5))].into_iter().collect()),
-                        Value::Float(f64::NAN),
                     ]),
                 ),
             ]
@@ -747,7 +763,7 @@ mod tests {
         let text = write(value).expect("writes");
         assert_eq!(
             text,
-            "w = 2.0\na = [\n  1658206780088562.2,\n  {\n    \"k\" = -0.5\n  },\n  null\n]\n"
+            "w = 2.0\na = [\n  1658206780088562.2,\n  {\n    \"k\" = -0.5\n  }\n]\n"
         );
     }
 
@@ -805,6 +821,27 @@ mod tests {
             assert_eq!(
                 err.to_string(),
                 format!("hcl format error: HCL cannot represent arbitrary-precision number {big}")
+            );
+        }
+    }
+
+    #[test]
+    fn write_refuses_nan_and_infinities_as_float_or_literal() {
+        for (value, spelling) in [
+            (Value::Float(f64::NAN), ".nan"),
+            (Value::Float(f64::INFINITY), ".inf"),
+            (Value::Float(f64::NEG_INFINITY), "-.inf"),
+            (Value::BigFloat(".nan".into()), ".nan"),
+            (Value::BigFloat(".Inf".into()), ".inf"),
+            (Value::BigFloat("-.inf".into()), "-.inf"),
+        ] {
+            let mut map = indexmap::IndexMap::new();
+            map.insert("a".to_owned(), Value::Array(vec![value.clone()]));
+            let err = write(Value::Map(map)).expect_err("non-finite refused");
+            assert_eq!(
+                err.to_string(),
+                format!("hcl format error: HCL cannot represent non-finite number {spelling}"),
+                "{value:?}"
             );
         }
     }

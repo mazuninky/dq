@@ -93,7 +93,7 @@ Parses the file (format from its name; `-F` is the output) and re-emits it in
 the target format through that format's writer, honouring `--sort-keys` and
 `--indent`. A conversion that loses formatting metadata (comments, anchors,
 quote style) logs a warning and still exits 0. A value the target cannot hold
-(NaN in JSON, a big number in HCL/TOON, a non-tabular value in CSV, a
+(NaN in JSON or HCL, a big number in HCL/TOON, a non-tabular value in CSV, a
 non-table root in TOML) fails with exit 1 or 6. `-F markdown` only accepts
 Markdown input. `convert -i` is a write command, see
 [write-commands.md](write-commands.md#convert--i).
