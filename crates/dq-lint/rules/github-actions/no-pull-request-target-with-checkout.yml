@@ -11,8 +11,13 @@ match:
   # without it a CircleCI `config.yml` (`version` + `jobs:`) would match.
   filter: 'type == "object" and has("on") and has("jobs") and (.jobs | . == null or type == "object")'
 check:
+  # `ref:` / `repository:` of the checkout name the PR head in any of these
+  # spellings: `github.head_ref`, `github.event.pull_request.head.*` (also the
+  # merge commit), `refs/pull/<n>/{merge,head}` (literal, or built with
+  # `format()`). Bracket access (`github.event['pull_request']`) is folded to
+  # dotted form first; context names are case-insensitive in expressions.
   # `on:` names its events as a string, a list or a mapping keyed by event.
-  jq: 'select(.on | (if type == "string" then [.] elif type == "array" then . elif type == "object" then keys else [] end) | any(. == "pull_request_target")) | (.jobs // {})[] | objects | (.steps // []) | arrays | .[] | objects | select((.uses // "") | tostring | test("^actions/checkout@")) | select((.with.ref? // "") | tostring | test("github\\.event\\.pull_request|head\\.sha"))'
+  jq: 'select(.on | (if type == "string" then [.] elif type == "array" then . elif type == "object" then keys else [] end) | any(. == "pull_request_target")) | (.jobs // {})[] | objects | (.steps // []) | arrays | .[] | objects | select((.uses // "") | tostring | test("^actions/checkout@")) | select([.with.ref?, .with.repository?] | map((. // "") | tostring | gsub("\\[\\s*[\u0027\"](?<k>[^\u0027\"\\]]+)[\u0027\"]\\s*\\]"; "." + .k) | test("github\\.head_ref|github\\.event\\.pull_request\\.(head|merge_commit_sha)|head\\.(sha|ref)|refs/pull/"; "i")) | any)'
   message: "Workflow uses pull_request_target AND checks out untrusted PR ref — security risk"
 references:
   - https://securitylab.github.com/research/github-actions-preventing-pwn-requests/

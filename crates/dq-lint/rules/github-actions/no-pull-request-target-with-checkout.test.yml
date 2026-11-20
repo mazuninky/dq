@@ -185,3 +185,386 @@ tests:
                 ref: ${{ github.event.pull_request.head.sha }}
     expected:
       violations: []
+  - name: head_ref fires
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.head_ref }}
+    expected:
+      violations:
+        - rule: github-actions.no-pull-request-target-with-checkout
+  - name: head_ref without spaces in the braces fires
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{github.head_ref}}
+    expected:
+      violations:
+        - rule: github-actions.no-pull-request-target-with-checkout
+  - name: head_ref with extra whitespace in the braces fires
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{   github.head_ref   }}
+    expected:
+      violations:
+        - rule: github-actions.no-pull-request-target-with-checkout
+  - name: head_ref in a single-quoted scalar fires
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: '${{ github.head_ref }}'
+    expected:
+      violations:
+        - rule: github-actions.no-pull-request-target-with-checkout
+  - name: head_ref in a double-quoted scalar fires
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: "${{ github.head_ref }}"
+    expected:
+      violations:
+        - rule: github-actions.no-pull-request-target-with-checkout
+  - name: pull_request.head.ref fires
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.pull_request.head.ref }}
+    expected:
+      violations:
+        - rule: github-actions.no-pull-request-target-with-checkout
+  - name: pull_request.head.sha in a double-quoted scalar fires
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: "${{ github.event.pull_request.head.sha }}"
+    expected:
+      violations:
+        - rule: github-actions.no-pull-request-target-with-checkout
+  - name: pull_request.head.repo.full_name in repository fires
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                repository: ${{ github.event.pull_request.head.repo.full_name }}
+    expected:
+      violations:
+        - rule: github-actions.no-pull-request-target-with-checkout
+  - name: head repository with a base ref still fires
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: main
+                repository: ${{ github.event.pull_request.head.repo.full_name }}
+    expected:
+      violations:
+        - rule: github-actions.no-pull-request-target-with-checkout
+  - name: bracket-notation head sha fires
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event['pull_request']['head']['sha'] }}
+    expected:
+      violations:
+        - rule: github-actions.no-pull-request-target-with-checkout
+  - name: pull_request.merge_commit_sha fires
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.pull_request.merge_commit_sha }}
+    expected:
+      violations:
+        - rule: github-actions.no-pull-request-target-with-checkout
+  - name: literal refs/pull/N/merge fires
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: refs/pull/123/merge
+    expected:
+      violations:
+        - rule: github-actions.no-pull-request-target-with-checkout
+  - name: literal refs/pull/N/head fires
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: refs/pull/123/head
+    expected:
+      violations:
+        - rule: github-actions.no-pull-request-target-with-checkout
+  - name: refs/pull/ with event.number fires
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: refs/pull/${{ github.event.number }}/merge
+    expected:
+      violations:
+        - rule: github-actions.no-pull-request-target-with-checkout
+  - name: refs/pull/ with pull_request.number head fires
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: refs/pull/${{ github.event.pull_request.number }}/head
+    expected:
+      violations:
+        - rule: github-actions.no-pull-request-target-with-checkout
+  - name: format() building refs/pull/ merge fires
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ format('refs/pull/{0}/merge', github.event.number) }}
+    expected:
+      violations:
+        - rule: github-actions.no-pull-request-target-with-checkout
+  - name: format() building refs/pull/ head with pull_request.number fires
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ format('refs/pull/{0}/head', github.event.pull_request.number) }}
+    expected:
+      violations:
+        - rule: github-actions.no-pull-request-target-with-checkout
+  - name: format() in a double-quoted scalar fires
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: "${{ format('refs/pull/{0}/merge', github.event.number) }}"
+    expected:
+      violations:
+        - rule: github-actions.no-pull-request-target-with-checkout
+  - name: head_ref under on as a list fires
+    input: |
+      name: ci
+      on: [push, pull_request_target]
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.head_ref }}
+    expected:
+      violations:
+        - rule: github-actions.no-pull-request-target-with-checkout
+  - name: head_ref under a pull_request trigger passes
+    input: |
+      name: ci
+      on: pull_request
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.head_ref }}
+    expected:
+      violations: []
+  - name: refs/pull/ merge under a pull_request trigger passes
+    input: |
+      name: ci
+      on: pull_request
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: refs/pull/${{ github.event.number }}/merge
+    expected:
+      violations: []
+  - name: checkout with no ref or repository passes
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+    expected:
+      violations: []
+  - name: base_ref passes
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.base_ref }}
+    expected:
+      violations: []
+  - name: pull_request.base.ref passes
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.pull_request.base.ref }}
+    expected:
+      violations: []
+  - name: literal branch name passes
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: main
+    expected:
+      violations: []
+  - name: github.sha (the base commit) passes
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.sha }}
+    expected:
+      violations: []
+  - name: github.repository passes
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                repository: ${{ github.repository }}
+    expected:
+      violations: []
+  - name: base ref with base repository passes
+    input: |
+      name: ci
+      on: pull_request_target
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.pull_request.base.sha }}
+                repository: ${{ github.repository }}
+    expected:
+      violations: []
