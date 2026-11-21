@@ -36,9 +36,9 @@ tar -xzf dq-*-x86_64-unknown-linux-gnu.tar.gz
 sudo install -m 0755 dq-*/dq /usr/local/bin/dq
 ```
 
-Prebuilt artifacts are available for Linux (x86_64, aarch64) and macOS (aarch64). On platforms without a prebuilt asset, build from source — see below.
+Prebuilt artifacts are available for Linux (x86_64, aarch64) and macOS (aarch64, x86_64). On platforms without a prebuilt asset, build from source — see below.
 
-### Homebrew (macOS arm64, Linux x86_64 + aarch64)
+### Homebrew (macOS arm64 + x86_64, Linux x86_64 + aarch64)
 
 A Homebrew tap is published at [`mazuninky/homebrew-tap`](https://github.com/mazuninky/homebrew-tap). The formula installs the binary, man pages, and shell completions for `bash`, `zsh`, and `fish`:
 
@@ -430,7 +430,7 @@ git push origin master && git push origin v$(scripts/bump-version.sh --dry-run)
 The push of a `vYYYY.WW.BUILD` tag triggers [.github/workflows/release.yml](.github/workflows/release.yml):
 
 1. `verify-version` — asserts the tag matches `cargo pkgid -p dq-cli`.
-2. `build` (matrix: `x86_64-linux-gnu`, `aarch64-linux-gnu`, `aarch64-apple-darwin`) — release binary + `dq generate-docs` man/completions, packaged as tar.gz with per-target `.sha256` sidecars.
+2. `build` (matrix: `x86_64-linux-gnu`, `aarch64-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin`) — release binary + `dq generate-docs` man/completions, packaged as tar.gz with per-target `.sha256` sidecars.
 3. `release` — combined `dq-checksums.txt`, [build provenance attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations), optional cosign signing (only when `COSIGN_PRIVATE_KEY` is set), GitHub Release with auto-generated notes.
 
 The Homebrew formula (`Formula/dq.rb` in [mazuninky/homebrew-tap](https://github.com/mazuninky/homebrew-tap)) is bumped by a separate pull request there once the release is out; the release workflow does not touch the tap.

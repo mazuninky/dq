@@ -18,12 +18,13 @@ and the lock file, commits and tags (`--dry-run` only prints it).
 Triggered by pushing a tag matching `vYYYY.WW.BUILD`:
 
 1. **verify-version** — the tag must match the workspace version.
-2. **build** — a matrix over three targets: `x86_64-unknown-linux-gnu`,
+2. **build** — a matrix over four targets: `x86_64-unknown-linux-gnu`,
    `aarch64-unknown-linux-gnu` (cross toolchain via
-   `taiki-e/setup-cross-toolchain-action`) and `aarch64-apple-darwin`. Each
+   `taiki-e/setup-cross-toolchain-action`), `aarch64-apple-darwin` and
+   `x86_64-apple-darwin` (built on the arm64 macOS runner). Each
    job runs `cargo build --release --locked --target … --bin dq`, generates man
-   pages and completions with the hidden `dq generate-docs` (native targets
-   only), and packages `dq-<version>-<target>.tar.gz` holding the binary,
+   pages and completions with the hidden `dq generate-docs` (from the target
+   binary on native targets, from a host build on the other two), and packages `dq-<version>-<target>.tar.gz` holding the binary,
    `LICENSE`, `README.md`, `man/` and `completions/`, plus a `.sha256`
    sidecar.
 3. **release** — collects the archives, writes `dq-checksums.txt` (one

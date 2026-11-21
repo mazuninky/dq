@@ -83,6 +83,15 @@ jobs:
             bin: dq
             archive: tar.gz
             cross: false
+          # Intel macOS, built on the arm64 runner: Apple's toolchain targets
+          # x86_64 natively, so no cross toolchain. The binary may not run on
+          # the runner, so the docs come from a host build (host_docs).
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            bin: dq
+            archive: tar.gz
+            cross: false
+            host_docs: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -104,9 +113,10 @@ jobs:
       # exports CARGO_BUILD_TARGET globally for the job — after that, every
       # plain `cargo build` cross-compiles, leaving `target/release/dq` empty
       # and any attempt to execute the binary on the host runner crashes
-      # (exit 127, observed in run 25769046894).
-      - name: Build host binary and generate docs (cross targets only)
-        if: matrix.cross
+      # (exit 127, observed in run 25769046894). Targets with host_docs (a
+      # binary the runner may not execute) take the same path.
+      - name: Build host binary and generate docs (cross and host_docs targets)
+        if: matrix.cross || matrix.host_docs
         shell: bash
         run: |
           set -euo pipefail
@@ -123,7 +133,7 @@ jobs:
         run: cargo build --release --locked --target ${{ matrix.target }} --bin dq
 
       - name: Generate docs (native targets only)
-        if: ${{ !matrix.cross }}
+        if: ${{ !matrix.cross && !matrix.host_docs }}
         shell: bash
         run: |
           set -euo pipefail
