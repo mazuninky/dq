@@ -86,7 +86,7 @@ crates/
    Optional scope in parentheses (e.g. `feat(lint):`, `fix(core):`) is encouraged.
 5. **Open the PR.** Fill out the template: summary, linked issue or plan (`Fixes #NN` / `Refs docs/plans/<name>.md`), and how you tested. Keep the title short — use the description for detail.
 6. **Respond to review.** Push follow-up commits rather than force-pushing, unless a reviewer explicitly asks for a rebase. Mark conversations resolved as you address them.
-7. **CI must be green.** All required checks (`lint`, `test`, `cargo deny`, `cargo audit`) gate the PR; if any fails, fix the underlying issue rather than retrying.
+7. **CI must be green.** The `ci-success` check gates the PR: it needs `lint`, `test` and `cargo deny` from `ci.yml`. If any of them fails, fix the underlying issue rather than retrying.
 
 ## Commit messages
 

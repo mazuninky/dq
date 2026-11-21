@@ -12,16 +12,10 @@ on:
       - "deny.toml"
       - "scripts/**"
       - ".github/workflows/ci.yml"
+  # No paths filter here: the branch ruleset requires ci-success, and a
+  # workflow skipped by `paths` leaves a required check waiting forever, so a
+  # docs-only PR could not be merged.
   pull_request:
-    paths:
-      - "crates/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - "clippy.toml"
-      - "deny.toml"
-      - "scripts/**"
-      - ".github/workflows/ci.yml"
   workflow_dispatch:
 
 permissions:
@@ -107,3 +101,17 @@ jobs:
           # by audit.yml via rustsec/audit-check, which uses an independent
           # parser path.
           command-arguments: "bans licenses sources"
+
+  # The one required status check: the job names above change with the event
+  # (the test matrix is wider on push), so the branch ruleset requires this
+  # job instead of each of them.
+  ci-success:
+    name: ci-success
+    needs: [lint, test, deny]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Fail if any dependency failed
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: exit 1
+      - run: echo "All CI checks passed"
