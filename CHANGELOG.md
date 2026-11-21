@@ -14,7 +14,12 @@ breaking changes are listed first under Changed.
   2027 is `2027.1.1`, not `2027.01.1`. Cargo versions are SemVer, which
   forbids a leading zero, so `scripts/bump-version.sh` would have written a
   version Cargo refuses from 2027-01-04. The release and Docker workflows
-  accept the new spelling.
+  accept the new spelling, and the release workflow now starts on a tag
+  with a one-digit week (its tag filter wanted two digits).
+- The Docker image is published only after its release is out: the release
+  workflow builds it after creating the GitHub Release. Before, the image
+  was built from the tag on its own, so `v2026.47.2`, whose release failed,
+  still got `ghcr.io/mazuninky/dq:2026.47.2` and `:latest`.
 
 ### Fixed
 

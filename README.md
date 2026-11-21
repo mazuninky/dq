@@ -366,7 +366,7 @@ jobs:
           sarif_file: dq-results.sarif
 ```
 
-Get the digest from the [Docker workflow run summary](https://github.com/mazuninky/dq/actions/workflows/docker.yml) for the release you want to pin, or via `docker buildx imagetools inspect ghcr.io/mazuninky/dq:<version>`. Verify the attestation:
+Get the digest from the summary of the [Release workflow run](https://github.com/mazuninky/dq/actions/workflows/release.yml) for the release you want to pin (the image is built there, after the release), or via `docker buildx imagetools inspect ghcr.io/mazuninky/dq:<version>`. Verify the attestation:
 
 ```sh
 gh attestation verify oci://ghcr.io/mazuninky/dq:<version> --owner mazuninky

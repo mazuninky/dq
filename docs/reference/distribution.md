@@ -53,7 +53,9 @@ Not shipped, although planned originally: a Windows build
   size-sensitive use.
 - `.dockerignore` keeps the build context to what `cargo build --bin dq`
   needs.
-- `.github/workflows/docker.yml`: on release tags, builds `linux/amd64` and
+- `.github/workflows/docker.yml`: called by `release.yml` after its `release`
+  job (so a tag whose release failed gets no image), or run by hand with an
+  existing release tag. Builds `linux/amd64` and
   `linux/arm64` natively (one runner per architecture), pushes by digest to
   `ghcr.io/mazuninky/dq`, composes a manifest list (`latest`, full tag, bare
   version), attaches SBOM and build provenance. Docker Hub publication and a
