@@ -130,11 +130,13 @@ prefer the package manager's own upgrade there.
 
 ## CI (`.github/workflows/`)
 
-- `ci.yml` — on pushes to `master` and on pull requests: `cargo fmt --check`
-  and `cargo clippy --workspace --all-targets --all-features --locked -D
-  warnings` on Linux; `cargo build --workspace --all-targets --locked` and
+- `ci.yml` — on every pull request, and on pushes to `master` that touch the
+  code, the toolchain or CI: `cargo fmt --check` and `cargo clippy
+  --workspace --all-targets --all-features --locked -D warnings` on Linux; `cargo build --workspace --all-targets --locked` and
   `cargo test --workspace --all-features --locked` on Linux for PRs and on
-  Linux and macOS for pushes; `cargo deny check` on Linux. No Windows job.
+  Linux and macOS for pushes; `cargo deny check` on Linux. No Windows job. The
+  `ci-success` job needs all of them and is the status check the branch
+  ruleset requires: a pull request is not merged while it is red or missing.
 - `audit.yml` — `cargo audit` (RustSec) daily and when `Cargo.toml` /
   `Cargo.lock` change on `master`.
 - `codeql.yml` — CodeQL analysis.
