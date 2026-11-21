@@ -38,7 +38,10 @@ The workflow does not touch the Homebrew tap: `Formula/dq.rb` in
 `mazuninky/homebrew-tap` is updated by a pull request to that repository
 after the release is out.
 
-Third-party actions are pinned by commit SHA.
+Third-party actions are pinned by commit SHA (`dtolnay/rust-toolchain` by a
+commit on its `master` branch: its `stable` branch is rewritten, and an old
+pin drops out of the history). The release and Docker builds restore no
+cache: a cache written by another run could change what is released.
 
 Not shipped, although planned originally: a Windows build
 (`x86_64-pc-windows-msvc`, zip archive). See [../roadmap.md](../roadmap.md).
@@ -131,12 +134,15 @@ prefer the package manager's own upgrade there.
 ## CI (`.github/workflows/`)
 
 - `ci.yml` — on every pull request, and on pushes to `master` that touch the
-  code, the toolchain or CI: `cargo fmt --check` and `cargo clippy
-  --workspace --all-targets --all-features --locked -D warnings` on Linux; `cargo build --workspace --all-targets --locked` and
-  `cargo test --workspace --all-features --locked` on Linux for PRs and on
-  Linux and macOS for pushes; `cargo deny check` on Linux. No Windows job. The
-  `ci-success` job needs all of them and is the status check the branch
-  ruleset requires: a pull request is not merged while it is red or missing.
+  code, the toolchain or `.github/`: `cargo fmt --check` and `cargo clippy
+  --workspace --all-targets --all-features --locked -D warnings` on Linux;
+  `cargo build --workspace --all-targets --locked` and `cargo test
+  --workspace --all-features --locked` on Linux for PRs and on Linux and
+  macOS for pushes; `cargo deny check` on Linux; actionlint and zizmor over
+  the workflows (`workflows` job; zizmor runs offline, configured in
+  `.github/zizmor.yml`). No Windows job. The `ci-success` job needs all of
+  them and is the status check the branch ruleset requires: a pull request
+  is not merged while it is red or missing.
 - `audit.yml` — `cargo audit` (RustSec) daily and when `Cargo.toml` /
   `Cargo.lock` change on `master`.
 - `codeql.yml` — CodeQL analysis.

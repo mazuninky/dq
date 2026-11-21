@@ -31,10 +31,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: stable
 
@@ -96,9 +97,11 @@ jobs:
             host_docs: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
@@ -112,11 +115,6 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: rustup target add "$TARGET"
-
-      - name: Cache cargo registry and target (release)
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          shared-key: release-${{ matrix.target }}
 
       # Cross targets first build a host-runnable binary purely so we can invoke
       # `dq generate-docs` to produce man pages / shell completions (output is
@@ -154,12 +152,15 @@ jobs:
       - name: Package (tar.gz)
         if: matrix.archive == 'tar.gz'
         shell: bash
+        env:
+          VERSION: ${{ needs.verify-version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          BIN: ${{ matrix.bin }}
         run: |
           set -euo pipefail
-          VERSION="${{ needs.verify-version.outputs.version }}"
-          NAME="dq-${VERSION}-${{ matrix.target }}"
+          NAME="dq-${VERSION}-${TARGET}"
           mkdir -p "dist/${NAME}/man" "dist/${NAME}/completions"
-          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${NAME}/"
+          cp "target/${TARGET}/release/${BIN}" "dist/${NAME}/"
           cp LICENSE README.md "dist/${NAME}/"
           cp -R dist/_docs/man/. "dist/${NAME}/man/"
           cp -R dist/_docs/completions/. "dist/${NAME}/completions/"
@@ -186,6 +187,8 @@ jobs:
       attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Download all build artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
