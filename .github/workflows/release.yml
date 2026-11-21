@@ -5,9 +5,8 @@ name: Release
 #   2. build (matrix) : per-target release binary, generated man/completions,
 #                       packaged tar.gz/zip with a SHA256 sidecar.
 #   3. release         : downloads every artifact, attests build provenance,
-#                       creates the GitHub Release. Optional cosign signing
-#                       runs only when COSIGN_PRIVATE_KEY is configured (no-op
-#                       on forks without the secret).
+#                       creates the GitHub Release. The attestation is the
+#                       signature (keyless, Sigstore): `gh attestation verify`.
 
 on:
   push:
@@ -215,40 +214,6 @@ jobs:
           subject-path: |
             dist/dq-*.tar.gz
 
-      # Step-level `env:` is NOT visible to the same step's `if:` expression,
-      # and `secrets.*` cannot be referenced directly in `if:`. Detect once
-      # in a tiny pre-step that exposes a boolean output, then gate the real
-      # signing step on that output.
-      - name: Detect cosign secret
-        id: cosign_check
-        shell: bash
-        env:
-          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
-        run: |
-          if [ -n "${COSIGN_PRIVATE_KEY:-}" ]; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Sign artifacts with cosign
-        if: steps.cosign_check.outputs.available == 'true'
-        env:
-          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
-          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl -sSfLO https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
-          chmod +x cosign-linux-amd64
-          sudo mv cosign-linux-amd64 /usr/local/bin/cosign
-          cd dist
-          for f in dq-*.tar.gz dq-checksums.txt; do
-            [ -f "$f" ] || continue
-            cosign sign-blob --yes --key env://COSIGN_PRIVATE_KEY \
-              --output-signature "${f}.sig" "${f}"
-          done
-
       - name: Create GitHub Release
         uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
@@ -261,8 +226,7 @@ jobs:
             dist/dq-*.tar.gz
             dist/dq-*.tar.gz.sha256
             dist/dq-checksums.txt
-            dist/dq-*.sig
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
 
   # The image is built only once the release is out, from the same tag. A
   # release that fails before this point publishes no image.

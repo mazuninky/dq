@@ -99,7 +99,7 @@ dq self update --to v2026.47.3 # pin to a specific YYYY.WW.BUILD release
 dq self update --dry-run       # download + verify SHA256, replace nothing
 ```
 
-Before anything is extracted, `self update` checks the archive's SHA-256 against its line in the release's `dq-checksums.txt`. A mismatch, a release without `dq-checksums.txt`, a malformed file or one with no line for the archive refuses the update with exit 4 and leaves the installed binary untouched. The checksum comes from the same release as the archive, so it catches a corrupted or swapped download, not a compromised release; cosign signatures and build-provenance attestations are not checked — use `gh attestation verify` for that (see [Installation](#installation)).
+Before anything is extracted, `self update` checks the archive's SHA-256 against its line in the release's `dq-checksums.txt`. A mismatch, a release without `dq-checksums.txt`, a malformed file or one with no line for the archive refuses the update with exit 4 and leaves the installed binary untouched. The checksum comes from the same release as the archive, so it catches a corrupted or swapped download, not a compromised release; the build-provenance attestation is not checked — use `gh attestation verify` for that (see [Installation](#installation)).
 
 ## Quick start
 
@@ -431,7 +431,7 @@ The push of a `vYYYY.WW.BUILD` tag triggers [.github/workflows/release.yml](.git
 
 1. `verify-version` — asserts the tag matches `cargo pkgid -p dq-cli`.
 2. `build` (matrix: `x86_64-linux-gnu`, `aarch64-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin`) — release binary + `dq generate-docs` man/completions, packaged as tar.gz with per-target `.sha256` sidecars.
-3. `release` — combined `dq-checksums.txt`, [build provenance attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations), optional cosign signing (only when `COSIGN_PRIVATE_KEY` is set), GitHub Release with auto-generated notes.
+3. `release` — combined `dq-checksums.txt`, [build provenance attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations), GitHub Release with auto-generated notes.
 
 The Homebrew formula (`Formula/dq.rb` in [mazuninky/homebrew-tap](https://github.com/mazuninky/homebrew-tap)) is bumped by a separate pull request there once the release is out; the release workflow does not touch the tap.
 
