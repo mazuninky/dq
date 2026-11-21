@@ -45,7 +45,7 @@ pub fn apply_merge(doc: &mut Document, patch: &Value) -> Result<()> {
     let mut working = doc.clone();
     // The recursive worker mutates `base` in place via push/pop rather than
     // cloning a new child pointer per key. See
-    // `docs/plans/perf-pointer-recursive-walks.md` for the rationale and bench
+    // `docs/archive/perf-pointer-recursive-walks.md` for the rationale and bench
     // numbers — without this, deep patches paid an O(depth²) toll on
     // pointer construction alone.
     let mut base = Pointer::default();

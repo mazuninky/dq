@@ -190,6 +190,11 @@ the document as JSON get them as strings ([../plugin-abi.md](../plugin-abi.md)).
 
 ## Performance
 
-Rule expressions are compiled once per evaluator. Caching compiled
-expressions across evaluators and commands is the subject of
-[../plans/perf-jq-compile-cache.md](../plans/perf-jq-compile-cache.md).
+Each distinct rule expression is compiled once per evaluator: rules that
+share an expression share one compiled filter. Nothing is cached across
+evaluators (the reasons are in
+[../archive/perf-jq-compile-cache.md](../archive/perf-jq-compile-cache.md))
+or across runs.
+A compile costs about the same whatever the expression, because jaq parses
+its standard definitions again each time; sharing them is open in the
+[roadmap](../roadmap.md).

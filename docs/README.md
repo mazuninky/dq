@@ -20,12 +20,6 @@ Work in progress, with design and remaining steps.
 
 - [plans/add-std-skills-rules.md](plans/add-std-skills-rules.md) — `@std/skills`
   rules for `SKILL.md` frontmatter and `evals.json`.
-- [plans/perf-jq-compile-cache.md](plans/perf-jq-compile-cache.md) — compile
-  each jq expression once per evaluator.
-- [plans/perf-json-parse-linear.md](plans/perf-json-parse-linear.md) —
-  linear-time JSON span map.
-- [plans/perf-pointer-recursive-walks.md](plans/perf-pointer-recursive-walks.md)
-  — linear-cost pointers in `diff` / `merge` walks.
 
 ## Reference
 
@@ -70,3 +64,10 @@ Historical documents in [archive/](archive/), kept for context:
   [roadmap.md](roadmap.md).
 - [archive/plan-validation-2026-05-03.md](archive/plan-validation-2026-05-03.md)
   — a review of the original plan's engineering conventions (May 2026).
+- Finished plans, with their design and measurements:
+  [archive/perf-json-parse-linear.md](archive/perf-json-parse-linear.md)
+  (linear-time JSON span map),
+  [archive/perf-jq-compile-cache.md](archive/perf-jq-compile-cache.md)
+  (each jq expression compiled once per evaluator) and
+  [archive/perf-pointer-recursive-walks.md](archive/perf-pointer-recursive-walks.md)
+  (one pointer through the `diff` and `merge` walks).

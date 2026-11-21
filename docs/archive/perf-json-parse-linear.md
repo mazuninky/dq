@@ -1,6 +1,6 @@
 # Linear-time JSON span map
 
-**Status: done.** The quadratic span builder is replaced, and a regression test guards against it coming back. What's left is recording the after-numbers, a changelog line, and optional follow-ups.
+**Status: shipped in 2026.20.2, archived 2026-11-21.** The quadratic span builder is replaced, a regression test guards against it coming back, and the after-numbers are below. The summary is in [decisions.md](../decisions.md#2026-11-21--linear-json-spans-cached-jq-compiles-in-place-pointer-walks-perf).
 
 ## Problem
 
@@ -68,12 +68,22 @@ Memory: the table holds one `usize` per newline plus one cell per line. That is 
   - Each test parses a 10,000-element array under the dev profile and fails above 1.0 s. That is about three times the ~250–300 ms target, leaving headroom for slow CI runners, and the failure message points at the span builder.
 - Existing span and round-trip tests ([crates/dq-core/tests/parse_json.rs](../../crates/dq-core/tests/parse_json.rs)) and CLI snapshots are unchanged.
 
-## Remaining work
+## Measured
 
-- Record the after-numbers. Run `cargo bench -p dq-core --bench parse -- --quick` and add `parse/json/{100,1000,10000}` to the table above. The target is 300 ms or less at 10,000 records, the same order as YAML and TOML. The numbers have never been written down in the repo.
-- Manual smoke test, still unrun: with a release build, `dq query '. | length'` on a 10,000-element compact array (for example `seq 1 10000 | jq -sc .`) should finish in under 200 ms.
-- Changelog: `[Unreleased]` in [CHANGELOG.md](../../CHANGELOG.md) has no entry for this. Add a line saying large compact JSON now parses in milliseconds instead of seconds. No README change is needed; performance isn't part of the documented surface.
-- Optional follow-ups, none blocking:
-  - Make `pointer_for` incremental (push and pop on a `String` during the walk) instead of rebuilding the pointer per value. A small win on deep documents.
-  - Audit the YAML span builder ([crates/dq-core/src/parsers/yaml_spans.rs](../../crates/dq-core/src/parsers/yaml_spans.rs)). It uses the `saphyr-parser` event API and probably has no similar bug, but `parse/yaml/10000` measured about 53 ms against a hoped-for ~30 ms.
-  - If another parser needs offset-to-line lookups (Markdown front matter sometimes wants line numbers), move `LineIndex` into a shared `dq-core` module rather than copying it.
+`cargo bench -p dq-core --bench parse -- --quick` on 2026-11-21, release profile, Apple M4 Pro with other work running. The before-numbers above are from an M1 Pro; on the M4 Pro one jq compile (`jq/compile/identity`) takes 193 µs against 346 µs there, so this machine is roughly 1.8× faster.
+
+| records | JSON | YAML | TOML |
+|---|---|---|---|
+| 100 | 142 µs | 236 µs | 206 µs |
+| 1,000 | 1.56 ms | 2.39 ms | 2.07 ms |
+| 10,000 | 18.1 ms | 26.1 ms | 28.0 ms |
+
+- JSON is linear: ×11 and ×11.6 per tenfold step, and 10,000 records take 18 ms against the 300 ms target and the 13.9 s before.
+- Manual smoke test with the released `dq` 2026.47.3 and `hyperfine`: `dq query '. | length'` on a 10,000-element compact array (`seq 1 10000 | jq -sc .`) runs in 6.7 ms end to end (target: under 200 ms); on 10,000 compact records of four fields (568 KB) in 37 ms.
+- Changelog: a line under 2026.20.2, the first release with this change.
+
+Not done, and why:
+
+- An incremental `pointer_for`: still open, listed in [../roadmap.md](../roadmap.md).
+- The YAML span-builder audit: dropped. `parse/yaml` scales linearly (×10, ×11) and sits within 1.5× of JSON on the same machine, so the 53 ms that prompted it was the slower machine, not a bug.
+- A shared `LineIndex`: no second parser needs offset-to-line lookups yet.
