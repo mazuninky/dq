@@ -6,7 +6,8 @@ describes the machinery behind them.
 
 ## Versioning
 
-Calendar versioning, `YYYY.WW.BUILD`: ISO year, zero-padded ISO week, and a
+Calendar versioning, `YYYY.WW.BUILD`: ISO year, ISO week without a leading
+zero (Cargo versions are SemVer, which forbids one: `2027.1.1`), and a
 build counter within the week starting at 1. The version lives in the
 workspace `Cargo.toml` (`[workspace.package].version`, inherited by every
 crate); the git tag `vYYYY.WW.BUILD` is the source of truth.
@@ -33,9 +34,9 @@ Triggered by pushing a tag matching `vYYYY.WW.BUILD`:
    `COSIGN_PRIVATE_KEY` secret exists, and publishes the GitHub Release with
    generated notes. The workflow must keep working on a fork without
    secrets.
-4. **bump-homebrew-tap** — opens a PR against the `mazuninky/homebrew-tap`
-   repository updating `Formula/dq.rb`; skipped without a
-   `HOMEBREW_TAP_TOKEN`.
+The workflow does not touch the Homebrew tap: `Formula/dq.rb` in
+`mazuninky/homebrew-tap` is updated by a pull request to that repository
+after the release is out.
 
 Third-party actions are pinned by commit SHA.
 

@@ -54,7 +54,7 @@ For convenience on a trusted workstation, [`scripts/install.sh`](scripts/install
 
 ```sh
 # Recommended: pin to a specific release
-curl -sSfL https://raw.githubusercontent.com/mazuninky/dq/master/scripts/install.sh | sh -s -- --version v2026.20.1
+curl -sSfL https://raw.githubusercontent.com/mazuninky/dq/master/scripts/install.sh | sh -s -- --version v2026.47.3
 ```
 
 ```sh
@@ -72,7 +72,7 @@ Each release publishes a multi-arch image (`linux/amd64`, `linux/arm64`) to GHCR
 docker run --rm -v "$PWD:/work" ghcr.io/mazuninky/dq:latest get config.yaml /name
 ```
 
-Pin to a specific release tag (`v2026.20.1`) or to a digest (`@sha256:…`) for reproducibility. See [Use in GitHub Actions](#use-in-github-actions) below.
+Pin to a specific release tag (`v2026.47.3`) or to a digest (`@sha256:…`) for reproducibility. See [Use in GitHub Actions](#use-in-github-actions) below.
 
 ### From source
 
@@ -95,7 +95,7 @@ Once installed, `dq` can update itself from GitHub Releases:
 ```sh
 dq self check                  # is a newer release available?
 dq self update                 # download + verify SHA256 + atomic replace
-dq self update --to v2026.20.1 # pin to a specific YYYY.WW.BUILD release
+dq self update --to v2026.47.3 # pin to a specific YYYY.WW.BUILD release
 dq self update --dry-run       # download + verify SHA256, replace nothing
 ```
 
@@ -414,7 +414,7 @@ For an overview of the source tree, conventions, and explicit anti-scope, see [`
 `dq` uses **calendar versioning** in the form `YYYY.WW.BUILD`:
 
 - `YYYY` — ISO year.
-- `WW` — ISO week number (zero-padded, `01`–`53`).
+- `WW` — ISO week number without a leading zero (`1`–`53`): Cargo versions are SemVer, which forbids one, so the first week of 2027 is `2027.1.1`.
 - `BUILD` — monotonic build counter within that week, starting at `1`.
 
 The version lives in the workspace root `[workspace.package].version`; every member crate inherits it via `version.workspace = true`. Git tag `vYYYY.WW.BUILD` is the source of truth.
