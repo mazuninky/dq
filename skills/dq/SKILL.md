@@ -337,7 +337,7 @@ dq lint -F sarif 'k8s/**/*.yaml' > lint.sarif
 curl -sSfL https://raw.githubusercontent.com/mazuninky/dq/master/scripts/install.sh \
   | sh -s -- --version v2026.20.1
 
-# Homebrew (macOS arm64, Linux x86_64/aarch64)
+# Homebrew (macOS arm64/x86_64, Linux x86_64/aarch64)
 brew install mazuninky/tap/dq
 
 # Docker (multi-arch, GHCR with provenance)

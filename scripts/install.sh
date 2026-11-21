@@ -133,14 +133,7 @@ detect_target() {
 
     case "${os}" in
         linux)   echo "${arch}-unknown-linux-gnu" ;;
-        darwin)
-            if [ "${arch}" = "aarch64" ]; then
-                echo "aarch64-apple-darwin"
-            else
-                # x86_64-apple-darwin builds aren't shipped in M6 — Apple Silicon
-                # is the macOS minimum. Bail with a clear note.
-                die "x86_64-apple-darwin is not in the M6 release matrix; install via 'cargo install dq' instead"
-            fi ;;
+        darwin)  echo "${arch}-apple-darwin" ;;
         mingw*|msys*|cygwin*)
             if [ "${arch}" = "x86_64" ]; then
                 echo "x86_64-pc-windows-msvc"

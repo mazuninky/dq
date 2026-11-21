@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2026.47.2] - 2026-11-21
+
+### Added
+
+- Prebuilt binaries for Intel macOS (`x86_64-apple-darwin`). The release
+  ships `dq-<version>-x86_64-apple-darwin.tar.gz`, `scripts/install.sh`
+  installs it on an Intel Mac instead of refusing, and `dq self update`
+  finds it. The Homebrew formula can now name a URL for every platform:
+  current Homebrew checks a tap's formulae on every OS and architecture,
+  and `brew tap mazuninky/tap` failed with "invalid syntax in tap" while
+  Intel macOS had none.
+
 ## [2026.47.1] - 2026-11-20
 
 ### Added
