@@ -30,9 +30,10 @@ Triggered by pushing a tag matching `vYYYY.WW.BUILD`:
    sidecar.
 3. **release** — collects the archives, writes `dq-checksums.txt` (one
    SHA256 per archive, `sha256sum -c` format), attests SLSA build provenance
-   (`actions/attest-build-provenance`), signs with cosign only when a
-   `COSIGN_PRIVATE_KEY` secret exists, and publishes the GitHub Release with
-   generated notes. The workflow must keep working on a fork without
+   (`actions/attest-build-provenance`; it is the signature, keyless through
+   Sigstore, and `gh attestation verify` checks it), and publishes the GitHub
+   Release with generated notes. The release fails if an expected file is
+   missing. The workflow must keep working on a fork without
    secrets.
 The workflow does not touch the Homebrew tap: `Formula/dq.rb` in
 `mazuninky/homebrew-tap` is updated by a pull request to that repository
@@ -101,8 +102,8 @@ atomically. `--to` may also install an older release.
 The SHA-256 check runs after the download and before anything is
 extracted. `self update` downloads the release's `dq-checksums.txt` — not
 the per-archive `.sha256` sidecar: the release job computes it over the
-exact archives it publishes, `scripts/install.sh` verifies against it, and
-it is the file cosign signs — and requires exactly one digest for the
+exact archives it publishes, and `scripts/install.sh` verifies against it —
+and requires exactly one digest for the
 archive's file name. The file is parsed strictly as `sha256sum` output:
 every non-blank line is 64 hex digits (either case), two spaces (or a space
 and `*`), then the file name, matched exactly (no path prefix). The update
@@ -113,9 +114,8 @@ archive twice with different digests, or the digests differ.
 
 What is not verified: the checksum comes from the same release as the
 archive, so it catches a corrupted or swapped download but not a
-compromised release. Cosign signatures (`*.sig`, published only when the
-release job has a signing key) and the build-provenance attestation are
-not checked; `gh attestation verify` does the latter.
+compromised release. The build-provenance attestation is not checked;
+`gh attestation verify` does that.
 
 `--dry-run` resolves the release, downloads the archive and
 `dq-checksums.txt`, runs the same check, prints the archive it would

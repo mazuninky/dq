@@ -21,6 +21,13 @@ breaking changes are listed first under Changed.
   was built from the tag on its own, so `v2026.47.2`, whose release failed,
   still got `ghcr.io/mazuninky/dq:2026.47.2` and `:latest`.
 
+### Removed
+
+- The optional cosign signing step of the release workflow. It ran only
+  with a `COSIGN_PRIVATE_KEY` secret, which no release ever had, so no
+  release carries `.sig` files. The build-provenance attestation, checked
+  with `gh attestation verify`, is the signature.
+
 ### Fixed
 
 - Install and pin examples in the README and the skill named `v2026.20.1`,

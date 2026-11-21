@@ -93,8 +93,8 @@ not built:
   `DQ_CONFIG`.
 - **Platforms and packaging**: a Windows build and CI job (and an atomic-write
   test on Windows), Docker Hub publication and a published scratch image, an
-  AUR `.SRCINFO` and submission automation, signing beyond the optional
-  cosign step (notarisation, Authenticode), pre-commit hooks with
+  AUR `.SRCINFO` and submission automation, signing beyond the build-provenance
+  attestation (notarisation, Authenticode), pre-commit hooks with
   `language: rust` instead of `system`.
 - **Performance baseline published in the README**: criterion benches exist in
   `dq-core`, `dq-exec`, `dq-transform`, but neither CI nor the release runs

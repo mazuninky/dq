@@ -28,16 +28,18 @@ jobs:
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
-    # audit-check opens an issue per advisory and reports through a check run.
-    permissions:
-      contents: read
-      issues: write
-      checks: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit@0.23.0
+
+      # Fails on a vulnerability in Cargo.lock; a failed scheduled run is
+      # mailed to the maintainer, and Dependabot alerts carry the same
+      # RustSec advisories.
+      - name: cargo audit
+        run: cargo audit
