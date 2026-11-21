@@ -11,7 +11,7 @@ on:
       - "clippy.toml"
       - "deny.toml"
       - "scripts/**"
-      - ".github/workflows/ci.yml"
+      - ".github/**"
   # No paths filter here: the branch ruleset requires ci-success, and a
   # workflow skipped by `paths` leaves a required check waiting forever, so a
   # docs-only PR could not be merged.
@@ -37,9 +37,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: stable
           components: rustfmt, clippy
@@ -67,9 +69,11 @@ jobs:
         os: ${{ github.event_name == 'push' && fromJSON('["ubuntu-latest","macos-latest"]') || fromJSON('["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: stable
 
@@ -90,6 +94,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2.1.2
         with:
@@ -102,12 +108,43 @@ jobs:
           # parser path.
           command-arguments: "bans licenses sources"
 
+  # actionlint (syntax, expressions, shellcheck on `run:` scripts) and zizmor
+  # (security audits, configured in .github/zizmor.yml). zizmor runs offline:
+  # its online audits follow upstream branches and tags, which would turn a
+  # required check red without a change in this repository.
+  workflows:
+    name: workflows (actionlint + zizmor)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install zizmor
+        uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
+        with:
+          tool: zizmor@1.32.0
+
+      # go install checks the module against the Go checksum database.
+      - name: Install actionlint
+        shell: bash
+        run: |
+          set -euo pipefail
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: actionlint
+        run: actionlint -color
+
+      - name: zizmor
+        run: zizmor --offline --min-severity low --format github .
+
   # The one required status check: the job names above change with the event
   # (the test matrix is wider on push), so the branch ruleset requires this
   # job instead of each of them.
   ci-success:
     name: ci-success
-    needs: [lint, test, deny]
+    needs: [lint, test, deny, workflows]
     runs-on: ubuntu-latest
     if: always()
     steps:
