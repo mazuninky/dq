@@ -236,7 +236,7 @@ Milestone M8 (built 2026-05-04): dq becomes a platform for writing linters.
 
 Since then: every document of a multi-document YAML stream is linted on its own. The open question "should `dq lint -` read stdin with `-F`" was settled as yes, but `-F` selects the reporter for `lint`, so stdin input currently fails asking for `-F` (exit 6); whether that stays is open.
 
-**Deferred or left out.** `fix` (M10), Markdown rules (M9), composite and JSON Schema rules (M11), a community registry and plugins (M12), `--watch`, jq variables in rules, a `--no-std` switch, `dq test --parallel`, conditionals in message templates, GitLab Code Quality, HTML and step-summary reporters, caching compiled rules across runs (see [plans/perf-jq-compile-cache.md](plans/perf-jq-compile-cache.md)), benchmark-driven tuning, streaming evaluation. This change's task list was never ticked off in the archive, although the engine, commands and reporters shipped.
+**Deferred or left out.** `fix` (M10), Markdown rules (M9), composite and JSON Schema rules (M11), a community registry and plugins (M12), `--watch`, jq variables in rules, a `--no-std` switch, `dq test --parallel`, conditionals in message templates, GitLab Code Quality, HTML and step-summary reporters, caching compiled rules across runs (still open; the cache that shipped lives for one evaluator, see [archive/perf-jq-compile-cache.md](archive/perf-jq-compile-cache.md)), benchmark-driven tuning, streaming evaluation. This change's task list was never ticked off in the archive, although the engine, commands and reporters shipped.
 
 ## 2026-05-06 — Autofix (add-autofix)
 
@@ -371,3 +371,25 @@ PR #40, on top of the dependency update (#39).
 - `set --jq .` rewrites unchanged data, because people use it to reformat.
 - HCL diagnostics still report at line 1.
 - jq differences that remain are listed in [reference/jq.md](reference/jq.md).
+
+## 2026-11-21 — Linear JSON spans, cached jq compiles, in-place pointer walks (perf)
+
+Three performance changes that shipped in 2026.20.2, archived together once their numbers were measured. The designs, with the alternatives turned down, are in [archive/perf-json-parse-linear.md](archive/perf-json-parse-linear.md), [archive/perf-jq-compile-cache.md](archive/perf-jq-compile-cache.md) and [archive/perf-pointer-recursive-walks.md](archive/perf-pointer-recursive-walks.md). The numbers are criterion `--quick` runs on an Apple M4 Pro; the before-numbers came from an M1 Pro, about 1.8× slower.
+
+**What it did.**
+- **JSON spans in linear time.** The span builder scanned back to the previous newline for every value, which is quadratic on compact JSON: 10,000 records took 13.9 s. A `LineIndex` built once (newline offsets, binary search, indent cached per line) replaced the scans. 10,000 records now parse in 18 ms, next to YAML (26 ms) and TOML (28 ms).
+- **One compile per distinct jq expression.** `Evaluator::new` compiled every jq field of every rule. A cache scoped to one `Evaluator::new` shares an `Arc<JqEngine>` per expression, composite `extract` included. Building the `@std/k8s` evaluator went from about 49 compile-costs to about 25 (4.9 ms here).
+- **Recursive walks extend one pointer.** `diff` and `merge` built each child pointer with `Pointer::with_segment`, a copy of the whole path. `push_segment` / `pop_segment` let them walk with one `&mut Pointer`. At depth 64 the walk costs 829 ns against 26.9 µs for a `with_segment` chain.
+- New bench groups `transform/diff_deep` and `transform/apply_merge_deep` vary depth at a fixed leaf count.
+
+**Decisions and reasons**
+
+- **The JSON parse stays two-pass:** `serde_json` for the value, then a byte walk for spans. `serde_json` reports the reader's position, not one per value. A lazy span map only moves the cost, since `lint` and textual edits need every span. A single-pass parser would redo what `serde_json` already gets right.
+- **The jq cache lives for one `Evaluator::new`, keyed on the exact expression text.** A process-wide cache only grows, shares state between tests that compile invalid expressions on purpose, and gains nothing in a CLI that builds one evaluator per run. Whitespace is not normalised, so two spellings never share an engine. Engines are behind `Arc` because jaq's `Filter` is not `Clone`, and they are `Send + Sync` through `jaq-json`'s `sync` feature.
+- **Push and pop by hand, with no guard type.** `merge_into` pops before it applies `?`, so an error leaves the pointer as it found it. `with_segment` stays for callers that keep the parent. `Arc<Vec<Segment>>`, `SmallVec` and a persistent vector were turned down: each still copies, or adds a dependency for an O(log n) push.
+
+**Deferred or left out.**
+- Every jq compile re-parses jaq's standard definitions: compiling `.` costs as much as a pipe (193 µs each), so that setup is most of a compile. Sharing the parsed definitions would speed up every rule set and one-shot `query`.
+- No guard holds a bench to a number; criterion only reports. The plan's 6 ms target for `evaluator_new` assumed 28 k8s rules; there are 14.
+- Measuring deep documents found two costs that grow faster than depth. `diff_into` compares subtrees with `==` before descending, so a differing chain is re-scanned at every level. `merge_into` clones the target subtree through `read_value_at` at every level to see whether it is a map. Each textual edit also parses the file again to check it, so `merge`, `patch` and `fix.ops` cost changes × file size. That check is deliberate.
+- From the plans: an incremental `pointer_for` in the JSON span builder; a shared `LineIndex` (no second user yet); `compile_composite` repeats the cache lookup instead of calling `compile_or_cached`. The YAML span-builder audit was dropped: YAML parses in linear time.

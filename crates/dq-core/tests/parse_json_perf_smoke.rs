@@ -1,6 +1,6 @@
 //! Performance regression smoke tests for the JSON parser.
 //!
-//! Pins the contract in `docs/plans/perf-json-parse-linear.md`: parsing a 10 000-element
+//! Pins the contract in `docs/archive/perf-json-parse-linear.md`: parsing a 10 000-element
 //! flat JSON array (the pathological "compact single-line" shape) completes in
 //! linear time, not the quadratic time the pre-fix `compute_line_range` /
 //! `compute_indent` helpers exhibited (~14 s on M1 Pro release).

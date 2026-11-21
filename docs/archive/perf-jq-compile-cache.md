@@ -1,6 +1,6 @@
 # Compile each jq expression once per `Evaluator::new`
 
-**Status: done.** The per-evaluator cache is in place, with tests. What's left is measuring the gain, resetting the target to the real ruleset, and fixing two stale notes. There is also a possible next step on per-compile cost (see open questions).
+**Status: shipped in 2026.20.2, archived 2026-11-21.** The per-evaluator cache is in place, with tests, and the gain is measured below. A possible next step on per-compile cost is under open questions. The summary is in [decisions.md](../decisions.md#2026-11-21--linear-json-spans-cached-jq-compiles-in-place-pointer-walks-perf).
 
 ## Problem
 
@@ -86,17 +86,22 @@ A `static` cache (`OnceLock<RwLock<HashMap<…>>>` in `dq-transform`) was reject
   - `cache_does_not_collapse_different_filters`.
   - `cache_does_not_persist_across_evaluator_news`: two evaluators get distinct `Arc`s.
 
-## Remaining work
+## Measured
 
-- Measure the gain. Run `cargo bench -p dq-exec --bench evaluate -- --quick` and record `evaluate/evaluator_new` here next to the 17 ms before-number. The after-number has never been written down.
-- Reset the target. The plan set `evaluator_new` for `@std/k8s` at 6 ms or less, on the assumption of 28 rules with about 14 distinct expressions. The namespace has 14 rules with about 20 distinct expressions, so at about 350 µs per compile expect about 7 ms. Pick a target from the measurement.
-- If you want a guard, add one: nothing enforces the target today. Criterion benches don't assert, and the bench only reports.
-- Don't use `jq/recompile_same_filter` to show this change. It calls `JqEngine::compile` directly and bypasses the evaluator cache, so its numbers won't move. Only `evaluate/evaluator_new` reflects this change.
-- Manual check: time a release `dq lint` on one Kubernetes manifest before and after. The plan expected 10–15 ms faster on warm runs.
-- Fix the stale doc comment on `JqCache` in `evaluator.rs`. It says `@std/k8s` has "~10 unique `match.filter`s shared across 28 rules"; the real figure is 4 distinct filters across 14 rules.
-- Optional tidy-up: make `compile_or_cached` `pub(crate)` and call it from `compile_composite` instead of repeating the logic there.
-- Add a changelog line under `[Unreleased]` in [CHANGELOG.md](../../CHANGELOG.md) for faster `dq lint` / `dq fix` startup.
+`cargo bench -p dq-exec --bench evaluate -- --quick` and `cargo bench -p dq-transform --bench jq -- --quick` on 2026-11-21, release profile, Apple M4 Pro with other work running. The 17 ms and 346 µs above are from an M1 Pro, so compare in compile-costs, measured on each machine:
+
+| | one compile (`jq/recompile_same_filter/1`) | `evaluate/evaluator_new`, `@std/k8s` | in compile-costs |
+|---|---|---|---|
+| before, M1 Pro | 346 µs | about 17 ms | about 49 |
+| after, M4 Pro | 193 µs | 4.9 ms | about 25 |
+
+- The cache halves the work: about 25 compile-costs, close to the 20 distinct expressions counted above plus loading the rule files.
+- Target: the 6 ms in the plan assumed 28 rules. On the real 14 rules the measurement is 4.9 ms on the M4 Pro, about 9 ms at M1 Pro speed. No guard holds it there: criterion only reports.
+- Manual check with the released `dq` 2026.47.3 and `hyperfine`: `dq lint --rules @std/k8s` on one Deployment manifest runs in 12 ms end to end, and `dq lint` with every matching `@std` namespace bound in 17 ms. There is no binary without the cache on this machine to time against.
+- The stale doc comment on `JqCache` now says 4 distinct `match.filter`s across 14 rules.
+- Changelog: a line under 2026.20.2, the first release with this change.
+- Not done: `compile_composite` still repeats the lookup-or-compile logic instead of calling `compile_or_cached`. Behaviour is the same; it is a tidy-up only.
 
 ## Open questions
 
-- **Is the fixed per-compile cost the real target?** `JqEngine::compile` re-parses the jaq core, std and json definitions (`jaq_core::defs()`, `jaq_std::defs()`, `jaq_json::defs()` fed to a fresh `Loader`) on every call. Compiling the identity filter `.` alone costs about 350 µs, which suggests most of each compile is that fixed setup. Sharing the parsed definitions across compiles would cut the cost of the roughly 20 compiles that remain, and would also help one-shot commands. It would touch `dq-transform` internals and needs its own measurement. This idea came up while checking the code; it isn't in the original plan.
+- **Is the fixed per-compile cost the real target?** `JqEngine::compile` re-parses the jaq core, std and json definitions (`jaq_core::defs()`, `jaq_std::defs()`, `jaq_json::defs()` fed to a fresh `Loader`) on every call. Compiling the identity filter `.` alone costs about 350 µs, which suggests most of each compile is that fixed setup. Sharing the parsed definitions across compiles would cut the cost of the roughly 20 compiles that remain, and would also help one-shot commands. It would touch `dq-transform` internals and needs its own measurement. This idea came up while checking the code; it isn't in the original plan. Measured on 2026-11-21: `jq/compile/identity`, `path` and `pipe` take 193–195 µs each, so the fixed setup is nearly all of a compile.

@@ -1343,6 +1343,13 @@ XML:
 - `RuleFix` schema now accepts both `jq` (legacy) and `ops` (new) fields,
   each `Option<String>`. At least one must be set; both is allowed and
   `ops` wins at runtime (with a `tracing::warn!` shadowing log).
+- Large JSON on one line parses in linear time: 10,000 compact records
+  took about 14 s and take about 20 ms. Pretty-printed JSON was not
+  affected.
+- `dq lint` and `dq fix` start faster: a jq expression that several rules
+  share is compiled once, which halves the compile work for `@std/k8s`.
+- `dq diff` and `dq merge` no longer copy the whole path at every step of
+  their walk, a cost that grew with the square of the depth.
 
 ### Deprecated
 
