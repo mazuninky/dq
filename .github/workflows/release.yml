@@ -44,12 +44,12 @@ jobs:
           TAG="${GITHUB_REF_NAME}"
           VERSION="${TAG#v}"
 
-          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]{4}\.(0[1-9]|[1-4][0-9]|5[0-3])\.[1-9][0-9]*$'; then
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]{4}\.([1-9]|[1-4][0-9]|5[0-3])\.[1-9][0-9]*$'; then
             echo "::error::Tag '$TAG' does not match vYYYY.WW.BUILD format" >&2
             exit 1
           fi
 
-          # `cargo pkgid -p dq-cli` returns e.g. `path+file:///.../dq-cli#2026.20.1`.
+          # `cargo pkgid -p dq-cli` returns e.g. `path+file:///.../dq-cli#2026.47.3`.
           # The version is the substring after `#` (or `@` on newer cargo).
           CARGO_VERSION=$(cargo pkgid -p dq-cli | awk -F'[#@]' '{print $NF}')
           if [ "$CARGO_VERSION" != "$VERSION" ]; then

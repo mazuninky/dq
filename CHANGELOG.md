@@ -1,10 +1,25 @@
 # Changelog
 
 All notable changes to this project are documented here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
-adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions are
+calendar-based, `YYYY.WW.BUILD` (see [Releases & versioning](README.md#releases--versioning)), so
+a version number says when a release was cut, not whether it is compatible:
+breaking changes are listed first under Changed.
 
 ## [Unreleased]
+
+### Changed
+
+- Versions in ISO weeks 1–9 have no leading zero: the first release of
+  2027 is `2027.1.1`, not `2027.01.1`. Cargo versions are SemVer, which
+  forbids a leading zero, so `scripts/bump-version.sh` would have written a
+  version Cargo refuses from 2027-01-04. The release and Docker workflows
+  accept the new spelling.
+
+### Fixed
+
+- Install and pin examples in the README and the skill named `v2026.20.1`,
+  a release that does not exist; they now name `v2026.47.3`.
 
 ## [2026.47.3] - 2026-11-21
 

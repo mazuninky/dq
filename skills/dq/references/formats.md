@@ -176,12 +176,12 @@ For read commands (`get`, `query`, `select`), `-F console` renders compact-YAML-
 
 ## Self-update & versioning
 
-CalVer: `YYYY.WW.BUILD` (e.g. `v2026.20.1`). Git tag is the source of truth.
+CalVer: `YYYY.WW.BUILD` (e.g. `v2026.47.3`). Git tag is the source of truth.
 
 ```bash
 dq self check                  # is a newer release available?
 dq self update                 # download + SHA256 verify + atomic replace
-dq self update --to v2026.20.1 # pin to a specific YYYY.WW.BUILD release
+dq self update --to v2026.47.3 # pin to a specific YYYY.WW.BUILD release
 ```
 
 `self update` exits 5 on network failure, 7 on atomic-replace failure. The archive is verified against the release's `dq-checksums.txt` before anything is extracted; a mismatch, or a release without a usable checksum line, refuses the update with exit 4. `--dry-run` downloads and verifies without replacing.

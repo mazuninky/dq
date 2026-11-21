@@ -19,7 +19,7 @@ description: >
 
 Single-binary, non-interactive Rust CLI for structured data files plus a span-aware lint and autofix engine. Works on Cloud (GHCR) and any Linux/macOS host. Designed for agents: structured errors, deterministic exit codes, no prompts, no telemetry, no network outside `self check`/`update`.
 
-Versioning is **CalVer** (`YYYY.WW.BUILD`, e.g. `v2026.20.1`); there is no semver minor/major. The CalVer is in `Cargo.toml [workspace.package].version` and the matching git tag.
+Versioning is **CalVer** (`YYYY.WW.BUILD`, e.g. `v2026.47.3`); there is no semver minor/major. The CalVer is in `Cargo.toml [workspace.package].version` and the matching git tag.
 
 ## Safety rules — apply even when the user does not restate them
 
@@ -335,7 +335,7 @@ dq lint -F sarif 'k8s/**/*.yaml' > lint.sarif
 ```bash
 # Recommended: pinned curl-pipe-sh with SHA256 verification
 curl -sSfL https://raw.githubusercontent.com/mazuninky/dq/master/scripts/install.sh \
-  | sh -s -- --version v2026.20.1
+  | sh -s -- --version v2026.47.3
 
 # Homebrew (macOS arm64/x86_64, Linux x86_64/aarch64)
 brew install mazuninky/tap/dq
