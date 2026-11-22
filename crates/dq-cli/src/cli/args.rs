@@ -40,6 +40,7 @@ mod rules;
 mod select;
 mod self_cmd;
 mod set;
+mod skill;
 mod test_cmd;
 mod type_args;
 mod validate;
@@ -70,6 +71,7 @@ pub use rules::{RulesAddArgs, RulesArgs, RulesCommand, RulesListArgs};
 pub use select::SelectArgs;
 pub use self_cmd::{SelfArgs, SelfCommand, SelfUpdateArgs};
 pub use set::SetArgs;
+pub use skill::{SkillArgs, SkillCommand, SkillStatusArgs, SkillWriteArgs};
 pub use test_cmd::TestArgs;
 pub use type_args::TypeArgs;
 pub use validate::ValidateArgs;
@@ -87,8 +89,8 @@ pub struct Cli {
     /// convert: the format to convert to. set, del, patch, merge, fmt, fix:
     /// the file keeps its own format, so a -F naming another one is refused
     /// (exit 2) and the same one is accepted. test: console, json or tap.
-    /// exists, completions, man, self and rules add print no formatted
-    /// value and do not use it.
+    /// exists, completions, man, self, rules add and skill (but for its
+    /// status) print no formatted value and do not use it.
     #[arg(short = 'F', long, global = true, value_enum, default_value_t = OutputFormat::Console)]
     pub format: OutputFormat,
 
@@ -96,8 +98,8 @@ pub struct Cli {
     /// one their extension or name implies.
     ///
     /// Stdin has no extension: a command reading `-` needs this flag (exit
-    /// 2 without it). test, explain, rules, completions, man and self read
-    /// no data file and refuse it (exit 2).
+    /// 2 without it). test, explain, rules, completions, man, self and skill
+    /// read no data file and refuse it (exit 2).
     #[arg(long, global = true, value_enum, value_name = "FORMAT")]
     pub input_format: Option<InputFormat>,
 
@@ -573,6 +575,14 @@ pub enum Command {
     /// attribute on [`SelfArgs`].
     #[command(name = "self")]
     Self_(SelfArgs),
+    /// Install, update or remove the agent skill of this dq.
+    ///
+    /// The skill tells a coding agent how to use dq. It goes to
+    /// `~/.agents/skills/dq`, which several agents read, and Claude Code gets
+    /// a link to it. An installed skill follows dq: the first run of a newer
+    /// version updates it, unless a file in it was changed, `CI` is set, or
+    /// `DQ_NO_SKILL_UPDATE` is set to anything but 0.
+    Skill(SkillArgs),
     /// Lint files with one or more rulesets.
     Lint(LintArgs),
     /// Run a single rule against files (or `--inline` an ad-hoc rule).
@@ -620,6 +630,7 @@ impl Command {
             Self::Completions(_)
             | Self::Man(_)
             | Self::Self_(_)
+            | Self::Skill(_)
             | Self::Test(_)
             | Self::Explain(_)
             | Self::Rules(_)
@@ -640,6 +651,7 @@ impl Command {
             Self::Completions(_)
             | Self::Man(_)
             | Self::Self_(_)
+            | Self::Skill(_)
             | Self::Test(_)
             | Self::Explain(_)
             | Self::Rules(_)
@@ -741,6 +753,7 @@ impl Command {
             Self::Completions(_)
             | Self::Man(_)
             | Self::Self_(_)
+            | Self::Skill(_)
             | Self::Test(_)
             | Self::Explain(_)
             | Self::Rules(_)
@@ -773,6 +786,7 @@ impl Command {
             Self::Completions(_) => "completions",
             Self::Man(_) => "man",
             Self::Self_(_) => "self",
+            Self::Skill(_) => "skill",
             Self::Lint(_) => "lint",
             Self::Check(_) => "check",
             Self::Test(_) => "test",

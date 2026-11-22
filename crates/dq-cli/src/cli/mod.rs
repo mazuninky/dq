@@ -12,5 +12,6 @@ pub use args::{
     ExistsArgs, ExplainArgs, FixArgs, FmtArgs, GenerateDocsArgs, GetArgs, InputFormat, KeysArgs,
     LenArgs, LintArgs, ManArgs, MergeArgs, PatchArgs, PathsArgs, QueryArgs, RulesAddArgs,
     RulesArgs, RulesCommand, RulesListArgs, SelectArgs, SelfArgs, SelfCommand, SelfUpdateArgs,
-    SetArgs, TestArgs, TypeArgs, ValidateArgs, ValuesArgs, stdin_read_twice_error, usage_error,
+    SetArgs, SkillArgs, SkillCommand, SkillStatusArgs, SkillWriteArgs, TestArgs, TypeArgs,
+    ValidateArgs, ValuesArgs, stdin_read_twice_error, usage_error,
 };

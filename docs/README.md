@@ -22,6 +22,8 @@ Work in progress, with design and remaining steps.
   rules for `SKILL.md` frontmatter and `evals.json`.
 - [plans/lint-fail-closed.md](plans/lint-fail-closed.md) — rules as gates: a
   rule that raises fails the run; fixtures with a path; `.npmrc`.
+- [plans/skill-command.md](plans/skill-command.md) — `dq skill`: the agent skill
+  ships in the binary and updates with it (implemented, not released).
 - [plans/structured-errors.md](plans/structured-errors.md) — a caret under the
   offending byte and a JSON error object under `-F json` (phases 1 and 2 of 4 done).
 
@@ -55,6 +57,7 @@ How dq behaves today.
 - [reference/rule-checks.md](reference/rule-checks.md) — the check kinds: jq,
   JSON Schema, composite rules.
 - [reference/std-rules.md](reference/std-rules.md) — the `@std` rule library.
+- [reference/skill.md](reference/skill.md) — `dq skill`, the automatic update.
 - [reference/distribution.md](reference/distribution.md) — versioning, release
   and Docker workflows, installers, self-update, CI.
 

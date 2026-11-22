@@ -376,13 +376,16 @@ For non-containerised runners, install with the script and run `dq` directly —
 
 ## Claude Code skill
 
-A `dq` skill for [Claude Code](https://claude.ai/code) is shipped under [`skills/dq/SKILL.md`](skills/dq/SKILL.md), giving Claude deep knowledge of all `dq` commands, flags, output formats, and common workflows — so Claude can use `dq` as a tool without re-deriving its surface.
-
-Install from [skills.sh](https://skills.sh):
+dq carries a skill for coding agents such as [Claude Code](https://claude.ai/code): all `dq` commands, flags, output formats and common workflows, so an agent can use `dq` without re-deriving its surface. The text is [`skills/dq/SKILL.md`](skills/dq/SKILL.md) and its references, embedded in the binary.
 
 ```sh
-npx skills add mazuninky/dq
+dq skill install            # ~/.agents/skills/dq, linked from ~/.claude/skills
+dq skill install --project  # .agents/skills/dq of the current directory
+dq skill status
+dq skill remove
 ```
+
+An installed skill follows dq: the first run of a newer version updates it, however dq was updated, unless you edited it. `DQ_NO_SKILL_UPDATE=1` turns that off. It needs no network. Details: [docs/reference/skill.md](docs/reference/skill.md).
 
 The skill covers reads, in-place edits with round-trip preservation, format conversion, JSON Patch / Merge Patch, lint + autofix, SARIF / JUnit / TAP reporters, and CI integration patterns.
 

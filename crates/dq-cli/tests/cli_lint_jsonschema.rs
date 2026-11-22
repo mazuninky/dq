@@ -163,6 +163,8 @@ fn lint_schema_message_prefix_is_separated_from_the_keyword_location() {
     std::fs::write(&doc, "a: 1\n").unwrap();
     let out = assert_cmd::Command::cargo_bin("dq")
         .expect("dq binary built")
+        .env("HOME", "/tmp")
+        .env("DQ_NO_SKILL_UPDATE", "1")
         .args(["--no-color", "lint", "--rules"])
         .arg(&rule)
         .arg(&doc)

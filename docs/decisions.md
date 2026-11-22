@@ -204,7 +204,7 @@ Milestone M6 (built 2026-05-04): install in one line, update in place, CI-readab
 - **One `dq-checksums.txt` per release** in `sha256sum` format rather than a file per artifact. cosign signing runs only when the secret is configured, so forks stay green. Since then (2026-11-21) the cosign step is gone: no release ever had the key, and the build-provenance attestation, keyless through Sigstore, is the signature.
 - **Alpine image by default** (a shell for debugging and `COPY --from` chains), plus a `FROM scratch` variant. Distroless needs a glibc build; Debian-based images dwarf the binary. Since then: `rust:1.100-alpine` and `alpine:3.24`.
 - **`generate-docs` stays hidden** for packaging; `completions` and `man` are the user-facing versions writing to stdout.
-- **The skill lives in this repository,** so `npx skills add mazuninky/dq` installs from it. Since then: it moved from `skill/` to `skills/dq/`, the only skill published from the repo.
+- **The skill lives in this repository,** so `npx skills add mazuninky/dq` installs from it. Since then: it moved from `skill/` to `skills/dq/`; `dq skill install` installs it from the binary (2026-11-22), and no other way is documented.
 
 This change's task list was never ticked off in the archive, although everything above except the items below shipped.
 
@@ -412,3 +412,19 @@ Since then: the `==` re-scan in `diff` and the subtree clones in `merge` are gon
 - **A file whose deletion is denied is refused** (a macOS ACL or flag, Linux `chattr +i` / `+a`), also where taking the protection off first would work: it is the user's to take off. It is asked beforehand, because the rename that fails leaves a temporary file that cannot be removed either.
 
 **Deferred or left out.** Extended attributes (the SELinux label), NFSv4 ACLs, file flags, timestamps and other hard links are not kept, because the file is a new one. No `fsync`: a crash of the system may lose the new content. A directory above the file that is swapped for another is followed. `dq set FIFO` still blocks on reading.
+
+## 2026-11-22 — The agent skill ships in the binary (`dq skill`)
+
+**What it did.** `SKILL.md` and `references/` are embedded in the binary; `dq skill install | update | status | remove` manage the installed copy, and the first run of a newer dq brings an unedited one to its version. Behaviour: [reference/skill.md](reference/skill.md). Design: [plans/skill-command.md](plans/skill-command.md).
+
+**Decisions and reasons**
+
+- **An own command** (owner) instead of `npx skills`: no Node, no network, and the skill is always the one of this version.
+- **The skill is updated on the first run of a new version** (owner), an exception to "one command, one operation, no hidden state". A package manager has no moment for it: Homebrew runs `post_install` in a sandbox with a temporary `HOME`. The exception is narrow: only files dq wrote and nobody edited, only where the user had it installed, only when the version changes, silent, without effect on the exit code, off with `DQ_NO_SKILL_UPDATE` and under `CI`. Turned down: a hint to run a command.
+- **What dq wrote is known by a manifest with hashes**, `.dq-skill.json`. Without it a directory is someone else's, whoever made it, so there is no migration from other installers (owner).
+- **`~/.agents/skills` and a link from Claude Code** (owner), not a list of agents to keep current. The copy is one; the link is made only by `install`.
+- **The automatic update is in release builds only**, so that developing and testing dq cannot touch the developer's skill; CI runs its tests in a build without debug assertions.
+- **The skill directory itself is the lock**, so nothing is left behind in the home directory. `remove` deletes what it has locked; whoever waited compares the directory with the path and starts over.
+- **Two spellings of a name are one file when the directory lists one entry for both**, by device and inode: a file renamed in case only between versions is renamed on macOS too, and a hard link stays the user's.
+
+**Deferred or left out.** Other agents' configuration, rules and instruction files; updating a project's skill on its own (it is under version control); Windows links. `atl` gets the same command with an implementation of its own.

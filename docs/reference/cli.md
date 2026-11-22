@@ -23,7 +23,8 @@ other reference pages (linked from the command table below).
 | `fix` | Apply rule fixes | [lint-engine.md](lint-engine.md) |
 | `completions <shell>` | Shell completion script on stdout (bash, zsh, fish, powershell, elvish) | below |
 | `man [PAGE]` | troff man page on stdout (`dq man`, `dq man get`) | below |
-| `self check`, `self update [--to VER] [--dry-run]` | Check for / install a newer release (SHA-256 checked against `dq-checksums.txt`) | [distribution.md](distribution.md) |
+| `self check`, `self update [--to VER] [--dry-run] [--no-skill]` | Check for / install a newer release (SHA-256 checked against `dq-checksums.txt`) | [distribution.md](distribution.md) |
+| `skill install`, `update`, `status`, `remove` | Install the agent skill embedded in the binary | [skill.md](skill.md) |
 | `generate-docs --output-dir DIR` | Hidden; writes completions and man pages for packaging | [distribution.md](distribution.md) |
 
 `dq config` and `dq init` from the original plan do not exist; see

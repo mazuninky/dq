@@ -36,13 +36,17 @@ use camino::Utf8PathBuf;
 use tracing::{info, warn};
 use ureq::ResponseExt;
 
+pub(crate) use self::checksum::sha256_hex;
 pub use self::checksum::{CHECKSUMS_ASSET, ChecksumError, verify_archive_checksum};
 use crate::cli::SelfUpdateArgs;
 use crate::error::InvalidInput;
+use crate::output::terminal_text;
+use crate::skill::{Edition, Environment, installed_note, installed_version};
 
 const GITHUB_REPO_OWNER: &str = "mazuninky";
 const GITHUB_REPO_NAME: &str = "dq";
-const GITHUB_RELEASES_LATEST_URL: &str =
+/// Where `dq self check` asks for the latest release.
+pub(crate) const GITHUB_RELEASES_LATEST_URL: &str =
     "https://api.github.com/repos/mazuninky/dq/releases/latest";
 const USER_AGENT: &str = "dq-self-check";
 /// User-Agent `dq self update` sends on every request (the API listing and
@@ -66,13 +70,10 @@ pub enum CheckOutcome {
     PreRelease { local: String, latest: String },
 }
 
-/// Run `dq self check` — query GitHub for the latest release and render the
-/// outcome to `out`.
-///
-/// Thin wrapper around [`run_check_with_url`] that hardcodes the production
-/// GitHub Releases endpoint. The inner function takes the URL as a parameter
-/// so unit tests can stand up a local mock server and exercise the full
-/// HTTP-response → error-mapping path without touching the network.
+/// Run `dq self check` — ask `releases_url` for the latest release
+/// ([`GITHUB_RELEASES_LATEST_URL`], but in a test) and render the outcome to
+/// `out`, with a line about the skill installed in `env` when it was changed
+/// or is older than this dq.
 ///
 /// # Errors
 ///
@@ -80,19 +81,20 @@ pub enum CheckOutcome {
 ///   [`dq_core::Error::Io`] so the exit-code mapper picks 5 (`IO_ERROR`).
 /// - HTTP 403 + `X-RateLimit-Remaining: 0` produces a [`dq_core::Error::Io`]
 ///   carrying a `GITHUB_TOKEN` hint — same exit code, more helpful message.
-pub fn run_check(out: &mut dyn Write) -> anyhow::Result<()> {
-    run_check_with_url(out, GITHUB_RELEASES_LATEST_URL)
+pub fn run_check(releases_url: &str, env: &Environment, out: &mut dyn Write) -> anyhow::Result<()> {
+    check_release(releases_url, out)?;
+    if let Some(note) = installed_note(env, &Edition::embedded()) {
+        writeln!(out, "{}", terminal_text(&note))?;
+    }
+    Ok(())
 }
 
-/// Inner implementation of [`run_check`] with the releases URL injected.
-///
-/// Exposed at crate visibility so the unit test in this module can point it
-/// at a mock HTTP server. Production callers should go through [`run_check`].
+/// The part of [`run_check`] that is about the release.
 ///
 /// # Errors
 ///
 /// Same as [`run_check`].
-pub(crate) fn run_check_with_url(out: &mut dyn Write, releases_url: &str) -> anyhow::Result<()> {
+fn check_release(releases_url: &str, out: &mut dyn Write) -> anyhow::Result<()> {
     let io_error = |source: std::io::Error| {
         anyhow::Error::new(dq_core::Error::Io {
             path: Utf8PathBuf::from(":self-check"),
@@ -249,7 +251,7 @@ pub fn render_check_outcome(outcome: &CheckOutcome, out: &mut dyn Write) -> std:
 /// to a string compare if a component isn't numeric. Pre-release suffixes
 /// (`1.2.3-rc1`) are stripped to the leading numeric core — good enough for
 /// the M6 use case where both versions come from the same release pipeline.
-fn version_is_newer(a: &str, b: &str) -> bool {
+pub(crate) fn version_is_newer(a: &str, b: &str) -> bool {
     let parse = |v: &str| -> Vec<u64> {
         v.split('.')
             .map(|c| {
@@ -281,6 +283,9 @@ fn version_is_newer(a: &str, b: &str) -> bool {
 /// replace the running binary. With `--dry-run`, stop after the
 /// verification and report what would be installed to `out`.
 ///
+/// Once the binary is replaced, the new one updates the installed skill
+/// ([`skill_step`]); whatever comes of that is no error of this command.
+///
 /// # Errors
 ///
 /// - [`InvalidInput`] (exit 6) when the running binary's parent directory
@@ -291,7 +296,11 @@ fn version_is_newer(a: &str, b: &str) -> bool {
 ///   nothing is extracted or replaced.
 /// - [`dq_core::Error::Io`] (exit 5) for network errors.
 /// - [`dq_core::Error::WriteIo`] (exit 7) for atomic-replace failures.
-pub fn run_update(args: &SelfUpdateArgs, out: &mut dyn Write) -> anyhow::Result<()> {
+pub fn run_update(
+    args: &SelfUpdateArgs,
+    env: &Environment,
+    out: &mut dyn Write,
+) -> anyhow::Result<()> {
     let current_exe = std::env::current_exe().map_err(|source| {
         anyhow::Error::new(dq_core::Error::Io {
             path: Utf8PathBuf::from(":self-update"),
@@ -313,7 +322,82 @@ pub fn run_update(args: &SelfUpdateArgs, out: &mut dyn Write) -> anyhow::Result<
         // replaces nothing, so it neither asks nor prints that block.
         builder.no_confirm(true);
     }
-    run_gated_update(&mut builder, args.dry_run, &current_exe, out)
+    let outcome = run_gated_update(&mut builder, args.dry_run, &current_exe, out)?;
+    skill_step(&outcome, args.no_skill, env, &current_exe, out)
+}
+
+/// What the update came to.
+#[derive(Debug, PartialEq, Eq)]
+enum UpdateOutcome {
+    /// The binary was replaced.
+    Replaced,
+    /// A dry run verified an archive it would have installed.
+    WouldReplace,
+    /// There was nothing to install.
+    UpToDate,
+}
+
+/// After an update: have the binary at `exe` — the new one — update the
+/// skill dq installed in the home directory, if it did; in a dry run, say
+/// that it would. Nothing of it with `--no-skill` (`no_skill`) or under
+/// `DQ_NO_SKILL_UPDATE`.
+///
+/// The new binary does it because the new skill is in it. An older one,
+/// installed with `--to`, may not know `dq skill`: like any other failure,
+/// that is a warning. As root in another user's home directory (`sudo dq
+/// self update`) nothing is done: the files would be root's. That user's
+/// first run of the new dq updates the skill.
+///
+/// # Errors
+///
+/// Any error of `out`.
+fn skill_step(
+    outcome: &UpdateOutcome,
+    no_skill: bool,
+    env: &Environment,
+    exe: &std::path::Path,
+    out: &mut dyn Write,
+) -> anyhow::Result<()> {
+    if no_skill
+        || env.opted_out()
+        || *outcome == UpdateOutcome::UpToDate
+        || env.is_root_in_foreign_home()
+    {
+        return Ok(());
+    }
+    let Some((dir, version)) = installed_version(env) else {
+        return Ok(());
+    };
+    if *outcome == UpdateOutcome::WouldReplace {
+        writeln!(
+            out,
+            "would update the dq skill v{version} in {}",
+            terminal_text(dir.as_str())
+        )?;
+    } else if let Err(why) = update_skill_with(exe) {
+        warn!("the dq skill in {dir} was not updated: {why}");
+    }
+    Ok(())
+}
+
+/// Run `exe skill update`. What went wrong, if it did.
+fn update_skill_with(exe: &std::path::Path) -> Result<(), String> {
+    let output = std::process::Command::new(exe)
+        .args(["skill", "update", "--quiet"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|err| format!("{} did not run: {err}", exe.display()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let said = stderr.lines().find(|line| !line.trim().is_empty());
+    Err(format!(
+        "`dq skill update` failed ({}){}",
+        output.status,
+        said.map(|line| format!(": {}", line.trim()))
+            .unwrap_or_default()
+    ))
 }
 
 /// Install the checksum gate on `builder`, run the update and turn the
@@ -326,7 +410,7 @@ fn run_gated_update(
     dry_run: bool,
     install_path: &std::path::Path,
     out: &mut dyn Write,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<UpdateOutcome> {
     let gate = Arc::new(Mutex::new(GateState::default()));
     install_checksum_gate(builder, &gate, dry_run);
     let updater = builder.build().map_err(map_self_update_error)?;
@@ -336,7 +420,9 @@ fn run_gated_update(
         (Ok(status), _) => {
             if status.is_updated() {
                 info!("dq updated to v{}", status.version());
-            } else if dry_run {
+                return Ok(UpdateOutcome::Replaced);
+            }
+            if dry_run {
                 writeln!(
                     out,
                     "dq v{} is up to date; nothing to install",
@@ -345,7 +431,7 @@ fn run_gated_update(
             } else {
                 info!("dq is already up to date (v{})", status.version());
             }
-            Ok(())
+            Ok(UpdateOutcome::UpToDate)
         }
         // The gate stops a dry run by rejecting the verified archive; that
         // rejection is the success path.
@@ -359,7 +445,7 @@ fn run_gated_update(
                 out,
                 "sha256 {sha256} matches {CHECKSUMS_ASSET}; nothing replaced (--dry-run)"
             )?;
-            Ok(())
+            Ok(UpdateOutcome::WouldReplace)
         }
         (Err(_), Some(Verdict::Refused(refusal))) => Err(anyhow::Error::new(refusal)),
         (Err(_), Some(Verdict::Failed(err))) => Err(err),
@@ -864,7 +950,7 @@ mod tests {
     // run — opt in with `cargo test --package dq-cli -- --ignored self_cmd`.
     //
     // `run_check` itself now has a hermetic test (`run_check_returns_io_error_on_404`
-    // above): the URL is injected via [`run_check_with_url`] so the test
+    // above): the URL is injected via [`check_release`] so the test
     // can point it at a local `TcpListener`-backed mock returning a
     // specific status code. The live-API test is retained as a pre-release
     // smoke check that confirms the GitHub API contract hasn't drifted.
@@ -878,8 +964,8 @@ mod tests {
     // integration test below. The checksum gate is driven end to end through
     // [`run_gated_update`] (the `gated_release` tests): every refusal stops
     // before extraction, and the dry run stops after verification, so no
-    // binary is replaced. Still untested: `run_update` itself (`current_exe`)
-    // and a successful replacement — it needs a real release.
+    // binary is replaced; a successful replacement is of a stand-in binary.
+    // Still untested: `run_update` itself (`current_exe`).
     // ---------------------------------------------------------------------
 
     /// Minimal one-shot HTTP server backed by a `TcpListener`. Reads the
@@ -890,7 +976,7 @@ mod tests {
     /// (each of which drags in a full async runtime plus an HTTP server
     /// stack) because all the regression test actually needs is a server
     /// that returns one specific status code so the error-mapping branch
-    /// of `run_check_with_url` is reachable from a unit test.
+    /// of `check_release` is reachable from a unit test.
     fn spawn_one_shot_http(response_bytes: &'static [u8]) -> String {
         spawn_one_shot_http_at("/releases/latest", response_bytes.to_vec()).0
     }
@@ -921,7 +1007,7 @@ mod tests {
             // connection reset before it can read the response. A 1 KiB
             // scratch buffer is plenty for the one-line GET produced by
             // `ureq::get(url).call()` plus the User-Agent / Accept headers
-            // set in `run_check_with_url`.
+            // set in `check_release`.
             let mut buf = [0u8; 1024];
             let mut total = Vec::new();
             loop {
@@ -944,17 +1030,20 @@ mod tests {
 
     /// Build a complete `Connection: close` HTTP/1.1 response with a
     /// correct `Content-Length`.
-    fn http_response(status_line: &str, extra_headers: &[&str], body: &str) -> Vec<u8> {
+    fn http_response(status_line: &str, extra_headers: &[&str], body: impl AsRef<[u8]>) -> Vec<u8> {
+        let body = body.as_ref();
         let mut out = format!("HTTP/1.1 {status_line}\r\n");
         for header in extra_headers {
             out.push_str(header);
             out.push_str("\r\n");
         }
         out.push_str(&format!(
-            "Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "Content-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         ));
-        out.into_bytes()
+        let mut out = out.into_bytes();
+        out.extend_from_slice(body);
+        out
     }
 
     /// The message of the `std::io::Error` inside a `dq_core::Error::Io`
@@ -978,7 +1067,7 @@ mod tests {
         let (url, _req) =
             spawn_one_shot_http_at("/releases/latest", http_response("404 Not Found", &[], ""));
         let mut buf: Vec<u8> = Vec::new();
-        let err = run_check_with_url(&mut buf, &url).expect_err("404 must fail");
+        let err = check_release(&url, &mut buf).expect_err("404 must fail");
         assert_eq!(
             io_source_message(&err),
             format!("self-check request failed: {url}: status code 404"),
@@ -996,7 +1085,7 @@ mod tests {
             http_response("500 Internal Server Error", &[], "boom"),
         );
         let mut buf: Vec<u8> = Vec::new();
-        let err = run_check_with_url(&mut buf, &url).expect_err("500 must fail");
+        let err = check_release(&url, &mut buf).expect_err("500 must fail");
         assert_eq!(
             io_source_message(&err),
             format!("self-check request failed: {url}: status code 500"),
@@ -1015,7 +1104,7 @@ mod tests {
             ),
         );
         let mut buf: Vec<u8> = Vec::new();
-        let err = run_check_with_url(&mut buf, &url).expect_err("403 must fail");
+        let err = check_release(&url, &mut buf).expect_err("403 must fail");
         assert_eq!(
             io_source_message(&err),
             "GitHub API returned HTTP 403 (rate limit exhausted; set GITHUB_TOKEN)",
@@ -1033,7 +1122,7 @@ mod tests {
             http_response("403 Forbidden", &["X-RateLimit-Remaining: 12"], ""),
         );
         let mut buf: Vec<u8> = Vec::new();
-        let err = run_check_with_url(&mut buf, &url).expect_err("403 must fail");
+        let err = check_release(&url, &mut buf).expect_err("403 must fail");
         assert_eq!(io_source_message(&err), "GitHub API returned HTTP 403");
     }
 
@@ -1049,7 +1138,7 @@ mod tests {
             http_response("302 Found", &[location.as_str()], ""),
         );
         let mut buf: Vec<u8> = Vec::new();
-        let err = run_check_with_url(&mut buf, &start_url).expect_err("404 must fail");
+        let err = check_release(&start_url, &mut buf).expect_err("404 must fail");
         assert_eq!(
             io_source_message(&err),
             format!(
@@ -1065,7 +1154,7 @@ mod tests {
             http_response("200 OK", &[], r#"{"tag_name":"v0.0.0"}"#),
         );
         let mut buf: Vec<u8> = Vec::new();
-        run_check_with_url(&mut buf, &url).expect("200 with a tag must succeed");
+        check_release(&url, &mut buf).expect("200 with a tag must succeed");
         let raw = String::from_utf8(req.join().expect("server thread")).expect("ascii request");
         let lower = raw.to_ascii_lowercase();
         assert!(
@@ -1204,7 +1293,7 @@ mod tests {
     /// builder `dq self update` would run against it (no prompt) and the
     /// archive's name.
     fn gated_release(
-        archive_body: &str,
+        archive_body: impl AsRef<[u8]>,
         sums: Sums<'_>,
     ) -> (self_update::backends::github::UpdateBuilder, String) {
         let archive_name = format!("dq-99999.0.0-{}.tar.gz", self_update::get_target());
@@ -1369,6 +1458,358 @@ mod tests {
         assert_eq!(std::fs::read(&installed).expect("read"), b"installed");
     }
 
+    /// A home directory in which dq installed the skill.
+    fn home_with_skill() -> (tempfile::TempDir, Environment, camino::Utf8PathBuf) {
+        let home = tempfile::tempdir().expect("tempdir");
+        let env = Environment {
+            home: Some(home.path().into()),
+            ..Environment::default()
+        };
+        let target = env.global().expect("target");
+        crate::skill::install(&target, &Edition::embedded(), false).expect("install");
+        (home, env, target.dir)
+    }
+
+    #[test]
+    fn a_dry_run_says_that_the_skill_would_be_updated() {
+        let (_home, env, dir) = home_with_skill();
+        let step = |outcome: UpdateOutcome, env: &Environment| {
+            let mut out: Vec<u8> = Vec::new();
+            // Nothing runs a binary that is not there.
+            let exe = std::path::Path::new("/no/dq");
+            skill_step(&outcome, false, env, exe, &mut out).expect("step");
+            String::from_utf8(out).expect("UTF-8")
+        };
+        assert_eq!(
+            step(UpdateOutcome::WouldReplace, &env),
+            format!(
+                "would update the dq skill v{} in {dir}\n",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+        assert_eq!(step(UpdateOutcome::UpToDate, &env), "");
+        assert_eq!(step(UpdateOutcome::Replaced, &env), "", "a warning at most");
+        let nothing = tempfile::tempdir().expect("tempdir");
+        let env = Environment {
+            home: Some(nothing.path().into()),
+            ..Environment::default()
+        };
+        assert_eq!(step(UpdateOutcome::WouldReplace, &env), "");
+    }
+
+    /// The new binary is run as `dq skill update --quiet`; what it says when
+    /// it fails — an older dq has no `skill` — is what the warning says.
+    #[test]
+    #[cfg(unix)]
+    fn the_new_binary_updates_the_skill() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            script(&path, body);
+            path
+        };
+        let new = script("new", r#"[ "$*" = "skill update --quiet" ]"#);
+        assert_eq!(update_skill_with(&new), Ok(()));
+        let old = script(
+            "old",
+            "echo \"error: unrecognized subcommand 'skill'\" >&2; exit 2",
+        );
+        assert_eq!(
+            update_skill_with(&old),
+            Err("`dq skill update` failed (exit status: 2): \
+                 error: unrecognized subcommand 'skill'"
+                .to_owned())
+        );
+        let gone = update_skill_with(&dir.path().join("gone")).expect_err("no such binary");
+        assert!(gone.contains(" did not run: "), "{gone}");
+    }
+
+    /// A stand-in for a new dq: a script that appends what it is run with to
+    /// `ran`, next to it, then does `body`. A shell writes it: a file this
+    /// process has open for writing is open in whatever child another test
+    /// forks at that moment, and cannot be run until that is gone (ETXTBSY).
+    #[cfg(unix)]
+    fn script(path: &std::path::Path, body: &str) {
+        let text = format!("#!/bin/sh\necho \"$*\" >> \"$(dirname \"$0\")/ran\"\n{body}\n");
+        let written = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "rm -f \"$2\" && printf %s \"$1\" > \"$2\" && chmod 755 \"$2\"",
+                "sh",
+            ])
+            .arg(text)
+            .arg(path)
+            .status()
+            .expect("run sh");
+        assert!(written.success());
+    }
+
+    /// What the scripts in `dir` were run with, a line for each.
+    #[cfg(unix)]
+    fn ran(dir: &std::path::Path) -> String {
+        std::fs::read_to_string(dir.join("ran")).unwrap_or_default()
+    }
+
+    /// The step after an update, with what it prints and what it logs; once
+    /// more while the binary, which `self_update` has just written, is still
+    /// open in a child another test forked (ETXTBSY).
+    #[cfg(unix)]
+    fn skill_step_says(
+        outcome: &UpdateOutcome,
+        env: &Environment,
+        exe: &std::path::Path,
+    ) -> (String, String) {
+        let busy = std::io::Error::from_raw_os_error(libc::ETXTBSY).to_string();
+        let start = std::time::Instant::now();
+        loop {
+            let said = skill_step_once(outcome, false, env, exe);
+            if !said.1.contains(&busy) || start.elapsed().as_secs() > 30 {
+                return said;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    #[cfg(unix)]
+    fn skill_step_once(
+        outcome: &UpdateOutcome,
+        no_skill: bool,
+        env: &Environment,
+        exe: &std::path::Path,
+    ) -> (String, String) {
+        #[derive(Clone, Default)]
+        struct Log(Arc<Mutex<Vec<u8>>>);
+        impl Write for Log {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("lock").write(data)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        // With one subscriber in the process, `tracing` takes what another
+        // thread's test says of a log line, whose thread has none, for all.
+        static OTHERS: std::sync::OnceLock<[tracing::Dispatch; 2]> = std::sync::OnceLock::new();
+        OTHERS.get_or_init(|| {
+            [(), ()].map(|()| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()))
+        });
+        let log = Log::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let log = log.clone();
+                move || log.clone()
+            })
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .finish();
+        let mut out: Vec<u8> = Vec::new();
+        tracing::subscriber::with_default(subscriber, || {
+            skill_step(outcome, no_skill, env, exe, &mut out).expect("no error of the update");
+        });
+        let logged = log.0.lock().expect("lock").clone();
+        (
+            String::from_utf8(out).expect("UTF-8"),
+            String::from_utf8(logged).expect("UTF-8"),
+        )
+    }
+
+    /// A whole update against a local release: the archive is verified and
+    /// extracted, the binary replaced, and the new one updates the skill.
+    #[test]
+    #[cfg(unix)]
+    fn after_a_replacement_the_new_binary_updates_the_skill() {
+        let (_home, env, _dir) = home_with_skill();
+        let built = tempfile::tempdir().expect("tempdir");
+        script(&built.path().join("dq"), "echo noise; exit 0");
+        let tar = std::process::Command::new("tar")
+            .args(["-czf", "archive.tar.gz", "dq"])
+            // No `._dq` beside it on macOS.
+            .env("COPYFILE_DISABLE", "1")
+            .current_dir(built.path())
+            .status()
+            .expect("run tar");
+        assert!(tar.success());
+        let archive = std::fs::read(built.path().join("archive.tar.gz")).expect("archive");
+        let sums = format!(
+            "{}  dq-99999.0.0-{}.tar.gz\n",
+            sha256_hex(&archive),
+            self_update::get_target()
+        );
+        let (mut builder, _) = gated_release(&archive, Sums::Served(&sums));
+        let (dir, installed) = installed_binary();
+        builder.bin_install_path(&installed);
+        let mut out: Vec<u8> = Vec::new();
+        let outcome = run_gated_update(&mut builder, false, &installed, &mut out).expect("update");
+        assert_eq!((&outcome, out.len()), (&UpdateOutcome::Replaced, 0));
+        assert_eq!(ran(dir.path()), "", "the update itself runs nothing");
+        assert_eq!(
+            skill_step_says(&outcome, &env, &installed),
+            (String::new(), String::new())
+        );
+        assert_eq!(ran(dir.path()), "skill update --quiet\n");
+    }
+
+    /// Whatever the new binary comes to, the update went well: its first
+    /// line is what the warning says.
+    #[test]
+    #[cfg(unix)]
+    fn a_failure_of_the_new_binary_is_a_warning() {
+        let (_home, env, skill) = home_with_skill();
+        let (dir, exe) = installed_binary();
+        for (body, why) in [
+            (
+                "echo >&2; echo '  refused: edited  ' >&2; echo more >&2; exit 6",
+                "`dq skill update` failed (exit status: 6): refused: edited",
+            ),
+            ("exit 1", "`dq skill update` failed (exit status: 1)"),
+            (
+                "kill -9 $$",
+                "`dq skill update` failed (signal: 9 (SIGKILL))",
+            ),
+        ] {
+            script(&exe, body);
+            assert_eq!(
+                skill_step_says(&UpdateOutcome::Replaced, &env, &exe),
+                (
+                    String::new(),
+                    format!(" WARN the dq skill in {skill} was not updated: {why}\n")
+                )
+            );
+        }
+        assert_eq!(ran(dir.path()).lines().count(), 3);
+        std::fs::remove_file(&exe).expect("rm");
+        let (out, log) = skill_step_says(&UpdateOutcome::Replaced, &env, &exe);
+        assert_eq!(out, "");
+        assert!(
+            log.starts_with(" WARN ") && log.contains(" did not run: "),
+            "{log}"
+        );
+    }
+
+    /// The new binary is run only when the old one was replaced, and only
+    /// for a skill dq installed in a home directory that is the user's.
+    #[test]
+    #[cfg(unix)]
+    fn the_new_binary_is_not_run_for_nothing() {
+        let (home, env, skill) = home_with_skill();
+        let (dir, exe) = installed_binary();
+        script(&exe, "exit 1");
+        let step = |outcome: UpdateOutcome, env: &Environment| {
+            let (out, log) = skill_step_says(&outcome, env, &exe);
+            assert_eq!(log, "", "{outcome:?}");
+            out
+        };
+        assert_eq!(step(UpdateOutcome::UpToDate, &env), "");
+        assert!(step(UpdateOutcome::WouldReplace, &env).starts_with("would update the dq skill"));
+
+        crate::skill::testing::not_roots(home.path());
+        let root = Environment {
+            euid: Some(0),
+            ..env.clone()
+        };
+        let nothing = tempfile::tempdir().expect("tempdir");
+        let elsewhere = Environment {
+            home: Some(nothing.path().into()),
+            ..Environment::default()
+        };
+        for env in [&root, &elsewhere, &Environment::default()] {
+            assert_eq!(step(UpdateOutcome::Replaced, env), "");
+            assert_eq!(step(UpdateOutcome::WouldReplace, env), "");
+        }
+        let manifest = skill.join(".dq-skill.json");
+        let kept = std::fs::read(&manifest).expect("read");
+        for text in ["{}", r#"{"schema": 2}"#] {
+            std::fs::write(&manifest, text).expect("write");
+            assert_eq!(step(UpdateOutcome::Replaced, &env), "");
+            assert_eq!(step(UpdateOutcome::WouldReplace, &env), "");
+        }
+        std::fs::write(&manifest, kept).expect("write");
+        let aside = home.path().join("aside");
+        std::fs::rename(&skill, &aside).expect("mv");
+        std::os::unix::fs::symlink(&aside, &skill).expect("symlink");
+        assert_eq!(step(UpdateOutcome::Replaced, &env), "");
+        assert_eq!(ran(dir.path()), "");
+    }
+
+    /// `--no-skill` and `DQ_NO_SKILL_UPDATE` leave the skill alone: no binary
+    /// is run, and a dry run does not say that one would be.
+    #[test]
+    #[cfg(unix)]
+    fn the_skill_is_left_alone_when_asked_to() {
+        let (_home, env, _skill) = home_with_skill();
+        let (dir, exe) = installed_binary();
+        script(&exe, "exit 1");
+        let with = |value: &str| Environment {
+            no_skill_update: Some(value.into()),
+            ..env.clone()
+        };
+        for (no_skill, env) in [(true, &env), (false, &with("1")), (false, &with(""))] {
+            for outcome in [UpdateOutcome::Replaced, UpdateOutcome::WouldReplace] {
+                assert_eq!(
+                    skill_step_once(&outcome, no_skill, env, &exe),
+                    (String::new(), String::new()),
+                    "{outcome:?}, {no_skill}, {env:?}"
+                );
+            }
+        }
+        assert_eq!(ran(dir.path()), "");
+        // `0` is no such request.
+        let (out, _) = skill_step_once(&UpdateOutcome::WouldReplace, false, &with("0"), &exe);
+        assert!(out.starts_with("would update the dq skill"), "{out}");
+    }
+
+    /// `dq self check` against a release of version 0: what it prints.
+    fn check_says(env: &Environment) -> String {
+        let (url, _req) = spawn_one_shot_http_at(
+            "/releases/latest",
+            http_response("200 OK", &[], r#"{"tag_name":"v0.0.0"}"#),
+        );
+        let mut buf: Vec<u8> = Vec::new();
+        run_check(&url, env, &mut buf).expect("200 with a tag must succeed");
+        String::from_utf8(buf).expect("utf-8")
+    }
+
+    /// The line about the skill comes after the one about the release, with
+    /// what a path may hold escaped for the terminal.
+    #[test]
+    #[cfg(unix)]
+    fn run_check_says_that_the_skill_was_changed() {
+        let version = env!("CARGO_PKG_VERSION");
+        let release =
+            format!("running pre-release version (local: v{version}, latest published: v0.0.0)\n");
+        assert_eq!(check_says(&Environment::default()), release, "no home");
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("a\nb\u{1b}[31m\u{202e}");
+        std::fs::create_dir(&home).expect("mkdir");
+        let env = Environment {
+            home: Some(home.into()),
+            ..Environment::default()
+        };
+        assert_eq!(check_says(&env), release, "no skill");
+        let target = env.global().expect("target");
+        crate::skill::install(&target, &Edition::embedded(), false).expect("install");
+        assert_eq!(check_says(&env), release, "nothing to say of it");
+        std::fs::write(target.dir.join("SKILL.md"), "mine").expect("write");
+        let tmp = tmp.path().to_str().expect("UTF-8");
+        assert_eq!(
+            check_says(&env),
+            format!(
+                "{release}dq skill in {tmp}/a\\x0ab\\x1b[31m\\u202e/.agents/skills/dq was changed \
+                 (SKILL.md): dq leaves it alone; `dq skill update --force` writes dq's files in \
+                 their place\n"
+            )
+        );
+        // A check that failed says nothing of it.
+        let url = spawn_one_shot_http(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let mut buf: Vec<u8> = Vec::new();
+        run_check(&url, &env, &mut buf).expect_err("404 must fail");
+        assert!(buf.is_empty(), "{buf:?}");
+    }
+
     #[test]
     fn select_archive_skips_sidecars() {
         let target = self_update::get_target();
@@ -1391,7 +1832,7 @@ mod tests {
             http_response("200 OK", &[], r#"{"tag_name":"v0.0.0","name":"x"}"#),
         );
         let mut buf: Vec<u8> = Vec::new();
-        run_check_with_url(&mut buf, &url).expect("200 with a tag must succeed");
+        check_release(&url, &mut buf).expect("200 with a tag must succeed");
         assert_eq!(
             String::from_utf8(buf).expect("utf-8"),
             format!(
@@ -1408,7 +1849,7 @@ mod tests {
             http_response("200 OK", &[], "<html>not json</html>"),
         );
         let mut buf: Vec<u8> = Vec::new();
-        let err = run_check_with_url(&mut buf, &url).expect_err("non-JSON must fail");
+        let err = check_release(&url, &mut buf).expect_err("non-JSON must fail");
         let msg = io_source_message(&err);
         assert!(
             msg.starts_with("GitHub API response was not valid JSON: "),
@@ -1423,7 +1864,7 @@ mod tests {
             http_response("200 OK", &[], r#"{"name":"no tag here"}"#),
         );
         let mut buf: Vec<u8> = Vec::new();
-        let err = run_check_with_url(&mut buf, &url).expect_err("missing tag must fail");
+        let err = check_release(&url, &mut buf).expect_err("missing tag must fail");
         assert_eq!(
             io_source_message(&err),
             "GitHub API response did not contain a `tag_name` field",
@@ -1440,7 +1881,7 @@ mod tests {
             .expect("local_addr");
         let url = format!("http://{addr}/releases/latest");
         let mut buf: Vec<u8> = Vec::new();
-        let err = run_check_with_url(&mut buf, &url).expect_err("refused connect must fail");
+        let err = check_release(&url, &mut buf).expect_err("refused connect must fail");
         let msg = io_source_message(&err);
         assert!(
             msg.starts_with(&format!("self-check request failed: {url}: ")),
@@ -1567,7 +2008,7 @@ mod tests {
         // Regression for the "exit 0 on HTTP 4xx/5xx" bug: stand up a local
         // mock server that returns HTTP 404 (the symptom a fresh repo
         // without a published GitHub release exhibits) and confirm
-        // `run_check_with_url` surfaces the failure as `dq_core::Error::Io`.
+        // `check_release` surfaces the failure as `dq_core::Error::Io`.
         //
         // The downstream contract this guards: `exit_code_for_error` maps
         // `Error::Io` to exit 5 (`IO_ERROR`), so as long as the error is
@@ -1580,7 +2021,7 @@ mod tests {
             b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         );
         let mut buf: Vec<u8> = Vec::new();
-        let result = run_check_with_url(&mut buf, &url);
+        let result = check_release(&url, &mut buf);
         let err = result.expect_err("HTTP 404 must produce an error, not a silent Ok");
         let domain = err
             .downcast_ref::<dq_core::Error>()
@@ -1606,7 +2047,12 @@ mod tests {
         // we cannot pin the released version. Run manually before publishing
         // a new release to confirm the GitHub API contract still holds.
         let mut buf: Vec<u8> = Vec::new();
-        run_check(&mut buf).expect("live GitHub API call must succeed");
+        run_check(
+            GITHUB_RELEASES_LATEST_URL,
+            &Environment::default(),
+            &mut buf,
+        )
+        .expect("live GitHub API call must succeed");
         let out = String::from_utf8(buf).expect("output must be valid UTF-8");
         // One of three known status lines must appear.
         assert!(

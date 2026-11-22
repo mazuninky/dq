@@ -17,7 +17,7 @@ spikes/          throwaway investigations (saphyr/, etc.)
 docs/            contributor docs: architecture.md, reference/ (current behaviour), plans/ (in flight),
                  roadmap.md, decisions.md (dated log), plugin-abi.md
 docs/archive/    historical docs, incl. the original plan (dq-plan-2026-05.md, Russian)
-skills/dq/       Claude Code skill bundle published to skills.sh (SKILL.md + skill.json)
+skills/dq/       the agent skill, embedded in the binary (`dq skill install`); evals/ is not
 ```
 
 ## Stable surface vs experimental
@@ -75,7 +75,7 @@ cd ../.. && cargo run --features plugins -- lint \
 - **`@std` rule namespacing**: `@std/<namespace>/<rule-id>` — namespace is the directory under `crates/dq-lint/rules/`. User rules under `./.dq/rules/` are bound automatically without a namespace prefix.
 - **Composite rules**: `extract:` returns `[{value, format, anchor}]`; each item is reparsed in a different format and run through a `nested:` rule. Recursion bounded at `MAX_EXTRACT_DEPTH = 4`. Inner-format parse failures emit `<outer>.parse-failed`. Inline position spans live in `Provenance::Original.inline_offset`; the public lookup is `Ir::inline_offset_for(&pointer)`.
 - **Schema rules**: `$ref` restricted to internal references — HTTP/file `$ref` rejected at compile time. `schema_file` paths resolved relative to the rule directory; absolute paths and `..` escapes rejected.
-- **Skills**: the only skill published to [skills.sh](https://skills.sh) is `skills/dq/`.
+- **Skill**: `skills/dq/SKILL.md` and `references/` are embedded in the binary by `crates/dq-cli/src/skill/content.rs`; a new reference file is added there too (a test compares the list). Update the skill with the CLI surface it describes.
 
 ## How to extend
 

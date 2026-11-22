@@ -22,7 +22,8 @@
 //! - 4 — `VALIDATE_FAIL` — `validate` reports the document is invalid;
 //!   also `self update` refusing a downloaded archive at its checksum gate.
 //! - 5 — `IO_ERROR` — read-side IO failure (couldn't read source file).
-//! - 6 — `INVALID_INPUT` — bad CLI usage / unsupported flag combination.
+//! - 6 — `INVALID_INPUT` — bad CLI usage / unsupported flag combination;
+//!   `dq skill` refusing to touch what is not dq's.
 //! - 7 — `WRITE_FAILED` — read+resolve+render succeeded but writing the
 //!   result to the filesystem failed (atomic-rename collision, missing
 //!   textual-edit renderer, document loaded read-only, an edit the
@@ -61,6 +62,7 @@ use crate::error::{
     BulkPartialFailure, CheckPending, DocOutOfRange, DocOutOfRangeEverywhere, InvalidInput,
     LintFail, LintWarnStrict, RuleErrorFail, ValidateFail, WrongType,
 };
+use crate::skill::SkillError;
 
 /// Successful exit.
 pub const SUCCESS: i32 = 0;
@@ -210,10 +212,20 @@ pub fn exit_code_for_error(err: &anyhow::Error) -> i32 {
             _ => GENERIC,
         };
     }
-    let Some(domain) = err.downcast_ref::<Error>() else {
-        return GENERIC;
-    };
-    match domain.kind_name() {
+    // `dq skill`: what is on the disk is not dq's to change.
+    if let Some(skill) = err.downcast_ref::<SkillError>() {
+        return match skill {
+            SkillError::Refused(_) => INVALID_INPUT,
+            SkillError::File(file) => code_for_core_error(file),
+        };
+    }
+    err.downcast_ref::<Error>()
+        .map_or(GENERIC, code_for_core_error)
+}
+
+/// The exit code of a `dq-core` error.
+fn code_for_core_error(err: &Error) -> i32 {
+    match err.kind_name() {
         "io" => IO_ERROR,
         // `edit_rejected`: the file and the pointer are fine, but dq cannot
         // write this edit without changing other parts of the file — the
@@ -306,6 +318,76 @@ mod tests {
             exit_code_for_error(&anyhow::Error::from(io_err())),
             IO_ERROR
         );
+    }
+
+    /// A refusal is exit 6 whichever it is; a file error has the code it has
+    /// everywhere else, and a context around it changes neither.
+    #[test]
+    fn maps_skill_errors() {
+        use crate::skill::Refusal;
+        let dir = || camino::Utf8PathBuf::from("/h/dq");
+        for refusal in [
+            Refusal::NoHome,
+            Refusal::BadHome {
+                home: "rel".to_owned(),
+            },
+            Refusal::BadClaudeDir {
+                dir: "rel".to_owned(),
+            },
+            Refusal::NoCurrentDir,
+            Refusal::ForeignOwner {
+                home: dir(),
+                owner: 501,
+            },
+            Refusal::OtherOwner {
+                path: dir(),
+                owner: 501,
+                user: 502,
+            },
+            Refusal::DirectoryIsLink { dir: dir() },
+            Refusal::NotADirectory { path: dir() },
+            Refusal::Foreign {
+                dir: dir(),
+                files: Vec::new(),
+            },
+            Refusal::NotOurs {
+                dir: dir(),
+                why: String::new(),
+            },
+            Refusal::DamagedManifest {
+                dir: dir(),
+                reason: String::new(),
+            },
+            Refusal::NewerSchema {
+                dir: dir(),
+                schema: 2,
+            },
+            Refusal::Changed {
+                dir: dir(),
+                edited: Vec::new(),
+                colliding: Vec::new(),
+                hint: "",
+            },
+            Refusal::Blocked {
+                dir: dir(),
+                paths: Vec::new(),
+            },
+            Refusal::OtherLink {
+                place: dir(),
+                target: String::new(),
+            },
+            Refusal::LinkPlaceTaken { place: dir() },
+        ] {
+            let name = format!("{refusal:?}");
+            let err = anyhow::Error::new(SkillError::from(refusal));
+            assert_eq!(exit_code_for_error(&err), INVALID_INPUT, "{name}");
+            let err = err.context("around it");
+            assert_eq!(exit_code_for_error(&err), INVALID_INPUT, "{name}");
+        }
+        for (file, code) in [(io_err(), IO_ERROR), (write_io_err(), WRITE_FAILED)] {
+            let err = anyhow::Error::new(SkillError::from(file));
+            assert_eq!(exit_code_for_error(&err), code);
+        }
     }
 
     #[test]

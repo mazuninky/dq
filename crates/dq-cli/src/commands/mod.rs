@@ -34,6 +34,7 @@ pub mod rules;
 pub mod select;
 pub mod self_cmd;
 pub mod set;
+pub mod skill;
 pub mod test_cmd;
 pub mod type_cmd;
 pub mod validate;

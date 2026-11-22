@@ -313,9 +313,9 @@ fix:
                 );
                 Command::new("/bin/sh")
                     .current_dir(&dir)
-                    .env("HOME", &dir)
                     .args(["-c", &script])
                     .arg(assert_cmd::cargo::cargo_bin("dq"))
+                    .env("HOME", &dir)
                     .assert()
                     .success();
 
@@ -1132,6 +1132,7 @@ fix:
         let copied = StdCommand::new("cp")
             .arg(assert_cmd::cargo::cargo_bin("dq"))
             .arg(&dq)
+            .env("HOME", root)
             .status();
         assert!(copied.expect("cp").success());
         fs::set_permissions(root, fs::Permissions::from_mode(0o755)).expect("chmod");

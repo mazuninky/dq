@@ -54,6 +54,8 @@ fn lint_with_plugins_dir_errors_when_feature_disabled() {
 
     let assert = Command::cargo_bin("dq")
         .expect("cargo_bin dq must resolve")
+        .env("HOME", "/tmp")
+        .env("DQ_NO_SKILL_UPDATE", "1")
         // Strip developer's environment that could leak into the assertion.
         // `NO_COLOR` is irrelevant here (we don't assert color), but
         // `RUST_LOG` could attach extra log lines to stderr that are fine

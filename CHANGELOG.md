@@ -10,6 +10,12 @@ breaking changes are listed first under Changed.
 
 ### Added
 
+- `dq skill install`, `update`, `status` and `remove`: the skill for coding
+  agents is embedded in the binary and needs no network. An installed skill is
+  updated on the first run of a newer dq, however dq was updated, and by
+  `dq self update` (`--no-skill` leaves it). A skill you edited, or that dq did
+  not install, is never overwritten without `--force`. `DQ_NO_SKILL_UPDATE=1`
+  turns the automatic update off.
 - A parse error shows the source line with a caret under what is wrong, on
   every command:
 
@@ -87,6 +93,7 @@ breaking changes are listed first under Changed.
 
 ### Removed
 
+- `skills/dq/skill.json`; nothing read it.
 - The optional cosign signing step of the release workflow. It ran only
   with a `COSIGN_PRIVATE_KEY` secret, which no release ever had, so no
   release carries `.sig` files. The build-provenance attestation, checked

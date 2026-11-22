@@ -323,6 +323,7 @@ fn input_format_is_refused_by_every_command_that_reads_no_data() {
         ("completions", &["completions", "bash"]),
         ("man", &["man"]),
         ("self", &["self", "check"]),
+        ("skill", &["skill", "install"]),
         ("generate-docs", &["generate-docs", "--output-dir", "out"]),
     ];
     for (command, args) in refused {

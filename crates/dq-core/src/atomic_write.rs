@@ -79,25 +79,44 @@ pub struct Original {
 ///
 /// [`Error::Io`] as for any read: missing, not permitted, a directory, ...
 pub fn read(path: &Utf8Path) -> Result<(Vec<u8>, Original)> {
-    let read = || -> io::Result<_> {
-        let mut file = File::open(path.as_std_path())?;
-        // Before the contents: a change while they are read shows, too.
-        let entry = Entry::of(&file.metadata()?);
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        // The file is the one that was open, wherever the path leads by now.
-        let place = resolve(path.as_std_path(), Links::Follow)
-            .ok()
-            .map(|place| Place {
-                entry: Some(entry),
-                ..place
-            });
-        Ok((bytes, Original { place }))
+    read_from(path, Links::Follow)
+}
+
+/// As [`read`], of a file that is no symbolic link: one is refused. Nothing
+/// bound to this is ever written through a link, or removed as one, that
+/// comes to be at `path` later.
+///
+/// # Errors
+///
+/// As [`read`]; also when `path` is a symbolic link.
+pub fn read_no_link(path: &Utf8Path) -> Result<(Vec<u8>, Original)> {
+    read_from(path, Links::Refuse)
+}
+
+fn read_from(path: &Utf8Path, links: Links) -> Result<(Vec<u8>, Original)> {
+    let file = match links {
+        Links::Follow => File::open(path.as_std_path()),
+        Links::Refuse => open_no_follow(path.as_std_path()),
     };
-    read().map_err(|source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })
+    file.and_then(|file| read_open(file, path, links))
+        .map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+/// Read `file`, opened at `path`.
+fn read_open(mut file: File, path: &Utf8Path, links: Links) -> io::Result<(Vec<u8>, Original)> {
+    // Before the contents: a change while they are read shows, too.
+    let entry = Entry::of(&file.metadata()?);
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    // The file is the one that was open, wherever the path leads by now.
+    let place = resolve(path.as_std_path(), links).ok().map(|place| Place {
+        entry: Some(entry),
+        ..place
+    });
+    Ok((bytes, Original { place }))
 }
 
 /// Note which file `path` leads to, without reading it. `None` when it leads
@@ -166,6 +185,19 @@ pub fn rewrite(path: &Utf8Path, original: &Original, content: &[u8], backup: boo
 /// this is called, or that there is none.
 pub fn write(path: &Utf8Path, content: &[u8], backup: bool) -> Result<()> {
     Write::to(path, Links::Follow, IfExists::replace(backup))
+        .and_then(|write| write.commit(content, None))
+        .map_err(write_error(path))
+}
+
+/// Atomically write `content` to `path`, where nothing may be: a new file,
+/// created with `0666` less the umask.
+///
+/// # Errors
+///
+/// As [`write`]; also when anything is at `path`, a symbolic link among it,
+/// by the time the file would get its name.
+pub fn create(path: &Utf8Path, content: &[u8]) -> Result<()> {
+    Write::to(path, Links::Refuse, IfExists::Refuse)
         .and_then(|write| write.commit(content, None))
         .map_err(write_error(path))
 }
@@ -274,8 +306,23 @@ fn write_error(path: &Utf8Path) -> impl FnOnce(io::Error) -> Error {
     move |source| Error::WriteIo { path, source }
 }
 
+/// Whether `err` is the refusal of a write or a removal because the file is
+/// not the one that was read any more, or one is there where none was.
+#[must_use]
+pub fn is_changed(err: &Error) -> bool {
+    matches!(err, Error::WriteIo { source, .. }
+        if source.get_ref().is_some_and(|source| source.is::<Changed>()))
+}
+
+/// What [`is_changed`] tells from other errors.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct Changed(&'static str);
+
 fn changed() -> io::Error {
-    io::Error::other("it changed while dq was running: it is not the file that was read any more")
+    io::Error::other(Changed(
+        "it changed while dq was running: it is not the file that was read any more",
+    ))
 }
 
 /// The error of a file that cannot be `done`.
@@ -561,7 +608,7 @@ impl<'a> Write<'a> {
 fn appeared() -> io::Error {
     io::Error::new(
         io::ErrorKind::AlreadyExists,
-        "a file appeared there while dq was running; it is not replaced",
+        Changed("a file appeared there while dq was running; it is not replaced"),
     )
 }
 
@@ -1598,6 +1645,104 @@ mod tests {
                 ("old", 0o640)
             );
             assert_eq!(names(dir.path()), ["out", "source"]);
+        }
+
+        /// Nothing may be where a file is created: what is there stays.
+        #[test]
+        fn a_file_is_created_only_where_nothing_is() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let at = |name: &str| dir.path().join(name);
+            seed(&at("old"), "old", 0o600);
+            symlink("old", at("link")).expect("symlink");
+            symlink("none", at("dangling")).expect("symlink");
+            fs::create_dir(at("dir")).expect("mkdir");
+            for (name, is_new, cause) in [
+                ("old", true, APPEARED),
+                ("link", false, "it is a symbolic link"),
+                ("dangling", false, "it is a symbolic link"),
+                ("dir", false, "it is not a regular file"),
+            ] {
+                let err = create(utf8(&at(name)), b"new").expect_err(name);
+                assert_eq!(is_changed(&err), is_new, "{name}");
+                assert!(write_error(Err(err)).1.starts_with(cause), "{name}");
+            }
+            assert_eq!(read(&at("old")), "old");
+            create(utf8(&at("new")), b"new").expect("created");
+            seed(&at("plain"), "", 0o666);
+            fs::remove_file(at("plain")).expect("rm");
+            fs::write(at("plain"), "").expect("write");
+            assert_eq!(read(&at("new")), "new");
+            assert_eq!(mode(&at("new")), mode(&at("plain")), "any new file's");
+            assert_eq!(
+                names(dir.path()),
+                ["dangling", "dir", "link", "new", "old", "plain"]
+            );
+        }
+
+        /// What was read as no link is never written or removed as one.
+        #[test]
+        fn a_file_that_was_no_link_is_not_followed_when_it_is_one() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let at = |name: &str| dir.path().join(name);
+            seed(&at("file"), "old", 0o644);
+            symlink("file", at("link")).expect("symlink");
+            symlink("none", at("dangling")).expect("symlink");
+            for name in ["link", "dangling"] {
+                let err = read_no_link(utf8(&at(name))).map(drop).expect_err(name);
+                assert!(matches!(err, Error::Io { .. }), "{err:?}");
+            }
+            let (bytes, original) = read_no_link(utf8(&at("file"))).expect("read");
+            assert_eq!(bytes, b"old");
+            // The very file, behind a link.
+            fs::rename(at("file"), at("moved")).expect("mv");
+            symlink("moved", at("file")).expect("symlink");
+            let file = at("file");
+            for err in [
+                rewrite(utf8(&file), &original, b"new", false).map(drop),
+                remove(utf8(&file), &original),
+            ] {
+                let err = err.expect_err("a link");
+                assert!(is_changed(&err), "{err}");
+                assert_eq!(write_error(Err(err)).1, CHANGED);
+            }
+            assert_eq!(read(&at("moved")), "old");
+            assert!(file.is_symlink());
+            fs::rename(at("moved"), &file).expect("mv");
+            assert!(rewrite(utf8(&file), &original, b"new", false).expect("written"));
+            assert_eq!(read(&file), "new");
+            let failed = create(utf8(&at("none/file")), b"new").expect_err("no directory");
+            assert!(!is_changed(&failed), "{failed}");
+        }
+
+        /// Nor is what becomes a link while it is read.
+        #[test]
+        fn a_file_that_becomes_a_link_while_it_is_read_is_not_written() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let at = |name: &str| dir.path().join(name);
+            seed(&at("file"), "old", 0o644);
+            let file = open_no_follow(&at("file")).expect("open");
+            fs::rename(at("file"), at("moved")).expect("mv");
+            symlink("moved", at("file")).expect("symlink");
+            let (bytes, original) =
+                read_open(file, utf8(&at("file")), Links::Refuse).expect("read");
+            assert_eq!(bytes, b"old");
+            rewrite(utf8(&at("file")), &original, b"new", false).expect_err("a link");
+            remove(utf8(&at("file")), &original).expect_err("a link");
+            assert_eq!(read(&at("moved")), "old");
+            assert!(at("file").is_symlink());
+        }
+
+        /// A pipe is not waited for.
+        #[test]
+        fn a_pipe_is_no_file_to_read() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let at = dir.path().join("pipe");
+            let path = std::ffi::CString::new(at.to_str().expect("UTF-8")).expect("no NUL");
+            // SAFETY: a NUL-terminated path, which the call only reads.
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+            let (_, original) = read_no_link(utf8(&at)).expect("read");
+            let err = rewrite(utf8(&at), &original, b"new", false).expect_err("a pipe");
+            assert!(!is_changed(&err), "{err}");
         }
 
         const APPEARED: &str = "a file appeared there while dq was running; it is not replaced";
