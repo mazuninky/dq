@@ -415,8 +415,9 @@ impl<'a> Ir<'a> {
     ///
     /// On success, returns the position of `span.value_range.start` —
     /// `line` is `1 + count of '\n' bytes before the offset`, `col` is
-    /// `1 + bytes since the previous newline`. Behaviour matches
-    /// `crates/dq-core/src/parsers/json.rs::derive_line_col` byte-for-byte.
+    /// `1 + bytes since the previous newline`. Unlike a parse error's
+    /// ([`crate::Error::parse_at`]), a lone `\r` ends no line and a byte
+    /// order mark counts into the columns of the first one.
     #[must_use]
     pub fn line_col_for(&self, pointer: &Pointer) -> Option<(u32, u32)> {
         let span = self.span_for(pointer)?;
@@ -444,11 +445,8 @@ impl<'a> Ir<'a> {
 
 /// Derive a 1-indexed `(line, col)` for byte offset `idx` in `bytes`.
 ///
-/// Behaviour mirrors `crates/dq-core/src/parsers/json.rs::derive_line_col`
-/// byte-for-byte; the helper is duplicated here rather than exposed from
-/// the JSON parser because it is the load-bearing primitive for the IR
-/// layer's diagnostic-position chain (Phase 2 of `add-ir-foundation`),
-/// independent of any one parser.
+/// The load-bearing primitive for the IR layer's diagnostic-position chain
+/// (Phase 2 of `add-ir-foundation`), independent of any one parser.
 #[must_use]
 fn derive_line_col(bytes: &[u8], idx: usize) -> (u32, u32) {
     let cap = idx.min(bytes.len());

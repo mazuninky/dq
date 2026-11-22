@@ -1439,7 +1439,7 @@ fn xml_reads_us_ascii_strictly_and_iso_8859_1_byte_for_code_point() {
                 "json",
                 3,
                 b"",
-                "parse error in ascii.xml: invalid US-ASCII in XML input: byte 0xE9 at index 47\n",
+                "parse error in ascii.xml: invalid US-ASCII in XML input: byte 0xE9\n  --> ascii.xml:1:48\n",
             ),
             (
                 "latin_c1.yaml",
@@ -1817,23 +1817,25 @@ fn xml_refuses_a_bom_its_declaration_contradicts_and_keeps_a_utf8_bom() {
         ),
         ("attrs_null.yaml", b"r:\n- \"@attrs\": null\n"),
     ]);
-    // Each placed at its label, past the BOM.
-    let unreadable = |file: &str, message: &str| format!("parse error in {file}: {message}\n");
+    // Each is placed at the encoding name.
+    let unreadable = |file: &str, message: &str| {
+        format!("parse error in {file}: {message}\n  --> {file}:1:31\n")
+    };
     let u16_latin_err = unreadable(
         "u16_latin.xml",
-        "XML parse error at line 1, column 31: the file begins with a UTF-16LE byte order mark but declares encoding \"ISO-8859-1\"",
+        "XML parse error: the file begins with a UTF-16LE byte order mark but declares encoding \"ISO-8859-1\"",
     );
     let u16_be_le_err = unreadable(
         "u16_be_le.xml",
-        "XML parse error at line 1, column 31: the file begins with a UTF-16BE byte order mark but declares encoding \"UTF-16LE\"",
+        "XML parse error: the file begins with a UTF-16BE byte order mark but declares encoding \"UTF-16LE\"",
     );
     let spaced_err = unreadable(
         "spaced.xml",
-        "XML parse error at line 1, column 31: the XML declaration's encoding \" ISO-8859-1 \" is not an encoding name",
+        "XML parse error: the XML declaration's encoding \" ISO-8859-1 \" is not an encoding name",
     );
     let u8_latin_err = unreadable(
         "u8_latin.xml",
-        "XML parse error at line 1, column 31: the file begins with a UTF-8 byte order mark but declares encoding \"ISO-8859-1\"",
+        "XML parse error: the file begins with a UTF-8 byte order mark but declares encoding \"ISO-8859-1\"",
     );
     let u8_latin_refused = "xml format error: XML write: '#xml' field 'bom' is UTF-8 but the \
                             declared encoding is \"ISO-8859-1\"\n";

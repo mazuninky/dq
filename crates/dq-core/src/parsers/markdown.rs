@@ -50,7 +50,7 @@ use crate::error::Error;
 use crate::format::Format;
 use crate::ir::{InlineBaseline, Provenance, ProvenanceMap};
 use crate::parsers::frontmatter::{
-    detect_json_frontmatter, detect_toml_frontmatter, detect_yaml_frontmatter,
+    detect_json_frontmatter, detect_toml_frontmatter, detect_yaml_frontmatter, parse_header,
 };
 use crate::parsers::{Json, Toml, Yaml};
 use crate::pointer::Pointer;
@@ -152,13 +152,10 @@ fn parse_to_value(bytes: &[u8]) -> Result<Value> {
     // 2. Body via comrak.
     let arena = Arena::new();
     let opts = build_options();
-    let body_str = std::str::from_utf8(body_bytes).map_err(|e| Error::Parse {
-        file: None,
-        line: 0,
-        col: 0,
-        span: 0..0,
-        snippet: String::new(),
-        message: format!("invalid UTF-8 in Markdown input: {e}"),
+    let body_start = bytes.len() - body_bytes.len();
+    let body_str = std::str::from_utf8(body_bytes).map_err(|e| {
+        Error::invalid_utf8(body_bytes, e, "Markdown")
+            .relocated(body_bytes, bytes, |at| body_start + at)
     })?;
     let root = parse_document(&arena, body_str, &opts);
     restore_link_definition_starts(root, body_str, &opts);
@@ -175,7 +172,7 @@ fn parse_to_value(bytes: &[u8]) -> Result<Value> {
     //    from the start of the file. The body always starts at the start of
     //    a line (every frontmatter form ends with a line break), so only
     //    lines move — by the lines the frontmatter takes.
-    let header_lines = line_breaks(&bytes[..bytes.len() - body_bytes.len()]);
+    let header_lines = line_breaks(&bytes[..body_start]);
     if header_lines > 0 {
         shift_position(&mut position, header_lines);
         for child in &mut children {
@@ -611,21 +608,21 @@ fn detect_and_parse_frontmatter(bytes: &[u8]) -> Result<(Value, &[u8])> {
     // first line's columns).
     let content = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
     if let Some((header_bytes, body_bytes)) = detect_yaml_frontmatter(content) {
-        let header_doc = Yaml.parse(header_bytes)?;
+        let header_doc = parse_header(&Yaml, bytes, header_bytes)?;
         let mut wrap = IndexMap::new();
         wrap.insert("kind".to_owned(), Value::String("yaml".to_owned()));
         wrap.insert("value".to_owned(), header_doc.value().clone());
         return Ok((Value::Map(wrap), body_bytes));
     }
     if let Some((header_bytes, body_bytes)) = detect_toml_frontmatter(content) {
-        let header_doc = Toml.parse(header_bytes)?;
+        let header_doc = parse_header(&Toml, bytes, header_bytes)?;
         let mut wrap = IndexMap::new();
         wrap.insert("kind".to_owned(), Value::String("toml".to_owned()));
         wrap.insert("value".to_owned(), header_doc.value().clone());
         return Ok((Value::Map(wrap), body_bytes));
     }
     if let Some((header_bytes, body_bytes)) = detect_json_frontmatter(content) {
-        let header_doc = Json.parse(header_bytes)?;
+        let header_doc = parse_header(&Json, bytes, header_bytes)?;
         let mut wrap = IndexMap::new();
         wrap.insert("kind".to_owned(), Value::String("json".to_owned()));
         wrap.insert("value".to_owned(), header_doc.value().clone());
@@ -1098,6 +1095,15 @@ mod tests {
             panic!("expected node map");
         };
         m.get(key).unwrap_or_else(|| panic!("field {key} missing"))
+    }
+
+    #[test]
+    fn a_body_that_is_no_utf8_is_placed_in_the_file() {
+        assert!(matches!(
+            Markdown.parse(b"---\na: 1\n---\n# B\xFF\n").expect_err("must fail"),
+            Error::Parse { line: 4, col: 4, span, snippet, .. }
+                if span == (16..17) && snippet == "# B\u{fffd}"
+        ));
     }
 
     #[test]

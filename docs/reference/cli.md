@@ -237,9 +237,9 @@ present when it says more; `helpUri` is the first `http(s)://` entry of
 Errors are printed on stderr, escaped as `console` escapes text (see
 above): a pointer, a key in `did_you_mean`, a path — what the user typed or
 the file holds — never reaches the terminal with a raw control or direction
-character; the message keeps its own line breaks. A line break inside the
-pointer, the key, the path or the file name prints as `\x0a` (a carriage
-return as `\x0d`), so `dq get x.json $'/a\nY'` reports `path '/a\x0aY' not
+character. A line break inside the
+pointer, the key, the path, the file name or the message of a parse error
+prints as `\x0a` (a carriage return as `\x0d`), so `dq get x.json $'/a\nY'` reports `path '/a\x0aY' not
 found` on one line rather than a line `Y' …` of its own. The same holds for
 a key, a section, an element or a label a writer's refusal quotes from the
 file (`csv format error: row 0 key 'k\x0az': …`), a rule id or path in a
@@ -249,9 +249,8 @@ lines, the `--- a/<path>` / `+++ b/<path>` header of `--diff`, the fields of
 a log line on stderr, the `test` runner's fixture paths, case names and
 diagnostics (console and TAP), and `explain`'s rule id, description and
 references. Each prints control characters as `\xNN` and the direction
-controls as `\uNNNN`, as `console` does. A parse error's snippet keeps its
-own line breaks, and the lines of a `--diff` are the file's text, as they
-are. The escaping is the terminal's: machine-readable output (`-F json`,
+controls as `\uNNNN`, as `console` does. The lines of a `--diff` are the
+file's text, as they are. The escaping is the terminal's: machine-readable output (`-F json`,
 `yaml`, `sarif`, `junit`, TAP's YAML blocks) carries a message as it is, a
 line break as a line break in its string (`dq test -F json` on a rule whose
 id holds one). A path error names the
@@ -264,17 +263,26 @@ path '/server/prot' not found (matched up to '/server')
   pointer: /server/prot
 ```
 
-Parse errors carry the file, line, column, message and the offending source
-line. clap usage errors are rendered the way clap renders them (`error: …`,
+A parse error prints `parse error in FILE: MESSAGE` and, on the next line,
+the place: `  --> FILE:LINE:COL` (`<stdin>` for input read from stdin). Lines
+and columns are 1-based; columns count bytes, for every format, and a leading
+BOM is not counted. A line break is `\n`, `\r\n`, or a lone `\r` in a file
+with no `\n`. In the bulk summary the place follows the entry as
+` (line 2, column 4)`. The error also carries the source line and the byte
+range of what is wrong; `validate` prints them today, the rest of the
+commands do not yet. For XML in another encoding than UTF-8, `col` and the
+source line are of the decoded text, the byte range of the file. A jq
+expression that does not compile has no place in the file and prints none.
+clap usage errors are rendered the way clap renders them (`error: …`,
 usage line, `--help` hint), including the usage errors raised by handlers
 (`--doc` refusals, stdin without `--input-format`, a `-F` a write command
 cannot keep a file in).
 
-Not implemented yet, although the original design asked for them: a caret
-under the offending byte, and a JSON error object on stderr under `-F json`
-(today `-F json` changes nothing about error rendering, except for
-`validate`, whose diagnostics go through the reporter). Both are on the
-[roadmap](../roadmap.md).
+Not implemented yet, although the original design asked for them: the source
+line with a caret under the offending byte, and a JSON error object on stderr
+under `-F json` (today `-F json` changes nothing about error rendering, except
+for `validate`, whose diagnostics go through the reporter). Both are planned in
+[../plans/structured-errors.md](../plans/structured-errors.md).
 
 ## Exit codes
 

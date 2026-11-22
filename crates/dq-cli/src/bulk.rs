@@ -21,7 +21,7 @@ use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use crate::cli::Cli;
 use crate::commands::io_helpers::every_file_lacks;
-use crate::error::{BulkPartialFailure, CheckPending, DocOutOfRange};
+use crate::error::{BulkPartialFailure, CheckPending, DocOutOfRange, position_note};
 use crate::glob::{self, GlobError};
 use crate::output::terminal_text;
 
@@ -305,9 +305,9 @@ pub fn run_per_file(
             failed.len(),
         )?;
         for (path, err) in &failed {
-            // One line per file: the path and the error chain, a parse
-            // error's snippet included, through `terminal_text`.
-            let entry = format!("{path}: {err:#}");
+            // One line per file: the path, the error chain and a parse
+            // error's position, through `terminal_text`.
+            let entry = format!("{path}: {err:#}{}", position_note(err));
             writeln!(out, "  - {}", terminal_text(&entry))?;
         }
     }

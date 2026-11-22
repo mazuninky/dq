@@ -87,6 +87,24 @@ fn failure_of(dir: &TempDir, args: &[&str]) -> (Option<i32>, String, String) {
     )
 }
 
+/// `text`, `<message> at line L column C`, in its two parts: the message on
+/// stderr, and the lines `validate` reports for the place.
+fn message_and_place(text: &str) -> (&str, String) {
+    let (message, place) = text.split_once(" at line ").expect("a place");
+    let (line, col) = place.split_once(" column ").expect("a column");
+    (
+        message,
+        format!("\nline: {line}\ncol: {col}\nmessage: {message}\n"),
+    )
+}
+
+/// The stderr of a command that cannot parse `file`, for the same text.
+fn parse_error(file: &str, text: &str) -> String {
+    let (message, place) = text.split_once(" at line ").expect("a place");
+    let (line, col) = place.split_once(" column ").expect("a column");
+    format!("parse error in {file}: {message}\n  --> {file}:{line}:{col}\n")
+}
+
 // ---- reading ----------------------------------------------------------
 
 #[test]
@@ -299,9 +317,7 @@ fn a_duplicate_big_key_fails_like_any_duplicate_key() {
         assert_eq!(stdout, "", "{file}");
         assert_eq!(
             stderr,
-            format!(
-                "parse error in {file}: x: duplicate entry with key {key} at line 3 column 3\n"
-            )
+            format!("parse error in {file}: x: duplicate entry with key {key}\n  --> {file}:3:3\n")
         );
     }
     for file in ["same.yaml", "quoted.yaml"] {
@@ -309,7 +325,7 @@ fn a_duplicate_big_key_fails_like_any_duplicate_key() {
         assert_eq!(code, Some(3), "{file}");
         assert_eq!(
             stderr,
-            format!("parse error in {file}: duplicate entry with key 1e400 at line 2 column 1\n")
+            format!("parse error in {file}: duplicate entry with key 1e400\n  --> {file}:2:1\n")
         );
     }
     assert_eq!(
@@ -821,9 +837,13 @@ fn keys_that_become_the_same_dq_key_fail_at_the_repeated_key() {
             "duplicate entry with key 1 at line 5 column 1",
         ),
     ];
-    for (src, message) in cases {
+    for (src, text) in cases {
         let dir = dir_with(&[("k.yaml", src)]);
-        let want = format!("parse error in k.yaml: {message}\n");
+        let (_, place) = message_and_place(text);
+        let want = parse_error("k.yaml", text);
+        let (code, _, stderr) = failure_of(&dir, &["validate", "k.yaml"]);
+        assert_eq!(code, Some(4), "{src:?}");
+        assert!(stderr.contains(&place), "{src:?}: {stderr}");
         for args in [
             &["get", "k.yaml", "/x"][..],
             &["set", "k.yaml", "/zz", "1"],
@@ -884,14 +904,14 @@ fn hcl_object_keys_a_and_quoted_a_are_a_parse_error() {
         ("block.hcl", "b {\n  o = { a = 1, \"a\" = 2 }\n}\n"),
         ("ok.hcl", "x = { a = 1, \"a b\" = 2 }\n"),
     ]);
-    for file in ["a.hcl", "b.hcl", "block.hcl"] {
+    for (file, place) in [("a.hcl", "1:14"), ("b.hcl", "1:16"), ("block.hcl", "2:16")] {
         let (code, stdout, stderr) = failure_of(&dir, &["-F", "json", "convert", file]);
         assert_eq!(code, Some(3), "{file}");
         assert_eq!(stdout, "", "{file}");
         assert_eq!(
             stderr,
             format!(
-                "parse error in {file}: invalid object item; expected unique object key; found redefined object key \"a\"\n"
+                "parse error in {file}: invalid object item; expected unique object key; found redefined object key \"a\"\n  --> {file}:{place}\n"
             )
         );
     }
@@ -1197,7 +1217,7 @@ fn an_alias_key_repeats_its_anchor_and_a_tagged_collection_key_reads() {
         ("flow.yaml", "{&x +1e400: a, *x : b}\n"),
         ("seq.yaml", "[!!float 1e400]: a\n"),
     ]);
-    for (file, message) in [
+    for (file, text) in [
         (
             "alias.yaml",
             "duplicate entry with key +1e400 at line 3 column 1",
@@ -1210,7 +1230,10 @@ fn an_alias_key_repeats_its_anchor_and_a_tagged_collection_key_reads() {
         let (code, stdout, stderr) = failure_of(&dir, &["get", file, ""]);
         assert_eq!(code, Some(3), "{file}");
         assert_eq!(stdout, "", "{file}");
-        assert_eq!(stderr, format!("parse error in {file}: {message}\n"));
+        let (_, place) = message_and_place(text);
+        assert_eq!(stderr, parse_error(file, text));
+        let (_, _, stderr) = failure_of(&dir, &["validate", file]);
+        assert!(stderr.contains(&place), "{file}: {stderr}");
     }
     // A collection key holding one is named by its value, with no tag.
     assert_eq!(stdout_of(&dir, &["keys", "seq.yaml", ""]), "[1e400]\n");
@@ -1271,13 +1294,15 @@ fn a_repeated_number_key_is_named_as_first_written() {
     ] {
         let src = format!("{first}: a\n{again}: b\n");
         let dir = dir_with(&[("k.yaml", &src)]);
+        let (_, _, stderr) = failure_of(&dir, &["validate", "k.yaml"]);
+        assert!(stderr.contains("\nline: 2\ncol: 1\n"), "{src:?}: {stderr}");
         for args in [&["get", "k.yaml", ""][..], &["set", "k.yaml", "/z", "1"]] {
             let (code, stdout, stderr) = failure_of(&dir, args);
             assert_eq!((code, stdout.as_str()), (Some(3), ""), "{src:?} {args:?}");
             assert_eq!(
                 stderr,
                 format!(
-                    "parse error in k.yaml: duplicate entry with key {first} at line 2 column 1\n"
+                    "parse error in k.yaml: duplicate entry with key {first}\n  --> k.yaml:2:1\n"
                 ),
                 "{src:?} {args:?}"
             );

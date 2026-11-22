@@ -816,7 +816,8 @@ fn a_toml_file_with_lone_carriage_returns_does_not_parse() {
             &["-i", "set", "f.toml", "/a", "5"],
             3
         ),
-        "parse error in f.toml: carriage return must be followed by newline, expected newline\n"
+        "parse error in f.toml: carriage return must be followed by newline, expected newline\n  \
+         --> f.toml:2:1\n"
     );
 }
 

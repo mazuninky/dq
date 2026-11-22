@@ -554,35 +554,51 @@ fn repeated_bodies_that_disagree_on_a_nested_key_still_read_back_the_same() {
 
 #[test]
 fn a_body_whose_keys_one_map_cannot_hold_apart_is_a_parse_error() {
-    for (source, message) in [
+    for (source, at, message) in [
         (
             "x = 1\nx {\n  b = 2\n}\n",
-            "HCL error in line 2, column 1: block \"x\" has the name of an attribute of the \
+            (2, 1),
+            "HCL error: block \"x\" has the name of an attribute of the \
              same body; dq reads both as the key \"x\" and would lose one",
         ),
         (
             "x {\n  b = 2\n}\nx = 1\n",
-            "HCL error in line 4, column 1: attribute \"x\" has the name of a block of the same \
+            (4, 1),
+            "HCL error: attribute \"x\" has the name of a block of the same \
              body; dq reads both as the key \"x\" and would lose one",
         ),
         (
             "x \"a\" {\n  k = 1\n}\n  x {\n  a = 2\n}\n",
-            "HCL error in line 4, column 3: block \"x\" has 0 labels here and 1 label on an \
+            (4, 3),
+            "HCL error: block \"x\" has 0 labels here and 1 label on an \
              earlier \"x\" block of the same body; dq nests one map level per label and would \
              lose one",
         ),
         (
             "o {\n  x \"a\" \"b\" {}\n  x \"c\" {}\n}\n",
-            "HCL error in line 3, column 3: block \"x\" has 1 label here and 2 labels on an \
+            (3, 3),
+            "HCL error: block \"x\" has 1 label here and 2 labels on an \
              earlier \"x\" block of the same body; dq nests one map level per label and would \
              lose one",
         ),
     ] {
         let err = hcl().parse(source.as_bytes()).expect_err(source);
-        let dq_core::Error::Parse { message: got, .. } = &err else {
+        let dq_core::Error::Parse {
+            message: got,
+            line,
+            col,
+            snippet,
+            ..
+        } = &err
+        else {
             panic!("{err:?}")
         };
-        assert_eq!(got, message, "{source}");
+        assert_eq!((got.as_str(), (*line, *col)), (message, at), "{source}");
+        assert_eq!(
+            Some(snippet.as_str()),
+            source.lines().nth(*line as usize - 1),
+            "{source}"
+        );
     }
     // Blocks of one type in two different bodies are no clash.
     parse_hcl("x \"a\" {}\ny {\n  x {}\n}\n");

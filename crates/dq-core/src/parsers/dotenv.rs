@@ -41,18 +41,13 @@ impl Format for DotEnv {
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<Document> {
-        let text = std::str::from_utf8(bytes).map_err(|e| Error::Parse {
-            file: None,
-            line: 0,
-            col: 0,
-            span: 0..0,
-            snippet: String::new(),
-            message: format!("invalid UTF-8 in .env input: {e}"),
-        })?;
+        let text = std::str::from_utf8(bytes).map_err(|e| Error::invalid_utf8(bytes, e, ".env"))?;
         let mut out: IndexMap<String, Value> = IndexMap::new();
         let mut layout = DotEnvLayout::default();
-        for (lineno_0, raw) in text.split('\n').enumerate() {
-            let line_no = (lineno_0 + 1) as u32;
+        let mut next_line = 0;
+        for raw in text.split('\n') {
+            let line_start = next_line;
+            next_line += raw.len() + 1;
             // Trim trailing CR for CRLF-terminated lines; leading whitespace
             // is allowed and stripped.
             let line = raw.trim_end_matches('\r');
@@ -63,29 +58,30 @@ impl Format for DotEnv {
             // Strip leading `export ` prefix if present.
             let exported = trimmed.strip_prefix("export ");
             let body = exported.map_or(trimmed, str::trim_start);
+            // `body` and the value are tails of `line`.
+            let offset_of = |tail: &str| line_start + line.len() - tail.len();
             let Some(eq_idx) = body.find('=') else {
-                return Err(Error::Parse {
-                    file: None,
-                    line: line_no,
-                    col: 1,
-                    span: 0..0,
-                    snippet: line.to_owned(),
-                    message: "expected `KEY=VALUE` in .env line".to_owned(),
-                });
+                let start = offset_of(trimmed);
+                return Err(Error::parse_at(
+                    bytes,
+                    start..start + trimmed.trim_end().len(),
+                    "expected `KEY=VALUE` in .env line",
+                ));
             };
             let key = body[..eq_idx].trim().to_owned();
             if key.is_empty() {
-                return Err(Error::Parse {
-                    file: None,
-                    line: line_no,
-                    col: 1,
-                    span: 0..0,
-                    snippet: line.to_owned(),
-                    message: "empty key in .env line".to_owned(),
-                });
+                let eq = offset_of(&body[eq_idx..]);
+                return Err(Error::parse_at(bytes, eq..eq + 1, "empty key in .env line"));
             }
             let raw_val = &body[eq_idx + 1..];
-            let value = parse_value(raw_val, line_no, line)?;
+            let value = parse_value(raw_val).map_err(|unterminated| {
+                // At the quote nothing closes, to the end of the line.
+                Error::parse_at(
+                    bytes,
+                    offset_of(raw_val.trim_start())..line_start + line.len(),
+                    unterminated,
+                )
+            })?;
             // The last assignment of a key wins, with or without `export`.
             if exported.is_some() {
                 layout.exported.insert(key.clone());
@@ -154,29 +150,32 @@ pub(crate) struct DotEnvLayout {
     exported: HashSet<String>,
 }
 
-/// Parse the value side of a single `.env` line.
-fn parse_value(raw: &str, line_no: u32, full_line: &str) -> Result<String> {
+/// Parse the value side of a single `.env` line; `Err` says which quote it
+/// opens and does not close.
+fn parse_value(raw: &str) -> std::result::Result<String, &'static str> {
     // Skip leading whitespace; everything up to either a quote or end-of-line.
     let trimmed = raw.trim_start();
-    if trimmed.is_empty() {
-        return Ok(String::new());
-    }
-    let bytes = trimmed.as_bytes();
-    match bytes[0] {
-        b'"' => parse_double_quoted(trimmed, line_no, full_line),
-        b'\'' => parse_single_quoted(trimmed, line_no, full_line),
-        _ => Ok(parse_unquoted(trimmed)),
+    if let Some(after) = trimmed.strip_prefix('"') {
+        parse_double_quoted(after).ok_or("unterminated double-quoted value")
+    } else if let Some(after) = trimmed.strip_prefix('\'') {
+        // Literal — no escape processing.
+        after
+            .find('\'')
+            .map(|end| after[..end].to_owned())
+            .ok_or("unterminated single-quoted value")
+    } else {
+        Ok(parse_unquoted(trimmed))
     }
 }
 
-/// Parse a double-quoted value, applying backslash escape sequences.
-fn parse_double_quoted(input: &str, line_no: u32, full_line: &str) -> Result<String> {
-    debug_assert!(input.starts_with('"'));
-    let mut chars = input[1..].chars();
+/// Parse a double-quoted value past its opening quote, applying backslash
+/// escape sequences; `None` without a closing quote.
+fn parse_double_quoted(input: &str) -> Option<String> {
+    let mut chars = input.chars();
     let mut out = String::new();
     while let Some(c) = chars.next() {
         match c {
-            '"' => return Ok(out),
+            '"' => return Some(out),
             '\\' => match chars.next() {
                 Some('\\') => out.push('\\'),
                 Some('"') => out.push('"'),
@@ -192,31 +191,7 @@ fn parse_double_quoted(input: &str, line_no: u32, full_line: &str) -> Result<Str
             other => out.push(other),
         }
     }
-    Err(Error::Parse {
-        file: None,
-        line: line_no,
-        col: 1,
-        span: 0..0,
-        snippet: full_line.to_owned(),
-        message: "unterminated double-quoted value".to_owned(),
-    })
-}
-
-/// Parse a single-quoted value (literal — no escape processing).
-fn parse_single_quoted(input: &str, line_no: u32, full_line: &str) -> Result<String> {
-    debug_assert!(input.starts_with('\''));
-    let after = &input[1..];
-    if let Some(end) = after.find('\'') {
-        return Ok(after[..end].to_owned());
-    }
-    Err(Error::Parse {
-        file: None,
-        line: line_no,
-        col: 1,
-        span: 0..0,
-        snippet: full_line.to_owned(),
-        message: "unterminated single-quoted value".to_owned(),
-    })
+    None
 }
 
 /// Parse an unquoted value: literal until end-of-line or first inline `#`
@@ -289,6 +264,73 @@ mod tests {
         let doc = DotEnv.parse(b"M=\"a\\nb\"\n").expect("parse");
         let Value::Map(m) = doc.value() else { panic!() };
         assert_eq!(m.get("M"), Some(&Value::String("a\nb".into())));
+    }
+
+    /// `(line, col, span, snippet, message)` of the error `bytes` fail with.
+    fn parse_error(bytes: &[u8]) -> (u32, u32, std::ops::Range<usize>, String, String) {
+        match DotEnv.parse(bytes).expect_err("must fail") {
+            Error::Parse {
+                file: None,
+                line,
+                col,
+                span,
+                snippet,
+                message,
+            } => (line, col, span, snippet, message),
+            other => panic!("expected a parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_parse_error_is_at_the_text_at_fault() {
+        for (text, line, col, span, snippet, message) in [
+            (
+                "A=1\r\n  я б \r\n",
+                2,
+                3,
+                7..12,
+                "  я б ",
+                "expected `KEY=VALUE` in .env line",
+            ),
+            (
+                "export  =x\n",
+                1,
+                9,
+                8..9,
+                "export  =x",
+                "empty key in .env line",
+            ),
+            (
+                "B= \"я\r\n",
+                1,
+                4,
+                3..6,
+                "B= \"я",
+                "unterminated double-quoted value",
+            ),
+            (
+                "B='x",
+                1,
+                3,
+                2..4,
+                "B='x",
+                "unterminated single-quoted value",
+            ),
+            (
+                "A=1\n B=\"x\\",
+                2,
+                4,
+                7..10,
+                " B=\"x\\",
+                "unterminated double-quoted value",
+            ),
+        ] {
+            assert_eq!(
+                parse_error(text.as_bytes()),
+                (line, col, span, snippet.to_owned(), message.to_owned()),
+                "{text:?}"
+            );
+        }
     }
 
     #[test]

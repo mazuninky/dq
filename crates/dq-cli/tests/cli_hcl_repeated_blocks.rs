@@ -239,7 +239,7 @@ fix:
 }
 
 #[test]
-fn a_block_with_the_name_of_an_attribute_exits_3_naming_its_line() {
+fn a_block_with_the_name_of_an_attribute_exits_3_naming_it() {
     let dir = TempDir::new().expect("tempdir");
     std::fs::write(dir.path().join("x.tf"), "x = 1\nx {\n  b = 2\n}\n").expect("write x.tf");
     dq().current_dir(dir.path())
@@ -248,7 +248,8 @@ fn a_block_with_the_name_of_an_attribute_exits_3_naming_its_line() {
         .code(3)
         .stdout("")
         .stderr(
-            "parse error in x.tf: HCL error in line 2, column 1: block \"x\" has the name of an \
-             attribute of the same body; dq reads both as the key \"x\" and would lose one\n",
+            "parse error in x.tf: HCL error: block \"x\" has the name of an \
+             attribute of the same body; dq reads both as the key \"x\" and would lose one\n\
+             \x20 --> x.tf:2:1\n",
         );
 }

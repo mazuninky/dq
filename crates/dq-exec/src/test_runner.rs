@@ -382,9 +382,13 @@ fn parse_input(input: &str, format: &str) -> std::result::Result<dq_core::Docume
     }
     let parser =
         dq_core::by_name(format).ok_or_else(|| format!("{format} format not registered"))?;
-    let doc = parser
-        .parse(input.as_bytes())
-        .map_err(|err| format!("{format} parse error: {err}"))?;
+    let doc = parser.parse(input.as_bytes()).map_err(|err| {
+        let place = err
+            .place()
+            .map(|(line, col)| format!(" (line {line}, column {col})"))
+            .unwrap_or_default();
+        format!("{format} parse error: {err}{place}")
+    })?;
     if let Some(documents) = doc.values() {
         return Err(format!(
             "{format} parse error: a fixture input holds one document, this one holds {}",
@@ -688,6 +692,13 @@ tests:
         );
         let err = parse_input("FOO x\n", "dockerfile").expect_err("unknown instruction");
         assert!(err.contains("dockerfile parse error"), "got: {err}");
+        assert!(err.ends_with(" (line 1, column 1)"), "got: {err}");
+        let err = parse_input("a: 1\nя: @\n", "yaml").expect_err("no token");
+        assert_eq!(
+            err,
+            "yaml parse error: parse error: found character that cannot start any token, while \
+             scanning for the next token (line 2, column 5)"
+        );
     }
 
     #[test]

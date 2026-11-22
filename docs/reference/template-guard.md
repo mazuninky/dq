@@ -136,6 +136,7 @@ On a reading command each template is read as the string it is written as:
 prints `{{ .Values.x }}`, and `convert` writes it as that string. Lines in
 `lint` positions match the file (a template never spans a line break);
 columns after a template on the same line count the placeholder's length.
+A parse error names its place in the file, not in the substituted text.
 
 ## `--allow-templates`
 

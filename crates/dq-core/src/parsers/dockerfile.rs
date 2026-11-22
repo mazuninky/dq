@@ -101,14 +101,8 @@ impl Format for Dockerfile {
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<Document> {
-        let text = std::str::from_utf8(bytes).map_err(|e| Error::Parse {
-            file: None,
-            line: 0,
-            col: 0,
-            span: 0..0,
-            snippet: String::new(),
-            message: format!("invalid UTF-8 in Dockerfile input: {e}"),
-        })?;
+        let text =
+            std::str::from_utf8(bytes).map_err(|e| Error::invalid_utf8(bytes, e, "Dockerfile"))?;
         let instructions = parse_instructions(text)?;
         // The document keeps the text without a BOM, so a column on the
         // first line counts from the character after it; the instruction
@@ -292,7 +286,7 @@ fn source_lines(text: &str) -> Vec<SourceLine<'_>> {
 /// Parse the whole Dockerfile into instructions.
 fn parse_instructions(text: &str) -> Result<Vec<Instruction>> {
     let lines = source_lines(text);
-    let escape = parse_directives(&lines)?;
+    let escape = parse_directives(text, &lines)?;
     let mut out = Vec::new();
     let mut i = 0;
     while i < lines.len() {
@@ -323,14 +317,7 @@ fn parse_instructions(text: &str) -> Result<Vec<Instruction>> {
         if logical.is_empty() {
             continue;
         }
-        let err = |message: String| Error::Parse {
-            file: None,
-            line: start_line,
-            col: 1,
-            span: first.span(),
-            snippet: first.text.to_owned(),
-            message: format!("line {start_line}: {message}"),
-        };
+        let err = |message: String| Error::parse_at(text.as_bytes(), first.span(), message);
         let (word, rest) = split_keyword(logical);
         let keyword = word.to_ascii_uppercase();
         if !KEYWORDS.contains(&keyword.as_str()) {
@@ -405,23 +392,16 @@ fn line_number(i: usize) -> u32 {
     u32::try_from(i + 1).unwrap_or(u32::MAX)
 }
 
-/// Read the parser directives at the top of the file and return the escape
-/// character they select (`\` by default).
-fn parse_directives(lines: &[SourceLine<'_>]) -> Result<char> {
+/// Read the parser directives at the top of `text`, which `lines` split,
+/// and return the escape character they select (`\` by default).
+fn parse_directives(text: &str, lines: &[SourceLine<'_>]) -> Result<char> {
     let mut escape = '\\';
     let mut seen: Vec<String> = Vec::new();
-    for (idx, line) in lines.iter().enumerate() {
+    for line in lines {
         let Some((name, value)) = directive(line.text) else {
             break;
         };
-        let err = |message: String| Error::Parse {
-            file: None,
-            line: line_number(idx),
-            col: 1,
-            span: line.span(),
-            snippet: line.text.to_owned(),
-            message: format!("line {}: {message}", line_number(idx)),
-        };
+        let err = |message: String| Error::parse_at(text.as_bytes(), line.span(), message);
         if seen.contains(&name) {
             return Err(err(format!(
                 "only one `{name}` parser directive can be used"
@@ -829,7 +809,12 @@ mod tests {
 
     fn parse_err(text: &str) -> (u32, String) {
         match parse_instructions(text).expect_err("must fail") {
-            Error::Parse { line, message, .. } => (line, message),
+            Error::Parse {
+                line, col, message, ..
+            } => {
+                assert_eq!(col, 1, "{message}");
+                (line, message)
+            }
             other => panic!("expected Error::Parse, got {other:?}"),
         }
     }
@@ -852,7 +837,10 @@ mod tests {
     #[test]
     fn parse_rejects_invalid_utf8() {
         let err = Dockerfile.parse(b"FROM \xff\n").expect_err("invalid UTF-8");
-        assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+        assert!(
+            matches!(&err, Error::Parse { line: 1, col: 6, span, .. } if *span == (5..6)),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -1066,7 +1054,17 @@ mod tests {
             let (got_line, message) = parse_err(src);
             assert_eq!(got_line, *line, "line for {src:?}: {message}");
             assert!(message.contains(needle), "{src:?}: {message}");
+            assert!(!message.starts_with("line "), "{src:?}: {message}");
         }
+        // The whole first line of the instruction, a byte order mark and
+        // the line break left out.
+        assert!(matches!(
+            Dockerfile
+                .parse("\u{feff}FROM a\r\n  FRUM я \\\r\n  b\r\n".as_bytes())
+                .expect_err("must fail"),
+            Error::Parse { line: 2, col: 1, span, snippet, .. }
+                if span == (11..22) && snippet == "  FRUM я \\"
+        ));
     }
 
     /// `line:col` of every pointer in `pointers` for the Dockerfile `src`.

@@ -383,18 +383,23 @@ fn process_extract_item(
             // anchored at the outer coordinates. Per spec scenario
             // "Inner-format parse failure becomes outer-rule diagnostic"
             // we do NOT recurse into `nested` for this item.
+            // The outer document of a nested composite rule is itself a
+            // part of the file: its positions are not the file's.
+            let text = in_outer_context(&err, |line, col| {
+                (current_depth == 0)
+                    .then(|| anchor_position.locate(outer_ir.bytes(), value_str, line, col))
+                    .flatten()
+            });
             let message = crate::evaluator::prefixed(
                 &composite.message_prefix,
-                &format!("{format_str} parse failed: {err}"),
+                &format!("{format_str} parse failed: {text}"),
             );
             // A parse error that knows where it is lands there, projected
             // onto the outer file the way a nested diagnostic is; one that
             // does not lands on the anchor.
-            let (line, col) = match &err {
-                dq_core::Error::Parse { line, col, .. } if *line > 0 && *col > 0 => {
-                    anchor_position.project(*line, *col)
-                }
-                _ => (anchor_position.line, anchor_position.col),
+            let (line, col) = match err.place() {
+                Some((line, col)) => anchor_position.project(line, col),
+                None => (anchor_position.line, anchor_position.col),
             };
             out.diagnostics.push(Diagnostic {
                 rule_id: format!("{outer_id}.parse-failed"),
@@ -511,6 +516,46 @@ impl AnchorPosition {
             projected_line,
             base_col.saturating_add(col).saturating_sub(1),
         )
+    }
+
+    /// [`Self::project`], where that is exact: where the rest of the line
+    /// there in `outer`, the source of the outer document, is the rest of
+    /// the line of `inner`. `None` elsewhere — an escaped string has its
+    /// line breaks in one line, the lines of a YAML block scalar their
+    /// indent — and without the outer source.
+    fn locate(&self, outer: &[u8], inner: &str, line: u32, col: u32) -> Option<(u32, u32)> {
+        fn rest(bytes: &[u8], line: u32, col: u32) -> Option<&[u8]> {
+            let nth = usize::try_from(line.checked_sub(1)?).ok()?;
+            let from = usize::try_from(col.checked_sub(1)?).ok()?;
+            let rest = bytes.split(|&b| b == b'\n').nth(nth)?.get(from..)?;
+            Some(rest.strip_suffix(b"\r").unwrap_or(rest))
+        }
+        let (at_line, at_col) = self.project(line, col);
+        (rest(outer, at_line, at_col)? == rest(inner.as_bytes(), line, col)?)
+            .then_some((at_line, at_col))
+    }
+}
+
+/// The text of `err`, raised on an inner document, with the place a YAML
+/// message ends with — the one of its context, `…, while parsing a flow
+/// sequence at line 2 column 4` — where `locate` finds it in the outer file,
+/// and without that place where it finds none.
+fn in_outer_context(
+    err: &dq_core::Error,
+    locate: impl FnOnce(u32, u32) -> Option<(u32, u32)>,
+) -> String {
+    let text = err.to_string();
+    let context = text.rsplit_once(" at line ").and_then(|(problem, place)| {
+        let (line, col) = place.split_once(" column ")?;
+        let place = (line.parse().ok()?, col.parse().ok()?);
+        problem.contains(", while ").then_some((problem, place))
+    });
+    match context {
+        Some((problem, (line, col))) => match locate(line, col) {
+            Some((line, col)) => format!("{problem} at line {line} column {col}"),
+            None => problem.to_owned(),
+        },
+        None => text,
     }
 }
 
@@ -635,6 +680,7 @@ fn as_str(v: &dq_core::Value) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    use super::{AnchorPosition, in_outer_context};
     use crate::evaluator::Evaluator;
     use crate::ruleset::{RuleSet, RuleSource};
 
@@ -852,6 +898,57 @@ check:
                 eval.evaluate_file(&Utf8PathBuf::from("doc.yaml"), &owned.to_borrowed(), "yaml");
             assert_eq!(diags.len(), 1, "{diags:?}");
             assert!(diags[0].message.contains(message), "{}", diags[0].message);
+        }
+    }
+
+    #[test]
+    fn locate_gives_the_places_the_outer_file_holds_the_inner_text_at() {
+        let at = |line, span_col, inline_col| AnchorPosition {
+            line,
+            col: 1,
+            span_line: Some(line),
+            span_col,
+            inline_col,
+            inline_line_cols: Vec::new(),
+        };
+        let inner = "a: 1\r\nb: [1, 2\r\n";
+        // A fence indented by two.
+        let fence = at(2, Some(1), Some(3));
+        let outer = b"```yaml\r\n  a: 1\r\n  b: [1, 2\r\n```\r\n";
+        assert_eq!(fence.locate(outer, inner, 2, 4), Some((3, 6)));
+        // The outer line holds more, or other text; it is no line.
+        for outer in [
+            &b"|\n  a: 1\n   b: [1, 2\n"[..],
+            b"|\n  a: 1\n  b: [1, 3\n",
+            b"|\n  a: 1\n",
+            b"",
+        ] {
+            assert_eq!(fence.locate(outer, inner, 2, 4), None, "{outer:?}");
+        }
+        // An escaped string.
+        let string = at(1, Some(6), None);
+        let outer = br#"{"s": "a: 1\r\nb: [1, 2\r\n"}"#;
+        assert_eq!(string.locate(outer, inner, 2, 4), None);
+        assert_eq!(string.locate(outer, inner, 1, 1), None);
+    }
+
+    #[test]
+    fn in_outer_context_moves_or_drops_the_place_of_a_context() {
+        let err = |message: &str| dq_core::Error::parse_at(b"x", 0..0, message);
+        let moved = err("m, while parsing a y at line 2 column 4");
+        assert_eq!(
+            in_outer_context(&moved, |line, col| Some((line + 5, col + 1))),
+            "parse error: m, while parsing a y at line 7 column 5"
+        );
+        assert_eq!(
+            in_outer_context(&moved, |_, _| None),
+            "parse error: m, while parsing a y"
+        );
+        for message in ["m", "m, while parsing a y", "m at line 2 column 4"] {
+            assert_eq!(
+                in_outer_context(&err(message), |_, _| None),
+                format!("parse error: {message}")
+            );
         }
     }
 

@@ -34,7 +34,7 @@ use crate::commands::io_helpers::{
     checked_index, every_file_lacks, load_document_for_lint, pick_format, skip_out_of_range,
 };
 use crate::commands::plugin_loader::{self, LoadedPlugins};
-use crate::error::{InvalidInput, LintFail, LintWarnStrict};
+use crate::error::{InvalidInput, LintFail, LintWarnStrict, position_note};
 use crate::output::{OutputFormat, Reporter};
 
 /// Run the lint pipeline once a caller has produced the input rulesets.
@@ -233,9 +233,9 @@ pub(crate) fn run_with_rulesets(
     let mut unparsed = unparsed.into_iter();
     if let Some(first) = unparsed.next() {
         // The first is printed as the run's error; the console names the
-        // others here, as it names a file skipped.
+        // others here, each with its position, as it names a file skipped.
         for err in unparsed {
-            tracing::warn!("{err}");
+            tracing::warn!("{err}{}", position_note(&err));
         }
         return Err(first);
     }

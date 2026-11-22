@@ -260,18 +260,24 @@ fn dq_get_addresses_the_ir_by_pointer() {
 }
 
 #[test]
-fn a_bad_instruction_exits_3_naming_its_start_line() {
+fn a_bad_instruction_exits_3_naming_it() {
     let cases: &[(&[u8], &str)] = &[
-        (b"FROM a\nFOO bar\n", "line 2: unknown instruction `FOO`"),
+        (
+            b"FROM a\nFOO bar\n",
+            "Dockerfile: unknown instruction `FOO`",
+        ),
         (
             b"FROM a\nRUN <<EOF\necho\n",
-            "line 2: unterminated heredoc `EOF`",
+            "Dockerfile: unterminated heredoc `EOF`",
         ),
         (
             b"FROM a\nSHELL sh -c\n",
-            "line 2: SHELL requires the arguments in JSON form",
+            "Dockerfile: SHELL requires the arguments in JSON form",
         ),
-        (b"FROM a\nENV A\n", "line 2: ENV must have two arguments"),
+        (
+            b"FROM a\nENV A\n",
+            "Dockerfile: ENV must have two arguments",
+        ),
     ];
     for (src, needle) in cases {
         let dir = dockerfile(src);
@@ -280,6 +286,9 @@ fn a_bad_instruction_exits_3_naming_its_start_line() {
             .assert()
             .code(3)
             .stdout("")
-            .stderr(predicate::str::contains(*needle));
+            .stderr(
+                predicate::str::contains(*needle)
+                    .and(predicate::str::contains("\n  --> Dockerfile:2:1\n")),
+            );
     }
 }

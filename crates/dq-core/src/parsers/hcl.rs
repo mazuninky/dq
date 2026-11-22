@@ -24,6 +24,7 @@ use std::io::Write;
 
 use camino::Utf8PathBuf;
 use hcl::edit::Span as _;
+use hcl::edit::expr::Expression as EditExpression;
 use hcl::edit::structure::{
     Block as EditBlock, BlockLabel as EditLabel, Body as EditBody, Structure as EditStructure,
 };
@@ -49,19 +50,10 @@ impl Format for Hcl {
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<Document> {
-        let text = std::str::from_utf8(bytes).map_err(|e| Error::Parse {
-            file: None,
-            line: 0,
-            col: 0,
-            span: 0..0,
-            snippet: String::new(),
-            message: format!("invalid UTF-8 in HCL input: {e}"),
-        })?;
+        let text = std::str::from_utf8(bytes).map_err(|e| Error::invalid_utf8(bytes, e, "HCL"))?;
         // One parse, with `hcl-edit`, which keeps every number literal;
         // `hcl::parse` is the same parse turned into `hcl-rs` types.
-        let body: EditBody = text
-            .parse()
-            .map_err(|e: hcl::edit::parser::Error| map_hcl_parse_error(e.into()))?;
+        let body: EditBody = text.parse().map_err(|e| parse_error(text, &e))?;
         let mut reader = Reader {
             text,
             path: Vec::new(),
@@ -319,7 +311,7 @@ impl Reader<'_> {
     ///
     /// # Errors
     ///
-    /// [`Error::Parse`] from [`check_expression_keys`], and for a body
+    /// [`Error::Parse`] from [`Reader::check_expression_keys`], and for a body
     /// whose keys one map cannot hold apart: an attribute and a block of
     /// one name, or blocks of one type with different label counts.
     ///
@@ -348,7 +340,7 @@ impl Reader<'_> {
                         ));
                     }
                     let expr = Expression::from(attr.value.clone());
-                    check_expression_keys(&expr)?;
+                    self.check_expression_keys(&expr, &attr.value)?;
                     let mut val = hcl_value_to_value(HclValue::from(expr));
                     restore_in_expression(&attr.value, &mut val);
                     collect_exprs(
@@ -467,18 +459,70 @@ impl Reader<'_> {
         Ok((at, exprs))
     }
 
-    /// An [`Error::Parse`] at the start of `span`.
-    fn clash(&self, span: Option<std::ops::Range<usize>>, message: &str) -> Error {
-        let span = span.unwrap_or(0..0);
-        let (line, col) = line_col(self.text, span.start);
-        Error::Parse {
-            file: None,
-            line,
-            col,
-            span,
-            snippet: String::new(),
-            message: format!("HCL error in line {line}, column {col}: {message}"),
+    /// Fail on an object whose keys repeat once they are the strings a
+    /// [`Value::Map`] holds: `hcl-rs` rejects `{ a = 1, a = 2 }`, but `a`
+    /// and `"a"` (or `1` and `"1"`) are two keys to it and one to the map,
+    /// where the last would silently win. `source` is `expr` as `hcl-edit`
+    /// read it, which says where a key is.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Parse`] naming the repeated key, at that key.
+    fn check_expression_keys(&self, expr: &Expression, source: &EditExpression) -> Result<()> {
+        match expr {
+            Expression::Array(items) => {
+                let mut sources = match source {
+                    EditExpression::Array(array) => Some(array.iter()),
+                    _ => None,
+                };
+                items.iter().try_for_each(|item| {
+                    let at = sources.as_mut().and_then(Iterator::next);
+                    self.check_expression_keys(item, at.unwrap_or(source))
+                })
+            }
+            Expression::Parenthesis(inner) => {
+                let at = match source {
+                    EditExpression::Parenthesis(outer) => outer.inner(),
+                    _ => source,
+                };
+                self.check_expression_keys(inner, at)
+            }
+            Expression::Object(object) => {
+                let mut sources = match source {
+                    EditExpression::Object(read) if read.len() == object.len() => Some(read.iter()),
+                    _ => None,
+                };
+                let mut seen = std::collections::HashSet::with_capacity(object.len());
+                for (key, value) in object.iter() {
+                    let at = sources.as_mut().and_then(Iterator::next);
+                    let key = key.to_string();
+                    if !seen.insert(key.clone()) {
+                        let span = at.and_then(|(key, _)| key.span()).or_else(|| source.span());
+                        return Err(Error::parse_at(
+                            self.text.as_bytes(),
+                            span.unwrap_or(0..0),
+                            format!(
+                                "invalid object item; expected unique object key; found \
+                                 redefined object key {key:?}"
+                            ),
+                        ));
+                    }
+                    let at = at.map_or(source, |(_, value)| value.expr());
+                    self.check_expression_keys(value, at)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
         }
+    }
+
+    /// An [`Error::Parse`] at `span`.
+    fn clash(&self, span: Option<std::ops::Range<usize>>, message: &str) -> Error {
+        Error::parse_at(
+            self.text.as_bytes(),
+            span.unwrap_or(0..0),
+            format!("HCL error: {message}"),
+        )
     }
 }
 
@@ -489,18 +533,6 @@ fn label_count(count: usize) -> String {
     } else {
         format!("{count} labels")
     }
-}
-
-/// The 1-based line and column of byte `offset` of `text`, the column
-/// counted in characters.
-fn line_col(text: &str, offset: usize) -> (u32, u32) {
-    let before = text.get(..offset).unwrap_or(text);
-    let line = before.matches('\n').count() + 1;
-    let col = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
-    (
-        u32::try_from(line).unwrap_or(u32::MAX),
-        u32::try_from(col).unwrap_or(u32::MAX),
-    )
 }
 
 /// The map of labels at `parent[key]`, made if it is not there yet.
@@ -529,42 +561,6 @@ fn add_repeat(parent: &mut IndexMap<String, Value>, key: String, body: Value) {
     }
 }
 
-/// Fail on an object whose keys repeat once they are the strings a
-/// [`Value::Map`] holds: `hcl-rs` rejects `{ a = 1, a = 2 }`, but `a` and
-/// `"a"` (or `1` and `"1"`) are two keys to it and one to the map, where
-/// the last would silently win.
-///
-/// # Errors
-///
-/// [`Error::Parse`] naming the repeated key; `hcl-rs` gives no position.
-fn check_expression_keys(expr: &Expression) -> Result<()> {
-    match expr {
-        Expression::Array(items) => items.iter().try_for_each(check_expression_keys),
-        Expression::Parenthesis(inner) => check_expression_keys(inner),
-        Expression::Object(object) => {
-            let mut seen = std::collections::HashSet::with_capacity(object.len());
-            for (key, value) in object.iter() {
-                let key = key.to_string();
-                if !seen.insert(key.clone()) {
-                    return Err(Error::Parse {
-                        file: None,
-                        line: 0,
-                        col: 0,
-                        span: 0..0,
-                        snippet: String::new(),
-                        message: format!(
-                            "invalid object item; expected unique object key; found redefined object key {key:?}"
-                        ),
-                    });
-                }
-                check_expression_keys(value)?;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
 /// Note in `out` every value of `expr` (read as `value`, at `path` from
 /// its body) that a value cannot spell, with its source: an expression
 /// other than a literal, an array or an object of literal keys — and a
@@ -576,12 +572,12 @@ fn check_expression_keys(expr: &Expression) -> Result<()> {
 /// the object to write each key and member that stays as it was.
 fn collect_exprs(
     text: &str,
-    expr: &hcl::edit::expr::Expression,
+    expr: &EditExpression,
     value: &Value,
     path: &mut Vec<String>,
     out: &mut BodyExprs,
 ) {
-    use hcl::edit::expr::{Expression as EditExpression, ObjectKey};
+    use hcl::edit::expr::ObjectKey;
     match (expr, value) {
         (EditExpression::Null(_) | EditExpression::Bool(_) | EditExpression::Number(_), _) => {}
         (EditExpression::String(_), Value::String(s)) if !has_template_marker(s) => {}
@@ -632,7 +628,7 @@ fn collect_exprs(
 /// Note in `out` the expression `expr`, read as `value` at `path`, whole.
 fn note_whole(
     text: &str,
-    expr: &hcl::edit::expr::Expression,
+    expr: &EditExpression,
     value: &Value,
     path: &[String],
     out: &mut BodyExprs,
@@ -1337,26 +1333,31 @@ fn non_finite_error(spelling: &str) -> Error {
     }
 }
 
-/// Map an `hcl::Error` into our structured `Error::Parse`.
-///
-/// The `Parse` variant exposes `Location { line, column }`; other error
-/// variants don't carry position info, so we anchor at `0/0` for them.
-fn map_hcl_parse_error(e: hcl::Error) -> Error {
-    let (line, col, message) = match &e {
-        hcl::Error::Parse(parse_err) => {
-            let loc = parse_err.location();
-            (loc.line() as u32, loc.column() as u32, e.to_string())
-        }
-        other => (0, 0, other.to_string()),
-    };
-    Error::Parse {
-        file: None,
-        line,
-        col,
-        span: 0..0,
-        snippet: String::new(),
-        message,
-    }
+/// `err`, which `hcl-edit` raised on `text`, as an [`Error::Parse`] where
+/// it stopped, with its message but not the rendering of the source line
+/// its `Display` puts around it.
+fn parse_error(text: &str, err: &hcl::edit::parser::Error) -> Error {
+    let location = err.location();
+    // The offset never goes past the last byte; at the end of the input
+    // the column — the characters of the line up to the offset, the one
+    // there included, or its bytes when the offset cuts a character — is
+    // one more.
+    let last = location.offset();
+    let line = text
+        .as_bytes()
+        .get(..=last)
+        .map(|read| {
+            let before = &read[..last];
+            let start = before
+                .iter()
+                .rposition(|&b| b == b'\n')
+                .map_or(0, |i| i + 1);
+            &read[start..]
+        })
+        .unwrap_or_default();
+    let col = std::str::from_utf8(line).map_or(line.len(), |line| line.chars().count());
+    let at = last + location.column().saturating_sub(col);
+    Error::parse_at(text.as_bytes(), at..at, err.message())
 }
 
 #[cfg(test)]
@@ -1523,10 +1524,77 @@ mod tests {
         assert_eq!(s3.get("region"), Some(&Value::String("us-east-1".into())));
     }
 
+    /// `(line, col, span, snippet, message)` of the error `bytes` fail with.
+    fn parse_error(bytes: &[u8]) -> (u32, u32, std::ops::Range<usize>, String, String) {
+        match Hcl.parse(bytes).expect_err("must fail") {
+            Error::Parse {
+                file: None,
+                line,
+                col,
+                span,
+                snippet,
+                message,
+            } => (line, col, span, snippet, message),
+            other => panic!("expected a parse error, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn parse_invalid_returns_parse_error() {
-        let err = Hcl.parse(b"this = =\n").expect_err("must parse-error");
-        assert_eq!(err.kind_name(), "parse");
+    fn a_parse_error_is_where_hcl_edit_stops() {
+        for (text, line, col, span, snippet, message) in [
+            (
+                "this = =\n",
+                1,
+                8,
+                7..7,
+                "this = =",
+                "invalid expression; expected `\"`, `[`, `{`, `-`, `!`, `(`, `_`, `<`, letter or digit",
+            ),
+            // Byte columns, the character at fault multi-byte or past some.
+            (
+                "a = \"я\" я\n",
+                1,
+                10,
+                9..9,
+                "a = \"я\" я",
+                "expected newline or eof",
+            ),
+            (
+                "a = \"я\"\nb = [1, 2\nc = 3\n",
+                3,
+                1,
+                19..19,
+                "c = 3",
+                "expected `]`",
+            ),
+            // At the end of the input, after a line break, a multi-byte
+            // character and neither.
+            ("a = [1\n", 2, 1, 7..7, "", "expected `]`"),
+            ("a = [1, я", 1, 11, 10..10, "a = [1, я", "expected `]`"),
+            ("a = [1", 1, 7, 6..6, "a = [1", "expected `]`"),
+        ] {
+            assert_eq!(
+                parse_error(text.as_bytes()),
+                (line, col, span, snippet.to_owned(), message.to_owned()),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_repeated_object_key_is_placed_at_the_repeat() {
+        for (text, line, col, span) in [
+            ("x = { a = 1, \"a\" = 2 }\n", 1, 14, 13..16),
+            (
+                "y = 1\nx = [{ \"я\" = 1 }, ({ k = { 1 = 1, \"1\" = 2 } })]\n",
+                2,
+                36,
+                41..44,
+            ),
+        ] {
+            let (got_line, got_col, got_span, ..) = parse_error(text.as_bytes());
+            assert_eq!((got_line, got_col, got_span), (line, col, span), "{text}");
+        }
     }
 
     fn write(value: Value) -> Result<String> {

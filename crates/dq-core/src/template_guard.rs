@@ -239,7 +239,8 @@ pub enum TemplateMode {
 ///
 /// [`crate::Error::TemplatedFile`] as above; any error `parse` returns for
 /// the bytes it is handed in the `Allow` and `RawStrings` modes, and for
-/// bytes without a template marker.
+/// bytes without a template marker. A parse error is placed in `bytes`,
+/// with placeholders or not.
 pub fn guarded_parse(
     bytes: &[u8],
     mode: TemplateMode,
@@ -377,8 +378,8 @@ const MAX_FILL: usize = 8;
 ///
 /// # Errors
 ///
-/// The error of `parse`; [`crate::Error::TemplatedFile`] for bytes that
-/// spell every prefix tried.
+/// The error of `parse`, a parse error placed in `bytes`;
+/// [`crate::Error::TemplatedFile`] for bytes that spell every prefix tried.
 fn parse_placeheld(
     bytes: &[u8],
     parse: impl Fn(&[u8]) -> crate::Result<crate::Document>,
@@ -388,7 +389,7 @@ fn parse_placeheld(
     loop {
         let (marks, twin) = Marks::pair(bytes, min_fill);
         let (text, map) = substitute_with(bytes, &marks);
-        let doc = parse(&text)?;
+        let doc = parse(&text).map_err(|e| place_in_source(e, &text, bytes, &marks))?;
         if map.is_empty() || !spells_apart {
             return Ok((doc, map));
         }
@@ -403,6 +404,30 @@ fn parse_placeheld(
         }
         min_fill = marks.fill + 1;
     }
+}
+
+/// `err`, raised on `text` — `bytes` with every template block swapped for a
+/// placeholder of `marks` — placed in `bytes`: an error inside a placeholder
+/// is at its block.
+fn place_in_source(err: crate::Error, text: &[u8], bytes: &[u8], marks: &Marks) -> crate::Error {
+    err.relocated(text, bytes, |at| {
+        // What the text so far holds more than the bytes, and less.
+        let (mut longer, mut shorter) = (0, 0);
+        for (n, block) in substitution_regex().find_iter(bytes).enumerate() {
+            let start = block.start() + longer - shorter;
+            let end = start + marks.name(n).len();
+            if at < end {
+                return if at > start {
+                    block.start()
+                } else {
+                    at + shorter - longer
+                };
+            }
+            longer += marks.name(n).len();
+            shorter += block.len();
+        }
+        at + shorter - longer
+    })
 }
 
 /// The refusal of `bytes` that spell, with escapes, the placeholder text
@@ -845,6 +870,19 @@ pub fn check_templates_kept(
 
     let after = guarded_parse(written, TemplateMode::Guard, &parse).map_err(|err| match err {
         crate::Error::TemplatedFile { line, snippet, .. } => not_kept(line, snippet),
+        // A place in the text dq would write is no place in the file.
+        crate::Error::Parse {
+            line, col, message, ..
+        } => crate::Error::Parse {
+            file: None,
+            line: 0,
+            col: 0,
+            span: 0..0,
+            snippet: String::new(),
+            message: format!(
+                "the text dq would write does not parse: {message} (line {line}, column {col})"
+            ),
+        },
         other => other,
     })?;
     let mut read_back = Found::default();
@@ -1452,6 +1490,71 @@ mod tests {
                 !strings.iter().any(|s| s == "strong"),
                 "{format} {text:?}: {strings:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_parse_error_read_with_placeholders_is_placed_in_the_file() {
+        let json = |b: &[u8]| crate::by_name("json").expect("json").parse(b);
+        for (text, line, col, span) in [
+            // Past a short block and a long one, before a third.
+            (
+                "{\"a\": \"{{ .x }}\", \"b\": \"{{ .Values.long.path }}\", x: \"{{ .y }}\"}\n",
+                1,
+                51,
+                50..51,
+            ),
+            ("{\"a\": \"{{ .x }}\",\n \"b\": ,}\n", 2, 7, 24..25),
+            // A block where no value may be: the block.
+            ("[1,\n {{ .Values.long.path }}]\n", 2, 2, 5..5),
+        ] {
+            match guarded_parse(text.as_bytes(), TemplateMode::RawStrings, json)
+                .expect_err("must fail")
+            {
+                crate::Error::Parse {
+                    line: at_line,
+                    col: at_col,
+                    span: at_span,
+                    snippet,
+                    ..
+                } => {
+                    assert_eq!((at_line, at_col, at_span), (line, col, span), "{text}");
+                    assert!(
+                        text.lines().any(|l| l == snippet),
+                        "{text}: {snippet} is no line of it"
+                    );
+                }
+                other => panic!("{text}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_context_read_with_placeholders_is_placed_in_the_file() {
+        let message =
+            |text: &str| match guarded_parse(text.as_bytes(), TemplateMode::RawStrings, yaml)
+                .expect_err("must fail")
+            {
+                crate::Error::Parse { message, .. } => message,
+                other => panic!("{text}: {other:?}"),
+            };
+        let sequence = "did not find expected ',' or ']', while parsing a flow sequence";
+        for (text, place) in [
+            (
+                "\"{{ .Values.long.path }}\": [1,\nb: 2\n",
+                " at line 1 column 28",
+            ),
+            // Past a block shorter than its placeholder, and one on an
+            // earlier line.
+            ("{{ .x }}: [1,\nb: 2\n", " at line 1 column 11"),
+            (
+                "a: \"{{ .Values.long.path }}\"\nя: [1\nb: 2\n",
+                " at line 2 column 5",
+            ),
+            // At the place of nothing dq moved.
+            ("a: 1\nb: [1\nc: '{{ .x }}'\n", " at line 2 column 4"),
+        ] {
+            assert_eq!(message(text), format!("{sequence}{place}"), "{text}");
         }
     }
 

@@ -18,6 +18,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::hash::BuildHasher as _;
 use std::io::Write;
+use std::str::Utf8Error;
 
 use indexmap::IndexMap;
 use serde::de::{
@@ -27,8 +28,8 @@ use serde_norway::Value as YamlValue;
 
 use crate::Result;
 use crate::WriteOptions;
-use crate::document::{Document, Value};
-use crate::error::Error;
+use crate::document::{Document, Value, bom_end};
+use crate::error::{Error, invalid_utf8_span, split_context};
 use crate::format::Format;
 use crate::write_options::canonicalize_keys;
 
@@ -49,8 +50,12 @@ impl Format for Yaml {
         // A byte order mark is not content. serde_norway's scanner reads a
         // leading one as part of the first line, and a second top-level key
         // then fails with "did not find expected <document start>".
-        let bytes = bytes.strip_prefix("\u{feff}".as_bytes()).unwrap_or(bytes);
-        let mut documents = read_documents(bytes)?;
+        let bom = bom_end(bytes);
+        // What is read may stand in for the file's own text, byte for byte:
+        // an error is placed in the file.
+        let text = &bytes[bom..];
+        let mut documents =
+            read_documents(text).map_err(|e| e.relocated(text, bytes, |at| bom + at))?;
         match documents.len() {
             0 => Ok(Document::value_only(
                 Value::Null,
@@ -126,44 +131,124 @@ impl Format for Yaml {
 /// empty `!!null` node reads as null
 /// ([`super::yaml_numbers::untag_empty_nulls`]).
 fn read_documents(bytes: &[u8]) -> Result<Vec<Value>> {
-    let untagged = super::yaml_numbers::untag_foreign(bytes);
-    let bytes = untagged.as_deref().map_or(bytes, str::as_bytes);
-    let nulls = super::yaml_numbers::untag_empty_nulls(bytes);
-    let bytes = nulls.as_deref().map_or(bytes, str::as_bytes);
-    if !super::yaml_numbers::may_lose_numbers(bytes) {
-        match read_nodes(bytes, true) {
+    // libyaml reads by the block: it meets bytes that are no UTF-8 before
+    // or after another fault, as the size of its buffer has it.
+    let text = std::str::from_utf8(bytes).map_err(|e| no_utf8(bytes, e))?;
+    let untagged = super::yaml_numbers::untag_foreign(text);
+    let text = untagged.as_deref().unwrap_or(text);
+    let nulls = super::yaml_numbers::untag_empty_nulls(text);
+    let text = nulls.as_deref().unwrap_or(text);
+    if !super::yaml_numbers::may_lose_numbers(text.as_bytes()) {
+        match read_nodes(text, true) {
             Ok(nodes) => return Ok(nodes.into_iter().map(node_to_value).collect()),
             Err(err) if is_duplicate_key(&err) || is_tagged_number(&err) => {}
-            Err(err) => return Err(map_yaml_err(err)),
+            Err(err) => return Err(map_yaml_err(&err, text)),
         }
     }
-    super::yaml_numbers::read_exact(bytes)
+    super::yaml_numbers::read_exact(text)
+}
+
+/// The error for `bytes` that are no UTF-8, at the first that are none, in
+/// the words of libyaml's reader, which gives the place of another byte of
+/// the sequence for some.
+fn no_utf8(bytes: &[u8], err: Utf8Error) -> Error {
+    let bad = invalid_utf8_span(bytes, err);
+    // The reader fails on the first sequence it is given.
+    let message = serde_norway::from_slice::<de::IgnoredAny>(&bytes[bad.start..])
+        .err()
+        .map_or_else(
+            || "invalid UTF-8".to_owned(),
+            |err| without_reader_position(&err.to_string()).to_owned(),
+        );
+    Error::parse_at(bytes, bad, message)
+}
+
+/// `message` without the place of an error of libyaml's reader at its end,
+/// ` at position N`.
+fn without_reader_position(message: &str) -> &str {
+    split_reader_position(message).map_or(message, |(problem, _)| problem)
+}
+
+/// `message` split at the byte an error of libyaml's reader names at its
+/// end, ` at position N`.
+fn split_reader_position(message: &str) -> Option<(&str, usize)> {
+    let (problem, offset) = message.rsplit_once(" at position ")?;
+    Some((problem, offset.parse().ok()?))
 }
 
 fn write_one(v: &Value, w: &mut dyn Write) -> Result<()> {
-    let s = super::yaml_emit::to_yaml_string(v).map_err(map_yaml_err)?;
+    // An emitter error is about no source: it has no position.
+    let s = super::yaml_emit::to_yaml_string(v).map_err(|e| map_yaml_err(&e, ""))?;
     write_io(w, s.as_bytes())
 }
 
-pub(super) fn map_yaml_err(e: serde_norway::Error) -> Error {
-    let location = e.location();
-    Error::Parse {
-        file: None,
-        line: location.as_ref().map(|l| l.line() as u32).unwrap_or(0),
-        col: location.as_ref().map(|l| l.column() as u32).unwrap_or(0),
-        span: 0..0,
-        snippet: String::new(),
-        message: e.to_string(),
+/// `err`, which serde_norway raised on `text`, as an [`Error::Parse`]: at
+/// the start of `text` when it has no place (an alias expanded too often),
+/// its message without that place. A place the message gives for its
+/// context (`while parsing a flow sequence at line 3 column 8`) is another
+/// one and stays, with the line and the byte column it has in `text`.
+///
+/// The place is libyaml's mark, whose index counts bytes; its line and
+/// column would not do ([`libyaml_offset`]). An error of libyaml's reader (a
+/// control character) leaves the mark at the start and gives the byte in
+/// its message alone.
+pub(super) fn map_yaml_err(err: &serde_norway::Error, text: &str) -> Error {
+    let bytes = text.as_bytes();
+    let message = err.to_string();
+    let Some(location) = err.location() else {
+        return Error::parse_at(bytes, 0..0, message);
+    };
+    let (line, col) = (location.line(), location.column());
+    if (line, col) == (1, 1)
+        && let Some((problem, at)) = split_reader_position(&message)
+    {
+        return Error::parse_at(bytes, at..at, problem);
     }
+    let own = format!(" at line {line} column {col}");
+    let message = match message.strip_suffix(&own) {
+        Some(problem) => problem.to_owned(),
+        None => message.replacen(&format!("{own}, "), ", ", 1),
+    };
+    let (problem, context) = match split_context(&message) {
+        Some((problem, place)) => (problem, libyaml_offset(text, place)),
+        None => (message.as_str(), None),
+    };
+    let at = location.index();
+    Error::parse_in_context(bytes, at..at, problem, context)
 }
 
-/// Read every document of `bytes` into [`Node`]s. `check_keys` fails on a
+/// The byte of `text` at the 1-based line and column of a libyaml mark: a
+/// line ends at `\r\n`, `\n`, `\r`, NEL, LS or PS, and a column is a
+/// character. `None` when `text` has no such place.
+fn libyaml_offset(text: &str, (line, col): (u32, u32)) -> Option<usize> {
+    let (mut at_line, mut at_col) = (1, 1);
+    let mut chars = text.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        if (at_line, at_col) == (line, col) {
+            return Some(at);
+        }
+        let ends_line = match c {
+            '\r' => !matches!(chars.peek(), Some((_, '\n'))),
+            '\n' | '\u{85}' | '\u{2028}' | '\u{2029}' => true,
+            _ => false,
+        };
+        if ends_line {
+            at_line += 1;
+            at_col = 1;
+        } else {
+            at_col += 1;
+        }
+    }
+    ((at_line, at_col) == (line, col)).then_some(text.len())
+}
+
+/// Read every document of `text` into [`Node`]s. `check_keys` fails on a
 /// mapping key that may repeat one before it ([`NodeVisitor`]).
 pub(super) fn read_nodes(
-    bytes: &[u8],
+    text: &str,
     check_keys: bool,
 ) -> std::result::Result<Vec<Node>, serde_norway::Error> {
-    serde_norway::Deserializer::from_slice(bytes)
+    serde_norway::Deserializer::from_str(text)
         .map(|document| NodeSeed { check_keys }.deserialize(document))
         .collect()
 }
@@ -559,45 +644,30 @@ mod tests {
         // Worded as serde_norway words it, naming the first key, at the
         // second one.
         for (text, message, line, col) in [
-            (
-                "a: 1\na: 2\n",
-                "duplicate entry with key \"a\" at line 2 column 1",
-                2,
-                1,
-            ),
-            (
-                "1: 1\n1: 2\n",
-                "duplicate entry with key 1 at line 2 column 1",
-                2,
-                1,
-            ),
+            ("a: 1\na: 2\n", "duplicate entry with key \"a\"", 2, 1),
+            ("1: 1\n1: 2\n", "duplicate entry with key 1", 2, 1),
             (
                 "18446744073709551616: 1\n18446744073709551616: 2\n",
-                "duplicate entry with key 18446744073709551616 at line 2 column 1",
+                "duplicate entry with key 18446744073709551616",
                 2,
                 1,
             ),
             (
                 "18446744073709551616: 1\n'18446744073709551616': 2\n",
-                "duplicate entry with key 18446744073709551616 at line 2 column 1",
+                "duplicate entry with key 18446744073709551616",
                 2,
                 1,
             ),
             (
                 "x:\n  - {~: 1, null: 2}\n",
-                "x[0]: duplicate entry with null key at line 2 column 12",
+                "x[0]: duplicate entry with null key",
                 2,
                 12,
             ),
-            (
-                "[1]: 1\n[1]: 2\n",
-                "duplicate entry in YAML map at line 2 column 1",
-                2,
-                1,
-            ),
+            ("[1]: 1\n[1]: 2\n", "duplicate entry in YAML map", 2, 1),
             (
                 "y: {true: 1, 'true': 2}\n",
-                "y: duplicate entry with key `true` at line 1 column 14",
+                "y: duplicate entry with key `true`",
                 1,
                 14,
             ),
@@ -626,8 +696,127 @@ mod tests {
             .map_err(|e| e.to_string());
         let theirs = serde_norway::from_str::<YamlValue>(text)
             .map(|_| ())
-            .map_err(|e| map_yaml_err(e).to_string());
+            .map_err(|e| map_yaml_err(&e, text).to_string());
         assert_eq!(ours, theirs);
+    }
+
+    /// `(line, col, span, snippet, message)` of the error `bytes` fail with.
+    fn parse_error(bytes: &[u8]) -> (u32, u32, std::ops::Range<usize>, String, String) {
+        match Yaml.parse(bytes).expect_err("must fail") {
+            Error::Parse {
+                file: None,
+                line,
+                col,
+                span,
+                snippet,
+                message,
+            } => (line, col, span, snippet, message),
+            other => panic!("expected a parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_parse_error_is_at_the_byte_libyaml_marks() {
+        let token =
+            "found character that cannot start any token, while scanning for the next token";
+        for (text, line, col, span, snippet, message) in [
+            // Columns in bytes; later documents; a byte order mark, CRLF.
+            ("я: @x\n", 1, 5, 4..4, "я: @x", token),
+            ("a: 1\n---\nя: @x\n", 3, 5, 13..13, "я: @x", token),
+            ("\u{feff}a: 1\r\nb: @x\r\n", 2, 4, 12..12, "b: @x", token),
+            ("a: 1\rb: @x\r", 2, 4, 8..8, "b: @x", token),
+            // A line break to libyaml alone.
+            ("a: \"x\u{2028}y\"\nb: @x\n", 2, 4, 14..14, "b: @x", token),
+            // A context position stays; the end of the input.
+            (
+                "a:\n  b: [1",
+                2,
+                8,
+                10..10,
+                "  b: [1",
+                "did not find expected ',' or ']', while parsing a flow sequence at line 2 column 6",
+            ),
+            // libyaml's reader gives the byte in its message alone.
+            (
+                "я: 1\nb: \u{1}\n",
+                2,
+                4,
+                9..9,
+                "b: \u{1}",
+                "control characters are not allowed",
+            ),
+            // The key of a second entry, without the blank after it.
+            (
+                "я: {\"ю\": 1, \"ю\" : 2}\n",
+                1,
+                15,
+                14..18,
+                "я: {\"ю\": 1, \"ю\" : 2}",
+                "я: duplicate entry with key \"ю\"",
+            ),
+            // Read with the tag rewritten: the file's own line is shown.
+            (
+                "%TAG !! tag:x.org,2000:\n---\nя: !!str 1\nb: @x\n",
+                4,
+                4,
+                43..43,
+                "b: @x",
+                token,
+            ),
+        ] {
+            assert_eq!(
+                parse_error(text.as_bytes()),
+                (line, col, span, snippet.to_owned(), message.to_owned()),
+                "{text:?}"
+            );
+        }
+        assert_eq!(
+            parse_error(b"a: 1\nb: x\xFF\n"),
+            (
+                2,
+                5,
+                9..10,
+                "b: x\u{fffd}".to_owned(),
+                "invalid leading UTF-8 octet".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn libyaml_offset_counts_lines_and_columns_as_libyaml_does() {
+        let text = "я1\r\nb\rc\u{85}d\u{2028}e\u{2029}f";
+        for (place, at) in [
+            ((1, 1), Some(0)),
+            ((1, 2), Some(2)),
+            ((2, 1), text.find('b')),
+            ((3, 1), text.find('c')),
+            ((4, 1), text.find('d')),
+            ((5, 1), text.find('e')),
+            ((6, 1), text.find('f')),
+            ((6, 2), Some(text.len())),
+            ((6, 3), None),
+            ((7, 1), None),
+            ((3, 9), None),
+        ] {
+            assert_eq!(libyaml_offset(text, place), at, "{place:?}");
+        }
+    }
+
+    #[test]
+    fn a_place_in_bytes_that_are_no_utf8_is_the_first_of_them() {
+        // libyaml reads the second key first.
+        let mut bytes = b"a: 1\n".repeat(5000);
+        bytes.extend(b"b: \xE9 x\n");
+        assert_eq!(
+            parse_error(&bytes),
+            (
+                5001,
+                4,
+                25_003..25_004,
+                "b: \u{fffd} x".to_owned(),
+                "invalid trailing UTF-8 octet".to_owned()
+            )
+        );
     }
 
     #[test]

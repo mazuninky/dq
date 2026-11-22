@@ -132,7 +132,7 @@ use std::borrow::Cow;
 use std::io::{Cursor, Write};
 
 use camino::Utf8PathBuf;
-use encoding_rs::{Encoding, REPLACEMENT, UTF_8, UTF_16BE, UTF_16LE};
+use encoding_rs::{DecoderResult, Encoding, REPLACEMENT, UTF_8, UTF_16BE, UTF_16LE};
 use indexmap::IndexMap;
 use quick_xml::events::attributes::{AttrError, Attribute};
 use quick_xml::events::{
@@ -184,11 +184,12 @@ impl Format for Xml {
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<Document> {
-        let (value, top) = parse_xml_with_order(bytes).map_err(with_position)?;
+        let (value, top) = parse_xml_with_order(bytes)?;
         // The line break the file uses, from its first: decoded, as the
         // file may be UTF-16.
-        let crlf = decode_input(bytes)
-            .is_ok_and(|(text, ..)| text.find('\n').is_some_and(|at| text[..at].ends_with('\r')));
+        let crlf = decode_input(bytes).is_ok_and(|Decoded { text, .. }| {
+            text.find('\n').is_some_and(|at| text[..at].ends_with('\r'))
+        });
         Ok(Document::value_only(value, FormatTag::Xml)
             .with_layout(Layout::Xml(XmlLayout { crlf, top }))
             .with_source_bytes(bytes))
@@ -405,8 +406,19 @@ fn parse_xml(bytes: &[u8]) -> Result<Value> {
 
 /// [`parse_xml`], and the order of the items at the top level.
 fn parse_xml_with_order(bytes: &[u8]) -> Result<(Value, Vec<TopItem>)> {
-    let (text, bom, detected) = decode_input(bytes)?;
-    let text: &str = &text;
+    let input = decode_input(bytes)?;
+    parse_text(&input.text, input.bom, input.detected)
+        .map_err(|e| place_in_file(e, bytes, input.start, input.charset))
+}
+
+/// [`parse_xml_with_order`] for the `text` of a file that began with `bom`
+/// and, with none, in the encoding `detected`. An error is placed in
+/// `text`.
+fn parse_text(
+    text: &str,
+    bom: Option<Bom>,
+    detected: Option<Bom>,
+) -> Result<(Value, Vec<TopItem>)> {
     // The characters a document may hold depend on its version, which
     // its declaration, ahead of every other character, gives.
     // Its line ends, and its namespaces (Namespaces in XML 1.1 for a 1.1
@@ -600,35 +612,19 @@ fn parse_xml_with_order(bytes: &[u8]) -> Result<(Value, Vec<TopItem>)> {
             }
             Ok(Event::End(end)) => {
                 let Some(frame) = stack.pop() else {
-                    let pos = event_start;
-                    let (line, col) = byte_pos_to_line_col(text, pos);
-                    return Err(Error::Parse {
-                        file: None,
-                        line,
-                        col,
-                        span: pos..pos,
-                        snippet: snippet_for_pos(text, pos),
-                        message: format!(
-                            "XML parse error: unexpected closing tag </{}>",
-                            end.name().as_ref(),
-                        ),
-                    });
+                    return Err(parse_error_at(
+                        text,
+                        event_start,
+                        format!("unexpected closing tag </{}>", end.name().as_ref()),
+                    ));
                 };
                 let end_name = end.name().as_ref().to_owned();
                 if end_name != frame.tag {
-                    let pos = event_start;
-                    let (line, col) = byte_pos_to_line_col(text, pos);
-                    return Err(Error::Parse {
-                        file: None,
-                        line,
-                        col,
-                        span: pos..pos,
-                        snippet: snippet_for_pos(text, pos),
-                        message: format!(
-                            "XML parse error: closing tag </{}> does not match <{}>",
-                            end_name, frame.tag,
-                        ),
-                    });
+                    return Err(parse_error_at(
+                        text,
+                        event_start,
+                        format!("closing tag </{end_name}> does not match <{}>", frame.tag),
+                    ));
                 }
                 let path = element_path(&stack, &frame.tag);
                 let tag = frame.tag.clone();
@@ -882,9 +878,22 @@ fn names_utf16_byte_order(label: &str) -> bool {
     label.eq_ignore_ascii_case("utf-16le") || label.eq_ignore_ascii_case("utf-16be")
 }
 
-/// The text of an XML file, the BOM it began with, and — for UTF-16 with
-/// no BOM whose declaration names no byte order — the byte order it was
-/// read in ([`Bom::Utf16Le`] / [`Bom::Utf16Be`]). The encoding is the
+/// An XML file as [`decode_input`] reads it.
+struct Decoded<'b> {
+    /// Its text, without its BOM.
+    text: Cow<'b, str>,
+    /// The BOM it began with.
+    bom: Option<Bom>,
+    /// For UTF-16 with no BOM whose declaration names no byte order, the
+    /// byte order it was read in ([`Bom::Utf16Le`] / [`Bom::Utf16Be`]).
+    detected: Option<Bom>,
+    /// What the bytes past the BOM were read as.
+    charset: Charset,
+    /// Where those bytes begin.
+    start: usize,
+}
+
+/// The text of an XML file and how it was read. The encoding is the
 /// BOM's, else UTF-16 when the file starts `<?` in 16-bit units, else the
 /// one the declaration names if its declaration reads in ASCII (US-ASCII,
 /// ISO-8859-1, windows-1252, Shift_JIS, ISO-2022-JP, …), else UTF-8. A
@@ -894,38 +903,36 @@ fn names_utf16_byte_order(label: &str) -> bool {
 /// encoding_rs decodes to nothing but U+FFFD), and one the BOM, or the
 /// UTF-16 the file begins in, contradicts. The writer refuses the same
 /// labels.
-fn decode_input(bytes: &[u8]) -> Result<(Cow<'_, str>, Option<Bom>, Option<Bom>)> {
+fn decode_input(bytes: &[u8]) -> Result<Decoded<'_>> {
     use quick_xml::encoding::{DetectedEncoding, detect_encoding};
-    let (bom, detected, body, utf16) = match detect_encoding(bytes) {
-        Some(DetectedEncoding::Utf16LeBom) => {
-            (Some(Bom::Utf16Le), None, &bytes[2..], Some(UTF_16LE))
-        }
-        Some(DetectedEncoding::Utf16BeBom) => {
-            (Some(Bom::Utf16Be), None, &bytes[2..], Some(UTF_16BE))
-        }
-        Some(DetectedEncoding::Utf8Bom) => (Some(Bom::Utf8), None, &bytes[3..], None),
-        Some(DetectedEncoding::Utf16LeLike) => (None, Some(Bom::Utf16Le), bytes, Some(UTF_16LE)),
-        Some(DetectedEncoding::Utf16BeLike) => (None, Some(Bom::Utf16Be), bytes, Some(UTF_16BE)),
-        _ => (None, None, bytes, None),
+    let (bom, detected, start, utf16) = match detect_encoding(bytes) {
+        Some(DetectedEncoding::Utf16LeBom) => (Some(Bom::Utf16Le), None, 2, Some(UTF_16LE)),
+        Some(DetectedEncoding::Utf16BeBom) => (Some(Bom::Utf16Be), None, 2, Some(UTF_16BE)),
+        Some(DetectedEncoding::Utf8Bom) => (Some(Bom::Utf8), None, 3, None),
+        Some(DetectedEncoding::Utf16LeLike) => (None, Some(Bom::Utf16Le), 0, Some(UTF_16LE)),
+        Some(DetectedEncoding::Utf16BeLike) => (None, Some(Bom::Utf16Be), 0, Some(UTF_16BE)),
+        _ => (None, None, 0, None),
     };
-    let invalid = |message: String| Error::Parse {
-        file: None,
-        line: 0,
-        col: 0,
-        span: 0..0,
-        snippet: String::new(),
-        message,
-    };
+    let body = &bytes[start..];
     if let Some(encoding) = utf16 {
+        let charset = Charset::Whatwg(encoding);
         let text = quick_xml::encoding::decode(body, encoding)
-            .map_err(|_| invalid(format!("invalid {} in XML input", encoding.name())))?;
-        let label = declared_label(text.as_bytes(), bom, detected)?;
+            .map_err(|_| malformed_input(bytes, start, encoding))?;
+        let label = declared_label(text.as_bytes(), bom, detected)
+            .map_err(|e| place_in_file(e, bytes, start, charset))?;
         // `UTF-16LE` / `UTF-16BE` keep the byte order themselves.
         let detected = detected.filter(|_| !label.is_some_and(names_utf16_byte_order));
-        return Ok((text, bom, detected));
+        return Ok(Decoded {
+            text,
+            bom,
+            detected,
+            charset,
+            start,
+        });
     }
     // Every 8-bit encoding read here spells the declaration in ASCII.
-    let label = declared_label(body, bom, detected)?;
+    let label = declared_label(body, bom, detected)
+        .map_err(|e| e.relocated(body, bytes, |at| start + at))?;
     // A UTF-16 label over 8-bit bytes reads as UTF-8, by the bytes, and
     // says so in `detected`. ISO-2022-JP is not ASCII-compatible to
     // encoding_rs, but it starts in ASCII, so its declaration reads as
@@ -940,25 +947,111 @@ fn decode_input(bytes: &[u8]) -> Result<(Cow<'_, str>, Option<Bom>, Option<Bom>)
     let text = match charset {
         Charset::Ascii => {
             if let Some(index) = body.iter().position(|b| !b.is_ascii()) {
-                return Err(invalid(format!(
-                    "invalid US-ASCII in XML input: byte 0x{:02X} at index {index}",
-                    body[index],
-                )));
+                let at = start + index;
+                return Err(Error::parse_at(
+                    bytes,
+                    at..at + 1,
+                    format!("invalid US-ASCII in XML input: byte 0x{:02X}", body[index]),
+                ));
             }
-            let text = std::str::from_utf8(body)
-                .map_err(|e| invalid(format!("invalid US-ASCII in XML input: {e}")))?;
-            Cow::Borrowed(text)
+            String::from_utf8_lossy(body)
         }
         Charset::Latin1 => Cow::Owned(body.iter().map(|&b| char::from(b)).collect()),
         Charset::Whatwg(encoding) if encoding == UTF_8 => {
-            let text = std::str::from_utf8(body)
-                .map_err(|e| invalid(format!("invalid UTF-8 in XML input: {e}")))?;
+            let text = std::str::from_utf8(body).map_err(|e| {
+                Error::invalid_utf8(body, e, "XML").relocated(body, bytes, |at| start + at)
+            })?;
             Cow::Borrowed(text)
         }
         Charset::Whatwg(encoding) => quick_xml::encoding::decode(body, encoding)
-            .map_err(|_| invalid(format!("invalid {} in XML input", encoding.name())))?,
+            .map_err(|_| malformed_input(bytes, start, encoding))?,
     };
-    Ok((text, bom, detected))
+    Ok(Decoded {
+        text,
+        bom,
+        detected,
+        charset,
+        start,
+    })
+}
+
+/// The error for `bytes` whose `bytes[start..]` are no valid `encoding`, at
+/// the first sequence that is not.
+fn malformed_input(bytes: &[u8], start: usize, encoding: &'static Encoding) -> Error {
+    let charset = Charset::Whatwg(encoding);
+    let body = &bytes[start..];
+    // Up to it, the text is the one a lenient reader makes of it.
+    let (_, at) = read_up_to(charset, body, usize::MAX);
+    let (text, _) = encoding.decode_without_bom_handling(body);
+    place_in_file(
+        Error::parse_at(
+            text.as_bytes(),
+            at..at,
+            format!("invalid {} in XML input", encoding.name()),
+        ),
+        bytes,
+        start,
+        charset,
+    )
+}
+
+/// `err`, placed in the text that `bytes[start..]` are in `charset`, placed
+/// in the file `bytes`. Where the text's bytes are not the file's, only the
+/// span is the file's: the line, the column and the source line stay those
+/// of the text.
+fn place_in_file(err: Error, bytes: &[u8], start: usize, charset: Charset) -> Error {
+    let utf8 = match charset {
+        Charset::Ascii => true,
+        Charset::Latin1 => false,
+        Charset::Whatwg(encoding) => encoding == UTF_8,
+    };
+    if utf8 {
+        return err.relocated(bytes.get(start..).unwrap_or_default(), bytes, |at| {
+            start + at
+        });
+    }
+    let mut err = err;
+    if let Error::Parse { span, .. } = &mut err {
+        let in_file = |at| start + read_up_to(charset, &bytes[start..], at).0;
+        *span = in_file(span.start)..in_file(span.end);
+    }
+    err
+}
+
+/// Read `body` in `charset` up to where its text is `at` bytes long, to the
+/// first malformed sequence, or to its end: that place in `body` and in the
+/// text. In a stateful encoding (ISO-2022-JP) the place stops before an
+/// escape sequence that puts out no text, so a span can start at the escape
+/// rather than at the character after it.
+fn read_up_to(charset: Charset, body: &[u8], at: usize) -> (usize, usize) {
+    let mut written = 0;
+    let Charset::Whatwg(encoding) = charset else {
+        // One byte is one character.
+        for (read, &b) in body.iter().enumerate() {
+            if written >= at {
+                return (read, written);
+            }
+            written += char::from(b).len_utf8();
+        }
+        return (body.len(), written);
+    };
+    let mut decoder = encoding.new_decoder_without_bom_handling();
+    // One byte of input ends at most two characters.
+    let mut out = [0; 16];
+    for read in 0..body.len() {
+        if written >= at {
+            return (read, written);
+        }
+        let last = read + 1 == body.len();
+        let (result, _, n) =
+            decoder.decode_to_utf8_without_replacement(&body[read..=read], &mut out, last);
+        written += n;
+        if let DecoderResult::Malformed(bad, after) = result {
+            let back = usize::from(bad) + usize::from(after);
+            return ((read + 1).saturating_sub(back), written);
+        }
+    }
+    (body.len(), written)
 }
 
 /// The `encoding` label of the XML declaration `head` begins with, if any,
@@ -967,12 +1060,7 @@ fn decode_input(bytes: &[u8]) -> Result<(Cow<'_, str>, Option<Bom>, Option<Bom>)
 /// in the UTF-16 byte order `detected` with no BOM. A refusal is placed in
 /// `head`, at the declaration's fault or at the label.
 fn declared_label(head: &[u8], bom: Option<Bom>, detected: Option<Bom>) -> Result<Option<&str>> {
-    // The declaration, through its `?>`: what a refusal shows around it.
-    let shown = head
-        .windows(2)
-        .position(|pair| pair == b"?>")
-        .map_or(head, |end| &head[..end + b"?>".len()]);
-    let decl = read_declaration(head).map_err(|e| declaration_error(shown, e))?;
+    let decl = read_declaration(head).map_err(|e| declaration_error(head, e))?;
     let Some(XmlDecl {
         encoding: Some(label),
         ..
@@ -984,7 +1072,7 @@ fn declared_label(head: &[u8], bom: Option<Bom>, detected: Option<Bom>) -> Resul
         None => Ok(Some(label)),
         Some(message) => {
             let pos = (label.as_ptr() as usize).saturating_sub(head.as_ptr() as usize);
-            Err(declaration_error(shown, (pos, message)))
+            Err(declaration_error(head, (pos, message)))
         }
     }
 }
@@ -1266,7 +1354,7 @@ fn read_declaration(bytes: &[u8]) -> std::result::Result<Option<XmlDecl<'_>>, (u
 /// Every byte before the place is ASCII (a non-ASCII value is refused at
 /// its start), so it counts the same in the text `bytes` decode to.
 fn declaration_error(bytes: &[u8], (pos, message): (usize, String)) -> Error {
-    parse_error_at(&String::from_utf8_lossy(bytes), pos, message)
+    xml_error(bytes, pos, &message)
 }
 
 /// Why the reader refuses `label`, the declaration's `encoding`, in a file
@@ -1299,8 +1387,6 @@ fn label_refusal(label: &str, bom: Option<Bom>, detected: Option<Bom>) -> Option
     }
 }
 
-/// Build a [`Frame`] from a `<tag attr="...">` event.
-/// A parse error at byte `pos` of `text`, `XML parse error: ` + `message`.
 /// Where in `text` the name at fault in the start tag `start` (which
 /// begins at `event_start`, its `<`) begins: the attribute `attr`, else the
 /// element's name, just past the `<`. The reader borrows its events from
@@ -1468,47 +1554,14 @@ fn attr_refusal(e: &AttrError, content: &str, tag: &str) -> (usize, String) {
     }
 }
 
-/// `e` with its line and column in the message too, `XML parse error at
-/// line 2, column 4: …`, as the HCL and YAML readers put theirs — the
-/// message is all `convert` or `get` print. An error with no position
-/// (line 0: the encoding, told before there is text to count lines in)
-/// is left as it is.
-fn with_position(e: Error) -> Error {
-    match e {
-        Error::Parse {
-            file,
-            line,
-            col,
-            span,
-            snippet,
-            message,
-        } if line > 0 => {
-            let rest = message
-                .strip_prefix("XML parse error: ")
-                .unwrap_or(&message);
-            Error::Parse {
-                message: format!("XML parse error at line {line}, column {col}: {rest}"),
-                file,
-                line,
-                col,
-                span,
-                snippet,
-            }
-        }
-        other => other,
-    }
+/// A parse error at byte `pos` of `text`, `XML parse error: ` + `message`.
+fn parse_error_at(text: &str, pos: usize, message: String) -> Error {
+    xml_error(text.as_bytes(), pos, &message)
 }
 
-fn parse_error_at(text: &str, pos: usize, message: String) -> Error {
-    let (line, col) = byte_pos_to_line_col(text, pos);
-    Error::Parse {
-        file: None,
-        line,
-        col,
-        span: pos..pos,
-        snippet: snippet_for_pos(text, pos),
-        message: format!("XML parse error: {message}"),
-    }
+/// A parse error at byte `pos` of `bytes`, `XML parse error: ` + `message`.
+fn xml_error(bytes: &[u8], pos: usize, message: &str) -> Error {
+    Error::parse_at(bytes, pos..pos, format!("XML parse error: {message}"))
 }
 
 /// Record on `frame` the prefixes its attributes declare or undeclare,
@@ -1845,39 +1898,6 @@ fn element_path(stack: &[Frame], current_tag: &str) -> String {
     path.push('/');
     path.push_str(current_tag);
     path
-}
-
-fn byte_pos_to_line_col(text: &str, pos: usize) -> (u32, u32) {
-    let pos = pos.min(text.len());
-    let mut line: u32 = 1;
-    let mut col: u32 = 1;
-    for (i, ch) in text.char_indices() {
-        if i >= pos {
-            break;
-        }
-        if ch == '\n' {
-            line += 1;
-            col = 1;
-        } else {
-            col += 1;
-        }
-    }
-    (line, col)
-}
-
-fn snippet_for_pos(text: &str, pos: usize) -> String {
-    let pos = pos.min(text.len());
-    let start = pos.saturating_sub(20);
-    let end = (pos + 20).min(text.len());
-    // Snap to char boundaries.
-    let start = (0..=start)
-        .rev()
-        .find(|&i| text.is_char_boundary(i))
-        .unwrap_or(0);
-    let end = (end..=text.len())
-        .find(|&i| text.is_char_boundary(i))
-        .unwrap_or(text.len());
-    text[start..end].replace('\n', "\\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -3689,7 +3709,7 @@ mod tests {
     #[test]
     fn a_file_is_decoded_per_its_bom_or_declared_encoding() {
         let latin = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><r>caf\xe9</r>";
-        let (text, bom, _) = decode_input(latin).expect("decodes");
+        let Decoded { text, bom, .. } = decode_input(latin).expect("decodes");
         assert!(
             text.ends_with("<r>caf\u{e9}</r>") && bom.is_none(),
             "{text}"
@@ -3697,7 +3717,7 @@ mod tests {
 
         let mut utf16 = vec![0xFE, 0xFF];
         utf16.extend("<r>\u{e9}</r>".encode_utf16().flat_map(u16::to_be_bytes));
-        let (text, bom, _) = decode_input(&utf16).expect("decodes");
+        let Decoded { text, bom, .. } = decode_input(&utf16).expect("decodes");
         assert_eq!((text.as_ref(), bom), ("<r>\u{e9}</r>", Some(Bom::Utf16Be)));
 
         // ISO-8859-1 is byte = code point (0x80 a C1 control), windows-1252
@@ -3709,24 +3729,22 @@ mod tests {
         ] {
             let mut xml = format!("<?xml version='1.0' encoding='{label}'?><r>").into_bytes();
             xml.extend(b"\x80</r>");
-            let (text, ..) = decode_input(&xml).expect("decodes");
+            let Decoded { text, .. } = decode_input(&xml).expect("decodes");
             assert!(
                 text.ends_with(&format!("<r>{expected}</r>")),
                 "{label}: {text}"
             );
         }
         let ascii = b"<?xml version='1.0' encoding='US-ASCII'?><r>caf\xe9</r>";
-        let Err(Error::Parse { message, .. }) = decode_input(ascii) else {
+        let Err(Error::Parse { message, span, .. }) = decode_input(ascii) else {
             panic!("US-ASCII with a byte above 0x7F must be a parse error");
         };
-        assert_eq!(
-            message,
-            "invalid US-ASCII in XML input: byte 0xE9 at index 47"
-        );
+        assert_eq!(message, "invalid US-ASCII in XML input: byte 0xE9");
+        assert_eq!(span, 47..48);
 
         // A BOM keeps its own encoding: one the declaration contradicts, and
         // an `encoding` that is no encoding name, are parse errors.
-        let (text, bom, _) = decode_input(b"\xEF\xBB\xBF<r/>").expect("decodes");
+        let Decoded { text, bom, .. } = decode_input(b"\xEF\xBB\xBF<r/>").expect("decodes");
         assert_eq!((text.as_ref(), bom), ("<r/>", Some(Bom::Utf8)));
         for bytes in [
             &b"\xEF\xBB\xBF<?xml version='1.0' encoding='latin1'?><r/>"[..],
@@ -3765,7 +3783,12 @@ mod tests {
         ] {
             let xml = format!("{decl}<r>\u{e9}</r>");
             let bytes = bare(&xml, big_endian);
-            let (text, bom, order) = decode_input(&bytes).expect("decodes");
+            let Decoded {
+                text,
+                bom,
+                detected: order,
+                ..
+            } = decode_input(&bytes).expect("decodes");
             assert_eq!((text.as_ref(), bom, order), (xml.as_str(), None, detected));
         }
         for (label, big_endian, order) in [
@@ -3791,16 +3814,24 @@ mod tests {
         // ISO-2022-JP reads as itself.
         for label in ["UTF-16", "utf-16le", "unicode"] {
             let xml = format!("<?xml version=\"1.0\" encoding='{label}'?><r>\u{e9}</r>");
-            let (text, bom, detected) = decode_input(xml.as_bytes()).expect("decodes");
+            let Decoded {
+                text,
+                bom,
+                detected,
+                ..
+            } = decode_input(xml.as_bytes()).expect("decodes");
             assert_eq!(
                 (text.as_ref(), bom, detected),
                 (xml.as_str(), None, Some(Bom::Utf8))
             );
         }
         let xml = "<?xml version=\"1.0\" encoding='UTF-8'?><r/>";
-        assert_eq!(decode_input(xml.as_bytes()).expect("decodes").2, None);
+        assert_eq!(
+            decode_input(xml.as_bytes()).expect("decodes").detected,
+            None
+        );
         let jis = b"<?xml version='1.0' encoding='ISO-2022-JP'?><r>\x1b$B$\x22\x1b(B</r>";
-        let (text, ..) = decode_input(jis).expect("decodes");
+        let Decoded { text, .. } = decode_input(jis).expect("decodes");
         assert!(text.ends_with("<r>\u{3042}</r>"), "{text}");
         // A label dq does not know, or cannot read, is a parse error.
         for (label, why) in [
@@ -4044,7 +4075,7 @@ mod tests {
         let (line, col, message) = at("<r>\n  <k b=\" a:x=1\" a:x=\"2\"/>\n</r>");
         assert_eq!((line, col), (2, 17));
         assert!(
-            message.starts_with("XML parse error at line 2, column 17: attribute 'a:x' on <k>"),
+            message.starts_with("XML parse error: attribute 'a:x' on <k>"),
             "{message}"
         );
         let place = |xml: &str| {
@@ -4068,14 +4099,101 @@ mod tests {
         let (line, col, message) = at("<?xml version=\"1.0\" encoding=\"UTF-32\"?><r/>");
         assert_eq!((line, col), (1, 31));
         assert!(
-            message.starts_with(
-                "XML parse error at line 1, column 31: the XML declaration's encoding"
-            ),
+            message.starts_with("XML parse error: the XML declaration's encoding"),
             "{message}"
         );
         assert_eq!(
             place("\u{FEFF}<?xml version=\"1.0\"\n  encoding='ISO-8859-1'?><r/>"),
             (2, 13)
+        );
+    }
+
+    /// `(line, col, span, snippet, message)` of the error `bytes` fail with.
+    fn parse_error(bytes: &[u8]) -> (u32, u32, std::ops::Range<usize>, String, String) {
+        match Xml.parse(bytes).expect_err("must fail") {
+            Error::Parse {
+                file: None,
+                line,
+                col,
+                span,
+                snippet,
+                message,
+            } => (line, col, span, snippet, message),
+            other => panic!("expected a parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_parse_error_is_placed_in_the_file_whatever_its_encoding() {
+        let message = "XML parse error: closing tag </s> does not match <r>";
+        let utf16 = |text: &str| {
+            let mut bytes = b"\xFF\xFE".to_vec();
+            bytes.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+            bytes
+        };
+        let declared = |encoding: &str, body: &[u8]| {
+            let mut bytes = format!("<?xml version='1.0' encoding='{encoding}'?>\n").into_bytes();
+            let start = bytes.len();
+            bytes.extend(body);
+            (bytes, start)
+        };
+        // The line and the column are those of the text, the span the file's.
+        assert_eq!(
+            parse_error("\u{feff}<!--я-->\r\n<r>é</s>".as_bytes()),
+            (2, 6, 19..19, "<r>é</s>".to_owned(), message.to_owned())
+        );
+        assert_eq!(
+            parse_error(&utf16("<!--я-->\n<r>\u{1f600}</s>")),
+            (
+                2,
+                8,
+                30..30,
+                "<r>\u{1f600}</s>".to_owned(),
+                message.to_owned()
+            )
+        );
+        for (encoding, raw, text, read) in [
+            ("ISO-8859-1", &b"<r>\xE9</s>"[..], "<r>é</s>", 4),
+            ("windows-1251", b"<r>\xFF</s>", "<r>я</s>", 4),
+            ("Shift_JIS", b"<r>\x93\xFA</s>", "<r>日</s>", 5),
+        ] {
+            let (bytes, start) = declared(encoding, raw);
+            let col = u32::try_from(text.len() - "</s>".len() + 1).expect("short");
+            assert_eq!(
+                parse_error(&bytes),
+                (
+                    2,
+                    col,
+                    start + read..start + read,
+                    text.to_owned(),
+                    message.to_owned()
+                ),
+                "{encoding}"
+            );
+        }
+        // Not in the encoding: at the first byte that is not.
+        let (bytes, start) = declared("Shift_JIS", b"<r>\x93\xFA\x93</r>");
+        assert_eq!(
+            parse_error(&bytes),
+            (
+                2,
+                7,
+                start + 5..start + 5,
+                "<r>日\u{fffd}</r>".to_owned(),
+                "invalid Shift_JIS in XML input".to_owned()
+            )
+        );
+        let (line, col, span, ..) = parse_error(b"\xFF\xFE<\0a\0/\0>\0\x00\xD8>\0");
+        assert_eq!((line, col, span), (1, 5, 10..10));
+        assert_eq!(
+            parse_error(b"\xEF\xBB\xBF<r>\n\xFF</r>"),
+            (
+                2,
+                1,
+                7..8,
+                "\u{fffd}</r>".to_owned(),
+                "invalid UTF-8 in XML input: invalid utf-8 sequence of 1 bytes".to_owned()
+            )
         );
     }
 

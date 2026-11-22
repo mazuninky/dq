@@ -1,6 +1,6 @@
 # Structured errors: a caret under the offending byte, a JSON error object under `-F json`
 
-**Status: accepted (2026-11-22).** Nothing is implemented yet. The owner accepted every recommendation; the decisions are at the end. Phase 1 comes first.
+**Status: in progress (2026-11-22).** Phase 1 (positions) is done; phases 2 to 4 are open. The owner accepted every recommendation; the decisions are at the end.
 
 Agent-first error output was a founding goal of dq ([archive/dq-plan-2026-05.md](../archive/dq-plan-2026-05.md)): errors with line, column, span, snippet, suggestions, and a machine-readable form under `-F json`. The suggestions shipped (`did_you_mean`, the matched prefix). The caret and the JSON form did not. [roadmap.md](../roadmap.md) and [reference/cli.md](../reference/cli.md) list both as missing.
 
@@ -61,8 +61,6 @@ New in [crates/dq-core/src/error.rs](../../crates/dq-core/src/error.rs):
 impl Error {
     /// A parse error at byte `span` of `bytes`: line, column and the source line are derived here.
     pub fn parse_at(bytes: &[u8], span: Range<usize>, message: impl Into<String>) -> Self;
-    /// The same from a 1-based line and a 1-based *character* column (saphyr, csv).
-    pub fn parse_at_line_col(bytes: &[u8], line: u32, char_col: u32, message: impl Into<String>) -> Self;
 }
 ```
 
@@ -74,7 +72,7 @@ impl Error {
 - Invalid UTF-8 points at the first bad byte.
 - Front matter positions are mapped to the outer file.
 
-Every constructor of `Error::Parse` in the parsers (57 sites in 14 files) moves to these helpers. `Error::Parse` itself keeps its fields, so `validate` and `lint` only get better values, not a new shape.
+Every constructor of `Error::Parse` in the parsers moves to this helper. `parse_at_line_col` was planned for parsers that report a line and a character column; every parser turned out to offer a byte offset or something the helper must not share, so it was dropped. (The count at the time: 57 sites in 14 files.) `Error::Parse` itself keeps its fields, so `validate` and `lint` only get better values, not a new shape.
 
 ### 2. Console rendering (dq-cli)
 
@@ -151,7 +149,7 @@ jq compile error: expected key
 
 Each phase is one PR, releasable on its own.
 
-1. **Positions (dq-core).** `parse_at` / `parse_at_line_col`; migrate the parsers; byte columns in YAML; outer positions for front matter; line and column for CSV, JSONL, `.env`; first bad byte for invalid UTF-8; messages without positions; the XML snippet's stray `\n`. Corpus of malformed files with expected line, column, span and snippet (`crates/dq-core/tests/parse_error_positions.rs`), a property test that line and column agree with a naive scan for random offsets in texts with `\n`, `\r\n`, lone `\r`, a BOM and multi-byte characters.
+1. **Positions (dq-core): done.** Also in this phase: the second line `  --> FILE:LINE:COL` on the console and the place in the bulk summary, because taking the position out of the messages would otherwise have left the console without one. `Error::parse_at`; migrate the parsers; byte columns in YAML; outer positions for front matter; line and column for CSV, JSONL, `.env`; first bad byte for invalid UTF-8; messages without positions; the XML snippet's stray `\n`. corpus of malformed files with expected line, column, span and snippet (`crates/dq-core/tests/parse_error_positions.rs`), a property test that line and column agree with a naive scan for random offsets in texts with `\n`, `\r\n`, lone `\r`, a BOM and multi-byte characters.
 2. **Console (dq-cli).** `output/error.rs`; caret block; `Caused by:` de-duplication; `unicode-width`; insta snapshots per format, plus: tab, CJK, emoji, ESC in the line, 3,000-character line, position at end of file, CRLF, empty file.
 3. **JSON (dq-cli).** `render_error` takes the output format; the JSON object; jq compile errors; bulk files; the table of kinds. Tests: every kind's object is valid JSON, its `exit_code` equals the process's, the object is the last line of stderr; a source line with an ESC byte reaches JSON unescaped and the terminal escaped.
 4. **Docs and skill.** `reference/cli.md` (errors and the kind table), README, `skills/dq/SKILL.md`, the `lint` / SARIF claim in the README that a file that does not parse produces no SARIF (it does: `lint.parse`), CHANGELOG "Changed", a dated entry in `decisions.md`.

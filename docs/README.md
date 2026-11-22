@@ -21,7 +21,7 @@ Work in progress, with design and remaining steps.
 - [plans/add-std-skills-rules.md](plans/add-std-skills-rules.md) — `@std/skills`
   rules for `SKILL.md` frontmatter and `evals.json`.
 - [plans/structured-errors.md](plans/structured-errors.md) — a caret under the
-  offending byte and a JSON error object under `-F json` (accepted, phase 1 next).
+  offending byte and a JSON error object under `-F json` (phase 1 of 4 done).
 
 ## Reference
 

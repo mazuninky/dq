@@ -46,7 +46,7 @@ use saphyr_parser::{Event, Parser as YamlParser, ScalarStyle, Span};
 use crate::Result;
 use crate::document::spans::{SpanContext, SpanMap, ValueSpan};
 use crate::document::{Document, FormatTag, Value};
-use crate::error::Error;
+use crate::error::{Error, invalid_utf8_span};
 use crate::format::Format;
 use crate::ir::{InlineBaseline, Provenance, ProvenanceMap};
 use crate::pointer::Pointer;
@@ -72,9 +72,7 @@ use super::yaml_emit::{single_quotable, typed_by_another_schema};
 /// # Errors
 ///
 /// - [`Error::Parse`] when the input is not valid UTF-8 or `saphyr-parser`
-///   reports a `ScanError`. The error carries a 1-indexed line/column and a
-///   short snippet matching the failing line, so the CLI's diagnostic
-///   formatting works without further introspection.
+///   reports a `ScanError`.
 pub fn parse_with_spans(bytes: &[u8]) -> Result<(Value, SpanMap)> {
     let parsed = parse_with_spans_and_block_scalars(bytes)?;
     Ok((parsed.value, parsed.spans))
@@ -676,13 +674,12 @@ struct BuiltSpans {
 /// over a blanked copy, and the main [`State`] walk, which also collects
 /// the [`ContainerLayout`] of every collection when `collect_layout` is set.
 fn build_span_map_with_stats(bytes: &[u8], collect_layout: bool) -> Result<BuiltSpans> {
-    let text = std::str::from_utf8(bytes).map_err(|err| Error::Parse {
-        file: None,
-        line: 0,
-        col: 0,
-        span: 0..0,
-        snippet: String::new(),
-        message: format!("source is not valid UTF-8: {err}"),
+    let text = std::str::from_utf8(bytes).map_err(|err| {
+        Error::parse_at(
+            bytes,
+            invalid_utf8_span(bytes, err),
+            "source is not valid UTF-8",
+        )
     })?;
 
     // One-time O(N) precompute. Lookup by char-index then becomes O(1).
@@ -941,47 +938,15 @@ fn replay_one_block_scalar(
     }
 }
 
-/// Convert a `saphyr_parser::ScanError` into our domain [`Error::Parse`],
-/// pulling a one-line snippet out of the source bytes for the CLI to render.
-///
-/// The marker's character index is translated to a byte offset (see
-/// [`char_index_to_byte`]) so the snippet seek lands on the correct line
-/// even when the source contains multi-byte UTF-8 before the failure point.
+/// Convert a `saphyr_parser::ScanError` into our domain [`Error::Parse`] at
+/// the byte its marker's character index is at (see [`char_index_to_byte`]).
 fn scan_to_parse_error(
     scan_err: &saphyr_parser::ScanError,
     bytes: &[u8],
     char_to_byte: &[usize],
 ) -> Error {
-    let marker = scan_err.marker();
-    let line = u32::try_from(marker.line()).unwrap_or(u32::MAX);
-    let col = u32::try_from(marker.col().saturating_add(1)).unwrap_or(u32::MAX);
-    let idx = char_index_to_byte(char_to_byte, marker.index());
-    let snippet = extract_line_snippet(bytes, idx);
-    Error::Parse {
-        file: None,
-        line,
-        col,
-        span: idx..idx,
-        snippet,
-        message: scan_err.info().to_owned(),
-    }
-}
-
-/// Extract the line containing `idx` (or the empty string at EOF). Used only
-/// for error rendering; never on the hot path.
-fn extract_line_snippet(bytes: &[u8], idx: usize) -> String {
-    if bytes.is_empty() {
-        return String::new();
-    }
-    let mut start = idx.min(bytes.len().saturating_sub(1));
-    while start > 0 && bytes[start - 1] != b'\n' {
-        start -= 1;
-    }
-    let mut end = idx.min(bytes.len());
-    while end < bytes.len() && bytes[end] != b'\n' {
-        end += 1;
-    }
-    String::from_utf8_lossy(&bytes[start..end]).into_owned()
+    let at = char_index_to_byte(char_to_byte, scan_err.marker().index());
+    Error::parse_at(bytes, at..at, scan_err.info())
 }
 
 #[derive(Debug)]
@@ -3458,16 +3423,21 @@ mod tests {
 
     #[test]
     fn parse_with_spans_scan_error_carries_position() {
-        // Unbalanced flow: `[a, b` with no closing `]`.
-        let bytes = b"key: [a, b\n";
-        let err = parse_with_spans(bytes).expect_err("unbalanced flow must error");
+        // serde_norway reads it: the error is saphyr-parser's, which counts
+        // characters, a byte order mark one of them.
+        let text = "\u{feff}я: #c\r\n  [я]#c\r\n";
+        let err = parse_with_spans(text.as_bytes()).expect_err("a comment with no blank");
         match err {
-            Error::Parse { line, .. } => {
-                assert!(
-                    line >= 1,
-                    "Parse error must carry a non-zero line; got line={line}"
-                );
-            }
+            Error::Parse {
+                line,
+                col,
+                span,
+                snippet,
+                ..
+            } => assert_eq!(
+                (line, col, span, snippet.as_str()),
+                (2, 7, 17..17, "  [я]#c")
+            ),
             other => panic!("expected Parse, got: {other:?}"),
         }
     }

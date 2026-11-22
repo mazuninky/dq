@@ -104,7 +104,9 @@ pub(super) fn jq_compile_to_parse(
             let col = u32::try_from(position).unwrap_or(u32::MAX);
             dq_core::Error::Parse {
                 file: Some(file.to_path_buf()),
-                line: 1,
+                // No position in `file`: `col` and `span` are offsets into
+                // the expression, so no `--> FILE:LINE:COL` is printed.
+                line: 0,
                 col,
                 span: position..position,
                 snippet,

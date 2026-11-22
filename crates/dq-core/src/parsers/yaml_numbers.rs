@@ -93,33 +93,31 @@ pub(super) fn may_lose_numbers(bytes: &[u8]) -> bool {
 /// repeats an earlier one — an `f64` by value, any key as the
 /// [`Value::Map`] key it becomes (`1` and `"1"`, `[1,2]` and `[1, 2]`), a
 /// collection or tagged key also by value ([`Twins`]) — at the repeated
-/// key's line and column. Two spellings of one big number (`1e400`, `1.0e+400`)
+/// key. Two spellings of one big number (`1e400`, `1.0e+400`)
 /// are two keys.
-pub(super) fn read_exact(bytes: &[u8]) -> Result<Vec<Value>> {
+pub(super) fn read_exact(text: &str) -> Result<Vec<Value>> {
     let as_serde_norway_reads = || {
-        read_nodes(bytes, true)
+        read_nodes(text, true)
             .map(|nodes| nodes.into_iter().map(node_to_value).collect())
-            .map_err(map_yaml_err)
+            .map_err(|e| map_yaml_err(&e, text))
     };
-    let Ok(text) = std::str::from_utf8(bytes) else {
-        return as_serde_norway_reads();
-    };
-    let (nodes, refused) = match read_nodes(bytes, false) {
+    let (nodes, refused) = match read_nodes(text, false) {
         Ok(nodes) => (nodes, None),
         Err(err) if is_tagged_number(&err) => {
-            let refused = map_yaml_err(err);
+            let refused = map_yaml_err(&err, text);
             let Some(untagged) = untag_numbers(text) else {
                 return Err(refused);
             };
-            match read_nodes(untagged.as_bytes(), false) {
+            match read_nodes(&untagged, false) {
                 Ok(nodes) => (nodes, Some(refused)),
                 // Every position is kept: the error is the file's.
-                Err(err) => return Err(map_yaml_err(err)),
+                Err(err) => return Err(map_yaml_err(&err, &untagged)),
             }
         }
-        Err(err) => return Err(map_yaml_err(err)),
+        Err(err) => return Err(map_yaml_err(&err, text)),
     };
     let walk = Walk {
+        text,
         events: YamlParser::new_from_str(text),
         anchors: HashMap::new(),
         literals: HashMap::new(),
@@ -160,7 +158,7 @@ fn untag_numbers(text: &str) -> Option<String> {
     stand_in_tags(text, &starts)
 }
 
-/// `bytes` with the tag of every plain scalar under a global tag outside
+/// `text` with the tag of every plain scalar under a global tag outside
 /// the core schema — written through a `%TAG` handle (`!!str` once `!!` is
 /// bound to `tag:example.com,2000:`) or verbatim (`!<tag:example.com:x>`)
 /// — made a local tag of the same length (`!xxxx`), so the scalar reads
@@ -169,13 +167,12 @@ fn untag_numbers(text: &str) -> Option<String> {
 /// The core tags keep their typing however they are spelled.
 ///
 /// `None` when no such tag can be there (no `%TAG` directive, no `!<`), when
-/// there is none, or when `bytes` is no UTF-8 or saphyr-parser fails on it.
-pub(super) fn untag_foreign(bytes: &[u8]) -> Option<String> {
-    let maybe = bytes.windows(4).any(|w| w == b"%TAG") || bytes.windows(2).any(|w| w == b"!<");
+/// there is none, or when saphyr-parser fails on it.
+pub(super) fn untag_foreign(text: &str) -> Option<String> {
+    let maybe = text.contains("%TAG") || text.contains("!<");
     if !maybe {
         return None;
     }
-    let text = std::str::from_utf8(bytes).ok()?;
     let mut starts = Vec::new();
     let mut events = YamlParser::new_from_str(text);
     while let Some(item) = events.next_event() {
@@ -189,7 +186,7 @@ pub(super) fn untag_foreign(bytes: &[u8]) -> Option<String> {
     stand_in_tags(text, &starts)
 }
 
-/// `bytes` with every empty `!!null` node — no content (`{n: !!null }`,
+/// `text` with every empty `!!null` node — no content (`{n: !!null }`,
 /// `- !!null`) or an empty quoted scalar (`!!null ""`), both null to YAML's
 /// core schema — read as the null it is: its tag made a local tag of the
 /// same length (`!xxxxx`), which serde_norway reads as untagged, and an
@@ -198,14 +195,13 @@ pub(super) fn untag_foreign(bytes: &[u8]) -> Option<String> {
 /// and blanks. serde_norway refuses an empty `!!null` ("expected null").
 /// Every node keeps its position, and every collection its shape.
 ///
-/// `None` when there is none, when `bytes` is no UTF-8 or saphyr-parser
-/// fails on it, or when a quoted one is followed by what no stand-in
-/// keeps the shape of (`""#c`, a key on another line than its `:`).
-pub(super) fn untag_empty_nulls(bytes: &[u8]) -> Option<String> {
-    if !bytes.windows(4).any(|w| w == b"null") || !bytes.contains(&b'!') {
+/// `None` when there is none, when saphyr-parser fails on `text`, or when a
+/// quoted one is followed by what no stand-in keeps the shape of (`""#c`, a
+/// key on another line than its `:`).
+pub(super) fn untag_empty_nulls(text: &str) -> Option<String> {
+    if !text.contains("null") || !text.contains('!') {
         return None;
     }
-    let text = std::str::from_utf8(bytes).ok()?;
     let mut starts = Vec::new();
     let mut quoted = Vec::new();
     let mut events = YamlParser::new_from_str(text);
@@ -671,27 +667,29 @@ impl fmt::Display for Path<'_> {
     }
 }
 
-/// The error for a key that repeats an earlier one, worded as
-/// serde_norway words it, at the repeated key.
-fn repeated(path: &Path<'_>, message: &str, span: &Span) -> Stop {
-    let line = span.start.line();
-    let col = span.start.col() + 1;
+/// The error for a key of `text` that repeats an earlier one, worded as
+/// serde_norway words it, at the repeated key, which is at `span`.
+fn repeated(text: &str, path: &Path<'_>, message: &str, span: &Span) -> Stop {
     let prefix = match path {
         Path::Root => String::new(),
         path => format!("{path}: "),
     };
-    Stop::Repeated(Error::Parse {
-        file: None,
-        line: u32::try_from(line).unwrap_or(u32::MAX),
-        col: u32::try_from(col).unwrap_or(u32::MAX),
-        span: 0..0,
-        snippet: String::new(),
-        message: format!("{prefix}{message} at line {line} column {col}"),
-    })
+    // saphyr-parser counts characters. The span of a quoted key may hold
+    // the blanks after it.
+    let ends = byte_offsets(text, &[span.start.index(), span.end.index()]);
+    let start = ends.first().copied().unwrap_or(text.len());
+    let end = ends.get(1).copied().unwrap_or(text.len());
+    let key = text.get(start..end).unwrap_or_default().trim_end();
+    Stop::Repeated(Error::parse_at(
+        text.as_bytes(),
+        start..start + key.len(),
+        format!("{prefix}{message}"),
+    ))
 }
 
 /// The events left to walk and the values of the anchors seen so far.
 struct Walk<'t> {
+    text: &'t str,
     events: YamlParser<'t, StrInput<'t>>,
     anchors: HashMap<usize, Value>,
     /// The literal of each anchored scalar that got its exact number: an
@@ -910,7 +908,12 @@ impl<'t> Walk<'t> {
                 let (first_key, _) = out.get_index(first).ok_or(Stop::Disagree)?;
                 let (first_kind, written) = &names[first];
                 let name = written.as_deref().unwrap_or(first_key);
-                return Err(repeated(path, &first_kind.duplicate_message(name), &span));
+                return Err(repeated(
+                    self.text,
+                    path,
+                    &first_kind.duplicate_message(name),
+                    &span,
+                ));
             }
             let value = match key_text.as_deref() {
                 Some(text) => self.node(
@@ -954,9 +957,16 @@ mod tests {
             .clone()
     }
 
+    /// The message `yaml` fails with and where, the place as text: the
+    /// message holds none.
     fn error(yaml: &str) -> String {
         match crate::parsers::Yaml.parse(yaml.as_bytes()) {
-            Err(Error::Parse { message, .. }) => message,
+            Err(Error::Parse {
+                message, line, col, ..
+            }) => {
+                assert!(!message.contains(" at line "), "{message}");
+                format!("{message} at line {line} column {col}")
+            }
             other => panic!("{other:?}"),
         }
     }
@@ -1005,8 +1015,8 @@ mod tests {
             read("- !!null\n- 1\n"),
             Value::Array(vec![Value::Null, Value::Int(1)])
         );
-        assert_eq!(untag_empty_nulls(b"n: !!null x\n"), None);
-        assert_eq!(untag_empty_nulls(b"n: null\n"), None);
+        assert_eq!(untag_empty_nulls("n: !!null x\n"), None);
+        assert_eq!(untag_empty_nulls("n: null\n"), None);
         // Content is no null: the reader's own error stays.
         assert!(crate::parsers::Yaml.parse(b"n: !!null x\n").is_err());
         // A tag right before `}`: no reader of dq (nor libyaml) scans it.
