@@ -30,7 +30,7 @@
 //!
 //! ## Write-mode flags
 //!
-//! - `-i` → atomic in-place write (via [`dq_core::atomic_write::write`]).
+//! - `-i` → atomic in-place write (via [`dq_core::atomic_write::rewrite`]).
 //! - `--diff` → unified diff to stdout, no write.
 //! - `--check` → exit 1 if any file would be modified, no write. M10
 //!   reuses [`crate::error::CheckPending`] (already mapped to exit 1)

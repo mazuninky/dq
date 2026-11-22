@@ -395,3 +395,20 @@ Three performance changes that shipped in 2026.20.2, archived together once thei
 - From the plans: an incremental `pointer_for` in the JSON span builder; a shared `LineIndex` (no second user yet); `compile_composite` repeats the cache lookup instead of calling `compile_or_cached`. The YAML span-builder audit was dropped: YAML parses in linear time.
 
 Since then: the `==` re-scan in `diff` and the subtree clones in `merge` are gone (2026-11-22); `transform/diff_deep` grows about 1.8× per doubling of depth. The read-back parse per edit stays.
+
+## 2026-11-22 — `-i` keeps access, follows links and writes the file it read
+
+**What it did.** A temporary file is created 0600, and renaming it over the target made that the target's mode: every `-i` write took a script's execute bit and other users' read access. A link was replaced by a regular file. `convert -i` overwrote whatever was at the target and could remove a source it had not converted. All of it is described in [reference/write-commands.md](reference/write-commands.md#atomic-writes).
+
+**Decisions and reasons**
+
+- **A link is followed; the file it leads to is edited and the link stays** (owner). A link in a dotfiles or a vendored tree is there to be kept. Turned down: replacing the link, as dq did.
+- **Except where dq made up the name.** A link at a `convert -i` target or a `.bak` is refused: the user named neither, so writing through it changes a file they never mentioned.
+- **Access narrows, it never widens.** What the process may not keep (owner, group, ACL) is a WARN and fewer rights, not an error: refusing would make dq unusable for an editor who is not the owner. Each step leaves the temporary file open to no more than the old one was, so the order is fixed: group, ACL, permission bits, owner, special bits. What came of a step is read back, not taken from its result: Linux drops setgid without an error.
+- **ACLs through the file descriptor, with `libc`.** Without them an ACL that shuts someone out (`deny`, a mask) was lost and the file opened to them. Linux: the `system.posix_acl_access` attribute, copied as bytes; macOS: `acl_get_fd_np` / `acl_set_fd_np`. Turned down: `fcopyfile` with `COPYFILE_ACL`, which leaves the entries the new file inherited from its directory.
+- **A write is bound to the file that was read**, by where the path leads, device and inode, creation time, size and modification time, checked when the write starts and right before the rename. Otherwise an edit made in between is lost, and a run as root can be pointed at another file through a link. The price is that a `touch` in between is refused too; the command can be run again.
+- **`convert -i` refuses an existing target** (owner): exit 6 over the whole run before anything is written, `--overwrite` to replace, `--backup` to replace and keep a copy. The target's name is made up by dq, so the user may not know that a file is there. Where a write found no file, the rename itself refuses to replace one, with every flag: a file that appears at that moment is in nobody's copy. `--overwrite` without `-i` is a usage error (exit 2), like the newer flag checks; `--backup` without `-i` stays exit 6.
+- **`convert -i` is planned before it writes:** two sources of one target, a target that is a source under another spelling or a hard link, a link to its own target, a backup over a source. Names are compared as the file system tells them apart, by looking them up, not by folding case in dq.
+- **A file whose deletion is denied is refused** (a macOS ACL or flag, Linux `chattr +i` / `+a`), also where taking the protection off first would work: it is the user's to take off. It is asked beforehand, because the rename that fails leaves a temporary file that cannot be removed either.
+
+**Deferred or left out.** Extended attributes (the SELinux label), NFSv4 ACLs, file flags, timestamps and other hard links are not kept, because the file is a new one. No `fsync`: a crash of the system may lose the new content. A directory above the file that is swapped for another is followed. `dq set FIFO` still blocks on reading.

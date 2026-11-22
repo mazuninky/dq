@@ -166,7 +166,7 @@ dq set deploy.yaml --jq '.spec.template.spec.containers[].image |= sub(":latest"
 
 ```bash
 dq convert deploy.yaml -F json --indent 2
-dq convert config.toml -F yaml -i               # in-place format swap
+dq convert config.toml -F yaml -i               # in-place format swap; refuses an existing config.yaml (--overwrite)
 dq convert users.csv -F json                    # CSV → array-of-objects
 dq convert post.md -F json                      # Markdown → JSON: /frontmatter/value plus the body's AST under /children
 dq convert deploy.yaml -F toon                  # YAML → TOON (agent-friendly)
@@ -255,8 +255,8 @@ Full matrix, write-mode semantics, and pointer prefixes per format: [references/
 |    3 | PARSE_ERROR — input failed format parsing (or templated file without `--raw-template-strings`); an invalid rule; a rule whose `match.filter` / `check.jq` raised in `lint` / `check` / `fix` (its findings may be missing; `--allow-rule-errors` accepts it). |
 |    4 | LINT_FAIL / VALIDATE_FAIL — `lint` produced an error-severity diagnostic, or `validate` saw a parse error. |
 |    5 | IO_ERROR — read failed; `self check`/`update` network failure.          |
-|    6 | INVALID_INPUT — bad CLI flag combo, unknown format, read cmd + write flag. |
-|    7 | WRITE_FAILED — atomic write failed; `edit_rejected` (a `set`/`del` whose result would not read back as the requested change is refused, file untouched; `set --jq` rewrites through the writer instead); bulk partial-failure mode; self-update replace failed. |
+|    6 | INVALID_INPUT — bad CLI flag combo, unknown format, read cmd + write flag, `convert -i` onto a file that exists. |
+|    7 | WRITE_FAILED — atomic write failed; the file changed while dq was running (run it again); `edit_rejected` (a `set`/`del` whose result would not read back as the requested change is refused, file untouched; `set --jq` rewrites through the writer instead); bulk partial-failure mode; self-update replace failed. |
 
 `--strict` promotes `warn`-severity lint findings to exit 1; error-severity always exits 4 regardless of `--strict`.
 

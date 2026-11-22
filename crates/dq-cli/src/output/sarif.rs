@@ -90,7 +90,7 @@ impl Reporter for SarifReporter {
             .ok_or_else(|| {
                 anyhow::Error::new(InvalidInput::new(
                     "SARIF reporter expects an object with a `diagnostics` array; \
-                     selecting `-F sarif` is only valid for `validate` and the M8+ lint commands",
+                     selecting `-F sarif` is only valid for `validate` and the lint commands",
                 ))
             })?;
         let catalog = value

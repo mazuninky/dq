@@ -1,6 +1,6 @@
 //! Atomic-write side-effect tests.
 //!
-//! These confirm the contract of `dq_core::atomic_write::write` end-to-end
+//! These confirm the contract of `dq_core::atomic_write` end-to-end
 //! through the binary:
 //! - After `dq set f.yaml /x 1 -i`, the target file holds the new content
 //!   AND no `tempfile`-style intermediate files (`.tmp.<random>`) remain in
@@ -614,8 +614,8 @@ fix:
             ));
         assert_eq!(contents(&dir), before);
 
-        // Without backups nothing is lost.
-        run(&[]).success();
+        // Without backups nothing is lost but the target.
+        run(&["--overwrite"]).success();
         assert_eq!(list_files(&dir), ["0.yaml", "x.yaml", "x.yaml.yaml"]);
         assert_eq!(read(&dir.join("x.yaml.yaml")), "v: 3\n");
     }
@@ -755,7 +755,7 @@ fix:
         // The last one would be read and then removed as the source.
         for to in ["victim.json", "nowhere.json", "f.json", "f.yaml"] {
             symlink(to, dir.join("f.json")).expect("symlink");
-            for more in [&[][..], &["--backup"], &["--keep-source"]] {
+            for more in [&[][..], &["--backup"], &["--keep-source"], &["--overwrite"]] {
                 convert(&dir, "f.yaml", more)
                     .code(7)
                     .stderr(predicates::str::contains(
@@ -849,7 +849,7 @@ fix:
 
         // Without the conflict the same run goes through.
         fs::rename(dir.join("a.yml"), dir.join("b.yml")).expect("mv");
-        convert(&dir, "*.{yaml,yml}", &[])
+        convert(&dir, "*.{yaml,yml}", &["--overwrite"])
             .success()
             .stdout("Modified: 4, Skipped: 0, Failed: 0\n");
         assert_eq!(list_files(&dir), ["0.json", "a.json", "b.json", "z.json"]);
@@ -916,19 +916,533 @@ fix:
         }
     }
 
-    /// Today's behaviour, kept: an existing file that is no source of the
-    /// run is replaced without a word, `--backup` keeps a copy.
+    const OLD: &str = "{\"old\": 1}\n";
+    const NEW: &str = "{\n  \"n\": 1\n}\n";
+
+    /// Only what the user said may go: an existing file that is no source of
+    /// the run is one they did not name.
     #[test]
-    fn convert_replaces_an_unrelated_file_at_the_target() {
+    fn convert_replaces_an_unrelated_file_at_the_target_only_when_told_to() {
+        let (_root, dir, _rule) = sandbox();
+        let file = |name: &str, content: &str| (name.to_owned(), content.to_owned());
+        let source = || file("a.yaml", "n: 1\n");
+        for (more, after) in [
+            (&[][..], None),
+            (&["--keep-source"], None),
+            (&["--overwrite"], Some(vec![file("a.json", NEW)])),
+            (
+                &["--backup"],
+                Some(vec![file("a.json", NEW), file("a.json.bak", OLD)]),
+            ),
+            (
+                &["--backup", "--overwrite", "--keep-source"],
+                Some(vec![file("a.json", NEW), file("a.json.bak", OLD), source()]),
+            ),
+        ] {
+            let _ = fs::remove_file(dir.join("a.json.bak"));
+            seed(&dir.join("a.yaml"), "n: 1\n", 0o644);
+            seed(&dir.join("a.json"), OLD, 0o640);
+
+            let assert = convert(&dir, "a.yaml", more).stdout("");
+
+            let converted = after.is_some();
+            let after = after.unwrap_or_else(|| vec![file("a.json", OLD), source()]);
+            assert_eq!(contents(&dir), after, "{more:?}");
+            assert_eq!(mode(&dir.join("a.json")), 0o640, "{more:?}");
+            if converted {
+                assert.success();
+            } else {
+                assert.code(6).stderr(
+                    "convert -i to json: the target 'a.json' already exists; pass --overwrite to \
+                     replace it, or --backup to keep a copy. Nothing was converted\n",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn convert_of_a_glob_names_the_targets_that_exist_and_converts_nothing() {
+        let (_root, dir, _rule) = sandbox();
+        for name in ["a", "b", "c", "d", "e", "f"] {
+            seed(&dir.join(format!("{name}.yaml")), "n: 1\n", 0o644);
+        }
+        for (there, named) in [
+            (
+                "c",
+                "target 'c.json' already exists; pass --overwrite to replace it, or --backup to keep a copy.",
+            ),
+            (
+                "e",
+                "targets 'c.json' and 'e.json' already exist; pass --overwrite to replace them, or --backup to keep a copy of each.",
+            ),
+            (
+                "f",
+                "targets 'c.json', 'e.json' and 'f.json' already exist;",
+            ),
+            (
+                "b",
+                "targets 'b.json', 'c.json' and 2 others already exist;",
+            ),
+        ] {
+            seed(&dir.join(format!("{there}.json")), OLD, 0o644);
+            let before = contents(&dir);
+
+            convert(&dir, "*.yaml", &[])
+                .code(6)
+                .stdout("")
+                .stderr(predicates::str::starts_with(format!(
+                    "convert -i to json: the {named}"
+                )))
+                .stderr(predicates::str::ends_with("Nothing was converted\n"))
+                .stderr(predicates::function::function(|text: &str| {
+                    text.lines().count() == 1
+                }));
+
+            assert_eq!(contents(&dir), before);
+        }
+
+        convert(&dir, "*.yaml", &["--overwrite"])
+            .success()
+            .stdout("Modified: 6, Skipped: 0, Failed: 0\n");
+        assert!(contents(&dir).iter().all(|(_, content)| content == NEW));
+        assert_eq!(list_files(&dir).len(), 6);
+    }
+
+    #[test]
+    fn convert_refuses_a_target_by_a_name_of_several_lines_in_one() {
+        let (_root, dir, _rule) = sandbox();
+        seed(&dir.join("a\nb.yaml"), "n: 1\n", 0o644);
+        seed(&dir.join("a\nb.json"), OLD, 0o644);
+
+        convert(&dir, "a\nb.yaml", &[])
+            .code(6)
+            .stderr(predicates::str::starts_with(
+                "convert -i to json: the target 'a\\x0ab.json' already exists; pass",
+            ));
+    }
+
+    /// As the file system tells names apart.
+    #[test]
+    fn convert_takes_a_target_for_there_when_the_file_system_does() {
+        // Case, and an accented letter in one code point or in two.
+        for (one, other) in [("A", "a"), ("\u{e9}", "e\u{301}")] {
+            let (_root, dir, _rule) = sandbox();
+            seed(&dir.join(format!("{one}.yaml")), "n: 1\n", 0o644);
+            seed(&dir.join(format!("{other}.json")), OLD, 0o644);
+            let same = dir.join(format!("{one}.json")).exists();
+            let before = contents(&dir);
+
+            let assert = convert(&dir, &format!("{one}.yaml"), &[]);
+
+            if same {
+                assert
+                    .code(6)
+                    .stderr(predicates::str::contains("already exists"));
+                assert_eq!(contents(&dir), before);
+            } else {
+                assert.success();
+                assert_eq!(list_files(&dir).len(), 2);
+            }
+        }
+        if cfg!(target_os = "macos") {
+            let (_root, dir, _rule) = sandbox();
+            seed(&dir.join("A.json"), OLD, 0o644);
+            assert!(dir.join("a.json").exists(), "the default macOS volume");
+        }
+    }
+
+    /// Nothing is said of the target of a source that is gone: it may be what
+    /// the source was converted to before.
+    #[test]
+    fn convert_of_a_source_that_is_gone_is_a_read_error() {
+        let (_root, dir, _rule) = sandbox();
+        let missing = || {
+            convert(&dir, "a.yaml", &[])
+                .code(5)
+                .stderr(predicates::str::contains("I/O error reading 'a.yaml'"));
+        };
+        seed(&dir.join("a.json"), OLD, 0o644);
+        missing();
+        symlink("nowhere", dir.join("a.yaml")).expect("symlink");
+        missing();
+        assert_eq!(read(&dir.join("a.json")), OLD);
+        fs::remove_file(dir.join("a.json")).expect("rm");
+
+        symlink("victim", dir.join("a.json")).expect("symlink");
+        missing();
+        fs::remove_file(dir.join("a.yaml")).expect("rm");
+        missing();
+        fs::remove_file(dir.join("a.json")).expect("rm");
+        fs::create_dir(dir.join("a.json")).expect("mkdir");
+        missing();
+        assert_eq!(list_files(&dir), ["a.json"]);
+    }
+
+    #[test]
+    fn convert_refuses_a_link_to_its_own_target() {
+        let (_root, dir, _rule) = sandbox();
+        seed(&dir.join("a.json"), OLD, 0o644);
+        symlink("a.json", dir.join("a.yaml")).expect("symlink");
+        for more in [
+            &[][..],
+            &["--overwrite"],
+            &["--overwrite", "--keep-source"],
+            &["--backup"],
+        ] {
+            convert(&dir, "a.yaml", more).code(6).stdout("").stderr(
+                "convert -i to json: 'a.yaml' is a symbolic link to 'a.json', which the \
+                 conversion would replace; remove the link first. Nothing was converted\n",
+            );
+            assert_eq!(read(&dir.join("a.json")), OLD, "{more:?}");
+            assert_eq!(link_target(&dir.join("a.yaml")), "a.json");
+            assert_eq!(list_files(&dir), ["a.json", "a.yaml"], "{more:?}");
+        }
+    }
+
+    #[test]
+    fn convert_refuses_a_backup_that_cannot_be_made_before_it_writes_anything() {
         let (_root, dir, _rule) = sandbox();
         seed(&dir.join("a.yaml"), "n: 1\n", 0o644);
-        seed(&dir.join("a.json"), "{\"old\": 1}\n", 0o644);
+        seed(&dir.join("b.yaml"), "n: 1\n", 0o644);
+        seed(&dir.join("b.json"), OLD, 0o644);
+        fs::create_dir(dir.join("b.json.bak")).expect("mkdir");
 
-        convert(&dir, "a.yaml", &[]).success().stdout("");
+        convert(&dir, "*.yaml", &["--backup"])
+            .code(7)
+            .stdout("")
+            .stderr(
+                "I/O error writing 'b.json': cannot back up to 'b.json.bak': something other \
+                 than a regular file is there\n",
+            );
 
         assert_eq!(
-            contents(&dir),
-            [("a.json".to_owned(), "{\n  \"n\": 1\n}\n".to_owned())]
+            list_files(&dir),
+            ["a.yaml", "b.json", "b.json.bak", "b.yaml"]
         );
+        assert_eq!(read(&dir.join("b.json")), OLD);
+        convert(&dir, "*.yaml", &["--overwrite"]).success();
+    }
+
+    /// The binary, where any user may run it: in `root`. Not copied by this
+    /// process: a child another test starts meanwhile would hold the copy
+    /// open for writing, and it could not be run.
+    #[cfg(target_os = "linux")]
+    fn dq_for_all(root: &Path) -> PathBuf {
+        let dq = root.join("dq");
+        let copied = StdCommand::new("cp")
+            .arg(assert_cmd::cargo::cargo_bin("dq"))
+            .arg(&dq)
+            .status();
+        assert!(copied.expect("cp").success());
+        fs::set_permissions(root, fs::Permissions::from_mode(0o755)).expect("chmod");
+        dq
+    }
+
+    /// A file of another user in a sticky directory can be read there, and a
+    /// new one be written beside it, but not removed: as root, which can be
+    /// those users.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn convert_says_that_only_the_removal_failed() {
+        use std::os::unix::fs::chown;
+        use std::os::unix::process::CommandExt as _;
+
+        const USER: u32 = 12_345;
+        let (root, dir, _rule) = sandbox();
+        if fs::metadata(&dir).expect("stat").uid() != 0 {
+            return;
+        }
+        let dq = dq_for_all(root.path());
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o1777)).expect("chmod");
+        seed(&dir.join("a.yaml"), "n: 1\n", 0o644);
+        seed(&dir.join("b.yaml"), "n: 1\n", 0o644);
+        chown(dir.join("a.yaml"), Some(USER), None).expect("chown");
+        let run = |file: &str| {
+            let mut run = StdCommand::new(&dq);
+            run.current_dir(&dir).env_clear().env("HOME", &dir);
+            run.uid(USER).gid(USER);
+            run.args(["-q", "convert", file, "-F", "json", "-i"]);
+            let done = run.output().expect("dq");
+            let stderr = String::from_utf8(done.stderr).expect("utf-8");
+            (done.status.code(), stderr)
+        };
+        let error = |more: &str| {
+            format!(
+                "I/O error writing 'b.yaml': it was converted to 'b.json', but could not be \
+                 removed: Operation not permitted (os error 1){more}\n"
+            )
+        };
+
+        let of_all = run("*.yaml");
+        let after = list_files(&dir);
+        fs::remove_file(dir.join("b.json")).expect("rm");
+        let of_one = run("b.yaml");
+
+        assert_eq!(of_all, (Some(7), error("; already converted: 2 of 2")));
+        assert_eq!(after, ["a.json", "b.json", "b.yaml"]);
+        assert_eq!(of_one, (Some(7), error("")));
+        assert_eq!(read(&dir.join("b.json")), NEW);
+        assert_eq!(read(&dir.join("b.yaml")), "n: 1\n");
+    }
+
+    #[test]
+    fn convert_never_replaces_what_is_no_regular_file() {
+        let (_root, dir, _rule) = sandbox();
+        seed(&dir.join("a.yaml"), "n: 1\n", 0o644);
+        for program in ["mkdir", "mkfifo"] {
+            let made = StdCommand::new(program).arg(dir.join("a.json")).status();
+            assert!(made.expect(program).success());
+            for more in [&[][..], &["--overwrite"], &["--backup"]] {
+                convert(&dir, "a.yaml", more)
+                    .code(7)
+                    .stderr("I/O error writing 'a.json': it is not a regular file\n");
+                assert_eq!(list_files(&dir), ["a.json", "a.yaml"]);
+                assert_eq!(read(&dir.join("a.yaml")), "n: 1\n");
+            }
+            let removed = match program {
+                "mkdir" => fs::remove_dir(dir.join("a.json")),
+                _ => fs::remove_file(dir.join("a.json")),
+            };
+            removed.expect("rm");
+        }
+    }
+
+    /// A pipe that holds less than the lines of a long run.
+    fn small_pipe() -> (std::io::PipeReader, std::io::PipeWriter) {
+        let (reader, writer) = std::io::pipe().expect("pipe");
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd as _;
+
+            // By default 16 pages, which may be of 64 KiB.
+            // SAFETY: the descriptor is open.
+            let size = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) };
+            assert!((4096..=65_536).contains(&size), "{size}");
+        }
+        (reader, writer)
+    }
+
+    /// Every conversion from YAML logs a line, so dq stops in the middle of
+    /// the run, once the pipe nobody reads is full: long after it has planned
+    /// the run, and long before the last file.
+    #[test]
+    fn a_target_that_appears_during_the_run_is_not_replaced() {
+        use std::io::Read as _;
+
+        const FILES: usize = 1500;
+        let appear = |dir: &Path| seed(&dir.join("z.json"), OLD, 0o640);
+        for (more, code) in [(None, 7), (Some("--overwrite"), 0)] {
+            let (_root, dir, _rule) = sandbox();
+            for n in 1..FILES {
+                fs::write(dir.join(format!("f{n}.yaml")), "n: 1\n").expect("seed");
+            }
+            fs::write(dir.join("z.yaml"), "n: 1\n").expect("seed");
+            let (mut pipe, writer) = small_pipe();
+            let mut run = StdCommand::new(assert_cmd::cargo::cargo_bin("dq"))
+                .current_dir(&dir)
+                .env_clear()
+                .env("HOME", &dir)
+                .args(["convert", "*.yaml", "-F", "json", "-i"])
+                .args(more)
+                .stdout(std::process::Stdio::null())
+                .stderr(writer)
+                .spawn()
+                .expect("dq");
+            while !dir.join("f1.json").exists() {
+                assert_eq!(run.try_wait().expect("wait"), None, "dq ended early");
+                std::thread::yield_now();
+            }
+            assert!(!dir.join("z.json").exists(), "dq must be stopped by now");
+
+            appear(&dir);
+            let mut stderr = String::new();
+            pipe.read_to_string(&mut stderr).expect("utf-8");
+            // More than any pipe above holds: dq has had to wait.
+            assert!(stderr.len() > 2 * 65_536, "{}", stderr.len());
+
+            assert_eq!(run.wait().expect("wait").code(), Some(code), "{more:?}");
+            let error = format!(
+                "I/O error writing 'z.json': a file appeared there while dq was running; it is \
+                 not replaced; already converted: {} of {FILES}\n",
+                FILES - 1
+            );
+            assert_eq!(stderr.ends_with(&error), code == 7, "{more:?}");
+            assert_eq!(read(&dir.join("f1.json")), NEW);
+            assert!(!dir.join("f1.yaml").exists());
+            assert!(
+                stderr.lines().next().is_some_and(|line| line.ends_with(
+                    "conversion from yaml to JSON drops comments, anchors, and quote-style metadata"
+                )),
+                "{stderr}"
+            );
+            assert_eq!(dir.join("z.yaml").exists(), code == 7, "{more:?}");
+            let expected = if code == 7 { OLD } else { NEW };
+            assert_eq!(read(&dir.join("z.json")), expected);
+            assert_eq!(mode(&dir.join("z.json")), 0o640);
+            let left = FILES + usize::from(code == 7);
+            assert_eq!(list_files(&dir).len(), left, "nothing else is left");
+        }
+    }
+
+    #[test]
+    fn overwrite_is_for_convert_in_place_alone() {
+        let (_root, dir, rule) = sandbox();
+        seed(&dir.join("a.yaml"), "k: 1\n", 0o644);
+        let run = |args: &[&str]| dq().current_dir(&dir).args(args).assert();
+
+        run(&["convert", "a.yaml", "-F", "json", "--overwrite"])
+            .code(2)
+            .stdout("")
+            .stderr(predicates::str::starts_with(
+                "error: --overwrite requires -i/--in-place\n",
+            ));
+        // Wherever `-i` stands.
+        run(&["-i", "convert", "a.yaml", "-F", "json", "--overwrite"]).success();
+        run(&["convert", "--overwrite", "a.json", "-F", "yaml", "-i"]).success();
+        for (name, mut args) in edits(&rule) {
+            args.push("--overwrite".to_owned());
+            edit(&dir, &args, "a.yaml")
+                .code(2)
+                .stderr(predicates::str::contains("unexpected argument"));
+            assert_eq!(
+                contents(&dir),
+                [("a.yaml".into(), "k: 1\n".into())],
+                "{name}"
+            );
+        }
+    }
+
+    /// A target that its owner cannot read has an ACL dq cannot read, either:
+    /// nothing is kept for anyone else.
+    #[test]
+    fn an_acl_that_cannot_be_read_is_a_warning_and_costs_the_others_their_access() {
+        let (_root, dir, _rule) = sandbox();
+        seed(&dir.join("a.yaml"), "n: 1\n", 0o644);
+        seed(&dir.join("a.json"), OLD, 0o244);
+        if fs::read(dir.join("a.json")).is_ok() {
+            return; // root reads whatever it wants
+        }
+
+        convert(&dir, "a.yaml", &["--overwrite"])
+            .success()
+            .stderr(predicates::str::contains(
+                " WARN a.json: its ACL could not be kept, so only its owner has access\n",
+            ));
+
+        assert_eq!(mode(&dir.join("a.json")), 0o200);
+        assert_eq!(list_files(&dir), ["a.json"]);
+    }
+
+    /// What a user who is not in the group of a file loses by editing it:
+    /// as root, which can be such a user.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_group_or_a_bit_that_cannot_be_kept_is_a_warning() {
+        use std::os::unix::fs::chown;
+        use std::os::unix::process::CommandExt as _;
+
+        const USER: u32 = 12_345;
+        const GROUP: u32 = 23_456;
+        let (root, dir, _rule) = sandbox();
+        if fs::metadata(&dir).expect("stat").uid() != 0 {
+            return;
+        }
+        let dq = dq_for_all(root.path());
+        let file = dir.join("f.yaml");
+        for (of_dir, bits, after, gid, what) in [
+            // The new file has the group of the user.
+            (0o777, 0o664, 0o644, USER, "its owner or group"),
+            // It has that of the directory, but the user is not in it.
+            (0o2777, 0o2664, 0o664, GROUP, "its permission bits"),
+            (0o2777, 0o664, 0o664, GROUP, ""),
+        ] {
+            chown(&dir, None, Some(GROUP)).expect("chgrp");
+            fs::set_permissions(&dir, fs::Permissions::from_mode(of_dir)).expect("chmod");
+            seed(&file, BEFORE, bits);
+            chown(&file, Some(USER), Some(GROUP)).expect("chown");
+            fs::set_permissions(&file, fs::Permissions::from_mode(bits)).expect("chmod");
+
+            let mut run = StdCommand::new(&dq);
+            run.current_dir(&dir).env_clear().env("HOME", &dir);
+            run.uid(USER).gid(USER);
+            run.args(["set", "f.yaml", "/a", "2", "-i"]);
+            let done = run.output().expect("dq");
+
+            let stderr = String::from_utf8(done.stderr).expect("utf-8");
+            assert!(done.status.success(), "{stderr}");
+            let expected = match what {
+                "" => String::new(),
+                "its permission bits" => {
+                    " WARN f.yaml: its permission bits could not all be kept\n".to_owned()
+                }
+                what => format!(" WARN f.yaml: {what} could not be kept\n"),
+            };
+            assert!(stderr.ends_with(&expected), "{stderr}");
+            assert_eq!(stderr.is_empty(), expected.is_empty(), "{stderr}");
+            assert_eq!(mode(&file), after, "{bits:o}");
+            assert_eq!(fs::metadata(&file).expect("stat").gid(), gid, "{bits:o}");
+        }
+    }
+
+    /// An ACL that forbids deleting a file forbids replacing it, and renaming
+    /// the new one that has it: nothing may be left that cannot be removed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_file_that_may_not_be_deleted_leaves_nothing_behind() {
+        let (_root, dir, rule) = sandbox();
+        let chmod = |args: &[&str]| {
+            let done = StdCommand::new("/bin/chmod")
+                .args(args)
+                .current_dir(&dir)
+                .status();
+            assert!(done.expect("chmod").success());
+        };
+        for (name, args) in edits(&rule) {
+            for backup in [None, Some("--backup".to_owned())] {
+                seed(&dir.join("f.yaml"), BEFORE, 0o644);
+                chmod(&["+a", "everyone deny delete", "f.yaml"]);
+                let args: Vec<String> = args.iter().cloned().chain(backup).collect();
+
+                let assert = edit(&dir, &args, "f.yaml");
+
+                chmod(&["-N", "f.yaml"]);
+                assert.code(7).stdout("").stderr(
+                    "I/O error writing 'f.yaml': it cannot be replaced: its ACL or flags, or its \
+                     directory, forbid deleting it\n",
+                );
+                assert_eq!(read(&dir.join("f.yaml")), BEFORE, "{name}");
+                assert_eq!(list_files(&dir), ["f.yaml"], "{name}");
+            }
+        }
+
+        // A conversion would remove it: refused before anything is written,
+        // of the other files, too.
+        seed(&dir.join("a.yaml"), BEFORE, 0o644);
+        chmod(&["+a", "everyone deny delete", "f.yaml"]);
+        let refused = convert(&dir, "*.yaml", &[]);
+        let after = list_files(&dir);
+        // The source may stay: then the new file has its ACL.
+        let converted = convert(&dir, "f.yaml", &["--keep-source"]);
+        let listed = StdCommand::new("/bin/ls")
+            .args(["-le", "f.json"])
+            .current_dir(&dir)
+            .output()
+            .expect("ls");
+        chmod(&["-N", "f.yaml"]);
+        chmod(&["-N", "f.json"]);
+
+        refused.code(7).stdout("").stderr(
+            "I/O error writing 'f.yaml': it cannot be removed: its ACL or flags, or its \
+             directory, forbid deleting it\n",
+        );
+        assert_eq!(after, ["a.yaml", "f.yaml"]);
+        converted.success();
+        let listed = String::from_utf8(listed.stdout).expect("utf-8");
+        assert!(
+            listed.ends_with(" 0: group:everyone deny delete\n"),
+            "{listed}"
+        );
+        assert_eq!(mode(&dir.join("f.json")), 0o644);
+        assert_eq!(list_files(&dir), ["a.yaml", "f.json", "f.yaml"]);
     }
 }

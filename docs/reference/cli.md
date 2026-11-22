@@ -68,7 +68,7 @@ harmless) or refuses it, as noted.
 | `--doc <N\|all>` | Pick a document of a multi-document YAML stream; see [read-commands.md](read-commands.md#multi-document-yaml-and---doc). |
 | `-i, --in-place` | Write the result back atomically, keeping the file's permissions; a link is followed (write commands only). |
 | `--diff` | Print a unified diff instead of writing. |
-| `--backup` | With `-i`, copy the original to `<file>.bak` first, beside the real file when it is reached through a link. |
+| `--backup` | With `-i`, copy the file that is replaced to `<file>.bak` first, beside the real file when it is reached through a link. |
 | `--check` | Write nothing; exit 1 if any file would change. |
 | `--continue-on-error` | Bulk runs: keep going past failing files, exit 7 at the end if any failed. |
 | `--parallel <N>` | Bulk runs: N worker threads (`0` = number of CPUs). |
@@ -95,7 +95,8 @@ Refused as usage errors (exit 2), before any file is written:
 - a `-F` naming another format than the file's on `set`, `del`, `patch`,
   `merge`, `fmt` and `fix` (see below);
 - `-i` or `--check` on stdin (`-`), which has no file to write back to or
-  compare with.
+  compare with;
+- `convert --overwrite` without `-i`.
 
 `--parallel N` on a single file is accepted and simply runs sequentially (the
 original design wanted it refused; the code downgrades silently).
@@ -322,8 +323,8 @@ defined as named constants in `crates/dq-cli/src/exit_code.rs`.
 | 3 | `PARSE_ERROR` | The input does not parse; a templated file without an escape hatch; a jq compile error; an invalid rule file (bad YAML, unknown field, bad `check`, unknown or no `match.format`, schema compile failure, unsafe `schema_file`); a rule whose `match.filter` or `check.jq` raised in `lint` / `check` / `fix`, unless `--allow-rule-errors`; a failing `fix` script; a plugin with the wrong ABI major or a malformed fix. |
 | 4 | `VALIDATE_FAIL` | `validate` found a parse error; `lint` / `check` found an error-severity diagnostic; a plugin trapped, ran out of fuel or memory, or failed to load; `self update` refused a downloaded archive at its SHA-256 check. |
 | 5 | `IO_ERROR` | Read-side I/O (missing file, unreadable file, a glob root that does not exist or a glob that matched nothing); network errors in `self check` / `self update` (incl. downloading `dq-checksums.txt`). |
-| 6 | `INVALID_INPUT` | A flag combination a handler refuses; write flags on a read command; unsupported format or file extension; a reporter that does not fit the command; unknown rule id or `@std` namespace; a `--rules` directory without rules; `./.dq/rules` that is no directory; a `rules add` source that overlaps its destination; bad fixture file; `--plugins` without the `plugins` feature; `dq merge` on a stream; `self update` into a path the user cannot write. |
-| 7 | `WRITE_FAILED` | Writing failed (temp file, rename, backup); the format takes no point edits (`set` on Markdown, Dockerfile, …); a textual edit refused because the file would not read back as the change (`edit_rejected`); a bulk run with `--continue-on-error` where any file failed; `self update` could not replace the binary. |
+| 6 | `INVALID_INPUT` | A flag combination a handler refuses; write flags on a read command; unsupported format or file extension; a reporter that does not fit the command; unknown rule id or `@std` namespace; a `--rules` directory without rules; `./.dq/rules` that is no directory; a `rules add` source that overlaps its destination; bad fixture file; `--plugins` without the `plugins` feature; `dq merge` on a stream; `convert -i` onto a file that exists (without `--overwrite` or `--backup`), onto a source or another target of the run, or of a link to its own target; `self update` into a path the user cannot write. |
+| 7 | `WRITE_FAILED` | Writing failed (temp file, rename, backup); the file changed between the read and the write, or may not be replaced (a link or no regular file at a `convert -i` target or a `.bak`, a file whose deletion is forbidden); the format takes no point edits (`set` on Markdown, Dockerfile, …); a textual edit refused because the file would not read back as the change (`edit_rejected`); a bulk run with `--continue-on-error` where any file failed; `self update` could not replace the binary. |
 
 The split between 2 and 6 follows who raises the error: anything clap rejects
 while parsing (and the usage errors handlers build as clap errors: `--doc`

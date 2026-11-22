@@ -58,7 +58,7 @@ The `--jq` filter must produce **exactly one** output value. Multi-output stream
 ### 3. `convert` / `fmt` — comments DROPPED
 
 ```bash
-dq convert config.toml -F yaml -i         # format swap
+dq convert config.toml -F yaml -i         # writes config.yaml, removes config.toml
 dq convert deploy.yaml -F json --indent 2
 dq fmt 'k8s/**/*.yaml' -i --sort-keys     # canonicalise + sort
 dq fmt --check 'k8s/**/*.yaml'            # CI idempotency gate
@@ -74,7 +74,7 @@ Same trade-off as the jq-driven path — the entire document is re-emitted throu
 |-------------------------|----------------------------------------------------------------------------|
 | `-i`, `--in-place`      | Atomic rename write (tempfile + rename); keeps the mode, follows a link.   |
 | `--diff`                | Unified diff to stdout, no write.                                          |
-| `--backup`              | Write `.bak` next to the file (requires `-i`).                             |
+| `--backup`              | Keep the old file as `<file>.bak` next to it (requires `-i`).              |
 | `--check`               | Idempotency gate — exit 1 if changes pending, no write.                    |
 | `--continue-on-error`   | Bulk: don't abort on the first failing file.                               |
 | `--parallel <N>`        | Rayon worker count for bulk mode. `0` = `current_num_threads()`.           |
@@ -84,6 +84,8 @@ Same trade-off as the jq-driven path — the entire document is re-emitted throu
 | `--raw-template-strings`| Substitute `{{ ... }}` with opaque placeholders, restore on write.         |
 
 `--check` is mutually exclusive with `-i`, `--diff`, and `--backup`. `--backup` requires `-i`.
+
+`convert -i` never replaces a file that is already at the target: exit 6, nothing converted. Pass `--overwrite` to replace it, or `--backup` to replace it and keep a copy — only when the user wants that file gone. `--keep-source` keeps the source.
 
 ### Bulk mode
 
@@ -121,7 +123,7 @@ Every `-i` write goes through:
 2. Give it the mode (and, where allowed, owner and group) of the target.
 3. `rename(tmp, target)` — atomic per POSIX.
 
-So either the old file is intact, or the new file is fully written, also when the process is killed. There is no `fsync`. A file reached through a symbolic link is the one edited; the link stays. `--backup` saves the old contents as `<file>.bak` beside the real file before the rename.
+So either the old file is intact, or the new file is fully written, also when the process is killed. There is no `fsync`. A file that changed between dq reading it and writing it is not written (exit 7; run the command again). A file reached through a symbolic link is the one edited; the link stays. `--backup` saves the old contents as `<file>.bak` beside the real file before the rename.
 
 Under `--parallel` the files are computed in parallel and written one after another. A failing rename in one file does not affect others; the summary reports per-file outcomes.
 

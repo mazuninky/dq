@@ -4,7 +4,8 @@ The write commands `set`, `del`, `patch`, `merge`, `fmt` and `fix` accept a
 glob instead of a file and then run once per matched file through one driver,
 `crates/dq-cli/src/bulk.rs` (`run_per_file`). `convert -i` accepts one too, with
 a loop of its own that refuses `--check`, `--continue-on-error` and
-`--parallel`.
+`--parallel`, and checks the whole run before it writes
+([write-commands.md](write-commands.md#convert--i)).
 `lint` and `check` take several files or globs too, through the lint
 pipeline. Read commands take a single file. `convert` to stdout takes a
 glob only when it matches exactly one file: several files written back to

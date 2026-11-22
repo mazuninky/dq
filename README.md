@@ -272,9 +272,9 @@ Write commands (`set`, `del`, `patch`, `merge`, `convert`, `fmt`, `fix`) share t
 
 | Flag | Effect |
 |---|---|
-| `-i`, `--in-place` | atomic rename write |
+| `-i`, `--in-place` | atomic rename write; keeps the file's permissions, edits the file a link leads to |
 | `--diff` | unified diff to stdout, no write |
-| `--backup` | write `.bak` next to the file |
+| `--backup` | with `-i`: keep the old file as `<file>.bak` next to it |
 | `--check` | idempotency gate; exit 1 if changes pending |
 | `--continue-on-error` | bulk partial-failure tolerant |
 | `--parallel <N>` | rayon thread pool |
@@ -282,7 +282,7 @@ Write commands (`set`, `del`, `patch`, `merge`, `convert`, `fmt`, `fix`) share t
 | `--indent <N>` | JSON / JSONL only |
 | `--allow-templates` / `--raw-template-strings` | Helm / Go-template guard |
 
-Bulk multi-file mode prints `Modified: N, Skipped: M, Failed: K`; Skipped counts files whose bytes would not change (never rewritten, mtime kept) and files without the `--doc N` document. Single-file invocation stays byte-identical. In a glob, `*` and `?` stop at `/` and `**` crosses directories (`'k8s/**/*.yaml'`); a pattern without a directory (`'2-*.yaml'`) matches in the current directory, and an existing path is taken literally even with `[` in it. `convert` to stdout takes a glob only when it matches one file (exit 6 otherwise).
+Bulk multi-file mode prints `Modified: N, Skipped: M, Failed: K`; Skipped counts files whose bytes would not change (never rewritten, mtime kept) and files without the `--doc N` document. Single-file invocation stays byte-identical. In a glob, `*` and `?` stop at `/` and `**` crosses directories (`'k8s/**/*.yaml'`); a pattern without a directory (`'2-*.yaml'`) matches in the current directory, and an existing path is taken literally even with `[` in it. `convert` to stdout takes a glob only when it matches one file (exit 6 otherwise). `convert -i` does not replace a file that is already at the target (exit 6) unless `--overwrite` or `--backup` is given.
 
 | Code | Meaning |
 |---|---|
@@ -293,7 +293,7 @@ Bulk multi-file mode prints `Modified: N, Skipped: M, Failed: K`; Skipped counts
 | 4 | validate fail; `self update` refused an archive at its SHA-256 check |
 | 5 | I/O error (read; `self check` / `update` network errors) |
 | 6 | invalid input |
-| 7 | write failed (write IO, renderer unavailable, textual edit refused because the file would not read back as the change (`edit_rejected`), bulk partial-failure, self-update atomic-replace failure) |
+| 7 | write failed (write IO, the file changed while dq was running, renderer unavailable, textual edit refused because the file would not read back as the change (`edit_rejected`), bulk partial-failure, self-update atomic-replace failure) |
 
 ## Plugins (experimental)
 

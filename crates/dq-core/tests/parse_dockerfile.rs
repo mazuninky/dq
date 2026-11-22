@@ -108,7 +108,7 @@ fn registry_detects_dockerfile_extension() {
 
 #[test]
 fn write_returns_format_error_with_read_only_message() {
-    // Dockerfile is read-only in M5. `Format::write` must return
+    // Dockerfiles are read-only. `Format::write` must return
     // `Error::Format` with the format tagged `dockerfile` and a message
     // mentioning "read-only" so users see the rejection cause without having
     // to look up the docs.
@@ -120,10 +120,7 @@ fn write_returns_format_error_with_read_only_message() {
     match err {
         dq_core::Error::Format { format, message } => {
             assert_eq!(format, "dockerfile", "format tag must be `dockerfile`");
-            assert!(
-                message.contains("read-only"),
-                "message must mention `read-only`, got: {message:?}",
-            );
+            assert_eq!(message, "Dockerfiles are read-only");
         }
         other => panic!("expected Error::Format, got: {other:?}"),
     }

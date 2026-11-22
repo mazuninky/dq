@@ -129,7 +129,7 @@ impl Format for Dockerfile {
     fn write(&self, _doc: &Document, _w: &mut dyn Write) -> Result<()> {
         Err(Error::Format {
             format: "dockerfile",
-            message: "Dockerfile is read-only in M5".to_owned(),
+            message: "Dockerfiles are read-only".to_owned(),
         })
     }
 }

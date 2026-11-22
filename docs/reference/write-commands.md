@@ -108,21 +108,23 @@ with `--input-format`) works in plain stdout mode and with `--diff`; `-i` and
 
 ## Atomic writes
 
-Every `-i` write goes through `dq_core::atomic_write` (`read` notes the file that
-was read, `rewrite` replaces that one): the content is written to a `tempfile::NamedTempFile` created **in the target's directory**
-and then renamed over the target. Same-directory placement keeps the rename
-atomic (no cross-device `EXDEV`). If writing or renaming fails, the original
-is byte-identical to before and the error exits 7. Read-side failures (the
-source cannot be opened) exit 5. The file is not synced to disk before the
-rename.
+Every `-i` write goes through `dq_core::atomic_write` (`read` notes the file
+that was read, `rewrite` replaces that one): the content is written to a
+`tempfile::NamedTempFile` created **in the target's directory** and then
+renamed over the target. Same-directory placement keeps the rename atomic (no
+cross-device `EXDEV`). If writing or renaming fails, the original is
+byte-identical to before and the error exits 7; a process that is killed may
+leave the temporary file (`.tmpXXXXXX`) behind. Read-side failures (the source
+cannot be opened) exit 5. The file is not synced to disk before the rename.
 
 - **Permissions.** The file keeps its mode, and its owner and group where the
   process may set them. Where the group cannot be kept, the bits it and others
   had are narrowed, never widened; a lost owner drops setuid, a lost group
-  setgid. Both log a WARN, neither fails the write. At no moment is the new
-  content readable by more users than the old. A new file gets `0666` less the
-  umask. A read-only file is edited (the directory must be writable) and stays
-  read-only.
+  setgid. Each is a WARN (hidden by `-q`) and does not fail the write; so is a
+  bit the system drops, as Linux does with setgid for a group the process is
+  not in. At no moment is the new content readable by more users than the old.
+  A new file gets `0666` less the umask. A read-only file is edited (the
+  directory must be writable) and stays read-only.
 - **Symbolic links.** A file edited through a link, or a chain of them, is the
   one the link leads to, in its own directory; the link stays.
 - **`--backup`** copies the real file to `<real file>.bak` beside it, with its
@@ -130,13 +132,21 @@ rename.
   refused, exit 7, and nothing is written.
 - **ACLs.** POSIX ACLs on Linux and ACLs on macOS are kept, on the file, its
   `.bak` and the file `convert -i` makes; one the directory would give the new
-  file is not. Where an ACL cannot be read or kept, the group and others get
-  nothing and a WARN says so: access never widens. Kept through the rename,
-  the ACL's group entry refers to the old group, so a file whose group could not
-  be kept keeps no ACL and is private to its owner.
+  file is not. Where an ACL cannot be read or kept, the file is open to its
+  owner only and a WARN says so. A Linux ACL says what the file's group may do,
+  so a file whose group could not be kept loses its ACL too; on macOS it keeps
+  the ACL and only the mode is narrowed.
+- **Deletion denied.** Replacing a file is deleting it, which can be forbidden:
+  on macOS by an ACL (`deny delete`, `deny delete_child` on the directory) or a
+  flag (`uchg`), on Linux by `chattr +i` / `+a` on the file or `+a` on the
+  directory. Such a file is refused, exit 7, before anything is written; so is
+  `convert -i` without `--keep-source` of such a source.
 - **Changed while dq was running.** The file written is the one that was read:
   if, between the two, the path leads to another file (it was replaced, or
-  turned into a link), the write is refused, exit 7.
+  turned into a link), or the file's size or modification time changed, the
+  write is refused, exit 7. Not noticed: a rewrite of the same size that leaves
+  the modification time as it was, and one between the last check and the
+  rename.
 - **Not preserved:** other ACLs (NFSv4, other systems), extended attributes
   (the SELinux label too), file flags, timestamps, and the other names of a
   hard-linked file, which keep the old content.
@@ -270,15 +280,37 @@ that is the source under another spelling (`f.YAML` to `f.yaml` on a
 case-insensitive file system). `--doc` is refused with `-i`, because deleting
 the source would delete the other documents with it.
 
-The new file takes the mode, owner and group of the source. An existing file at
-the target is replaced without a question and keeps its own mode; `--backup`
-keeps a copy of it. A target that is a link is refused (exit 7). When the source is a
-link, the new file goes beside the link, the link is removed and the file it
-leads to stays. Before anything is written the whole run is planned: two sources
-that map to the same target (`a.yaml` and `a.yml` to `a.json`), a target that is
-a source, a target that is two names of one file (a hard link), a `<target>.bak`
-that is a source, are refused (exit 6), and a link at a target exits 7. Nothing
-is converted then.
+A file that is already at the target is not replaced: the run is refused
+(exit 6) and the message names the targets. `--overwrite` replaces them;
+`--backup` does too and keeps a copy of each as `<target>.bak`. A file replaced
+this way keeps its own mode. A target that is a link or no regular file is
+refused whatever the flags (exit 7). `--overwrite` without `-i` is a usage error
+(exit 2).
+
+A new file takes the mode, owner, group and ACL of the source. When the source
+is a link, the new file goes beside the link, the link is removed and the file
+it leads to stays.
+
+The whole run is checked before anything is written. Nothing is converted when
+there is
+
+- an existing target, two sources that map to one target (`a.yaml` and `a.yml`
+  to `a.json`), a target that is a source or another name of it (a hard link),
+  a `<target>.bak` that is a source, or a source that is a link to its own
+  target or to that `.bak` (exit 6);
+- a link or no regular file at a target, a target that may not be replaced, a
+  source that may not be deleted, or, with `--backup`, a `<target>.bak` that is
+  no regular file (exit 7).
+
+A source that is missing, or a link to nothing, is exit 5, whatever is at its
+target.
+
+A target that appears after the check is not replaced without `--overwrite` or
+`--backup`: that file fails with exit 7, its source stays, and the files before
+it stay converted (`already converted: 3 of 10`). With them it is replaced if it
+is there when its turn comes, and not if it appears during the write itself. A
+source that cannot be removed in the end stays next to its converted file; the
+error says so (exit 7), and the file counts as converted.
 
 ## YAML streams
 

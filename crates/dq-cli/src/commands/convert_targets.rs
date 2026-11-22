@@ -30,6 +30,14 @@ pub(super) enum Conflict {
         /// The other.
         target: Utf8PathBuf,
     },
+    /// The source is a link to a file the conversion would replace: its
+    /// target, or the backup of that.
+    Link {
+        /// The link.
+        source: Utf8PathBuf,
+        /// The target or the backup.
+        file: Utf8PathBuf,
+    },
     /// Two sources would be written to one file.
     Shared {
         /// The earlier source and its target.
@@ -45,6 +53,43 @@ pub(super) enum Conflict {
         /// The source at the name of its backup.
         source: Utf8PathBuf,
     },
+    /// Files are at the targets already, and nothing says that they may go.
+    Existing {
+        /// Those targets, one at least, in the order of the run.
+        targets: Vec<Utf8PathBuf>,
+    },
+}
+
+/// How many targets a message names.
+const LISTED: usize = 3;
+
+/// `the target 'a' already exists`, `the targets 'a', 'b' and 'c' already
+/// exist`, `the targets 'a', 'b' and 5 others already exist`.
+fn existing(targets: &[Utf8PathBuf]) -> String {
+    let shown = if targets.len() > LISTED {
+        LISTED - 1
+    } else {
+        targets.len()
+    };
+    let mut names: Vec<String> = targets[..shown].iter().map(|t| format!("'{t}'")).collect();
+    match targets.len() - shown {
+        0 => {}
+        others => names.push(format!("{others} others")),
+    }
+    match names.as_slice() {
+        [init @ .., last] if !init.is_empty() => {
+            format!(
+                "the targets {} and {last} already exist; pass --overwrite to replace them, \
+                 or --backup to keep a copy of each",
+                init.join(", ")
+            )
+        }
+        names => format!(
+            "the target {} already exists; pass --overwrite to replace it, or --backup to keep \
+             a copy",
+            names.concat()
+        ),
+    }
 }
 
 impl Conflict {
@@ -59,6 +104,9 @@ impl Conflict {
             }
             Self::HardLink { source, target } => format!(
                 "'{source}' and its target '{target}' are two names of one file (a hard link); remove one of them first"
+            ),
+            Self::Link { source, file } => format!(
+                "'{source}' is a symbolic link to '{file}', which the conversion would replace; remove the link first"
             ),
             Self::Shared { first, second } => {
                 let (source, target) = first;
@@ -75,6 +123,7 @@ impl Conflict {
             Self::Backup { target, source } => format!(
                 "the backup of '{target}' would replace '{source}', which is to be converted too; rename one of them first"
             ),
+            Self::Existing { targets } => existing(targets),
         };
         format!("convert -i to {format}: {what}. Nothing was converted")
     }
@@ -82,7 +131,8 @@ impl Conflict {
 
 /// The first conflict among `planned`, the `(source, target)` pairs of a run
 /// in order, each target next to its source with another extension; `backup`
-/// when the targets that exist are backed up.
+/// when the targets that exist are backed up. [`Conflict::Existing`] is not
+/// looked for: whether it is one depends on the flags.
 ///
 /// A target that is another source of the run needs no case of its own: it
 /// has the extension the targets have, so that source is its own target.
@@ -93,8 +143,14 @@ pub(super) fn find_conflict(
     let sources = Sources::of(planned);
     sources
         .own_target()
+        .or_else(|| sources.linked_target(backup))
         .or_else(|| sources.shared_target())
         .or_else(|| backup.then(|| sources.backed_up_over()).flatten())
+}
+
+/// Where a target that exists is backed up.
+fn backup_of(target: &Utf8Path) -> Utf8PathBuf {
+    Utf8PathBuf::from(format!("{target}.bak"))
 }
 
 #[cfg(unix)]
@@ -102,7 +158,9 @@ use unix::Sources;
 
 #[cfg(unix)]
 mod unix {
-    use std::collections::{BTreeSet, HashMap};
+    use std::cell::RefCell;
+    use std::collections::{BTreeSet, HashMap, HashSet};
+    use std::ffi::OsString;
     use std::os::unix::fs::MetadataExt as _;
 
     use super::*;
@@ -118,6 +176,9 @@ mod unix {
         planned: &'a [(Utf8PathBuf, Utf8PathBuf)],
         entries: Vec<Option<Entry>>,
         directories: Vec<Option<Entry>>,
+        /// The names in the directories that had to be listed: each is once,
+        /// however many of its files are hard links.
+        names: RefCell<HashMap<Entry, HashSet<OsString>>>,
     }
 
     fn entry(path: &Utf8Path) -> io::Result<Entry> {
@@ -139,13 +200,13 @@ mod unix {
             .map_or_else(String::new, |extension| format!(".{extension}"))
     }
 
-    /// Whether the directory of `path` lists its name as it is spelled.
-    fn is_listed(path: &Utf8Path) -> bool {
-        std::fs::read_dir(parent(path).as_std_path()).is_ok_and(|names| {
-            names
-                .filter_map(Result::ok)
-                .any(|entry| entry.file_name().to_str() == path.file_name())
-        })
+    /// The names the directory of `path` lists; none when it cannot be read.
+    fn listed_beside(path: &Utf8Path) -> HashSet<OsString> {
+        std::fs::read_dir(parent(path).as_std_path())
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| Some(entry.ok()?.file_name()))
+            .collect()
     }
 
     /// What is left of `stem` in every spelling some file system takes for
@@ -189,14 +250,26 @@ mod unix {
                         })
                     })
                     .collect(),
+                names: RefCell::default(),
             }
+        }
+
+        /// Whether `directory`, in which `path` is, lists its name as it is
+        /// spelled.
+        fn is_listed(&self, path: &Utf8Path, directory: Entry) -> bool {
+            let mut names = self.names.borrow_mut();
+            let names = names
+                .entry(directory)
+                .or_insert_with(|| listed_beside(path));
+            path.file_name()
+                .is_some_and(|name| names.contains(std::ffi::OsStr::new(name)))
         }
 
         pub(super) fn own_target(&self) -> Option<Conflict> {
             self.planned
                 .iter()
-                .zip(&self.entries)
-                .find_map(|((source, target), found)| {
+                .zip(self.entries.iter().zip(&self.directories))
+                .find_map(|((source, target), (found, directory))| {
                     let source = source.clone();
                     if source == *target {
                         return Some(Conflict::Itself { source });
@@ -205,12 +278,38 @@ mod unix {
                         return None;
                     }
                     // Another spelling of the one name, or another name.
-                    Some(if is_listed(target) {
+                    let listed = directory.is_some_and(|dir| self.is_listed(target, dir));
+                    Some(if listed {
                         let target = target.clone();
                         Conflict::HardLink { source, target }
                     } else {
                         Conflict::Itself { source }
                     })
+                })
+        }
+
+        /// The first source that is a link to its own target, or with
+        /// `backup` to the backup of that.
+        pub(super) fn linked_target(&self, backup: bool) -> Option<Conflict> {
+            self.planned
+                .iter()
+                .zip(&self.entries)
+                .find_map(|((source, target), found)| {
+                    let file = std::fs::metadata(source.as_std_path()).ok()?;
+                    let file = Some((file.dev(), file.ino()));
+                    if file == *found {
+                        return None; // no link
+                    }
+                    entry(target).ok()?;
+                    let backup = backup.then(|| backup_of(target));
+                    [Some(target.clone()), backup]
+                        .into_iter()
+                        .flatten()
+                        .find(|path| entry(path).ok() == file)
+                        .map(|file| Conflict::Link {
+                            source: source.clone(),
+                            file,
+                        })
                 })
         }
 
@@ -268,7 +367,7 @@ mod unix {
                 .zip(&self.directories)
                 .find_map(|((_, target), directory)| {
                     entry(target).ok()?;
-                    let backup = Utf8PathBuf::from(format!("{target}.bak"));
+                    let backup = backup_of(target);
                     let source = self.named(&backup, (*directory)?, &all)?;
                     Some(Conflict::Backup {
                         target: target.clone(),
@@ -285,12 +384,13 @@ mod unix {
             directory: Entry,
             known: &HashMap<Entry, Vec<usize>>,
         ) -> Option<usize> {
-            let found = entry(probe).ok()?;
-            known.get(&found)?.iter().copied().find(|&index| {
-                // A name that is there as it is spelled, and is not the
-                // source's, is a hard link: another file.
+            let known = known.get(&entry(probe).ok()?)?;
+            // A name that is there as it is spelled, and is not the source's,
+            // is a hard link: another file.
+            let listed = self.is_listed(probe, directory);
+            known.iter().copied().find(|&index| {
                 self.directories[index] == Some(directory)
-                    && (self.planned[index].0.file_name() == probe.file_name() || !is_listed(probe))
+                    && (!listed || self.planned[index].0.file_name() == probe.file_name())
             })
         }
     }
@@ -313,6 +413,26 @@ impl<'a> Sources<'a> {
         })
     }
 
+    fn linked_target(&self, backup: bool) -> Option<Conflict> {
+        self.0.iter().find_map(|(source, target)| {
+            let source_is_link = source.as_std_path().symlink_metadata().ok()?.is_symlink();
+            let file = source.as_std_path().canonicalize().ok()?;
+            let backup = backup.then(|| backup_of(target));
+            [Some(target.clone()), backup]
+                .into_iter()
+                .flatten()
+                .find(|path| {
+                    source_is_link
+                        && target.exists()
+                        && path.as_std_path().canonicalize().ok().as_ref() == Some(&file)
+                })
+                .map(|file| Conflict::Link {
+                    source: source.clone(),
+                    file,
+                })
+        })
+    }
+
     fn shared_target(&self) -> Option<Conflict> {
         self.0.iter().enumerate().find_map(|(later, second)| {
             let first = self.0[..later].iter().find(|first| first.1 == second.1)?;
@@ -325,7 +445,7 @@ impl<'a> Sources<'a> {
 
     fn backed_up_over(&self) -> Option<Conflict> {
         self.0.iter().find_map(|(_, target)| {
-            let backup = Utf8PathBuf::from(format!("{target}.bak"));
+            let backup = backup_of(target);
             let (source, _) = self.0.iter().find(|(source, _)| *source == backup)?;
             target.exists().then(|| Conflict::Backup {
                 target: target.clone(),
@@ -370,7 +490,9 @@ mod tests {
             Conflict::HardLink { source, target } | Conflict::Backup { target, source } => {
                 (name(&target), name(&source))
             }
+            Conflict::Link { source, file } => (name(&file), name(&source)),
             Conflict::Shared { first, second } => (name(&first.0), name(&second.0)),
+            Conflict::Existing { .. } => unreachable!("not looked for"),
         })
     }
 
@@ -520,6 +642,118 @@ mod tests {
             "convert -i to json: the backup of 'a.json' would replace 'a.json.bak', which is to \
              be converted too; rename one of them first. Nothing was converted"
         );
+    }
+
+    #[test]
+    fn the_message_names_the_targets_that_exist_up_to_three() {
+        let message = |targets: &[&str]| {
+            Conflict::Existing {
+                targets: targets.iter().map(Utf8PathBuf::from).collect(),
+            }
+            .message("json")
+        };
+        assert_eq!(
+            message(&["a.json"]),
+            "convert -i to json: the target 'a.json' already exists; pass --overwrite to replace \
+             it, or --backup to keep a copy. Nothing was converted"
+        );
+        for (targets, named) in [
+            (&["a", "b"][..], "'a' and 'b'"),
+            (&["a", "b", "c"], "'a', 'b' and 'c'"),
+            (&["a", "b", "c", "d"], "'a', 'b' and 2 others"),
+            (&["a", "b", "c", "d", "e"], "'a', 'b' and 3 others"),
+        ] {
+            assert_eq!(
+                message(targets),
+                format!(
+                    "convert -i to json: the targets {named} already exist; pass --overwrite to \
+                     replace them, or --backup to keep a copy of each. Nothing was converted"
+                )
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_a_file_the_conversion_would_replace_is_found() {
+        let (_dir, root) = directory_of(&["a.json", "a.json.bak", "other.json", "sub/a.json"]);
+        for (link, to, expected) in [
+            ("a.yaml", "a.json", pair("a.json", "a.yaml")),
+            ("a.yaml", "b.lnk", pair("a.json", "a.yaml")),
+            ("a.yaml", "a.json.bak", pair("a.json.bak", "a.yaml")),
+            ("a.yaml", "other.json", None),
+            ("a.yaml", "sub/a.json", None),
+            ("a.yaml", "nowhere", None),
+            // There is no `n.json` to replace.
+            ("n.yaml", "a.json", None),
+        ] {
+            std::os::unix::fs::symlink("a.json", root.join("b.lnk")).expect("symlink");
+            std::os::unix::fs::symlink(to, root.join(link)).expect("symlink");
+            assert_eq!(conflict(&root, &[link]), expected, "{to}");
+            std::fs::remove_file(root.join("b.lnk")).expect("rm");
+            std::fs::remove_file(root.join(link)).expect("rm");
+        }
+        // Without a backup that file stays.
+        std::os::unix::fs::symlink("a.json.bak", root.join("a.yaml")).expect("symlink");
+        assert_eq!(find_conflict(&plan(&root, &["a.yaml"]), false), None);
+        let spelled = Conflict::Link {
+            source: "a.yaml".into(),
+            file: "a.json".into(),
+        };
+        assert_eq!(
+            spelled.message("json"),
+            "convert -i to json: 'a.yaml' is a symbolic link to 'a.json', which the conversion \
+             would replace; remove the link first. Nothing was converted"
+        );
+    }
+
+    /// The names of one directory say nothing of another.
+    #[cfg(unix)]
+    #[test]
+    fn hard_links_of_several_directories_are_files_of_their_own() {
+        let (_dir, root) = directory_of(&["one/a.yaml", "two/d.yaml"]);
+        let links = [
+            ("one/a.yaml", "one/b.yml"),
+            ("one/a.yaml", "two/e.yaml"),
+            ("two/d.yaml", "two/f.yml"),
+            ("two/d.yaml", "one/g.yaml"),
+        ];
+        for (file, link) in links {
+            std::fs::hard_link(root.join(file), root.join(link)).expect("link");
+        }
+        let sources = [
+            "one/a.yaml",
+            "one/b.yml",
+            "one/g.yaml",
+            "two/d.yaml",
+            "two/e.yaml",
+            "two/f.yml",
+        ];
+        assert_eq!(conflict(&root, &sources), None);
+    }
+
+    /// Listing the directory for each pair takes minutes.
+    #[cfg(unix)]
+    #[test]
+    fn many_hard_links_of_one_file_are_compared_at_once() {
+        let names: Vec<String> = (0..200)
+            .flat_map(|n| [format!("f{n}.yaml"), format!("f{n}x.yml")])
+            .collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (_dir, root) = directory_of(&["f0.yaml", "other/f0.yml"]);
+        for name in &names[1..] {
+            std::fs::hard_link(root.join("f0.yaml"), root.join(name)).expect("link");
+        }
+        let start = std::time::Instant::now();
+
+        assert_eq!(conflict(&root, &names), None);
+
+        let mut names = names;
+        std::fs::hard_link(root.join("f0.yaml"), root.join("f7.yml")).expect("link");
+        names.push("f7.yml");
+        assert_eq!(conflict(&root, &names), pair("f7.yaml", "f7.yml"));
+        let took = start.elapsed();
+        assert!(took < std::time::Duration::from_secs(10), "{took:?}");
     }
 
     #[cfg(unix)]

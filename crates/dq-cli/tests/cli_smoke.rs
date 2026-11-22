@@ -1268,3 +1268,48 @@ fn smoke_frontmatter_takes_filters_and_refuses_point_edits() {
         (0, String::new(), String::new(), src.to_owned())
     );
 }
+
+/// What dq says of what it cannot do is about dq as it is, not about the
+/// milestones it was built in.
+#[test]
+fn no_message_names_a_milestone() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for (name, content) in [
+        ("a.yaml", "a: 1\n"),
+        ("Dockerfile", "FROM scratch\n"),
+        (".gitignore", "target\n"),
+        ("a.md", "# a\n"),
+    ] {
+        std::fs::write(dir.path().join(name), content).expect("seed");
+    }
+    for args in [
+        &["convert", "a.yaml", "-F", "json"][..],
+        &["convert", "a.yaml", "-F", "sarif"],
+        &["convert", "a.yaml", "-F", "junit"],
+        &["convert", "a.yaml", "-F", "tap"],
+        &["get", "a.yaml", "/a", "-F", "sarif"],
+        &["get", "a.yaml", "/a", "-F", "junit"],
+        &["get", "a.yaml", "/a", "-F", "tap"],
+        &["set", "Dockerfile", "--jq", "[]"],
+        &["set", ".gitignore", "--jq", "[]"],
+        &["set", "a.md", "--jq", ".type = 1"],
+    ] {
+        let output = assert_cmd::Command::cargo_bin("dq")
+            .expect("dq binary built")
+            .current_dir(dir.path())
+            .env_clear()
+            .env("HOME", dir.path())
+            .args(args)
+            .output()
+            .expect("run");
+        let stderr = String::from_utf8(output.stderr).expect("utf-8");
+        assert!(!stderr.is_empty(), "{args:?}");
+        let milestone = stderr
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|word| {
+                word.strip_prefix('M')
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            });
+        assert!(!milestone, "{args:?}: {stderr}");
+    }
+}

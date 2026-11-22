@@ -52,6 +52,8 @@ impl Access {
 pub(super) struct Kept {
     /// The owner and the group.
     pub(super) owner: bool,
+    /// The bits that go with the owner, group and ACL the file has now.
+    pub(super) bits: bool,
     pub(super) acl: bool,
 }
 
@@ -110,6 +112,20 @@ pub(super) fn strip_acl(file: &dyn Staged) -> io::Result<()> {
     }
 }
 
+/// Take away the ACL `file` has been given, and with it what the mode `bits`
+/// open it to beyond its owner.
+///
+/// That first: on Linux the group bits were the mask of the ACL, and are the
+/// group's own once the ACL is gone.
+///
+/// # Errors
+///
+/// As [`strip_acl`]; also when the bits cannot be set.
+pub(super) fn withdraw_acl(file: &dyn Staged, bits: u32) -> io::Result<()> {
+    file.set_bits(bits & 0o700)?;
+    strip_acl(file)
+}
+
 /// Give `file`, open to its owner at most and without an ACL, the access
 /// `like`.
 ///
@@ -145,9 +161,13 @@ pub(super) fn keep(file: &dyn Staged, like: &Access) -> io::Result<Kept> {
         file.set_owner(uid).ok();
     }
     let same_owner = file.mode()?.uid == uid;
-    set_bits(kept_bits(bits, same_owner, same_group) & open_to).ok();
+    let wanted = kept_bits(bits, same_owner, same_group) & open_to;
+    set_bits(wanted).ok();
     Ok(Kept {
         owner: same_owner && same_group,
+        // Linux drops set-group-ID without a word when the process is not in
+        // the file's group.
+        bits: file.mode()?.bits == wanted,
         acl: same_acl,
     })
 }
@@ -172,7 +192,7 @@ fn keep_acl(file: &dyn Staged, like: &Access, same_group: bool) -> io::Result<bo
     {
         return Ok(true);
     }
-    strip_acl(file)?;
+    withdraw_acl(file, like.mode.bits)?;
     Ok(false)
 }
 
@@ -213,6 +233,11 @@ mod tests {
         may_set_acl: bool,
         /// The file system keeps the ACL it is given.
         keeps_acl: bool,
+        /// An ACL can be taken off a file again.
+        drops_acl: bool,
+        /// The ACL is a POSIX one: the mode shows it, and keeps showing it
+        /// once it is gone. Without it the mode is another thing (macOS).
+        posix_acl: bool,
     }
 
     const USER: Process = Process {
@@ -222,6 +247,8 @@ mod tests {
         may_chmod: false,
         may_set_acl: true,
         keeps_acl: true,
+        drops_acl: true,
+        posix_acl: true,
     };
 
     /// A temporary file as the system would keep it, that checks after every
@@ -299,7 +326,14 @@ mod tests {
             if !self.owns() {
                 return denied();
             }
-            self.step("bits", |now| now.0.bits = bits);
+            let process = self.process;
+            self.step("bits", |now| {
+                now.0.bits = bits;
+                // Linux, without `CAP_FSETID`: no error.
+                if !(process.may_chown || process.groups.contains(&now.0.gid)) {
+                    now.0.bits &= !0o2000;
+                }
+            });
             Ok(())
         }
 
@@ -334,14 +368,20 @@ mod tests {
             if !(self.owns() && self.process.may_set_acl) {
                 return denied();
             }
-            let keeps = self.process.keeps_acl;
+            let process = self.process;
+            let like = self.like.bits & 0o777;
             self.step("acl", |now| {
                 now.1 = match list {
-                    Some(list) if keeps => Some(list.to_vec()),
+                    Some(list) if process.keeps_acl => Some(list.to_vec()),
                     // Less than it was given.
                     Some(list) => Some(list[1..].to_vec()),
-                    None => None,
+                    None if process.drops_acl => None,
+                    None => return,
                 };
+                // The user, the mask and the others of the list.
+                if process.posix_acl && now.1.is_some() {
+                    now.0.bits = (now.0.bits & 0o7000) | like;
+                }
             });
             Ok(())
         }
@@ -365,6 +405,7 @@ mod tests {
 
     const ALL: Kept = Kept {
         owner: true,
+        bits: true,
         acl: true,
     };
 
@@ -377,6 +418,8 @@ mod tests {
             may_chmod: true,
             may_set_acl: true,
             keeps_acl: true,
+            drops_acl: true,
+            posix_acl: true,
         };
         let list = Some(b"list".to_vec());
         for process in [
@@ -423,7 +466,7 @@ mod tests {
             };
             let expected = Kept {
                 owner: false,
-                acl: true,
+                ..ALL
             };
             assert_eq!(kept(USER, &like), (mode, None, expected), "{bits:o}");
         }
@@ -435,10 +478,7 @@ mod tests {
             may_set_acl: false,
             ..USER
         };
-        let expected = Kept {
-            owner: true,
-            acl: false,
-        };
+        let expected = Kept { acl: false, ..ALL };
         let forgetful = Process {
             keeps_acl: false,
             ..USER
@@ -466,10 +506,79 @@ mod tests {
         let list = Some(b"list".to_vec());
         let like = access(1000, 3000, 0o664, Some(list.clone()));
         let linux = cfg!(target_os = "linux");
-        let (mode, acl, kept) = kept(USER, &like);
+        let process = Process {
+            posix_acl: linux,
+            ..USER
+        };
+        let (mode, acl, kept) = kept(process, &like);
         assert_eq!(mode.bits, if linux { 0o600 } else { 0o644 });
         assert_eq!(acl, if linux { None } else { list });
         assert_eq!((kept.owner, kept.acl), (false, !linux));
+    }
+
+    /// A temporary file made in a set-group-ID directory has the group of
+    /// that, which its owner need not be in.
+    #[test]
+    fn a_set_group_id_bit_the_system_drops_is_noticed() {
+        for (bits, dropped) in [(0o2664, 0o664), (0o6755, 0o4755), (0o664, 0o664)] {
+            let like = access(1000, 3000, bits, Some(None));
+            let fake = Fake::new(USER, &like);
+            fake.now.borrow_mut().0.gid = 3000;
+
+            let kept = keep(&fake, &like).expect("not being allowed is no error");
+
+            assert_eq!(fake.now.borrow().0.bits, dropped);
+            let expected = Kept {
+                bits: bits == dropped,
+                ..ALL
+            };
+            assert_eq!(kept, expected, "{bits:o}");
+        }
+    }
+
+    /// What is not read back was not taken away.
+    #[test]
+    fn an_acl_that_stays_is_an_error() {
+        let like = access(1000, 1000, 0o664, Some(Some(b"list".to_vec())));
+        let clinging = Process {
+            drops_acl: false,
+            ..USER
+        };
+        let fake = Fake::new(clinging, &like);
+        assert!(strip_acl(&fake).is_ok(), "there is none");
+        fake.set_acl(Some(b"list")).expect("set");
+
+        assert!(strip_acl(&fake).is_err());
+
+        // The same when it is there but is not the one that was wanted.
+        let fake = Fake::new(
+            Process {
+                keeps_acl: false,
+                ..clinging
+            },
+            &like,
+        );
+        assert!(keep(&fake, &like).is_err());
+    }
+
+    #[test]
+    fn an_acl_that_cannot_be_read_is_not_none() {
+        let file = tempfile::tempfile().expect("temp");
+        let mode = Mode::from(&file.metadata().expect("stat"));
+        assert_eq!(Access::of(mode, None).acl, None);
+        assert_eq!(Access::of(mode, Some(&file)).acl, Some(None));
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+
+            // A descriptor that gives access to the path alone.
+            let path = File::options()
+                .read(true)
+                .custom_flags(libc::O_PATH)
+                .open("/")
+                .expect("open");
+            assert_eq!(Access::of(mode, Some(&path)).acl, None);
+        }
     }
 
     #[test]
