@@ -59,8 +59,8 @@ unicode-width = { workspace = true }
 # M6 distribution. `self_update` drives `dq self update` (atomic GitHub
 # Releases download); `ureq` powers the `dq self check` API ping. Workspace
 # defaults already disable OpenSSL in favour of rustls. `tempfile` is used
-# by the `self update` install-dir writability probe (the dev-dependencies
-# entry is for unit tests; this runtime entry is a separate consumer).
+# by the `self update` install-dir writability probe and by `rules add` (the
+# dev-dependencies entry is for unit tests).
 self_update = { workspace = true }
 ureq = { workspace = true }
 # SHA-256 of the downloaded release archive (`self update` checksum gate).

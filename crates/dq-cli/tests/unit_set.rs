@@ -66,7 +66,7 @@ fn set_replaces_scalar() {
 #[test]
 fn set_in_place_writes_file_atomically() {
     // `-i` mode: file content updated, stdout empty. We use the atomic-write
-    // path through `dq_core::atomic_write::write` — its byte-for-byte
+    // path through `dq_core::atomic_write::rewrite` — its byte-for-byte
     // semantics are exercised here.
     let tmp = write_yaml("spec:\n  replicas: 3\n");
     let path = tmp.to_str().unwrap();
@@ -358,12 +358,15 @@ fn set_in_place_failure_leaves_original_intact() {
     let original = "a: 1\n";
     std::fs::write(&path, original).expect("seed victim file");
 
-    // Make the parent directory non-writable. `atomic_write::write` creates
+    // Make the parent directory non-writable. `atomic_write::rewrite` creates
     // a tempfile in the same directory before persisting; that creation must
     // fail.
     let mut dir_perms = std::fs::metadata(dir.path()).unwrap().permissions();
     dir_perms.set_mode(0o500);
     std::fs::set_permissions(dir.path(), dir_perms).expect("chmod dir");
+    if std::fs::write(dir.path().join("probe"), "").is_ok() {
+        return; // root writes wherever it wants
+    }
 
     let path_str = path.to_str().unwrap();
     let cli = Cli::try_parse_from(["dq", "-i", "set", path_str, "/a", "2"]).unwrap();

@@ -14,15 +14,17 @@
 //! `docs/reference/bulk.md`, and the `--parallel` decision in the
 //! add-bulk-and-ci section of `docs/decisions.md`).
 
+use std::collections::HashSet;
 use std::io::{self, Write};
 
 use camino::{Utf8Path, Utf8PathBuf};
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use dq_core::atomic_write::Original;
+use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
 use crate::cli::Cli;
 use crate::commands::io_helpers::every_file_lacks;
 use crate::error::{
-    BulkPartialFailure, CheckPending, DocOutOfRange, joined_message, position_note,
+    BulkPartialFailure, CheckPending, DocOutOfRange, InvalidInput, joined_message, position_note,
 };
 use crate::glob::{self, GlobError};
 use crate::output::terminal_text;
@@ -41,6 +43,9 @@ pub enum FileOpResult {
         output_bytes: Vec<u8>,
         /// Optional unified-diff string for `--diff` mode.
         diff: Option<String>,
+        /// The file the op read, which `-i` writes and no other: the path
+        /// must still lead to it. `None` for stdin.
+        original: Option<Original>,
     },
     /// File is byte-identical to its prospective output (idempotent run).
     /// Counted under `Skipped`, nothing printed. An op may return
@@ -152,6 +157,10 @@ fn resolve_parallel(n: Option<usize>) -> usize {
 ///   aborting; if any failed, the function returns
 ///   [`BulkPartialFailure`] (mapped to exit 7). Without the flag, the
 ///   first error short-circuits.
+/// - **Two names of one file** (`fix -i` on a file and a link to it): files
+///   are written one at a time, in order, whatever `cli.parallel` is, and
+///   the op is applied to a further name of a file once its turn to be
+///   written has come. The result is that of a sequential run.
 ///
 /// # Errors
 ///
@@ -177,19 +186,22 @@ pub fn run_per_file(
     // Apply the op to every file, collecting results in matched-file
     // order. Sequential when `parallel == 1` or when there's just one
     // file — avoids spinning up a rayon pool for the common case.
-    let results: Vec<(Utf8PathBuf, anyhow::Result<FileOpResult>)> =
+    //
+    // Not yet to a further name of a file that will be written by then: its
+    // result would be made from the bytes before that write.
+    let again = further_names(&files, cli.in_place);
+    let apply = |(file, again): (&Utf8PathBuf, &Option<Original>)| {
+        let result = again.is_none().then(|| op.apply(file));
+        (file.clone(), result)
+    };
+    let results: Vec<(Utf8PathBuf, Option<anyhow::Result<FileOpResult>>)> =
         if parallel <= 1 || files.len() <= 1 {
-            files.iter().map(|f| (f.clone(), op.apply(f))).collect()
+            files.iter().zip(&again).map(apply).collect()
         } else {
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(parallel)
                 .build()?;
-            pool.install(|| {
-                files
-                    .par_iter()
-                    .map(|f| (f.clone(), op.apply(f)))
-                    .collect::<Vec<_>>()
-            })
+            pool.install(|| files.par_iter().zip(&again).map(apply).collect())
         };
 
     // Aggregation state.
@@ -200,9 +212,24 @@ pub fn run_per_file(
     let mut buffer: Vec<u8> = Vec::new();
     let mut missing: Vec<(Utf8PathBuf, DocOutOfRange)> = Vec::new();
 
-    for (path, result) in results {
+    for ((path, result), again) in results.into_iter().zip(again) {
+        let result = result.unwrap_or_else(|| op.apply(&path)).and_then(|done| {
+            if let FileOpResult::Modified {
+                original: Some(original),
+                ..
+            } = &done
+                && let Some(before) = &again
+            {
+                original.check_way(&path, before)?;
+            }
+            Ok(done)
+        });
         match result {
-            Ok(FileOpResult::Modified { output_bytes, diff }) => {
+            Ok(FileOpResult::Modified {
+                output_bytes,
+                diff,
+                original,
+            }) => {
                 if cli.check {
                     match would_change(&path, &output_bytes) {
                         Ok(true) => {
@@ -218,23 +245,17 @@ pub fn run_per_file(
                 // A file whose bytes would not change is never rewritten
                 // (its mtime and any `.bak` stay as they are) and counts
                 // under Skipped, like an op's own `Unchanged`.
-                let unchanged = source_matches(&path, &output_bytes);
                 if cli.in_place {
-                    if unchanged {
-                        skipped += 1;
-                        continue;
+                    match rewrite(&path, original.as_ref(), &output_bytes, cli.backup) {
+                        Ok(true) => modified += 1,
+                        Ok(false) => skipped += 1,
+                        Err(e) if collect_failures => failed.push((path, e)),
+                        Err(e) => return Err(e),
                     }
-                    match dq_core::atomic_write::write(&path, &output_bytes, cli.backup) {
-                        Ok(()) => modified += 1,
-                        Err(e) => {
-                            if collect_failures {
-                                failed.push((path.clone(), anyhow::Error::new(e)));
-                            } else {
-                                return Err(anyhow::Error::new(e));
-                            }
-                        }
-                    }
-                } else if cli.diff {
+                    continue;
+                }
+                let unchanged = source_matches(&path, &output_bytes);
+                if cli.diff {
                     if unchanged {
                         skipped += 1;
                         continue;
@@ -339,6 +360,50 @@ pub fn run_per_file(
     Ok(())
 }
 
+/// Write `output_bytes` to the file at `path`, which must be the one the op
+/// read, `original`. `false` when it holds them already.
+fn rewrite(
+    path: &Utf8Path,
+    original: Option<&Original>,
+    output_bytes: &[u8],
+    backup: bool,
+) -> anyhow::Result<bool> {
+    let original = original.ok_or_else(|| {
+        InvalidInput::new(format!("-i/--in-place needs a file on disk: '{path}'"))
+    })?;
+    dq_core::atomic_write::rewrite(path, original, output_bytes, backup).map_err(anyhow::Error::new)
+}
+
+/// For each of `files` that an earlier one is another name of, through a
+/// link, as a hard link or in another spelling: where it leads. For none,
+/// unless the run writes.
+fn further_names(files: &[Utf8PathBuf], in_place: bool) -> Vec<Option<Original>> {
+    let mut seen = HashSet::new();
+    files
+        .iter()
+        .map(|file| {
+            let further = in_place && identity(file).is_some_and(|id| !seen.insert(id));
+            further
+                .then(|| dq_core::atomic_write::locate(file))
+                .flatten()
+        })
+        .collect()
+}
+
+/// What the file at `path` is, links followed; `None` when it cannot be told.
+#[cfg(unix)]
+fn identity(path: &Utf8Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let found = std::fs::metadata(path.as_std_path()).ok()?;
+    Some((found.dev(), found.ino()))
+}
+
+#[cfg(not(unix))]
+fn identity(path: &Utf8Path) -> Option<std::path::PathBuf> {
+    std::fs::canonicalize(path.as_std_path()).ok()
+}
+
 /// Whether the file at `path` already holds exactly `output_bytes`. A file
 /// that cannot be read counts as different, so the write that follows
 /// reports the real error.
@@ -399,12 +464,19 @@ mod tests {
         }
     }
 
+    /// The file at `path`, as an op that read it notes it.
+    fn original(path: &Utf8Path) -> Option<Original> {
+        let (_, original) = dq_core::atomic_write::read(path).ok()?;
+        Some(original)
+    }
+
     impl FileOp for ConstOp {
-        fn apply(&self, _path: &Utf8Path) -> anyhow::Result<FileOpResult> {
+        fn apply(&self, path: &Utf8Path) -> anyhow::Result<FileOpResult> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(FileOpResult::Modified {
                 output_bytes: self.bytes.clone(),
                 diff: self.diff.clone(),
+                original: original(path),
             })
         }
     }
@@ -424,6 +496,7 @@ mod tests {
             Ok(FileOpResult::Modified {
                 output_bytes: self.bytes.clone(),
                 diff: None,
+                original: original(path),
             })
         }
     }
@@ -610,6 +683,7 @@ mod tests {
             Ok(FileOpResult::Modified {
                 output_bytes: self.bytes.clone(),
                 diff: None,
+                original: original(path),
             })
         }
     }
@@ -720,5 +794,192 @@ mod tests {
         assert!(s.contains("-x: 1"), "missing diff body: {s}");
         // Diff mode in bulk still ends with a summary so users see counts.
         assert!(s.contains("Modified: 2"));
+    }
+
+    /// `FileOp` whose result depends on the bytes it finds: adds a line.
+    #[cfg(unix)]
+    struct AppendOp;
+
+    #[cfg(unix)]
+    impl FileOp for AppendOp {
+        fn apply(&self, path: &Utf8Path) -> anyhow::Result<FileOpResult> {
+            let (mut bytes, original) = dq_core::atomic_write::read(path)?;
+            bytes.extend_from_slice(b"# more\n");
+            Ok(FileOpResult::Modified {
+                output_bytes: bytes,
+                diff: None,
+                original: Some(original),
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_names_of_one_file_are_written_one_after_the_other() {
+        let dir = tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let file = root.join("a.yaml");
+        let link = root.join("link.yaml");
+        std::os::unix::fs::symlink("a.yaml", link.as_std_path()).unwrap();
+        for flags in [&["-i"][..], &["-i", "--parallel", "4"]] {
+            for files in [
+                vec![file.clone(), link.clone()],
+                vec![link.clone(), file.clone()],
+                vec![file.clone(), root.join(".").join("a.yaml")],
+            ] {
+                fs::write(file.as_std_path(), "a: 1\n").unwrap();
+                let mut out: Vec<u8> = Vec::new();
+
+                run_per_file(files, &AppendOp, &cli_for(flags), &mut out).expect("bulk run");
+
+                assert_eq!(
+                    fs::read_to_string(file.as_std_path()).unwrap(),
+                    "a: 1\n# more\n# more\n"
+                );
+                assert_eq!(
+                    fs::read_link(link.as_std_path()).unwrap().to_str(),
+                    Some("a.yaml")
+                );
+                assert_eq!(
+                    String::from_utf8(out).unwrap(),
+                    "Modified: 2, Skipped: 0, Failed: 0\n"
+                );
+            }
+        }
+    }
+
+    /// [`AppendOp`] that, when it comes to `last`, replaces the files as
+    /// `swap` says: after every file was read, before any is written.
+    #[cfg(unix)]
+    struct SwapOp<'a> {
+        last: &'a Utf8Path,
+        swap: &'a (dyn Fn() + Sync),
+    }
+
+    #[cfg(unix)]
+    impl FileOp for SwapOp<'_> {
+        fn apply(&self, path: &Utf8Path) -> anyhow::Result<FileOpResult> {
+            let result = AppendOp.apply(path);
+            if path == self.last {
+                (self.swap)();
+            }
+            result
+        }
+    }
+
+    #[cfg(unix)]
+    const CHANGED: &str =
+        "it changed while dq was running: it is not the file that was read any more";
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_became_a_link_during_the_run_is_refused() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        for (flags, collected) in [
+            (&["-i", "--backup"][..], false),
+            (&["-i", "--backup", "--continue-on-error"], true),
+        ] {
+            let dir = tempdir().unwrap();
+            let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+            let [a, b, c, victim] = ["a.yaml", "b.yaml", "c.yaml", "victim"].map(|n| root.join(n));
+            for file in [&a, &b, &c] {
+                fs::write(file, "a: 1\n").unwrap();
+            }
+            fs::write(&victim, "victim\n").unwrap();
+            fs::set_permissions(&victim, fs::Permissions::from_mode(0o600)).unwrap();
+            let swap = || {
+                fs::remove_file(&b).unwrap();
+                symlink(&victim, &b).unwrap();
+            };
+            let op = SwapOp {
+                last: &c,
+                swap: &swap,
+            };
+            let mut out: Vec<u8> = Vec::new();
+
+            let err = run_per_file(
+                vec![a.clone(), b.clone(), c.clone()],
+                &op,
+                &cli_for(flags),
+                &mut out,
+            )
+            .expect_err("must fail");
+
+            if collected {
+                assert!(err.is::<BulkPartialFailure>(), "{err:?}");
+                assert_eq!(
+                    String::from_utf8(out).unwrap(),
+                    format!(
+                        "Modified: 2, Skipped: 0, Failed: 1\n  - {b}: I/O error writing '{b}': {CHANGED}\n"
+                    )
+                );
+            } else {
+                assert_eq!(
+                    err.to_string(),
+                    format!("I/O error writing '{b}': {CHANGED}")
+                );
+                assert_eq!(fs::read_to_string(&c).unwrap(), "a: 1\n");
+            }
+            assert_eq!(fs::read_to_string(&victim).unwrap(), "victim\n");
+            let mode = fs::metadata(&victim).unwrap().permissions().mode();
+            assert_eq!(mode & 0o7777, 0o600);
+            assert!(!root.join("victim.bak").exists());
+            assert_eq!(fs::read_link(&b).unwrap(), victim);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_pointed_elsewhere_during_the_run_is_refused() {
+        use std::os::unix::fs::symlink;
+
+        // Read before the link is turned, or in its turn to be written,
+        // after it was.
+        for further_name in [false, true] {
+            let dir = tempdir().unwrap();
+            let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+            for release in ["one", "two"] {
+                fs::create_dir(root.join(release)).unwrap();
+                let file = root.join(release).join("f.yaml");
+                fs::write(file, format!("a: {release}\n")).unwrap();
+            }
+            symlink("one/f.yaml", root.join("link.yaml")).unwrap();
+            let (file, link, last) = (
+                root.join("one/f.yaml"),
+                root.join("link.yaml"),
+                root.join("z.yaml"),
+            );
+            fs::write(&last, "z: 1\n").unwrap();
+            let swap = || {
+                fs::remove_file(&link).unwrap();
+                symlink("two/f.yaml", &link).unwrap();
+            };
+            let op = SwapOp {
+                last: &last,
+                swap: &swap,
+            };
+            let files = if further_name {
+                vec![file.clone(), link.clone(), last.clone()]
+            } else {
+                vec![link.clone(), last.clone()]
+            };
+
+            let err = run_per_file(files, &op, &cli_for(&["-i"]), &mut Vec::new())
+                .expect_err("must fail");
+
+            assert_eq!(
+                err.to_string(),
+                format!("I/O error writing '{link}': {CHANGED}")
+            );
+            let read = |release| fs::read_to_string(root.join(release).join("f.yaml")).unwrap();
+            assert_eq!(read("two"), "a: two\n");
+            let one = if further_name {
+                "a: one\n# more\n"
+            } else {
+                "a: one\n"
+            };
+            assert_eq!(read("one"), one);
+        }
     }
 }

@@ -66,8 +66,10 @@ fn main() {
     init_tracing(cli.verbose, cli.quiet, colors.stderr);
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
-    let stderr = std::io::stderr();
-    let mut stderr = stderr.lock();
+    // Not locked for the run, unlike stdout: the subscriber logs to stderr
+    // from the `--parallel` workers too, which would wait for this thread
+    // while it waits for them.
+    let mut stderr = std::io::stderr();
     let result = dq::run(&cli, colors, &mut stdout, &mut stderr);
     let code = match result {
         Ok(()) => dq::exit_code::SUCCESS,

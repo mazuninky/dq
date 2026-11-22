@@ -32,7 +32,7 @@ use camino::Utf8Path;
 use dq_core::Pointer;
 
 use super::io_helpers::{
-    finish_edit, parse_file_for_edit, pick_format, pointer_in_document, read_bytes,
+    finish_edit, parse_file_for_edit, pick_format, pointer_in_document, read_for_edit,
     skip_out_of_range,
 };
 use crate::bulk::{self, FileOp, FileOpResult};
@@ -115,7 +115,7 @@ impl<'a> FileOp for DelFileOp<'a> {
         // Mirror `commands::set::SetFileOp::apply` minus the value: the per-
         // file pipeline is identical except `del_at` replaces `set_at`.
         let format = pick_format(path, self.input_format)?;
-        let original_bytes = read_bytes(path)?;
+        let (original_bytes, original) = read_for_edit(path)?;
 
         // Template guard, then parse: a file whose templates change what
         // the parser reads is refused; `guard` checks below that the edit
@@ -159,6 +159,7 @@ impl<'a> FileOp for DelFileOp<'a> {
         Ok(FileOpResult::Modified {
             output_bytes: final_bytes,
             diff,
+            original,
         })
     }
 }

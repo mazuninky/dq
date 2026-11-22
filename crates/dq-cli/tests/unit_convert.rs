@@ -344,25 +344,8 @@ fn convert_in_place_bulk_glob_converts_every_yaml_file() {
 // Test 5 — `--backup` preserves a pre-existing target file as `<target>.bak`.
 // ---------------------------------------------------------------------------
 //
-// Production-code decision (from `crates/dq-cli/src/commands/convert.rs`,
-// lines 220-224 + 67-75 of `crates/dq-core/src/atomic_write.rs`):
-//
-// ```text
-// // Atomic write to target. `--backup` is honoured by atomic_write
-// // when the target already exists.
-// dq_core::atomic_write::write(&target_path, &output_bytes, cli.backup)
-//     .map_err(anyhow::Error::new)?;
-// ```
-//
-// And `atomic_write::write` only creates `<target>.bak` when the TARGET
-// path already exists at write time:
-//
-// ```text
-// if backup && path.exists() {
-//     let backup_path = backup_path_for(path);
-//     std::fs::copy(path.as_std_path(), backup_path.as_std_path())...
-// }
-// ```
+// `dq_core::atomic_write::write_like` only creates `<target>.bak` when the
+// TARGET path already exists at write time.
 //
 // So convert's `--backup` semantics are: "back up the TARGET if it
 // already exists; the source is never backed up". This test verifies

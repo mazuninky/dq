@@ -20,6 +20,8 @@ Work in progress, with design and remaining steps.
 
 - [plans/add-std-skills-rules.md](plans/add-std-skills-rules.md) — `@std/skills`
   rules for `SKILL.md` frontmatter and `evals.json`.
+- [plans/lint-fail-closed.md](plans/lint-fail-closed.md) — rules as gates: a
+  rule that raises fails the run; fixtures with a path; `.npmrc`.
 - [plans/skill-command.md](plans/skill-command.md) — `dq skill`: the agent skill
   ships in the binary and updates with it (implemented, not released).
 - [plans/structured-errors.md](plans/structured-errors.md) — a caret under the

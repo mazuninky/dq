@@ -25,7 +25,9 @@ use dq_core::{PatchOp, Pointer, Value};
 
 use crate::bulk::{self, FileOp, FileOpResult};
 use crate::cli::{Cli, PatchArgs};
-use crate::commands::io_helpers::{finish_edit, parse_file_for_edit, pick_format, read_bytes};
+use crate::commands::io_helpers::{
+    finish_edit, parse_file_for_edit, pick_format, read_bytes, read_for_edit,
+};
 use crate::error::InvalidInput;
 
 /// Run `dq patch`.
@@ -91,10 +93,10 @@ struct PatchFileOp<'a> {
 impl<'a> FileOp for PatchFileOp<'a> {
     fn apply(&self, path: &Utf8Path) -> anyhow::Result<FileOpResult> {
         // Mirror `commands::set::run` minus the value-resolution step:
-        // pick_format -> read_bytes -> template guard -> parse_to_document
+        // pick_format -> read_for_edit -> template guard -> parse_to_document
         // -> apply_patch -> restore_placeholders -> optional diff.
         let format = pick_format(path, self.input_format)?;
-        let original_bytes = read_bytes(path)?;
+        let (original_bytes, original) = read_for_edit(path)?;
 
         // Template guard, then parse: a file whose templates change what
         // the parser reads is refused; `guard` checks below that the edit
@@ -134,6 +136,7 @@ impl<'a> FileOp for PatchFileOp<'a> {
         Ok(FileOpResult::Modified {
             output_bytes: final_bytes,
             diff,
+            original,
         })
     }
 }

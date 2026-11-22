@@ -118,7 +118,7 @@ fn del_root_pointer_returns_type_mismatch() {
 
 #[test]
 fn del_in_place_writes_atomically() {
-    // `-i` flushes the modification to disk via `dq_core::atomic_write::write`,
+    // `-i` flushes the modification to disk via `dq_core::atomic_write::rewrite`,
     // and stdout stays empty.
     let tmp = write_yaml("a: 1\nb: 2\n");
     let path = tmp.to_str().unwrap();

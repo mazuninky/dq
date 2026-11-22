@@ -18,6 +18,14 @@ fn dq() -> Command {
     cmd
 }
 
+/// stderr without a log line: neither a warning nor a rule error
+/// (`ERROR rule did not run`).
+fn no_rule_raised() -> impl Predicate<str> {
+    predicate::str::contains("WARN")
+        .or(predicate::str::contains("ERROR"))
+        .not()
+}
+
 #[test]
 fn dockerfile_rules_stay_quiet_on_ordinary_yaml() {
     for src in ["name: web\nreplicas: 2\n", "- a\n- b\n", "[]\n"] {
@@ -61,7 +69,7 @@ fn each_dockerfile_rule_fires_on_a_dockerfile_and_not_on_a_clean_one() {
                 .and(predicate::str::contains("dockerfile.no-curl-pipe-bash"))
                 .and(predicate::str::contains("dockerfile.has-healthcheck")),
         )
-        .stderr(predicate::str::contains("WARN").not());
+        .stderr(no_rule_raised());
 
     // Pinned tag, COPY, no pipe into a shell: only the missing HEALTHCHECK.
     let dir = TempDir::new().expect("tempdir");
@@ -80,7 +88,7 @@ fn each_dockerfile_rule_fires_on_a_dockerfile_and_not_on_a_clean_one() {
                 .and(predicate::str::contains("dockerfile.no-add-use-copy").not())
                 .and(predicate::str::contains("dockerfile.no-curl-pipe-bash").not()),
         )
-        .stderr(predicate::str::contains("WARN").not());
+        .stderr(no_rule_raised());
 }
 
 #[test]
@@ -98,7 +106,7 @@ fn dockerfile_rules_still_run_on_a_dockerfile() {
             predicate::str::contains("dockerfile.no-add-use-copy")
                 .and(predicate::str::contains("dockerfile.has-healthcheck")),
         )
-        .stderr(predicate::str::contains("WARN").not());
+        .stderr(no_rule_raised());
 }
 
 // ---------------------------------------------------------------------------
@@ -107,8 +115,7 @@ fn dockerfile_rules_still_run_on_a_dockerfile() {
 // ---------------------------------------------------------------------------
 
 /// `dq lint -F json Dockerfile` over `src`: the exit code and the
-/// `(rule_id, message)` of every diagnostic. Asserts that no rule raised a
-/// runtime warning.
+/// `(rule_id, message)` of every diagnostic. Asserts that no rule raised.
 fn lint(src: &str) -> (i32, Vec<(String, String)>) {
     let dir = TempDir::new().expect("tempdir");
     std::fs::write(dir.path().join("Dockerfile"), src).expect("write Dockerfile");
@@ -119,8 +126,8 @@ fn lint(src: &str) -> (i32, Vec<(String, String)>) {
         .expect("run dq lint");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        !stderr.contains("WARN"),
-        "rule warning for {src:?}: {stderr}"
+        no_rule_raised().eval(&stderr),
+        "rule warning or error for {src:?}: {stderr}"
     );
     let report: serde_json::Value = serde_json::from_slice(&out.stdout)
         .unwrap_or_else(|e| panic!("lint -F json for {src:?} is not JSON ({e}); stderr: {stderr}"));

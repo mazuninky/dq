@@ -1,8 +1,7 @@
 //! `dq check [RULE] [--inline YAML] FILE...` — run a single rule against files.
 //!
 //! Sibling to [`crate::commands::lint`]: same evaluation pipeline (via
-//! [`crate::commands::lint_core::run_with_rulesets`]), different rule
-//! sourcing.
+//! [`crate::commands::lint_core::run`]), different rule sourcing.
 //!
 //! Resolution priority for the rule input:
 //!
@@ -15,10 +14,10 @@
 
 use std::io::Write;
 
-use dq_exec::{RuleSet, RuleSource};
+use dq_exec::{RuleLoader, RuleSet, RuleSource};
 
 use crate::cli::{CheckArgs, Cli};
-use crate::commands::lint_core::run_with_rulesets;
+use crate::commands::lint_core::{self, LintRun};
 use crate::error::InvalidInput;
 use crate::output::Reporter;
 
@@ -29,6 +28,8 @@ use crate::output::Reporter;
 /// - [`InvalidInput`] (exit 6) when neither `<rule>` nor `--inline` is set,
 ///   when a write-mode flag is set, when a glob matches zero files, or when
 ///   the rule id can't be resolved.
+/// - [`crate::error::RuleErrorFail`] (exit 3) when the rule raised on a file
+///   and `--allow-rule-errors` is not set.
 /// - [`crate::error::LintFail`] / [`crate::error::LintWarnStrict`] for
 ///   non-zero exit codes (see [`crate::commands::lint_core`]).
 pub fn run(
@@ -54,17 +55,15 @@ pub fn run(
     // `@std/<ns>` rule matching the file's format alongside it (e.g. asking
     // for `k8s.no-latest-tag` against a YAML file would also fire every
     // other `@std/k8s` and `@std/dockerfile` rule). See
-    // [`crate::commands::lint_core::run_with_rulesets`] for the contract.
-    run_with_rulesets(
-        cli,
-        &args.files,
-        Vec::new(),
+    // [`LintRun`] for the contract.
+    let run = LintRun {
+        files: &args.files,
+        rules: Vec::new(),
         extra,
-        true,
-        input_format,
-        reporter,
-        out,
-    )
+        suppress_auto_bind: true,
+        allow_rule_errors: args.allow_rule_errors,
+    };
+    lint_core::run(cli, run, input_format, reporter, out)
 }
 
 /// Build the `extra` rulesets list for the lint pipeline from `--inline`
@@ -80,7 +79,7 @@ fn resolve_rule(args: &CheckArgs) -> anyhow::Result<Vec<RuleSet>> {
     // 1. Try as a path on disk (relative or absolute).
     let candidate = camino::Utf8PathBuf::from(raw);
     if candidate.exists() {
-        let set = RuleSet::from_path(&candidate).map_err(anyhow::Error::new)?;
+        let set = RuleLoader::load_named(&candidate, raw).map_err(anyhow::Error::new)?;
         return Ok(vec![set]);
     }
 
@@ -203,6 +202,7 @@ mod tests {
             rule: None,
             inline: None,
             files: vec![Utf8PathBuf::from("f.yaml")],
+            allow_rule_errors: false,
         };
         let reporter = JsonReporter;
         let mut out: Vec<u8> = Vec::new();
@@ -235,6 +235,7 @@ check:
             rule: None,
             inline: Some(inline.to_owned()),
             files: vec![path],
+            allow_rule_errors: false,
         };
         let reporter = JsonReporter;
         let mut out: Vec<u8> = Vec::new();
@@ -251,6 +252,7 @@ check:
             rule: Some("totally-unknown.rule".to_owned()),
             inline: None,
             files: vec![Utf8PathBuf::from("f.yaml")],
+            allow_rule_errors: false,
         };
         let reporter = JsonReporter;
         let mut out: Vec<u8> = Vec::new();
@@ -338,6 +340,7 @@ spec:
             rule: Some("k8s.no-latest-tag".to_owned()),
             inline: None,
             files: vec![path],
+            allow_rule_errors: false,
         };
         let reporter = JsonReporter;
         let mut out: Vec<u8> = Vec::new();

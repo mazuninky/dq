@@ -1,7 +1,7 @@
 //! `dq fix FILE...` — apply every applicable rule's fix (`fix.ops` / `fix.jq`) to the
 //! given files.
 //!
-//! Pipeline mirrors [`crate::commands::lint_core::run_with_rulesets`] up
+//! Pipeline mirrors [`crate::commands::lint_core::run`] up
 //! to the evaluator-build step, then forks: instead of collecting
 //! diagnostics through a [`crate::output::Reporter`], it builds a
 //! [`dq_exec::Fixer`] and dispatches per-file work through
@@ -30,7 +30,7 @@
 //!
 //! ## Write-mode flags
 //!
-//! - `-i` → atomic in-place write (via [`dq_core::atomic_write::write`]).
+//! - `-i` → atomic in-place write (via [`dq_core::atomic_write::rewrite`]).
 //! - `--diff` → unified diff to stdout, no write.
 //! - `--check` → exit 1 if any file would be modified, no write. M10
 //!   reuses [`crate::error::CheckPending`] (already mapped to exit 1)
@@ -39,6 +39,14 @@
 //!   for `dq set` / `dq del` / `dq fmt` because the bulk driver is the
 //!   same code path.
 //!
+//! ## Rules that raise
+//!
+//! A rule whose `match.filter` or `check.jq` raises is skipped for the
+//! document, so its fix may be missing: the other rules' fixes are applied
+//! and written, and the run ends with exit 3 (see
+//! [`crate::commands::rule_errors`]), also under `--check`.
+//! `--allow-rule-errors` turns that into a warning.
+//!
 //! ## Template guard
 //!
 //! Templated files (Helm / Argo / GitHub Actions) cannot round-trip
@@ -46,23 +54,25 @@
 //! `--raw-template-strings` are explicitly rejected with `InvalidInput`
 //! (exit 6), mirroring the `dq set --jq` rejection.
 
+use std::collections::HashMap;
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use dq_core::template_guard::TemplateMode;
 use dq_core::{Document, Pointer, Segment};
-use dq_exec::{Evaluator, FixOutcome, Fixer, LoaderArgs, RuleLoader};
+use dq_exec::{Evaluator, FixOutcome, Fixer, LoaderArgs, RuleError, RuleLoader};
 use indexmap::IndexSet;
 
 use crate::bulk::{self, FileOp, FileOpResult};
 use crate::cli::{Cli, DocSelector, FixArgs};
 use crate::commands::io_helpers::{
-    checked_index, parse_for_lint, pick_format, read_bytes, skip_out_of_range,
+    checked_index, parse_for_lint, pick_format, read_for_edit, skip_out_of_range,
 };
 use crate::commands::lint_core::expand_lint_inputs;
 use crate::commands::plugin_loader::{self, LoadedPlugins};
-use crate::error::InvalidInput;
+use crate::commands::rule_errors::RuleErrors;
+use crate::error::{CheckPending, InvalidInput};
 
 /// Run the `dq fix` command.
 ///
@@ -71,8 +81,12 @@ use crate::error::InvalidInput;
 /// - [`InvalidInput`] (exit 6) for inconsistent write flags, template-
 ///   guard incompatibilities, unknown `--rules` entries, zero-match
 ///   globs, missing format hints, etc.
-/// - [`crate::error::CheckPending`] (exit 1) when `--check` finds at
-///   least one fixable file.
+/// - [`CheckPending`] (exit 1) when `--check` finds at least one fixable
+///   file.
+/// - [`crate::error::RuleErrorFail`] (exit 3) when a rule raised before its
+///   fix could run and `--allow-rule-errors` is not set. It replaces
+///   [`CheckPending`]; a run that failed on a file keeps that error, and the
+///   rule errors are still reported.
 /// - [`crate::error::BulkPartialFailure`] (exit 7) when
 ///   `--continue-on-error` finishes with one or more failed files.
 /// - [`dq_core::Error::*`] for the usual file-load / write failures.
@@ -161,9 +175,38 @@ pub fn run(
         fixer,
         plugins,
         several: expanded.len() > 1,
+        allow_rule_errors: args.allow_rule_errors,
+        rule_errors: Mutex::default(),
     };
 
-    bulk::run_per_file(expanded, &op, cli, out)
+    let result = bulk::run_per_file(expanded.clone(), &op, cli, out);
+    let rule_errors = in_file_order(&expanded, op.rule_errors);
+    rule_errors.log();
+    match (result, rule_errors.failure()) {
+        (Ok(()), Some(failure)) => Err(anyhow::Error::new(failure)),
+        // "Some files would change" does not answer whether every rule ran.
+        (Err(err), Some(failure)) if err.is::<CheckPending>() => Err(anyhow::Error::new(failure)),
+        // A file that failed is the run's error, and under
+        // `--continue-on-error` its exit 7: a script acts on files that
+        // were not written before it acts on a rule.
+        (result, _) => result,
+    }
+}
+
+/// The rule errors the per-file runs collected, in the order of `files` —
+/// not the one the workers finished in.
+fn in_file_order(
+    files: &[Utf8PathBuf],
+    by_file: Mutex<HashMap<Utf8PathBuf, Vec<RuleError>>>,
+) -> RuleErrors {
+    let mut by_file = by_file.into_inner().unwrap_or_else(PoisonError::into_inner);
+    let mut rule_errors = RuleErrors::default();
+    for file in files {
+        for error in by_file.remove(file).unwrap_or_default() {
+            rule_errors.record(file, error);
+        }
+    }
+    rule_errors
 }
 
 /// Per-file `FileOp` adapter for `dq fix`. Holds an [`Arc<Fixer>`] so
@@ -181,6 +224,43 @@ struct FixFileOp<'a> {
     /// The run covers several files: one without document `--doc N` is
     /// skipped.
     several: bool,
+    /// `--allow-rule-errors`: rule errors are logged as warnings instead of
+    /// collected.
+    allow_rule_errors: bool,
+    /// The rules that raised before their fix could run, by file, filled by
+    /// the workers.
+    rule_errors: Mutex<HashMap<Utf8PathBuf, Vec<RuleError>>>,
+}
+
+impl FixFileOp<'_> {
+    /// Apply the rules' fixes to `document`, or to its document `only`.
+    fn apply_rules(
+        &self,
+        path: &Utf8Path,
+        document: &mut Document,
+        format_name: &str,
+        only: Option<usize>,
+    ) -> anyhow::Result<FixOutcome> {
+        if self.allow_rule_errors {
+            return self
+                .fixer
+                .apply_to(path, document, format_name, only)
+                .map_err(anyhow::Error::new);
+        }
+        let mut raised = Vec::new();
+        let outcome = self
+            .fixer
+            .apply_reporting(path, document, format_name, only, &mut raised);
+        if !raised.is_empty() {
+            self.rule_errors
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(path.to_owned())
+                .or_default()
+                .append(&mut raised);
+        }
+        outcome.map_err(anyhow::Error::new)
+    }
 }
 
 impl<'a> FileOp for FixFileOp<'a> {
@@ -191,7 +271,7 @@ impl<'a> FileOp for FixFileOp<'a> {
         // `EditScript::apply` would fail with `WriteUnavailable` against a
         // value-only `Document`).
         let format = pick_format(path, self.input_format)?;
-        let original_bytes = read_bytes(path)?;
+        let (original_bytes, original) = read_for_edit(path)?;
         let mut document = parse_for_lint(path, format, &original_bytes, TemplateMode::Guard)?;
         // A multi-document stream is fixed one document at a time, and
         // written back with every document; `--doc N` fixes document N
@@ -206,10 +286,7 @@ impl<'a> FileOp for FixFileOp<'a> {
             Some(DocSelector::All) | None => None,
         };
 
-        let outcome = self
-            .fixer
-            .apply_to(path, &mut document, format.name(), only)
-            .map_err(anyhow::Error::new)?;
+        let outcome = self.apply_rules(path, &mut document, format.name(), only)?;
 
         // Audit log — visible at `-v` (info) verbosity. The check path
         // also benefits from this so users see what would change.
@@ -352,6 +429,7 @@ impl<'a> FileOp for FixFileOp<'a> {
         Ok(FileOpResult::Modified {
             output_bytes: final_bytes,
             diff,
+            original,
         })
     }
 }
@@ -402,7 +480,6 @@ fn log_outcome(path: &Utf8Path, outcome: &FixOutcome) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::CheckPending;
     use clap::Parser;
     use std::io::Write;
     use tempfile::NamedTempFile;
@@ -462,6 +539,7 @@ fix:
         let args = FixArgs {
             files: vec![path.clone()],
             rules: vec![rule_path.to_string()],
+            allow_rule_errors: false,
         };
         let mut out: Vec<u8> = Vec::new();
         run(&cli, &args, None, false, &mut out).expect("--diff fix should succeed");
@@ -493,6 +571,7 @@ fix:
         let args = FixArgs {
             files: vec![path.clone()],
             rules: vec![rule_path.to_string()],
+            allow_rule_errors: false,
         };
         let mut out: Vec<u8> = Vec::new();
         let err = run(&cli, &args, None, false, &mut out)
@@ -524,6 +603,7 @@ fix:
         let args = FixArgs {
             files: vec![path.clone()],
             rules: vec![rule_path.to_string()],
+            allow_rule_errors: false,
         };
         let mut out: Vec<u8> = Vec::new();
         run(&cli, &args, None, false, &mut out).expect("-i fix should succeed");
@@ -560,6 +640,7 @@ fix:
         let args = FixArgs {
             files: vec![path],
             rules: vec![rule_path.to_string()],
+            allow_rule_errors: false,
         };
         let mut out: Vec<u8> = Vec::new();
         let err = run(&cli, &args, None, false, &mut out)
@@ -594,6 +675,7 @@ fix:
         let args = FixArgs {
             files: vec![path],
             rules: vec![rule_path.to_string()],
+            allow_rule_errors: false,
         };
         let mut out: Vec<u8> = Vec::new();
         let err = run(&cli, &args, None, false, &mut out)
@@ -632,6 +714,7 @@ check:
         let args = FixArgs {
             files: vec![path.clone()],
             rules: vec![rule_path.to_string()],
+            allow_rule_errors: false,
         };
         let mut out: Vec<u8> = Vec::new();
         run(&cli, &args, None, false, &mut out).expect("no-fix run should succeed");
@@ -652,6 +735,7 @@ check:
         let args = FixArgs {
             files: vec![path.clone()],
             rules: vec![rule_path.to_string()],
+            allow_rule_errors: false,
         };
         let mut out: Vec<u8> = Vec::new();
         run(&cli, &args, None, false, &mut out).expect("fix should succeed");

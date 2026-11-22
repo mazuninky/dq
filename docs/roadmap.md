@@ -39,6 +39,30 @@ change:
   in the column, a block-quoted fence the quote mark, and a quoted string's
   escapes shift the lines.
 
+Found while making `lint` fail closed (2026-11-22,
+[plans/lint-fail-closed.md](plans/lint-fail-closed.md)). In each of the first
+group dq can still check nothing and exit 0:
+
+- Input globs drop a directory that cannot be read, a file that is a symbolic
+  link, and a name that is not UTF-8.
+- A nested rule whose `match.format` excludes the extracted items; `fix --check`
+  with a fix on a schema check, a fix that is not idempotent, or an edit that
+  was refused (a warning each).
+- `--plugins DIR` without a plugin, or whose plugin is a link or `*.WASM`.
+- `dq test`: a case whose `format` is not in the rule's `match.format`, a
+  fixture with `tests: []`, a fixture name that is not UTF-8.
+- `match.glob` against a path typed as `./x`.
+- `dq rules add` of something that is no rule, or a directory without rules.
+
+And:
+
+- `schema_file` is resolved against the directory given to `--rules` (or
+  `.dq/rules`), not the rule file's own; `dq rules add` does not copy it.
+- `rules list` and `explain` leave out all of `.dq/rules` when one rule in it
+  does not load.
+- TAP and JUnit carry a raw ESC or line break of a file name or rule id in
+  `file:` and in attributes.
+
 ## Known limits, not dq bugs
 
 - `{n: !!str}` with no space before `}` is rejected by every YAML reader

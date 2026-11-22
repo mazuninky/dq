@@ -1,9 +1,9 @@
 //! `dq convert FILE` — re-emit the file in the format selected by `-F`.
 //!
-//! M3 §8 adds `--keep-source`, which only takes effect when paired with `-i`
-//! (in-place format conversion). With `-i`, the default behaviour is to
-//! remove the source file once the converted target has been written
-//! atomically; `--keep-source` preserves both files instead.
+//! `--keep-source` and `--overwrite` are about `-i` (in-place format
+//! conversion), which writes a file next to the source and then removes the
+//! source: the one keeps the source, the other allows replacing a file that
+//! is already where the new one goes.
 
 use camino::Utf8PathBuf;
 use clap::Args;
@@ -19,4 +19,11 @@ pub struct ConvertArgs {
     /// instead of removing it. No effect without `-i`.
     #[arg(long = "keep-source")]
     pub keep_source: bool,
+
+    /// With `-i`: replace a file that already exists at the target path.
+    /// Without it (or `--backup`, which keeps a copy of that file as
+    /// `<file>.bak`) such a target is refused and nothing is converted.
+    /// Requires `-i`.
+    #[arg(long = "overwrite")]
+    pub overwrite: bool,
 }

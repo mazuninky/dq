@@ -9,6 +9,7 @@
 pub mod check;
 pub mod completions;
 pub mod convert;
+mod convert_targets;
 pub mod del;
 pub mod diff;
 pub mod exists;
@@ -28,6 +29,7 @@ pub mod patch;
 pub mod paths;
 pub mod plugin_loader;
 pub mod query;
+pub mod rule_errors;
 pub mod rules;
 pub mod select;
 pub mod self_cmd;
