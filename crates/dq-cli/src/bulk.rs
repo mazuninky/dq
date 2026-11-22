@@ -142,7 +142,10 @@ fn resolve_parallel(n: Option<usize>) -> usize {
 /// - **`--check`**: never writes to disk; the driver compares each op's
 ///   `output_bytes` to the on-disk source bytes and accumulates a list of
 ///   files that would change. Returns [`CheckPending`] with that count
-///   (mapped to exit 1) if any file would change; `Ok(())` otherwise.
+///   (mapped to exit 1) if any file would change; `Ok(())` otherwise. With
+///   `--continue-on-error` and a failed file the run is a partial failure
+///   instead, whatever the other files hold: the summary (Modified counts
+///   the files that would change) and the failures follow the list.
 /// - **`--continue-on-error`**: per-file errors are collected instead of
 ///   aborting; if any failed, the function returns
 ///   [`BulkPartialFailure`] (mapped to exit 7). Without the flag, the
@@ -165,6 +168,8 @@ pub fn run_per_file(
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
     let is_bulk = files.len() > 1;
+    // Collect per-file failures instead of stopping at the first one.
+    let collect_failures = cli.continue_on_error && is_bulk;
     let parallel = resolve_parallel(cli.parallel);
 
     // Apply the op to every file, collecting results in matched-file
@@ -197,7 +202,15 @@ pub fn run_per_file(
         match result {
             Ok(FileOpResult::Modified { output_bytes, diff }) => {
                 if cli.check {
-                    handle_check(&path, &output_bytes, &mut would_modify)?;
+                    match would_change(&path, &output_bytes) {
+                        Ok(true) => {
+                            modified += 1;
+                            would_modify.push(path);
+                        }
+                        Ok(false) => skipped += 1,
+                        Err(e) if collect_failures => failed.push((path, e)),
+                        Err(e) => return Err(e),
+                    }
                     continue;
                 }
                 // A file whose bytes would not change is never rewritten
@@ -212,7 +225,7 @@ pub fn run_per_file(
                     match dq_core::atomic_write::write(&path, &output_bytes, cli.backup) {
                         Ok(()) => modified += 1,
                         Err(e) => {
-                            if cli.continue_on_error && is_bulk {
+                            if collect_failures {
                                 failed.push((path.clone(), anyhow::Error::new(e)));
                             } else {
                                 return Err(anyhow::Error::new(e));
@@ -256,7 +269,7 @@ pub fn run_per_file(
                 missing.push((path, reason));
             }
             Err(e) => {
-                if cli.continue_on_error && is_bulk {
+                if collect_failures {
                     failed.push((path, e));
                 } else {
                     // Single-file mode or no continue-on-error: short-
@@ -281,19 +294,23 @@ pub fn run_per_file(
 
     out.write_all(&buffer)?;
 
-    // `--check` short-circuits before any summary.
+    // `--check` has no summary of its own, unless a file failed: then the
+    // failures outrank the pending changes and are reported below, as in
+    // every other mode.
     if cli.check {
         for p in &would_modify {
             writeln!(out, "would modify: {}", terminal_text(p.as_str()))?;
         }
-        let count = would_modify.len();
-        if count > 0 {
-            return Err(anyhow::Error::new(CheckPending { count }));
+        if failed.is_empty() {
+            let count = would_modify.len();
+            if count > 0 {
+                return Err(anyhow::Error::new(CheckPending { count }));
+            }
+            if is_bulk {
+                writeln!(out, "0 files would be modified")?;
+            }
+            return Ok(());
         }
-        if is_bulk {
-            writeln!(out, "0 files would be modified")?;
-        }
-        return Ok(());
     }
 
     // Bulk summary follows per-file output. Single-file invocations omit
@@ -327,25 +344,17 @@ fn source_matches(path: &Utf8Path, output_bytes: &[u8]) -> bool {
     std::fs::read(path.as_std_path()).is_ok_and(|source| source == output_bytes)
 }
 
-/// Compare `output_bytes` to the file's on-disk bytes and append `path` to
-/// `would_modify` if they differ. Read failures are bubbled up as
-/// [`dq_core::Error::Io`] (read-side, IO_ERROR=5) — they are NOT
-/// reclassified as write errors.
-fn handle_check(
-    path: &Utf8Path,
-    output_bytes: &[u8],
-    would_modify: &mut Vec<Utf8PathBuf>,
-) -> anyhow::Result<()> {
+/// Whether writing `output_bytes` would change the file at `path`
+/// (`--check`). Read failures are bubbled up as [`dq_core::Error::Io`]
+/// (read-side, IO_ERROR=5) — they are NOT reclassified as write errors.
+fn would_change(path: &Utf8Path, output_bytes: &[u8]) -> anyhow::Result<bool> {
     let source_bytes = std::fs::read(path.as_std_path()).map_err(|source| {
         anyhow::Error::new(dq_core::Error::Io {
             path: path.to_owned(),
             source,
         })
     })?;
-    if source_bytes != output_bytes {
-        would_modify.push(path.to_owned());
-    }
-    Ok(())
+    Ok(source_bytes != output_bytes)
 }
 
 #[cfg(test)]
@@ -582,6 +591,65 @@ mod tests {
         // No surprises on stdout besides the bulk-mode "0 files" line.
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("0 files would be modified"), "got: {s}");
+    }
+
+    /// `FileOp` that removes the file at `bad` before returning, as if it
+    /// vanished between the op's read and the driver's comparison.
+    struct VanishOnPath {
+        bad: Utf8PathBuf,
+        bytes: Vec<u8>,
+    }
+
+    impl FileOp for VanishOnPath {
+        fn apply(&self, path: &Utf8Path) -> anyhow::Result<FileOpResult> {
+            if path == self.bad {
+                fs::remove_file(path.as_std_path())?;
+            }
+            Ok(FileOpResult::Modified {
+                output_bytes: self.bytes.clone(),
+                diff: None,
+            })
+        }
+    }
+
+    #[test]
+    fn run_per_file_check_continue_on_error_collects_a_comparison_read_failure() {
+        // The comparison read of `--check` fails for the first file: with
+        // `--continue-on-error` that is one failed file and the other one
+        // is still compared; without it the read error stops the run.
+        for (flags, collected) in [
+            (&["--check", "--continue-on-error"][..], true),
+            (&["--check"], false),
+        ] {
+            let dir = tempdir().unwrap();
+            let p1 = Utf8PathBuf::from_path_buf(dir.path().join("a.yaml")).unwrap();
+            let p2 = Utf8PathBuf::from_path_buf(dir.path().join("b.yaml")).unwrap();
+            fs::write(p1.as_std_path(), b"x: 1\n").unwrap();
+            fs::write(p2.as_std_path(), b"x: 1\n").unwrap();
+            let op = VanishOnPath {
+                bad: p1.clone(),
+                bytes: b"x: 2\n".to_vec(),
+            };
+            let mut out: Vec<u8> = Vec::new();
+            let err = run_per_file(vec![p1.clone(), p2.clone()], &op, &cli_for(flags), &mut out)
+                .expect_err("a vanished file must fail the run");
+            let out = String::from_utf8(out).unwrap();
+            if collected {
+                let partial = err
+                    .downcast_ref::<BulkPartialFailure>()
+                    .expect("expected BulkPartialFailure marker");
+                assert_eq!(partial.failed_count, 1);
+                let head =
+                    format!("would modify: {p2}\nModified: 1, Skipped: 0, Failed: 1\n  - {p1}: ");
+                assert!(out.starts_with(&head), "got: {out}");
+            } else {
+                let domain = err
+                    .downcast_ref::<dq_core::Error>()
+                    .expect("the read error itself");
+                assert_eq!(domain.kind_name(), "io");
+                assert_eq!(out, "");
+            }
+        }
     }
 
     #[test]

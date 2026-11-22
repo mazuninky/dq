@@ -83,7 +83,9 @@ Exactly one of:
   line break is followed by `\ No newline at end of file`, as in GNU diff
   and git.
 - `--check` — nothing is written or printed except `would modify: <path>`
-  lines and a count; exit 1 if any file would change, 0 otherwise.
+  lines and a count; exit 1 if any file would change, 0 otherwise. With
+  `--continue-on-error`, a file that fails makes it exit 7
+  ([bulk.md](bulk.md)).
 
 A file holding Go-template or GitHub Actions markers is edited when its
 templates do not change what the parser reads (a workflow's

@@ -49,6 +49,10 @@ breaking changes are listed first under Changed.
 
 ### Fixed
 
+- `--check --continue-on-error` hid files that failed: with one file that does
+  not parse among clean ones it printed `0 files would be modified` and exited
+  0, so a CI gate passed (1 when other files would change). The run now lists
+  the failures under the summary and exits 7, as it does without `--check`.
 - Parse errors had a missing or wrong position in several formats: CSV and
   TSV (column 0, or the wrong line after a blank line), JSON Lines and
   `.env` (always column 1), INI, YAML and HCL (no source line, no byte

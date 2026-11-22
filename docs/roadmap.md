@@ -28,6 +28,8 @@ Each has its own page with the design and the remaining steps.
 Found while testing parse-error positions (2026-11-22), not part of that
 change:
 
+- `fix` picks every file's format up front, so one file of an unknown format
+  stops the run (exit 6) even with `--continue-on-error`.
 - JSON Lines refuses a blank line behind a byte order mark
   (`\u{feff}\n{"a":1}\n` is `EOF while parsing a value`).
 - INI and `.env` do not strip a byte order mark: it becomes part of the
