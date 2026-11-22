@@ -10,7 +10,8 @@
 //! - [`RuleSet::from_std`] — `@std/<name>` namespace lookup (M8 stub; the
 //!   real `dq-lint` wiring lands in §4.4 of `add-exec-engine/tasks.md`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::Deserialize;
@@ -18,6 +19,7 @@ use serde_norway::Value as YamlValue;
 
 use crate::error::{ExecError, Result};
 use crate::rule::{Check, CheckParseError, Rule};
+use crate::rule_dir::{self, WalkedFile};
 
 /// Provenance marker for a [`RuleSet`].
 ///
@@ -48,20 +50,6 @@ pub struct RuleSet {
     pub rules: Vec<Rule>,
 }
 
-/// File extension allow-list for `RuleSet::from_path` directory walks.
-///
-/// `.yml` / `.yaml` are accepted; the suffix-based exclusion list at
-/// [`TEST_FIXTURE_SUFFIXES`] keeps `*.test.yml` fixtures out of the
-/// ruleset.
-const RULE_FILE_EXTENSIONS: &[&str] = &["yml", "yaml"];
-
-/// Suffixes that mark a file as a `dq test` fixture rather than a rule.
-///
-/// `RuleSet::from_path(<dir>)` skips any file whose name ends with one of
-/// these. The fixtures travel with the rules in `dq-lint`'s embedding
-/// table; the rule loader must not parse them as rules.
-const TEST_FIXTURE_SUFFIXES: &[&str] = &[".test.yml", ".test.yaml"];
-
 impl RuleSet {
     /// Parse `yaml` as a single rule **or** a `---`-separated YAML stream.
     ///
@@ -84,6 +72,13 @@ impl RuleSet {
     /// the rule id) and maps the error to the matching [`ExecError`]
     /// variant. Non-sentinel errors fall through to [`ExecError::Parse`]
     /// unchanged.
+    ///
+    /// # Errors
+    ///
+    /// - The errors above for a document that is not a rule.
+    /// - [`ExecError::NoFormat`] for an empty `match.format`, and
+    ///   [`ExecError::UnknownFormat`] for a name in it dq has no format of,
+    ///   in a rule or in a rule nested in it.
     pub fn from_str(yaml: &str, source: RuleSource) -> Result<Self> {
         let mut rules = Vec::new();
         // Collect document spans in two parallel passes: the typed
@@ -94,7 +89,10 @@ impl RuleSet {
         for de in serde_norway::Deserializer::from_str(yaml) {
             let parsed: std::result::Result<Rule, serde_norway::Error> = Rule::deserialize(de);
             match parsed {
-                Ok(rule) => rules.push(rule),
+                Ok(rule) => {
+                    rule.check_formats()?;
+                    rules.push(rule);
+                }
                 Err(err) => {
                     let rule_index = rules.len() + 1;
                     let rule_id = recover_rule_id_at_index(yaml, rule_index);
@@ -111,12 +109,19 @@ impl RuleSet {
     /// Behaviour:
     ///
     /// - When `path` is a file: parse it as a rule (or rule stream).
-    /// - When `path` is a directory: walk recursively, picking up every
-    ///   `.yml` / `.yaml` file whose name does **not** end with
-    ///   `.test.yml` or `.test.yaml`. Each file is parsed independently
-    ///   and the rules are concatenated. Directory traversal order
-    ///   matches `walkdir`'s default (sort-stable for reproducible
-    ///   loads).
+    /// - When `path` is a directory: walk recursively, links followed
+    ///   ([`rule_dir::files_under`]), picking up every `.yml` / `.yaml`
+    ///   file (in any case) that is no `*.test.yml` / `*.test.yaml`
+    ///   fixture. Each file is parsed independently and the rules are
+    ///   concatenated, in name order. A file that several links lead to is
+    ///   loaded once, under the first path that reaches it.
+    ///
+    /// # Errors
+    ///
+    /// - [`ExecError::Io`] for what cannot be read, for a link in the
+    ///   directory that leads nowhere, and for a FIFO, socket or device named
+    ///   as a rule file or a fixture.
+    /// - The errors of [`RuleSet::from_str`] for a file that does not load.
     pub fn from_path(path: &Utf8Path) -> Result<Self> {
         let metadata = std::fs::metadata(path).map_err(|err| ExecError::Io {
             path: path.to_path_buf(),
@@ -124,58 +129,84 @@ impl RuleSet {
         })?;
 
         if metadata.is_file() {
-            let yaml = std::fs::read_to_string(path).map_err(|err| ExecError::Io {
-                path: path.to_path_buf(),
-                source: err,
-            })?;
-            return Self::from_str(&yaml, RuleSource::Local(path.to_path_buf()));
+            return Self::from_file(path, path.as_std_path());
         }
 
+        let files = rule_dir::files_under(path, rule_dir::DanglingLinks::Refuse)?;
+        Self::from_walk(path, &files)
+    }
+
+    /// Load the rule files among `files`, which
+    /// [`files_under`](rule_dir::files_under) found in the directory `path`:
+    /// what [`RuleSet::from_path`] does on it.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`RuleSet::from_path`] for a directory.
+    pub fn from_walk(path: &Utf8Path, files: &[WalkedFile]) -> Result<Self> {
         let mut rules = Vec::new();
-        // walkdir default ordering is stable across runs but not sorted —
-        // collect entries first, sort by path, then parse so the loader's
-        // de-duplication step in §3.3 sees a deterministic order.
-        let mut entries: Vec<Utf8PathBuf> = Vec::new();
-        for entry in walkdir::WalkDir::new(path.as_std_path()).sort_by_file_name() {
-            let entry = entry.map_err(|err| ExecError::Io {
-                path: path.to_path_buf(),
-                source: err.into(),
-            })?;
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let entry_path = entry.path();
-            let Ok(utf8) = Utf8PathBuf::from_path_buf(entry_path.to_path_buf()) else {
+        // Collect first, then parse, so the loader's de-duplication step
+        // sees a deterministic order.
+        let mut entries: Vec<(Utf8PathBuf, &Path)> = Vec::new();
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        for file in files {
+            let utf8 = Utf8PathBuf::from_path_buf(file.path.clone()).map_err(|entry| {
                 // A non-UTF-8 path under a rules directory is an
                 // operational anomaly — surface it through the existing
                 // Io variant so the user sees the offending path.
-                return Err(ExecError::Io {
+                ExecError::Io {
                     path: path.to_path_buf(),
                     source: std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        format!("non-UTF-8 path in rules directory: {entry_path:?}"),
+                        format!("non-UTF-8 path in rules directory: {entry:?}"),
                     ),
-                });
-            };
-            if !is_rule_file(&utf8) {
-                continue;
+                }
+            })?;
+            // A rule file two links lead to is one rule file.
+            if rule_dir::is_rule_file(&utf8) && seen.insert(file.real()?) {
+                entries.push((utf8, &file.location));
             }
-            entries.push(utf8);
         }
 
-        for entry in &entries {
-            let yaml = std::fs::read_to_string(entry).map_err(|err| ExecError::Io {
-                path: entry.clone(),
-                source: err,
-            })?;
-            let one = Self::from_str(&yaml, RuleSource::Local(entry.clone()))?;
-            rules.extend(one.rules);
+        for (entry, location) in &entries {
+            rules.extend(Self::from_file(entry, location)?.rules);
         }
 
         Ok(Self {
             source: RuleSource::Local(path.to_path_buf()),
             rules,
         })
+    }
+
+    /// Load the rule file at `location`, which the caller calls `path`.
+    ///
+    /// # Errors
+    ///
+    /// [`ExecError::Io`] on `path` when it cannot be read, and the errors of
+    /// [`RuleSet::from_str`].
+    fn from_file(path: &Utf8Path, location: &Path) -> Result<Self> {
+        let yaml = std::fs::read_to_string(location).map_err(|source| ExecError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Self::from_str(&yaml, RuleSource::Local(path.to_path_buf()))
+    }
+
+    /// Load the rule file a walk found.
+    ///
+    /// Its source is where it is, for a `schema_file` beside it: the links on
+    /// its path may be more than a system follows. A location that is not
+    /// UTF-8 is no base for a `schema_file` in any case.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`RuleSet::from_path`] for a file.
+    pub(crate) fn from_walked(path: &Utf8Path, location: &Path) -> Result<Self> {
+        let mut set = Self::from_file(path, location)?;
+        if let Some(location) = Utf8Path::from_path(location) {
+            set.source = RuleSource::Local(location.to_path_buf());
+        }
+        Ok(set)
     }
 
     /// Resolve `name` against the embedded `@std/<name>` ruleset table.
@@ -496,27 +527,10 @@ fn extract_sentinel(formatted: &str) -> Option<CheckParseError> {
     CheckParseError::from_sentinel(&tail[..end])
 }
 
-/// Returns `true` for `*.yml` / `*.yaml` files that aren't `*.test.yml`
-/// / `*.test.yaml` fixtures.
-fn is_rule_file(path: &Utf8Path) -> bool {
-    let Some(file_name) = path.file_name() else {
-        return false;
-    };
-    if TEST_FIXTURE_SUFFIXES
-        .iter()
-        .any(|suffix| file_name.ends_with(suffix))
-    {
-        return false;
-    }
-    let Some(extension) = path.extension() else {
-        return false;
-    };
-    RULE_FILE_EXTENSIONS.contains(&extension)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rule_dir::is_rule_file;
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
 
@@ -634,6 +648,96 @@ mod tests {
     }
 
     #[test]
+    fn from_str_takes_every_registered_format_name() {
+        for format in dq_core::parsers::registry() {
+            let name = format.name();
+            let rule = RULE_A.replace("format: yaml", &format!("format: [{name}]"));
+            let set = RuleSet::from_str(&rule, RuleSource::Inline).expect(name);
+            assert_eq!(set.rules[0].match_.format, [name]);
+        }
+    }
+
+    #[test]
+    fn from_str_refuses_an_unknown_format_of_a_rule_or_a_nested_rule() {
+        let composite = r#"
+id: a.outer
+description: outer
+severity: error
+match:
+  format: yaml
+check:
+  extract: '[]'
+  message: outer
+  nested:
+    id: a.inner
+    description: inner
+    severity: error
+    match:
+      format: [json, dot-env]
+    check:
+      jq: '.'
+      message: inner
+"#;
+        let second = RULE_B.replace("format: json", "format: YAML");
+        let stream = format!("{RULE_A}---\n{second}");
+        for (yaml, id, name, close) in [
+            (composite, "a.inner", "dot-env", vec!["dotenv"]),
+            (&stream, "a.two", "YAML", vec![]),
+        ] {
+            match RuleSet::from_str(yaml, RuleSource::Inline) {
+                Err(ExecError::UnknownFormat {
+                    rule_id,
+                    format,
+                    did_you_mean,
+                }) => {
+                    assert_eq!((rule_id.as_str(), format.as_str()), (id, name));
+                    assert_eq!(did_you_mean, close);
+                }
+                other => panic!("{id}: expected UnknownFormat, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn from_str_refuses_a_rule_or_a_nested_rule_without_a_format() {
+        let empty = RULE_A.replace("format: yaml", "format: []");
+        let nested: String = empty.lines().map(|l| format!("    {l}\n")).collect();
+        let outer = format!(
+            "id: a.outer\ndescription: d\nseverity: error\nmatch:\n  format: yaml\ncheck:\n  \
+             extract: '[]'\n  message: m\n  nested:\n{nested}"
+        );
+        for yaml in [&empty, &outer] {
+            match RuleSet::from_str(yaml, RuleSource::Inline) {
+                Err(ExecError::NoFormat { rule_id }) => assert_eq!(rule_id, "a.one"),
+                other => panic!("expected NoFormat, got {other:?}"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn from_path_loads_linked_rules_once_and_any_yaml_extension() {
+        use std::os::unix::fs::symlink;
+        let temp = TempDir::new().expect("tempdir");
+        let dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("UTF-8");
+        let rules = dir.join("rules");
+        std::fs::create_dir_all(dir.join("shared")).expect("mkdir");
+        std::fs::create_dir(&rules).expect("mkdir");
+        std::fs::write(dir.join("shared/two.YAML"), RULE_B).expect("write");
+        std::fs::write(dir.join("shared/two.TEST.YML"), "tests: []\n").expect("write");
+        std::fs::write(dir.join("one.yml"), RULE_A).expect("write");
+        std::fs::write(rules.join("three.Yml"), RULE_C).expect("write");
+        symlink("../one.yml", rules.join("a.yml")).expect("link");
+        symlink("../one.yml", rules.join("b.yml")).expect("link");
+        symlink("../shared", rules.join("shared")).expect("link");
+        // Not a rule file by its name, so it does not stand in for one.
+        symlink("../one.yml", rules.join("0.txt")).expect("link");
+        let set = RuleSet::from_path(&rules).expect("load");
+        let ids: Vec<&str> = set.rules.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["a.one", "a.two", "a.three"]);
+    }
+
+    #[test]
     fn from_str_propagates_parse_error_with_hint() {
         // A rule with an unknown top-level field — `deny_unknown_fields`
         // turns this into a `serde_norway::Error` that `from_str` wraps in
@@ -681,7 +785,7 @@ mod tests {
 
         let set = RuleSet::from_path(&dir).expect("load directory ruleset");
         let ids: Vec<&str> = set.rules.iter().map(|r| r.id.as_str()).collect();
-        // walkdir's `sort_by_file_name` orders alpha.yml before beta.yaml,
+        // The walk orders alpha.yml before beta.yaml,
         // and the .test.yml file is filtered out before parsing.
         assert_eq!(ids, vec!["a.one", "a.two"]);
     }

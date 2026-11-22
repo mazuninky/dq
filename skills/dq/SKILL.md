@@ -252,7 +252,7 @@ Full matrix, write-mode semantics, and pointer prefixes per format: [references/
 |    0 | Success.                                                                |
 |    1 | Generic failure (`exists` answered no; `--check` saw pending changes; JSON Patch `test` op failed; `lint --strict` saw a warn; a read command, `convert` or `set --jq` cannot write a value in the output format, e.g. NaN/Infinity in JSON; `keys` / `values` / `len` on a node of the wrong type). |
 |    2 | NOT_FOUND — JSON Pointer addressed a node that does not exist, or `--doc N` a document the file lacks; also clap usage errors (incl. `--doc` on a command that cannot honour it). |
-|    3 | PARSE_ERROR — input failed format parsing (or templated file without `--raw-template-strings`). |
+|    3 | PARSE_ERROR — input failed format parsing (or templated file without `--raw-template-strings`); an invalid rule; a rule whose `match.filter` / `check.jq` raised in `lint` / `check` / `fix` (its findings may be missing; `--allow-rule-errors` accepts it). |
 |    4 | LINT_FAIL / VALIDATE_FAIL — `lint` produced an error-severity diagnostic, or `validate` saw a parse error. |
 |    5 | IO_ERROR — read failed; `self check`/`update` network failure.          |
 |    6 | INVALID_INPUT — bad CLI flag combo, unknown format, read cmd + write flag. |

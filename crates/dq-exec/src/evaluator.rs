@@ -41,10 +41,12 @@
 //! and a `loc.file` / `loc.line` that raises falls back to the file under
 //! check / the document start. Each of these is a [`RuleError`], returned
 //! beside the diagnostics by [`Evaluator::evaluate`] so a caller can act
-//! on it: the fixture runner fails the case, while
-//! [`Evaluator::evaluate_file`] (what `dq lint` runs) logs each one as a
-//! `tracing::warn!` and keeps going. Fall-through cases that are normal
-//! (a `loc.pointer` with no span, a `loc.line` that returns a
+//! on it: the fixture runner fails the case. `dq lint`, which fails the run
+//! when a rule was skipped ([`RuleErrorStage::skips_rule`]), takes those
+//! from [`Evaluator::evaluate_reporting`]; the others are logged as a
+//! `tracing::warn!`, as [`Evaluator::evaluate_file`]
+//! (`dq lint --allow-rule-errors`) logs them all. Fall-through cases that
+//! are normal (a `loc.pointer` with no span, a `loc.line` that returns a
 //! non-integer) are `tracing::trace!` only and not rule errors.
 
 use std::sync::Arc;
@@ -108,7 +110,18 @@ impl RuleErrorStage {
         }
     }
 
-    /// What the evaluator did about it, worded for the `dq lint` warning.
+    /// Whether the rule did not run on the document, so that its findings
+    /// may be missing: `match.filter` and `check.jq`. A `loc.file` or
+    /// `loc.line` that raises only moves a finding.
+    #[must_use]
+    pub fn skips_rule(self) -> bool {
+        match self {
+            Self::MatchFilter | Self::CheckJq => true,
+            Self::LocFile | Self::LocLine => false,
+        }
+    }
+
+    /// What the evaluator did about it, worded for [`RuleError::warn`].
     fn consequence(self) -> &'static str {
         match self {
             Self::MatchFilter | Self::CheckJq => "skipping rule for this file",
@@ -128,7 +141,7 @@ impl std::fmt::Display for RuleErrorStage {
 /// in the rule (it indexes a field of a type it did not expect), not in
 /// the document. The evaluator recovers (see [`RuleErrorStage`]) and
 /// reports it here instead of failing the run.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RuleError {
     /// Id of the rule that raised (for a composite rule's `nested` rule,
     /// the nested rule's id).
@@ -140,7 +153,11 @@ pub struct RuleError {
 }
 
 impl RuleError {
-    fn new(rule: &CompiledRule, stage: RuleErrorStage, error: &dq_transform::JqError) -> Self {
+    pub(crate) fn new(
+        rule: &CompiledRule,
+        stage: RuleErrorStage,
+        error: &dq_transform::JqError,
+    ) -> Self {
         Self {
             rule_id: rule.rule.id.clone(),
             stage,
@@ -148,8 +165,8 @@ impl RuleError {
         }
     }
 
-    /// Log the error as `dq lint` reports it: a `tracing::warn!` naming
-    /// the field, what the evaluator did, the rule id and the jq error.
+    /// Log the error as a `tracing::warn!` naming the field, what the
+    /// evaluator did, the rule id and the jq error.
     pub fn warn(&self) {
         tracing::warn!(
             rule_id = %self.rule_id,
@@ -176,38 +193,52 @@ pub struct Evaluation {
     /// One per rule expression that raised. Non-empty means some rule
     /// did not (fully) run on this document.
     pub rule_errors: Vec<RuleError>,
-    /// Log each [`RuleError`] as it is recorded (see
-    /// [`Evaluator::evaluate_file`]); [`Evaluator::evaluate`] stays quiet.
-    log_rule_errors: bool,
+    /// Which rule errors are logged instead of kept in `rule_errors`.
+    logged: LoggedRuleErrors,
+}
+
+/// Which [`RuleError`]s an evaluation logs with [`RuleError::warn`] instead
+/// of returning them — the moment each is recorded, so the warnings
+/// interleave with the ones other stages log.
+#[derive(Debug, Clone, Copy, Default)]
+enum LoggedRuleErrors {
+    /// None: [`Evaluator::evaluate`].
+    #[default]
+    None,
+    /// Those that do not skip a rule ([`RuleErrorStage::skips_rule`]):
+    /// [`Evaluator::evaluate_reporting`].
+    Recovered,
+    /// All: [`Evaluator::evaluate_file`].
+    All,
 }
 
 impl Evaluation {
-    /// An empty evaluation that logs every [`RuleError`] with
-    /// [`RuleError::warn`] the moment it is recorded, so the warnings
-    /// interleave with the ones other stages log immediately.
-    fn logging() -> Self {
+    /// An empty evaluation that logs the errors `logged` says.
+    fn logging(logged: LoggedRuleErrors) -> Self {
         Self {
-            log_rule_errors: true,
+            logged,
             ..Self::default()
         }
     }
 
-    /// An empty evaluation that reports errors the way `self` does —
-    /// for a nested rule's run, whose errors are then appended to
-    /// `self` already logged.
+    /// An empty evaluation that reports errors the way `self` does, for a
+    /// nested rule's run.
     pub(crate) fn empty_like(&self) -> Self {
-        Self {
-            log_rule_errors: self.log_rule_errors,
-            ..Self::default()
-        }
+        Self::logging(self.logged)
     }
 
-    /// Record a rule error, logging it first when this evaluation logs.
+    /// Log a rule error or keep it.
     fn record_rule_error(&mut self, error: RuleError) {
-        if self.log_rule_errors {
+        let log = match self.logged {
+            LoggedRuleErrors::None => false,
+            LoggedRuleErrors::Recovered => !error.stage.skips_rule(),
+            LoggedRuleErrors::All => true,
+        };
+        if log {
             error.warn();
+        } else {
+            self.rule_errors.push(error);
         }
-        self.rule_errors.push(error);
     }
 }
 
@@ -468,8 +499,25 @@ impl Evaluator {
         ir: &dq_core::Ir<'_>,
         format_name: &str,
     ) -> Vec<Diagnostic> {
-        self.evaluate_into(Evaluation::logging(), path, ir, format_name)
+        let evaluation = Evaluation::logging(LoggedRuleErrors::All);
+        self.evaluate_into(evaluation, path, ir, format_name)
             .diagnostics
+    }
+
+    /// Run every applicable rule against `ir`, as
+    /// [`Evaluator::evaluate_file`] does, and return the diagnostics
+    /// together with every [`RuleError`] that skipped a rule
+    /// ([`RuleErrorStage::skips_rule`]). The others, which only move a
+    /// finding, are logged as `evaluate_file` logs them.
+    #[must_use]
+    pub fn evaluate_reporting(
+        &self,
+        path: &Utf8Path,
+        ir: &dq_core::Ir<'_>,
+        format_name: &str,
+    ) -> Evaluation {
+        let evaluation = Evaluation::logging(LoggedRuleErrors::Recovered);
+        self.evaluate_into(evaluation, path, ir, format_name)
     }
 
     /// Run every applicable rule against `ir`, as
@@ -2198,6 +2246,10 @@ loc:
             evaluation.rule_errors[1].to_string(),
             "rule=t.check check.jq: jq runtime error: cannot index \"s\" with \"x\""
         );
+        // `evaluate_reporting` keeps those that skipped a rule.
+        let reported = eval.evaluate_reporting(&path, &owned.to_borrowed(), "yaml");
+        assert_eq!(reported.rule_errors, evaluation.rule_errors[..2]);
+        assert_eq!(reported.diagnostics.len(), 1);
         // `evaluate_file` logs the same errors and returns the same
         // diagnostics.
         let logged = eval.evaluate_file(&path, &owned.to_borrowed(), "yaml");

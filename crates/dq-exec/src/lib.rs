@@ -25,6 +25,8 @@ pub mod fixer;
 pub mod loader;
 /// Parsed rule schema — `Rule`, `RuleMatch`, [`Check`], `RuleLoc`.
 pub mod rule;
+/// The files of a rule directory — the walk, and rule or fixture by name.
+pub mod rule_dir;
 /// Multi-rule containers and the three loaders (`from_str` / `from_path` / `from_std`).
 pub mod ruleset;
 /// M11 Phase 3: JSON Schema 2020-12 compilation + validation for the

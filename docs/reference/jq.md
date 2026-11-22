@@ -130,6 +130,13 @@ construction goes through `_dq_key`. `getpath`, `has`, `in`, `pick`,
 `from_entries` and `with_entries` are redefined. The natives are in
 `crates/dq-transform/src/jq/keys.rs`.
 
+## Ending the process
+
+`halt`, `halt_error` and `halt_error/1` are a jq runtime error (exit 1; in a
+rule a [rule error](lint-engine.md#a-rule-that-raises), exit 3), and `try` does
+not catch it. An expression cannot end dq: a rule would stop a lint with exit 0
+and no report, and `set --jq` a bulk run half way.
+
 ## API
 
 ```rust

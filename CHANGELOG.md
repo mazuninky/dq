@@ -27,6 +27,22 @@ breaking changes are listed first under Changed.
 
 ### Changed
 
+- jq `halt`, `halt_error` and `halt_error/1` are a runtime error, in rules,
+  `query` and `set --jq`. They ended the process: a rule with `halt` made a
+  lint exit 0 without a report, whatever the other rules found.
+- **`dq lint`, `check` and `fix` fail when a rule raises.** A rule whose
+  `match.filter` or `check.jq` raised a jq error was skipped with a warning
+  (none under `-q`) and the run exited 0, so a gate with a typo in its rule
+  passed. Each error is now a `lint.rule_error` result in every structured
+  format, stderr names it, the rest of the run goes on, and the exit code is 3.
+  `--allow-rule-errors` restores the old behaviour. `@std` rules do not raise;
+  your own may need a guard such as `type == "object" and .kind == "Pod"`.
+- A rule with an unknown name in `match.format`, or none, is an error (exit 3):
+  it never applied and said nothing. A `--rules` directory without a rule file
+  is exit 6.
+- Rule directories follow symbolic links and take `.yml` / `.yaml` in any case.
+  Rules added with `dq rules add --symlink` were never loaded. A link to nothing
+  is exit 5. `dq test DIR` follows links too.
 - An error no longer repeats its cause: `Caused by:` leaves out a cause whose
   text the message above it already holds (I/O, write, rule and glob errors
   printed it twice), and so does an entry of the bulk summary.
@@ -87,6 +103,16 @@ breaking changes are listed first under Changed.
   to `a.json`) overwrote each other and were both removed, and on a
   case-insensitive file system `convert f.YAML -F yaml -i` removed the file. Both
   are refused (exit 6). A target that is a link is refused (exit 7).
+- `dq rules add SRC --symlink --force` deleted the source when `.dq/rules`
+  already linked to it, and wrote outside `.dq/rules` through links or for a
+  file named `...yml`. A source that overlaps its destination and such a name
+  are refused (exit 6), and `--force` replaces a link, never what it points to.
+  A failed `--force` leaves every file old or new; it removed the old ones first.
+- A write error of `dq rules add` exits 7, as a write, not 5.
+- `./.dq/rules` that cannot be read or is not a directory was skipped with exit
+  0; it is now exit 5 or 6.
+- `dq fix --parallel` hung when a worker logged a warning: the run held the lock
+  on stderr that the log needs.
 - A usage error that names the file (`-F yaml … keeps FILE in its own format`)
   shows the name whole and on one line: a line break in it started a line of
   its own, and terminal sequences were dropped from it.

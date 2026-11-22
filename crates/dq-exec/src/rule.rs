@@ -19,6 +19,7 @@ use camino::Utf8PathBuf;
 use serde::{Deserialize, Deserializer};
 
 use crate::diagnostic::Severity;
+use crate::error::ExecError;
 pub use crate::schema_value::SchemaNotes;
 
 /// One rule, parsed from a YAML document.
@@ -111,6 +112,47 @@ struct RawRuleFix {
     ops: Option<String>,
 }
 
+impl Rule {
+    /// Check that `match.format` lists a format and that every name in it
+    /// is one dq reads — in this rule and in the `nested:` rules of a
+    /// composite. A rule without a format, or with a name that is none,
+    /// would never apply to a file.
+    ///
+    /// # Errors
+    ///
+    /// [`ExecError::NoFormat`], or [`ExecError::UnknownFormat`] for the
+    /// first unknown name; the outer rule's before a nested one's.
+    pub(crate) fn check_formats(&self) -> crate::error::Result<()> {
+        if self.match_.format.is_empty() {
+            return Err(ExecError::NoFormat {
+                rule_id: self.id.clone(),
+            });
+        }
+        for format in &self.match_.format {
+            if dq_core::by_name(format).is_none() {
+                return Err(ExecError::UnknownFormat {
+                    rule_id: self.id.clone(),
+                    format: format.clone(),
+                    did_you_mean: dq_core::pointer::did_you_mean(format, &format_names()),
+                });
+            }
+        }
+        match &self.check {
+            Check::Composite { nested, .. } => nested.check_formats(),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// The format names `match.format` takes: those of dq's parsers, as
+/// [`dq_core::Format::name`] gives them.
+pub(crate) fn format_names() -> Vec<&'static str> {
+    dq_core::parsers::registry()
+        .iter()
+        .map(|format| format.name())
+        .collect()
+}
+
 impl<'de> Deserialize<'de> for RuleFix {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -137,7 +179,9 @@ impl<'de> Deserialize<'de> for RuleFix {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuleMatch {
-    /// One or more format names that this rule applies to.
+    /// One or more format names that this rule applies to, as dq's parsers
+    /// name themselves ([`dq_core::by_name`]). [`crate::RuleSet`]'s loaders
+    /// refuse a name dq does not have, and an empty list.
     #[serde(deserialize_with = "deserialize_format_list")]
     pub format: Vec<String>,
     /// Optional jq predicate over the parsed document — the rule applies
