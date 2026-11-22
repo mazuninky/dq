@@ -180,8 +180,9 @@ the set of formats present in the inputs:
   walked once and a file loaded once however many links reach it. A link that
   leads nowhere (or to itself) is exit 5, as it may have been a rule (`.#name`,
   an editor's lock, is not); so is a special file named as a rule. In
-  `dq test DIR` only links named as a rule or fixture count, and a directory
-  behind a link that cannot be read is skipped with a warning.
+  `dq test DIR` only links named as a rule or fixture count: any other link that
+  cannot be followed, and a directory behind a link that cannot be read, is
+  skipped with a warning.
 - `./.dq/rules` that cannot be read or resolved is exit 5, and exit 6 when it
   is not a directory. It may be absent or empty.
 - The same `--rules` value given twice is loaded twice.
@@ -192,7 +193,21 @@ the set of formats present in the inputs:
 that overlaps its destination, with or without `--force`, and a file or
 directory whose name gives no directory name in `.dq/rules` (`...yml`).
 `--force` replaces what is in the way, a link itself and never what it points
-to. `--symlink` links to the real file, links on the way to it resolved.
+to. `--symlink` links to the real file, links on the way to it resolved. A rule
+reached by several names is added once, under the first of them; a fixture of
+a name that is left out is left out with a warning.
+
+Everything is staged beside its target and renamed at the end, so a failure
+(exit 7 for writing) leaves each file old or new, never missing or cut short,
+and says whether anything was replaced. The files are renamed one by one: when
+a rule moved from one file to another, a failure between the two renames can
+leave it in neither, until the command is run again. Files of the old set that
+the new one does not have are kept. Names of the set that are one name on the
+destination's file system are refused (exit 6), as is a file that appeared at a
+target meanwhile without `--force`. An interrupted run can leave a
+`.dq-XXXXXX` directory or file, or the replaced link under `.dq-old-XXXXXX`;
+the first is never read as a rule (a warning names a directory) and may be
+deleted, as may the second.
 
 `dq explain` resolves `@std/<ns>.<rule>`, `<ns>.<rule>` for a known
 namespace, or an exact id among loaded rules; an unknown id exits 6 with

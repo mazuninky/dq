@@ -3,7 +3,7 @@
 //! files are rules and which are fixtures.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 
 use camino::{Utf8Path, Utf8PathBuf};
@@ -14,20 +14,37 @@ use crate::error::{ExecError, Result};
 /// does not matter.
 const RULE_FILE_EXTENSIONS: [&str; 2] = ["yml", "yaml"];
 
+/// How the names start that `dq rules add` writes under before it renames.
+pub const STAGING_PREFIX: &str = ".dq-";
+
+/// How many ASCII letters and digits come after [`STAGING_PREFIX`], and then
+/// nothing.
+pub const STAGING_RANDOM: usize = 6;
+
+/// Whether `name` is one `dq rules add` writes under, `.dq-` and six letters
+/// and digits: what is there is not a rule, or not yet.
+#[must_use]
+pub fn is_staging_name(name: &OsStr) -> bool {
+    let random = name.to_str().and_then(|n| n.strip_prefix(STAGING_PREFIX));
+    random.is_some_and(|random| {
+        random.len() == STAGING_RANDOM && random.bytes().all(|b| b.is_ascii_alphanumeric())
+    })
+}
+
 /// What [`files_under`] does about what it cannot follow or read by way of a
-/// link: one that leads nowhere — to nothing, or back to itself — and one
-/// that leads to what may not be read.
+/// link: a link that cannot be followed — it leads to nothing, back to itself,
+/// through a file, past what may not be looked at, by more links than the
+/// system follows — and a directory behind one that cannot be read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DanglingLinks {
     /// An error, all of it: in a directory of rules it may have been a
     /// directory of them, such as a submodule that is not checked out.
     Refuse,
-    /// A link that leads nowhere is an error when it is named as a rule file
-    /// or a fixture, and else no file. A directory that cannot be read is
-    /// passed over with a warning when a link led to it, or above it; so is
-    /// a link to what may not be looked at, unless it is named as a rule
-    /// file or a fixture. The walk is over any part of a repository, where a
-    /// link may have nothing to do with rules.
+    /// A link that cannot be followed is an error when it is named as a rule
+    /// file or a fixture. Any other, and a directory that cannot be read when
+    /// a link led to it, or above it, is passed over with a warning. The walk
+    /// is over any part of a repository, where a link may have nothing to do
+    /// with rules.
     RefuseRules,
 }
 
@@ -63,13 +80,15 @@ impl WalkedFile {
 /// link before it leads to, adds nothing and cannot loop. A file that is
 /// linked to comes once per link, under the link's path.
 ///
-/// An editor's lock (`.#a.yml`, a link to no path) is never a rule.
+/// An editor's lock (`.#a.yml`, a link to no path) is never a rule, and what
+/// has a staging name ([`is_staging_name`]) is left out: a `dq rules add` that
+/// was killed may have left it. A directory of that name is warned about.
 ///
 /// # Errors
 ///
-/// [`ExecError::Io`] naming a link that leads nowhere or what cannot be read,
-/// as `dangling` says, or a FIFO, socket or device named as a rule file or a
-/// fixture: skipping it would leave out rules without a word.
+/// [`ExecError::Io`] naming a link that cannot be followed or what cannot be
+/// read, as `dangling` says, or a FIFO, socket or device named as a rule file
+/// or a fixture: skipping it would leave out rules without a word.
 pub fn files_under(dir: &Utf8Path, dangling: DanglingLinks) -> Result<Vec<WalkedFile>> {
     let mut files = Vec::new();
     let mut walked: HashSet<PathBuf> = HashSet::new();
@@ -96,14 +115,34 @@ pub fn files_under(dir: &Utf8Path, dangling: DanglingLinks) -> Result<Vec<Walked
                 Err(err) => return Err(tree.walk_error(err)),
             };
             let path = tree.path_of(entry.path());
+            // The directory of the walk and what a link leads to are there by
+            // the name the user gave them.
+            if entry.depth() > 0 && is_staging_name(entry.file_name()) {
+                if entry.file_type().is_dir() {
+                    tracing::warn!(
+                        "skipped {}: left by a `dq rules add` that did not finish; \
+                         it may be deleted",
+                        dq_core::one_line(&path.to_string_lossy())
+                    );
+                    entries.skip_current_dir();
+                }
+                continue;
+            }
             let file_type = if entry.path_is_symlink() {
-                match std::fs::metadata(entry.path()) {
-                    Ok(meta) => meta.file_type(),
-                    Err(err) if is_no_file(entry.path(), &err, dangling) => continue,
+                match follow(entry.path()) {
+                    Ok(Followed::Directory(location)) => {
+                        trees.push_back(Tree {
+                            path,
+                            location,
+                            linked: true,
+                        });
+                        continue;
+                    }
+                    Ok(Followed::Other(file_type)) => file_type,
+                    Err(err) if is_lock(entry.path(), &err) => continue,
                     Err(err) => {
-                        let skipped = may_be_skipped(entry.path(), &err, dangling);
                         let err = io_error(&path, entry.path(), err);
-                        if !skipped {
+                        if dangling == DanglingLinks::Refuse || is_named_as_rule(&path) {
                             return Err(err);
                         }
                         warn_skipped(&err);
@@ -114,15 +153,7 @@ pub fn files_under(dir: &Utf8Path, dangling: DanglingLinks) -> Result<Vec<Walked
                 entry.file_type()
             };
             if file_type.is_dir() {
-                if entry.path_is_symlink() {
-                    let location = std::fs::canonicalize(entry.path())
-                        .map_err(|source| io_error(&path, entry.path(), source))?;
-                    trees.push_back(Tree {
-                        path,
-                        location,
-                        linked: true,
-                    });
-                } else if !walked.insert(entry.into_path()) {
+                if !walked.insert(entry.into_path()) {
                     entries.skip_current_dir();
                 }
             } else if file_type.is_file() {
@@ -207,22 +238,31 @@ pub fn project_dir(cwd: &Utf8Path) -> Result<Option<Utf8PathBuf>> {
     Ok(Some(cwd.join(".dq").join("rules")))
 }
 
-/// Whether the link at `location`, which cannot be followed for `err`, leads
-/// nowhere and is no file to a walk.
-fn is_no_file(location: &Path, err: &std::io::Error, dangling: DanglingLinks) -> bool {
-    let is_lock = location
-        .file_name()
-        .is_some_and(|name| name.to_string_lossy().starts_with(".#"));
-    (is_lock || (dangling == DanglingLinks::RefuseRules && !is_named_as_rule(location)))
-        && leads_nowhere(location, err)
+/// What a link leads to.
+enum Followed {
+    /// A directory, where it is.
+    Directory(PathBuf),
+    /// Anything else.
+    Other(std::fs::FileType),
 }
 
-/// Whether a walk may go on without the link at `location`, which leads to
-/// what may not be looked at: `err`.
-fn may_be_skipped(location: &Path, err: &std::io::Error, dangling: DanglingLinks) -> bool {
-    dangling == DanglingLinks::RefuseRules
-        && err.kind() == std::io::ErrorKind::PermissionDenied
-        && !is_named_as_rule(location)
+/// Follow the link at `location` to its end.
+fn follow(location: &Path) -> std::io::Result<Followed> {
+    let file_type = std::fs::metadata(location)?.file_type();
+    Ok(if file_type.is_dir() {
+        Followed::Directory(std::fs::canonicalize(location)?)
+    } else {
+        Followed::Other(file_type)
+    })
+}
+
+/// Whether the link at `location`, which cannot be followed for `err`, is an
+/// editor's lock.
+fn is_lock(location: &Path, err: &std::io::Error) -> bool {
+    location
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with(".#"))
+        && leads_nowhere(location, err)
 }
 
 /// Whether `path` is named as a rule file or a fixture.
@@ -305,7 +345,8 @@ pub fn is_fixture_file(path: &Utf8Path) -> bool {
 /// The rule file a fixture tests, beside it: `foo.test.yml` is the fixture
 /// of `foo.yml`, `foo.test.YAML` of `foo.YAML`. `None` for a path that is no
 /// fixture.
-pub(crate) fn parent_rule_path(fixture: &Utf8Path) -> Option<Utf8PathBuf> {
+#[must_use]
+pub fn parent_rule_path(fixture: &Utf8Path) -> Option<Utf8PathBuf> {
     let name = fixture.file_name()?;
     // Lowercasing ASCII keeps every byte offset.
     let lower = name.to_ascii_lowercase();
@@ -375,6 +416,28 @@ mod tests {
         ] {
             let parent = parent_rule_path(Utf8Path::new(fixture));
             assert_eq!(parent.as_deref(), Some(Utf8Path::new(rule)));
+        }
+    }
+
+    #[test]
+    fn a_staging_name_is_the_whole_name() {
+        for name in [".dq-a1B2c3", ".dq-abcdef", ".dq-000000"] {
+            assert!(is_staging_name(OsStr::new(name)), "{name}");
+        }
+        for name in [
+            ".dq-",
+            ".dq-abcde",
+            ".dq-abcdefg",
+            ".dq-abcdef.yml",
+            ".dq-old-abcdef",
+            ".dq-abc.ef",
+            ".dq-rules",
+            "x.dq-abcdef",
+            "dq-abcdef",
+            ".DQ-abcdef",
+            ".dq-abcdé",
+        ] {
+            assert!(!is_staging_name(OsStr::new(name)), "{name}");
         }
     }
 
@@ -511,6 +574,15 @@ mod tests {
             assert_eq!(found(&dir), ["1/deep/c.yml", "a.yml", "sub/b.yml"]);
         }
 
+        /// [`is_loop`], which must not take for ever to tell.
+        fn is_loop_in_time(path: &Utf8Path) -> bool {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let link = path.to_path_buf();
+            std::thread::spawn(move || tx.send(is_loop(link.as_std_path())));
+            rx.recv_timeout(std::time::Duration::from_secs(20))
+                .unwrap_or_else(|err| panic!("is_loop({path}): {err}"))
+        }
+
         #[test]
         fn a_loop_is_told_from_a_chain_that_is_only_long() {
             let (_temp, root) = tree();
@@ -559,13 +631,13 @@ mod tests {
                 "twice79",
                 "a.yml",
             ] {
-                assert!(!is_loop(dir.join(name).as_std_path()), "{name}");
+                assert!(!is_loop_in_time(&dir.join(name)), "{name}");
             }
             assert!(!is_loop(dir.join("nothing").as_std_path()));
         }
 
         #[test]
-        fn a_chain_of_too_many_links_is_not_one_to_nothing() {
+        fn a_link_that_cannot_be_followed_stops_a_walk_for_rules_only() {
             let (_temp, root) = tree();
             let dir = root.join("real");
             // No system follows as many in one go.
@@ -574,14 +646,29 @@ mod tests {
                 let target = format!("chain{:02}", n - 1);
                 symlink(target, dir.join(format!("chain{n:02}"))).expect("link");
             }
-            for dangling in [DanglingLinks::Refuse, DanglingLinks::RefuseRules] {
-                let err = files_under(&dir, dangling).expect_err("too many");
-                assert!(err.to_string().contains("real/chain"), "{err}");
+            let too_many = "chain79".to_owned();
+            let targets = [too_many, "a.yml/x".to_owned(), "x".repeat(300)];
+            let err = files_under(&dir, DanglingLinks::Refuse).expect_err("too many");
+            assert!(err.to_string().contains("real/chain"), "{err}");
+            let files = files_under(&dir, DanglingLinks::RefuseRules).expect("walk");
+            assert_eq!(files.len(), 2, "{files:?}");
+            std::fs::create_dir(root.join("set")).expect("mkdir");
+            for target in targets {
+                for (name, stops) in [("notes", false), ("b.yml", true), ("b.test.YAML", true)] {
+                    let link = root.join("set").join(name);
+                    symlink(format!("../real/{target}"), &link).expect("link");
+                    let walk = |dangling| files_under(&root.join("set"), dangling);
+                    let err = walk(DanglingLinks::Refuse).expect_err(&target);
+                    assert!(err.to_string().contains(link.as_str()), "{err}");
+                    let walked = walk(DanglingLinks::RefuseRules);
+                    assert_eq!(walked.is_err(), stops, "{name} -> {target}: {walked:?}");
+                    std::fs::remove_file(&link).expect("rm");
+                }
             }
         }
 
         #[test]
-        fn a_link_to_itself_is_one_to_nothing() {
+        fn a_link_to_itself_cannot_be_followed() {
             let (_temp, root) = tree();
             let dir = root.join("real");
             // Directly, and by way of another link.

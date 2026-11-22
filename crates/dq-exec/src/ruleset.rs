@@ -19,7 +19,7 @@ use serde_norway::Value as YamlValue;
 
 use crate::error::{ExecError, Result};
 use crate::rule::{Check, CheckParseError, Rule};
-use crate::rule_dir;
+use crate::rule_dir::{self, WalkedFile};
 
 /// Provenance marker for a [`RuleSet`].
 ///
@@ -132,12 +132,24 @@ impl RuleSet {
             return Self::from_file(path, path.as_std_path());
         }
 
+        let files = rule_dir::files_under(path, rule_dir::DanglingLinks::Refuse)?;
+        Self::from_walk(path, &files)
+    }
+
+    /// Load the rule files among `files`, which
+    /// [`files_under`](rule_dir::files_under) found in the directory `path`:
+    /// what [`RuleSet::from_path`] does on it.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`RuleSet::from_path`] for a directory.
+    pub fn from_walk(path: &Utf8Path, files: &[WalkedFile]) -> Result<Self> {
         let mut rules = Vec::new();
         // Collect first, then parse, so the loader's de-duplication step
         // sees a deterministic order.
-        let mut entries: Vec<(Utf8PathBuf, PathBuf)> = Vec::new();
+        let mut entries: Vec<(Utf8PathBuf, &Path)> = Vec::new();
         let mut seen: HashSet<PathBuf> = HashSet::new();
-        for file in rule_dir::files_under(path, rule_dir::DanglingLinks::Refuse)? {
+        for file in files {
             let utf8 = Utf8PathBuf::from_path_buf(file.path.clone()).map_err(|entry| {
                 // A non-UTF-8 path under a rules directory is an
                 // operational anomaly — surface it through the existing
@@ -152,7 +164,7 @@ impl RuleSet {
             })?;
             // A rule file two links lead to is one rule file.
             if rule_dir::is_rule_file(&utf8) && seen.insert(file.real()?) {
-                entries.push((utf8, file.location));
+                entries.push((utf8, &file.location));
             }
         }
 

@@ -149,7 +149,7 @@ impl RuleTester {
     ///
     /// - [`crate::ExecError::Io`] when the directory walk itself fails (e.g.
     ///   the directory doesn't exist, or a link in it named as a rule or a
-    ///   fixture leads nowhere; see [`rule_dir::DanglingLinks::RefuseRules`]).
+    ///   fixture cannot be followed; see [`rule_dir::DanglingLinks::RefuseRules`]).
     ///   Per-fixture failures are reported as [`TestOutcome::Error`] entries
     ///   — they don't bubble up.
     pub fn run_dir(dir: &Utf8Path) -> Result<Vec<TestOutcome>> {

@@ -151,6 +151,7 @@ pub(crate) fn run(
     let console = matches!(cli.format, OutputFormat::Console);
     let mut report = Report {
         diagnostics: Vec::new(),
+        unparsed: Vec::new(),
         rule_errors: RuleErrors::default(),
         structured: !console,
         allow_rule_errors,
@@ -165,17 +166,14 @@ pub(crate) fn run(
     );
     let Report {
         diagnostics,
+        unparsed,
         rule_errors,
         ..
     } = report;
-    let unparsed = match linted {
-        Ok(unparsed) => unparsed,
-        Err(err) => {
-            // No report names them now.
-            rule_errors.log();
-            return Err(err);
-        }
-    };
+    if let Err(err) = linted {
+        log_unreported(&unparsed, &rule_errors);
+        return Err(err);
+    }
     let mut envelope = build_envelope(&diagnostics);
     if reporter.wants_rule_catalog() {
         let mut catalog = rule_catalog(evaluator.rules());
@@ -192,8 +190,11 @@ pub(crate) fn run(
     } else {
         reporter.report(&envelope, out)
     };
+    if let Err(err) = reported {
+        log_unreported(&unparsed, &rule_errors);
+        return Err(err);
+    }
     rule_errors.log();
-    reported?;
 
     let mut unparsed = unparsed.into_iter();
     if let Some(first) = unparsed.next() {
@@ -210,10 +211,19 @@ pub(crate) fn run(
     classify_exit(&diagnostics, cli.strict)
 }
 
-/// Lint `files` into `report`, and return the errors of those that do not
-/// parse: each is a `lint.<kind>` result of its own in a structured report
-/// (the console prints the error itself), and the run still lints every
-/// other file before it fails with exit 3.
+/// Name every file that does not parse and every rule error on stderr: no
+/// report does, and the run's error is another one.
+fn log_unreported(unparsed: &[anyhow::Error], rule_errors: &RuleErrors) {
+    for err in unparsed {
+        tracing::error!("{err}{}", position_note(err));
+    }
+    rule_errors.log();
+}
+
+/// Lint `files` into `report`. A file that does not parse is kept there with
+/// its error, and is a `lint.<kind>` result of its own in a structured report
+/// (the console prints the error itself): the run still lints every other
+/// file before it fails with exit 3.
 ///
 /// # Errors
 ///
@@ -227,8 +237,7 @@ fn lint_files(
     evaluator: &Evaluator,
     plugins: Option<&LoadedPlugins>,
     report: &mut Report,
-) -> anyhow::Result<Vec<anyhow::Error>> {
-    let mut unparsed: Vec<anyhow::Error> = Vec::new();
+) -> anyhow::Result<()> {
     let several = files.len() > 1;
     let mut missing = Vec::new();
     for file in files {
@@ -247,7 +256,7 @@ fn lint_files(
                     if report.structured {
                         report.diagnostics.push(diagnostic);
                     }
-                    unparsed.push(err);
+                    report.unparsed.push(err);
                     continue;
                 }
                 None => return Err(err),
@@ -295,7 +304,7 @@ fn lint_files(
     for (file, reason) in &missing {
         tracing::warn!("skipped {file}: {reason}");
     }
-    Ok(unparsed)
+    Ok(())
 }
 
 /// The diagnostic for `file`, which did not load with `err`, when that is
@@ -355,6 +364,8 @@ fn own_catalog(diagnostics: &[Diagnostic]) -> Vec<serde_json::Value> {
 struct Report {
     /// The findings, in file and rule order.
     diagnostics: Vec<Diagnostic>,
+    /// The errors of the files that do not parse, in file order.
+    unparsed: Vec<anyhow::Error>,
     /// The rules that raised and did not run on a file.
     rule_errors: RuleErrors,
     /// The report is a structured one: a file that does not parse and a rule

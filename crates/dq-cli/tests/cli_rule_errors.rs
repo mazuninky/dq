@@ -861,3 +861,89 @@ fn rule_errors_are_named_when_a_later_file_ends_the_run() {
     let stderr = rule_errors(&out.get_output().stderr);
     assert!(stderr.starts_with(&format!("{error}\n")), "{stderr}");
 }
+
+#[test]
+fn files_that_do_not_parse_are_named_when_a_later_file_ends_the_run() {
+    let dir = TempDir::new().expect("tempdir");
+    for (name, text) in [
+        ("r.yml", RAISES_IN_CHECK),
+        ("broken.yaml", "a: [1\n"),
+        ("worse.yaml", "a: b: c\n"),
+        ("pod.yaml", WRONG_TYPE_SPEC),
+    ] {
+        std::fs::write(dir.path().join(name), text).expect("write");
+    }
+    for flags in [&[][..], &["-q"], &["-F", "json"], &["-F", "sarif"]] {
+        for command in [["lint", "--rules"], ["check", "--rule"]] {
+            let out = dq()
+                .current_dir(dir.path())
+                .arg("--no-color")
+                .args(flags)
+                .args(command)
+                .args([
+                    "r.yml",
+                    "broken.yaml",
+                    "pod.yaml",
+                    "worse.yaml",
+                    "nope.yaml",
+                ])
+                .assert()
+                .code(5)
+                .stdout("");
+            let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+            let lines: Vec<&str> = stderr.lines().collect();
+            // Each with its position, then the rule, then the run's error.
+            for (line, (what, place)) in lines.iter().zip([
+                ("ERROR parse error in broken.yaml: ", "(line 2, column 1)"),
+                ("ERROR parse error in worse.yaml: ", "(line 1, column 5)"),
+                ("ERROR rule did not run rule_id=", ""),
+                ("I/O error reading 'nope.yaml': ", ""),
+            ]) {
+                assert!(
+                    line.contains(what) && line.ends_with(place),
+                    "{flags:?} {command:?}: {what}{place}: {stderr}"
+                );
+            }
+            assert_eq!(lines.len(), 4, "{stderr}");
+        }
+    }
+}
+
+#[test]
+fn files_that_do_not_parse_are_named_when_the_report_is_refused() {
+    let dir = TempDir::new().expect("tempdir");
+    for (name, text) in [
+        ("r.yml", RAISES_IN_CHECK),
+        ("broken.yaml", "a: [1\n"),
+        ("worse.yaml", "a: b: c\n"),
+        ("pod.yaml", WRONG_TYPE_SPEC),
+    ] {
+        std::fs::write(dir.path().join(name), text).expect("write");
+    }
+    for format in ["csv", "hcl"] {
+        for command in [["lint", "--rules"], ["check", "--rule"]] {
+            let out = dq()
+                .current_dir(dir.path())
+                .args(["--no-color", "-q", "-F", format])
+                .args(command)
+                .args(["r.yml", "broken.yaml", "pod.yaml", "worse.yaml"])
+                .assert()
+                .code(6)
+                .stdout("");
+            let stderr = String::from_utf8_lossy(&out.get_output().stderr).into_owned();
+            let lines: Vec<&str> = stderr.lines().collect();
+            for (line, (what, place)) in lines.iter().zip([
+                ("ERROR parse error in broken.yaml: ", "(line 2, column 1)"),
+                ("ERROR parse error in worse.yaml: ", "(line 1, column 5)"),
+                ("ERROR rule did not run rule_id=", ""),
+                (format, ""),
+            ]) {
+                assert!(
+                    line.contains(what) && line.ends_with(place),
+                    "{format} {command:?}: {what}{place}: {stderr}"
+                );
+            }
+            assert_eq!(lines.len(), 4, "{stderr}");
+        }
+    }
+}

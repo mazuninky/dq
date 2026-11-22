@@ -544,6 +544,9 @@ mod links {
             "ok ./.dq/rules/a.test.yml: thing\nsummary: 1 passed, 0 failed, 0 errored, 1 total\n";
         let run = scratch.run(&["test", "."]);
         assert_eq!((run.code, run.stdout.as_str()), (0, passed));
+        let why = "a link to '../../company-rules', where nothing is";
+        let skipped = format!("WARN skipped ./.dq/rules/company: {why}\n");
+        assert_eq!(run.stderr, skipped);
         // One named as a rule or a fixture is a test that does not run.
         for name in ["b.yml", "b.test.yaml", "b.TEST.YML"] {
             scratch.link("../gone", &format!(".dq/rules/{name}"));
@@ -1327,5 +1330,480 @@ mod links {
         ] {
             assert_eq!(run, stopped(path, "Permission denied (os error 13)"));
         }
+    }
+
+    #[test]
+    fn a_link_that_cannot_be_followed_stops_a_lint_and_no_test_run() {
+        let scratch = Scratch::new(&[
+            ("thing.yaml", THING),
+            ("set/a.yml", FIRES),
+            ("set/a.test.yml", FIXTURE),
+            ("out/c00", FIRES),
+        ]);
+        // More than any system follows in one go.
+        for n in 1..80 {
+            scratch.link(&format!("c{:02}", n - 1), &format!("out/c{n:02}"));
+        }
+        let long = "x".repeat(300);
+        // Through a file, to a name no file can have, by too many links, to
+        // itself.
+        for target in ["a.yml/x", &long, "../out/c79", "itself"] {
+            let link = if target == "itself" { target } else { "notes" };
+            scratch.link(target, &format!("set/{link}"));
+            let run = scratch.run(&["test", "set"]);
+            let passed =
+                "ok set/a.test.yml: thing\nsummary: 1 passed, 0 failed, 0 errored, 1 total\n";
+            assert_eq!((run.code, run.stdout.as_str()), (0, passed), "{target}");
+            let skipped = format!("WARN skipped set/{link}: ");
+            assert!(run.stderr.starts_with(&skipped), "{run:?}");
+            assert_eq!(run.stderr.lines().count(), 1, "{run:?}");
+            // Any of them may have been a directory of rules.
+            for args in [&LINT_SET[..], &["rules", "add", "set"]] {
+                let run = scratch.run(args);
+                assert_eq!((run.code, run.stdout.as_str()), (5, ""), "{target}");
+                let why = format!("io error reading ROOT/set/{link}: ");
+                assert!(run.stderr.starts_with(&why), "{run:?}");
+            }
+            std::fs::remove_file(scratch.path(&format!("set/{link}"))).expect("rm");
+            for name in ["b.yml", "b.test.YAML"] {
+                scratch.link(target, &format!("set/{name}"));
+                let run = scratch.run(&["test", "set"]);
+                assert_eq!((run.code, run.stdout.as_str()), (5, ""), "{target}");
+                let why = format!("io error reading set/{name}: ");
+                assert!(run.stderr.starts_with(&why), "{run:?}");
+                std::fs::remove_file(scratch.path(&format!("set/{name}"))).expect("rm");
+            }
+        }
+        assert_eq!(found(&scratch, &LINT_SET), ["t.fires"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // `rules add` that fails, and what it leaves
+    // -----------------------------------------------------------------------
+
+    /// The mode of a file, followed.
+    fn mode_of(path: &std::path::Path) -> u32 {
+        let metadata = std::fs::metadata(path).expect("metadata");
+        metadata.permissions().mode() & 0o7777
+    }
+
+    fn set_mode(scratch: &Scratch, path: &str, mode: u32) {
+        let permissions = std::fs::Permissions::from_mode(mode);
+        std::fs::set_permissions(scratch.path(path), permissions).expect("chmod");
+    }
+
+    /// `src`, and an older `src` added in `.dq/rules`, with a rule more.
+    fn added() -> Scratch {
+        Scratch::new(&[
+            ("thing.yaml", THING),
+            ("src/a.yml", &fires("t.new-a")),
+            ("src/sub/b.yml", &fires("t.new-b")),
+            (".dq/rules/src/a.yml", &fires("t.old-a")),
+            (".dq/rules/src/sub/b.yml", &fires("t.old-b")),
+            (".dq/rules/src/z.yml", &fires("t.old-z")),
+        ])
+    }
+
+    const OLD: [&str; 3] = ["t.old-a", "t.old-b", "t.old-z"];
+    const NEW: [&str; 3] = ["t.new-a", "t.new-b", "t.old-z"];
+
+    #[test]
+    fn rules_add_that_may_not_write_leaves_every_rule_as_it_was() {
+        for flags in [&["--force"][..], &["--symlink", "--force"]] {
+            let scratch = added();
+            let add = [&["rules", "add", "src"], flags].concat();
+            let before = tree(&scratch);
+            set_mode(&scratch, ".dq/rules/src/sub", 0o555);
+            let root = std::fs::write(scratch.path(".dq/rules/src/sub/probe"), "").is_ok();
+            let run = scratch.run(&add);
+            let after = tree(&scratch);
+            set_mode(&scratch, ".dq/rules/src/sub", 0o755);
+            if root {
+                // Root writes everywhere.
+                return;
+            }
+            let failed_at = |path: &str| {
+                failed(
+                    7,
+                    &format!(
+                        "I/O error writing 'ROOT/{path}': Permission denied (os error 13); \
+                         nothing was replaced\n"
+                    ),
+                )
+            };
+            assert_eq!(run, failed_at(".dq/rules/src/sub/b.yml"), "{flags:?}");
+            assert_eq!(after, before, "{flags:?}");
+            assert_eq!(found(&scratch, &["lint", "thing.yaml"]), OLD);
+
+            // The same where the directory is one to make.
+            scratch.write("src/0/c.yml", &fires("t.new-c"));
+            set_mode(&scratch, ".dq/rules/src", 0o555);
+            let run = scratch.run(&add);
+            let after = tree(&scratch);
+            set_mode(&scratch, ".dq/rules/src", 0o755);
+            assert_eq!(run, failed_at(".dq/rules/src/0/c.yml"), "{flags:?}");
+            assert_eq!(after, before_with(&before, &scratch), "{flags:?}");
+            std::fs::remove_file(scratch.path("src/0/c.yml")).expect("rm");
+
+            // With the mode back, what the new set does not have stays.
+            assert_eq!(scratch.run(&add).code, 0);
+            assert_eq!(found(&scratch, &["lint", "thing.yaml"]), NEW);
+            let hidden = |entry: &&String| entry.contains("/.dq-");
+            let rules: Vec<String> = tree(&scratch)
+                .into_iter()
+                .filter_map(|entry| Some(entry.strip_prefix(".dq/")?.to_owned()))
+                .collect();
+            assert_eq!(rules.iter().find(hidden), None, "{flags:?}");
+        }
+    }
+
+    /// `before`, and `src/0` in it.
+    fn before_with(before: &[String], scratch: &Scratch) -> Vec<String> {
+        let mut entries = before.to_vec();
+        entries.push("src/0/".to_owned());
+        let text = read(scratch, "src/0/c.yml");
+        entries.push(format!("src/0/c.yml: {text:?}"));
+        entries.sort();
+        entries
+    }
+
+    /// [`Scratch::run`] with no file it writes allowed past some KiB, as on a
+    /// disk that is full.
+    fn run_on_a_full_disk(scratch: &Scratch, args: &[&str]) -> Run {
+        let out = assert_cmd::Command::new("sh")
+            .args(["-c", "trap '' XFSZ; ulimit -f 16; exec \"$@\"", "sh"])
+            .arg(env!("CARGO_BIN_EXE_dq"))
+            .arg("--no-color")
+            .args(args)
+            .current_dir(scratch.path(""))
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", scratch.path(""))
+            .timeout(scratch::DEADLINE)
+            .output()
+            .expect("run sh");
+        let root = real(&scratch.path(""));
+        let stderr = String::from_utf8(out.stderr).expect("UTF-8 stderr");
+        Run {
+            code: out.status.code().expect("an exit code"),
+            stdout: String::from_utf8(out.stdout).expect("UTF-8 stdout"),
+            stderr: stderr.replace(root.to_str().expect("UTF-8 path"), "ROOT"),
+        }
+    }
+
+    #[test]
+    fn rules_add_that_cannot_write_it_all_leaves_every_rule_as_it_was() {
+        let full = |path: &str| {
+            failed(
+                7,
+                &format!(
+                    "I/O error writing 'ROOT/{path}': File too large (os error 27); \
+                     nothing was replaced\n"
+                ),
+            )
+        };
+        let add = ["rules", "add", "src", "--force"];
+        let big = format!("{}# {}\n", fires("t.new-b"), "x".repeat(200_000));
+        // The old files, replaced one by one.
+        let scratch = added();
+        scratch.write("src/sub/b.yml", &big);
+        let before = tree(&scratch);
+        let run = run_on_a_full_disk(&scratch, &add);
+        assert_eq!(run, full(".dq/rules/src/sub/b.yml"));
+        assert_eq!(tree(&scratch), before);
+        assert_eq!(found(&scratch, &["lint", "thing.yaml"]), OLD);
+        assert_eq!(scratch.run(&add).code, 0);
+        assert_eq!(found(&scratch, &["lint", "thing.yaml"]), NEW);
+
+        // Old rules behind a link that is replaced as a whole.
+        for (target, link) in [
+            ("../../old/src", ".dq/rules/src"),
+            ("../../../old/src/sub", ".dq/rules/src/sub"),
+        ] {
+            let scratch = Scratch::new(&[
+                ("thing.yaml", THING),
+                ("src/a.yml", &fires("t.new-a")),
+                ("src/sub/b.yml", &big),
+                ("old/src/a.yml", &fires("t.old-a")),
+                ("old/src/sub/b.yml", &fires("t.old-b")),
+            ]);
+            scratch.link(target, link);
+            let before = tree(&scratch);
+            let old = found(&scratch, &["lint", "thing.yaml"]);
+            let run = run_on_a_full_disk(&scratch, &add);
+            assert_eq!(run, full(".dq/rules/src/sub/b.yml"), "{link}");
+            assert_eq!(tree(&scratch), before, "{link}");
+            assert_eq!(found(&scratch, &["lint", "thing.yaml"]), old);
+            assert_eq!(scratch.run(&add).code, 0);
+            assert_eq!(
+                found(&scratch, &["lint", "thing.yaml"]),
+                ["t.new-a", "t.new-b"]
+            );
+        }
+
+        // With nothing there yet, no rule is added.
+        let scratch = Scratch::new(&[
+            ("thing.yaml", THING),
+            ("src/a.yml", FIRES),
+            ("src/b.yml", &big),
+        ]);
+        let run = run_on_a_full_disk(&scratch, &add);
+        assert_eq!(run, full(".dq/rules/src/b.yml"));
+        assert_eq!(scratch.run(&["lint", "thing.yaml"]).code, 0);
+    }
+
+    #[test]
+    fn rules_add_makes_files_with_the_mode_they_had_with_a_plain_copy() {
+        let scratch = Scratch::new(&[("src/a.yml", FIRES), ("src/sub/b.yml", FIRES)]);
+        set_mode(&scratch, "src/a.yml", 0o640);
+        set_mode(&scratch, "src/sub/b.yml", 0o444);
+        for flags in [&[][..], &["--force"]] {
+            let run = scratch.run(&[&["rules", "add", "src"], flags].concat());
+            assert_eq!((run.code, run.stderr.as_str()), (0, ""));
+            for (path, mode) in [("a.yml", 0o640), ("sub/b.yml", 0o444)] {
+                let added = scratch.path(&format!(".dq/rules/src/{path}"));
+                assert_eq!(mode_of(&added), mode, "{path}");
+            }
+        }
+        // An embedded file is as any the user makes.
+        assert_eq!(scratch.run(&["rules", "add", "@std/npm"]).code, 0);
+        scratch.write("plain", "");
+        for entry in std::fs::read_dir(scratch.path(".dq/rules/npm")).expect("read dir") {
+            let path = entry.expect("entry").path();
+            assert_eq!(mode_of(&path), mode_of(&scratch.path("plain")), "{path:?}");
+        }
+        // A directory in place of a link, too.
+        let scratch = Scratch::new(&[("src/a.yml", FIRES)]);
+        scratch.link("../../gone", ".dq/rules/src");
+        assert_eq!(scratch.run(&["rules", "add", "src", "--force"]).code, 0);
+        let mode = |path| mode_of(&scratch.path(path));
+        assert_eq!(mode(".dq/rules/src"), mode(".dq/rules"));
+    }
+
+    // -----------------------------------------------------------------------
+    // `rules add` of a rule with several names
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rules_add_takes_a_rule_with_several_names_once() {
+        let files = |scratch: &Scratch| -> Vec<String> {
+            let entries = tree(scratch).into_iter();
+            let added = entries.filter_map(|entry| {
+                let name = entry.strip_prefix(".dq/rules/set/")?;
+                let end = name.find([':', ' ']).unwrap_or(name.len());
+                Some(name[..end].to_owned())
+            });
+            added.filter(|name| !name.is_empty()).collect()
+        };
+        for flags in [&[][..], &["--symlink"]] {
+            let scratch = Scratch::new(&[
+                ("thing.yaml", THING),
+                ("set/a.yml", FIRES),
+                ("set/a.test.yml", FIXTURE),
+                ("set/c.yml", &fires("t.c")),
+                ("set/only.test.yml", FIXTURE),
+            ]);
+            // A second name with the same fixture, one without, one below.
+            scratch.link("a.yml", "set/b.yml");
+            scratch.link("a.test.yml", "set/b.test.yml");
+            scratch.link("b.yml", "set/d.yaml");
+            scratch.link("../a.yml", "set/z/a.yml");
+            // A fixture of two rules goes with both.
+            scratch.link("a.test.yml", "set/c.test.yml");
+            let loaded = found(&scratch, &LINT_SET);
+            assert_eq!(loaded, ["t.fires", "t.c"]);
+            let add = [&["rules", "add", "set"], flags].concat();
+            let run = scratch.run(&add);
+            assert_eq!((run.code, run.stderr.as_str()), (0, ""), "{flags:?}");
+            assert_eq!(found(&scratch, &["lint", "thing.yaml"]), loaded);
+            assert_eq!(
+                files(&scratch),
+                [
+                    "a.test.yml",
+                    "a.yml",
+                    "c.test.yml",
+                    "c.yml",
+                    "only.test.yml"
+                ]
+            );
+        }
+        // The name the loader uses is the first, with its fixture; another's
+        // is left out, which is said where it is another file.
+        for flags in [&[][..], &["--symlink"]] {
+            let scratch = Scratch::new(&[
+                ("thing.yaml", THING),
+                ("set/b.yml", FIRES),
+                ("set/b.test.yml", FIXTURE),
+                ("set/a.test.yml", FIXTURE),
+            ]);
+            scratch.link("b.yml", "set/a.yml");
+            let run = scratch.run(&[&["rules", "add", "set"], flags].concat());
+            let left = "WARN left out ROOT/set/b.test.yml: its rule is added as \
+                        ROOT/set/a.yml, the first of its names\n";
+            assert_eq!((run.code, run.stderr.as_str()), (0, left), "{flags:?}");
+            assert_eq!(files(&scratch), ["a.test.yml", "a.yml"]);
+            assert_eq!(found(&scratch, &["lint", "thing.yaml"]), ["t.fires"]);
+            let run = scratch.run(&["test", ".dq/rules"]);
+            let summary = "summary: 1 passed, 0 failed, 0 errored, 1 total";
+            assert_eq!((run.code, run.stdout.lines().last()), (0, Some(summary)));
+            assert_eq!(read(&scratch, "set/b.yml"), FIRES);
+        }
+        // The same fixture beside another rule does not make up for it.
+        let scratch = Scratch::new(&[
+            ("set/a.yml", FIRES),
+            ("set/b.test.yml", FIXTURE),
+            ("set/c.yml", &fires("t.c")),
+        ]);
+        scratch.link("a.yml", "set/b.yml");
+        scratch.link("b.test.yml", "set/c.test.yml");
+        let run = scratch.run(&["rules", "add", "set"]);
+        assert_eq!(run.code, 0, "{run:?}");
+        assert!(run.stderr.contains("left out ROOT/set/b.test.yml: "));
+        assert_eq!(files(&scratch), ["a.yml", "c.test.yml", "c.yml"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // What a `rules add` that was killed leaves
+    // -----------------------------------------------------------------------
+
+    /// The warning about the staging directory at `path`.
+    fn unfinished(path: &str) -> String {
+        format!(
+            "WARN skipped {path}: left by a `dq rules add` that did not finish; \
+             it may be deleted\n"
+        )
+    }
+
+    #[test]
+    fn what_a_killed_rules_add_left_is_no_rule() {
+        let scratch = Scratch::new(&[
+            ("thing.yaml", THING),
+            (".dq/rules/src/a.yml", FIRES),
+            (".dq/rules/src/a.test.yml", FIXTURE),
+            (".dq/rules/src/.dq-aB3dE6/b.yml", &fires("t.left")),
+            (".dq/rules/src/.dq-aB3dE6/sub/b.test.yml", "no fixture"),
+            (".dq/rules/src/.dq-aB3dE7", "half a ru"),
+        ]);
+        // One that was staged as a link, to a source that is gone by now.
+        scratch.link("../../../gone.yml", ".dq/rules/src/.dq-000000");
+        let lint = |args: &[&str]| scratch.run(&[&["-F", "json", "lint"], args].concat());
+        for (args, root) in [
+            (&["thing.yaml"][..], "ROOT/"),
+            (&["--rules", ".dq/rules", "thing.yaml"], "ROOT/"),
+            (&["--rules", ".dq/rules/src", "thing.yaml"], "ROOT/"),
+        ] {
+            let run = lint(args);
+            assert_eq!(run.code, 4, "{run:?}");
+            let report: serde_json::Value = serde_json::from_str(&run.stdout).expect("JSON");
+            let found = report["diagnostics"].as_array().expect("diagnostics");
+            assert_eq!(found.len(), 1, "{run:?}");
+            assert_eq!(found[0]["rule_id"], "t.fires");
+            let left = unfinished(&format!("{root}.dq/rules/src/.dq-aB3dE6"));
+            assert!(run.stderr.starts_with(&left), "{run:?}");
+            assert_eq!(run.stderr.lines().count(), 2, "{run:?}");
+        }
+        let run = scratch.run(&["test", ".dq/rules"]);
+        let summary = "summary: 1 passed, 0 failed, 0 errored, 1 total";
+        assert_eq!((run.code, run.stdout.lines().last()), (0, Some(summary)));
+        assert_eq!(run.stderr, unfinished(".dq/rules/src/.dq-aB3dE6"));
+        // Nor is it one of a source: said once, and not copied.
+        scratch.write("set/a.yml", FIRES);
+        scratch.write("set/.dq-aB3dE6/b.yml", &fires("t.left"));
+        let run = scratch.run(&["rules", "add", "set"]);
+        let left = unfinished("ROOT/set/.dq-aB3dE6");
+        assert_eq!((run.code, run.stderr), (0, left));
+        let added = std::fs::read_dir(scratch.path(".dq/rules/set")).expect("read dir");
+        assert_eq!(added.count(), 1);
+        // It may not be read: nor has it to be.
+        set_mode(&scratch, ".dq/rules/src/.dq-aB3dE6", 0o000);
+        let run = lint(&["thing.yaml"]);
+        set_mode(&scratch, ".dq/rules/src/.dq-aB3dE6", 0o755);
+        assert_eq!(run.code, 4, "{run:?}");
+    }
+
+    #[test]
+    fn a_name_that_only_looks_like_a_staging_name_is_a_rule() {
+        let names = [
+            ".dq-abcdef.yml",
+            ".dq-rules/r.yml",
+            ".dq-old-abcdef/r.yml",
+            "x.dq-abcdef/r.yml",
+            "a/.dq-abc/r.yml",
+        ];
+        let scratch = Scratch::new(&[("thing.yaml", THING)]);
+        for name in names {
+            scratch.write(&format!("set/{name}"), &fires(&format!("t.{name}")));
+        }
+        let found_ids = |args: &[&str]| {
+            let mut ids = found(&scratch, args);
+            ids.sort();
+            ids
+        };
+        let mut expected = names.map(|name| format!("t.{name}"));
+        expected.sort();
+        assert_eq!(found_ids(&LINT_SET), expected);
+        let run = scratch.run(&["rules", "add", "set"]);
+        assert_eq!((run.code, run.stderr.as_str()), (0, ""));
+        assert_eq!(found_ids(&["lint", "thing.yaml"]), expected);
+        // One the user names, on the way to the rules or by a link.
+        scratch.write("out/.dq-abcdef/set/r.yml", &fires("t.named"));
+        scratch.link("../out/.dq-abcdef", "linked/x");
+        for dir in ["out/.dq-abcdef", "out/.dq-abcdef/set", "linked"] {
+            let args = ["lint", "--rules", dir, "thing.yaml"];
+            assert_eq!(found(&scratch, &args), ["t.named"], "{dir}");
+        }
+        // None is added where it would never be loaded.
+        for source in ["out/.dq-abcdef", "out/.dq-abcdef.yml"] {
+            scratch.write("out/.dq-abcdef.yml", FIRES);
+            let message = format!(
+                "cannot add ROOT/{source}: '.dq-abcdef' does not name a directory for it in \
+                 .dq/rules\n"
+            );
+            let run = scratch.run(&["rules", "add", source]);
+            assert_eq!(run, failed(6, &message));
+        }
+    }
+
+    #[test]
+    fn rules_add_that_may_not_replace_a_link_names_it_alone() {
+        let scratch = Scratch::new(&[("src/a.yml", FIRES), ("old/a.yml", FIRES)]);
+        scratch.link("../../old", ".dq/rules/src");
+        set_mode(&scratch, ".dq/rules", 0o555);
+        let root = std::fs::write(scratch.path(".dq/rules/probe"), "").is_ok();
+        let run = scratch.run(&["rules", "add", "src", "--force"]);
+        set_mode(&scratch, ".dq/rules", 0o755);
+        if root {
+            // Root writes everywhere.
+            return;
+        }
+        let message = "I/O error writing 'ROOT/.dq/rules/src': Permission denied (os error 13); \
+                       nothing was replaced\n";
+        assert_eq!(run, failed(7, message));
+    }
+
+    #[test]
+    fn rules_add_keeps_the_mode_of_a_source_whatever_the_umask() {
+        let scratch = Scratch::new(&[("src/a.yml", FIRES), ("src/b.yml", FIRES)]);
+        set_mode(&scratch, "src/a.yml", 0o666);
+        set_mode(&scratch, "src/b.yml", 0o600);
+        for add in [&["src"][..], &["@std/npm"]] {
+            let out = assert_cmd::Command::new("sh")
+                .args(["-c", "umask 077; exec \"$@\"", "sh"])
+                .arg(env!("CARGO_BIN_EXE_dq"))
+                .args(["rules", "add"])
+                .args(add)
+                .current_dir(scratch.path(""))
+                .env_clear()
+                .env("HOME", scratch.path(""))
+                .env("PATH", std::env::var("PATH").unwrap_or_default())
+                .timeout(scratch::DEADLINE)
+                .output()
+                .expect("run sh");
+            assert!(out.status.success(), "{out:?}");
+        }
+        let mode = |path| mode_of(&scratch.path(path));
+        assert_eq!(mode(".dq/rules/src/a.yml"), 0o666);
+        assert_eq!(mode(".dq/rules/src/b.yml"), 0o600);
+        assert_eq!(mode(".dq/rules/npm/has-license.yml"), 0o600);
     }
 }

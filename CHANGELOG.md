@@ -92,6 +92,8 @@ breaking changes are listed first under Changed.
   already linked to it, and wrote outside `.dq/rules` through links or for a
   file named `...yml`. A source that overlaps its destination and such a name
   are refused (exit 6), and `--force` replaces a link, never what it points to.
+  A failed `--force` leaves every file old or new; it removed the old ones first.
+- A write error of `dq rules add` exits 7, as a write, not 5.
 - `./.dq/rules` that cannot be read or is not a directory was skipped with exit
   0; it is now exit 5 or 6.
 - `dq fix --parallel` hung when a worker logged a warning: the run held the lock
