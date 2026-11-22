@@ -5,8 +5,9 @@
 //! skill; the first run of the new binary is the moment there is. So this is
 //! an exception to "one command, one operation", and a narrow one: it writes
 //! only into the directory the user had dq install the skill to, only when
-//! nobody touched it since, only when its version is behind, and it never
-//! changes what the command printed or how it exits.
+//! nobody touched it since, only when its version is behind or a run of this
+//! one did not come to its end, and it never changes what the command printed
+//! or how it exits.
 
 use camino::Utf8Path;
 
@@ -49,7 +50,7 @@ pub enum Skipped {
     NotInstalled,
     /// The manifest cannot be used, or the directory is none.
     Unusable,
-    /// The installed skill is of this version or a newer one.
+    /// The installed skill is of this version, all of it, or a newer one.
     NotOlder,
     /// Root, in another user's home directory.
     ForeignHome,
@@ -88,7 +89,7 @@ impl FirstRun {
     /// to hold for that does. Prints nothing, whatever happens; the result is
     /// for tests.
     pub fn update_skill(&self, edition: &Edition) -> Outcome {
-        let outcome = self.attempt(edition).unwrap_or_else(|err| match err {
+        let outcome = silently(|| self.attempt(edition)).unwrap_or_else(|err| match err {
             SkillError::Refused(_) => Outcome::Skipped(Skipped::NoHome),
             SkillError::File(err) => Outcome::Failed(err.to_string()),
         });
@@ -147,6 +148,12 @@ impl FirstRun {
     }
 }
 
+/// Run `act` without a word in the log: a write that cannot keep all of a
+/// file's access says so, whoever asked for it.
+fn silently<T>(act: impl FnOnce() -> T) -> T {
+    tracing::dispatcher::with_default(&tracing::Dispatch::none(), act)
+}
+
 /// Update the skill in `dir`, which is locked, if it still is to be: another
 /// may have been here before the lock was this run's.
 fn update_locked(
@@ -183,7 +190,8 @@ enum Decision {
     Write(Manifest, Vec<FileState>),
 }
 
-/// Whether the skill in `dir` is to be updated to `edition` by `user`. The files are
+/// Whether the skill in `dir` is to be updated to `edition` by `user`: an older
+/// one, or one of this version that was not written to its end. The files are
 /// looked at one by one up to the first that was changed. What else is in the
 /// directory does not matter, and is not looked at.
 fn decide(
@@ -200,7 +208,16 @@ fn decide(
         Installed::Unusable(_) => return Ok(Decision::Skip(Skipped::Unusable)),
         Installed::Yes(manifest) => manifest,
     };
-    if Freshness::of(&manifest.dq_version, edition.version) != Freshness::Older {
+    let is_due = match Freshness::of(&manifest.dq_version, edition.version) {
+        Freshness::Older => true,
+        // A first install, or one over changed files, that did not come to
+        // its end: what it was to write is asked for already.
+        Freshness::Same => {
+            !manifest.unfinished.is_empty() && manifest.unfinished == Manifest::of(edition).files
+        }
+        Freshness::Newer => false,
+    };
+    if !is_due {
         return Ok(Decision::Skip(Skipped::NotOlder));
     }
     let mut seen = Vec::new();
@@ -588,6 +605,85 @@ mod tests {
         }
     }
 
+    /// What the log takes of warnings and above while `act` runs.
+    fn logged(act: impl FnOnce()) -> String {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex, OnceLock};
+        #[derive(Clone, Default)]
+        struct Log(Arc<Mutex<Vec<u8>>>);
+        impl Write for Log {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("lock").write(data)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        // With one subscriber in the process, `tracing` takes what another
+        // thread's test says of a log line, whose thread has none, for all.
+        static OTHERS: OnceLock<[tracing::Dispatch; 2]> = OnceLock::new();
+        OTHERS.get_or_init(|| {
+            [(), ()].map(|()| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()))
+        });
+        let log = Log::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer({
+                let log = log.clone();
+                move || log.clone()
+            })
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, act);
+        let bytes = log.0.lock().expect("lock").clone();
+        String::from_utf8(bytes).expect("UTF-8")
+    }
+
+    #[test]
+    fn silence_is_kept_for_as_long_as_it_is_asked_for() {
+        let said = logged(|| {
+            tracing::warn!("before");
+            silently(|| tracing::error!("meanwhile"));
+            tracing::warn!("after");
+        });
+        assert!(said.contains("before") && said.contains("after"), "{said}");
+        assert!(!said.contains("meanwhile"), "{said}");
+    }
+
+    /// Replacing a file whose group cannot be kept is told of by whoever
+    /// writes it, but not by the automatic update. On macOS, where a file of a
+    /// group the user is not in is made without being root.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn access_that_is_lost_is_not_told_of() {
+        use std::os::unix::fs::MetadataExt;
+        let of_wheel = |target: &Target| {
+            let at = target.dir.join("SKILL.md");
+            let made = tempfile::NamedTempFile::new_in("/private/tmp").expect("temp file");
+            fs::write(made.path(), "one").expect("write");
+            made.persist(&at).expect("mv");
+            fs::metadata(&at).expect("stat").gid()
+        };
+        let (_home, _run, target) = run_with_v1();
+        let before = of_wheel(&target);
+        let said = logged(|| {
+            crate::skill::update(&target, &V2, false).expect("update");
+        });
+        if fs::metadata(target.dir.join("SKILL.md"))
+            .expect("stat")
+            .gid()
+            == before
+        {
+            return; // kept: the user is in that group
+        }
+        assert!(said.contains("group could not be kept"), "{said}");
+        let (_home, run, target) = run_with_v1();
+        of_wheel(&target);
+        let said = logged(|| assert_eq!(update(&run, &V2), Outcome::Updated));
+        assert_eq!(said, "");
+    }
+
     /// What is decided before the lock is decided once more after it.
     #[test]
     fn what_another_dq_did_before_the_lock_counts() {
@@ -603,6 +699,95 @@ mod tests {
         assert_eq!(locked(&V3), Outcome::Skipped(Skipped::Changed));
         fs::remove_file(dir.join(MANIFEST)).expect("rm");
         assert_eq!(locked(&V3), Outcome::Skipped(Skipped::NotInstalled));
+    }
+
+    /// A run of this version that did not come to its end is finished, as long
+    /// as nothing of it was changed; whatever else is of this version is not
+    /// looked at.
+    #[test]
+    fn a_run_of_this_version_that_was_cut_short_is_finished() {
+        type Change = fn(&Utf8Path);
+        let unfinished = |edition: &Edition, files: &Edition| {
+            Manifest::unfinished(edition.version, Default::default(), files).to_bytes()
+        };
+        let cases: [(Change, Option<Skipped>); 7] = [
+            (|_| {}, None),
+            (
+                |dir| fs::write(dir.join("SKILL.md"), "three").expect("write"),
+                None,
+            ),
+            (
+                |dir| fs::write(dir.join("mine.md"), "mine").expect("write"),
+                None,
+            ),
+            (
+                |dir| fs::write(dir.join("SKILL.md"), "mine").expect("write"),
+                Some(Skipped::Changed),
+            ),
+            (
+                |dir| fs::write(dir.join("new.md"), "mine").expect("write"),
+                Some(Skipped::Changed),
+            ),
+            (
+                |dir| fs::create_dir(dir.join("new.md")).expect("mkdir"),
+                Some(Skipped::Changed),
+            ),
+            // All of it is there: nothing to finish but the manifest.
+            (
+                |dir| {
+                    fs::write(dir.join("SKILL.md"), "three").expect("write");
+                    fs::write(dir.join("new.md"), "new").expect("write");
+                },
+                None,
+            ),
+        ];
+        for (n, (change, skipped)) in cases.into_iter().enumerate() {
+            let (_home, run) = run();
+            let target = run.env.global().expect("target");
+            let dir = &target.dir;
+            fs::create_dir_all(dir).expect("mkdir");
+            fs::write(dir.join(MANIFEST), unfinished(&V3, &V3)).expect("write");
+            change(dir);
+            let read = |path: &str| fs::read(dir.join(path)).ok();
+            let before = (read("SKILL.md"), read("new.md"));
+            assert_eq!(
+                update(&run, &V3),
+                skipped.map_or(Outcome::Updated, Outcome::Skipped),
+                "case {n}"
+            );
+            let state = status(&target, &V3).expect("status").state;
+            if skipped.is_some() {
+                assert_eq!(before, (read("SKILL.md"), read("new.md")), "case {n}");
+                assert_eq!(state, State::Differs, "case {n}");
+            } else {
+                assert_eq!(state, State::UpToDate, "case {n}");
+                let again = update(&run, &V3);
+                assert_eq!(again, Outcome::Skipped(Skipped::NotOlder), "case {n}");
+            }
+        }
+        // A file of the user's where a run was yet to write one that this
+        // edition has not: in no one's way.
+        let (_home, v1, target) = run_with_v1();
+        let manifest = Manifest::unfinished(V1.version, Manifest::of(&V1).files, &V3);
+        fs::write(target.dir.join(MANIFEST), manifest.to_bytes()).expect("write");
+        fs::write(target.dir.join("new.md"), "mine").expect("write");
+        assert_eq!(update(&v1, &V3), Outcome::Skipped(Skipped::Changed));
+        assert_eq!(update(&v1, &V2), Outcome::Updated);
+        let kept = fs::read_to_string(target.dir.join("new.md")).expect("read");
+        assert_eq!(kept, "mine");
+        // A run of another edition, and one of a newer version.
+        let newer = Edition {
+            version: "2027.1.0",
+            ..V3
+        };
+        for bytes in [unfinished(&V3, &V2), unfinished(&newer, &V3)] {
+            let (_home, run) = run();
+            let target = run.env.global().expect("target");
+            fs::create_dir_all(&target.dir).expect("mkdir");
+            fs::write(target.dir.join(MANIFEST), bytes).expect("write");
+            assert_eq!(update(&run, &V3), Outcome::Skipped(Skipped::NotOlder));
+            assert!(!target.dir.join("SKILL.md").exists());
+        }
     }
 
     /// A user saves a file after the decision: it stays, and is an edit from
@@ -688,7 +873,7 @@ mod tests {
         fs::write(target.dir.join(MANIFEST), manifest.to_bytes()).expect("write");
         assert_eq!(update(&run, &V2), Outcome::Skipped(Skipped::Unusable));
         manifest.files.retain(|path, _| path.len() < 3);
-        manifest.dq_version.push_str(&".0".repeat(70_000));
+        manifest.dq_version.push_str(&".0".repeat(90_000));
         fs::write(target.dir.join(MANIFEST), manifest.to_bytes()).expect("write");
         assert_eq!(update(&run, &V2), Outcome::Skipped(Skipped::Unusable));
     }

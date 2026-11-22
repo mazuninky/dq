@@ -48,18 +48,25 @@ pub(super) enum Verdict {
     Absent,
     /// Not there, though the manifest lists it.
     Missing,
+    /// Not there, for the run that was to write it did not come to it; the
+    /// edition has it too.
+    Unwritten,
     /// As the edition has it.
     Identical,
     /// As dq wrote it.
     Unedited,
     /// Listed, and neither as dq wrote it nor as the edition has it.
     Edited,
-    /// Not listed, where the edition has another file: not dq's.
+    /// Not dq's, where the edition has a file.
     Colliding,
-    /// What stands in the way of a listed file: a link or a file in the place
-    /// of a directory, a directory in the place of a file.
+    /// Not dq's, where a run that did not come to its end was to write a file
+    /// the edition has not. In no one's way.
+    Theirs,
+    /// What stands in the way of a file dq wrote: a link or a file in the
+    /// place of a directory, a directory in the place of a file.
     Blocked(String),
-    /// The same, of a file only the edition has.
+    /// The same, of a file only the edition has, or that was yet to be
+    /// written.
     Obstructed(String),
 }
 
@@ -69,7 +76,9 @@ pub(super) struct FileState {
     /// The path messages name.
     pub path: String,
     /// The paths under which the manifest lists it: one, but for spellings
-    /// that are the same file here.
+    /// that are the same file here. None of one that is not dq's: a file that
+    /// was yet to be written, when what is there is something else. What is
+    /// not listed is never deleted.
     pub listed: Vec<String>,
     /// The path at which the edition has it.
     pub in_edition: Option<&'static str>,
@@ -89,7 +98,11 @@ impl FileState {
     /// was changed, or removed though the edition has it.
     pub(super) fn is_change(&self) -> bool {
         match self.verdict {
-            Verdict::Absent | Verdict::Identical | Verdict::Unedited => false,
+            Verdict::Absent
+            | Verdict::Unwritten
+            | Verdict::Identical
+            | Verdict::Unedited
+            | Verdict::Theirs => false,
             Verdict::Missing => self.in_edition.is_some(),
             Verdict::Edited | Verdict::Colliding | Verdict::Blocked(_) | Verdict::Obstructed(_) => {
                 true
@@ -128,9 +141,12 @@ impl Survey {
         self.paths(&Verdict::Edited)
     }
 
-    /// Files the manifest lists that are gone.
+    /// Files the manifest lists that are gone, or have not been written yet.
     pub(super) fn missing(&self) -> Vec<String> {
-        self.paths(&Verdict::Missing)
+        let mut missing = self.paths(&Verdict::Missing);
+        missing.extend(self.paths(&Verdict::Unwritten));
+        missing.sort();
+        missing
     }
 
     /// Files and links at a path the edition has a file at, not dq's.
@@ -234,50 +250,51 @@ fn file_state(
     group: &[&str],
 ) -> Result<FileState, dq_core::Error> {
     let lists = |path: &&str| manifest.is_some_and(|m| m.digests(path).next().is_some());
-    let listed: Vec<&str> = group.iter().copied().filter(lists).collect();
-    let is_listed = !listed.is_empty();
+    let in_manifest: Vec<&str> = group.iter().copied().filter(lists).collect();
+    let any = |is: &dyn Fn(&Manifest, &str) -> bool| {
+        manifest.is_some_and(|m| in_manifest.iter().any(|path| is(m, path)))
+    };
     let file = edition.files.iter().find(|file| group.contains(&file.path));
-    let path = listed.first().copied().unwrap_or(group[0]);
+    let path = in_manifest.first().copied().unwrap_or(group[0]);
     let found = find(dir, path)?;
     let seen = found.seen();
+    // A file a run was yet to write may be anyone's, until it is as dq has it.
+    let was_written = any(&|m, path| m.files.contains_key(path));
+    let is_as_written = any(&|m, path| {
+        let is_seen = |digest: &str| seen == Seen::File(digest.to_owned());
+        m.digests(path).any(is_seen)
+    });
     let verdict = match found {
         Found::Blocked(at) => {
             let at = spelling(dir, &at)?;
-            if is_listed {
+            if was_written {
                 Verdict::Blocked(at)
-            } else {
+            } else if file.is_some() {
                 Verdict::Obstructed(at)
-            }
-        }
-        Found::Missing if !is_listed => Verdict::Absent,
-        Found::Missing => {
-            if listed
-                .iter()
-                .any(|path| manifest.is_some_and(|m| m.may_lack(path)))
-            {
-                Verdict::Absent
             } else {
-                Verdict::Missing
+                Verdict::Theirs
             }
         }
-        Found::File(bytes) if file.is_some_and(|file| file.text.as_bytes() == bytes) => {
+        Found::Missing if in_manifest.is_empty() => Verdict::Absent,
+        Found::Missing if !any(&|m, path| m.may_lack(path)) => Verdict::Missing,
+        Found::Missing if !was_written && file.is_some() => Verdict::Unwritten,
+        Found::Missing => Verdict::Absent,
+        Found::File(bytes, _) if file.is_some_and(|file| file.text.as_bytes() == bytes) => {
             Verdict::Identical
         }
-        Found::File(_) | Found::Large | Found::Other if !is_listed => Verdict::Colliding,
-        Found::File(_) | Found::Large | Found::Other => {
-            let is_digest = |digest: &str| seen == Seen::File(digest.to_owned());
-            let is_unedited =
-                |path: &&str| manifest.is_some_and(|m| m.digests(path).any(is_digest));
-            if listed.iter().any(is_unedited) {
-                Verdict::Unedited
-            } else {
-                Verdict::Edited
-            }
-        }
+        Found::File(..) | Found::Large | Found::Other if is_as_written => Verdict::Unedited,
+        Found::File(..) | Found::Large | Found::Other if was_written => Verdict::Edited,
+        Found::File(..) | Found::Large | Found::Other if file.is_some() => Verdict::Colliding,
+        Found::File(..) | Found::Large | Found::Other => Verdict::Theirs,
+    };
+    let listed = if was_written || is_as_written {
+        in_manifest.iter().map(|path| (*path).to_owned()).collect()
+    } else {
+        Vec::new()
     };
     Ok(FileState {
         path: path.to_owned(),
-        listed: listed.into_iter().map(str::to_owned).collect(),
+        listed,
         in_edition: file.map(|file| file.path),
         seen,
         verdict,
@@ -411,7 +428,7 @@ pub(super) fn read_manifest(dir: &Utf8Path) -> Result<Installed, dq_core::Error>
     let unusable = |reason: String| Installed::Unusable(ManifestError::Malformed { reason });
     Ok(match find_up_to(dir, MANIFEST, MAX_BYTES)? {
         Found::Missing => Installed::No,
-        Found::File(bytes) => match Manifest::parse(&bytes) {
+        Found::File(bytes, _) => match Manifest::parse(&bytes) {
             Ok(manifest) => Installed::Yes(manifest),
             Err(err) => Installed::Unusable(err),
         },
@@ -538,12 +555,50 @@ mod tests {
         assert_eq!(groups(dir, paths).expect("groups"), expected);
     }
 
+    /// The names of the temporary files, as they are seen while files are
+    /// made and replaced.
     #[test]
     fn the_temporary_file_of_an_atomic_write_is_recognised() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let tmp = tempfile::NamedTempFile::new_in(dir.path()).expect("temp file");
-        let name = tmp.path().file_name().expect("name").to_string_lossy();
-        assert!(is_write_in_progress(&name), "{name}");
+        use dq_core::atomic_write::{create, read_no_link, rewrite};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = Utf8Path::from_path(tmp.path()).expect("UTF-8");
+        let seen = |act: &(dyn Fn() + Sync)| -> BTreeSet<String> {
+            let start = std::time::Instant::now();
+            let seen = std::sync::Mutex::new(BTreeSet::new());
+            let is_seen = || !seen.lock().expect("lock").is_empty();
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    while !is_seen() && start.elapsed().as_secs() < 60 {
+                        act();
+                    }
+                });
+                while !is_seen() && start.elapsed().as_secs() < 60 {
+                    let names = names_in(dir).expect("names");
+                    let others = names.into_iter().filter(|name| name != "a");
+                    seen.lock().expect("lock").extend(others);
+                }
+            });
+            seen.into_inner().expect("lock")
+        };
+        let at = dir.join("a");
+        let bytes = [vec![b'x'; 4 << 20], vec![b'y'; 4 << 20]];
+        let turn = std::sync::atomic::AtomicUsize::new(0);
+        let made = seen(&|| {
+            let _ = fs::remove_file(&at);
+            create(&at, &bytes[0]).expect("created");
+        });
+        let replaced = seen(&|| {
+            let n = turn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let (_, original) = read_no_link(&at).expect("read");
+            rewrite(&at, &original, &bytes[n % 2], false).expect("rewritten");
+        });
+        for names in [made, replaced] {
+            assert!(!names.is_empty(), "none was seen");
+            assert!(
+                names.iter().all(|name| is_write_in_progress(name)),
+                "{names:?}"
+            );
+        }
         for name in [".tmp", ".tmpabc", ".tmpabcdefg", ".tmpab/def", "tmpabcdef"] {
             assert!(!is_write_in_progress(name), "{name}");
         }

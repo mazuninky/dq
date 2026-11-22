@@ -32,11 +32,15 @@ pub const MANIFEST: &str = ".dq-skill.json";
 /// The manifest schema this dq reads and writes.
 pub const SCHEMA: u64 = 1;
 
-/// The largest manifest. The limits below fit in it.
-pub(super) const MAX_BYTES: u64 = 128 * 1024;
+/// The largest manifest. One within the limits below is never larger, as dq
+/// writes it.
+pub(super) const MAX_BYTES: u64 = 160 * 1024;
 
-/// How many files a manifest lists at most.
+/// How many files a manifest lists at most, `files` and `unfinished` together.
 const MAX_FILES: usize = 256;
+
+/// The longest version of a manifest, in bytes.
+const MAX_VERSION_BYTES: usize = 64;
 
 /// The longest path of a manifest, in bytes: what every file system takes as
 /// a name.
@@ -104,6 +108,12 @@ impl Manifest {
         }
     }
 
+    /// Whether it lists no more files than a manifest may. Of one that was
+    /// read that is so; what dq makes of one need not be.
+    pub(super) fn is_within_limits(&self) -> bool {
+        self.files.len() + self.unfinished.len() <= MAX_FILES
+    }
+
     /// The path of every file it lists, sorted, each once.
     pub(super) fn paths(&self) -> impl Iterator<Item = &str> {
         let paths: std::collections::BTreeSet<&str> = self
@@ -169,11 +179,15 @@ impl Manifest {
                 .ok_or_else(|| malformed("it lists no unfinished files"))
                 .and_then(listed)?,
         };
-        Ok(Self {
+        let manifest = Self {
             dq_version,
             files: listed(files)?,
             unfinished,
-        })
+        };
+        if !manifest.is_within_limits() {
+            return Err(malformed(&format!("it lists more than {MAX_FILES} files")));
+        }
+        Ok(manifest)
     }
 
     /// The bytes of the manifest file.
@@ -238,9 +252,10 @@ fn is_plain_path(path: &str) -> bool {
 /// as 0, which would make a manifest with a mangled version the oldest there
 /// is.
 fn is_version(version: &str) -> bool {
-    version
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+    version.len() <= MAX_VERSION_BYTES
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
         && version.split('.').all(|component| {
             let digits = component
                 .find(|c: char| !c.is_ascii_digit())
@@ -336,32 +351,55 @@ mod tests {
         }
     }
 
+    /// The two maps share one limit, and the largest manifest there is within
+    /// it, every character of every path escaped, is read again.
     #[test]
     fn a_manifest_lists_so_many_files_of_so_long_a_path() {
-        let of = |count: usize| {
-            let files: BTreeMap<String, String> = (0..count)
-                .map(|n| (format!("{n:0>255}"), "0".repeat(64)))
-                .collect();
+        let of = |files: usize, unfinished: usize| {
+            let some = |from: usize, count: usize| -> BTreeMap<String, String> {
+                (from..from + count)
+                    .map(|n| (format!("{n:\">255}"), "0".repeat(64)))
+                    .collect()
+            };
             Manifest {
-                dq_version: "2026.1.0".to_owned(),
-                files: files.clone(),
-                unfinished: BTreeMap::new(),
+                dq_version: "1".repeat(MAX_VERSION_BYTES),
+                files: some(0, files),
+                unfinished: some(files, unfinished),
             }
         };
-        let most = of(MAX_FILES);
-        let bytes = most.to_bytes();
-        assert!(bytes.len() as u64 <= MAX_BYTES, "{}", bytes.len());
-        assert_eq!(Manifest::parse(&bytes), Ok(most));
-        assert_eq!(
-            malformed(&String::from_utf8(of(MAX_FILES + 1).to_bytes()).expect("UTF-8")),
-            "it lists more than 256 files"
-        );
+        assert_eq!(of(1, 0).files.keys().next().expect("a path").len(), 255);
+        for (files, unfinished) in [(256, 0), (0, 256), (128, 128), (255, 1)] {
+            let mut most = of(files, unfinished);
+            assert!(most.is_within_limits());
+            let bytes = most.to_bytes();
+            assert!(bytes.len() as u64 <= MAX_BYTES, "{}", bytes.len());
+            // A version of 64 digits is none that can be ordered.
+            most.dq_version = format!("1{}", ".1".repeat(31));
+            let bytes = most.to_bytes();
+            assert_eq!(Manifest::parse(&bytes), Ok(most));
+        }
+        for (files, unfinished) in [(257, 0), (0, 257), (256, 1), (1, 256), (200, 200)] {
+            let mut more = of(files, unfinished);
+            more.dq_version = "1".to_owned();
+            assert!(!more.is_within_limits());
+            assert_eq!(
+                malformed(&String::from_utf8(more.to_bytes()).expect("UTF-8")),
+                "it lists more than 256 files"
+            );
+        }
         assert_eq!(
             malformed(&with_path(&"a".repeat(256))),
             format!(
                 "it lists '{}\u{2026}', which is no path inside the skill",
                 "a".repeat(255)
             )
+        );
+        let version = format!("1{}", ".1".repeat(32));
+        assert_eq!(
+            malformed(&format!(
+                r#"{{"schema": 1, "dq_version": "{version}", "files": {{}}}}"#
+            )),
+            "it names no dq version"
         );
     }
 

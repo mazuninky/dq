@@ -220,7 +220,7 @@ mod tests {
         }
         assert!(home.join(".agents/skills/dq/SKILL.md").is_file());
         let status = dq(&["status"], &env).expect("status");
-        assert!(status.contains(r#""state": "up_to_date""#), "{status}");
+        assert!(status.contains(r#""state": "other_owner""#), "{status}");
     }
 
     /// Root in a checkout of another user's is what a container or a CI job

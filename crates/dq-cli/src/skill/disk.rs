@@ -3,16 +3,22 @@
 //!
 //! A write or a deletion is bound to what was seen when the command decided
 //! ([`Seen`]): what is there is read once more right before, and if it is
-//! something else, it is someone's work and stays. No link below the skill
-//! directory is followed: the directories on the way are looked at last of
-//! all. Between that and the change a moment remains, which
-//! [`dq_core::atomic_write::write`] has no way to close.
+//! something else, it is someone's work and stays. From that read on
+//! [`dq_core::atomic_write`] binds it to the very file, up to the instant
+//! before the rename.
+//!
+//! No link is followed below the skill directory, at a file or above it. A
+//! file is read as no link, and what was read so is never written through
+//! one; a new one takes no one's place; and the directories on the way are
+//! looked at last of all. Where a file was read, its identity tells a
+//! directory that was swapped for another even after that.
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{ErrorKind, Read};
+use std::io::ErrorKind;
 
 use camino::{Utf8Path, Utf8PathBuf};
+use dq_core::atomic_write::{self, Original};
 
 use super::place::identity;
 use super::survey::{files_under, spelling};
@@ -22,13 +28,16 @@ use crate::commands::self_cmd::sha256_hex;
 /// their place was not written by dq.
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 
+/// How often a change is tried that is overtaken by another each time.
+const ATTEMPTS: usize = 3;
+
 /// What a path of the skill holds.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(super) enum Found {
     /// Nothing.
     Missing,
-    /// A regular file.
-    File(Vec<u8>),
+    /// A regular file, with what is in it.
+    File(Vec<u8>, Original),
     /// A regular file larger than was asked for.
     Large,
     /// A link, a device.
@@ -53,8 +62,16 @@ impl Found {
     pub(super) fn seen(&self) -> Seen {
         match self {
             Self::Missing => Seen::Missing,
-            Self::File(bytes) => Seen::File(sha256_hex(bytes)),
+            Self::File(bytes, _) => Seen::File(sha256_hex(bytes)),
             Self::Large | Self::Other | Self::Blocked(_) => Seen::Other,
+        }
+    }
+
+    /// What a change to the file that was found is bound to.
+    fn original(&self) -> Option<&Original> {
+        match self {
+            Self::File(_, original) => Some(original),
+            Self::Missing | Self::Large | Self::Other | Self::Blocked(_) => None,
         }
     }
 }
@@ -110,33 +127,35 @@ pub(super) fn find_up_to(dir: &Utf8Path, path: &str, max: u64) -> Result<Found, 
             if meta.len() > max {
                 return Ok(Found::Large);
             }
-            return match read_up_to(&here, max) {
-                Ok(bytes) if bytes.len() as u64 > max => Ok(Found::Large),
-                Ok(bytes) => Ok(Found::File(bytes)),
-                Err(err) if err.kind() == ErrorKind::NotFound => Ok(Found::Missing),
-                Err(err) => Err(read_error(&here, err)),
-            };
+            return content(&here, max);
         }
     }
     Ok(Found::Missing)
 }
 
-/// The bytes of a file, or the first `max` of them and one.
-fn read_up_to(path: &Utf8Path, max: u64) -> std::io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    fs::File::open(path)?
-        .take(max + 1)
-        .read_to_end(&mut bytes)?;
-    Ok(bytes)
+/// The file at `path`, which was a regular one of at most `max` bytes a moment
+/// ago.
+fn content(path: &Utf8Path, max: u64) -> Result<Found, dq_core::Error> {
+    match atomic_write::read_no_link(path) {
+        Ok((bytes, _)) if bytes.len() as u64 > max => Ok(Found::Large),
+        Ok((bytes, original)) => Ok(Found::File(bytes, original)),
+        Err(dq_core::Error::Io { source, .. }) if source.kind() == ErrorKind::NotFound => {
+            Ok(Found::Missing)
+        }
+        // A link, by now.
+        Err(_) if fs::symlink_metadata(path).is_ok_and(|meta| meta.is_symlink()) => {
+            Ok(Found::Other)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// Put `bytes` at `path` in `dir`. A file that holds them already is not
 /// touched. With `seen`, only over what was seen; without, over anything but
 /// a directory.
 ///
-/// A link (or anything else that is no regular file) is taken out first, so
-/// that nothing is written through it whether or not
-/// [`dq_core::atomic_write::write`] follows links.
+/// A file keeps its access, a new one has that of any new file. What is no
+/// regular file, or too large to be read, is taken out first.
 ///
 /// # Errors
 ///
@@ -148,50 +167,17 @@ pub(super) fn write(
     bytes: &[u8],
     seen: Option<&Seen>,
 ) -> Result<Done, dq_core::Error> {
-    let at = dir.join(path);
-    let found = find(dir, path)?;
-    if matches!(&found, Found::File(there) if there == bytes) {
-        return Ok(Done::No);
-    }
-    if matches!(found, Found::Blocked(_)) {
-        return Err(in_the_way(&at));
-    }
-    if seen.is_some_and(|seen| *seen != found.seen()) {
-        return Ok(Done::Changed);
-    }
-    if found == Found::Other {
-        unlink(dir, path)?;
-    }
-    if let Some(parent) = at.parent() {
-        fs::create_dir_all(parent).map_err(|err| write_error(parent, err))?;
-    }
-    put(dir, path, bytes)?;
-    Ok(Done::Yes)
-}
-
-/// Write `bytes` to `path` in `dir`, if no link is on the way there.
-fn put(dir: &Utf8Path, path: &str, bytes: &[u8]) -> Result<(), dq_core::Error> {
-    ensure_plain_way(dir, path)?;
-    dq_core::atomic_write::write(&dir.join(path), bytes, false)
-}
-
-/// Delete the file (or link) at `path` in `dir`, if no link is on the way
-/// there. Whether there was one.
-fn unlink(dir: &Utf8Path, path: &str) -> Result<bool, dq_core::Error> {
-    ensure_plain_way(dir, path)?;
-    let at = dir.join(path);
-    match fs::remove_file(&at) {
-        Ok(()) => Ok(true),
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(write_error(&at, err)),
-    }
-}
-
-/// Remove the directory at `path` in `dir`, if it is empty and no link is on
-/// the way there. Whether it is gone.
-fn remove_empty(dir: &Utf8Path, path: &str) -> Result<bool, dq_core::Error> {
-    ensure_plain_way(dir, path)?;
-    remove_if_empty(&dir.join(path))
+    let is_done = |found: &Found| matches!(found, Found::File(there, _) if there == bytes);
+    change(dir, path, seen, is_done, |found| {
+        let at = dir.join(path);
+        if let Found::Large | Found::Other = found {
+            unlink(dir, path, None)?;
+        }
+        if let Some(parent) = at.parent() {
+            fs::create_dir_all(parent).map_err(|err| write_error(parent, err))?;
+        }
+        put(dir, path, bytes, found.original())
+    })
 }
 
 /// Delete the file (or link) at `path` in `dir`, and the directories above
@@ -207,24 +193,88 @@ pub(super) fn delete(
     path: &str,
     seen: Option<&Seen>,
 ) -> Result<Done, dq_core::Error> {
-    let at = dir.join(path);
-    match find(dir, path)? {
-        Found::Missing => return Ok(Done::No),
-        Found::Blocked(_) => return Err(in_the_way(&at)),
-        found if seen.is_some_and(|seen| *seen != found.seen()) => return Ok(Done::Changed),
-        _ => {}
-    }
-    if !unlink(dir, path)? {
-        return Ok(Done::No);
-    }
+    let is_done = |found: &Found| matches!(found, Found::Missing);
+    let done = change(dir, path, seen, is_done, |found| {
+        unlink(dir, path, found.original())
+    })?;
     let mut parent = Utf8Path::new(path).parent();
-    while let Some(relative) = parent.filter(|p| !p.as_str().is_empty()) {
+    while done == Done::Yes
+        && let Some(relative) = parent.filter(|p| !p.as_str().is_empty())
+    {
         if !remove_empty(dir, relative.as_str())? {
             break;
         }
         parent = relative.parent();
     }
-    Ok(Done::Yes)
+    Ok(done)
+}
+
+/// Make a change to what is at `path` in `dir`, unless it `is_done` already:
+/// only to what was `seen`, if that is given. When another overtakes `act`,
+/// what is there by then is looked at once more.
+fn change(
+    dir: &Utf8Path,
+    path: &str,
+    seen: Option<&Seen>,
+    is_done: impl Fn(&Found) -> bool,
+    act: impl Fn(&Found) -> Result<(), dq_core::Error>,
+) -> Result<Done, dq_core::Error> {
+    for _ in 0..ATTEMPTS {
+        let found = find(dir, path)?;
+        if is_done(&found) {
+            return Ok(Done::No);
+        }
+        if matches!(found, Found::Blocked(_)) {
+            return Err(in_the_way(&dir.join(path)));
+        }
+        let was = found.seen();
+        if seen.is_some_and(|seen| *seen != was) {
+            return Ok(Done::Changed);
+        }
+        match act(&found) {
+            Ok(()) => return Ok(Done::Yes),
+            Err(err) if atomic_write::is_changed(&err) => {}
+            // As good as that: the error is of what has come there since.
+            Err(_) if find(dir, path).is_ok_and(|now| now.seen() != was) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(Done::Changed)
+}
+
+/// Write `bytes` to `path` in `dir`, over the file that `over` was read from,
+/// or where nothing is; not through a link on the way there.
+fn put(
+    dir: &Utf8Path,
+    path: &str,
+    bytes: &[u8],
+    over: Option<&Original>,
+) -> Result<(), dq_core::Error> {
+    ensure_plain_way(dir, path)?;
+    let at = dir.join(path);
+    match over {
+        Some(over) => atomic_write::rewrite(&at, over, bytes, false).map(|_| ()),
+        None => atomic_write::create(&at, bytes),
+    }
+}
+
+/// Delete what is at `path` in `dir`: the file that `original` was read from,
+/// or what is none (of a link, the link); not through a link on the way there.
+fn unlink(dir: &Utf8Path, path: &str, original: Option<&Original>) -> Result<(), dq_core::Error> {
+    ensure_plain_way(dir, path)?;
+    let at = dir.join(path);
+    atomic_write::check_remove(&at)?;
+    match original {
+        Some(original) => atomic_write::remove(&at, original),
+        None => fs::remove_file(&at).map_err(|err| write_error(&at, err)),
+    }
+}
+
+/// Remove the directory at `path` in `dir`, if it is empty and no link is on
+/// the way there. Whether it is gone.
+fn remove_empty(dir: &Utf8Path, path: &str) -> Result<bool, dq_core::Error> {
+    ensure_plain_way(dir, path)?;
+    remove_if_empty(&dir.join(path))
 }
 
 /// Remove a directory, if it is empty. Whether it is gone.
@@ -419,11 +469,14 @@ mod tests {
         }
         // The last look of all, which only the change itself comes after.
         fs::create_dir(outside.join("empty")).expect("mkdir");
-        is_in_the_way(put(&dir, "references/a.md", b"new"));
-        is_in_the_way(unlink(&dir, "references/a.md").map(|_| ()));
+        let (_, original) = atomic_write::read(&outside.join("a.md")).expect("read");
+        for original in [None, Some(&original)] {
+            is_in_the_way(put(&dir, "references/a.md", b"new", original));
+            is_in_the_way(unlink(&dir, "references/a.md", original));
+        }
         is_in_the_way(remove_empty(&dir, "references/empty").map(|_| ()));
         assert!(outside.join("empty").is_dir());
-        is_in_the_way(put(&dir, "references/empty/a.md", b"new"));
+        is_in_the_way(put(&dir, "references/empty/a.md", b"new", None));
         assert!(!outside.join("empty/a.md").exists(), "further up the way");
         ensure_plain_way(&dir, "SKILL.md").expect("no link on the way");
         let moved = dir.with_file_name("moved");
@@ -437,12 +490,184 @@ mod tests {
         assert!(!outside.join("b.md").exists());
     }
 
+    /// What others do to a file between dq's last look at it and its change:
+    /// what is there by then stays, and no link is followed. `act` is
+    /// overtaken by `other`.
+    #[test]
+    fn a_change_that_is_overtaken_is_none() {
+        type Other = fn(&Utf8Path, &Utf8Path);
+        let save: Other = |at, _| fs::write(at, "mine, of another size").expect("write");
+        let replace: Other = |at, outside| {
+            fs::write(outside.join("new"), "mine").expect("write");
+            fs::rename(outside.join("new"), at).expect("mv");
+        };
+        let link: Other = |at, outside| {
+            let _ = fs::remove_file(at);
+            symlink(outside.join("a.md"), at).expect("symlink");
+        };
+        let link_to_itself_moved: Other = |at, outside| {
+            fs::rename(at, outside.join("a.md")).expect("mv");
+            symlink(outside.join("a.md"), at).expect("symlink");
+        };
+        let dangling: Other = |at, outside| {
+            let _ = fs::remove_file(at);
+            symlink(outside.join("none"), at).expect("symlink");
+        };
+        let remove: Other = |at, _| fs::remove_file(at).expect("rm");
+        for (n, (was, other, written, deleted)) in [
+            (Some("old"), save, Done::Changed, Done::Changed),
+            (Some("old"), replace, Done::Changed, Done::Changed),
+            (Some("old"), link, Done::Changed, Done::Changed),
+            (
+                Some("old"),
+                link_to_itself_moved,
+                Done::Changed,
+                Done::Changed,
+            ),
+            (Some("old"), dangling, Done::Changed, Done::Changed),
+            (Some("old"), remove, Done::Changed, Done::No),
+            (None, save, Done::Changed, Done::Changed),
+            (None, replace, Done::Changed, Done::Changed),
+            (None, link, Done::Changed, Done::Changed),
+            (None, dangling, Done::Changed, Done::Changed),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for delete in [false, true] {
+                if delete && was.is_none() {
+                    continue;
+                }
+                let (_tmp, dir) = dir();
+                let outside = dir.with_file_name("outside");
+                fs::create_dir(&outside).expect("mkdir");
+                fs::write(outside.join("a.md"), "old").expect("write");
+                let at = dir.join("a.md");
+                if let Some(was) = was {
+                    fs::write(&at, was).expect("write");
+                }
+                let is_done = |found: &Found| delete && matches!(found, Found::Missing);
+                let seen = was.map_or(Seen::Missing, file);
+                let done = change(&dir, "a.md", Some(&seen), is_done, |found| {
+                    other(&at, &outside);
+                    if delete {
+                        unlink(&dir, "a.md", found.original())
+                    } else {
+                        put(&dir, "a.md", b"new", found.original())
+                    }
+                });
+                let expected = if delete { deleted } else { written };
+                assert_eq!(done.expect("no error"), expected, "{n}, {delete}");
+                let there = fs::symlink_metadata(&at).is_ok();
+                assert_eq!(there, deleted != Done::No, "{n}, {delete}");
+                assert_ne!(fs::read(&at).ok().as_deref(), Some(&b"new"[..]), "{n}");
+                let kept = fs::read_to_string(outside.join("a.md")).expect("read");
+                assert_eq!(kept, "old", "{n}, {delete}: changed behind a link");
+                assert!(!outside.join("none").exists(), "{n}");
+            }
+        }
+    }
+
+    /// An error that has nothing to do with another is one, and one that is
+    /// overtaken each time gives up.
+    #[test]
+    fn a_change_is_tried_again_only_when_it_was_overtaken() {
+        let (_tmp, dir) = dir();
+        let at = dir.join("a.md");
+        fs::write(&at, "old").expect("write");
+        let tries = std::cell::Cell::new(0);
+        let count = || tries.replace(tries.get() + 1);
+        let failed = change(
+            &dir,
+            "a.md",
+            None,
+            |_| false,
+            |_| {
+                count();
+                Err(in_the_way(&at))
+            },
+        );
+        assert!(failed.is_err());
+        assert_eq!(tries.replace(0), 1);
+        let overtaken = change(
+            &dir,
+            "a.md",
+            None,
+            |_| false,
+            |found| {
+                let n = count();
+                fs::write(&at, "mine".repeat(n + 1)).expect("write");
+                put(&dir, "a.md", b"new", found.original())
+            },
+        );
+        assert_eq!(overtaken.expect("no error"), Done::Changed);
+        assert_eq!(tries.replace(0), ATTEMPTS);
+        // By the same text: it is what was seen.
+        let seen = file("old");
+        fs::write(&at, "old").expect("write");
+        let overtaken = change(
+            &dir,
+            "a.md",
+            Some(&seen),
+            |_| false,
+            |found| {
+                if count() == 0 {
+                    fs::write(dir.join("saved"), "old").expect("write");
+                    fs::rename(dir.join("saved"), &at).expect("mv");
+                }
+                put(&dir, "a.md", b"new", found.original())
+            },
+        );
+        assert_eq!(overtaken.expect("no error"), Done::Yes);
+        assert_eq!(tries.replace(0), 2);
+        // Once only: with nothing seen, what is there by then is replaced.
+        let overtaken = change(
+            &dir,
+            "a.md",
+            None,
+            |_| false,
+            |found| {
+                if count() == 0 {
+                    fs::write(&at, "theirs").expect("write");
+                }
+                put(&dir, "a.md", b"new", found.original())
+            },
+        );
+        assert_eq!(overtaken.expect("no error"), Done::Yes);
+        assert_eq!(fs::read(&at).expect("read"), b"new");
+    }
+
+    /// A link is never read as the file it leads to, whatever is in that.
+    #[test]
+    fn a_link_is_no_file() {
+        let (_tmp, dir) = dir();
+        fs::write(dir.join("a.md"), "old").expect("write");
+        symlink("a.md", dir.join("link.md")).expect("symlink");
+        assert!(matches!(find(&dir, "link.md"), Ok(Found::Other)));
+        // As if it had become one after the look at what it is.
+        assert!(matches!(
+            content(&dir.join("link.md"), 10),
+            Ok(Found::Other)
+        ));
+        assert!(matches!(
+            content(&dir.join("none.md"), 10),
+            Ok(Found::Missing)
+        ));
+        assert_eq!(
+            write(&dir, "link.md", b"new", None).expect("write"),
+            Done::Yes
+        );
+        assert!(!dir.join("link.md").is_symlink());
+        assert_eq!(fs::read(dir.join("a.md")).expect("read"), b"old");
+        assert_eq!(delete(&dir, "link.md", None).expect("delete"), Done::Yes);
+    }
+
     #[test]
     fn a_name_no_file_can_have_is_that_of_none() {
         let (_tmp, dir) = dir();
         let long = "a".repeat(300);
         for path in [long.clone(), format!("{long}/a.md")] {
-            assert_eq!(find(&dir, &path).expect("found"), Found::Missing);
+            assert!(matches!(find(&dir, &path), Ok(Found::Missing)), "{path}");
         }
     }
 
@@ -451,10 +676,15 @@ mod tests {
         let (_tmp, dir) = dir();
         fs::write(dir.join("a"), "1234").expect("write");
         let found = |max| find_up_to(&dir, "a", max).expect("found");
-        assert_eq!(found(4), Found::File(b"1234".to_vec()));
-        assert_eq!(found(3), Found::Large);
+        assert!(matches!(found(4), Found::File(bytes, _) if bytes == b"1234"));
+        assert!(matches!(found(3), Found::Large));
+        // Grown since it was looked at.
+        assert!(matches!(content(&dir.join("a"), 3), Ok(Found::Large)));
         let file = fs::File::create(dir.join("b")).expect("create");
         file.set_len(MAX_FILE_BYTES + 1).expect("grow");
-        assert_eq!(find(&dir, "b").expect("found"), Found::Large);
+        assert!(matches!(find(&dir, "b"), Ok(Found::Large)));
+        // Taken out, then: what replaces it is a new file.
+        assert_eq!(write(&dir, "b", b"new", None).expect("write"), Done::Yes);
+        assert_eq!(fs::read(dir.join("b")).expect("read"), b"new");
     }
 }

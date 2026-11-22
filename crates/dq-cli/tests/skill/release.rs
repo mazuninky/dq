@@ -240,6 +240,65 @@ fn a_skill_that_cannot_be_written_changes_nothing_of_the_command() {
     assert_eq!(version(&home), VERSION);
 }
 
+/// What a write cannot keep of a file's access is said by `dq skill update`,
+/// and not by an ordinary command. On macOS, where a file of a group the user
+/// is not in is made without being root.
+#[test]
+#[cfg(target_os = "macos")]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "cargo test --release -p dq-cli --test cli_skill"
+)]
+fn an_ordinary_command_says_nothing_of_access_that_is_lost() {
+    use std::os::unix::fs::MetadataExt;
+    let home_of_wheel = || {
+        let home = home();
+        let at = home.skill().join("SKILL.md");
+        let made = tempfile::NamedTempFile::new_in("/private/tmp").expect("temp file");
+        fs::write(made.path(), "old skill\n").expect("write");
+        made.persist(&at).expect("mv");
+        let group = fs::metadata(&at).expect("stat").gid();
+        (home, at, group)
+    };
+    let (home, at, group) = home_of_wheel();
+    let (code, _, stderr) = home.run(&["update"]);
+    assert_eq!(code, 0, "{stderr}");
+    if fs::metadata(&at).expect("stat").gid() == group {
+        return; // kept: the user is in that group
+    }
+    assert!(stderr.contains("WARN"), "{stderr}");
+    let (home, _, _) = home_of_wheel();
+    let said = home.finish(home.dq().args(["get", "a.json", "/a"]));
+    assert_eq!(said, (0, "1\n".to_owned(), String::new()));
+    assert_eq!(version(&home), VERSION);
+}
+
+/// A first install that failed midway: the next ordinary command that can
+/// finishes it.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "cargo test --release -p dq-cli --test cli_skill"
+)]
+fn an_ordinary_command_finishes_an_install_that_failed_midway() {
+    if !modes_bind() {
+        return;
+    }
+    let home = home();
+    home.ok(&["remove"]);
+    let references = home.skill().join("references");
+    fs::create_dir_all(&references).expect("mkdir");
+    chmod(&references, 0o500);
+    assert_eq!(home.run(&["install"]).0, 7);
+    let get = || home.finish(home.dq().args(["get", "a.json", "/a"]));
+    assert_eq!(get(), (0, "1\n".to_owned(), String::new()));
+    assert_eq!(home.status(&[])["state"], json!("differs"));
+    chmod(&references, 0o700);
+    assert_eq!(get(), (0, "1\n".to_owned(), String::new()));
+    assert_eq!(version(&home), VERSION);
+    assert_eq!(home.status(&[])["state"], json!("up_to_date"));
+}
+
 /// A reader that is gone: the process may die of SIGPIPE before it comes to
 /// the skill, or after; the skill is of one version.
 #[test]

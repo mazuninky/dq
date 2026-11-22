@@ -127,6 +127,8 @@ pub enum State {
     UnknownSchema,
     /// The place of the skill directory is a link, or no directory.
     Blocked,
+    /// The skill directory is another user's. What is in it is not looked at.
+    OtherOwner,
 }
 
 impl State {
@@ -143,6 +145,7 @@ impl State {
             Self::Damaged => "damaged",
             Self::UnknownSchema => "unknown_schema",
             Self::Blocked => "blocked",
+            Self::OtherOwner => "other_owner",
         }
     }
 
@@ -156,7 +159,7 @@ impl State {
             | Self::Differs
             | Self::Damaged
             | Self::UnknownSchema => true,
-            Self::NotInstalled | Self::Foreign | Self::Blocked => false,
+            Self::NotInstalled | Self::Foreign | Self::Blocked | Self::OtherOwner => false,
         }
     }
 }
@@ -317,14 +320,14 @@ fn remove_locked(
     Ok(())
 }
 
-/// Delete those of `files`, what was seen of them, that the manifest lists,
-/// then the manifest.
+/// Delete those of `files`, what was seen of them, that dq wrote, then the
+/// manifest.
 fn delete_files(dir: &Utf8Path, files: &[FileState], force: bool) -> Result<(), SkillError> {
     for file in files {
         let seen = (!force).then_some(&file.seen);
         for path in &file.listed {
             if delete(dir, path, seen)? == Done::Changed {
-                return Err(changed_since(dir, file, FORCE_REMOVES));
+                return Err(changed_file(dir, file, FORCE_REMOVES));
             }
         }
     }
@@ -359,6 +362,10 @@ pub fn status(target: &Target, edition: &Edition) -> Result<Status, SkillError> 
             return Ok(status);
         }
         Place::Directory => {}
+    }
+    if ensure_owner(target).is_err() {
+        status.state = State::OtherOwner;
+        return Ok(status);
     }
     let found = survey(&target.dir, edition)?;
     status.state = match &found.installed {
@@ -420,12 +427,25 @@ pub fn installed_note(env: &Environment, edition: &Edition) -> Option<String> {
     if !status.missing.is_empty() {
         said.push(format!("lacks {}", listed(&status.missing)));
     }
-    let changed: Vec<String> = [status.edited, status.colliding, status.in_the_way].concat();
-    let advice = if changed.is_empty() {
-        "run `dq skill update`"
-    } else {
+    let changed = [status.edited, status.colliding].concat();
+    if !changed.is_empty() {
         said.push(format!("was changed ({})", listed(&changed)));
-        "dq leaves it alone; `dq skill update --force` writes dq's files in their place"
+    }
+    if !status.in_the_way.is_empty() {
+        let in_the_way = listed(&status.in_the_way);
+        said.push(format!("has {in_the_way} in the way of dq's files"));
+    }
+    // What is in the way is not replaced by force.
+    let advice = match (changed.is_empty(), status.in_the_way.is_empty()) {
+        (true, true) => "run `dq skill update`",
+        (false, true) => {
+            "dq leaves it alone; `dq skill update --force` writes dq's files in their place"
+        }
+        (true, false) => "move that away, then run `dq skill update`",
+        (false, false) => {
+            "dq leaves it alone; move what is in the way away, then `dq skill update --force` \
+             writes dq's files in place of the changed ones"
+        }
     };
     if said.is_empty() {
         return None;
@@ -514,14 +534,18 @@ pub(super) fn write_files(
         .iter()
         .filter(|file| match file.in_edition {
             Some(_) => file.verdict != Verdict::Identical,
-            None => file.seen != Seen::Missing,
+            None => !file.listed.is_empty() && file.seen != Seen::Missing,
         })
         .collect();
     let finished = Manifest::of(edition);
     if !stale.is_empty() {
         let version = previous.map_or(edition.version, |manifest| &manifest.dq_version);
         let before = Manifest::unfinished(version, written_files(previous, files), edition);
-        write(dir, MANIFEST, &before.to_bytes(), None)?;
+        // Of a list no dq makes: the old one stays, rather than one no dq
+        // reads. A run that is cut short is then finished by this version.
+        if before.is_within_limits() {
+            write_manifest(dir, &before)?;
+        }
     }
     let ours: Vec<&str> = files
         .iter()
@@ -543,7 +567,7 @@ pub(super) fn write_files(
         match write(dir, path, text.as_bytes(), seen)? {
             Done::Yes => changed = true,
             Done::No => {}
-            Done::Changed => return Err(changed_since(dir, file, FORCE_WRITES)),
+            Done::Changed => return Err(changed_file(dir, file, FORCE_WRITES)),
         }
     }
     let mut kept = Vec::new();
@@ -556,12 +580,26 @@ pub(super) fn write_files(
             Done::Yes => changed = true,
             Done::No => {}
             Done::Changed if force => kept.push(file.path.clone()),
-            Done::Changed => return Err(changed_since(dir, file, FORCE_WRITES)),
+            Done::Changed => return Err(changed_file(dir, file, FORCE_WRITES)),
         }
     }
-    let wrote = write(dir, MANIFEST, &finished.to_bytes(), None)? == Done::Yes;
+    let wrote = write_manifest(dir, &finished)?;
     changed |= wrote && previous != Some(&finished);
     Ok((changed, kept))
+}
+
+/// Write the manifest of `dir`, over whatever is there. Whether it is new.
+fn write_manifest(dir: &Utf8Path, manifest: &Manifest) -> Result<bool, SkillError> {
+    match write(dir, MANIFEST, &manifest.to_bytes(), None)? {
+        Done::Yes => Ok(true),
+        Done::No => Ok(false),
+        Done::Changed => Err(changed_since(
+            dir,
+            vec![MANIFEST.to_owned()],
+            vec![],
+            FORCE_WRITES,
+        )),
+    }
 }
 
 /// The files that are there of those `previous` lists, as a manifest has
@@ -570,14 +608,14 @@ fn written_files(previous: Option<&Manifest>, files: &[FileState]) -> BTreeMap<S
     let mut written = BTreeMap::new();
     for file in files {
         for path in &file.listed {
-            let was = previous.and_then(|manifest| manifest.digests(path).next());
+            let was = previous.and_then(|manifest| manifest.files.get(path));
             let digest = match &file.seen {
                 Seen::Missing => continue,
-                Seen::File(digest) if file.is_dqs() => Some(digest.as_str()),
+                Seen::File(digest) if file.is_dqs() => Some(digest),
                 Seen::File(_) | Seen::Other => was,
             };
             if let Some(digest) = digest {
-                written.insert(path.clone(), digest.to_owned());
+                written.insert(path.clone(), digest.clone());
             }
         }
     }
@@ -585,13 +623,22 @@ fn written_files(previous: Option<&Manifest>, files: &[FileState]) -> BTreeMap<S
 }
 
 /// The refusal of a change to a file that is not what was seen any more.
-fn changed_since(dir: &Utf8Path, file: &FileState, hint: &'static str) -> SkillError {
-    let (mut edited, mut colliding) = (Vec::new(), Vec::new());
+fn changed_file(dir: &Utf8Path, file: &FileState, hint: &'static str) -> SkillError {
+    let path = vec![file.path.clone()];
     if file.listed.is_empty() {
-        colliding.push(file.path.clone());
+        changed_since(dir, Vec::new(), path, hint)
     } else {
-        edited.push(file.path.clone());
+        changed_since(dir, path, Vec::new(), hint)
     }
+}
+
+/// [`Refusal::Changed`].
+fn changed_since(
+    dir: &Utf8Path,
+    edited: Vec<String>,
+    colliding: Vec<String>,
+    hint: &'static str,
+) -> SkillError {
     Refusal::Changed {
         dir: dir.into(),
         edited,
@@ -906,7 +953,7 @@ mod tests {
     fn a_note_says_what_is_there_and_nothing_else() {
         type Change = fn(&Utf8Path);
         let write = |dir: &Utf8Path, path: &str| fs::write(dir.join(path), "mine").expect("write");
-        let cases: [(Change, Option<&str>); 12] = [
+        let cases: [(Change, Option<&str>); 13] = [
             (|_| {}, Some("is older (v2026.1.0): run `dq skill update`")),
             (
                 |dir| fs::remove_file(dir.join("SKILL.md")).expect("rm"),
@@ -922,14 +969,31 @@ mod tests {
             ),
             (
                 |dir| fs::create_dir(dir.join(NEW_REF.path)).expect("mkdir"),
-                Some("is older (v2026.1.0) and was changed (references/new.md): FORCE"),
+                Some(
+                    "is older (v2026.1.0) and has references/new.md in the way of dq's files: \
+                     move that away, then run `dq skill update`",
+                ),
+            ),
+            (
+                |dir| {
+                    fs::create_dir(dir.join(NEW_REF.path)).expect("mkdir");
+                    fs::write(dir.join("SKILL.md"), "mine").expect("write");
+                },
+                Some(
+                    "is older (v2026.1.0) and was changed (SKILL.md) and has references/new.md in \
+                     the way of dq's files: dq leaves it alone; move what is in the way away, then \
+                     `dq skill update --force` writes dq's files in place of the changed ones",
+                ),
             ),
             (
                 |dir| {
                     fs::rename(dir.join("references"), dir.join("aside")).expect("mv");
                     fs::write(dir.join("references"), "mine").expect("write");
                 },
-                Some("is older (v2026.1.0) and was changed (references): FORCE"),
+                Some(
+                    "is older (v2026.1.0) and has references in the way of dq's files: \
+                     move that away, then run `dq skill update`",
+                ),
             ),
             (
                 |dir| {
@@ -1073,9 +1137,11 @@ mod tests {
             };
             assert_eq!(check(&target, &seen), expected(), "{path}");
             assert_eq!(fs::read_to_string(&at).expect("read"), "mine", "{path}");
-            // What was written before it is no edit of anyone's.
+            // What was written before it is no edit of anyone's, and a file
+            // dq did not come to write is none of its.
             let seen = survey(&target.dir, &V2).expect("survey");
-            assert_eq!(seen.edited(), named(true), "{path}");
+            assert_eq!(seen.edited(), named(edited), "{path}");
+            assert_eq!(seen.colliding(), named(!edited), "{path}");
             fs::remove_file(&at).expect("rm");
             super::update(&target, &V2, false).expect("update");
             assert_eq!(
@@ -1169,6 +1235,9 @@ mod tests {
                 cut_short(&target, &V3, second);
                 let at = format!("{first}, {second}");
                 // Any version sees nothing to ask about.
+                let Installed::Yes(manifest) = read_manifest(&target.dir).expect("manifest") else {
+                    panic!("no manifest");
+                };
                 for edition in [&V1, &V2, &V3] {
                     let found = survey(&target.dir, edition).expect("survey");
                     assert!(
@@ -1176,7 +1245,15 @@ mod tests {
                         "{at}: {found:?}"
                     );
                     let found = status(&target, edition).expect("status");
-                    assert_eq!(found.missing, Vec::<String>::new(), "{at}");
+                    // What was yet to be written, and this edition has too.
+                    let is_unwritten = |path: &&str| {
+                        manifest.unfinished.contains_key(*path)
+                            && !manifest.files.contains_key(*path)
+                            && !target.dir.join(path).exists()
+                    };
+                    let mut unwritten: Vec<&str> = edition.files.iter().map(|f| f.path).collect();
+                    unwritten.retain(is_unwritten);
+                    assert_eq!(found.missing, unwritten, "{at}");
                     assert_eq!(found.unlisted, Vec::<String>::new(), "{at}");
                     let is_whole = found.state == State::UpToDate;
                     assert_eq!(
@@ -1218,6 +1295,174 @@ mod tests {
             names(&target),
             [MANIFEST, A2.path, "references", NEW_REF.path]
         );
+    }
+
+    /// A file at a path a run was yet to write is the user's: no command takes
+    /// it for dq's, and none deletes it, `--force` or not.
+    #[test]
+    fn what_a_run_did_not_come_to_write_is_not_dqs() {
+        // The user's own directory, taken over by a run that got as far as
+        // the manifest and, or not, a file of its.
+        for written in [false, true] {
+            for path in [A1.path, OLD_REF.path] {
+                for edition in [&V1, &V2] {
+                    for force in [false, true] {
+                        let (_tmp, target) = target();
+                        fs::create_dir_all(target.dir.join("references")).expect("mkdir");
+                        fs::write(target.dir.join(path), "mine").expect("write");
+                        let seen = survey(&target.dir, &V1).expect("survey").files;
+                        let written_before = written_files(None, &seen);
+                        let manifest = Manifest::unfinished(V1.version, written_before, &V1);
+                        fs::write(target.dir.join(MANIFEST), manifest.to_bytes()).expect("write");
+                        let other = if path == A1.path { OLD_REF } else { A1 };
+                        if written {
+                            fs::write(target.dir.join(other.path), other.text).expect("write");
+                        }
+                        let at = format!("{path}, {written}, {}, {force}", edition.version);
+
+                        let found = status(&target, edition).expect("status");
+                        assert_eq!(found.edited, Vec::<String>::new(), "{at}");
+                        assert_eq!(found.unlisted, [path], "{at}");
+                        let has = edition.text(path).is_some();
+                        let expected: &[&str] = if has { &[path] } else { &[] };
+                        assert_eq!(found.colliding, expected, "{at}");
+
+                        let report = remove(&target, edition, force).expect("remove");
+                        assert_eq!(report.left, [path], "{at}");
+                        assert!(!target.dir.join(other.path).exists(), "{at}");
+                        let kept = fs::read_to_string(target.dir.join(path)).expect("read");
+                        assert_eq!(kept, "mine", "{at}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Nor by an update: where this version has the file, it is asked about;
+    /// where it has not, the file is in no one's way and stays.
+    #[test]
+    fn an_update_keeps_what_a_run_did_not_come_to_write() {
+        let cut_short = || {
+            let (tmp, target) = target();
+            fs::create_dir_all(target.dir.join("references")).expect("mkdir");
+            fs::write(target.dir.join(OLD_REF.path), "mine").expect("write");
+            let manifest = Manifest::unfinished(V1.version, BTreeMap::new(), &V1);
+            fs::write(target.dir.join(MANIFEST), manifest.to_bytes()).expect("write");
+            (tmp, target)
+        };
+        let (_tmp, target) = cut_short();
+        assert_eq!(
+            refusal(super::update(&target, &V1, false)),
+            Refusal::Changed {
+                dir: target.dir.clone(),
+                edited: Vec::new(),
+                colliding: vec![OLD_REF.path.to_owned()],
+                hint: FORCE_WRITES,
+            }
+        );
+        for force in [false, true] {
+            let (_tmp, target) = cut_short();
+            let report = super::update(&target, &V2, force)
+                .expect("update")
+                .expect("installed");
+            assert_eq!(report.kept, Vec::<String>::new());
+            let status = status(&target, &V2).expect("status");
+            assert_eq!(status.state, State::UpToDate);
+            assert_eq!(status.unlisted, [OLD_REF.path]);
+            let kept = fs::read_to_string(target.dir.join(OLD_REF.path)).expect("read");
+            assert_eq!(kept, "mine");
+        }
+        // A directory or a link there is in no one's way either.
+        type Make = fn(&Utf8Path);
+        let cases: [Make; 3] = [
+            |at| fs::create_dir(at).expect("mkdir"),
+            |at| std::os::unix::fs::symlink("/nowhere", at).expect("symlink"),
+            |at| {
+                fs::create_dir(at).expect("mkdir");
+                fs::write(at.join("mine"), "mine").expect("write");
+            },
+        ];
+        for make in cases {
+            let (_tmp, target) = cut_short();
+            let at = target.dir.join(OLD_REF.path);
+            fs::remove_file(&at).expect("rm");
+            make(&at);
+            super::update(&target, &V2, false).expect("update");
+            assert!(fs::symlink_metadata(&at).is_ok());
+            remove(&target, &V2, true).expect("remove");
+            assert!(fs::symlink_metadata(&at).is_ok());
+        }
+    }
+
+    /// With `--force`, a file the user makes where a run was yet to write one
+    /// is not deleted by a `remove` that had seen nothing there.
+    #[test]
+    fn what_comes_where_nothing_was_written_yet_is_not_deleted() {
+        let (_tmp, target) = target();
+        fs::create_dir_all(&target.dir).expect("mkdir");
+        let manifest = Manifest::unfinished(V1.version, BTreeMap::new(), &V1);
+        fs::write(target.dir.join(MANIFEST), manifest.to_bytes()).expect("write");
+        let seen = survey(&target.dir, &V1).expect("survey");
+        assert_eq!(seen.missing(), [A1.path, OLD_REF.path]);
+        let at = target.dir.join(A1.path);
+        fs::write(&at, "mine").expect("write");
+        let error = refusal(write_files(
+            &target.dir,
+            &V1,
+            Some(&manifest),
+            &seen.files,
+            false,
+        ));
+        assert!(
+            matches!(&error, Refusal::Changed { edited, colliding, .. }
+                if edited.is_empty() && *colliding == [A1.path]),
+            "{error:?}"
+        );
+        delete_files(&target.dir, &seen.files, true).expect("deleted");
+        assert_eq!(fs::read_to_string(&at).expect("read"), "mine");
+    }
+
+    /// A list no dq makes is not made longer than one dq reads: a run over it
+    /// that stops half-way leaves a manifest, and the next one goes on.
+    #[test]
+    fn a_manifest_is_never_written_that_is_not_read_again() {
+        for count in [254, 255, 256] {
+            let (_tmp, target) = target();
+            fs::create_dir_all(&target.dir).expect("mkdir");
+            let mut files = BTreeMap::new();
+            for n in 0..count {
+                let path = format!("f{n}");
+                fs::write(target.dir.join(&path), &path).expect("write");
+                files.insert(
+                    path.clone(),
+                    crate::commands::self_cmd::sha256_hex(path.as_bytes()),
+                );
+            }
+            let previous = Manifest {
+                dq_version: V1.version.to_owned(),
+                files,
+                unfinished: BTreeMap::new(),
+            };
+            fs::write(target.dir.join(MANIFEST), previous.to_bytes()).expect("write");
+            let seen = survey(&target.dir, &V2).expect("survey");
+            assert_eq!(seen.installed, Installed::Yes(previous.clone()));
+            // In the way of the second file.
+            fs::write(target.dir.join("references"), "mine").expect("write");
+            write_files(&target.dir, &V2, Some(&previous), &seen.files, false)
+                .expect_err("in the way");
+            assert_eq!(
+                fs::read_to_string(target.dir.join(A2.path)).expect("read"),
+                A2.text
+            );
+            let left = read_manifest(&target.dir).expect("read");
+            assert!(matches!(left, Installed::Yes(_)), "{count}: {left:?}");
+            fs::remove_file(target.dir.join("references")).expect("rm");
+            super::update(&target, &V2, false).expect("update");
+            assert_eq!(
+                names(&target),
+                [MANIFEST, A2.path, "references", NEW_REF.path]
+            );
+        }
     }
 
     /// A user's edit is one before, during and after a forced run that did
@@ -1278,7 +1523,13 @@ mod tests {
                 owner + 1
             )
         );
-        assert_eq!(status(&target, &V2).expect("status").state, State::Older);
+        // Nothing in it is looked at.
+        let found = status(&target, &V2).expect("status");
+        assert_eq!((found.state, found.version), (State::OtherOwner, None));
+        fs::write(target.dir.join(MANIFEST), "{}").expect("write");
+        let found = status(&target, &V2).expect("status");
+        assert_eq!(found.state, State::OtherOwner);
+        fs::write(target.dir.join(MANIFEST), Manifest::of(&V1).to_bytes()).expect("write");
         let env = Environment {
             home: Some(target.root.as_str().into()),
             euid: target.user,
@@ -1307,6 +1558,8 @@ mod tests {
             );
         }
         assert!(!target.root.join(".agents").exists());
+        let found = status(&target, &V1).expect("status");
+        assert_eq!(found.state, State::NotInstalled, "there is no directory");
     }
 
     #[test]

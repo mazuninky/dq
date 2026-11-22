@@ -297,7 +297,12 @@ fn a_skill_directory_of_another_user_is_refused() {
              id 0: dq does not touch the skill there"
         );
     }
-    assert_eq!(home.status(&[])["state"], json!("older"));
+    let status = home.status(&[]);
+    assert_eq!(
+        (&status["state"], &status["installed"], &status["version"]),
+        (&json!("other_owner"), &json!(false), &json!(""))
+    );
+    assert!(home.ok(&["status"]).contains("\nstate: other_owner\n"));
     // Not there yet, but in a directory of another user's.
     let home = Home::new();
     let theirs = home.root.join("theirs");
@@ -308,6 +313,47 @@ fn a_skill_directory_of_another_user_is_refused() {
         home.refused(&["install"])
             .starts_with("~/.agents belongs to the user with id 12345, ")
     );
+}
+
+/// A file that may not be deleted may not be replaced either: one line says
+/// so, and the file stays. What was done before it is not asked about again.
+#[test]
+#[cfg(target_os = "macos")]
+fn a_file_that_may_not_be_deleted_is_a_write_failure() {
+    let system = |program: &str, args: &[&str], at: &Path| {
+        let mut cmd = std::process::Command::new(program);
+        assert!(cmd.args(args).arg(at).status().expect(program).success());
+    };
+    type Change<'a> = &'a dyn Fn(&Path);
+    let cases: [(Change, Change); 2] = [
+        (&|at| system("/usr/bin/chflags", &["uchg"], at), &|at| {
+            system("/usr/bin/chflags", &["nouchg"], at);
+        }),
+        (
+            &|at| system("/bin/chmod", &["+a", "everyone deny delete"], at),
+            &|at| system("/bin/chmod", &["-N"], at),
+        ),
+    ];
+    for (forbid, allow) in cases {
+        let home = Home::new();
+        home.install_edition(&OLD);
+        let at = home.skill().join("references/formats.md");
+        forbid(&at);
+        let updated = home.run(&["update"]);
+        let removed = home.run(&["remove"]);
+        allow(&at);
+        let failed = |done: &str| {
+            format!(
+                "I/O error writing '~/.agents/skills/dq/references/formats.md': it cannot be \
+                 {done}: its ACL or flags, or its directory, forbid deleting it\n"
+            )
+        };
+        assert_eq!(updated, (7, String::new(), failed("replaced")));
+        assert_eq!(removed, (7, String::new(), failed("removed")));
+        assert_eq!(fs::read_to_string(&at).expect("read"), "old formats\n");
+        home.ok(&["update", "--force"]);
+        assert_eq!(home.status(&[])["state"], json!("up_to_date"));
+    }
 }
 
 /// Every way a manifest can be none, through every command: `install` and
@@ -387,8 +433,8 @@ fn a_damaged_manifest_is_refused() {
             "it lists no unfinished files".to_owned(),
         ),
         (
-            format!("{}{}", manifest(json!({})), " ".repeat(128 * 1024)),
-            "it is larger than 131072 bytes".to_owned(),
+            format!("{}{}", manifest(json!({})), " ".repeat(160 * 1024)),
+            "it is larger than 163840 bytes".to_owned(),
         ),
         // Escaped where it is printed; the line stays one line.
         (listing("a\nb\u{1b}[31m"), no_path("a\\x0ab\\x1b[31m")),

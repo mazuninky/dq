@@ -54,7 +54,12 @@ fn an_update_that_fails_midway_is_finished_by_the_next() {
             fs::read_to_string(home.skill().join("SKILL.md")).expect("read"),
             source("SKILL.md")
         );
-        assert_eq!(whole(&home), "older");
+        let status = home.status(&[]);
+        assert_eq!(
+            (&status["state"], &status["edited"], &status["missing"]),
+            (&json!("older"), &json!([]), &json!(&FILES[3..])),
+            "what was yet to be written is missing"
+        );
         // Failing once more changes nothing about that.
         chmod(&references, 0o500);
         assert_eq!(home.run(&[command]).0, 7);
@@ -157,6 +162,77 @@ fn an_install_that_was_cut_short_is_finished_by_the_next() {
         home.refused(&["install"])
             .contains("was not installed by dq (SKILL.md)")
     );
+}
+
+/// A first install that fails midway says what is not there, by any next
+/// command.
+#[test]
+fn an_install_that_fails_midway_says_what_is_missing() {
+    if !modes_bind() {
+        return;
+    }
+    let home = Home::new();
+    let references = home.skill().join("references");
+    fs::create_dir_all(&references).expect("mkdir");
+    chmod(&references, 0o500);
+    let (code, stdout, stderr) = home.run(&["install"]);
+    assert_eq!((code, stdout.as_str()), (7, ""), "{stderr}");
+    let status = home.status(&[]);
+    assert_eq!(
+        (&status["state"], &status["installed"], &status["missing"]),
+        (&json!("differs"), &json!(true), &json!(&FILES[2..]),)
+    );
+    for list in ["edited", "colliding", "in_the_way", "unlisted"] {
+        assert_eq!(status[list], json!([]), "{list}");
+    }
+    chmod(&references, 0o700);
+    home.ok(&["update"]);
+    assert_eq!(whole(&home), "up_to_date");
+    assert_eq!(names(&home), FILES);
+}
+
+/// A forced install over the user's own files that fails midway: those it did
+/// not come to are still theirs, and `remove` leaves them, `--force` or not.
+#[test]
+fn a_forced_install_that_fails_midway_does_not_make_files_dqs() {
+    if !modes_bind() {
+        return;
+    }
+    for force in [&["remove"][..], &["remove", "--force"]] {
+        let home = Home::new();
+        let references = home.skill().join("references");
+        fs::create_dir_all(&references).expect("mkdir");
+        fs::write(references.join("formats.md"), "mine").expect("write");
+        chmod(&references, 0o500);
+        let (code, _, stderr) = home.run(&["install", "--force"]);
+        chmod(&references, 0o700);
+        assert_eq!(code, 7, "{stderr}");
+        let status = home.status(&[]);
+        assert_eq!(
+            (&status["edited"], &status["colliding"], &status["unlisted"]),
+            (
+                &json!([]),
+                &json!(["references/formats.md"]),
+                &json!(["references/formats.md"])
+            )
+        );
+        assert_eq!(
+            home.refused(&["install"]),
+            "~/.agents/skills/dq was changed since dq wrote it: not dq's: references/formats.md \
+             (--force writes dq's files in their place)"
+        );
+        assert_eq!(
+            home.ok(force),
+            format!(
+                "removed dq skill v{VERSION} from ~/.agents/skills/dq\n\
+                 kept ~/.agents/skills/dq: not dq's are references/formats.md\n"
+            )
+        );
+        assert_eq!(
+            tree(&home.skill()),
+            [("references/formats.md".to_owned(), "mine".to_owned())]
+        );
+    }
 }
 
 /// An update that was cut short anywhere is finished by the next, `--force`
@@ -417,6 +493,39 @@ fn a_directory_with_a_file_of_the_users_keeps_its_name() {
     );
     home.ok(&["remove"]);
     assert_eq!(entries(&home), ["References", "References/mine.md"]);
+}
+
+/// A new file has the mode of any new file, and one that is replaced keeps
+/// its own.
+#[test]
+fn modes_are_those_of_new_files_and_stay() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = Home::new();
+    let dq = assert_cmd::cargo::cargo_bin("dq");
+    let run = |umask: &str, command: &str| {
+        let mut sh = Command::new("/bin/sh");
+        sh.env_clear().env("HOME", &home.root).env("DQ", &dq);
+        let script = format!("umask {umask} && exec \"$DQ\" skill {command}");
+        sh.args(["-c", &script]).assert().success();
+    };
+    let mode = |path: &str| {
+        let meta = fs::metadata(home.skill().join(path)).expect("stat");
+        meta.permissions().mode() & 0o7777
+    };
+    run("027", "install");
+    assert_eq!(FILES.map(mode), [0o640; 5]);
+    assert_eq!((mode(""), mode("references")), (0o750, 0o750));
+
+    home.install_edition(&OLD);
+    chmod(&home.skill().join("SKILL.md"), 0o755);
+    chmod(&home.skill().join(MANIFEST), 0o600);
+    chmod(&home.skill().join("references/formats.md"), 0o444);
+    for new in ["references/linting.md", "references/pointers.md"] {
+        fs::remove_file(home.skill().join(new)).expect("rm");
+    }
+    run("002", "update");
+    assert_eq!(whole(&home), "up_to_date");
+    assert_eq!(FILES.map(mode), [0o600, 0o755, 0o444, 0o664, 0o664]);
 }
 
 /// The mode of a file does not stand in the way of replacing or removing
