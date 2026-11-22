@@ -1,7 +1,11 @@
 //! Where a parse error is: the message has no position, so the terminal
 //! gets it as a second line, `  --> FILE:LINE:COL`, and the bulk summary,
 //! one line per file, as ` (line LINE, column COL)`. A jq compile error is
-//! about the expression, not a place in the file, and gets neither.
+//! about the expression, not a place in the file, and gets neither. What
+//! stands below the second line is the source line with a caret:
+//! `cli_parse_error_caret.rs`.
+
+mod common;
 
 use std::path::Path;
 
@@ -25,7 +29,7 @@ fn dq(dir: &Path) -> Command {
 }
 
 /// Run `dq --no-color ARGS` in `dir` with `stdin`; the exit code, stdout
-/// and stderr.
+/// and stderr, without the source line of a parse error.
 fn run(dir: &Path, args: &[&str], stdin: &str) -> (i32, String, String) {
     let out = dq(dir)
         .args(args)
@@ -35,7 +39,7 @@ fn run(dir: &Path, args: &[&str], stdin: &str) -> (i32, String, String) {
     (
         out.status.code().expect("exit code"),
         String::from_utf8(out.stdout).expect("UTF-8 stdout"),
-        String::from_utf8(out.stderr).expect("UTF-8 stderr"),
+        common::without_source_block(&String::from_utf8(out.stderr).expect("UTF-8 stderr")),
     )
 }
 
@@ -163,7 +167,8 @@ fn a_message_quoting_a_line_break_of_the_file_stays_on_one_line() {
     );
 }
 
-/// The position stays the second line when a backtrace follows.
+/// The position stays the second line, the source line and the caret below
+/// it, when a backtrace follows.
 #[test]
 fn the_position_comes_before_a_backtrace() {
     let dir = dir_with(&[("bad.yaml", BAD_YAML)]);
@@ -175,7 +180,8 @@ fn the_position_comes_before_a_backtrace() {
     let stderr = String::from_utf8(out.stderr).expect("UTF-8 stderr");
     assert!(
         stderr.starts_with(&format!(
-            "parse error in bad.yaml: {BAD_YAML_MESSAGE}\n  --> bad.yaml:4:2\n\nStack backtrace:\n"
+            "parse error in bad.yaml: {BAD_YAML_MESSAGE}\n  --> bad.yaml:4:2\n   |\n 4 | c: 3\n   \
+             |  ^\n\nStack backtrace:\n"
         )),
         "{stderr}"
     );

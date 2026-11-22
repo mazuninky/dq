@@ -91,7 +91,7 @@ Milestone M3: one command over many files, and many operations on one file.
 - **One `FileOp` trait and one `run_per_file` harness** for every write command, so bulk semantics have one implementation and one test surface.
 - **`/-` (append to array)** is understood by pointers in write paths.
 
-Since then: `--parallel N` on a single file is accepted and silently runs sequentially; the spec said it would be refused to surface typos.
+Since then: `--parallel N` on a single file is accepted and silently runs sequentially; the spec said it would be refused to surface typos. `--check --continue-on-error` exits 7 when a file failed, ahead of 0 and 1 (2026-11-22); it used to hide the failed files.
 
 **Deferred or left out.** A `--no-glob` switch for literal file names containing `[` (shell escaping was judged enough; not added). An order-sensitive `diff --strict`. Patch dialects other than the two RFCs. Transactional bulk writes (never).
 

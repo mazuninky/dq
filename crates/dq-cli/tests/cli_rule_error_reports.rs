@@ -4,10 +4,10 @@
 //!
 //! `cli_rule_errors.rs` has the basics; `cli_rule_error_fix.rs` is `dq fix`.
 
-mod common;
+mod scratch;
 
-use common::{Run, Scratch};
 use pretty_assertions::assert_eq;
+use scratch::{Run, Scratch};
 
 /// Indexes `.spec` as an object in `check.jq`.
 const RAISES: &str = r#"id: t.raises
@@ -528,6 +528,9 @@ fn a_file_that_does_not_parse_gives_the_run_its_error_and_both_are_reported() {
     let parse_error = concat!(
         "parse error in broken.yaml: did not find expected node content, while parsing a flow node\n",
         "  --> broken.yaml:2:1\n",
+        "   |\n",
+        " 2 |\n",
+        "   | ^\n",
     );
     for files in [["broken.yaml", "pod.yaml"], ["pod.yaml", "broken.yaml"]] {
         let console = scratch.run(&with(&LINT_BOTH, &files));

@@ -17,33 +17,46 @@ use std::fmt;
 use camino::Utf8Path;
 
 /// Where a file does not parse: the position of a
-/// [`dq_core::Error::Parse`], whose message has none of its own.
+/// [`dq_core::Error::Parse`], whose message has none of its own, and the
+/// line there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ParsePosition<'e> {
     /// The file; `None` for stdin.
     pub(crate) file: Option<&'e Utf8Path>,
     /// 1-based line.
     pub(crate) line: u32,
-    /// 1-based column, in bytes.
+    /// 1-based column, in bytes of `snippet`.
     pub(crate) col: u32,
+    /// How many bytes of the source are at fault; 0 where no construct is
+    /// known.
+    pub(crate) len: usize,
+    /// The whole source line, without its line break, as it is.
+    pub(crate) snippet: &'e str,
 }
 
-/// The position of the parse error in the chain of `err`. `None` when there
-/// is none, and for one that has no place in a file: a jq compile error (of
-/// `query` or `set --jq`) is about the expression.
-pub(crate) fn parse_position(err: &anyhow::Error) -> Option<ParsePosition<'_>> {
-    err.chain().find_map(|cause| {
+/// The position of the parse error in the `chain` of an error. `None` when
+/// there is none, and for one that has no place in a file: a jq compile
+/// error (of `query` or `set --jq`) is about the expression.
+pub(crate) fn parse_position(mut chain: anyhow::Chain<'_>) -> Option<ParsePosition<'_>> {
+    chain.find_map(|cause| {
         let err = cause.downcast_ref::<dq_core::Error>()?;
         let (line, col) = err.place()?;
-        let file = match err {
-            dq_core::Error::Parse { file, .. } => file.as_deref(),
-            _ => None,
+        let dq_core::Error::Parse {
+            file,
+            span,
+            snippet,
+            ..
+        } = err
+        else {
+            return None;
         };
         Some(ParsePosition {
             // An edit of stdin names it `-`.
-            file: file.filter(|file| *file != "-"),
+            file: file.as_deref().filter(|file| *file != "-"),
             line,
             col,
+            len: span.len(),
+            snippet,
         })
     })
 }
@@ -51,9 +64,33 @@ pub(crate) fn parse_position(err: &anyhow::Error) -> Option<ParsePosition<'_>> {
 /// The position of the parse error in the chain of `err`, to end a line
 /// that shows the error: ` (line 4, column 2)`. Empty when there is none.
 pub(crate) fn position_note(err: &anyhow::Error) -> String {
-    parse_position(err)
+    parse_position(err.chain())
         .map(|at| format!(" (line {}, column {})", at.line, at.col))
         .unwrap_or_default()
+}
+
+/// The errors of `chain` that say something new, the outermost first: a
+/// cause whose text the message right above it holds, left out itself or
+/// not, is left out — the I/O error a [`dq_core::Error::Io`] ends with.
+pub(crate) fn telling_errors(
+    chain: anyhow::Chain<'_>,
+) -> impl Iterator<Item = &(dyn std::error::Error + 'static)> {
+    let mut above: Option<String> = None;
+    chain.filter(move |err| {
+        let text = err.to_string();
+        let new = above.as_ref().is_none_or(|above| !above.contains(&text));
+        above = Some(text);
+        new
+    })
+}
+
+/// The messages of `err` and its causes joined by `: `, as anyhow's `{:#}`
+/// writes them, without those [`telling_errors`] leaves out.
+pub(crate) fn joined_message(err: &anyhow::Error) -> String {
+    let messages: Vec<String> = telling_errors(err.chain())
+        .map(ToString::to_string)
+        .collect();
+    messages.join(": ")
 }
 
 /// "Fail with exit code 1, but write nothing to stderr."
@@ -252,5 +289,49 @@ fn index_hint(count: usize) -> String {
         0 => String::new(),
         1 => " (--doc 0)".to_owned(),
         n => format!(" (--doc 0 to {})", n - 1),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`joined_message`] of an error of `messages`, the outermost first.
+    fn joined(messages: &[&'static str]) -> String {
+        let (cause, above) = messages.split_last().expect("a message");
+        let err = above
+            .iter()
+            .rfold(anyhow::Error::msg(*cause), |err, message| {
+                err.context(*message)
+            });
+        joined_message(&err)
+    }
+
+    #[test]
+    fn a_joined_message_has_no_cause_twice() {
+        assert_eq!(joined(&["a"]), "a");
+        assert_eq!(joined(&["a", "b", "c"]), "a: b: c");
+        assert_eq!(joined(&["a: b", "b"]), "a: b");
+        assert_eq!(joined(&["a: b: c", "b: c", "c"]), "a: b: c");
+        // Compared with the message right above it, left out or not.
+        assert_eq!(joined(&["a: b: c", "b", "c"]), "a: b: c: c");
+        assert_eq!(joined(&["a: b", "b", "more"]), "a: b: more");
+        // Held by the cause, not by the message.
+        assert_eq!(joined(&["a", "a: b"]), "a: a: b");
+    }
+
+    #[test]
+    fn a_joined_message_names_an_io_cause_once() {
+        let io = || {
+            anyhow::Error::new(dq_core::Error::Io {
+                path: "m.json".into(),
+                source: std::io::Error::other("gone"),
+            })
+        };
+        assert_eq!(joined_message(&io()), "I/O error reading 'm.json': gone");
+        assert_eq!(
+            joined_message(&io().context("cannot start")),
+            "cannot start: I/O error reading 'm.json': gone"
+        );
     }
 }

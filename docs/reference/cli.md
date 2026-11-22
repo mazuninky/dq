@@ -263,26 +263,50 @@ path '/server/prot' not found (matched up to '/server')
   pointer: /server/prot
 ```
 
-A parse error prints `parse error in FILE: MESSAGE` and, on the next line,
-the place: `  --> FILE:LINE:COL` (`<stdin>` for input read from stdin). Lines
-and columns are 1-based; columns count bytes, for every format, and a leading
-BOM is not counted. A line break is `\n`, `\r\n`, or a lone `\r` in a file
-with no `\n`. In the bulk summary the place follows the entry as
-` (line 2, column 4)`. The error also carries the source line and the byte
-range of what is wrong; `validate` prints them today, the rest of the
-commands do not yet. For XML in another encoding than UTF-8, `col` and the
-source line are of the decoded text, the byte range of the file. A jq
-expression that does not compile has no place in the file and prints none.
+A parse error prints its message, the place, and the source line with a
+caret under what is wrong; every command does, `validate` included:
+
+```
+parse error in bad.json: expected JSON value (object, array, scalar)
+  --> bad.json:2:14
+   |
+ 2 |   "b": [1, 2,, 3]
+   |              ^
+```
+
+- The place is `FILE:LINE:COL` (`<stdin>` for input read from stdin). Lines
+  and columns are 1-based; columns count bytes, for every format, and a
+  leading BOM is not counted. A line break is `\n`, `\r\n`, or a lone `\r` in
+  a file with no `\n`. For XML in another encoding than UTF-8, the column and
+  the source line are of the decoded text.
+- The caret is under the first character of the error, underlined `^~~~` when
+  the error spans several. One column past the text means the end of the line
+  or the file.
+- The source line is escaped as other terminal text; the caret accounts for
+  it. A tab shows as four spaces, a wide character (CJK, emoji) takes two
+  columns. A line over 120 columns is cut around the caret, `…` on each side
+  that was cut.
+- In the bulk summary an entry stays on one line and ends with
+  ` (line 2, column 4)`; `lint`'s WARN lines and `dq test` do the same.
+- The place and the gutter are dim and the caret bold red when stderr takes
+  colour.
+- A template refusal names its line in the message, and a jq expression that
+  does not compile has no place in the file: neither prints a source line.
+- Widths are per character: a terminal that joins emoji sequences or writes
+  right to left can show the caret off by some columns on such a line.
+
+Under `Caused by:` come the errors behind an error. One whose text the message
+above it already holds is left out.
+
 clap usage errors are rendered the way clap renders them (`error: …`,
 usage line, `--help` hint), including the usage errors raised by handlers
 (`--doc` refusals, stdin without `--input-format`, a `-F` a write command
 cannot keep a file in).
 
-Not implemented yet, although the original design asked for them: the source
-line with a caret under the offending byte, and a JSON error object on stderr
-under `-F json` (today `-F json` changes nothing about error rendering, except
-for `validate`, whose diagnostics go through the reporter). Both are planned in
-[../plans/structured-errors.md](../plans/structured-errors.md).
+Not implemented yet, although the original design asked for it: a JSON error
+object on stderr under `-F json` (today `-F json` changes nothing about error
+rendering, except for `validate`, whose diagnostics go through the reporter).
+It is planned in [../plans/structured-errors.md](../plans/structured-errors.md).
 
 ## Exit codes
 

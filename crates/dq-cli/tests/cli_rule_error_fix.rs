@@ -5,10 +5,10 @@
 //! `cli_rule_errors.rs` has the basics; `cli_rule_error_reports.rs` is
 //! `dq lint` and `dq check`.
 
-mod common;
+mod scratch;
 
-use common::{Run, Scratch};
 use pretty_assertions::assert_eq;
+use scratch::{Run, Scratch};
 
 /// Raises in `check.jq` unless `.spec` is an object; its fix adds `x`.
 const RAISES_IN_CHECK: &str = r#"id: t.check
@@ -132,6 +132,9 @@ const BROKEN: &str = "a: [\n";
 const PARSE_ERROR: &str = concat!(
     "parse error in broken.yaml: did not find expected node content, while parsing a flow node\n",
     "  --> broken.yaml:2:1\n",
+    "   |\n",
+    " 2 |\n",
+    "   | ^\n",
 );
 
 /// Two files the rules raise on (`t.fixes` still fixes them) around one they
@@ -519,7 +522,7 @@ fn rule_errors_of_a_parallel_run_come_in_file_order() {
 
 /// The workers of a parallel run log to stderr, which the main thread must
 /// not hold while it waits for them: it did, and such a run never ended
-/// ([`common::DEADLINE`] kills it).
+/// ([`scratch::DEADLINE`] kills it).
 #[test]
 fn a_parallel_run_whose_rules_log_ends() {
     let names: Vec<String> = (0..12).map(|n| format!("f{n:02}.yaml")).collect();

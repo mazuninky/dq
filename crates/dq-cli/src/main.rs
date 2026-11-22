@@ -52,22 +52,21 @@ fn init_tracing(verbose: u8, quiet: bool, ansi: bool) {
 fn main() {
     restore_sigpipe();
     let cli = Cli::parse();
-    init_tracing(
-        cli.verbose,
-        cli.quiet,
-        dq::output::resolve_log_color(cli.no_color),
-    );
-    let use_color = dq::output::resolve_color(cli.no_color);
+    let colors = dq::output::StreamColors {
+        stdout: dq::output::resolve_color(cli.no_color),
+        stderr: dq::output::resolve_log_color(cli.no_color),
+    };
+    init_tracing(cli.verbose, cli.quiet, colors.stderr);
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
     // Not locked for the run, unlike stdout: the subscriber logs to stderr
     // from the `--parallel` workers too, which would wait for this thread
     // while it waits for them.
     let mut stderr = std::io::stderr();
-    let result = dq::run(&cli, use_color, &mut stdout, &mut stderr);
+    let result = dq::run(&cli, colors, &mut stdout, &mut stderr);
     if let Err(err) = result {
         if err.downcast_ref::<dq::SilentError>().is_none() {
-            let _ = dq::render_error(&err, &mut stderr);
+            let _ = dq::render_error(&err, colors.stderr, &mut stderr);
         }
         std::process::exit(dq::exit_code::exit_code_for_error(&err));
     }

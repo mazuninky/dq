@@ -428,7 +428,13 @@ impl Cli {
         }
         let shown = clap::ValueEnum::to_possible_value(&self.format)
             .map_or_else(String::new, |v| v.get_name().to_owned());
-        let file = if file == "-" { "stdin" } else { file.as_str() };
+        // clap takes terminal sequences out of its messages and keeps line
+        // breaks: escape the name here, so that it is shown whole, on one line.
+        let file = if file == "-" {
+            "stdin".into()
+        } else {
+            crate::output::terminal_text(file.as_str())
+        };
         Err(usage_error(
             clap::error::ErrorKind::ArgumentConflict,
             format!(

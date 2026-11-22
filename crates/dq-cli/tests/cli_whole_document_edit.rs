@@ -10,6 +10,8 @@
 //! Every edit is checked twice: the bytes on disk, and the value dq reads
 //! back from them. Each refusal leaves the file as it was.
 
+mod common;
+
 use std::path::Path;
 
 use assert_cmd::Command;
@@ -56,7 +58,7 @@ fn run_in(dir: &TempDir, name: &str, src: &str, args: &[&str]) -> Run {
     Run {
         code: out.status.code().expect("dq exited, not killed"),
         stdout: String::from_utf8(out.stdout).expect("UTF-8 stdout"),
-        stderr: String::from_utf8(out.stderr).expect("UTF-8 stderr"),
+        stderr: common::without_source_block(&String::from_utf8(out.stderr).expect("UTF-8 stderr")),
         file: String::from_utf8(std::fs::read(dir.path().join(name)).expect("read back"))
             .expect("UTF-8 file"),
     }

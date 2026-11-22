@@ -3,9 +3,8 @@ source: crates/dq-cli/tests/cli_snapshots.rs
 assertion_line: 88
 expression: stderr
 ---
-kind: parse
-file: <FIXTURE>
-line: [NUM]
-col: [NUM]
-message: [serde_json message]
-snippet: { "x": 1, }
+parse error in <FIXTURE>: expected string key in object
+  --> <FIXTURE>:1:11
+   |
+ 1 | { "x": 1, }
+   |           ^

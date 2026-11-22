@@ -3,10 +3,10 @@
 //!
 //! `cli_rule_errors.rs` has the basics.
 
-mod common;
+mod scratch;
 
-use common::{Run, Scratch};
 use pretty_assertions::assert_eq;
+use scratch::{Run, Scratch};
 
 /// Reports every document whose `kind` is `Thing`, in YAML; its fix sets
 /// `fixed`.
@@ -320,10 +320,7 @@ mod links {
 
     /// The error of a run stopped by `path`, which could not be read.
     fn stopped(path: &str, why: &str) -> Run {
-        failed(
-            5,
-            &format!("io error reading {path}: {why}\n\nCaused by:\n    {why}\n"),
-        )
+        failed(5, &format!("io error reading {path}: {why}\n"))
     }
 
     fn dangling(path: &str, target: &str) -> Run {

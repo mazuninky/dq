@@ -162,6 +162,13 @@ jaq-core = "3.1"
 jaq-std = "3.0"
 jaq-json = { version = "2.0", features = ["sync", "serde"] }
 
+# Display width of a character: the caret of a parse error on the console
+# must stand under the character at fault on a line with wide (CJK, emoji)
+# or zero-width characters. `default-features = false` drops `width_cjk`,
+# the tables for East Asian legacy terminals. No dependencies. License:
+# MIT OR Apache-2.0.
+unicode-width = { version = "0.2", default-features = false }
+
 # OS
 libc = "0.2"
 

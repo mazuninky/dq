@@ -19,19 +19,18 @@ pub use error::{
     DocOutOfRange, DocOutOfRangeEverywhere, LintFail, SilentError, ValidateFail, WrongType,
 };
 
-use std::borrow::Cow;
 use std::io::Write;
 
 use cli::InputFormat;
 use dq_core::one_line;
 use output::{
     ConsoleReporter, JsonReporter, JsonlReporter, JunitReporter, OutputFormat, Reporter,
-    SarifReporter, TapReporter, TomlReporter, ToonReporter, YamlReporter,
+    SarifReporter, StreamColors, TapReporter, TomlReporter, ToonReporter, YamlReporter,
 };
 
 /// CLI entry point used by both `main.rs` and integration tests.
 ///
-/// Performs reporter selection from `cli.format` + `use_color`, then
+/// Performs reporter selection from `cli.format` + `colors`, then
 /// dispatches into the matching `commands::*::run`. Write-mode flag
 /// rejection lives in each read handler's first line via
 /// [`Cli::ensure_no_write_flags`] — that placement means future write
@@ -49,21 +48,23 @@ use output::{
 /// [`exit_code::exit_code_for_error`].
 pub fn run(
     cli: &Cli,
-    use_color: bool,
+    colors: impl Into<StreamColors>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> anyhow::Result<()> {
-    let reporter = reporter_for_format(cli.format, use_color);
-    dispatch(cli, use_color, reporter.as_ref(), stdout, stderr)
+    let colors = colors.into();
+    let reporter = reporter_for_format(cli.format, colors.stdout);
+    dispatch(cli, colors, reporter.as_ref(), stdout, stderr)
 }
 
 fn dispatch(
     cli: &Cli,
-    use_color: bool,
+    colors: StreamColors,
     reporter: &dyn Reporter,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> anyhow::Result<()> {
+    let use_color = colors.stdout;
     // `-F` is the output format only (the reporter above, or `convert`'s
     // target); the parser comes from `--input-format`, else detection.
     let input_format = cli.input_format.map(InputFormat::parser_name);
@@ -118,7 +119,9 @@ fn dispatch(
         // M4 §3: `dq fmt FILE` — re-emit through the format's native
         // writer with the global `--sort-keys` / `--indent` knobs applied.
         Command::Fmt(args) => commands::fmt::run(cli, args, input_format, use_color, &opts, out),
-        Command::Validate(args) => commands::validate::run(cli, args, input_format, reporter, err),
+        Command::Validate(args) => {
+            commands::validate::run(cli, args, input_format, colors.stderr, reporter, err)
+        }
         Command::Diff(args) => {
             commands::diff::run(cli, args, input_format, use_color, reporter, out)
         }
@@ -267,17 +270,21 @@ impl Reporter for BannedReporter {
     }
 }
 
-/// Render an `anyhow::Error` to a writer in human-friendly form.
+/// Render an `anyhow::Error` to a writer in human-friendly form, with ANSI
+/// escapes when `use_color` is set (the colour of stderr,
+/// [`output::resolve_log_color`]).
 ///
 /// Behaviour:
 /// - For `dq_core::Error::Path` errors, the renderer expands the structured
 ///   fields (matched prefix, did_you_mean) onto separate lines so the spec's
 ///   "did_you_mean" affordance is visible to users without `-vv`.
 /// - For [`ValidateFail`] errors, the rendering is suppressed because the
-///   validate handler has already streamed a structured error through its
-///   reporter; printing again would duplicate the message.
+///   validate handler has already written the error to stderr; printing
+///   again would duplicate the message.
 /// - For all other errors, the standard anyhow chain (`{:?}`) is written; a
-///   parse error's position (`  --> FILE:LINE:COL`) follows the message.
+///   parse error's position (`  --> FILE:LINE:COL`) and the source line with
+///   a caret under the character at fault follow the message. A cause the
+///   message above it names already is left out.
 ///
 /// Every line is written escaped as the console reporter escapes text
 /// ([`output::console`]): a message echoes what the user typed and what
@@ -287,30 +294,24 @@ impl Reporter for BannedReporter {
 ///
 /// Called from `main.rs` after `run` returns an error; tests can call it
 /// directly with a `Vec<u8>` writer to assert on the rendered shape.
-pub fn render_error(err: &anyhow::Error, w: &mut dyn Write) -> std::io::Result<()> {
-    let mut raw = Vec::new();
-    render_error_raw(err, &mut raw)?;
-    let text = String::from_utf8_lossy(&raw);
-    for (i, line) in text.split('\n').enumerate() {
-        if i > 0 {
-            w.write_all(b"\n")?;
-        }
-        w.write_all(output::console::escape_control(line).as_bytes())?;
-    }
-    Ok(())
-}
-
-/// [`render_error`] before the escaping.
-fn render_error_raw(err: &anyhow::Error, w: &mut dyn Write) -> std::io::Result<()> {
+///
+/// # Errors
+///
+/// Any error of `w`.
+pub fn render_error(
+    err: &anyhow::Error,
+    use_color: bool,
+    w: &mut dyn Write,
+) -> std::io::Result<()> {
     if err.downcast_ref::<ValidateFail>().is_some() {
-        // The validate handler already wrote a structured error through its
-        // reporter to the caller-supplied stderr writer. Don't print again.
+        // The validate handler already wrote the error to the
+        // caller-supplied stderr writer. Don't print again.
         return Ok(());
     }
     if let Some(usage) = err.downcast_ref::<clap::Error>() {
         // Rendered the way clap renders its own usage errors: `error: …`,
         // the usage line, the `--help` hint.
-        return write!(w, "{usage}");
+        return write_escaped(&usage.to_string(), w);
     }
     if let Some(dq_core::Error::Path {
         pointer,
@@ -321,68 +322,98 @@ fn render_error_raw(err: &anyhow::Error, w: &mut dyn Write) -> std::io::Result<(
     {
         // What the user or the file put here goes on one line
         // ([`dq_core::one_line`]), so it cannot pass for a line of its own.
-        writeln!(w, "{}", one_line(&err.to_string()))?;
+        let mut text = format!("{}\n", one_line(&err.to_string()));
         if !matched_prefix.is_empty() {
-            writeln!(w, "  matched prefix: {}", one_line(matched_prefix))?;
+            text.push_str(&format!("  matched prefix: {}\n", one_line(matched_prefix)));
         }
         if !did_you_mean.is_empty() {
             let keys: Vec<_> = did_you_mean.iter().map(|key| one_line(key)).collect();
-            writeln!(w, "  did_you_mean: {}", keys.join(", "))?;
+            text.push_str(&format!("  did_you_mean: {}\n", keys.join(", ")));
         }
         // Echo the original pointer for copy-paste convenience.
-        writeln!(w, "  pointer: {}", one_line(pointer))?;
-        return Ok(());
+        text.push_str(&format!("  pointer: {}\n", one_line(pointer)));
+        return write_escaped(&text, w);
     }
-    write_chain(err, w)
+    write_chain(err.chain(), use_color, w)?;
+    write_backtrace(err, w)?;
+    writeln!(w)
 }
 
-/// `err` and the errors that caused it, as anyhow's `{:?}` writes them —
-/// the message, then `Caused by:` and each cause indented, numbered when
-/// there are several, then the backtrace when one was captured — each
-/// message as [`terminal_message`] gives it. The position of a parse error
-/// is a line of its own after the message.
-fn write_chain(err: &anyhow::Error, w: &mut dyn Write) -> std::io::Result<()> {
-    let mut chain = err.chain();
-    if let Some(top) = chain.next() {
-        write!(w, "{}", terminal_message(top))?;
-    }
-    if let Some(at) = error::parse_position(err) {
-        let file = at
-            .file
-            .map_or(Cow::Borrowed("<stdin>"), |file| one_line(file.as_str()));
-        write!(w, "\n  --> {file}:{}:{}", at.line, at.col)?;
-    }
-    let causes: Vec<_> = chain.collect();
-    if !causes.is_empty() {
-        write!(w, "\n\nCaused by:")?;
-        let numbered = causes.len() > 1;
-        for (n, cause) in causes.into_iter().enumerate() {
-            writeln!(w)?;
-            for (i, line) in terminal_message(cause).split('\n').enumerate() {
-                match (numbered, i) {
-                    (true, 0) => write!(w, "{n:>5}: ")?,
-                    (true, _) => write!(w, "\n       ")?,
-                    (false, 0) => write!(w, "    ")?,
-                    (false, _) => write!(w, "\n    ")?,
-                }
-                write!(w, "{line}")?;
-            }
-        }
-    }
-    // The backtrace anyhow captured (`RUST_BACKTRACE`), as its `{:?}`
-    // writes it.
-    let backtrace = err.backtrace();
-    if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
-        let mut backtrace = backtrace.to_string();
-        write!(w, "\n\n")?;
-        if backtrace.starts_with("stack backtrace:") {
-            backtrace.replace_range(0..1, "S");
-        } else {
-            writeln!(w, "Stack backtrace:")?;
-        }
-        write!(w, "{}", backtrace.trim_end())?;
-    }
+/// [`render_error`] of a `dq_core` error that is in no `anyhow::Error`, so
+/// with no backtrace: the one `validate` prints itself.
+pub(crate) fn render_core_error(
+    err: &dq_core::Error,
+    use_color: bool,
+    w: &mut dyn Write,
+) -> std::io::Result<()> {
+    write_chain(anyhow::Chain::new(err), use_color, w)?;
     writeln!(w)
+}
+
+/// `text` with the controls of every line escaped; its line breaks stay.
+fn write_escaped(text: &str, w: &mut dyn Write) -> std::io::Result<()> {
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            w.write_all(b"\n")?;
+        }
+        w.write_all(output::console::escape_control(line).as_bytes())?;
+    }
+    Ok(())
+}
+
+/// The errors of `chain`, as anyhow's `{:?}` writes them — the message, then
+/// `Caused by:` and each cause indented, numbered when there are several —
+/// each message as [`terminal_message`] gives it, with no line break at the
+/// end. A parse error's position and source line follow the message; a cause
+/// that says nothing new ([`error::telling_errors`]) is left out.
+fn write_chain(
+    chain: anyhow::Chain<'_>,
+    use_color: bool,
+    w: &mut dyn Write,
+) -> std::io::Result<()> {
+    let position = error::parse_position(chain.clone());
+    let mut errors = error::telling_errors(chain);
+    if let Some(top) = errors.next() {
+        write_escaped(&terminal_message(top), w)?;
+    }
+    if let Some(at) = position {
+        write!(w, "\n{}", output::error::source_block(&at, use_color))?;
+    }
+    let causes: Vec<String> = errors.map(terminal_message).collect();
+    if causes.is_empty() {
+        return Ok(());
+    }
+    let mut text = String::from("\n\nCaused by:");
+    let numbered = causes.len() > 1;
+    for (n, cause) in causes.iter().enumerate() {
+        text.push('\n');
+        for (i, line) in cause.split('\n').enumerate() {
+            match (numbered, i) {
+                (true, 0) => text.push_str(&format!("{n:>5}: ")),
+                (true, _) => text.push_str("\n       "),
+                (false, 0) => text.push_str("    "),
+                (false, _) => text.push_str("\n    "),
+            }
+            text.push_str(line);
+        }
+    }
+    write_escaped(&text, w)
+}
+
+/// The backtrace anyhow captured (`RUST_BACKTRACE`), as its `{:?}` writes
+/// it; nothing when it captured none.
+fn write_backtrace(err: &anyhow::Error, w: &mut dyn Write) -> std::io::Result<()> {
+    let backtrace = err.backtrace();
+    if backtrace.status() != std::backtrace::BacktraceStatus::Captured {
+        return Ok(());
+    }
+    let mut text = backtrace.to_string();
+    if text.starts_with("stack backtrace:") {
+        text.replace_range(0..1, "S");
+    } else {
+        text.insert_str(0, "Stack backtrace:\n");
+    }
+    write_escaped(&format!("\n\n{}", text.trim_end()), w)
 }
 
 /// The message of `err` for the terminal. A `dq_core` error dq knows to be
@@ -480,7 +511,7 @@ mod tests {
     /// pins the backtrace itself.
     fn rendered(err: impl std::error::Error + Send + Sync + 'static) -> String {
         let mut out = Vec::new();
-        render_error(&anyhow::Error::new(err), &mut out).expect("render");
+        render_error(&anyhow::Error::new(err), false, &mut out).expect("render");
         let text = String::from_utf8(out).expect("utf-8");
         match text.find("\n\nStack backtrace:") {
             Some(at) => format!("{}\n", &text[..at]),
@@ -525,8 +556,8 @@ mod tests {
             file: Some("f.yaml".into()),
             line,
             col: 4,
-            span: 0..0,
-            snippet: String::new(),
+            span: 9..11,
+            snippet: "a: [b".into(),
             message: "bad".into(),
         }
     }
@@ -535,7 +566,7 @@ mod tests {
     fn a_parse_error_is_placed_on_the_line_after_its_message() {
         assert_eq!(
             rendered(parse_err(3)),
-            "parse error in f.yaml: bad\n  --> f.yaml:3:4\n"
+            "parse error in f.yaml: bad\n  --> f.yaml:3:4\n   |\n 3 | a: [b\n   |    ^~\n"
         );
         // No position in a file.
         assert_eq!(rendered(parse_err(0)), "parse error in f.yaml: bad\n");
@@ -552,13 +583,395 @@ mod tests {
     fn a_parse_error_below_another_error_is_placed_too() {
         let err = anyhow::Error::new(parse_err(3)).context("while reading");
         let mut out = Vec::new();
-        render_error(&err, &mut out).expect("render");
+        render_error(&err, false, &mut out).expect("render");
         let text = String::from_utf8(out).expect("utf-8");
         assert!(
             text.starts_with(
-                "while reading\n  --> f.yaml:3:4\n\nCaused by:\n    parse error in f.yaml: bad\n"
+                "while reading\n  --> f.yaml:3:4\n   |\n 3 | a: [b\n   |    ^~\n\n\
+                 Caused by:\n    parse error in f.yaml: bad\n"
             ),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn colour_adds_styles_to_the_block_only() {
+        let err = anyhow::Error::new(parse_err(3));
+        let mut out = Vec::new();
+        render_error(&err, true, &mut out).expect("render");
+        let text = String::from_utf8(out).expect("utf-8");
+        assert!(
+            text.starts_with(
+                "parse error in f.yaml: bad\n\u{1b}[2m  --> f.yaml:3:4\u{1b}[0m\n\
+                 \u{1b}[2m   |\u{1b}[0m\n"
+            ),
+            "{text:?}"
+        );
+        // Any other error has no colour.
+        let err = anyhow::Error::new(dq_core::Error::UnsupportedFormat {
+            name: "\u{1b}x".into(),
+        });
+        let mut out = Vec::new();
+        render_error(&err, true, &mut out).expect("render");
+        let text = String::from_utf8(out).expect("utf-8");
+        assert!(
+            text.starts_with("unsupported format '\\x1bx'\n"),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn a_cause_the_message_above_it_holds_is_left_out() {
+        let io = |message: &str| dq_core::Error::Io {
+            path: "m.json".into(),
+            source: std::io::Error::other(message.to_owned()),
+        };
+        assert_eq!(rendered(io("gone")), "I/O error reading 'm.json': gone\n");
+        let wrapped = anyhow::Error::new(io("gone")).context("cannot start");
+        let mut out = Vec::new();
+        render_error(&wrapped, false, &mut out).expect("render");
+        let text = String::from_utf8(out).expect("utf-8");
+        assert!(
+            text.starts_with("cannot start\n\nCaused by:\n    I/O error reading 'm.json': gone\n")
+                && text.matches("gone").count() == 1,
+            "{text}"
+        );
+        // Causes that say something new are numbered as before.
+        let wrapped = wrapped.context("top");
+        let mut out = Vec::new();
+        render_error(&wrapped, false, &mut out).expect("render");
+        let text = String::from_utf8(out).expect("utf-8");
+        assert!(
+            text.starts_with(
+                "top\n\nCaused by:\n    0: cannot start\n    1: I/O error reading 'm.json': gone\n"
+            ) && text.matches("gone").count() == 1,
+            "{text}"
+        );
+    }
+
+    /// The text of `render_error` of an error of `messages`, the cause of the
+    /// others first, without the backtrace.
+    fn rendered_chain(messages: &[&'static str]) -> String {
+        let (cause, above) = messages.split_first().expect("a message");
+        let err = above
+            .iter()
+            .fold(anyhow::Error::msg(*cause), |err, message| {
+                err.context(*message)
+            });
+        let mut out = Vec::new();
+        render_error(&err, false, &mut out).expect("render");
+        let text = String::from_utf8(out).expect("utf-8");
+        match text.find("\n\nStack backtrace:") {
+            Some(at) => format!("{}\n", &text[..at]),
+            None => text,
+        }
+    }
+
+    #[test]
+    fn a_cause_is_compared_with_the_message_right_above_it() {
+        assert_eq!(rendered_chain(&["a: b"]), "a: b\n");
+        assert_eq!(rendered_chain(&["b", "a: b"]), "a: b\n");
+        assert_eq!(
+            rendered_chain(&["c", "b", "a: b: c"]),
+            "a: b: c\n\nCaused by:\n    c\n"
+        );
+        // Left out or not, a cause is what the one below it is compared with.
+        assert_eq!(rendered_chain(&["c", "b: c", "a: b: c"]), "a: b: c\n");
+        // One left is not numbered, two are, from 0.
+        assert_eq!(
+            rendered_chain(&["more", "b", "a: b"]),
+            "a: b\n\nCaused by:\n    more\n"
+        );
+        assert_eq!(
+            rendered_chain(&["two", "b", "a: b", "one"]),
+            "one\n\nCaused by:\n    0: a: b\n    1: two\n"
+        );
+        // Held by the cause, not by the message.
+        assert_eq!(
+            rendered_chain(&["a: b", "a"]),
+            "a\n\nCaused by:\n    a: b\n"
+        );
+    }
+
+    #[test]
+    fn a_cause_of_a_rule_or_a_plugin_error_is_left_out_when_the_message_holds_it() {
+        assert_eq!(
+            rendered(dq_exec::ExecError::Io {
+                path: "r.yml".into(),
+                source: std::io::Error::other("gone"),
+            }),
+            "io error reading r.yml: gone\n"
+        );
+        assert_eq!(
+            rendered(dq_core::Error::WriteIo {
+                path: "f.yaml".into(),
+                source: std::io::Error::other("full"),
+            }),
+            "I/O error writing 'f.yaml': full\n"
+        );
+        // The message of this one says nothing of why.
+        let source = serde_json::from_str::<serde_json::Value>("[").expect_err("malformed");
+        assert_eq!(
+            rendered(dq_plugin::PluginError::MalformedFix {
+                rule_id: "p.r".into(),
+                source,
+            }),
+            "plugin rule p.r returned malformed fix payload\n\nCaused by:\n    \
+             EOF while parsing a list at line 1 column 1\n"
+        );
+    }
+
+    /// What a terminal acts on — ESC with a whole colour sequence, C1 CSI, a
+    /// direction control, a line separator, NUL — and the escapes of it.
+    const RAW: &str = "a\u{1b}[2mb\u{9b}2Jc\u{202e}d\u{2028}e\0f";
+    const SHOWN: &str = "a\\x1b[2mb\\x9b2Jc\\u202ed\\u2028e\\x00f";
+
+    /// Whether a terminal acts on a character of `text`, its line breaks
+    /// apart.
+    fn holds_a_control(text: &str) -> bool {
+        text.chars()
+            .any(|c| c != '\n' && (c.is_control() || matches!(c, '\u{202e}' | '\u{2028}')))
+    }
+
+    /// `render` without colour, checked: no control is in it, and with colour
+    /// it is the same but for the styles of the source block, when there is
+    /// one.
+    fn checked(render: impl Fn(bool, &mut Vec<u8>) -> std::io::Result<()>) -> String {
+        let text = |use_color| {
+            let mut out = Vec::new();
+            render(use_color, &mut out).expect("render");
+            let text = String::from_utf8(out).expect("utf-8");
+            match text.find("\n\nStack backtrace:") {
+                Some(at) => format!("{}\n", &text[..at]),
+                None => text,
+            }
+        };
+        let plain = text(false);
+        assert!(!holds_a_control(&plain), "{plain:?}");
+        let coloured = text(true);
+        let unstyled = ["\u{1b}[2m", "\u{1b}[1;31m", "\u{1b}[0m"]
+            .iter()
+            .fold(coloured.clone(), |text, style| text.replace(style, ""));
+        // A style of the text itself would be gone from `unstyled` and is
+        // escaped in `plain`.
+        assert_eq!(unstyled, plain, "{coloured:?}");
+        assert_eq!(
+            coloured != plain,
+            plain.contains("\n  --> "),
+            "only a source block has styles: {coloured:?}"
+        );
+        plain
+    }
+
+    /// [`checked`] of [`render_error`].
+    fn escaped(err: impl Into<anyhow::Error>) -> String {
+        let err = err.into();
+        checked(|use_color, w| render_error(&err, use_color, w))
+    }
+
+    #[test]
+    fn controls_of_every_message_are_escaped() {
+        use dq_core::Error as E;
+        let raw = || RAW.to_owned();
+        let io = || std::io::Error::other(raw());
+        let cases: Vec<(anyhow::Error, String)> = vec![
+            (anyhow::anyhow!(raw()), SHOWN.into()),
+            // The CLI's own.
+            (error::InvalidInput::new(raw()).into(), SHOWN.into()),
+            (
+                error::WrongType {
+                    action: "list the keys of",
+                    pointer: raw(),
+                    found: "int",
+                    expected: "an object",
+                }
+                .into(),
+                format!("cannot list the keys of '{SHOWN}': it is int, not an object"),
+            ),
+            (
+                DocOutOfRange {
+                    index: 3,
+                    count: 1,
+                    file: raw(),
+                }
+                .into(),
+                format!("--doc 3 is out of range: {SHOWN} holds 1 document(s) (--doc 0)"),
+            ),
+            // `dq_core`'s.
+            (
+                E::Io {
+                    path: raw().into(),
+                    source: io(),
+                }
+                .into(),
+                format!("I/O error reading '{SHOWN}': {SHOWN}"),
+            ),
+            (
+                E::WriteIo {
+                    path: raw().into(),
+                    source: io(),
+                }
+                .into(),
+                format!("I/O error writing '{SHOWN}': {SHOWN}"),
+            ),
+            (
+                E::UnsupportedFormat { name: raw() }.into(),
+                format!("unsupported format '{SHOWN}'"),
+            ),
+            (
+                E::Format {
+                    format: "csv",
+                    message: raw(),
+                }
+                .into(),
+                format!("csv format error: {SHOWN}"),
+            ),
+            (
+                E::EditRejected {
+                    action: "set",
+                    pointer: raw(),
+                    reason: raw(),
+                }
+                .into(),
+                format!("cannot set '{SHOWN}': {SHOWN}"),
+            ),
+            // A template refusal: its message has two lines.
+            (
+                E::TemplatedFile {
+                    line: 2,
+                    snippet: raw(),
+                    hint: raw(),
+                }
+                .into(),
+                format!("file contains Go template syntax (line 2): {SHOWN}\n  hint: {SHOWN}"),
+            ),
+            // A rule's and a plugin's keep their line breaks.
+            (
+                dq_exec::ExecError::FixApply {
+                    rule_id: raw(),
+                    message: format!("{RAW}\n{RAW}"),
+                }
+                .into(),
+                format!("rule {SHOWN} fix failed: {SHOWN}\n{SHOWN}"),
+            ),
+            (
+                dq_plugin::PluginError::Load {
+                    path: raw().into(),
+                    message: format!("{RAW}\n{RAW}"),
+                }
+                .into(),
+                format!("failed to load plugin {SHOWN}: {SHOWN}\n{SHOWN}"),
+            ),
+        ];
+        for (err, shown) in cases {
+            assert_eq!(escaped(err), format!("{shown}\n"));
+        }
+    }
+
+    #[test]
+    fn controls_of_a_cause_are_escaped() {
+        assert_eq!(
+            escaped(anyhow::anyhow!(RAW).context("top")),
+            format!("top\n\nCaused by:\n    {SHOWN}\n")
+        );
+        // Several, of several lines: every line of every one.
+        assert_eq!(
+            escaped(
+                anyhow::anyhow!("last {RAW}\n{RAW}")
+                    .context(format!("first {RAW}\n{RAW}"))
+                    .context(format!("top {RAW}"))
+            ),
+            format!(
+                "top {SHOWN}\n\nCaused by:\n    0: first {SHOWN}\n       {SHOWN}\n    \
+                 1: last {SHOWN}\n       {SHOWN}\n"
+            )
+        );
+        // Below the source block, too.
+        let parse = dq_core::Error::parse_at(b"[", 0..1, RAW);
+        assert_eq!(
+            escaped(anyhow::Error::new(parse).context("reading")),
+            format!(
+                "reading\n  --> <stdin>:1:1\n   |\n 1 | [\n   | ^\n\n\
+                 Caused by:\n    parse error: {SHOWN}\n"
+            )
+        );
+    }
+
+    /// clap takes a terminal's sequences out of its text itself, and leaves
+    /// what is no such sequence.
+    #[test]
+    fn controls_of_a_usage_error_are_escaped() {
+        for control in ['\u{1b}', '\u{9b}', '\u{202e}', '\u{2028}', '\0', '\u{7}'] {
+            let usage = cli::usage_error(
+                clap::error::ErrorKind::ArgumentConflict,
+                format!("no a{control}[b here"),
+            );
+            let text = escaped(usage);
+            assert!(text.starts_with("error: no a"), "{control:?}: {text:?}");
+            assert!(text.contains("\n\nUsage: "), "{control:?}: {text:?}");
+            // The others are part of a sequence clap takes out, or make one.
+            if let Some(escape) = match control {
+                '\u{9b}' => Some("\\x9b"),
+                '\u{202e}' => Some("\\u202e"),
+                '\u{2028}' => Some("\\u2028"),
+                _ => None,
+            } {
+                let want = format!("error: no a{escape}[b here\n\n");
+                assert!(text.starts_with(&want), "{text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn controls_of_every_field_of_a_path_error_are_escaped() {
+        let raw = || RAW.to_owned();
+        let path = |kind| dq_core::Error::Path {
+            pointer: raw(),
+            matched_prefix: raw(),
+            kind,
+            did_you_mean: vec![raw(), raw()],
+        };
+        let fields = format!(
+            "\n  matched prefix: {SHOWN}\n  did_you_mean: {SHOWN}, {SHOWN}\n  pointer: {SHOWN}\n"
+        );
+        assert_eq!(
+            escaped(path(dq_core::PathErrorKind::MissingKey)),
+            format!("path '{SHOWN}' not found (matched up to '{SHOWN}'){fields}")
+        );
+        assert_eq!(
+            escaped(path(dq_core::PathErrorKind::IntoItsOwnChild {
+                from: raw()
+            })),
+            format!(
+                "cannot move '{SHOWN}' to '{SHOWN}': a value cannot move into one of its own \
+                 children{fields}"
+            )
+        );
+    }
+
+    #[test]
+    fn controls_of_a_parse_error_are_escaped() {
+        // The error is at the last character of the line.
+        let err = || dq_core::Error::Parse {
+            file: Some(RAW.into()),
+            line: 1,
+            col: u32::try_from(RAW.len()).expect("short"),
+            span: RAW.len() - 1..RAW.len(),
+            snippet: RAW.to_owned(),
+            message: RAW.to_owned(),
+        };
+        let want = format!(
+            "parse error in {SHOWN}: {SHOWN}\n  --> {SHOWN}:1:{}\n   |\n 1 | {SHOWN}\n   | {:2$}^\n",
+            RAW.len(),
+            "",
+            SHOWN.len() - 1,
+        );
+        assert_eq!(escaped(err()), want);
+        // The one `validate` prints itself.
+        let err = err();
+        assert_eq!(
+            checked(|use_color, w| render_core_error(&err, use_color, w)),
+            want
         );
     }
 

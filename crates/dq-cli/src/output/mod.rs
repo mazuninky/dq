@@ -8,6 +8,7 @@
 //! than constructing their own.
 
 pub mod console;
+pub(crate) mod error;
 pub mod json;
 pub mod jsonl;
 pub mod junit;
@@ -276,6 +277,26 @@ pub trait Reporter {
     }
 }
 
+/// Whether each of the two streams is coloured: stdout as [`resolve_color`]
+/// decides, stderr as [`resolve_log_color`]. A `bool` stands for both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamColors {
+    /// The command's output.
+    pub stdout: bool,
+    /// The error `validate` prints (and the one [`crate::render_error`] is
+    /// given).
+    pub stderr: bool,
+}
+
+impl From<bool> for StreamColors {
+    fn from(use_color: bool) -> Self {
+        Self {
+            stdout: use_color,
+            stderr: use_color,
+        }
+    }
+}
+
 /// Resolve whether output should be coloured.
 ///
 /// Precedence (highest to lowest):
@@ -292,9 +313,10 @@ pub fn resolve_color(no_color_flag: bool) -> bool {
     color_for_stream(no_color_flag, std::io::stdout().is_terminal())
 }
 
-/// Resolve whether log output should be coloured.
+/// Resolve whether log output, and the error a command fails with, should
+/// be coloured.
 ///
-/// Logs go to stderr, so this is [`resolve_color`] with stderr in place of
+/// Both go to stderr, so this is [`resolve_color`] with stderr in place of
 /// stdout: `--no-color`, then `NO_COLOR`, then `CLICOLOR_FORCE`, then
 /// whether stderr is a TTY.
 #[must_use]

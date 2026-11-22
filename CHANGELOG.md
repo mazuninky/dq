@@ -8,6 +8,23 @@ breaking changes are listed first under Changed.
 
 ## [Unreleased]
 
+### Added
+
+- A parse error shows the source line with a caret under what is wrong, on
+  every command:
+
+  ```
+  parse error in bad.json: expected JSON value (object, array, scalar)
+    --> bad.json:2:14
+     |
+   2 |   "b": [1, 2,, 3]
+     |              ^
+  ```
+
+  Control characters of the line are escaped, tabs and wide characters are
+  accounted for, and a line over 120 columns is cut around the caret. Output
+  under `-F json` does not change.
+
 ### Changed
 
 - jq `halt`, `halt_error` and `halt_error/1` are a runtime error, in rules,
@@ -26,6 +43,12 @@ breaking changes are listed first under Changed.
 - Rule directories follow symbolic links and take `.yml` / `.yaml` in any case.
   Rules added with `dq rules add --symlink` were never loaded. A link to nothing
   is exit 5. `dq test DIR` follows links too.
+- An error no longer repeats its cause: `Caused by:` leaves out a cause whose
+  text the message above it already holds (I/O, write, rule and glob errors
+  printed it twice), and so does an entry of the bulk summary.
+- `dq validate` on the console prints that block instead of `kind:` /
+  `file:` / `line:` / `col:` / `message:` / `snippet:` lines. The machine
+  formats (`-F json`, `sarif`, …) are unchanged.
 - A parse error prints its place on a second line, `  --> FILE:LINE:COL`
   (`<stdin>` for input on stdin), and the bulk summary ends the entry with
   ` (line L, column C)`. The place left the message itself: YAML's
@@ -73,6 +96,15 @@ breaking changes are listed first under Changed.
   0; it is now exit 5 or 6.
 - `dq fix --parallel` hung when a worker logged a warning: the run held the lock
   on stderr that the log needs.
+- A usage error that names the file (`-F yaml … keeps FILE in its own format`)
+  shows the name whole and on one line: a line break in it started a line of
+  its own, and terminal sequences were dropped from it.
+- `dq validate` on the console takes the colour of stderr, where it prints, not
+  of stdout.
+- `--check --continue-on-error` hid files that failed: with one file that does
+  not parse among clean ones it printed `0 files would be modified` and exited
+  0, so a CI gate passed (1 when other files would change). The run now lists
+  the failures under the summary and exits 7, as it does without `--check`.
 - Parse errors had a missing or wrong position in several formats: CSV and
   TSV (column 0, or the wrong line after a blank line), JSON Lines and
   `.env` (always column 1), INI, YAML and HCL (no source line, no byte

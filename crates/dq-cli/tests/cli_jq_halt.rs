@@ -3,10 +3,10 @@
 //! `halt_error(0)`) before the report of a lint, and in the middle of a bulk
 //! write.
 
-mod common;
+mod scratch;
 
-use common::{Run, Scratch};
 use pretty_assertions::assert_eq;
+use scratch::{Run, Scratch};
 
 const THING: &str = "kind: Thing\n";
 

@@ -106,9 +106,9 @@ fn snapshot_json_render_validate_malformed_json() {
 
 #[test]
 fn snapshot_console_render_validate_malformed_json() {
-    // Case 2 (console-render): validate without `-F json` writes the same
-    // structured error through the *console* reporter — still legible, with
-    // `: line:col` style location.
+    // Case 2 (console-render): validate without `-F json` writes the error
+    // as any command does: the message, the place, the source line and the
+    // caret.
     let f = fixture("broken.json");
     let f_str = f.to_str().unwrap();
     let out = dq()
@@ -117,19 +117,7 @@ fn snapshot_console_render_validate_malformed_json() {
         .unwrap();
     assert_eq!(out.status.code(), Some(4));
     let stderr = normalize_path(&String::from_utf8_lossy(&out.stderr), f_str);
-    insta::with_settings!({
-        filters => vec![
-            // Underlying serde_json message wording / position varies across
-            // versions; redact the human-text portion so the snapshot is
-            // resilient. The `kind: parse`, `file:`, `snippet:` fields are
-            // the load-bearing structure.
-            (r"line: \d+", "line: [NUM]"),
-            (r"col: \d+", "col: [NUM]"),
-            (r"message: .*", "message: [serde_json message]"),
-        ],
-    }, {
-        insta::assert_snapshot!("console_validate_malformed", stderr);
-    });
+    insta::assert_snapshot!("console_validate_malformed", stderr);
 }
 
 #[test]
