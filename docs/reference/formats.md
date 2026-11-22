@@ -453,12 +453,13 @@ gets a BOM, little-endian unless `bom` says otherwise; `UTF-16LE` and
   The writer takes `detected: UTF-8` only under a UTF-16 label (exit 1
   otherwise).
 
-The reader refuses, with exit 3, naming in the message where the name at
-fault begins (`XML parse error at line 2, column 4: element <a:b> uses the
-prefix 'a', …`), or the declaration's `encoding` label (line 1, column 31
-in `<?xml version="1.0" encoding="UTF-32"?>`, a BOM not counted), as
-`dq validate` does in its `line` / `col` fields. Bytes the encoding
-cannot read name their byte index instead:
+The reader refuses, with exit 3, placing the error where the name at
+fault begins (`XML parse error: element <a:b> uses the prefix 'a', …`, at
+2:4), or at the declaration's `encoding` label (line 1, column 31
+in `<?xml version="1.0" encoding="UTF-32"?>`, a BOM not counted). The
+place is the error's `line` / `col`, which the `-->` line on the console
+and `dq validate`'s `line` / `col` fields show. Bytes the encoding cannot
+read are at the byte itself. What it refuses:
 
 - malformed markup, in dq's words at the markup, attribute or reference
   at fault: a tag, comment, CDATA section, PI, attribute value or

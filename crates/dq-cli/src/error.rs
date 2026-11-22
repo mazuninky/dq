@@ -14,6 +14,48 @@
 
 use std::fmt;
 
+use camino::Utf8Path;
+
+/// Where a file does not parse: the position of a
+/// [`dq_core::Error::Parse`], whose message has none of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ParsePosition<'e> {
+    /// The file; `None` for stdin.
+    pub(crate) file: Option<&'e Utf8Path>,
+    /// 1-based line.
+    pub(crate) line: u32,
+    /// 1-based column, in bytes.
+    pub(crate) col: u32,
+}
+
+/// The position of the parse error in the chain of `err`. `None` when there
+/// is none, and for one that has no place in a file: a jq compile error (of
+/// `query` or `set --jq`) is about the expression.
+pub(crate) fn parse_position(err: &anyhow::Error) -> Option<ParsePosition<'_>> {
+    err.chain().find_map(|cause| {
+        let err = cause.downcast_ref::<dq_core::Error>()?;
+        let (line, col) = err.place()?;
+        let file = match err {
+            dq_core::Error::Parse { file, .. } => file.as_deref(),
+            _ => None,
+        };
+        Some(ParsePosition {
+            // An edit of stdin names it `-`.
+            file: file.filter(|file| *file != "-"),
+            line,
+            col,
+        })
+    })
+}
+
+/// The position of the parse error in the chain of `err`, to end a line
+/// that shows the error: ` (line 4, column 2)`. Empty when there is none.
+pub(crate) fn position_note(err: &anyhow::Error) -> String {
+    parse_position(err)
+        .map(|at| format!(" (line {}, column {})", at.line, at.col))
+        .unwrap_or_default()
+}
+
 /// "Fail with exit code 1, but write nothing to stderr."
 ///
 /// `main.rs` checks for this via `downcast_ref::<SilentError>()` before

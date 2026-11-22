@@ -23,6 +23,20 @@ Each has its own page with the design and the remaining steps.
   repository; fixtures cannot carry a `path`, so `match.glob` cannot be
   tested.
 
+## Open bugs
+
+Found while testing parse-error positions (2026-11-22), not part of that
+change:
+
+- JSON Lines refuses a blank line behind a byte order mark
+  (`\u{feff}\n{"a":1}\n` is `EOF while parsing a value`).
+- INI and `.env` do not strip a byte order mark: it becomes part of the
+  first section name or key, and `\u{feff}# c` in `.env` is a parse error.
+- A composite rule's `parse-failed` diagnostic places the inner text only
+  where it stands in the file as it is: a YAML block scalar loses the indent
+  in the column, a block-quoted fence the quote mark, and a quoted string's
+  escapes shift the lines.
+
 ## Known limits, not dq bugs
 
 - `{n: !!str}` with no space before `}` is rejected by every YAML reader
@@ -39,7 +53,7 @@ What is left is a feature, not a bug, plus a few known limits of that work:
 - **Structured errors**: no caret under the offending byte, and no JSON
   error object on stderr under `-F json` (only `validate` and `lint` emit
   structured output for a file that does not parse). Agent-first error
-  output was a founding goal.
+  output was a founding goal. Design: [plans/structured-errors.md](plans/structured-errors.md).
 - **Textual edits for XML, HCL, INI, dotenv and CSV.** Point edits on these
   formats rewrite the file through its writer, so comments and layout are
   lost (XML keeps its comments). Comment-keeping edits, as YAML and TOML

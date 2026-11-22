@@ -32,31 +32,20 @@ impl Format for Jsonl {
         // Splitting on `\n` keeps the final partial line if the file isn't
         // newline-terminated. `is_empty` skip handles the trailing-newline
         // case so we don't emit a stray `Null` at the end.
-        let text = std::str::from_utf8(bytes).map_err(|e| Error::Parse {
-            file: None,
-            line: 0,
-            col: 0,
-            span: 0..0,
-            snippet: String::new(),
-            message: format!("invalid UTF-8 in JSONL input: {e}"),
-        })?;
+        let text =
+            std::str::from_utf8(bytes).map_err(|e| Error::invalid_utf8(bytes, e, "JSONL"))?;
         let mut items: Vec<Value> = Vec::new();
+        let mut line_start = 0;
         for (lineno, raw) in text.split('\n').enumerate() {
+            let start = line_start;
+            line_start += raw.len() + 1;
             let line = raw.trim_end_matches('\r');
             if line.trim().is_empty() {
                 continue;
             }
-            let doc = Json.parse(line.as_bytes()).map_err(|e| match e {
-                Error::Parse { message, .. } => Error::Parse {
-                    file: None,
-                    line: (lineno + 1) as u32,
-                    col: 1,
-                    span: 0..0,
-                    snippet: line.to_owned(),
-                    message,
-                },
-                other => other,
-            })?;
+            let doc = Json
+                .parse(line.as_bytes())
+                .map_err(|e| e.relocated(line.as_bytes(), bytes, |at| start + at))?;
             if doc.is_multi() {
                 // Each line must be a single JSON value; embedded multi
                 // documents would mean unexpected structure.
@@ -186,6 +175,31 @@ mod tests {
             panic!()
         };
         assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn a_parse_error_is_placed_in_the_file() {
+        for (bytes, line, col, span, snippet) in [
+            ("{\"a\":1}\r\n\r\n{\"я\":,}\r\n", 3, 7, 17..18, "{\"я\":,}"),
+            // The end of a line cut short is the end of that line.
+            ("[1\n[2]\n", 1, 3, 2..2, "[1"),
+            ("\u{feff}[,]\n", 1, 2, 4..5, "[,]"),
+        ] {
+            match Jsonl.parse(bytes.as_bytes()).expect_err("must fail") {
+                Error::Parse {
+                    line: at_line,
+                    col: at_col,
+                    span: at_span,
+                    snippet: at_snippet,
+                    ..
+                } => assert_eq!(
+                    (at_line, at_col, at_span, at_snippet.as_str()),
+                    (line, col, span, snippet),
+                    "{bytes:?}"
+                ),
+                other => panic!("{other:?}"),
+            }
+        }
     }
 
     #[test]

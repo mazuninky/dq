@@ -47,35 +47,61 @@ fn run(dir: &TempDir, args: &[&str]) -> (i32, Vec<u8>, String) {
     )
 }
 
-/// The `(exit code, stdout, stderr)` a run is expected to end with.
-type Outcome = (i32, Vec<u8>, String);
+/// What a run is expected to end with.
+struct Outcome {
+    code: i32,
+    stdout: Vec<u8>,
+    stderr: String,
+    /// The line and column `validate` reports for the file a `convert` case
+    /// reads.
+    at: Option<(u32, u32)>,
+}
 
-/// `(0, stdout, "")`.
+impl Outcome {
+    fn new(code: i32, stdout: impl Into<Vec<u8>>, stderr: String) -> Self {
+        Self {
+            code,
+            stdout: stdout.into(),
+            stderr,
+            at: None,
+        }
+    }
+}
+
+/// Exit 0 with `stdout`.
 fn ok(stdout: impl Into<Vec<u8>>) -> Outcome {
-    (0, stdout.into(), String::new())
+    Outcome::new(0, stdout, String::new())
 }
 
 /// The XML writer's refusal: exit 1 and `message` on stderr.
 fn refused(message: &str) -> Outcome {
-    (
-        1,
-        Vec::new(),
-        format!("xml format error: XML write: {message}\n"),
-    )
+    Outcome::new(1, "", format!("xml format error: XML write: {message}\n"))
 }
 
-/// A reader's refusal of `file`: exit 3 and `message` on stderr.
-fn unreadable(file: &str, message: &str) -> Outcome {
-    (3, Vec::new(), format!("parse error in {file}: {message}\n"))
+/// A reader's refusal of `file`: exit 3 and on stderr `message`, which
+/// holds no position, then `line` and `col`; the same two from `validate`.
+fn unreadable(file: &str, line: u32, col: u32, message: &str) -> Outcome {
+    let stderr = format!("parse error in {file}: {message}\n  --> {file}:{line}:{col}\n");
+    Outcome {
+        at: Some((line, col)),
+        ..Outcome::new(3, "", stderr)
+    }
 }
 
-/// The XML reader's refusal of `file` at `line` and `col`, where the name
-/// at fault begins: exit 3 and `message` on stderr, placed.
+/// The XML reader's refusal of `file` ([`unreadable`]), at `line` and `col`,
+/// where the name at fault begins.
 fn unreadable_at(file: &str, line: u32, col: u32, message: &str) -> Outcome {
-    unreadable(
-        file,
-        &format!("XML parse error at line {line}, column {col}: {message}"),
-    )
+    unreadable(file, line, col, &format!("XML parse error: {message}"))
+}
+
+/// The line and column of the one diagnostic `dq validate -F json` reports
+/// for `file`.
+fn place_of(dir: &TempDir, file: &str) -> Option<(u32, u32)> {
+    let (_, _, stderr) = run(dir, &["-F", "json", "validate", file]);
+    let report: serde_json::Value = serde_json::from_str(&stderr).ok()?;
+    let diagnostic = &report["diagnostics"][0];
+    let field = |name: &str| u32::try_from(diagnostic[name].as_u64()?).ok();
+    Some((field("line")?, field("col")?))
 }
 
 /// Run every `(args, outcome)` case in `dir` and fail once, listing every
@@ -84,12 +110,24 @@ fn assert_cases(dir: &TempDir, cases: &[(Vec<&str>, Outcome)]) {
     let mut wrong = Vec::new();
     for (args, expected) in cases {
         let actual = run(dir, args);
-        if actual != *expected {
+        let at = expected.at.and_then(|_| match args.as_slice() {
+            ["convert", file, ..] => place_of(dir, file),
+            _ => None,
+        });
+        if actual
+            != (
+                expected.code,
+                expected.stdout.clone(),
+                expected.stderr.clone(),
+            )
+            || at != expected.at
+        {
             wrong.push(format!(
-                "{args:?}\n  expected {} {:?} {:?}\n  actual   {} {:?} {:?}",
-                expected.0,
-                String::from_utf8_lossy(&expected.1),
-                expected.2,
+                "{args:?}\n  expected {} {:?} {:?} {:?}\n  actual   {} {:?} {:?} {at:?}",
+                expected.code,
+                String::from_utf8_lossy(&expected.stdout),
+                expected.stderr,
+                expected.at,
                 actual.0,
                 String::from_utf8_lossy(&actual.1),
                 actual.2,
@@ -328,21 +366,23 @@ fn malformed_bytes_in_the_input_encoding_are_a_parse_error() {
         &[
             (
                 convert("odd.xml", "json"),
-                unreadable("odd.xml", "invalid UTF-16LE in XML input"),
+                unreadable("odd.xml", 1, 10, "invalid UTF-16LE in XML input"),
             ),
             (
                 convert("lone.xml", "json"),
-                unreadable("lone.xml", "invalid UTF-16LE in XML input"),
+                unreadable("lone.xml", 1, 4, "invalid UTF-16LE in XML input"),
             ),
             (
                 convert("sjis.xml", "json"),
-                unreadable("sjis.xml", "invalid Shift_JIS in XML input"),
+                unreadable("sjis.xml", 1, 46, "invalid Shift_JIS in XML input"),
             ),
             (
                 convert("bare.xml", "json"),
                 unreadable(
                     "bare.xml",
-                    "invalid UTF-8 in XML input: invalid utf-8 sequence of 1 bytes from index 6",
+                    1,
+                    7,
+                    "invalid UTF-8 in XML input: invalid utf-8 sequence of 1 bytes",
                 ),
             ),
         ],
@@ -516,7 +556,9 @@ fn encoding_labels_follow_their_iana_aliases() {
         convert("ansi.xml", "json"),
         unreadable(
             "ansi.xml",
-            "invalid US-ASCII in XML input: byte 0x80 at index 50",
+            1,
+            51,
+            "invalid US-ASCII in XML input: byte 0x80",
         ),
     ));
     assert_cases(&dir, &cases);
@@ -1347,8 +1389,8 @@ fn the_reader_refuses_every_declaration_the_writer_does() {
 }
 
 /// `dq validate` reports on stderr where the reader met an undeclared
-/// prefix: the line and column where the name at fault begins, in the
-/// fields and in the message.
+/// prefix: the line and column where the name at fault begins, and that
+/// line.
 #[test]
 fn an_undeclared_prefix_is_reported_with_its_line_and_column() {
     let dir = dir_with(&[
@@ -1360,12 +1402,12 @@ fn an_undeclared_prefix_is_reported_with_its_line_and_column() {
         ),
     ]);
     let report = |file: &str, line: u32, col: u32, message: &str, snippet: &str| {
-        (
+        Outcome::new(
             4,
-            Vec::new(),
+            "",
             format!(
-                "kind: parse\nfile: {file}\nline: {line}\ncol: {col}\nmessage: XML parse error \
-                 at line {line}, column {col}: {message}\nsnippet: {snippet}\n"
+                "kind: parse\nfile: {file}\nline: {line}\ncol: {col}\nmessage: XML parse error: \
+                 {message}\nsnippet: {snippet}\n"
             ),
         )
     };
@@ -1379,7 +1421,7 @@ fn an_undeclared_prefix_is_reported_with_its_line_and_column() {
                     2,
                     4,
                     "element <a:b> uses the prefix 'a', which no 'xmlns:a' declares in scope",
-                    "<r>\\n  <a:b>t</a:b>\\n</r>\\n",
+                    "  <a:b>t</a:b>",
                 ),
             ),
             (
@@ -1390,7 +1432,7 @@ fn an_undeclared_prefix_is_reported_with_its_line_and_column() {
                     5,
                     "attribute 'a:x' on <k> uses the prefix 'a', which no 'xmlns:a' declares in \
                      scope",
-                    "<r>\\n\\n <k a:x=\"1\"/>\\n</r>\\n",
+                    " <k a:x=\"1\"/>",
                 ),
             ),
             (
@@ -1400,7 +1442,7 @@ fn an_undeclared_prefix_is_reported_with_its_line_and_column() {
                     2,
                     12,
                     "the XML declaration's encoding \"UTF-32\" is one dq does not know",
-                    "on=\"1.0\"\\n encoding=\"UTF-32\"?>",
+                    " encoding=\"UTF-32\"?><r/>",
                 ),
             ),
         ],
@@ -1438,7 +1480,7 @@ fn replacement_labels_and_bad_iso_2022_jp_are_refused_on_read() {
             (convert("kr.xml", "json"), cannot("kr.xml", "csiso2022kr")),
             (
                 convert("jis.xml", "json"),
-                unreadable("jis.xml", "invalid ISO-2022-JP in XML input"),
+                unreadable("jis.xml", 1, 48, "invalid ISO-2022-JP in XML input"),
             ),
         ],
     );
@@ -1474,9 +1516,12 @@ fn whitespace_only_text_survives_set_and_in_place() {
     );
     assert_eq!(read(&dir, "ws.xml"), written.as_bytes());
     std::fs::write(dir.path().join("sep.xml"), "<d>&#x2028;</d>\n").expect("write sep.xml");
-    assert_eq!(
-        run(&dir, &convert("sep.xml", "json")),
-        ok("{\n  \"d\": [\n    {\n      \"#text\": \"\u{2028}\"\n    }\n  ]\n}\n")
+    assert_cases(
+        &dir,
+        &[(
+            convert("sep.xml", "json"),
+            ok("{\n  \"d\": [\n    {\n      \"#text\": \"\u{2028}\"\n    }\n  ]\n}\n"),
+        )],
     );
 }
 
@@ -2018,12 +2063,12 @@ fn the_writer_refuses_a_line_end_in_every_markup_place() {
 }
 
 /// A raw character the version does not allow is refused inside a PI and
-/// inside CDATA too, at its line and column, which count decoded
-/// characters — a UTF-16 file's as a UTF-8 file's, an astral character as
-/// one — and leave a UTF-8 BOM out. Allowed characters there read.
+/// inside CDATA too, at its line and column, which count the bytes of the
+/// decoded text in UTF-8 — a UTF-16 file's as a UTF-8 file's, an astral
+/// character as four — and leave a UTF-8 BOM out. Allowed characters there read.
 /// Before (7d12839), each read.
 #[test]
-fn a_raw_character_is_refused_in_markup_and_placed_by_characters() {
+fn a_raw_character_is_refused_in_markup_and_placed_by_bytes() {
     let v11 = "<?xml version=\"1.1\"?>";
     let astral = "<r>\n\u{1F600}\u{e9}\u{1}</r>";
     let files: Vec<(&str, Vec<u8>)> = vec![
@@ -2081,11 +2126,11 @@ fn a_raw_character_is_refused_in_markup_and_placed_by_characters() {
             ),
             (
                 convert("utf8.xml", "json"),
-                unreadable_at("utf8.xml", 2, 3, &not_10("U+0001")),
+                unreadable_at("utf8.xml", 2, 7, &not_10("U+0001")),
             ),
             (
                 convert("utf16.xml", "json"),
-                unreadable_at("utf16.xml", 2, 3, &not_10("U+0001")),
+                unreadable_at("utf16.xml", 2, 7, &not_10("U+0001")),
             ),
             (
                 convert("ok.xml", "xml"),
@@ -2131,7 +2176,7 @@ fn a_malformed_reference_or_attribute_is_placed() {
             ),
             (
                 convert("split.xml", "json"),
-                unreadable_at("split.xml", 1, 4, &no_number("&#x\n41;")),
+                unreadable_at("split.xml", 1, 4, &no_number("&#x\\x0a41;")),
             ),
             (
                 convert("split_name.xml", "json"),
@@ -2139,7 +2184,7 @@ fn a_malformed_reference_or_attribute_is_placed() {
                     "split_name.xml",
                     1,
                     4,
-                    "undeclared entity reference '&am\np;'",
+                    "undeclared entity reference '&am\\x0ap;'",
                 ),
             ),
             (
@@ -2205,13 +2250,13 @@ fn a_refused_label_is_placed_however_the_declaration_is_written() {
     );
 }
 
-/// `dq validate` refuses each of these with exit 4 and reports the same
-/// line and column in its `line` / `col` fields as the message names: a
-/// raw character (7d12839), a refused label (aa41529) and an attribute
+/// `dq validate` refuses each of these with exit 4 and reports the line
+/// and column in its `line` / `col` fields, and not in its message: a raw
+/// character (7d12839), a refused label (aa41529) and an attribute
 /// error (c7bb838). Before each, `line` / `col` were 0 or pointed past the
 /// tag. A well-formed document validates.
 #[test]
-fn validate_reports_the_line_and_column_its_message_names() {
+fn validate_reports_the_line_and_column_in_fields() {
     let dir = dir_with(&[
         ("pi.xml", b"<r><?p a\x01b?></r>"),
         (
@@ -2240,7 +2285,7 @@ fn validate_reports_the_line_and_column_its_message_names() {
         assert_eq!((code, stdout.as_slice()), (4, &b""[..]), "{file}: {stderr}");
         let fields = format!(
             "file: {file}\nline: {line}\ncol: {col}\n\
-             message: XML parse error at line {line}, column {col}: {message}\n"
+             message: XML parse error: {message}\n"
         );
         assert!(stderr.contains(&fields), "{file}: {stderr}");
     }

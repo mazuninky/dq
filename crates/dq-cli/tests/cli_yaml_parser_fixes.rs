@@ -202,9 +202,14 @@ fn a_collection_key_repeats_by_its_text() {
         assert_eq!(code, Some(3), "{}", String::from_utf8_lossy(src));
         assert_eq!(stdout, "");
         assert!(
-            stderr.ends_with(&format!(
-                "duplicate entry in YAML map at line {line} column 1\n"
-            )),
+            stderr.contains(": duplicate entry in YAML map\n  --> ")
+                && stderr.ends_with(&format!(":{line}:1\n")),
+            "{stderr}"
+        );
+        let (code, _, stderr) = outcome_of(&["validate"], &file, &[]);
+        assert_eq!(code, Some(4), "{stderr}");
+        assert!(
+            stderr.contains(&format!("\nline: {line}\ncol: 1\n")),
             "{stderr}"
         );
     }

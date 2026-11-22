@@ -19,6 +19,7 @@ pub use error::{
     DocOutOfRange, DocOutOfRangeEverywhere, LintFail, SilentError, ValidateFail, WrongType,
 };
 
+use std::borrow::Cow;
 use std::io::Write;
 
 use cli::InputFormat;
@@ -275,7 +276,8 @@ impl Reporter for BannedReporter {
 /// - For [`ValidateFail`] errors, the rendering is suppressed because the
 ///   validate handler has already streamed a structured error through its
 ///   reporter; printing again would duplicate the message.
-/// - For all other errors, the standard anyhow chain (`{:?}`) is written.
+/// - For all other errors, the standard anyhow chain (`{:?}`) is written; a
+///   parse error's position (`  --> FILE:LINE:COL`) follows the message.
 ///
 /// Every line is written escaped as the console reporter escapes text
 /// ([`output::console`]): a message echoes what the user typed and what
@@ -337,11 +339,18 @@ fn render_error_raw(err: &anyhow::Error, w: &mut dyn Write) -> std::io::Result<(
 /// `err` and the errors that caused it, as anyhow's `{:?}` writes them —
 /// the message, then `Caused by:` and each cause indented, numbered when
 /// there are several, then the backtrace when one was captured — each
-/// message as [`terminal_message`] gives it.
+/// message as [`terminal_message`] gives it. The position of a parse error
+/// is a line of its own after the message.
 fn write_chain(err: &anyhow::Error, w: &mut dyn Write) -> std::io::Result<()> {
     let mut chain = err.chain();
     if let Some(top) = chain.next() {
         write!(w, "{}", terminal_message(top))?;
+    }
+    if let Some(at) = error::parse_position(err) {
+        let file = at
+            .file
+            .map_or(Cow::Borrowed("<stdin>"), |file| one_line(file.as_str()));
+        write!(w, "\n  --> {file}:{}:{}", at.line, at.col)?;
     }
     let causes: Vec<_> = chain.collect();
     if !causes.is_empty() {
@@ -377,13 +386,14 @@ fn write_chain(err: &anyhow::Error, w: &mut dyn Write) -> std::io::Result<()> {
 }
 
 /// The message of `err` for the terminal. A `dq_core` error dq knows to be
-/// one line — a writer's refusal, a rejected edit, a path or I/O error —
-/// and the CLI's own are put on one line ([`dq_core::one_line`]), so a key,
-/// a pointer or a path they quote cannot break them. In the others only
-/// what the user or a file put there goes on one line — a parse error's
-/// file name, a template refusal's line, a rule's id and paths, a plugin's
-/// rule id and path — and the rest keeps its line breaks: a parse error's
-/// snippet, a wasm backtrace in a plugin's error. Any other error's
+/// one line — a parse error, a writer's refusal, a rejected edit, a path or
+/// I/O error — and the CLI's own are put on one line
+/// ([`dq_core::one_line`]), so what they quote of the user or a file cannot
+/// break them, and the place of a parse error stays on the line after it. In
+/// the others only what the user or a file put there goes on one line — a
+/// template refusal's line, a rule's id and paths, a plugin's rule id and
+/// path — and the rest keeps its line breaks: a wasm backtrace in a plugin's
+/// error. Any other error's
 /// message stays as it is. [`render_error`] escapes the controls of every
 /// line. The messages themselves keep the text as it is, for the
 /// machine-readable outputs that carry them.
@@ -393,10 +403,6 @@ fn terminal_message(err: &(dyn std::error::Error + 'static)) -> String {
     let text = err.to_string();
     if let Some(err) = err.downcast_ref::<dq_core::Error>() {
         return match err {
-            dq_core::Error::Parse {
-                file: Some(file), ..
-            } => one_line_fields(text, &[file.as_str()]),
-            dq_core::Error::Parse { .. } => text,
             dq_core::Error::TemplatedFile { snippet, .. } => one_line_fields(text, &[snippet]),
             _ => one_line(&text).into_owned(),
         };
@@ -504,6 +510,49 @@ mod tests {
             message: "two\nlines".into(),
         };
         assert_eq!(rendered(err), "rule r\\x0ax fix failed: two\nlines\n");
+    }
+
+    /// A parse error of `f.yaml` at `line`, column 4.
+    fn parse_err(line: u32) -> dq_core::Error {
+        dq_core::Error::Parse {
+            file: Some("f.yaml".into()),
+            line,
+            col: 4,
+            span: 0..0,
+            snippet: String::new(),
+            message: "bad".into(),
+        }
+    }
+
+    #[test]
+    fn a_parse_error_is_placed_on_the_line_after_its_message() {
+        assert_eq!(
+            rendered(parse_err(3)),
+            "parse error in f.yaml: bad\n  --> f.yaml:3:4\n"
+        );
+        // No position in a file.
+        assert_eq!(rendered(parse_err(0)), "parse error in f.yaml: bad\n");
+        // `validate` has reported it.
+        assert_eq!(
+            rendered(ValidateFail {
+                source: parse_err(3)
+            }),
+            ""
+        );
+    }
+
+    #[test]
+    fn a_parse_error_below_another_error_is_placed_too() {
+        let err = anyhow::Error::new(parse_err(3)).context("while reading");
+        let mut out = Vec::new();
+        render_error(&err, &mut out).expect("render");
+        let text = String::from_utf8(out).expect("utf-8");
+        assert!(
+            text.starts_with(
+                "while reading\n  --> f.yaml:3:4\n\nCaused by:\n    parse error in f.yaml: bad\n"
+            ),
+            "{text}"
+        );
     }
 
     #[test]

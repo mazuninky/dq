@@ -55,7 +55,7 @@ use crate::Result;
 use crate::WriteOptions;
 use crate::document::spans::{SpanContext, SpanMap, ValueSpan};
 use crate::document::{Document, FormatTag, Value, bom_end, line_start};
-use crate::error::Error;
+use crate::error::{Error, char_span};
 use crate::format::Format;
 use crate::textual_edit::{InsertionRenderer, ScalarRenderer};
 use crate::write_options::canonicalize_keys;
@@ -74,14 +74,7 @@ impl Format for Toml {
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<Document> {
-        let text = std::str::from_utf8(bytes).map_err(|e| Error::Parse {
-            file: None,
-            line: 0,
-            col: 0,
-            span: 0..0,
-            snippet: String::new(),
-            message: format!("invalid UTF-8 in TOML input: {e}"),
-        })?;
+        let text = std::str::from_utf8(bytes).map_err(|e| Error::invalid_utf8(bytes, e, "TOML"))?;
         // We parse via the immutable `toml_edit::Document` (named
         // `ImDocument` before 0.23) rather than `DocumentMut` because only
         // `Document::parse` preserves the byte spans on every node
@@ -89,22 +82,15 @@ impl Format for Toml {
         // §4 baseline never mutates the parsed DOM — splices land in
         // `original_bytes` — so the lack of mutation API is no constraint.
         let doc = TomlDocument::parse(text).map_err(|e| {
-            // `toml_edit::TomlError::span()` returns the byte range of the
-            // failing construct. The 0.25 API does not expose a `line_col`
-            // helper, so we re-derive the 1-indexed position by counting
-            // newlines up to the span's start. `message()` is the canonical
-            // human-friendly summary the CLI's diagnostic renderer expects.
-            let span = e.span().map(|r| r.start..r.end).unwrap_or(0..0);
-            let (line, col) = derive_line_col(bytes, span.start);
-            let snippet = extract_line_snippet(bytes, span.start);
-            Error::Parse {
-                file: None,
-                line,
-                col,
-                span,
-                snippet,
-                message: e.message().to_owned(),
+            // An empty span is where `toml_edit` met something else than it
+            // expected: the character there, unless the line ends.
+            let mut span = e.span().unwrap_or(0..0);
+            if span.is_empty() && !matches!(bytes.get(span.start), Some(b'\r' | b'\n')) {
+                span = char_span(bytes, span.start);
             }
+            // `message()` is the canonical human-friendly summary, without
+            // the position and the snippet `Display` renders.
+            Error::parse_at(bytes, span, e.message())
         })?;
 
         let mut spans = SpanMap::new();
@@ -813,40 +799,6 @@ fn compute_indent(bytes: &[u8], index: usize) -> u32 {
     indent
 }
 
-/// Derive a 1-indexed `(line, col)` for byte offset `idx`. Used by the
-/// parse-error path because `toml_edit::TomlError` only exposes a byte span,
-/// not a logical position.
-fn derive_line_col(bytes: &[u8], idx: usize) -> (u32, u32) {
-    let cap = idx.min(bytes.len());
-    let mut line: u32 = 1;
-    let mut col: u32 = 1;
-    for &b in &bytes[..cap] {
-        if b == b'\n' {
-            line = line.saturating_add(1);
-            col = 1;
-        } else {
-            col = col.saturating_add(1);
-        }
-    }
-    (line, col)
-}
-
-/// Extract the line containing byte offset `idx` for error rendering.
-fn extract_line_snippet(bytes: &[u8], idx: usize) -> String {
-    if bytes.is_empty() {
-        return String::new();
-    }
-    let mut start = idx.min(bytes.len().saturating_sub(1));
-    while start > 0 && bytes[start - 1] != b'\n' {
-        start -= 1;
-    }
-    let mut end = idx.min(bytes.len());
-    while end < bytes.len() && bytes[end] != b'\n' {
-        end += 1;
-    }
-    String::from_utf8_lossy(&bytes[start..end]).into_owned()
-}
-
 // ---------------------------------------------------------------------------
 // `value_only` write fallback (toml crate)
 // ---------------------------------------------------------------------------
@@ -1337,16 +1289,39 @@ mod tests {
         assert!(doc.spans().contains_key("/when"));
     }
 
+    /// `(line, col, span, snippet, message)` of the error `bytes` fail with.
+    fn parse_error(bytes: &[u8]) -> (u32, u32, std::ops::Range<usize>, String, String) {
+        match Toml.parse(bytes).expect_err("must fail") {
+            Error::Parse {
+                file: None,
+                line,
+                col,
+                span,
+                snippet,
+                message,
+            } => (line, col, span, snippet, message),
+            other => panic!("expected a parse error, got {other:?}"),
+        }
+    }
+
     #[test]
     fn parse_invalid_toml_returns_parse_error_with_position() {
-        let err = Toml
-            .parse(b"a = \n")
-            .expect_err("incomplete value must error");
-        match err {
-            Error::Parse { line, .. } => {
-                assert!(line >= 1, "Parse error must carry a line; got: {line}");
-            }
-            other => panic!("expected Parse, got: {other:?}"),
+        for (text, line, col, span, snippet) in [
+            // Nothing there: no span.
+            ("a = \r\n", 1, 5, 4..4, "a = "),
+            ("a = \"b", 1, 7, 6..6, "a = \"b"),
+            // toml_edit's own span.
+            ("a = 1\na = 2\n", 2, 1, 6..7, "a = 2"),
+            ("s = abc\n", 1, 5, 4..7, "s = abc"),
+            // The character toml_edit stopped at.
+            ("s = \"я\" я\n", 1, 10, 9..11, "s = \"я\" я"),
+        ] {
+            let (got_line, got_col, got_span, got_snippet, message) = parse_error(text.as_bytes());
+            assert_eq!(
+                (got_line, got_col, got_span, got_snippet.as_str()),
+                (line, col, span, snippet),
+                "{text}: {message}"
+            );
         }
     }
 

@@ -706,9 +706,9 @@ fn smoke_convert_hcl_to_json_emits_valid_json() {
 }
 
 #[test]
-fn smoke_hcl_syntax_error_names_its_line_and_column() {
-    // An HCL syntax error exits 3, and its message carries the line and
-    // column the parser stopped at.
+fn smoke_hcl_syntax_error_is_one_line_and_is_placed() {
+    // An HCL syntax error exits 3 with a one-line message and the line and
+    // column the parser stopped at, as `validate` names them.
     let dir = tempfile::TempDir::new().expect("tempdir");
     std::fs::write(dir.path().join("bad.tf"), "a = 1\nb = {\n").expect("write bad.tf");
     dq().current_dir(dir.path())
@@ -716,10 +716,15 @@ fn smoke_hcl_syntax_error_names_its_line_and_column() {
         .assert()
         .code(3)
         .stdout("")
-        .stderr(
-            "parse error in bad.tf:  --> HCL parse error in line 2, column 1\n  |\n2 | b = {\n  \
-             | ^---\n  |\n  = unexpected token\n",
-        );
+        .stderr("parse error in bad.tf: unexpected token\n  --> bad.tf:2:1\n");
+    dq().current_dir(dir.path())
+        .args(["--no-color", "-q", "validate", "bad.tf"])
+        .assert()
+        .code(4)
+        .stdout("")
+        .stderr(predicates::str::contains(
+            "line: 2\ncol: 1\nmessage: unexpected token\nsnippet: b = {\n",
+        ));
 }
 
 #[test]

@@ -77,7 +77,7 @@ impl Format for Frontmatter {
         // (header_value, body_bytes, kind) triple or `None` — in which case
         // we fall through to the no-frontmatter empty-map default.
         if let Some((header_bytes, body_bytes)) = detect_yaml_frontmatter(header_start) {
-            let header_doc = Yaml.parse(header_bytes)?;
+            let header_doc = parse_header(&Yaml, bytes, header_bytes)?;
             return Ok(document(
                 header_doc.value().clone(),
                 body_bytes.to_vec(),
@@ -85,7 +85,7 @@ impl Format for Frontmatter {
             ));
         }
         if let Some((header_bytes, body_bytes)) = detect_toml_frontmatter(header_start) {
-            let header_doc = Toml.parse(header_bytes)?;
+            let header_doc = parse_header(&Toml, bytes, header_bytes)?;
             return Ok(document(
                 header_doc.value().clone(),
                 body_bytes.to_vec(),
@@ -93,7 +93,7 @@ impl Format for Frontmatter {
             ));
         }
         if let Some((header_bytes, body_bytes)) = detect_json_frontmatter(header_start) {
-            let header_doc = Json.parse(header_bytes)?;
+            let header_doc = parse_header(&Json, bytes, header_bytes)?;
             return Ok(document(
                 header_doc.value().clone(),
                 body_bytes.to_vec(),
@@ -157,6 +157,21 @@ impl Format for Frontmatter {
         }
         Ok(())
     }
+}
+
+/// Parse `header`, the frontmatter header in the file `bytes`, with
+/// `format`; a parse error is placed in the file, and so is the context a
+/// YAML one names.
+///
+/// Visible to the M9 [`crate::parsers::markdown`] parser.
+pub(crate) fn parse_header(format: &dyn Format, bytes: &[u8], header: &[u8]) -> Result<Document> {
+    format.parse(header).map_err(|e| {
+        // The header is a slice of the file.
+        let start = (header.as_ptr() as usize)
+            .saturating_sub(bytes.as_ptr() as usize)
+            .min(bytes.len());
+        e.relocated(header, bytes, |at| start + at)
+    })
 }
 
 /// Detect a `---\n...---\n` (or `---\r\n`-prefixed) YAML frontmatter block.
@@ -338,6 +353,64 @@ fn write_io(w: &mut dyn Write, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `(line, col, span, snippet, message)` of the error `bytes` fail
+    /// with, the same for both front matter formats.
+    fn parse_error(bytes: &[u8]) -> (u32, u32, std::ops::Range<usize>, String, String) {
+        let parts = |format: &dyn Format| match format.parse(bytes).expect_err("must fail") {
+            Error::Parse {
+                file: None,
+                line,
+                col,
+                span,
+                snippet,
+                message,
+            } => (line, col, span, snippet, message),
+            other => panic!("expected a parse error, got {other:?}"),
+        };
+        let frontmatter = parts(&Frontmatter);
+        assert_eq!(frontmatter, parts(&crate::parsers::Markdown));
+        frontmatter
+    }
+
+    #[test]
+    fn a_parse_error_is_placed_in_the_file() {
+        assert_eq!(
+            parse_error("---\ntitle: я\nb: @x\n---\n# Body\n".as_bytes()),
+            (
+                3,
+                4,
+                17..17,
+                "b: @x".to_owned(),
+                "found character that cannot start any token, while scanning for the next token"
+                    .to_owned()
+            )
+        );
+        // The line of the context is the file's too; the header ends where
+        // its closing line begins.
+        assert_eq!(
+            parse_error(b"---\r\na: 1\r\nb: [x\r\n---\r\n# Body\r\n"),
+            (
+                4,
+                1,
+                18..18,
+                "---".to_owned(),
+                "did not find expected ',' or ']', while parsing a flow sequence at line 3 column 4"
+                    .to_owned()
+            )
+        );
+        let (line, col, span, snippet, _) = parse_error(b"+++\na = 1\na = 2\n+++\n");
+        assert_eq!((line, col, span, snippet.as_str()), (3, 1, 10..11, "a = 2"));
+        let (line, col, span, snippet, _) =
+            parse_error("\u{feff}{\n \"a\": ,\n}\n\n# Body\n".as_bytes());
+        assert_eq!(
+            (line, col, span, snippet.as_str()),
+            (2, 7, 11..12, " \"a\": ,")
+        );
+        // A header that is no UTF-8.
+        let (line, col, span, ..) = parse_error(b"---\na: \xFF\n---\n");
+        assert_eq!((line, col, span), (2, 4, 7..8));
+    }
 
     #[test]
     fn parse_yaml_frontmatter_extracts_title_and_body() {

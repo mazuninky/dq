@@ -29,14 +29,8 @@ impl Format for IgnoreList {
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<Document> {
-        let text = std::str::from_utf8(bytes).map_err(|e| Error::Parse {
-            file: None,
-            line: 0,
-            col: 0,
-            span: 0..0,
-            snippet: String::new(),
-            message: format!("invalid UTF-8 in ignore-list input: {e}"),
-        })?;
+        let text =
+            std::str::from_utf8(bytes).map_err(|e| Error::invalid_utf8(bytes, e, "ignore-list"))?;
         let mut out: Vec<Value> = Vec::new();
         for raw in text.split('\n') {
             let line = raw.trim_end_matches('\r').trim_end();
@@ -67,6 +61,15 @@ impl Format for IgnoreList {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bytes_that_are_no_utf8_are_placed_at_the_first_of_them() {
+        assert!(matches!(
+            IgnoreList.parse(b"a\nb\xFF\n").expect_err("must fail"),
+            Error::Parse { line: 2, col: 2, span, snippet, .. }
+                if span == (3..4) && snippet == "b\u{fffd}"
+        ));
+    }
 
     #[test]
     fn parse_one_pattern_per_line() {

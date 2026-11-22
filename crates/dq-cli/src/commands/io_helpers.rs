@@ -46,21 +46,8 @@ pub(crate) fn load_document_with_path(
 ) -> anyhow::Result<(&'static dyn Format, Document)> {
     let format = pick_format(file, format_override)?;
     let bytes = read_bytes(file)?;
-    let path_label = if file == "-" {
-        None
-    } else {
-        Some(file.to_path_buf())
-    };
     let doc = guarded_parse(&bytes, templates, |b| format.parse(b))
-        .map_err(|mut e| {
-            if let dq_core::Error::Parse { ref mut file, .. } = e
-                && file.is_none()
-            {
-                file.clone_from(&path_label);
-            }
-            e
-        })
-        .map_err(anyhow::Error::new)?;
+        .map_err(|e| anyhow::Error::new(name_source(e, file)))?;
     Ok((format, doc))
 }
 
@@ -115,11 +102,6 @@ pub(crate) fn parse_for_lint(
     bytes: &[u8],
     templates: TemplateMode,
 ) -> anyhow::Result<Document> {
-    let path_label = if file == "-" {
-        None
-    } else {
-        Some(file.to_path_buf())
-    };
     let doc_result = guarded_parse(bytes, templates, |b| match format.name() {
         // Stream-aware: a multi-document stream comes back as one, so the
         // lint pipeline and `dq fix` work on each document by itself.
@@ -127,16 +109,19 @@ pub(crate) fn parse_for_lint(
         "json" => dq_core::parse_json_with_spans(b),
         _ => format.parse(b),
     });
-    doc_result
-        .map_err(|mut e| {
-            if let dq_core::Error::Parse { ref mut file, .. } = e
-                && file.is_none()
-            {
-                file.clone_from(&path_label);
-            }
-            e
-        })
-        .map_err(anyhow::Error::new)
+    doc_result.map_err(|e| anyhow::Error::new(name_source(e, file)))
+}
+
+/// `err`, raised by parsing `path`: a parse error that names no file names
+/// `path` — none still for stdin (`-`). Any other error as it is.
+pub(crate) fn name_source(mut err: dq_core::Error, path: &Utf8Path) -> dq_core::Error {
+    if let dq_core::Error::Parse { file, .. } = &mut err
+        && file.is_none()
+        && path != "-"
+    {
+        *file = Some(path.to_path_buf());
+    }
+    err
 }
 
 /// Parse `bytes` as `format` into a document an edit can change: YAML

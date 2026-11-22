@@ -491,8 +491,12 @@ fn read_back(
         pointer: pointer.to_owned(),
         reason,
     };
-    let reparsed = parse_yaml_stream_with_spans(bytes)
-        .map_err(|err| rejected(format!("the rewritten file does not parse: {err}")))?;
+    let reparsed = parse_yaml_stream_with_spans(bytes).map_err(|err| {
+        rejected(format!(
+            "the rewritten file does not parse: {}",
+            err.with_place()
+        ))
+    })?;
     let single;
     let documents = match (stream, reparsed.values()) {
         (true, Some(documents)) => documents,

@@ -386,21 +386,20 @@ fn parse_declared_non_utf8_encoding_with_ascii_body_is_accepted() {
 }
 
 #[test]
-fn parse_non_utf8_input_is_a_parse_error_naming_the_offset() {
+fn parse_non_utf8_input_is_a_parse_error_at_the_offset() {
     for (bytes, offset) in [
         // Latin-1 é with no declaration naming Latin-1: read as UTF-8.
         (&b"<a>caf\xE9</a>"[..], 6),
         (&b"<a>\xC3\x28</a>"[..], 3), // truncated UTF-8 sequence
     ] {
         let err = xml().parse(bytes).expect_err("non-UTF-8 must be rejected");
-        let dq_core::Error::Parse { message, .. } = &err else {
+        let dq_core::Error::Parse { message, span, .. } = &err else {
             panic!("expected Error::Parse, got {err:?}");
         };
         assert_eq!(
             message,
-            &format!(
-                "invalid UTF-8 in XML input: invalid utf-8 sequence of 1 bytes from index {offset}"
-            ),
+            "invalid UTF-8 in XML input: invalid utf-8 sequence of 1 bytes",
         );
+        assert_eq!(*span, offset..offset + 1);
     }
 }

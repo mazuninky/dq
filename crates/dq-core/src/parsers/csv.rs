@@ -14,7 +14,7 @@ use indexmap::IndexMap;
 
 use crate::Result;
 use crate::document::{Document, FormatTag, Layout, Value};
-use crate::error::Error;
+use crate::error::{Error, invalid_utf8_span};
 use crate::format::Format;
 
 /// CSV format implementation (`,` delimiter).
@@ -131,32 +131,18 @@ fn parse_with_delimiter(
     let headers: Vec<String> = match rdr.headers() {
         Ok(h) => h.iter().map(str::to_owned).collect(),
         Err(e) => {
-            return Err(Error::Parse {
-                file: None,
-                line: 0,
-                col: 0,
-                span: 0..0,
-                snippet: String::new(),
-                message: format!("failed to read {upper} header: {e}"),
-            });
+            return Err(parse_error(
+                bytes,
+                &e,
+                &format!("failed to read {upper} header"),
+            ));
         }
     };
 
     let mut rows: Vec<Value> = Vec::new();
     for (record_idx, result) in rdr.records().enumerate() {
-        let record = result.map_err(|e| {
-            // `csv::Error::position()` is only set for parse-time errors; the
-            // 1-indexed line is what users care about.
-            let pos = e.position().map(|p| p.line()).unwrap_or(0);
-            Error::Parse {
-                file: None,
-                line: pos as u32,
-                col: 0,
-                span: 0..0,
-                snippet: String::new(),
-                message: format!("{upper} record {record_idx}: {e}"),
-            }
-        })?;
+        let record =
+            result.map_err(|e| parse_error(bytes, &e, &format!("{upper} record {record_idx}")))?;
         let mut row: IndexMap<String, Value> = IndexMap::with_capacity(headers.len());
         for (i, cell) in record.iter().enumerate() {
             let key = headers
@@ -174,6 +160,49 @@ fn parse_with_delimiter(
             kept: true,
         }),
     ))
+}
+
+/// `err`, which the `csv` crate raised on `bytes`, as an [`Error::Parse`]
+/// at the start of the record it is about — at the first bad byte, when
+/// that is one that is no UTF-8 — and worded `{what}: ` and the crate's
+/// message without its record position.
+fn parse_error(bytes: &[u8], err: &csv::Error, what: &str) -> Error {
+    let record = err
+        .position()
+        .and_then(|p| usize::try_from(p.byte()).ok())
+        .unwrap_or_default()
+        .min(bytes.len());
+    // Where a record begins the crate has not yet passed over the rest of
+    // the line break before it (`\n` after `\r`) and blank lines.
+    let start = record
+        + bytes[record..]
+            .iter()
+            .take_while(|b| matches!(b, b'\r' | b'\n'))
+            .count();
+    let (span, cause) = match err.kind() {
+        csv::ErrorKind::Utf8 { err, .. } => (
+            std::str::from_utf8(&bytes[start..]).err().map(|e| {
+                let bad = invalid_utf8_span(&bytes[start..], e);
+                start + bad.start..start + bad.end
+            }),
+            format!("CSV parse error: invalid UTF-8 in field {}", err.field()),
+        ),
+        csv::ErrorKind::UnequalLengths {
+            expected_len, len, ..
+        } => (
+            None,
+            format!(
+                "CSV error: found record with {len} fields, but the previous record has \
+                 {expected_len} fields"
+            ),
+        ),
+        _ => (None, err.to_string()),
+    };
+    Error::parse_at(
+        bytes,
+        span.unwrap_or(start..start),
+        format!("{what}: {cause}"),
+    )
 }
 
 /// Write a `Value::Array<Value::Map>` document as delimited records.
@@ -271,6 +300,65 @@ fn map_delim_write_err(format_label: &'static str, e: csv::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `(line, col, span, snippet, message)` of the error `bytes` fail with.
+    fn parse_error(bytes: &[u8]) -> (u32, u32, std::ops::Range<usize>, String, String) {
+        match Csv.parse(bytes).expect_err("must fail") {
+            Error::Parse {
+                file: None,
+                line,
+                col,
+                span,
+                snippet,
+                message,
+            } => (line, col, span, snippet, message),
+            other => panic!("expected a parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_parse_error_is_at_its_record() {
+        let uneven = "CSV record 1: CSV error: found record with 1 fields, but the previous record \
+                      has 2 fields";
+        for (text, line, span) in [
+            ("a,b\n1,2\n3\n", 3, 8..8),
+            // A line break and blank lines before it; a record of two lines.
+            ("a,b\r\n1,2\r\n\r\n3\r\n", 4, 12..12),
+            ("a,b\n\"x\ny\",2\n3\n", 4, 12..12),
+            ("\u{feff}a,b\n1,2\n3", 3, 11..11),
+            ("a,b\r1,2\r3\r", 3, 8..8),
+        ] {
+            assert_eq!(
+                parse_error(text.as_bytes()),
+                (line, 1, span, "3".to_owned(), uneven.to_owned()),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bytes_that_are_no_utf8_are_placed_at_the_first_of_them() {
+        assert_eq!(
+            parse_error(b"a,b\n\xD1\x8F,x\xFF\n"),
+            (
+                2,
+                5,
+                8..9,
+                "я,x\u{fffd}".to_owned(),
+                "CSV record 0: CSV parse error: invalid UTF-8 in field 1".to_owned()
+            )
+        );
+        assert_eq!(
+            parse_error(b"a,\xFF\n1,2\n"),
+            (
+                1,
+                3,
+                2..3,
+                "a,\u{fffd}".to_owned(),
+                "failed to read CSV header: CSV parse error: invalid UTF-8 in field 1".to_owned()
+            )
+        );
+    }
 
     #[test]
     fn parse_csv_array_of_maps() {

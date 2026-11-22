@@ -17,7 +17,7 @@ use ini::Ini as RustIni;
 use crate::Result;
 use crate::WriteOptions;
 use crate::document::{Document, FormatTag, Value};
-use crate::error::Error;
+use crate::error::{Error, char_span};
 use crate::format::Format;
 use crate::write_options::canonicalize_keys;
 
@@ -35,22 +35,8 @@ impl Format for Ini {
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<Document> {
-        let text = std::str::from_utf8(bytes).map_err(|e| Error::Parse {
-            file: None,
-            line: 0,
-            col: 0,
-            span: 0..0,
-            snippet: String::new(),
-            message: format!("invalid UTF-8 in INI input: {e}"),
-        })?;
-        let parsed = RustIni::load_from_str(text).map_err(|e| Error::Parse {
-            file: None,
-            line: e.line as u32,
-            col: e.col as u32,
-            span: 0..0,
-            snippet: String::new(),
-            message: e.msg.into_owned(),
-        })?;
+        let text = std::str::from_utf8(bytes).map_err(|e| Error::invalid_utf8(bytes, e, "INI"))?;
+        let parsed = RustIni::load_from_str(text).map_err(|e| parse_error(text, e))?;
 
         let mut top: IndexMap<String, Value> = IndexMap::new();
         for (section_name, props) in parsed.iter() {
@@ -192,6 +178,37 @@ fn scalar_to_ini_string(section: &str, key: &str, val: &Value) -> Result<String>
     }
 }
 
+/// `e`, which `rust-ini` raised on `text`, as an [`Error::Parse`] at the
+/// character it stopped at, or at the end of the input where it wants more.
+///
+/// `rust-ini` ends lines at `\n` alone, counts a line break as column 0 of
+/// the line after it, and gives the column after the character it stopped
+/// at; at the end of the input that is the end itself.
+fn parse_error(text: &str, e: ini::ParseError) -> Error {
+    let bytes = text.as_bytes();
+    let ended = e.msg.ends_with("but found EOF.") || e.msg.ends_with("found \"None\".");
+    let span = if ended {
+        bytes.len()..bytes.len()
+    } else {
+        let line_start = match e.line.saturating_sub(1) {
+            0 => 0,
+            breaks => text
+                .match_indices('\n')
+                .nth(breaks - 1)
+                .map_or(text.len(), |(at, _)| at + 1),
+        };
+        let at = match e.col.saturating_sub(1) {
+            0 => line_start.saturating_sub(1),
+            col => text[line_start..]
+                .char_indices()
+                .nth(col - 1)
+                .map_or(text.len(), |(at, _)| line_start + at),
+        };
+        char_span(bytes, at)
+    };
+    Error::parse_at(bytes, span, e.msg)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,6 +237,41 @@ mod tests {
             panic!("anonymous section missing")
         };
         assert_eq!(anon.get("foo"), Some(&Value::String("bar".into())));
+    }
+
+    /// `(line, col, span, snippet, message)` of the error `bytes` fail with.
+    fn parse_error(bytes: &[u8]) -> (u32, u32, std::ops::Range<usize>, String, String) {
+        match Ini.parse(bytes).expect_err("must fail") {
+            Error::Parse {
+                file: None,
+                line,
+                col,
+                span,
+                snippet,
+                message,
+            } => (line, col, span, snippet, message),
+            other => panic!("expected a parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_parse_error_is_at_the_character_rust_ini_stops_at() {
+        for (text, line, col, span, snippet) in [
+            ("[s]\nя=1\n  = 2\n", 3, 3, 11..12, "  = 2"),
+            ("[s] ; я\n", 1, 5, 4..5, "[s] ; я"),
+            // A line break is on the line it ends.
+            ("я=\\x123\nb=1\n", 1, 9, 8..9, "я=\\x123"),
+            // More is wanted at the end of the input.
+            ("[s]\nя\n", 3, 1, 7..7, ""),
+            ("[я", 1, 4, 3..3, "[я"),
+        ] {
+            let (got_line, got_col, got_span, got_snippet, message) = parse_error(text.as_bytes());
+            assert_eq!(
+                (got_line, got_col, got_span, got_snippet.as_str()),
+                (line, col, span, snippet),
+                "{text:?}: {message}"
+            );
+        }
     }
 
     #[test]

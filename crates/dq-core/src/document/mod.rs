@@ -1544,7 +1544,8 @@ impl Document {
                     .and_then(|()| {
                         format.parse(&bytes).map_err(|err| {
                             rejected(format!(
-                                "the {name} dq would write does not read back: {err}"
+                                "the {name} dq would write does not read back: {}",
+                                err.with_place()
                             ))
                         })
                     })
@@ -2535,7 +2536,12 @@ impl Document {
                 Ok(())
             }
             Some(Err(err)) => {
-                tracing::debug!(pointer = %canonical, action, %err, "edited bytes do not parse");
+                tracing::debug!(
+                    pointer = %canonical,
+                    action,
+                    err = %err.with_place(),
+                    "edited bytes do not parse",
+                );
                 Err(Error::EditRejected {
                     action,
                     pointer: canonical.to_owned(),
@@ -3300,7 +3306,12 @@ impl Document {
                 }
             }
             Err(err) => {
-                tracing::debug!(pointer = %canonical, action, %err, "edited bytes do not parse");
+                tracing::debug!(
+                    pointer = %canonical,
+                    action,
+                    err = %err.with_place(),
+                    "edited bytes do not parse",
+                );
                 "the edited document would not parse"
             }
         };

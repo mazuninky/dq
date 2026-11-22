@@ -68,6 +68,24 @@ fn failure_of(dir: &TempDir, args: &[&str]) -> (Option<i32>, String, String) {
     )
 }
 
+/// `text`, `<message> at line L column C`, in its two parts: the message on
+/// stderr, and the lines `validate` reports for the place.
+fn message_and_place(text: &str) -> (&str, String) {
+    let (message, place) = text.split_once(" at line ").expect("a place");
+    let (line, col) = place.split_once(" column ").expect("a column");
+    (
+        message,
+        format!("\nline: {line}\ncol: {col}\nmessage: {message}\n"),
+    )
+}
+
+/// The stderr of a command that cannot parse `file`, for the same text.
+fn parse_error(file: &str, text: &str) -> String {
+    let (message, place) = text.split_once(" at line ").expect("a place");
+    let (line, col) = place.split_once(" column ").expect("a column");
+    format!("parse error in {file}: {message}\n  --> {file}:{line}:{col}\n")
+}
+
 // ---- duplicates -------------------------------------------------------
 
 /// Collection keys whose text is the same — tags dropped, map order and
@@ -77,7 +95,7 @@ fn failure_of(dir: &TempDir, args: &[&str]) -> (Option<i32>, String, String) {
 /// keys.
 #[test]
 fn collection_keys_with_the_same_text_fail_at_the_repeated_key() {
-    for (src, message) in [
+    for (src, text) in [
         (
             "[!a 1]: x\n[!b 1]: y\n",
             "duplicate entry in YAML map at line 2 column 1",
@@ -112,6 +130,10 @@ fn collection_keys_with_the_same_text_fail_at_the_repeated_key() {
         ),
     ] {
         let dir = dir_with(&[("k.yaml", src)]);
+        let (_, place) = message_and_place(text);
+        let (code, _, stderr) = failure_of(&dir, &["validate", "k.yaml"]);
+        assert_eq!(code, Some(4), "{src:?}");
+        assert!(stderr.contains(&place), "{src:?}: {stderr}");
         for args in [
             &["get", "k.yaml", ""][..],
             &["set", "k.yaml", "/zz", "1"],
@@ -120,11 +142,7 @@ fn collection_keys_with_the_same_text_fail_at_the_repeated_key() {
             let (code, stdout, stderr) = failure_of(&dir, args);
             assert_eq!(code, Some(3), "{src:?} {args:?}");
             assert_eq!(stdout, "", "{src:?} {args:?}");
-            assert_eq!(
-                stderr,
-                format!("parse error in k.yaml: {message}\n"),
-                "{src:?} {args:?}"
-            );
+            assert_eq!(stderr, parse_error("k.yaml", text), "{src:?} {args:?}");
         }
         assert_eq!(read(&dir, "k.yaml"), src, "file untouched");
     }

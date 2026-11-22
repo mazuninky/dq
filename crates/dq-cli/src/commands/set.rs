@@ -40,8 +40,8 @@ use dq_core::template_guard::TemplateMode;
 use dq_core::{Document, Pointer, Value};
 
 use super::io_helpers::{
-    checked_index, finish_edit, load_document_with_path, parse_file_for_edit, parse_for_edit,
-    pick_format, pointer_in_document, read_bytes, skip_out_of_range,
+    checked_index, finish_edit, load_document_with_path, name_source, parse_file_for_edit,
+    parse_for_edit, pick_format, pointer_in_document, read_bytes, skip_out_of_range,
 };
 use super::query::jq_compile_to_parse;
 use crate::bulk::{self, FileOp, FileOpResult};
@@ -293,7 +293,7 @@ impl<'a> FileOp for JqFileOp<'a> {
             dq_core::template_guard::guarded_parse(&original_bytes, TemplateMode::Guard, |b| {
                 format.parse(b)
             })
-            .map_err(anyhow::Error::new)?;
+            .map_err(|e| anyhow::Error::new(name_source(e, path)))?;
 
         // Evaluate the filter. Runtime / Conversion errors stay as plain
         // anyhow (exit 1) — they aren't compile failures and aren't IO

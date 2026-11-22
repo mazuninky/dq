@@ -44,7 +44,7 @@ use crate::Result;
 use crate::WriteOptions;
 use crate::document::spans::{SpanContext, SpanMap, ValueSpan};
 use crate::document::{Document, FormatTag, Value, bom_end};
-use crate::error::Error;
+use crate::error::{Error, char_span, invalid_utf8_span};
 use crate::format::Format;
 use crate::textual_edit::{InsertionRenderer, ScalarRenderer};
 use crate::write_options::canonicalize_keys;
@@ -69,19 +69,8 @@ impl Format for Json {
         // contract (it rejects JSONC before serde_json would reject the
         // comment as unexpected token), giving a clearer diagnostic.
         let spans = build_span_map(bytes)?;
-        let json: JsonValue = serde_json::from_slice(&bytes[bom_end(bytes)..]).map_err(|e| {
-            let line = e.line() as u32;
-            let col = e.column() as u32;
-            let (span, snippet) = compute_parse_anchor(bytes, e.line());
-            Error::Parse {
-                file: None,
-                line,
-                col,
-                span,
-                snippet,
-                message: e.to_string(),
-            }
-        })?;
+        let json: JsonValue =
+            serde_json::from_slice(&bytes[bom_end(bytes)..]).map_err(|e| serde_error(bytes, &e))?;
         Ok(Document::with_spans(
             json_value_to_value(json),
             bytes.to_vec(),
@@ -186,19 +175,8 @@ fn end_line(w: &mut dyn Write) -> Result<()> {
 ///   comments, or fails strict JSON parsing.
 pub fn parse_with_spans(bytes: &[u8]) -> Result<(Value, SpanMap)> {
     let spans = build_span_map(bytes)?;
-    let json: JsonValue = serde_json::from_slice(&bytes[bom_end(bytes)..]).map_err(|e| {
-        let line = e.line() as u32;
-        let col = e.column() as u32;
-        let (span, snippet) = compute_parse_anchor(bytes, e.line());
-        Error::Parse {
-            file: None,
-            line,
-            col,
-            span,
-            snippet,
-            message: e.to_string(),
-        }
-    })?;
+    let json: JsonValue =
+        serde_json::from_slice(&bytes[bom_end(bytes)..]).map_err(|e| serde_error(bytes, &e))?;
     Ok((json_value_to_value(json), spans))
 }
 
@@ -260,15 +238,12 @@ pub(crate) fn json_container_ranges(bytes: &[u8]) -> Result<ContainerRanges> {
 /// The span map, and with `containers` the ranges
 /// [`json_container_ranges`] returns.
 fn scan(bytes: &[u8], containers: bool) -> Result<(SpanMap, Option<ContainerRanges>)> {
-    if std::str::from_utf8(bytes).is_err() {
-        return Err(Error::Parse {
-            file: None,
-            line: 0,
-            col: 0,
-            span: 0..0,
-            snippet: String::new(),
-            message: "source is not valid UTF-8".to_owned(),
-        });
+    if let Err(err) = std::str::from_utf8(bytes) {
+        return Err(Error::parse_at(
+            bytes,
+            invalid_utf8_span(bytes, err),
+            "source is not valid UTF-8",
+        ));
     }
     let lines = LineIndex::new(bytes);
     let mut scanner = Scanner::new(bytes, lines);
@@ -351,19 +326,10 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    /// Build an [`Error::Parse`] anchored at byte offset `at` with `message`.
+    /// Build an [`Error::Parse`] at the character at byte offset `at`, or
+    /// at the end of the source, with `message`.
     fn parse_error(&self, at: usize, message: &str) -> Error {
-        let (line, col) = derive_line_col(self.bytes, at);
-        let snippet = extract_line_snippet(self.bytes, at);
-        let end = (at + 1).min(self.bytes.len());
-        Error::Parse {
-            file: None,
-            line,
-            col,
-            span: at..end,
-            snippet,
-            message: message.to_owned(),
-        }
+        Error::parse_at(self.bytes, char_span(self.bytes, at), message)
     }
 
     /// Scan one JSON value at `self.pos`, recording a [`ValueSpan`] entry
@@ -789,38 +755,6 @@ impl LineIndex {
     }
 }
 
-/// Derive a 1-indexed `(line, col)` for byte offset `idx`.
-fn derive_line_col(bytes: &[u8], idx: usize) -> (u32, u32) {
-    let cap = idx.min(bytes.len());
-    let mut line: u32 = 1;
-    let mut col: u32 = 1;
-    for &b in &bytes[..cap] {
-        if b == b'\n' {
-            line = line.saturating_add(1);
-            col = 1;
-        } else {
-            col = col.saturating_add(1);
-        }
-    }
-    (line, col)
-}
-
-/// Extract the line containing byte offset `idx`, used for error rendering.
-fn extract_line_snippet(bytes: &[u8], idx: usize) -> String {
-    if bytes.is_empty() {
-        return String::new();
-    }
-    let mut start = idx.min(bytes.len().saturating_sub(1));
-    while start > 0 && bytes[start - 1] != b'\n' {
-        start -= 1;
-    }
-    let mut end = idx.min(bytes.len());
-    while end < bytes.len() && bytes[end] != b'\n' {
-        end += 1;
-    }
-    String::from_utf8_lossy(&bytes[start..end]).into_owned()
-}
-
 /// Build the canonical RFC 6901 pointer for `path`. Empty path → root.
 fn pointer_for(path: &[String]) -> String {
     if path.is_empty() {
@@ -852,59 +786,34 @@ fn decode_json_string(inner: &[u8]) -> Option<String> {
     serde_json::from_slice::<String>(&buf).ok()
 }
 
-/// Compute the byte span and source snippet for a `serde_json` parse error.
-///
-/// `serde_json::Error::line()` is 1-based. We walk `bytes` to find the start
-/// offset of that line and use its full text (without the trailing newline)
-/// as the snippet. The span is one byte wide pointing at the line start —
-/// `dq-core` does not yet render a column-anchored caret, but storing the
-/// data in this shape lets M2 add the caret without re-traversing the
-/// source.
-///
-/// Returns `(0..0, String::new())` when:
-/// - the input is not valid UTF-8 (we still emit the structured error, just
-///   without the snippet),
-/// - or `line` is 0 / out of range, which `serde_json` emits for some
-///   trailing-input errors.
-fn compute_parse_anchor(bytes: &[u8], line_1based: usize) -> (std::ops::Range<usize>, String) {
-    let Ok(text) = std::str::from_utf8(bytes) else {
-        return (0..0, String::new());
+/// `err`, which `serde_json` raised on `bytes` past their byte order mark,
+/// as an [`Error::Parse`] at the character it stopped at; an error at the
+/// end of the input at that end. `serde_json` counts lines by `\n` alone,
+/// and columns in bytes, a column being that of the last byte it read — 0
+/// when that was the line break before. Its message without the position.
+fn serde_error(bytes: &[u8], err: &serde_json::Error) -> Error {
+    let start = bom_end(bytes);
+    let span = if err.is_eof() {
+        bytes.len()..bytes.len()
+    } else {
+        let line_start = match err.line().saturating_sub(1) {
+            0 => start,
+            breaks => bytes
+                .iter()
+                .enumerate()
+                .filter(|&(_, &b)| b == b'\n')
+                .nth(breaks - 1)
+                .map_or(bytes.len(), |(at, _)| at + 1),
+        };
+        char_span(bytes, (line_start + err.column()).saturating_sub(1))
     };
-    if line_1based == 0 {
-        return (0..0, String::new());
-    }
-    // Walk the text, counting newlines, until we reach the line we want.
-    let target_line_idx = line_1based - 1; // convert to 0-based
-    let mut start_of_line = 0usize;
-    let mut newlines_seen = 0usize;
-    for (i, b) in text.bytes().enumerate() {
-        if newlines_seen == target_line_idx {
-            start_of_line = i;
-            break;
-        }
-        if b == b'\n' {
-            newlines_seen += 1;
-            // Tentative start: byte after the newline. If the next loop
-            // iteration short-circuits on `newlines_seen == target_line_idx`,
-            // this becomes the final value.
-            start_of_line = i + 1;
-        }
-    }
-    if newlines_seen < target_line_idx {
-        // Requested line is past EOF; fall back gracefully.
-        return (0..0, String::new());
-    }
-    let total_len = text.len();
-    if start_of_line >= total_len {
-        return (start_of_line..start_of_line, String::new());
-    }
-    // Snippet = the line text without the trailing newline.
-    let line_end = text[start_of_line..]
-        .find('\n')
-        .map_or(total_len, |off| start_of_line + off);
-    let snippet = text[start_of_line..line_end].to_owned();
-    let span_end = (start_of_line + 1).min(total_len);
-    (start_of_line..span_end, snippet)
+    let message = err.to_string();
+    let position = format!(" at line {} column {}", err.line(), err.column());
+    Error::parse_at(
+        bytes,
+        span,
+        message.strip_suffix(&position).unwrap_or(&message),
+    )
 }
 
 fn json_value_to_value(v: JsonValue) -> Value {
@@ -1408,43 +1317,103 @@ mod tests {
         assert_eq!(String::from_utf8(buf).unwrap(), "2.0");
     }
 
+    /// `(line, col, span, snippet, message)` of the error `bytes` fail with,
+    /// the same from both entry points.
+    fn parse_error(bytes: &[u8]) -> (u32, u32, Range<usize>, String, String) {
+        let from = |err: Error| match err {
+            Error::Parse {
+                file: None,
+                line,
+                col,
+                span,
+                snippet,
+                message,
+            } => (line, col, span, snippet, message),
+            other => panic!("expected Parse error, got {other:?}"),
+        };
+        let read = from(Json.parse(bytes).expect_err("must fail"));
+        let with_spans = from(parse_json_with_spans(bytes).expect_err("must fail"));
+        assert_eq!(read, with_spans);
+        read
+    }
+
     #[test]
     fn parse_error_carries_line_col_and_snippet() {
         // Trailing comma — invalid JSON. The error should carry the line, col,
         // and offending source line as the snippet.
-        let input = "{\n  \"a\": 1,\n}";
-        let err = Json.parse(input.as_bytes()).unwrap_err();
-        let Error::Parse {
-            line,
-            col,
-            span,
-            snippet,
-            ..
-        } = err
-        else {
-            panic!("expected Parse error");
-        };
-        assert!(line >= 1, "line should be 1-based and non-zero");
-        assert!(col >= 1, "col should be 1-based and non-zero");
-        assert!(!snippet.is_empty(), "snippet should be populated");
-        assert!(
-            span.start <= input.len(),
-            "span start must be in-bounds: got {span:?} for len={}",
-            input.len()
+        assert_eq!(
+            parse_error(b"{\n  \"a\": 1,\n}"),
+            (
+                3,
+                1,
+                12..13,
+                "}".to_owned(),
+                "expected string key in object".to_owned()
+            )
+        );
+        // Past a byte order mark and a multi-byte character, on a CRLF line.
+        assert_eq!(
+            parse_error("\u{feff}[\"я\", я]\r\n".as_bytes()),
+            (
+                1,
+                8,
+                10..12,
+                "[\"я\", я]".to_owned(),
+                "expected JSON value (object, array, scalar)".to_owned()
+            )
         );
     }
 
     #[test]
-    fn parse_error_on_non_utf8_input_falls_back_gracefully() {
-        // Non-UTF-8 input — JSON requires UTF-8, so this errors. The snippet
-        // should be empty and the span 0..0 (no caret data possible).
-        let input: [u8; 4] = [0xFF, 0xFE, 0xFD, 0xFC];
-        let err = Json.parse(&input).unwrap_err();
-        let Error::Parse { span, snippet, .. } = err else {
-            panic!("expected Parse error");
-        };
-        assert!(snippet.is_empty(), "snippet must be empty for non-UTF-8");
-        assert_eq!(span, 0..0);
+    fn parse_error_of_serde_json_is_placed_like_the_scanner_s() {
+        // The scanner lets these through to `serde_json`.
+        for (bytes, line, col, span, snippet, message) in [
+            (&b""[..], 1, 1, 0..0, "", "EOF while parsing a value"),
+            (b"\n\n", 3, 1, 2..2, "", "EOF while parsing a value"),
+            (b"1.", 1, 3, 2..2, "1.", "EOF while parsing a value"),
+            (b"1\n 2", 2, 2, 3..4, " 2", "trailing characters"),
+            (b"1 \xD1\x8F", 1, 3, 2..4, "1 я", "trailing characters"),
+            (b"[1]\r\r x", 3, 2, 6..7, " x", "trailing characters"),
+            (b"01", 1, 2, 1..2, "01", "invalid number"),
+            (b"\xEF\xBB\xBF{}x", 1, 3, 5..6, "{}x", "trailing characters"),
+            (
+                b"[\"a\",\n\"\\q\"]",
+                2,
+                3,
+                8..9,
+                "\"\\q\"]",
+                "invalid escape",
+            ),
+            // A raw line break in a string: the break, on the line it ends.
+            (
+                b"[\"a\nb\"]",
+                1,
+                4,
+                3..4,
+                "[\"a",
+                "control character (\\u0000-\\u001F) found while parsing a string",
+            ),
+        ] {
+            assert_eq!(
+                parse_error(bytes),
+                (line, col, span, snippet.to_owned(), message.to_owned()),
+                "{bytes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_error_on_non_utf8_input_is_at_the_first_bad_byte() {
+        assert_eq!(
+            parse_error(b"[1,\n\"\xFF\"]"),
+            (
+                2,
+                2,
+                5..6,
+                "\"\u{fffd}\"]".to_owned(),
+                "source is not valid UTF-8".to_owned()
+            )
+        );
     }
 
     // -- M2 §5 span builder ---------------------------------------------

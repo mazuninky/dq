@@ -10,6 +10,17 @@ breaking changes are listed first under Changed.
 
 ### Changed
 
+- A parse error prints its place on a second line, `  --> FILE:LINE:COL`
+  (`<stdin>` for input on stdin), and the bulk summary ends the entry with
+  ` (line L, column C)`. The place left the message itself: YAML's
+  `at line 4 column 4`, XML's `at line 1, column 8`, the CSV record
+  position, Dockerfile's `line 2:`, the byte index of invalid UTF-8, and
+  HCL's whole multi-line rendering, now one line (``expected `]` ``). A YAML
+  message still names the place of its context, such as the open bracket.
+- Columns of parse errors count bytes in every format, as lint diagnostics
+  and JSON, TOML and Dockerfile errors already did. YAML, XML and HCL counted
+  characters, so the column differs on a line with multi-byte characters
+  before the error. A leading BOM is not counted.
 - `dq diff` is faster on nested documents. It compared every pair of
   subtrees in full before descending into it, so a change deep in a
   document was scanned again at every level above it. On 256 values
@@ -38,6 +49,18 @@ breaking changes are listed first under Changed.
 
 ### Fixed
 
+- Parse errors had a missing or wrong position in several formats: CSV and
+  TSV (column 0, or the wrong line after a blank line), JSON Lines and
+  `.env` (always column 1), INI, YAML and HCL (no source line, no byte
+  range), front matter (counted from the inner block, not the file), and
+  input that is not valid UTF-8 (line and column 0; now the first bad byte,
+  which comes before a syntax error earlier in the file in YAML too).
+  `validate -F json` and `lint` carry the corrected positions.
+- `dq set --jq` on a file that does not parse did not name it
+  (`parse error: …`); it now prints `parse error in FILE: …` like the other
+  commands.
+- The message of a parse error is one line on the terminal even when it
+  quotes a line break of the file, which could have started a line of its own.
 - Install and pin examples in the README and the skill named `v2026.20.1`,
   a release that does not exist; they now name `v2026.47.3`.
 - `--help` and `dq man` no longer show internal milestone numbers: "(M8)"
