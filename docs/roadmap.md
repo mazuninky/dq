@@ -50,10 +50,10 @@ design or the README. All of it was fixed on `fix/after-deps-update`; see
 [decisions.md](decisions.md#2026-11-20--fix-everything-found-after-the-dependency-update-after-deps-update-fixes).
 What is left is a feature, not a bug, plus a few known limits of that work:
 
-- **Structured errors**: no caret under the offending byte, and no JSON
-  error object on stderr under `-F json` (only `validate` and `lint` emit
-  structured output for a file that does not parse). Agent-first error
-  output was a founding goal. Design: [plans/structured-errors.md](plans/structured-errors.md).
+- **Structured errors**: no JSON error object on stderr under `-F json` (only
+  `validate` and `lint` emit structured output for a file that does not
+  parse). Agent-first error output was a founding goal. Positions and the
+  caret are done; the rest is in [plans/structured-errors.md](plans/structured-errors.md).
 - **Textual edits for XML, HCL, INI, dotenv and CSV.** Point edits on these
   formats rewrite the file through its writer, so comments and layout are
   lost (XML keeps its comments). Comment-keeping edits, as YAML and TOML

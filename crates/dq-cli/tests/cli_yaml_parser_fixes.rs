@@ -6,6 +6,8 @@
 //! tests drive `set` / `del` through the real binary and compare the bytes
 //! it writes.
 
+mod common;
+
 use std::io::Write as _;
 
 use assert_cmd::Command;
@@ -151,7 +153,7 @@ fn outcome_of(args: &[&str], file: &TempPath, rest: &[&str]) -> (Option<i32>, St
     (
         out.status.code(),
         String::from_utf8(out.stdout).expect("UTF-8 stdout"),
-        String::from_utf8(out.stderr).expect("UTF-8 stderr"),
+        common::without_source_block(&String::from_utf8(out.stderr).expect("UTF-8 stderr")),
     )
 }
 
@@ -206,12 +208,9 @@ fn a_collection_key_repeats_by_its_text() {
                 && stderr.ends_with(&format!(":{line}:1\n")),
             "{stderr}"
         );
-        let (code, _, stderr) = outcome_of(&["validate"], &file, &[]);
-        assert_eq!(code, Some(4), "{stderr}");
-        assert!(
-            stderr.contains(&format!("\nline: {line}\ncol: 1\n")),
-            "{stderr}"
-        );
+        // `validate` prints the same.
+        let (code, _, validated) = outcome_of(&["validate"], &file, &[]);
+        assert_eq!((code, validated), (Some(4), stderr));
     }
 }
 

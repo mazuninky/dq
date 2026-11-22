@@ -10,6 +10,8 @@
 //! too (YAML, TOML, JSON, JSONL; not the console or TOON), so each output
 //! format reads a file of its own format. `query` reads by extension.
 
+mod common;
+
 use assert_cmd::Command;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
@@ -1367,18 +1369,17 @@ fn assert_byte_cases(dir: &TempDir, cases: &[(&str, &str, i32, &[u8], &str)]) {
             .args(["--no-color", "-q", "convert", file, "-F", to])
             .output()
             .expect("dq runs");
-        let actual = (
-            out.status.code(),
-            out.stdout.as_slice(),
-            out.stderr.as_slice(),
-        );
-        if actual != (Some(code), stdout, stderr.as_bytes()) {
+        // The source line of a parse error is checked and taken off.
+        let err =
+            common::without_source_block(&String::from_utf8(out.stderr).expect("UTF-8 stderr"));
+        let actual = (out.status.code(), out.stdout.as_slice(), err.as_str());
+        if actual != (Some(code), stdout, stderr) {
             wrong.push(format!(
                 "{file} -F {to}\n  expected {code} {:?} {stderr:?}\n  actual   {:?} {:?} {:?}",
                 String::from_utf8_lossy(stdout),
                 actual.0,
                 String::from_utf8_lossy(actual.1),
-                String::from_utf8_lossy(actual.2),
+                actual.2,
             ));
         }
     }

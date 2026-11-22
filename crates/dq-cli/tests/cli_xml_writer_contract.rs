@@ -8,6 +8,8 @@
 //! Every run goes through `dq --no-color -q`; stdout is compared as bytes,
 //! since the output is encoded in the declared encoding.
 
+mod common;
+
 use assert_cmd::Command;
 use tempfile::TempDir;
 
@@ -32,8 +34,14 @@ fn dir_with(files: &[(&str, &[u8])]) -> TempDir {
     dir
 }
 
-/// `(exit code, stdout, stderr)` of `dq --no-color -q <args>` in `dir`.
+/// [`run_raw`], stderr without the source line of a parse error.
 fn run(dir: &TempDir, args: &[&str]) -> (i32, Vec<u8>, String) {
+    let (code, stdout, stderr) = run_raw(dir, args);
+    (code, stdout, common::without_source_block(&stderr))
+}
+
+/// `(exit code, stdout, stderr)` of `dq --no-color -q <args>` in `dir`.
+fn run_raw(dir: &TempDir, args: &[&str]) -> (i32, Vec<u8>, String) {
     let out = dq()
         .current_dir(dir.path())
         .args(["--no-color", "-q"])
@@ -79,7 +87,8 @@ fn refused(message: &str) -> Outcome {
 }
 
 /// A reader's refusal of `file`: exit 3 and on stderr `message`, which
-/// holds no position, then `line` and `col`; the same two from `validate`.
+/// holds no position, then `line` and `col` (and the source line, which
+/// [`run`] checks and takes off); the same two from `validate`.
 fn unreadable(file: &str, line: u32, col: u32, message: &str) -> Outcome {
     let stderr = format!("parse error in {file}: {message}\n  --> {file}:{line}:{col}\n");
     Outcome {
@@ -1401,52 +1410,35 @@ fn an_undeclared_prefix_is_reported_with_its_line_and_column() {
             b"<?xml version=\"1.0\"\n encoding=\"UTF-32\"?><r/>",
         ),
     ]);
-    let report = |file: &str, line: u32, col: u32, message: &str, snippet: &str| {
-        Outcome::new(
-            4,
-            "",
-            format!(
-                "kind: parse\nfile: {file}\nline: {line}\ncol: {col}\nmessage: XML parse error: \
-                 {message}\nsnippet: {snippet}\n"
-            ),
-        )
-    };
-    assert_cases(
-        &dir,
-        &[
-            (
-                vec!["validate", "start.xml"],
-                report(
-                    "start.xml",
-                    2,
-                    4,
-                    "element <a:b> uses the prefix 'a', which no 'xmlns:a' declares in scope",
-                    "  <a:b>t</a:b>",
-                ),
-            ),
-            (
-                vec!["validate", "empty.xml"],
-                report(
-                    "empty.xml",
-                    3,
-                    5,
-                    "attribute 'a:x' on <k> uses the prefix 'a', which no 'xmlns:a' declares in \
-                     scope",
-                    " <k a:x=\"1\"/>",
-                ),
-            ),
-            (
-                vec!["validate", "label.xml"],
-                report(
-                    "label.xml",
-                    2,
-                    12,
-                    "the XML declaration's encoding \"UTF-32\" is one dq does not know",
-                    " encoding=\"UTF-32\"?><r/>",
-                ),
-            ),
-        ],
-    );
+    for (file, place, message, block) in [
+        (
+            "start.xml",
+            "2:4",
+            "element <a:b> uses the prefix 'a', which no 'xmlns:a' declares in scope",
+            "   |\n 2 |   <a:b>t</a:b>\n   |    ^\n",
+        ),
+        (
+            "empty.xml",
+            "3:5",
+            "attribute 'a:x' on <k> uses the prefix 'a', which no 'xmlns:a' declares in scope",
+            "   |\n 3 |  <k a:x=\"1\"/>\n   |     ^\n",
+        ),
+        (
+            "label.xml",
+            "2:12",
+            "the XML declaration's encoding \"UTF-32\" is one dq does not know",
+            "   |\n 2 |  encoding=\"UTF-32\"?><r/>\n   |            ^\n",
+        ),
+    ] {
+        let want = format!(
+            "parse error in {file}: XML parse error: {message}\n  --> {file}:{place}\n{block}"
+        );
+        assert_eq!(
+            run_raw(&dir, &["validate", file]),
+            (4, Vec::new(), want),
+            "{file}"
+        );
+    }
 }
 
 /// Every label of the WHATWG `replacement` encoding is one dq cannot read,
@@ -2251,12 +2243,12 @@ fn a_refused_label_is_placed_however_the_declaration_is_written() {
 }
 
 /// `dq validate` refuses each of these with exit 4 and reports the line
-/// and column in its `line` / `col` fields, and not in its message: a raw
+/// and column on a line of their own, and not in its message: a raw
 /// character (7d12839), a refused label (aa41529) and an attribute
 /// error (c7bb838). Before each, `line` / `col` were 0 or pointed past the
 /// tag. A well-formed document validates.
 #[test]
-fn validate_reports_the_line_and_column_in_fields() {
+fn validate_reports_the_line_and_column_on_a_line_of_their_own() {
     let dir = dir_with(&[
         ("pi.xml", b"<r><?p a\x01b?></r>"),
         (
@@ -2283,11 +2275,10 @@ fn validate_reports_the_line_and_column_in_fields() {
     ] {
         let (code, stdout, stderr) = run(&dir, &["validate", file]);
         assert_eq!((code, stdout.as_slice()), (4, &b""[..]), "{file}: {stderr}");
-        let fields = format!(
-            "file: {file}\nline: {line}\ncol: {col}\n\
-             message: XML parse error: {message}\n"
+        let want = format!(
+            "parse error in {file}: XML parse error: {message}\n  --> {file}:{line}:{col}\n"
         );
-        assert!(stderr.contains(&fields), "{file}: {stderr}");
+        assert_eq!(stderr, want, "{file}");
     }
     let (code, _, stderr) = run(&dir, &["validate", "ok.xml"]);
     assert_eq!(code, 0, "{stderr}");

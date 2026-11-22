@@ -10,6 +10,8 @@
 //! Each test spawns `dq` through `assert_cmd`, so the file can be run
 //! against another build by pointing `CARGO_BIN_EXE_dq` at it.
 
+mod common;
+
 use std::process::Output;
 
 use assert_cmd::Command;
@@ -76,29 +78,21 @@ fn stdout_of(dir: &TempDir, args: &[&str]) -> String {
     String::from_utf8(out.stdout).expect("UTF-8 stdout")
 }
 
-/// `(exit code, stdout, stderr)` of a failing `dq --no-color <args>`.
+/// `(exit code, stdout, stderr)` of a failing `dq --no-color <args>`, stderr
+/// without the source line of a parse error.
 fn failure_of(dir: &TempDir, args: &[&str]) -> (Option<i32>, String, String) {
     let out = run(dir, args);
     assert!(!out.status.success(), "{args:?} succeeded");
     (
         out.status.code(),
         String::from_utf8(out.stdout).expect("UTF-8 stdout"),
-        String::from_utf8(out.stderr).expect("UTF-8 stderr"),
+        common::without_source_block(&String::from_utf8(out.stderr).expect("UTF-8 stderr")),
     )
 }
 
-/// `text`, `<message> at line L column C`, in its two parts: the message on
-/// stderr, and the lines `validate` reports for the place.
-fn message_and_place(text: &str) -> (&str, String) {
-    let (message, place) = text.split_once(" at line ").expect("a place");
-    let (line, col) = place.split_once(" column ").expect("a column");
-    (
-        message,
-        format!("\nline: {line}\ncol: {col}\nmessage: {message}\n"),
-    )
-}
-
-/// The stderr of a command that cannot parse `file`, for the same text.
+/// The stderr of a command that cannot parse `file`, for
+/// `<message> at line L column C`, without the source line
+/// ([`common::without_source_block`]).
 fn parse_error(file: &str, text: &str) -> String {
     let (message, place) = text.split_once(" at line ").expect("a place");
     let (line, col) = place.split_once(" column ").expect("a column");
@@ -839,11 +833,10 @@ fn keys_that_become_the_same_dq_key_fail_at_the_repeated_key() {
     ];
     for (src, text) in cases {
         let dir = dir_with(&[("k.yaml", src)]);
-        let (_, place) = message_and_place(text);
         let want = parse_error("k.yaml", text);
         let (code, _, stderr) = failure_of(&dir, &["validate", "k.yaml"]);
         assert_eq!(code, Some(4), "{src:?}");
-        assert!(stderr.contains(&place), "{src:?}: {stderr}");
+        assert_eq!(stderr, want, "{src:?}");
         for args in [
             &["get", "k.yaml", "/x"][..],
             &["set", "k.yaml", "/zz", "1"],
@@ -1230,10 +1223,9 @@ fn an_alias_key_repeats_its_anchor_and_a_tagged_collection_key_reads() {
         let (code, stdout, stderr) = failure_of(&dir, &["get", file, ""]);
         assert_eq!(code, Some(3), "{file}");
         assert_eq!(stdout, "", "{file}");
-        let (_, place) = message_and_place(text);
         assert_eq!(stderr, parse_error(file, text));
         let (_, _, stderr) = failure_of(&dir, &["validate", file]);
-        assert!(stderr.contains(&place), "{file}: {stderr}");
+        assert_eq!(stderr, parse_error(file, text), "{file}");
     }
     // A collection key holding one is named by its value, with no tag.
     assert_eq!(stdout_of(&dir, &["keys", "seq.yaml", ""]), "[1e400]\n");
@@ -1294,18 +1286,14 @@ fn a_repeated_number_key_is_named_as_first_written() {
     ] {
         let src = format!("{first}: a\n{again}: b\n");
         let dir = dir_with(&[("k.yaml", &src)]);
-        let (_, _, stderr) = failure_of(&dir, &["validate", "k.yaml"]);
-        assert!(stderr.contains("\nline: 2\ncol: 1\n"), "{src:?}: {stderr}");
+        let want =
+            format!("parse error in k.yaml: duplicate entry with key {first}\n  --> k.yaml:2:1\n");
+        let (code, _, stderr) = failure_of(&dir, &["validate", "k.yaml"]);
+        assert_eq!((code, &stderr), (Some(4), &want), "{src:?}");
         for args in [&["get", "k.yaml", ""][..], &["set", "k.yaml", "/z", "1"]] {
             let (code, stdout, stderr) = failure_of(&dir, args);
             assert_eq!((code, stdout.as_str()), (Some(3), ""), "{src:?} {args:?}");
-            assert_eq!(
-                stderr,
-                format!(
-                    "parse error in k.yaml: duplicate entry with key {first}\n  --> k.yaml:2:1\n"
-                ),
-                "{src:?} {args:?}"
-            );
+            assert_eq!(stderr, want, "{src:?} {args:?}");
         }
     }
 }

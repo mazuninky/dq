@@ -240,7 +240,9 @@ pub enum TemplateMode {
 /// [`crate::Error::TemplatedFile`] as above; any error `parse` returns for
 /// the bytes it is handed in the `Allow` and `RawStrings` modes, and for
 /// bytes without a template marker. A parse error is placed in `bytes`,
-/// with placeholders or not.
+/// with placeholders or not — but for one of XML that is not UTF-8, whose
+/// column and source line, those of the decoded text, have the placeholder
+/// in place of a block on that line.
 pub fn guarded_parse(
     bytes: &[u8],
     mode: TemplateMode,
@@ -378,8 +380,9 @@ const MAX_FILL: usize = 8;
 ///
 /// # Errors
 ///
-/// The error of `parse`, a parse error placed in `bytes`;
-/// [`crate::Error::TemplatedFile`] for bytes that spell every prefix tried.
+/// The error of `parse`, a parse error placed in `bytes`
+/// ([`place_in_source`]); [`crate::Error::TemplatedFile`] for bytes that
+/// spell every prefix tried.
 fn parse_placeheld(
     bytes: &[u8],
     parse: impl Fn(&[u8]) -> crate::Result<crate::Document>,
@@ -389,7 +392,14 @@ fn parse_placeheld(
     loop {
         let (marks, twin) = Marks::pair(bytes, min_fill);
         let (text, map) = substitute_with(bytes, &marks);
-        let doc = parse(&text).map_err(|e| place_in_source(e, &text, bytes, &marks))?;
+        let doc = parse(&text).map_err(|e| {
+            if map.is_empty() {
+                // The parser read the file's own bytes.
+                e
+            } else {
+                place_in_source(e, &text, bytes, &marks)
+            }
+        })?;
         if map.is_empty() || !spells_apart {
             return Ok((doc, map));
         }
@@ -409,8 +419,22 @@ fn parse_placeheld(
 /// `err`, raised on `text` — `bytes` with every template block swapped for a
 /// placeholder of `marks` — placed in `bytes`: an error inside a placeholder
 /// is at its block.
-fn place_in_source(err: crate::Error, text: &[u8], bytes: &[u8], marks: &Marks) -> crate::Error {
-    err.relocated(text, bytes, |at| {
+///
+/// Only the span moves of an error that is not placed in `text`
+/// ([`crate::Error::is_placed_in`]): one of XML in an encoding other than
+/// UTF-8, whose line, column and source line are of the decoded text, which
+/// `bytes` do not give. They stay the parser's: the line is the file's (a
+/// block never spans a line break), the column and the source line have the
+/// placeholder in place of a block on that line. Whether `bytes` are UTF-8
+/// does not tell such a file: those of UTF-16 and ISO-2022-JP can be, and the
+/// position of a YAML file that is none is of its bytes.
+fn place_in_source(
+    mut err: crate::Error,
+    text: &[u8],
+    bytes: &[u8],
+    marks: &Marks,
+) -> crate::Error {
+    let to_source = |at| {
         // What the text so far holds more than the bytes, and less.
         let (mut longer, mut shorter) = (0, 0);
         for (n, block) in substitution_regex().find_iter(bytes).enumerate() {
@@ -427,7 +451,14 @@ fn place_in_source(err: crate::Error, text: &[u8], bytes: &[u8], marks: &Marks) 
             shorter += block.len();
         }
         at + shorter - longer
-    })
+    };
+    if err.is_placed_in(text) {
+        return err.relocated(text, bytes, to_source);
+    }
+    if let crate::Error::Parse { span, .. } = &mut err {
+        *span = to_source(span.start)..to_source(span.end);
+    }
+    err
 }
 
 /// The refusal of `bytes` that spell, with escapes, the placeholder text
@@ -1526,6 +1557,162 @@ mod tests {
                 }
                 other => panic!("{text}: {other:?}"),
             }
+        }
+    }
+
+    /// `(line, col, span, snippet)` of the error XML `bytes` fail with.
+    fn xml_error(bytes: &[u8], mode: TemplateMode) -> (u32, u32, std::ops::Range<usize>, String) {
+        let xml = |b: &[u8]| crate::by_name("xml").expect("xml").parse(b);
+        let read = guarded_parse(bytes, mode, xml).expect_err("must fail");
+        let edit = parse_for_write(bytes, mode, xml).expect_err("must fail");
+        match (read, edit) {
+            (
+                crate::Error::Parse {
+                    line,
+                    col,
+                    span,
+                    snippet,
+                    message,
+                    ..
+                },
+                crate::Error::Parse {
+                    line: edit_line,
+                    col: edit_col,
+                    span: edit_span,
+                    snippet: edit_snippet,
+                    message: edit_message,
+                    ..
+                },
+            ) => {
+                assert_eq!(
+                    (line, col, &span, &snippet, &message),
+                    (
+                        edit_line,
+                        edit_col,
+                        &edit_span,
+                        &edit_snippet,
+                        &edit_message
+                    )
+                );
+                (line, col, span, snippet)
+            }
+            other => panic!("{bytes:?}: {other:?}"),
+        }
+    }
+
+    fn utf16le(text: &str) -> Vec<u8> {
+        text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+    }
+
+    /// An XML document that declares `encoding`, `body` from line 2 on.
+    fn declared(encoding: &str, body: &[u8]) -> Vec<u8> {
+        let decl = format!("<?xml version=\"1.0\" encoding=\"{encoding}\"?>\n");
+        [decl.as_bytes(), body].concat()
+    }
+
+    #[test]
+    fn a_parse_error_of_xml_with_no_template_is_the_same_in_every_mode() {
+        for (bytes, line, col, snippet) in [
+            (utf16le("\u{feff}<a>\n <b>я</c>\n</a>\n"), 2, 7, " <b>я</c>"),
+            // No byte order mark: these bytes are valid UTF-8.
+            (
+                utf16le("<?xml version=\"1.0\"?><a>\n <b>x</c>\n"),
+                2,
+                6,
+                " <b>x</c>",
+            ),
+            (
+                declared("windows-1251", b"<a>\xff\xfe</c>\n"),
+                2,
+                8,
+                "<a>яю</c>",
+            ),
+            (declared("ISO-8859-1", b"<a>\xe9</c>\n"), 2, 6, "<a>é</c>"),
+            // ASCII bytes of another text.
+            (
+                declared("ISO-2022-JP", b"<a>\x1b$BF|\x1b(B</c>\n"),
+                2,
+                7,
+                "<a>日</c>",
+            ),
+            ("\u{feff}<a>\n я</c>".into(), 2, 4, " я</c>"),
+        ] {
+            let allowed = xml_error(&bytes, TemplateMode::Allow);
+            assert_eq!(
+                (allowed.0, allowed.1, allowed.3.as_str()),
+                (line, col, snippet)
+            );
+            for mode in [TemplateMode::RawStrings, TemplateMode::Guard] {
+                assert_eq!(xml_error(&bytes, mode), allowed, "{mode:?} {bytes:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_parse_error_of_xml_with_templates_keeps_the_place_in_its_text() {
+        let template: &[u8] = b"<a k=\"{{ .Values.long.path }}\">\n";
+        let fails = |bytes: &[u8], at: &[u8], line: u32, col: u32, snippet: &str| {
+            let start = bytes
+                .windows(at.len())
+                .position(|w| w == at)
+                .expect("the fault");
+            let (at_line, at_col, span, at_snippet) = xml_error(bytes, TemplateMode::RawStrings);
+            assert_eq!(
+                (at_line, at_col, span.start, at_snippet.as_str()),
+                (line, col, start, snippet),
+                "{bytes:?}"
+            );
+        };
+        // A template on an earlier line moves nothing.
+        let body = [template, b"\xff\xfe</c>\n"].concat();
+        fails(&declared("windows-1251", &body), b"</c>", 3, 5, "яю</c>");
+        let body = [template, b"\x1b$BF|\x1b(B</c>\n"].concat();
+        // (The span begins at the escape sequence before the tag.)
+        let bytes = declared("ISO-2022-JP", &body);
+        fails(&bytes, b"\x1b(B</c>", 3, 4, "日</c>");
+        // One on the line of the error is its placeholder, in the column
+        // and in the source line.
+        let body = b"<a>\xff{{ .Values.long.path }}</c>\n";
+        let bytes = declared("windows-1251", body);
+        fails(&bytes, b"</c>", 2, 16, "<a>яDQtplxq0qx</c>");
+        // A block that is no UTF-8 is none: nothing stands in its place.
+        let bytes = declared("windows-1251", b"<a>{{ \"\xff\xfe\" }}</c>\n");
+        fails(&bytes, b"</c>", 2, 16, "<a>{{ \"яю\" }}</c>");
+        // Where the text is the file's bytes, the place is the file's.
+        for encoding in ["UTF-8", "windows-1251", "ISO-2022-JP"] {
+            fails(
+                &declared(encoding, b"<a>{{ .x }}</c>\n"),
+                b"</c>",
+                2,
+                12,
+                "<a>{{ .x }}</c>",
+            );
+        }
+        fails(
+            "\u{feff}<a>\nя{{ .Values.long.path }}</c>\n".as_bytes(),
+            b"</c>",
+            2,
+            26,
+            "я{{ .Values.long.path }}</c>",
+        );
+    }
+
+    #[test]
+    fn a_parse_error_of_bytes_that_are_no_utf8_is_placed_in_them() {
+        // A YAML error counts the bytes, valid or not.
+        let text = b"a: \"{{ .Values.long.path }}\" \xff\n";
+        match guarded_parse(text, TemplateMode::RawStrings, yaml).expect_err("must fail") {
+            crate::Error::Parse {
+                line,
+                col,
+                span,
+                snippet,
+                ..
+            } => assert_eq!(
+                (line, col, span, snippet.as_str()),
+                (1, 30, 29..30, "a: \"{{ .Values.long.path }}\" \u{fffd}")
+            ),
+            other => panic!("{other:?}"),
         }
     }
 

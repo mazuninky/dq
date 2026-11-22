@@ -1,6 +1,6 @@
 # Structured errors: a caret under the offending byte, a JSON error object under `-F json`
 
-**Status: in progress (2026-11-22).** Phase 1 (positions) is done; phases 2 to 4 are open. The owner accepted every recommendation; the decisions are at the end.
+**Status: in progress (2026-11-22).** Phases 1 (positions) and 2 (console) are done; phases 3 and 4 are open. The owner accepted every recommendation; the decisions are at the end.
 
 Agent-first error output was a founding goal of dq ([archive/dq-plan-2026-05.md](../archive/dq-plan-2026-05.md)): errors with line, column, span, snippet, suggestions, and a machine-readable form under `-F json`. The suggestions shipped (`did_you_mean`, the matched prefix). The caret and the JSON form did not. [roadmap.md](../roadmap.md) and [reference/cli.md](../reference/cli.md) list both as missing.
 
@@ -89,10 +89,10 @@ parse error in bad.json: expected JSON value (object, array, scalar)
 - **The first line does not change**, so scripts that grep `parse error in …` keep working. What is new follows it.
 - A span longer than one byte is underlined `^~~~` up to the end of the line.
 - **Control characters.** The source line goes through `escape_control`, as all terminal output does ([crates/dq-cli/src/output/console.rs](../../crates/dq-cli/src/output/console.rs)): a file cannot rewrite the terminal. Escaping makes the line longer than its bytes (ESC prints as `\x1b`), so the caret position is computed by the same pass that escapes: it walks the line character by character, appends the escaped form, and records the display column when it reaches the byte the error is at.
-- **Width.** Tabs print as four spaces. Wide characters (CJK, emoji) take two columns. This needs the `unicode-width` crate (small, no dependencies, MIT/Apache-2.0); it is not in `Cargo.lock` today.
+- **Width.** Tabs print as four spaces. Wide characters (CJK, emoji) take two columns. This uses the `unicode-width` crate (small, no dependencies, MIT/Apache-2.0), per character: joined emoji and right-to-left text are not accounted for.
 - **Long lines.** A line wider than 120 columns is windowed around the caret, with `…` on the cut side. A 10 MB one-line JSON file does not print 10 MB.
-- **Other errors.** `templated_file` has a line and a snippet, so it gets the same block without a caret column. A jq compile error (section 4) shows the expression with a caret. Path errors keep their block and gain nothing. Everything else prints its message.
-- **Colour.** The caret and the `-->` line are dimmed only when `resolve_color` says so, never in JSON.
+- **Other errors.** `templated_file` keeps its one-line form: it carries no file name, and its message already quotes the line. A jq compile error (section 4) shows the expression with a caret. Path errors keep their block and gain nothing. Everything else prints its message.
+- **Colour.** The `-->` line and the gutter are dim and the caret bold red when stderr takes colour (the decision the log uses), never in JSON.
 - **`Caused by:`** is dropped when its text is already part of the message above it.
 
 `validate` on the console prints its position as `kind:` / `file:` / `line:` lines today. It prints the same block as every other command (decision 2).
@@ -150,7 +150,7 @@ jq compile error: expected key
 Each phase is one PR, releasable on its own.
 
 1. **Positions (dq-core): done.** Also in this phase: the second line `  --> FILE:LINE:COL` on the console and the place in the bulk summary, because taking the position out of the messages would otherwise have left the console without one. `Error::parse_at`; migrate the parsers; byte columns in YAML; outer positions for front matter; line and column for CSV, JSONL, `.env`; first bad byte for invalid UTF-8; messages without positions; the XML snippet's stray `\n`. corpus of malformed files with expected line, column, span and snippet (`crates/dq-core/tests/parse_error_positions.rs`), a property test that line and column agree with a naive scan for random offsets in texts with `\n`, `\r\n`, lone `\r`, a BOM and multi-byte characters.
-2. **Console (dq-cli).** `output/error.rs`; caret block; `Caused by:` de-duplication; `unicode-width`; insta snapshots per format, plus: tab, CJK, emoji, ESC in the line, 3,000-character line, position at end of file, CRLF, empty file.
+2. **Console (dq-cli): done.** `output/error.rs`; caret block; `Caused by:` de-duplication; `unicode-width`; exact output pinned per format, plus: tab, CJK, emoji, ESC in the line, 3,000-character line, position at end of file, CRLF, empty file.
 3. **JSON (dq-cli).** `render_error` takes the output format; the JSON object; jq compile errors; bulk files; the table of kinds. Tests: every kind's object is valid JSON, its `exit_code` equals the process's, the object is the last line of stderr; a source line with an ESC byte reaches JSON unescaped and the terminal escaped.
 4. **Docs and skill.** `reference/cli.md` (errors and the kind table), README, `skills/dq/SKILL.md`, the `lint` / SARIF claim in the README that a file that does not parse produces no SARIF (it does: `lint.parse`), CHANGELOG "Changed", a dated entry in `decisions.md`.
 

@@ -77,15 +77,24 @@ pub(crate) fn escape_control(s: &str) -> Cow<'_, str> {
     }
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if is_escaped_control(c) {
-            out.push_str(&format!("\\x{:02x}", u32::from(c)));
-        } else if is_invisible_layout(c) {
-            out.push_str(&format!("\\u{:04x}", u32::from(c)));
-        } else {
-            out.push(c);
+        match escaped_char(c) {
+            Some(escape) => out.push_str(&escape),
+            None => out.push(c),
         }
     }
     Cow::Owned(out)
+}
+
+/// What [`escape_control`] prints for `c`, in ASCII; `None` for a character
+/// it prints as it is.
+pub(crate) fn escaped_char(c: char) -> Option<String> {
+    if is_escaped_control(c) {
+        Some(format!("\\x{:02x}", u32::from(c)))
+    } else if is_invisible_layout(c) {
+        Some(format!("\\u{:04x}", u32::from(c)))
+    } else {
+        None
+    }
 }
 
 /// A C0 control, DEL or a C1 control: Unicode's `Cc` category, the set
@@ -221,9 +230,10 @@ fn flow_string(s: &str) -> String {
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
-            c if is_escaped_control(c) => out.push_str(&format!("\\x{:02x}", u32::from(c))),
-            c if is_invisible_layout(c) => out.push_str(&format!("\\u{:04x}", u32::from(c))),
-            c => out.push(c),
+            c => match escaped_char(c) {
+                Some(escape) => out.push_str(&escape),
+                None => out.push(c),
+            },
         }
     }
     out.push('"');

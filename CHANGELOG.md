@@ -8,8 +8,31 @@ breaking changes are listed first under Changed.
 
 ## [Unreleased]
 
+### Added
+
+- A parse error shows the source line with a caret under what is wrong, on
+  every command:
+
+  ```
+  parse error in bad.json: expected JSON value (object, array, scalar)
+    --> bad.json:2:14
+     |
+   2 |   "b": [1, 2,, 3]
+     |              ^
+  ```
+
+  Control characters of the line are escaped, tabs and wide characters are
+  accounted for, and a line over 120 columns is cut around the caret. Output
+  under `-F json` does not change.
+
 ### Changed
 
+- An error no longer repeats its cause: `Caused by:` leaves out a cause whose
+  text the message above it already holds (I/O, write, rule and glob errors
+  printed it twice), and so does an entry of the bulk summary.
+- `dq validate` on the console prints that block instead of `kind:` /
+  `file:` / `line:` / `col:` / `message:` / `snippet:` lines. The machine
+  formats (`-F json`, `sarif`, …) are unchanged.
 - A parse error prints its place on a second line, `  --> FILE:LINE:COL`
   (`<stdin>` for input on stdin), and the bulk summary ends the entry with
   ` (line L, column C)`. The place left the message itself: YAML's
@@ -49,6 +72,11 @@ breaking changes are listed first under Changed.
 
 ### Fixed
 
+- A usage error that names the file (`-F yaml … keeps FILE in its own format`)
+  shows the name whole and on one line: a line break in it started a line of
+  its own, and terminal sequences were dropped from it.
+- `dq validate` on the console takes the colour of stderr, where it prints, not
+  of stdout.
 - Parse errors had a missing or wrong position in several formats: CSV and
   TSV (column 0, or the wrong line after a blank line), JSON Lines and
   `.env` (always column 1), INI, YAML and HCL (no source line, no byte
