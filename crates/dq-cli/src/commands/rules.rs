@@ -11,14 +11,16 @@
 //! `add` follows `.dq` and `.dq/rules` where they are links to directories,
 //! and no link under `.dq/rules`: one in the way of a file counts as an
 //! existing destination, which `--force` replaces and never writes through.
-//! What it would write over or remove of its own source it refuses.
+//! What it would write over or remove of its own source it refuses. The
+//! source is resolved before anything is removed, so a link that is replaced
+//! may be on the way to it.
 
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
 use dq_exec::{RuleSet, RuleSource, rule_dir};
 
 use crate::cli::{RulesAddArgs, RulesListArgs};
@@ -104,7 +106,8 @@ pub fn run_list(
 ///
 /// # Errors
 ///
-/// - `InvalidInput` (exit 6) for unknown `@std/<ns>` namespaces, for
+/// - `InvalidInput` (exit 6) for unknown `@std/<ns>` namespaces, for a source
+///   whose name makes no directory of its own under `.dq/rules`, for
 ///   destination collisions (without `--force`), and for a source that is the
 ///   destination, inside it or around it. Nothing is written then.
 /// - `dq_exec::ExecError` for a `.dq` or `.dq/rules` that cannot be resolved
@@ -129,7 +132,7 @@ fn run_add_in_cwd(args: &RulesAddArgs, cwd: &Utf8Path) -> anyhow::Result<()> {
                 format!("unknown @std namespace: {name}",),
             ))
         })?;
-        let dest = rules_dir.join(name);
+        let dest = ruleset_dir(&rules_dir, name, Utf8Path::new(&args.ruleset))?;
         let files: Vec<NewFile> = files
             .iter()
             .map(|(name, text)| NewFile {
@@ -138,6 +141,7 @@ fn run_add_in_cwd(args: &RulesAddArgs, cwd: &Utf8Path) -> anyhow::Result<()> {
             })
             .collect();
         rule_dir::project_dir(cwd).map_err(anyhow::Error::new)?;
+        ensure_inside(&rules_dir, &dest, &files)?;
         return materialise(&dest, &files, args);
     }
 
@@ -153,15 +157,22 @@ fn run_add_in_cwd(args: &RulesAddArgs, cwd: &Utf8Path) -> anyhow::Result<()> {
         ))));
     }
 
+    // Where the source really is, once and for all: what is removed for it
+    // may be a link on the way to it.
+    let source = fs::canonicalize(&candidate).map_err(|err| io_error(&candidate, err))?;
     // The destination namespace is the path's file stem (file case) or
     // directory name (dir case).
     let (dest, files) = if candidate.is_file() {
-        // Text, as a rule is, and readable before anything is removed for it.
+        // Text, as a rule is.
         fs::read_to_string(&candidate).map_err(|source| io_error(&candidate, source))?;
-        let dest = rules_dir.join(candidate.file_stem().unwrap_or("local"));
+        let name = candidate.file_stem().unwrap_or("local");
+        let dest = ruleset_dir(&rules_dir, name, &candidate)?;
         let file = NewFile {
             target: dest.join(candidate.file_name().unwrap_or("rules.yml")),
-            from: Origin::File(candidate.clone()),
+            from: Origin::File {
+                found: candidate.as_std_path().to_path_buf(),
+                real: source.clone(),
+            },
         };
         (dest, vec![file])
     } else {
@@ -169,14 +180,61 @@ fn run_add_in_cwd(args: &RulesAddArgs, cwd: &Utf8Path) -> anyhow::Result<()> {
         // allow-list. We reuse `RuleSet::from_path` for parsing-only
         // validation, then iterate the directory ourselves to copy each
         // file verbatim (preserves comments / formatting).
+        let name = candidate.file_name().unwrap_or("local");
+        let dest = ruleset_dir(&rules_dir, name, &candidate)?;
         let _validated = RuleSet::from_path(&candidate).map_err(anyhow::Error::new)?;
-        let dest = rules_dir.join(candidate.file_name().unwrap_or("local"));
         let files = directory_files(&candidate, &dest)?;
         (dest, files)
     };
     rule_dir::project_dir(cwd).map_err(anyhow::Error::new)?;
-    ensure_apart(&candidate, &dest, &files)?;
+    ensure_inside(&rules_dir, &dest, &files)?;
+    ensure_apart(&candidate, &source, &dest, &files)?;
     materialise(&dest, &files, args)
+}
+
+/// The directory of `rules_dir` that `source` is added as, by its `name`.
+///
+/// # Errors
+///
+/// `InvalidInput` when `name` is not exactly one component of a path (the
+/// stem of `...yml` is `..`), or nothing but the dots and spaces that Windows
+/// drops from the end of one.
+fn ruleset_dir(rules_dir: &Utf8Path, name: &str, source: &Utf8Path) -> anyhow::Result<Utf8PathBuf> {
+    let mut components = Utf8Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(Utf8Component::Normal(only)), None)
+            if only == name && !name.trim_matches(['.', ' ']).is_empty() =>
+        {
+            Ok(rules_dir.join(name))
+        }
+        _ => Err(anyhow::Error::new(InvalidInput::new(format!(
+            "cannot add {source}: '{name}' does not name a directory for it in .dq/rules"
+        )))),
+    }
+}
+
+/// Refuse a plan that would write anything but `dest` in `rules_dir` and what
+/// is in it.
+fn ensure_inside(rules_dir: &Utf8Path, dest: &Utf8Path, files: &[NewFile]) -> anyhow::Result<()> {
+    let is_inside = |path: &Utf8Path, dir: &Utf8Path| {
+        path.strip_prefix(dir).is_ok_and(|rest| {
+            let mut components = rest.components().peekable();
+            components.peek().is_some()
+                && components.all(|part| matches!(part, Utf8Component::Normal(_)))
+        })
+    };
+    let outside = if is_inside(dest, rules_dir) {
+        let mut targets = files.iter().map(|file| file.target.as_path());
+        targets.find(|target| !is_inside(target, dest))
+    } else {
+        Some(dest)
+    };
+    match outside {
+        None => Ok(()),
+        Some(path) => Err(anyhow::Error::new(InvalidInput::new(format!(
+            "destination is outside {rules_dir}: {path}"
+        )))),
+    }
 }
 
 /// A file `rules add` makes.
@@ -192,21 +250,27 @@ enum Origin {
     /// The text of an `@std/*` file, which is nowhere on disk to link to.
     Embedded(&'static str),
     /// A file to copy, or to link to under `--symlink`.
-    File(Utf8PathBuf),
+    File {
+        /// Where the source has it, links as they are.
+        found: PathBuf,
+        /// The file itself, by an absolute path without a link: that is what
+        /// is copied, or what the link leads to.
+        real: PathBuf,
+    },
 }
 
 /// The rule files and fixtures a run over `src` would load, links followed,
 /// at the same places under `dest`.
 fn directory_files(src: &Utf8Path, dest: &Utf8Path) -> anyhow::Result<Vec<NewFile>> {
     let mut files = Vec::new();
-    for entry in
+    for file in
         rule_dir::files_under(src, rule_dir::DanglingLinks::Refuse).map_err(anyhow::Error::new)?
     {
         // `RuleSet::from_path` has refused a non-UTF-8 path already.
-        let Ok(entry) = Utf8PathBuf::from_path_buf(entry) else {
+        let Some(entry) = Utf8Path::from_path(&file.path) else {
             continue;
         };
-        if !rule_dir::is_rule_file(&entry) && !rule_dir::is_fixture_file(&entry) {
+        if !rule_dir::is_rule_file(entry) && !rule_dir::is_fixture_file(entry) {
             continue;
         }
         let relative = entry.strip_prefix(src).map_err(|_| {
@@ -216,7 +280,10 @@ fn directory_files(src: &Utf8Path, dest: &Utf8Path) -> anyhow::Result<Vec<NewFil
         })?;
         files.push(NewFile {
             target: dest.join(relative),
-            from: Origin::File(entry),
+            from: Origin::File {
+                real: file.real().map_err(anyhow::Error::new)?,
+                found: file.location,
+            },
         });
     }
     Ok(files)
@@ -228,29 +295,33 @@ fn directory_files(src: &Utf8Path, dest: &Utf8Path) -> anyhow::Result<Vec<NewFil
 ///
 /// A link in `dest` to a file of the source does not count. That is what
 /// `--symlink` makes, and replacing the link leaves the file alone.
-fn ensure_apart(source: &Utf8Path, dest: &Utf8Path, files: &[NewFile]) -> anyhow::Result<()> {
+///
+/// `real_source` is where `source` really is.
+fn ensure_apart(
+    source: &Utf8Path,
+    real_source: &Path,
+    dest: &Utf8Path,
+    files: &[NewFile],
+) -> anyhow::Result<()> {
     let refused = || {
         anyhow::Error::new(InvalidInput::new(format!(
             "cannot add {source} to {dest}: one is inside the other, or they are the same"
         )))
     };
-    let real_source = real_path(source.as_std_path());
     // Where a link at `dest` leads, and where the link itself is.
     let real_dests = [real_path(dest.as_std_path()), own_path(dest.as_std_path())];
     let in_dest = |path: &Path| real_dests.iter().any(|dest| path.starts_with(dest));
-    if in_dest(&real_source) || real_dests.iter().any(|dest| dest.starts_with(&real_source)) {
+    if in_dest(real_source) || real_dests.iter().any(|dest| dest.starts_with(real_source)) {
         return Err(refused());
     }
     for file in files {
-        let Origin::File(origin) = &file.from else {
+        let Origin::File { found, real } = &file.from else {
             continue;
         };
         let target = own_path(file.target.as_std_path());
-        if target.starts_with(&real_source)
-            || target == real_path(origin.as_std_path())
-            || link_chain(origin.as_std_path())
-                .iter()
-                .any(|at| in_dest(at))
+        if target.starts_with(real_source)
+            || target == *real
+            || link_chain(found).iter().any(|at| in_dest(at))
         {
             return Err(refused());
         }
@@ -290,18 +361,31 @@ fn link_chain(path: &Path) -> Vec<PathBuf> {
 /// Make `files` under `dest`, after everything that could refuse it has been
 /// looked at.
 fn materialise(dest: &Utf8Path, files: &[NewFile], args: &RulesAddArgs) -> anyhow::Result<()> {
-    for path in in_the_way(dest, files, args.force)? {
-        remove_entry(&path).map_err(|source| io_error(&path, source))?;
-    }
-    create_dir(dest)?;
+    let in_the_way = in_the_way(dest, files, args.force)?;
     for file in files {
-        if let Some(parent) = file.target.parent() {
+        if let Origin::File { real, .. } = &file.from {
+            fs::File::open(real).map_err(|source| std_io_error(real, source))?;
+        }
+    }
+    // Resolved before anything is removed, as the source is.
+    let real_dest = own_path(dest.as_std_path());
+    let place = |path: &Utf8Path| match path.strip_prefix(dest) {
+        Ok(rest) if !rest.as_str().is_empty() => real_dest.join(rest),
+        _ => real_dest.clone(),
+    };
+    for path in in_the_way {
+        remove_entry(&place(&path)).map_err(|source| io_error(&path, source))?;
+    }
+    create_dir(&real_dest)?;
+    for file in files {
+        let target = place(&file.target);
+        if let Some(parent) = target.parent() {
             create_dir(parent)?;
         }
-        if !(args.symlink && link_to_origin(file)?) {
+        if !(args.symlink && link_to_origin(file, &target)?) {
             let made = match &file.from {
-                Origin::Embedded(text) => fs::write(&file.target, text),
-                Origin::File(origin) => fs::copy(origin, &file.target).map(|_| ()),
+                Origin::Embedded(text) => fs::write(&target, text),
+                Origin::File { real, .. } => fs::copy(real, &target).map(|_| ()),
             };
             made.map_err(|source| io_error(&file.target, source))?;
         }
@@ -358,7 +442,7 @@ fn in_the_way(
 }
 
 /// Remove a file, or a link and not what it leads to.
-fn remove_entry(path: &Utf8Path) -> io::Result<()> {
+fn remove_entry(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
         // Windows removes a link to a directory as a directory; neither call
         // follows it.
@@ -367,18 +451,18 @@ fn remove_entry(path: &Utf8Path) -> io::Result<()> {
     }
 }
 
-/// Make the target of `file` a link to its origin, and say whether it was
-/// made.
+/// Make `target`, where `file` goes, a link to its origin, and say whether it
+/// was made.
 ///
 /// On Unix with an on-disk source that is a real symlink. In every other case
 /// (embedded `@std/*` source on any platform, or non-Unix platform with any
 /// source) there is none to make: the user asked for one and is warned that a
 /// copy takes its place.
-fn link_to_origin(file: &NewFile) -> anyhow::Result<bool> {
+fn link_to_origin(file: &NewFile, target: &Path) -> anyhow::Result<bool> {
     #[cfg(unix)]
     {
-        if let Origin::File(origin) = &file.from {
-            std::os::unix::fs::symlink(origin, &file.target)
+        if let Origin::File { real, .. } = &file.from {
+            std::os::unix::fs::symlink(real, target)
                 .map_err(|source| io_error(&file.target, source))?;
             return Ok(true);
         }
@@ -388,6 +472,8 @@ fn link_to_origin(file: &NewFile) -> anyhow::Result<bool> {
         );
     }
     #[cfg(not(unix))]
+    let _ = target;
+    #[cfg(not(unix))]
     tracing::warn!(
         target = %file.target,
         "--symlink not supported on this platform; copying instead"
@@ -395,8 +481,12 @@ fn link_to_origin(file: &NewFile) -> anyhow::Result<bool> {
     Ok(false)
 }
 
-fn create_dir(path: &Utf8Path) -> anyhow::Result<()> {
-    fs::create_dir_all(path).map_err(|source| io_error(path, source))
+fn create_dir(path: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(path).map_err(|source| std_io_error(path, source))
+}
+
+fn std_io_error(path: &Path, source: io::Error) -> anyhow::Error {
+    io_error(Utf8Path::new(&path.to_string_lossy()), source)
 }
 
 fn io_error(path: &Utf8Path, source: io::Error) -> anyhow::Error {
@@ -478,6 +568,53 @@ mod tests {
         };
         let err = run_add_in_cwd(&args, &cwd).expect_err("unknown std must error");
         assert!(err.downcast_ref::<InvalidInput>().is_some());
+    }
+
+    #[test]
+    fn a_ruleset_directory_is_one_component_under_the_rules() {
+        let dir = |name| ruleset_dir(Utf8Path::new("r"), name, Utf8Path::new("src"));
+        for name in ["k8s", ".yml", "..a", "a.", "a b", "local"] {
+            assert_eq!(dir(name).expect(name), Utf8Path::new("r").join(name));
+        }
+        for name in [
+            "", ".", "..", "...", ".. ", " ", "a/b", "/", "/a", "../a", "a/..", "./a", "a/", "a/.",
+        ] {
+            let err = dir(name).expect_err(name);
+            assert!(err.downcast_ref::<InvalidInput>().is_some(), "{name:?}");
+        }
+        if cfg!(windows) {
+            for name in ["a\\b", "c:", "c:a"] {
+                dir(name).expect_err(name);
+            }
+        }
+    }
+
+    #[test]
+    fn a_plan_stays_under_the_rules() {
+        let plan = |dest: &str, target: &str| {
+            let file = NewFile {
+                target: Utf8PathBuf::from(target),
+                from: Origin::Embedded(""),
+            };
+            ensure_inside(Utf8Path::new("q/rules"), Utf8Path::new(dest), &[file])
+        };
+        plan("q/rules/a", "q/rules/a/b.yml").expect("inside");
+        plan("q/rules/a", "q/rules/a/b/c.yml").expect("inside");
+        for (dest, target) in [
+            ("q/rules", "q/rules/b.yml"),
+            ("q/rules/..", "q/rules/../b.yml"),
+            ("q/rules/a/..", "q/rules/a/../b.yml"),
+            ("q/rules/a", "q/rules/a"),
+            ("q/rules/a", "q/rules/a/../b.yml"),
+            ("q/rules/a", "q/rules/b/b.yml"),
+            ("q/other", "q/other/b.yml"),
+        ] {
+            let err = plan(dest, target).expect_err(target);
+            assert!(err.downcast_ref::<InvalidInput>().is_some(), "{target}");
+        }
+        // A plan without a file makes `dest` too.
+        let rules = Utf8Path::new("q/rules");
+        ensure_inside(rules, rules, &[]).expect_err("the rules themselves");
     }
 
     #[test]

@@ -76,7 +76,8 @@ The two SQL-style operators of jq 1.5 and later, added to dq's jq prelude with j
 
 1. **Fail closed** (1 and 2): **done.** `dq-exec`, `dq-cli`, reference docs, CHANGELOG "Changed". Also: rule directories follow links (rules added with `--symlink` were never loaded) and take `.yml` / `.yaml` in any case; `main` no longer holds the stderr lock, which hung `fix --parallel`.
 2. **Rule authoring** (3 and 4): `dq-exec`, reference docs. Also: `match.glob` ignores a leading `./`; a `dq test` case whose `format` the rule does not match is an error.
-3. **`.npmrc`, `IN`, `INDEX`** (5 and 6): `dq-core`, `dq-transform`, reference docs.
+3. **Input globs**: a directory that cannot be read is an error, a file that is a symbolic link is matched. The glob is shared with the write commands, so this is a change of its own.
+4. **`.npmrc`, `IN`, `INDEX`** (5 and 6): `dq-core`, `dq-transform`, reference docs.
 
 ## Compatibility
 

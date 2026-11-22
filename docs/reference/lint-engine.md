@@ -11,9 +11,9 @@ the `dq-exec` crate (`crates/dq-exec/src/`); the standard library of rules is
 
 | Command | Purpose |
 |---|---|
-| `dq lint <files/globs>… [--rules SRC]…` | Run rule sets over files. |
-| `dq check (--rule ID-OR-PATH \| --inline YAML) <files>…` | Run one rule. No auto-binding. |
-| `dq fix <files/globs>… [--rules SRC]…` | Apply rule fixes; write modes as in [write-commands.md](write-commands.md). |
+| `dq lint <files/globs>… [--rules SRC]… [--allow-rule-errors]` | Run rule sets over files. |
+| `dq check (--rule ID-OR-PATH \| --inline YAML) <files>… [--allow-rule-errors]` | Run one rule. No auto-binding. |
+| `dq fix <files/globs>… [--rules SRC]… [--allow-rule-errors]` | Apply rule fixes; write modes as in [write-commands.md](write-commands.md). |
 | `dq test <dir \| @std/NS \| @std>` | Run every `*.test.yml` fixture under a directory, or the embedded fixtures of a standard namespace (`@std`: of every namespace). |
 | `dq explain <rule-id>` | Description, severity, references of a rule (`console` or `json`). |
 | `dq rules list [--namespace NS]` | List `@std` rules (id, namespace, severity, source). |
@@ -25,8 +25,9 @@ exits 6.
 
 Exit status of `lint` / `check`: 4 if any diagnostic has severity `error`;
 with `--strict`, 1 if there are `warn` findings and no errors; otherwise 0.
-`info` never fails a run. Rule-loading problems exit 3 (bad rule) or 6
-(unknown rule / namespace). A file that does not parse (or holds template
+`info` never fails a run. Rule-loading problems exit 3 (bad rule), 5 (a rule
+that cannot be read, a link that leads nowhere) or 6 (unknown rule / namespace,
+no rules in a directory). A file that does not parse (or holds template
 syntax with no escape hatch) does not stop the run: every other file is
 linted and the report written, the file a result of its own under
 `lint.parse` (`lint.templated_file`), severity `error`, at the error's line
@@ -179,7 +180,8 @@ the set of formats present in the inputs:
   walked once and a file loaded once however many links reach it. A link that
   leads nowhere (or to itself) is exit 5, as it may have been a rule (`.#name`,
   an editor's lock, is not); so is a special file named as a rule. In
-  `dq test DIR` only links named as a rule or fixture count.
+  `dq test DIR` only links named as a rule or fixture count, and a directory
+  behind a link that cannot be read is skipped with a warning.
 - `./.dq/rules` that cannot be read or resolved is exit 5, and exit 6 when it
   is not a directory. It may be absent or empty.
 - The same `--rules` value given twice is loaded twice.
@@ -187,8 +189,10 @@ the set of formats present in the inputs:
   suggestions.
 
 `dq rules add` checks everything before it writes. It refuses (exit 6) a source
-that overlaps its destination, with or without `--force`. `--force` replaces
-what is in the way, a link itself and never what it points to.
+that overlaps its destination, with or without `--force`, and a file or
+directory whose name gives no directory name in `.dq/rules` (`...yml`).
+`--force` replaces what is in the way, a link itself and never what it points
+to. `--symlink` links to the real file, links on the way to it resolved.
 
 `dq explain` resolves `@std/<ns>.<rule>`, `<ns>.<rule>` for a known
 namespace, or an exact id among loaded rules; an unknown id exits 6 with

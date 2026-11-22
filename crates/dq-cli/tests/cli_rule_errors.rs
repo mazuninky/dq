@@ -770,3 +770,94 @@ fn lint_warns_in_the_order_the_rules_run() {
         )
     );
 }
+
+/// The warnings of a run no rule error fails: the ones of a rule that raised
+/// only in its `loc`, and the composite's after it.
+#[test]
+fn lint_warns_in_the_order_the_rules_run_without_the_flag_too() {
+    let dir = TempDir::new().expect("tempdir");
+    let loc = "id: t.loc\ndescription: d\nseverity: warn\nmatch:\n  format: yaml\ncheck:\n  jq: '.'\n  message: m\nloc:\n  line: '.spec.x'\n";
+    std::fs::write(dir.path().join("a.yml"), loc).expect("write rule");
+    std::fs::write(dir.path().join("b.yml"), COMPOSITE_EXTRACT_NOT_AN_ARRAY).expect("write rule");
+    // The same for a rule nested in a composite.
+    let nested: String = loc.lines().map(|line| format!("    {line}\n")).collect();
+    let nested = format!(
+        "id: t.outer\ndescription: d\nseverity: warn\nmatch:\n  format: yaml\ncheck:\n  extract: '[{{value: \"spec: x\", format: \"yaml\", anchor: \"\"}}, 1]'\n  message: outer\n  nested:\n{nested}"
+    );
+    std::fs::write(dir.path().join("c.yml"), nested).expect("write rule");
+    std::fs::write(dir.path().join("pod.yaml"), "spec: x\n").expect("write input");
+    let loc_warning = concat!(
+        " WARN loc.line raised a runtime error; defaulting to line 1",
+        " rule_id=t.loc error=jq runtime error: cannot index \"x\" with \"x\"\n",
+    );
+    for flags in [&[][..], &["--allow-rule-errors"]] {
+        let out = dq()
+            .current_dir(dir.path())
+            .args(["--no-color", "lint"])
+            .args(flags)
+            .args(["--rules", "a.yml", "--rules", "b.yml"])
+            .args(["--rules", "c.yml", "pod.yaml"])
+            .assert()
+            .code(4);
+        assert_eq!(
+            warnings(&out.get_output().stderr),
+            [
+                loc_warning,
+                concat!(
+                    " WARN composite extract did not return an array",
+                    " rule_id=local.comp shape=number\n",
+                ),
+                loc_warning,
+                concat!(
+                    " WARN composite extract item is not an object",
+                    " rule_id=t.outer shape=number\n",
+                ),
+            ]
+            .concat(),
+            "{flags:?}"
+        );
+    }
+}
+
+#[test]
+fn rule_errors_are_named_when_a_later_file_ends_the_run() {
+    let dir = TempDir::new().expect("tempdir");
+    std::fs::write(dir.path().join("r.yml"), RAISES_IN_CHECK).expect("write rule");
+    std::fs::write(dir.path().join("pod.yaml"), WRONG_TYPE_SPEC).expect("write input");
+    let error = CHECK_RAISED.lines().next().expect("a line");
+    for flags in [&[][..], &["-q"], &["-F", "json"], &["-F", "sarif"]] {
+        for command in [["lint", "--rules"], ["check", "--rule"]] {
+            let run = |args: &[&str]| {
+                dq().current_dir(dir.path())
+                    .arg("--no-color")
+                    .args(flags)
+                    .args(command)
+                    .arg("r.yml")
+                    .args(args)
+                    .assert()
+                    .stdout("")
+            };
+            let out = run(&["pod.yaml", "nope.yaml"]).code(5);
+            let stderr = rule_errors(&out.get_output().stderr);
+            assert!(
+                stderr.starts_with(&format!("{error}\n")) && stderr.contains("nope.yaml"),
+                "{flags:?} {command:?}: {stderr}"
+            );
+            assert_eq!(stderr.matches("rule did not run").count(), 1, "{stderr}");
+            // Accepted, they are the warnings they are in any run.
+            let out = run(&["--allow-rule-errors", "pod.yaml", "nope.yaml"]).code(5);
+            let stderr = rule_errors(&out.get_output().stderr);
+            assert!(!stderr.contains("rule did not run"), "{stderr}");
+        }
+    }
+    // A format no report is written in.
+    let out = dq()
+        .current_dir(dir.path())
+        .args(["--no-color", "-F", "hcl", "lint", "--rules", "r.yml"])
+        .arg("pod.yaml")
+        .assert()
+        .code(6)
+        .stdout("");
+    let stderr = rule_errors(&out.get_output().stderr);
+    assert!(stderr.starts_with(&format!("{error}\n")), "{stderr}");
+}

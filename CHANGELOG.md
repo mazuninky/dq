@@ -25,7 +25,7 @@ breaking changes are listed first under Changed.
   is exit 6.
 - Rule directories follow symbolic links and take `.yml` / `.yaml` in any case.
   Rules added with `dq rules add --symlink` were never loaded. A link to nothing
-  is exit 5.
+  is exit 5. `dq test DIR` follows links too.
 - A parse error prints its place on a second line, `  --> FILE:LINE:COL`
   (`<stdin>` for input on stdin), and the bulk summary ends the entry with
   ` (line L, column C)`. The place left the message itself: YAML's
@@ -66,9 +66,9 @@ breaking changes are listed first under Changed.
 ### Fixed
 
 - `dq rules add SRC --symlink --force` deleted the source when `.dq/rules`
-  already linked to it, and wrote through links to outside `.dq/rules`. A source
-  that overlaps its destination is refused (exit 6), and `--force` replaces a
-  link, never what it points to.
+  already linked to it, and wrote outside `.dq/rules` through links or for a
+  file named `...yml`. A source that overlaps its destination and such a name
+  are refused (exit 6), and `--force` replaces a link, never what it points to.
 - `./.dq/rules` that cannot be read or is not a directory was skipped with exit
   0; it is now exit 5 or 6.
 - `dq fix --parallel` hung when a worker logged a warning: the run held the lock

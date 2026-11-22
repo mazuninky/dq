@@ -202,7 +202,7 @@ mod imp {
     use super::paths;
     use core::str::FromStr;
     use jaq_core::load::{Arena, File, Loader};
-    use jaq_core::{Compiler, Ctx, ValX, Vars, data};
+    use jaq_core::{Compiler, Ctx, Exn, ValX, Vars, data};
     use jaq_json::{Num, Val};
 
     /// Compiled jq filter, designed to be shared across rayon workers via
@@ -327,6 +327,10 @@ mod imp {
     /// The message of a program that calls `halt` or `halt_error`.
     const HALT: &str = "halt is not available: dq does not let an expression end the process";
 
+    /// The message of a program that stopped in a way jaq keeps to itself
+    /// (what it calls a bug of its own should it get this far).
+    const STOPPED: &str = "the expression stopped without a value or an error";
+
     /// One output of a filter.
     ///
     /// Takes the place of `jaq_core::unwrap_valr`, which ends the process
@@ -339,9 +343,11 @@ mod imp {
     /// [`JqError::Runtime`] for a filter that raised, or halted.
     fn output(result: ValX<'_, Val>) -> Result<Val, JqError> {
         result.map_err(|exn| JqError::Runtime {
-            message: exn
-                .get_err()
-                .map_or_else(|_| HALT.to_owned(), |err| err.to_string()),
+            message: match exn.get_err().map_err(Exn::get_halt) {
+                Ok(err) => err.to_string(),
+                Err(Ok(_exit_code)) => HALT.to_owned(),
+                Err(Err(_)) => STOPPED.to_owned(),
+            },
         })
     }
 

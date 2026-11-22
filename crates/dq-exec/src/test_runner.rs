@@ -24,6 +24,8 @@
 //! `dq_core::by_name` registry, since adding a format here is a one-word
 //! change.
 
+use std::path::Path;
+
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::Deserialize;
 
@@ -147,21 +149,19 @@ impl RuleTester {
     ///
     /// - [`crate::ExecError::Io`] when the directory walk itself fails (e.g.
     ///   the directory doesn't exist, or a link in it named as a rule or a
-    ///   fixture leads nowhere). Per-fixture failures are reported as
-    ///   [`TestOutcome::Error`] entries — they don't bubble up.
+    ///   fixture leads nowhere; see [`rule_dir::DanglingLinks::RefuseRules`]).
+    ///   Per-fixture failures are reported as [`TestOutcome::Error`] entries
+    ///   — they don't bubble up.
     pub fn run_dir(dir: &Utf8Path) -> Result<Vec<TestOutcome>> {
         // A fixture that several links lead to runs once per link: the rule
         // it tests is the one beside the link.
-        let fixtures: Vec<Utf8PathBuf> =
-            rule_dir::files_under(dir, rule_dir::DanglingLinks::RefuseRules)?
-                .into_iter()
-                .filter_map(|path| Utf8PathBuf::from_path_buf(path).ok())
-                .filter(|path| rule_dir::is_fixture_file(path))
-                .collect();
-
         let mut outcomes = Vec::new();
-        for fixture in &fixtures {
-            outcomes.extend(run_fixture(fixture));
+        for file in rule_dir::files_under(dir, rule_dir::DanglingLinks::RefuseRules)? {
+            if let Some(fixture) = Utf8Path::from_path(&file.path)
+                && rule_dir::is_fixture_file(fixture)
+            {
+                outcomes.extend(run_fixture(fixture, &file.location));
+            }
         }
         Ok(outcomes)
     }
@@ -198,8 +198,9 @@ impl RuleTester {
     }
 }
 
-/// Run one fixture file and emit one [`TestOutcome`] per test case.
-fn run_fixture(fixture: &Utf8Path) -> Vec<TestOutcome> {
+/// Run the fixture file at `location`, found as `fixture`, and emit one
+/// [`TestOutcome`] per test case.
+fn run_fixture(fixture: &Utf8Path, location: &Path) -> Vec<TestOutcome> {
     // 1. Locate the parent rule file (same stem minus `.test`).
     let Some(rule_path) = rule_dir::parent_rule_path(fixture) else {
         return file_error(
@@ -207,15 +208,16 @@ fn run_fixture(fixture: &Utf8Path) -> Vec<TestOutcome> {
             format!("could not derive parent rule path from fixture: {fixture}"),
         );
     };
-    if !rule_path.is_file() {
+    let rule_location = location.with_file_name(rule_path.file_name().unwrap_or_default());
+    if !rule_location.is_file() {
         return file_error(fixture, format!("rule file not found: {rule_path}"));
     }
-    let fixture_yaml = match std::fs::read_to_string(fixture) {
+    let fixture_yaml = match std::fs::read_to_string(location) {
         Ok(s) => s,
         Err(err) => return file_error(fixture, format!("failed to read fixture: {err}")),
     };
     run_fixture_text(fixture, &fixture_yaml, &rule_path, || {
-        RuleSet::from_path(&rule_path)
+        RuleSet::from_walked(&rule_path, &rule_location)
     })
 }
 

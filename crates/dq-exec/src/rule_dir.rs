@@ -2,8 +2,9 @@
 //! `./.dq/rules/`, `dq test DIR` and `dq rules add DIR`, and which of its
 //! files are rules and which are fixtures.
 
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::ffi::OsString;
+use std::path::{Component, Path, PathBuf};
 
 use camino::{Utf8Path, Utf8PathBuf};
 
@@ -13,79 +14,168 @@ use crate::error::{ExecError, Result};
 /// does not matter.
 const RULE_FILE_EXTENSIONS: [&str; 2] = ["yml", "yaml"];
 
-/// `ELOOP`, or Windows' `ERROR_CANT_RESOLVE_FILENAME`: what following a link
-/// that leads back to itself gives, which `std::io::ErrorKind` has no stable
-/// name for. `None` where dq does not know the number: the link is then one
-/// that cannot be read, which is never passed over.
-const LINK_LOOP: Option<i32> = if cfg!(windows) {
-    Some(1921)
-} else if cfg!(any(target_os = "linux", target_os = "android")) {
-    Some(40)
-} else if cfg!(any(
-    target_vendor = "apple",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd"
-)) {
-    Some(62)
-} else {
-    None
-};
-
-/// Which links that lead nowhere — to nothing, or back to themselves — stop
-/// [`files_under`].
+/// What [`files_under`] does about what it cannot follow or read by way of a
+/// link: one that leads nowhere — to nothing, or back to itself — and one
+/// that leads to what may not be read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DanglingLinks {
-    /// Any: in a directory of rules it may have been a directory of them,
-    /// such as a submodule that is not checked out.
+    /// An error, all of it: in a directory of rules it may have been a
+    /// directory of them, such as a submodule that is not checked out.
     Refuse,
-    /// Those named as a rule file or a fixture. The directory is any part of
-    /// a repository, where a link may have nothing to do with rules.
+    /// A link that leads nowhere is an error when it is named as a rule file
+    /// or a fixture, and else no file. A directory that cannot be read is
+    /// passed over with a warning when a link led to it, or above it; so is
+    /// a link to what may not be looked at, unless it is named as a rule
+    /// file or a fixture. The walk is over any part of a repository, where a
+    /// link may have nothing to do with rules.
     RefuseRules,
+}
+
+/// A file a walk found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalkedFile {
+    /// Its name: the path the walk took from its directory, as the caller
+    /// spelled that. Not for opening the file: the links on it may be more
+    /// than a system follows on one path.
+    pub path: PathBuf,
+    /// Where it is. No part of it but the last is a link.
+    pub location: PathBuf,
+}
+
+impl WalkedFile {
+    /// The location of the file itself, when the one found is a link.
+    ///
+    /// # Errors
+    ///
+    /// [`ExecError::Io`] when it cannot be resolved.
+    pub fn real(&self) -> Result<PathBuf> {
+        std::fs::canonicalize(&self.location)
+            .map_err(|source| io_error(&self.path, &self.location, source))
+    }
 }
 
 /// Every file under `dir`, at any depth, symbolic links to files and
 /// directories followed — `dq rules add --symlink` makes them. In the order
 /// of the names along the path, so it does not change between runs.
 ///
-/// A directory is walked once, under the first path that reaches it, so a
-/// link to one the walk has been to (or is in) adds nothing and cannot loop.
-/// A file that is linked to comes once per link, under the link's path.
+/// A directory is walked once, under the path to it with the fewest links,
+/// and of those the first by name: a link to one that is in `dir`, or that a
+/// link before it leads to, adds nothing and cannot loop. A file that is
+/// linked to comes once per link, under the link's path.
 ///
 /// An editor's lock (`.#a.yml`, a link to no path) is never a rule.
 ///
 /// # Errors
 ///
-/// [`ExecError::Io`] naming a link that leads nowhere, as `dangling` says,
-/// what cannot be read, or a FIFO, socket or device named as a rule file or a
+/// [`ExecError::Io`] naming a link that leads nowhere or what cannot be read,
+/// as `dangling` says, or a FIFO, socket or device named as a rule file or a
 /// fixture: skipping it would leave out rules without a word.
-pub fn files_under(dir: &Utf8Path, dangling: DanglingLinks) -> Result<Vec<PathBuf>> {
+pub fn files_under(dir: &Utf8Path, dangling: DanglingLinks) -> Result<Vec<WalkedFile>> {
     let mut files = Vec::new();
     let mut walked: HashSet<PathBuf> = HashSet::new();
-    let mut entries = walkdir::WalkDir::new(dir.as_std_path())
-        .follow_links(true)
-        .sort_by_file_name()
-        .into_iter();
-    while let Some(entry) = entries.next() {
-        let entry = match entry {
-            Ok(entry) => entry,
-            // A link to a directory the walk is in: already being walked.
-            Err(err) if err.loop_ancestor().is_some() => continue,
-            Err(err) if is_ignored_link(&err, dangling) => continue,
-            Err(err) => return Err(walk_error(dir, err)),
-        };
-        if entry.file_type().is_dir() {
-            if !walked.insert(canonical(entry.path())?) {
-                entries.skip_current_dir();
+    // Each link to a directory is a tree of its own, walked where it really
+    // is and after the trees before it: no path dq opens goes through the
+    // links that led there, which add up to more than a system follows.
+    let mut trees = VecDeque::from([Tree {
+        path: dir.as_std_path().to_path_buf(),
+        location: std::fs::canonicalize(dir)
+            .map_err(|source| io_error(dir.as_std_path(), dir.as_std_path(), source))?,
+        linked: false,
+    }]);
+    while let Some(tree) = trees.pop_front() {
+        let mut entries = walkdir::WalkDir::new(&tree.location)
+            .sort_by_file_name()
+            .into_iter();
+        while let Some(entry) = entries.next() {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) if tree.linked && dangling == DanglingLinks::RefuseRules => {
+                    warn_skipped(&tree.walk_error(err));
+                    continue;
+                }
+                Err(err) => return Err(tree.walk_error(err)),
+            };
+            let path = tree.path_of(entry.path());
+            let file_type = if entry.path_is_symlink() {
+                match std::fs::metadata(entry.path()) {
+                    Ok(meta) => meta.file_type(),
+                    Err(err) if is_no_file(entry.path(), &err, dangling) => continue,
+                    Err(err) => {
+                        let skipped = may_be_skipped(entry.path(), &err, dangling);
+                        let err = io_error(&path, entry.path(), err);
+                        if !skipped {
+                            return Err(err);
+                        }
+                        warn_skipped(&err);
+                        continue;
+                    }
+                }
+            } else {
+                entry.file_type()
+            };
+            if file_type.is_dir() {
+                if entry.path_is_symlink() {
+                    let location = std::fs::canonicalize(entry.path())
+                        .map_err(|source| io_error(&path, entry.path(), source))?;
+                    trees.push_back(Tree {
+                        path,
+                        location,
+                        linked: true,
+                    });
+                } else if !walked.insert(entry.into_path()) {
+                    entries.skip_current_dir();
+                }
+            } else if file_type.is_file() {
+                files.push(WalkedFile {
+                    path,
+                    location: entry.into_path(),
+                });
+            } else if is_named_as_rule(&path) {
+                let source = std::io::Error::other("not a regular file");
+                return Err(io_error(&path, entry.path(), source));
             }
-        } else if entry.file_type().is_file() {
-            files.push(entry.into_path());
-        } else if has_rule_extension(Utf8Path::new(&entry.path().to_string_lossy())) {
-            let source = std::io::Error::other("not a regular file");
-            return Err(io_error(entry.path(), source));
         }
     }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(files)
+}
+
+/// A directory to walk: the walk's own, or one a link leads to.
+struct Tree {
+    /// Its name, as in [`WalkedFile::path`].
+    path: PathBuf,
+    /// Where it is, no part of it a link.
+    location: PathBuf,
+    /// Whether a link led to it.
+    linked: bool,
+}
+
+impl Tree {
+    /// The name of what is at `location` in the tree.
+    fn path_of(&self, location: &Path) -> PathBuf {
+        match location.strip_prefix(&self.location) {
+            Ok(rest) if rest.as_os_str().is_empty() => self.path.clone(),
+            Ok(rest) => self.path.join(rest),
+            Err(_) => location.to_path_buf(),
+        }
+    }
+
+    /// The error of the walk over the tree, on the path it was raised for.
+    fn walk_error(&self, err: walkdir::Error) -> ExecError {
+        let location = err.path().unwrap_or(&self.location).to_path_buf();
+        let text = err.to_string();
+        let source = err
+            .into_io_error()
+            .unwrap_or_else(|| std::io::Error::other(text));
+        io_error(&self.path_of(&location), &location, source)
+    }
+}
+
+/// Say that a walk went on without what `err` names.
+fn warn_skipped(err: &ExecError) {
+    if let ExecError::Io { path, source } = err {
+        tracing::warn!("skipped {}: {source}", dq_core::one_line(path.as_str()));
+    }
 }
 
 /// The directory of the project's own rules, `.dq/rules` under `cwd`, or
@@ -111,42 +201,91 @@ pub fn project_dir(cwd: &Utf8Path) -> Result<Option<Utf8PathBuf>> {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound && !path.is_symlink() => {
                 return Ok(None);
             }
-            Err(err) => return Err(io_error(path.as_std_path(), err)),
+            Err(err) => return Err(io_error(path.as_std_path(), path.as_std_path(), err)),
         }
     }
     Ok(Some(cwd.join(".dq").join("rules")))
 }
 
-/// Whether `err` is a link that leads nowhere and that `dangling` lets pass.
-/// Never the directory of the walk itself.
-fn is_ignored_link(err: &walkdir::Error, dangling: DanglingLinks) -> bool {
-    let Some(path) = err.path().filter(|_| err.depth() > 0) else {
-        return false;
-    };
-    let Some(path) = Utf8Path::from_path(path) else {
-        return false;
-    };
-    let is_lock = path.file_name().is_some_and(|name| name.starts_with(".#"));
-    leads_nowhere(path)
-        && (is_lock || (dangling == DanglingLinks::RefuseRules && !has_rule_extension(path)))
+/// Whether the link at `location`, which cannot be followed for `err`, leads
+/// nowhere and is no file to a walk.
+fn is_no_file(location: &Path, err: &std::io::Error, dangling: DanglingLinks) -> bool {
+    let is_lock = location
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with(".#"));
+    (is_lock || (dangling == DanglingLinks::RefuseRules && !is_named_as_rule(location)))
+        && leads_nowhere(location, err)
 }
 
-/// The path `path` really has, every link on it followed.
-///
-/// # Errors
-///
-/// [`ExecError::Io`] when it cannot be resolved.
-pub(crate) fn canonical(path: &Path) -> Result<PathBuf> {
-    std::fs::canonicalize(path).map_err(|source| io_error(path, source))
+/// Whether a walk may go on without the link at `location`, which leads to
+/// what may not be looked at: `err`.
+fn may_be_skipped(location: &Path, err: &std::io::Error, dangling: DanglingLinks) -> bool {
+    dangling == DanglingLinks::RefuseRules
+        && err.kind() == std::io::ErrorKind::PermissionDenied
+        && !is_named_as_rule(location)
 }
 
-/// Whether `path` is a link to nothing or back to itself.
-fn leads_nowhere(path: &Utf8Path) -> bool {
-    path.is_symlink()
-        && std::fs::metadata(path).is_err_and(|err| {
-            err.kind() == std::io::ErrorKind::NotFound
-                || (LINK_LOOP.is_some() && err.raw_os_error() == LINK_LOOP)
-        })
+/// Whether `path` is named as a rule file or a fixture.
+fn is_named_as_rule(path: &Path) -> bool {
+    has_rule_extension(Utf8Path::new(&path.to_string_lossy()))
+}
+
+/// Whether the link at `location`, which cannot be followed for `err`, is one
+/// to nothing or back to itself.
+fn leads_nowhere(location: &Path, err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::NotFound || is_loop(location)
+}
+
+/// Whether the links on the absolute path `path` lead back to themselves: to
+/// follow one of them it would have to be followed already.
+///
+/// The system's error does not tell. It is the same (`ELOOP`) for a chain of
+/// more links than it follows, which leads to something.
+fn is_loop(path: &Path) -> bool {
+    enum Step {
+        Enter(OsString),
+        /// The link has been followed: the path is now what it leads to.
+        Followed(PathBuf),
+    }
+    let steps_of = |path: &Path| -> Vec<Step> {
+        let parts = path.components().rev();
+        parts
+            .filter(|part| *part != Component::CurDir)
+            .map(|part| Step::Enter(part.as_os_str().to_owned()))
+            .collect()
+    };
+    let mut at = PathBuf::new();
+    let mut following: HashSet<PathBuf> = HashSet::new();
+    // Links followed to the end. Followed again at every mention, links that
+    // mention each other twice would double the work at each one.
+    let mut leads_to: HashMap<PathBuf, PathBuf> = HashMap::new();
+    let mut steps = steps_of(path);
+    while let Some(step) = steps.pop() {
+        let part = match step {
+            Step::Followed(link) => {
+                following.remove(&link);
+                leads_to.insert(link, at.clone());
+                continue;
+            }
+            Step::Enter(part) if part == ".." => {
+                at.pop();
+                continue;
+            }
+            Step::Enter(part) => part,
+        };
+        at.push(part);
+        if let Some(target) = leads_to.get(&at) {
+            at.clone_from(target);
+        } else if let Ok(target) = std::fs::read_link(&at) {
+            if !following.insert(at.clone()) {
+                return true;
+            }
+            steps.push(Step::Followed(at.clone()));
+            steps.extend(steps_of(&target));
+            at.pop();
+        }
+    }
+    false
 }
 
 /// Whether `path` names a rule file: `*.yml` or `*.yaml`, in any case, that
@@ -185,24 +324,12 @@ fn has_rule_extension(path: &Utf8Path) -> bool {
     })
 }
 
-/// The error of a walk over `dir`, on the path it was raised for.
-fn walk_error(dir: &Utf8Path, err: walkdir::Error) -> ExecError {
-    let path = err
-        .path()
-        .map_or_else(|| dir.as_std_path().to_path_buf(), Path::to_path_buf);
-    let text = err.to_string();
-    let source = err
-        .into_io_error()
-        .unwrap_or_else(|| std::io::Error::other(text));
-    io_error(&path, source)
-}
-
-/// [`ExecError::Io`] on `path`, which says so when `path` is a link whose
-/// target is missing: the path itself is there. The target is put on one line
-/// ([`dq_core::one_line`]); whoever made the link chose its text.
-fn io_error(path: &Path, source: std::io::Error) -> ExecError {
+/// [`ExecError::Io`] on `path`, whose `location` says so when it is a link
+/// whose target is missing: the link itself is there. The target is put on
+/// one line ([`dq_core::one_line`]); whoever made the link chose its text.
+fn io_error(path: &Path, location: &Path, source: std::io::Error) -> ExecError {
     let target = match source.kind() {
-        std::io::ErrorKind::NotFound => std::fs::read_link(path).ok(),
+        std::io::ErrorKind::NotFound => std::fs::read_link(location).ok(),
         _ => None,
     };
     let source = match target {
@@ -272,8 +399,8 @@ mod tests {
             files_under(dir, DanglingLinks::Refuse)
                 .expect("walk")
                 .iter()
-                .map(|path| {
-                    let path = path.strip_prefix(dir).expect("under dir");
+                .map(|file| {
+                    let path = file.path.strip_prefix(dir).expect("under dir");
                     path.to_string_lossy().into_owned()
                 })
                 .collect()
@@ -305,9 +432,152 @@ mod tests {
                     )
                 );
             }
-            assert!(leads_nowhere(&link));
-            assert!(!leads_nowhere(&root.join("real/a.yml")));
-            assert!(!leads_nowhere(&root.join("nothing")));
+        }
+
+        /// `DIR/00` to `DIR/NN`, each with a rule `r.yml` and a link `next` to
+        /// the one after it.
+        fn chain(dir: &Utf8Path, count: usize) {
+            for n in 0..count {
+                let dir = dir.join(format!("{n:02}"));
+                std::fs::create_dir_all(&dir).expect("mkdir");
+                std::fs::write(dir.join("r.yml"), n.to_string()).expect("write");
+                if n + 1 < count {
+                    symlink(format!("../{:02}", n + 1), dir.join("next")).expect("link");
+                }
+            }
+        }
+
+        #[test]
+        fn the_links_on_the_way_to_a_file_do_not_add_up() {
+            let (_temp, root) = tree();
+            // Each directory is there without a link.
+            chain(&root.join("in"), 60);
+            let expected: Vec<String> = (0..60).map(|n| format!("{n:02}/r.yml")).collect();
+            assert_eq!(found(&root.join("in")), expected);
+            // Each directory is there by way of the one before it alone.
+            chain(&root.join("out"), 60);
+            symlink("../out/00", root.join("real/next")).expect("link");
+            for dangling in [DanglingLinks::Refuse, DanglingLinks::RefuseRules] {
+                let files = files_under(&root.join("real"), dangling).expect("walk");
+                assert_eq!(files.len(), 62);
+                for file in &files {
+                    std::fs::read(&file.location).expect("read");
+                    let real = file.real().expect("real");
+                    assert_eq!(
+                        Ok(real),
+                        std::fs::canonicalize(&file.location).map_err(|_| ())
+                    );
+                }
+                // Two, then the chain: its end is the deepest, so the first.
+                assert_eq!(files[0].path, root.join("real/a.yml"));
+                let end = root.join("real").join("next/".repeat(60));
+                assert_eq!(files[1].path, end.join("r.yml"));
+                let text = std::fs::read_to_string(&files[1].location).expect("read");
+                assert_eq!(text, "59");
+            }
+        }
+
+        #[test]
+        fn directories_that_all_link_to_each_other_are_walked_once_each() {
+            let (_temp, root) = tree();
+            let dir = root.join("set");
+            let names: Vec<String> = (0..45).map(|n| format!("{n:02}")).collect();
+            for name in &names {
+                let dir = dir.join(name);
+                std::fs::create_dir_all(&dir).expect("mkdir");
+                std::fs::write(dir.join("r.yml"), "").expect("write");
+                for other in &names {
+                    symlink(format!("../{other}"), dir.join(format!("to-{other}"))).expect("link");
+                }
+            }
+            let expected: Vec<String> = names.iter().map(|name| format!("{name}/r.yml")).collect();
+            assert_eq!(found(&dir), expected);
+            // From one of them, every other is one link away.
+            assert_eq!(found(&dir.join("07"))[..2], ["r.yml", "to-00/r.yml"]);
+            assert_eq!(found(&dir.join("07")).len(), 45);
+        }
+
+        #[test]
+        fn a_directory_is_found_under_the_path_with_the_fewest_links() {
+            let (_temp, root) = tree();
+            let dir = root.join("real");
+            // Named before the directory, and by way of another link.
+            symlink("sub", dir.join("0")).expect("link");
+            std::fs::create_dir_all(root.join("out/deep")).expect("mkdir");
+            std::fs::write(root.join("out/deep/c.yml"), "").expect("write");
+            symlink("../out", dir.join("1")).expect("link");
+            symlink("deep", root.join("out/0")).expect("link");
+            symlink("../../out/deep", dir.join("sub/2")).expect("link");
+            assert_eq!(found(&dir), ["1/deep/c.yml", "a.yml", "sub/b.yml"]);
+        }
+
+        #[test]
+        fn a_loop_is_told_from_a_chain_that_is_only_long() {
+            let (_temp, root) = tree();
+            let dir = root.join("real");
+            let link = |target: &str, name: &str| symlink(target, dir.join(name)).expect("link");
+            for (target, name) in [
+                ("self", "self"),
+                ("two", "one"),
+                ("one", "two"),
+                ("grows/x", "grows"),
+                ("sub/../back/x", "back"),
+                ("self/x", "by-way-of"),
+                ("sub/down", "up"),
+                ("../up", "sub/down"),
+            ] {
+                link(target, name);
+            }
+            for name in ["self", "one", "two", "grows", "back", "by-way-of", "up"] {
+                assert!(is_loop(dir.join(name).as_std_path()), "{name}");
+            }
+            link("nothing", "gone");
+            link("a.yml/x", "not-a-directory");
+            // The same link twice on one path.
+            link("sub", "s");
+            link("s/../s/../s/b.yml", "twice");
+            // A chain no system follows in one go.
+            link("sub", "chain00");
+            for n in 1..80 {
+                link(&format!("chain{:02}", n - 1), &format!("chain{n:02}"));
+            }
+            // Each mentions the one before it twice.
+            link("sub/..", "twice00");
+            for n in 1..80 {
+                let before = format!("twice{:02}", n - 1);
+                link(
+                    &format!("{before}/../real/{before}"),
+                    &format!("twice{n:02}"),
+                );
+            }
+            for name in [
+                "gone",
+                "not-a-directory",
+                "s",
+                "twice",
+                "chain79",
+                "twice79",
+                "a.yml",
+            ] {
+                assert!(!is_loop(dir.join(name).as_std_path()), "{name}");
+            }
+            assert!(!is_loop(dir.join("nothing").as_std_path()));
+        }
+
+        #[test]
+        fn a_chain_of_too_many_links_is_not_one_to_nothing() {
+            let (_temp, root) = tree();
+            let dir = root.join("real");
+            // No system follows as many in one go.
+            symlink("sub", dir.join("chain00")).expect("link");
+            for n in 1..80 {
+                let target = format!("chain{:02}", n - 1);
+                symlink(target, dir.join(format!("chain{n:02}"))).expect("link");
+            }
+            for dangling in [DanglingLinks::Refuse, DanglingLinks::RefuseRules] {
+                let err = files_under(&dir, dangling).expect_err("too many");
+                assert!(err.to_string().contains("real/chain"), "{err}");
+            }
         }
 
         #[test]
@@ -317,7 +587,6 @@ mod tests {
             // Directly, and by way of another link.
             for (target, link) in [("loop", "loop"), ("two", "one"), ("one", "two")] {
                 symlink(target, dir.join(link)).expect("link");
-                assert!(leads_nowhere(&dir.join(link)), "{link}");
             }
             let err = files_under(&dir, DanglingLinks::Refuse).expect_err("loop");
             assert!(err.to_string().contains("real/loop: "), "{err}");

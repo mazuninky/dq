@@ -152,16 +152,86 @@ pub(crate) fn run(
     let mut report = Report {
         diagnostics: Vec::new(),
         rule_errors: RuleErrors::default(),
-        rule_error_results: !console,
+        structured: !console,
         allow_rule_errors,
     };
-    // Files that do not parse: each is a `lint.<kind>` result of its own
-    // in a structured report (the console prints the error itself), and
-    // the run still lints every other file before it fails with exit 3.
+    let linted = lint_files(
+        cli,
+        &expanded,
+        input_format,
+        &evaluator,
+        plugins.as_ref(),
+        &mut report,
+    );
+    let Report {
+        diagnostics,
+        rule_errors,
+        ..
+    } = report;
+    let unparsed = match linted {
+        Ok(unparsed) => unparsed,
+        Err(err) => {
+            // No report names them now.
+            rule_errors.log();
+            return Err(err);
+        }
+    };
+    let mut envelope = build_envelope(&diagnostics);
+    if reporter.wants_rule_catalog() {
+        let mut catalog = rule_catalog(evaluator.rules());
+        if let Some(rules) = catalog.as_array_mut() {
+            rules.extend(own_catalog(&diagnostics));
+        }
+        envelope["rules"] = catalog;
+    }
+    // The console with nothing but errors prints them alone: an empty list
+    // of findings would read as "all clear".
+    let failed = !unparsed.is_empty() || !rule_errors.is_empty();
+    let reported = if console && diagnostics.is_empty() && failed {
+        Ok(())
+    } else {
+        reporter.report(&envelope, out)
+    };
+    rule_errors.log();
+    reported?;
+
+    let mut unparsed = unparsed.into_iter();
+    if let Some(first) = unparsed.next() {
+        // The first is printed as the run's error; the console names the
+        // others here, each with its position, as it names a file skipped.
+        for err in unparsed {
+            tracing::warn!("{err}{}", position_note(&err));
+        }
+        return Err(first);
+    }
+    if let Some(err) = rule_errors.failure() {
+        return Err(anyhow::Error::new(err));
+    }
+    classify_exit(&diagnostics, cli.strict)
+}
+
+/// Lint `files` into `report`, and return the errors of those that do not
+/// parse: each is a `lint.<kind>` result of its own in a structured report
+/// (the console prints the error itself), and the run still lints every
+/// other file before it fails with exit 3.
+///
+/// # Errors
+///
+/// What ends the run: a file that does not load for another reason, a plugin
+/// that fails, a `--doc N` no file holds. `report` keeps what was found
+/// before.
+fn lint_files(
+    cli: &Cli,
+    files: &[Utf8PathBuf],
+    input_format: Option<&str>,
+    evaluator: &Evaluator,
+    plugins: Option<&LoadedPlugins>,
+    report: &mut Report,
+) -> anyhow::Result<Vec<anyhow::Error>> {
     let mut unparsed: Vec<anyhow::Error> = Vec::new();
-    let several = expanded.len() > 1;
+    let several = files.len() > 1;
     let mut missing = Vec::new();
-    for file in &expanded {
+    for file in files {
         let fmt = pick_format(file, input_format)?;
         let format_name = fmt.name().to_owned();
         // Use the lint-specific loader so YAML/JSON are parsed through
@@ -174,7 +244,7 @@ pub(crate) fn run(
             Ok(loaded) => loaded,
             Err(err) => match unparsed_diagnostic(file, &err) {
                 Some(diagnostic) => {
-                    if !console {
+                    if report.structured {
                         report.diagnostics.push(diagnostic);
                     }
                     unparsed.push(err);
@@ -206,67 +276,26 @@ pub(crate) fn run(
             Some(parts) => {
                 for part in parts.iter().filter(|p| only.is_none_or(|i| p.index() == i)) {
                     lint_document(
-                        &evaluator,
-                        plugins.as_ref(),
+                        evaluator,
+                        plugins,
                         file,
                         &part.as_ir(),
                         &format_name,
-                        &mut report,
+                        report,
                     )?;
                 }
             }
-            None => lint_document(
-                &evaluator,
-                plugins.as_ref(),
-                file,
-                &doc.as_ir(),
-                &format_name,
-                &mut report,
-            )?,
+            None => lint_document(evaluator, plugins, file, &doc.as_ir(), &format_name, report)?,
         }
     }
 
-    if let Some(err) = every_file_lacks(&missing, expanded.len()) {
+    if let Some(err) = every_file_lacks(&missing, files.len()) {
         return Err(anyhow::Error::new(err));
     }
     for (file, reason) in &missing {
         tracing::warn!("skipped {file}: {reason}");
     }
-
-    let Report {
-        diagnostics,
-        rule_errors,
-        ..
-    } = report;
-    let mut envelope = build_envelope(&diagnostics);
-    if reporter.wants_rule_catalog() {
-        let mut catalog = rule_catalog(evaluator.rules());
-        if let Some(rules) = catalog.as_array_mut() {
-            rules.extend(own_catalog(&diagnostics));
-        }
-        envelope["rules"] = catalog;
-    }
-    // The console with nothing but errors prints them alone: an empty list
-    // of findings would read as "all clear".
-    let failed = !unparsed.is_empty() || !rule_errors.is_empty();
-    if !(console && diagnostics.is_empty() && failed) {
-        reporter.report(&envelope, out)?;
-    }
-    rule_errors.log();
-
-    let mut unparsed = unparsed.into_iter();
-    if let Some(first) = unparsed.next() {
-        // The first is printed as the run's error; the console names the
-        // others here, each with its position, as it names a file skipped.
-        for err in unparsed {
-            tracing::warn!("{err}{}", position_note(&err));
-        }
-        return Err(first);
-    }
-    if let Some(err) = rule_errors.failure() {
-        return Err(anyhow::Error::new(err));
-    }
-    classify_exit(&diagnostics, cli.strict)
+    Ok(unparsed)
 }
 
 /// The diagnostic for `file`, which did not load with `err`, when that is
@@ -328,8 +357,9 @@ struct Report {
     diagnostics: Vec<Diagnostic>,
     /// The rules that raised and did not run on a file.
     rule_errors: RuleErrors,
-    /// Whether a rule error is also a result among `diagnostics`.
-    rule_error_results: bool,
+    /// The report is a structured one: a file that does not parse and a rule
+    /// error are results among `diagnostics`.
+    structured: bool,
     /// `--allow-rule-errors`: rule errors are logged as warnings instead.
     allow_rule_errors: bool,
 }
@@ -348,15 +378,11 @@ impl Report {
             self.diagnostics.append(&mut found);
             return;
         }
-        let mut evaluation = evaluator.evaluate(file, ir, format_name);
+        let mut evaluation = evaluator.evaluate_reporting(file, ir, format_name);
         self.diagnostics.append(&mut evaluation.diagnostics);
         for error in evaluation.rule_errors {
-            if !error.stage.skips_rule() {
-                error.warn();
-                continue;
-            }
             let diagnostic = rule_errors::diagnostic(file, &error);
-            if self.rule_errors.record(file, error) && self.rule_error_results {
+            if self.rule_errors.record(file, error) && self.structured {
                 self.diagnostics.push(diagnostic);
             }
         }

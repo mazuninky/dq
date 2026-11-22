@@ -11,7 +11,7 @@
 //!   real `dq-lint` wiring lands in §4.4 of `add-exec-engine/tasks.md`).
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::Deserialize;
@@ -129,20 +129,16 @@ impl RuleSet {
         })?;
 
         if metadata.is_file() {
-            let yaml = std::fs::read_to_string(path).map_err(|err| ExecError::Io {
-                path: path.to_path_buf(),
-                source: err,
-            })?;
-            return Self::from_str(&yaml, RuleSource::Local(path.to_path_buf()));
+            return Self::from_file(path, path.as_std_path());
         }
 
         let mut rules = Vec::new();
         // Collect first, then parse, so the loader's de-duplication step
         // sees a deterministic order.
-        let mut entries: Vec<Utf8PathBuf> = Vec::new();
+        let mut entries: Vec<(Utf8PathBuf, PathBuf)> = Vec::new();
         let mut seen: HashSet<PathBuf> = HashSet::new();
-        for entry in rule_dir::files_under(path, rule_dir::DanglingLinks::Refuse)? {
-            let utf8 = Utf8PathBuf::from_path_buf(entry).map_err(|entry| {
+        for file in rule_dir::files_under(path, rule_dir::DanglingLinks::Refuse)? {
+            let utf8 = Utf8PathBuf::from_path_buf(file.path.clone()).map_err(|entry| {
                 // A non-UTF-8 path under a rules directory is an
                 // operational anomaly — surface it through the existing
                 // Io variant so the user sees the offending path.
@@ -155,26 +151,50 @@ impl RuleSet {
                 }
             })?;
             // A rule file two links lead to is one rule file.
-            if rule_dir::is_rule_file(&utf8)
-                && seen.insert(rule_dir::canonical(utf8.as_std_path())?)
-            {
-                entries.push(utf8);
+            if rule_dir::is_rule_file(&utf8) && seen.insert(file.real()?) {
+                entries.push((utf8, file.location));
             }
         }
 
-        for entry in &entries {
-            let yaml = std::fs::read_to_string(entry).map_err(|err| ExecError::Io {
-                path: entry.clone(),
-                source: err,
-            })?;
-            let one = Self::from_str(&yaml, RuleSource::Local(entry.clone()))?;
-            rules.extend(one.rules);
+        for (entry, location) in &entries {
+            rules.extend(Self::from_file(entry, location)?.rules);
         }
 
         Ok(Self {
             source: RuleSource::Local(path.to_path_buf()),
             rules,
         })
+    }
+
+    /// Load the rule file at `location`, which the caller calls `path`.
+    ///
+    /// # Errors
+    ///
+    /// [`ExecError::Io`] on `path` when it cannot be read, and the errors of
+    /// [`RuleSet::from_str`].
+    fn from_file(path: &Utf8Path, location: &Path) -> Result<Self> {
+        let yaml = std::fs::read_to_string(location).map_err(|source| ExecError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Self::from_str(&yaml, RuleSource::Local(path.to_path_buf()))
+    }
+
+    /// Load the rule file a walk found.
+    ///
+    /// Its source is where it is, for a `schema_file` beside it: the links on
+    /// its path may be more than a system follows. A location that is not
+    /// UTF-8 is no base for a `schema_file` in any case.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`RuleSet::from_path`] for a file.
+    pub(crate) fn from_walked(path: &Utf8Path, location: &Path) -> Result<Self> {
+        let mut set = Self::from_file(path, location)?;
+        if let Some(location) = Utf8Path::from_path(location) {
+            set.source = RuleSource::Local(location.to_path_buf());
+        }
+        Ok(set)
     }
 
     /// Resolve `name` against the embedded `@std/<name>` ruleset table.
