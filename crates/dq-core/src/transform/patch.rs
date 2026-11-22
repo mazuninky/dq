@@ -714,6 +714,33 @@ pub(super) fn read_value_at(doc: &Document, pointer: &Pointer) -> Result<Value> 
     Ok(current.clone())
 }
 
+/// Whether the value at `pointer` in `doc.value()` is a map — exactly when
+/// [`read_value_at`] would return `Ok(Value::Map(_))`.
+///
+/// Walks the same way [`read_value_at`] does (a numeric `Segment::Key`
+/// indexes an array, `-` and out-of-range indices address nothing), but
+/// borrows: no clone of the addressed subtree, no matched-prefix segments,
+/// no error to build on a miss. The merge engine asks this at every level
+/// of the patch, where a clone would copy the whole document at the root.
+pub(super) fn is_map_at(doc: &Document, pointer: &Pointer) -> bool {
+    let mut current: &Value = doc.value();
+    for seg in pointer.segments() {
+        let next = match (current, seg) {
+            (Value::Map(map), Segment::Key(k)) => map.get(k),
+            (Value::Array(items), Segment::Index(i)) => items.get(*i),
+            (Value::Array(items), Segment::Key(k)) => {
+                k.parse::<usize>().ok().and_then(|idx| items.get(idx))
+            }
+            _ => None,
+        };
+        match next {
+            Some(v) => current = v,
+            None => return false,
+        }
+    }
+    matches!(current, Value::Map(_))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1049,6 +1076,38 @@ mod tests {
             Error::Path { kind, .. } => assert_eq!(kind, PathErrorKind::MissingKey),
             other => panic!("expected Path/MissingKey, got {other:?}"),
         }
+    }
+
+    // ---- is_map_at ----
+
+    #[test]
+    fn is_map_at_agrees_with_read_value_at() {
+        let doc = crate::parsers::parse_yaml_with_spans(b"m:\n  k: 1\nl:\n  - x: 1\n  - 2\ns: 3\n")
+            .unwrap();
+        let cases = [
+            ("", true),
+            ("/m", true),
+            ("/m/k", false),
+            ("/m/missing", false),
+            ("/l", false),
+            ("/l/0", true),
+            ("/l/1", false),
+            ("/l/2", false),
+            ("/l/-", false),
+            ("/s", false),
+            ("/s/x", false),
+            ("/missing/x", false),
+        ];
+        for (pointer, want) in cases {
+            let pointer = Pointer::parse(pointer).unwrap();
+            assert_eq!(is_map_at(&doc, &pointer), want, "{pointer:?}");
+            let read = matches!(read_value_at(&doc, &pointer), Ok(Value::Map(_)));
+            assert_eq!(read, want, "read_value_at at {pointer:?}");
+        }
+        let index = Pointer::new(vec![Segment::Key("l".into()), Segment::Index(0)]);
+        assert!(is_map_at(&doc, &index));
+        let index_into_map = Pointer::new(vec![Segment::Index(0)]);
+        assert!(!is_map_at(&doc, &index_into_map));
     }
 
     // ---- replace on missing key returns MissingKey (and doc is untouched) ----

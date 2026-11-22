@@ -4,27 +4,31 @@
 //!
 //! - **`transform/diff`** — replace-ratio sweep on a 1k-leaf JSON-like
 //!   `Value`. Variants `b = a` (no diff), and `b = a` mutated at 1% / 10%
-//!   / 50% of leaves. Targets `crates/dq-core/src/transform/diff.rs:78`,
-//!   where `PatchOp::Replace` clones whole subtrees on type mismatch.
+//!   / 50% of leaves. Targets `Step::emit` in
+//!   `crates/dq-core/src/transform/diff.rs`, where `PatchOp::Replace`
+//!   clones whole subtrees on type mismatch. `ratio_0` is the up-front
+//!   `a == b` early return of `diff`.
 //! - **`transform/apply_patch`** — runs synth patches of 100 / 1_000 /
 //!   10_000 `Replace` ops. Each op pays one `set_at` traversal so this
 //!   scales as the *product* of op count and document depth.
 //! - **`transform/apply_merge_empty`** — calls
 //!   [`apply_merge`] with an empty `{}` patch. Quantifies the entry-clone
-//!   at `crates/dq-core/src/transform/merge.rs:38` (the function clones
-//!   the full document for zero useful work).
+//!   in `apply_merge` (`crates/dq-core/src/transform/merge.rs`: the
+//!   function clones the full document for zero useful work).
 //! - **`transform/diff_deep`** — diffs two 256-leaf trees whose leaves all
 //!   sit at depth 2 / 4 / 8 / 16 (same leaf count at every depth, so only
-//!   depth varies). Child pointers cost O(depth) per leaf since the walk
-//!   pushes and pops one `Pointer`. The `a == b` check at every node of
-//!   `diff_into` still re-scans a differing chain once per level, so the
-//!   group grows faster than linearly past depth 8.
+//!   depth varies). The walk is linear in the number of nodes: containers
+//!   of the same kind are recursed into without a deep `a == b` first, and
+//!   the pointer is one `Pointer` pushed and popped in place. Each emitted
+//!   `Replace` clones that pointer, O(depth), so the group grows about 2×
+//!   per doubling of depth (1.8× measured).
 //! - **`transform/apply_merge_deep`** — calls [`apply_merge`] with a nested
 //!   sparse merge patch that reaches a seeded ~10% of the leaves of a
 //!   256-leaf tree at depth 2 / 4 / 8 / 16. End-to-end cost, not the walk
 //!   alone: every patched leaf is a textual edit that parses the file again,
-//!   the file grows with depth, and `merge_into` calls `read_value_at`,
-//!   which walks from the root and clones the subtree, at every level.
+//!   and the file grows with depth. The "is the target a map" check of
+//!   `merge_into` borrows (`is_map_at`): it still walks from the root at
+//!   every level, O(depth) each, but clones nothing.
 
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use dq_core::{Document, PatchOp, Pointer, Value, apply_merge, apply_patch, diff};

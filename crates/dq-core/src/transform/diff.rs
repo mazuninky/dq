@@ -57,39 +57,97 @@ use crate::pointer::{Pointer, Segment};
 /// [`apply_patch`]: super::apply_patch
 #[must_use]
 pub fn diff(a: &Value, b: &Value) -> Vec<PatchOp> {
+    // One deep comparison of the whole documents up front. It is the only
+    // deep comparison of containers in the walk (see `Step::of`), so it
+    // adds at most one pass over `a` and `b` to a diff that finds changes.
+    // For identical documents it pays: `==` costs one key lookup per map
+    // entry, where the walk below costs three (remove, add and recurse
+    // passes of `diff_maps`), and it returns without touching the pointer.
+    if a == b || a.same_big_number(b) {
+        return Vec::new();
+    }
     let mut ops = Vec::new();
     // The recursive worker walks via `&mut Pointer` (push/pop) instead of
-    // building owned child pointers for each step — that keeps the per-walk
-    // cost O(N × depth) rather than O(N × depth²). See the
-    // `docs/archive/perf-pointer-recursive-walks.md` for the bench numbers
-    // behind this choice.
+    // building owned child pointers for each step, and decides at the
+    // parent whether a child needs a segment at all. The walk is linear in
+    // the size of the visited trees; each emitted op clones the pointer,
+    // O(depth). See `docs/archive/perf-pointer-recursive-walks.md` for the
+    // bench numbers behind this choice.
     let mut path = Pointer::default();
-    diff_into(&mut path, a, b, &mut ops);
+    Step::of(a, b).emit(&mut path, b, &mut ops);
     ops
 }
 
-/// Recursive worker. `path` is the pointer of the current subtree, mutated
-/// in place as the recursion descends and unwinds; `ops` accumulates emitted
-/// operations across the whole walk.
+/// What the walk does with one pair of nodes at the same path.
 ///
-/// Invariant: every caller of `diff_into` observes `path` in the same state
-/// it was in on entry. Internal helpers preserve this by pairing each
-/// `push_segment` with a matching `pop_segment`.
-fn diff_into(path: &mut Pointer, a: &Value, b: &Value, ops: &mut Vec<PatchOp>) {
-    if a == b || a.same_big_number(b) {
+/// Containers of the same kind are never compared deeply: recursing into
+/// an equal pair emits nothing, and comparing first would make a changed
+/// leaf at depth `d` cost `d` comparisons of its ancestors, `d²/2` map
+/// lookups in all. `==` and [`Value::same_big_number`] run only where a
+/// `Replace` is decided — a scalar on at least one side, or a map against
+/// an array — and there they are shallow.
+enum Step<'a> {
+    /// Equal nodes: no op, no segment pushed.
+    Equal,
+    /// Type mismatch (including `Null` vs anything non-`Null`) or scalar
+    /// inequality: replace the whole subtree. Child ops would be
+    /// redundant — D4 minimality rule.
+    Replace,
+    /// Two maps: walk their keys.
+    Maps(
+        &'a indexmap::IndexMap<String, Value>,
+        &'a indexmap::IndexMap<String, Value>,
+    ),
+    /// Two arrays: walk their indices.
+    Arrays(&'a [Value], &'a [Value]),
+}
+
+impl<'a> Step<'a> {
+    fn of(a: &'a Value, b: &'a Value) -> Self {
+        match (a, b) {
+            (Value::Map(am), Value::Map(bm)) => Step::Maps(am, bm),
+            (Value::Array(av), Value::Array(bv)) => Step::Arrays(av, bv),
+            _ if a == b || a.same_big_number(b) => Step::Equal,
+            _ => Step::Replace,
+        }
+    }
+
+    /// Emit the ops of this step at `path`, the pointer of the pair; `b` is
+    /// the target node, the value of a `Replace`.
+    ///
+    /// Invariant: `path` is in the same state on return as on entry.
+    /// Internal helpers preserve this by pairing each `push_segment` with a
+    /// matching `pop_segment`.
+    fn emit(self, path: &mut Pointer, b: &Value, ops: &mut Vec<PatchOp>) {
+        match self {
+            Step::Equal => {}
+            Step::Replace => ops.push(PatchOp::Replace {
+                path: path.clone(),
+                value: b.clone(),
+            }),
+            Step::Maps(am, bm) => diff_maps(path, am, bm, ops),
+            Step::Arrays(av, bv) => diff_arrays(path, av, bv, ops),
+        }
+    }
+}
+
+/// Diff the child pair `a` / `b` reached through `segment`. The segment is
+/// built and pushed only when the pair emits ops or is a container pair, so
+/// an equal scalar leaf under a map costs no key allocation.
+fn diff_child(
+    path: &mut Pointer,
+    segment: impl FnOnce() -> Segment,
+    a: &Value,
+    b: &Value,
+    ops: &mut Vec<PatchOp>,
+) {
+    let step = Step::of(a, b);
+    if matches!(step, Step::Equal) {
         return;
     }
-    match (a, b) {
-        (Value::Map(am), Value::Map(bm)) => diff_maps(path, am, bm, ops),
-        (Value::Array(av), Value::Array(bv)) => diff_arrays(path, av, bv, ops),
-        // Type mismatch (including Null vs anything-non-Null) and scalar
-        // inequality: replace the whole subtree at `path`. Child ops would
-        // be redundant — D4 minimality rule.
-        _ => ops.push(PatchOp::Replace {
-            path: path.clone(),
-            value: b.clone(),
-        }),
-    }
+    path.push_segment(segment());
+    step.emit(path, b, ops);
+    path.pop_segment();
 }
 
 fn diff_maps(
@@ -127,9 +185,7 @@ fn diff_maps(
     //    reflects the target document's key order.
     for (k, bv) in bm {
         if let Some(av) = am.get(k) {
-            path.push_segment(Segment::Key(k.clone()));
-            diff_into(path, av, bv, ops);
-            path.pop_segment();
+            diff_child(path, || Segment::Key(k.clone()), av, bv, ops);
         }
     }
 }
@@ -138,9 +194,7 @@ fn diff_arrays(path: &mut Pointer, av: &[Value], bv: &[Value], ops: &mut Vec<Pat
     let common = av.len().min(bv.len());
     // Index-aligned recursion over the shared prefix.
     for i in 0..common {
-        path.push_segment(Segment::Index(i));
-        diff_into(path, &av[i], &bv[i], ops);
-        path.pop_segment();
+        diff_child(path, || Segment::Index(i), &av[i], &bv[i], ops);
     }
     if av.len() > bv.len() {
         // Shrink: remove tail indices in REVERSE order so each remove keeps

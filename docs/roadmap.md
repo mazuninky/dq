@@ -124,9 +124,7 @@ Still open; the change that deferred each is in [decisions.md](decisions.md).
 - **Distribution**: `dq self update --dry-run`; `install.sh` only prints a
   `PATH` hint and does not edit shell profiles (open question).
 - **Performance**: share jaq's parsed standard definitions across compiles
-  (most of a compile's ~190 µs); `diff` without the deep `==` at every node,
-  which re-scans a differing chain once per level; `merge` without cloning
-  the target subtree through `read_value_at` at every level; one read-back
+  (most of a compile's ~190 µs); one read-back
   parse per batch of textual edits instead of one per edit (`merge`, `patch`
   and `fix.ops` cost changes × file size); an incremental `pointer_for` in
   the JSON span builder; a guard that holds the benches to a number.

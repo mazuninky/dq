@@ -393,3 +393,5 @@ Three performance changes that shipped in 2026.20.2, archived together once thei
 - No guard holds a bench to a number; criterion only reports. The plan's 6 ms target for `evaluator_new` assumed 28 k8s rules; there are 14.
 - Measuring deep documents found two costs that grow faster than depth. `diff_into` compares subtrees with `==` before descending, so a differing chain is re-scanned at every level. `merge_into` clones the target subtree through `read_value_at` at every level to see whether it is a map. Each textual edit also parses the file again to check it, so `merge`, `patch` and `fix.ops` cost changes × file size. That check is deliberate.
 - From the plans: an incremental `pointer_for` in the JSON span builder; a shared `LineIndex` (no second user yet); `compile_composite` repeats the cache lookup instead of calling `compile_or_cached`. The YAML span-builder audit was dropped: YAML parses in linear time.
+
+Since then: the `==` re-scan in `diff` and the subtree clones in `merge` are gone (2026-11-22); `transform/diff_deep` grows about 1.8× per doubling of depth. The read-back parse per edit stays.
