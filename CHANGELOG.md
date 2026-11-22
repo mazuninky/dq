@@ -10,6 +10,22 @@ breaking changes are listed first under Changed.
 
 ### Changed
 
+- jq `halt`, `halt_error` and `halt_error/1` are a runtime error, in rules,
+  `query` and `set --jq`. They ended the process: a rule with `halt` made a
+  lint exit 0 without a report, whatever the other rules found.
+- **`dq lint`, `check` and `fix` fail when a rule raises.** A rule whose
+  `match.filter` or `check.jq` raised a jq error was skipped with a warning
+  (none under `-q`) and the run exited 0, so a gate with a typo in its rule
+  passed. Each error is now a `lint.rule_error` result in every structured
+  format, stderr names it, the rest of the run goes on, and the exit code is 3.
+  `--allow-rule-errors` restores the old behaviour. `@std` rules do not raise;
+  your own may need a guard such as `type == "object" and .kind == "Pod"`.
+- A rule with an unknown name in `match.format`, or none, is an error (exit 3):
+  it never applied and said nothing. A `--rules` directory without a rule file
+  is exit 6.
+- Rule directories follow symbolic links and take `.yml` / `.yaml` in any case.
+  Rules added with `dq rules add --symlink` were never loaded. A link to nothing
+  is exit 5.
 - A parse error prints its place on a second line, `  --> FILE:LINE:COL`
   (`<stdin>` for input on stdin), and the bulk summary ends the entry with
   ` (line L, column C)`. The place left the message itself: YAML's
@@ -49,6 +65,14 @@ breaking changes are listed first under Changed.
 
 ### Fixed
 
+- `dq rules add SRC --symlink --force` deleted the source when `.dq/rules`
+  already linked to it, and wrote through links to outside `.dq/rules`. A source
+  that overlaps its destination is refused (exit 6), and `--force` replaces a
+  link, never what it points to.
+- `./.dq/rules` that cannot be read or is not a directory was skipped with exit
+  0; it is now exit 5 or 6.
+- `dq fix --parallel` hung when a worker logged a warning: the run held the lock
+  on stderr that the log needs.
 - Parse errors had a missing or wrong position in several formats: CSV and
   TSV (column 0, or the wrong line after a blank line), JSON Lines and
   `.env` (always column 1), INI, YAML and HCL (no source line, no byte

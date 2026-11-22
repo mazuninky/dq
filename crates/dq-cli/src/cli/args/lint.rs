@@ -22,4 +22,9 @@ pub struct LintArgs {
     /// directory exists.
     #[arg(long)]
     pub rules: Vec<String>,
+
+    /// Accept rules that raise a jq error in `match.filter` or `check.jq`
+    /// and so did not run: warn instead of failing the run (exit 3).
+    #[arg(long)]
+    pub allow_rule_errors: bool,
 }

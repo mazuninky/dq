@@ -10,18 +10,21 @@
 //! 5. Per-file: load + parse the document, evaluate each rule, collect
 //!    diagnostics; a file that does not parse is a `lint.parse` diagnostic
 //!    of its own (structured reporters only — the console prints the error)
-//!    and the run goes on to the next file.
+//!    and the run goes on to the next file. So is a rule that raised and
+//!    did not run on the file: `lint.rule_error`, see
+//!    [`crate::commands::rule_errors`].
 //! 6. Hand the canonical `{ "diagnostics": [...] }` shape to the configured
 //!    reporter.
 //! 7. Compute the lint exit code:
+//!    - a file that does not parse, or a rule that raised → exit 3.
 //!    - any `Severity::Error` diagnostic → [`LintFail`] (exit 4).
 //!    - any `Severity::Warn` diagnostic AND `cli.strict` → [`LintWarnStrict`]
 //!      (exit 1).
 //!    - otherwise `Ok(())`.
 //!
 //! Both `lint` (multi-rule, multi-source) and `check` (single rule from path
-//! / `--inline` / std lookup) funnel through [`run_with_rulesets`] — the only
-//! difference is how the caller materialises the rulesets list.
+//! / `--inline` / std lookup) funnel through [`run`] — the only difference
+//! is how the caller materialises the rulesets list ([`LintRun`]).
 
 use std::io::Write;
 
@@ -34,29 +37,35 @@ use crate::commands::io_helpers::{
     checked_index, every_file_lacks, load_document_for_lint, pick_format, skip_out_of_range,
 };
 use crate::commands::plugin_loader::{self, LoadedPlugins};
+use crate::commands::rule_errors::{self, RuleErrors};
 use crate::error::{InvalidInput, LintFail, LintWarnStrict, position_note};
 use crate::output::{OutputFormat, Reporter};
 
-/// Run the lint pipeline once a caller has produced the input rulesets.
-///
-/// `rules_args` is the user-facing `--rules` list. When empty *and* the
-/// caller has not opted out via `suppress_auto_bind`, the loader falls back
-/// to auto-binding `@std/*` namespaces matching the discovered file formats
-/// plus `<cwd>/.dq/rules/`.
-///
-/// `extra` carries any pre-built rulesets the caller already resolved
-/// (e.g. `--inline` YAML or the single-rule [`RuleSet`] for `check`); they
-/// are appended to whatever the loader produces from `rules_args`. A
-/// non-empty `extra` does NOT, by itself, suppress the auto-bind path:
-/// callers must set `suppress_auto_bind = true` to skip it. The current
-/// subcommand wiring is:
-///
-/// - [`crate::commands::lint::run`] → `suppress_auto_bind = false`
-///   (preserves the user-facing "no `--rules` ⇒ pick sensible defaults"
-///   behaviour).
-/// - [`crate::commands::check::run`] → `suppress_auto_bind = true` (the
-///   user has already named exactly one rule via `--rule` / `--inline`;
-///   auto-binding would silently run unrelated `@std/*` rules alongside).
+/// What one `lint` or `check` run covers.
+pub(crate) struct LintRun<'a> {
+    /// The files, as the user named them (paths or globs).
+    pub(crate) files: &'a [Utf8PathBuf],
+    /// The user-facing `--rules` list. When empty *and* the caller has not
+    /// opted out via `suppress_auto_bind`, the loader falls back to
+    /// auto-binding `@std/*` namespaces matching the discovered file formats
+    /// plus `<cwd>/.dq/rules/`.
+    pub(crate) rules: Vec<String>,
+    /// Pre-built rulesets the caller already resolved (`--inline` YAML, the
+    /// single-rule [`RuleSet`] of `check`), appended to whatever the loader
+    /// produces from `rules`. A non-empty `extra` does NOT, by itself,
+    /// suppress the auto-bind path.
+    pub(crate) extra: Vec<RuleSet>,
+    /// Skip the auto-bind path. `check` sets it: the user has named exactly
+    /// one rule via `--rule` / `--inline`, and auto-binding would silently
+    /// run unrelated `@std/*` rules alongside. `lint` does not: no `--rules`
+    /// picks sensible defaults.
+    pub(crate) suppress_auto_bind: bool,
+    /// `--allow-rule-errors`: a rule that raises is a warning and leaves the
+    /// report and the exit code alone.
+    pub(crate) allow_rule_errors: bool,
+}
+
+/// Run the lint pipeline.
 ///
 /// # Errors
 ///
@@ -66,26 +75,27 @@ use crate::output::{OutputFormat, Reporter};
 ///   not parse (or is templated) is reported as a `lint.parse`
 ///   (`lint.templated_file`) result with the others, every other file still
 ///   linted, and its error is returned once the report is written (exit 3).
+/// - [`crate::error::RuleErrorFail`] (exit 3) when a rule raised in its
+///   filter or check and [`LintRun::allow_rule_errors`] is off: the report
+///   is written first, with every other rule's findings. A file that does
+///   not parse gives the run's error; the rule errors are still reported.
 /// - [`LintFail`] (exit 4) when any error-severity diagnostic is emitted.
 /// - [`LintWarnStrict`] (exit 1) when warnings are emitted under `--strict`.
-// 8 args is one over clippy's default `too_many_arguments` threshold. The
-// alternative would be introducing a `RulesetSpec { rules_args, extra,
-// suppress_auto_bind }` struct purely for this internal `pub(crate)` helper
-// that only `lint::run` / `check::run` / `fix::run` call. Not worth the
-// indirection — `suppress_auto_bind` carries enough behavioural weight on
-// its own that callers should see it spelled out at the call site.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn run_with_rulesets(
+pub(crate) fn run(
     cli: &Cli,
-    files: &[Utf8PathBuf],
-    rules_args: Vec<String>,
-    extra: Vec<RuleSet>,
-    suppress_auto_bind: bool,
+    what: LintRun<'_>,
     input_format: Option<&str>,
     reporter: &dyn Reporter,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
     cli.ensure_no_write_flags()?;
+    let LintRun {
+        files,
+        rules,
+        extra,
+        suppress_auto_bind,
+        allow_rule_errors,
+    } = what;
 
     let expanded = expand_lint_inputs(files)?;
     if expanded.is_empty() {
@@ -110,7 +120,7 @@ pub(crate) fn run_with_rulesets(
         .unwrap_or_else(|| Utf8PathBuf::from("."));
 
     let loader_args = LoaderArgs {
-        rules: rules_args,
+        rules,
         cwd,
         discovered_formats: discovered_formats.clone(),
         suppress_auto_bind,
@@ -136,11 +146,18 @@ pub(crate) fn run_with_rulesets(
         None => None,
     };
 
-    let mut diagnostics: Vec<Diagnostic> = Vec::new();
+    // In a structured report a rule error is a result; the console lists
+    // findings only.
+    let console = matches!(cli.format, OutputFormat::Console);
+    let mut report = Report {
+        diagnostics: Vec::new(),
+        rule_errors: RuleErrors::default(),
+        rule_error_results: !console,
+        allow_rule_errors,
+    };
     // Files that do not parse: each is a `lint.<kind>` result of its own
     // in a structured report (the console prints the error itself), and
     // the run still lints every other file before it fails with exit 3.
-    let console = matches!(cli.format, OutputFormat::Console);
     let mut unparsed: Vec<anyhow::Error> = Vec::new();
     let several = expanded.len() > 1;
     let mut missing = Vec::new();
@@ -158,7 +175,7 @@ pub(crate) fn run_with_rulesets(
             Err(err) => match unparsed_diagnostic(file, &err) {
                 Some(diagnostic) => {
                     if !console {
-                        diagnostics.push(diagnostic);
+                        report.diagnostics.push(diagnostic);
                     }
                     unparsed.push(err);
                     continue;
@@ -194,7 +211,7 @@ pub(crate) fn run_with_rulesets(
                         file,
                         &part.as_ir(),
                         &format_name,
-                        &mut diagnostics,
+                        &mut report,
                     )?;
                 }
             }
@@ -204,7 +221,7 @@ pub(crate) fn run_with_rulesets(
                 file,
                 &doc.as_ir(),
                 &format_name,
-                &mut diagnostics,
+                &mut report,
             )?,
         }
     }
@@ -216,19 +233,26 @@ pub(crate) fn run_with_rulesets(
         tracing::warn!("skipped {file}: {reason}");
     }
 
+    let Report {
+        diagnostics,
+        rule_errors,
+        ..
+    } = report;
     let mut envelope = build_envelope(&diagnostics);
     if reporter.wants_rule_catalog() {
         let mut catalog = rule_catalog(evaluator.rules());
         if let Some(rules) = catalog.as_array_mut() {
-            rules.extend(unparsed_catalog(&diagnostics));
+            rules.extend(own_catalog(&diagnostics));
         }
         envelope["rules"] = catalog;
     }
-    // The console with nothing but parse errors prints them alone, as it
-    // did before the other files were linted on.
-    if !(console && diagnostics.is_empty() && !unparsed.is_empty()) {
+    // The console with nothing but errors prints them alone: an empty list
+    // of findings would read as "all clear".
+    let failed = !unparsed.is_empty() || !rule_errors.is_empty();
+    if !(console && diagnostics.is_empty() && failed) {
         reporter.report(&envelope, out)?;
     }
+    rule_errors.log();
 
     let mut unparsed = unparsed.into_iter();
     if let Some(first) = unparsed.next() {
@@ -238,6 +262,9 @@ pub(crate) fn run_with_rulesets(
             tracing::warn!("{err}{}", position_note(&err));
         }
         return Err(first);
+    }
+    if let Some(err) = rule_errors.failure() {
+        return Err(anyhow::Error::new(err));
     }
     classify_exit(&diagnostics, cli.strict)
 }
@@ -268,50 +295,91 @@ fn unparsed_diagnostic(file: &Utf8Path, err: &anyhow::Error) -> Option<Diagnosti
     })
 }
 
-/// The rule catalogue entries of the `lint.<kind>` ids
-/// [`unparsed_diagnostic`] reports under, one per id `diagnostics` holds.
-fn unparsed_catalog(diagnostics: &[Diagnostic]) -> Vec<serde_json::Value> {
+/// The rule catalogue entries of dq's own ids — the `lint.<kind>` ones
+/// [`unparsed_diagnostic`] reports under, and [`rule_errors::RULE_ID`] — one
+/// per id `diagnostics` holds.
+fn own_catalog(diagnostics: &[Diagnostic]) -> Vec<serde_json::Value> {
     let mut ids: IndexSet<&str> = IndexSet::new();
     for diagnostic in diagnostics {
-        if let Some(kind) = diagnostic.rule_id.strip_prefix("lint.")
-            && matches!(kind, "parse" | "templated_file")
-        {
-            ids.insert(&diagnostic.rule_id);
-        }
+        ids.insert(&diagnostic.rule_id);
     }
     ids.into_iter()
-        .map(|id| {
-            let description = if id == "lint.parse" {
-                "The file does not parse in its format."
-            } else {
-                "The file holds template syntax dq reads only with --allow-templates or \
-                 --raw-template-strings."
+        .filter_map(|id| {
+            let description = match id {
+                "lint.parse" => "The file does not parse in its format.",
+                "lint.templated_file" => {
+                    "The file holds template syntax dq reads only with --allow-templates or \
+                     --raw-template-strings."
+                }
+                rule_errors::RULE_ID => {
+                    "A rule raised a jq error and did not run on the file: its findings may be \
+                     missing."
+                }
+                _ => return None,
             };
-            serde_json::json!({ "id": id, "description": description, "references": [] })
+            Some(serde_json::json!({ "id": id, "description": description, "references": [] }))
         })
         .collect()
 }
 
+/// What a run has found so far.
+struct Report {
+    /// The findings, in file and rule order.
+    diagnostics: Vec<Diagnostic>,
+    /// The rules that raised and did not run on a file.
+    rule_errors: RuleErrors,
+    /// Whether a rule error is also a result among `diagnostics`.
+    rule_error_results: bool,
+    /// `--allow-rule-errors`: rule errors are logged as warnings instead.
+    allow_rule_errors: bool,
+}
+
+impl Report {
+    /// Evaluate the rules on one document of `file`.
+    fn evaluate(
+        &mut self,
+        evaluator: &Evaluator,
+        file: &Utf8Path,
+        ir: &dq_core::Ir<'_>,
+        format_name: &str,
+    ) {
+        if self.allow_rule_errors {
+            let mut found = evaluator.evaluate_file(file, ir, format_name);
+            self.diagnostics.append(&mut found);
+            return;
+        }
+        let mut evaluation = evaluator.evaluate(file, ir, format_name);
+        self.diagnostics.append(&mut evaluation.diagnostics);
+        for error in evaluation.rule_errors {
+            if !error.stage.skips_rule() {
+                error.warn();
+                continue;
+            }
+            let diagnostic = rule_errors::diagnostic(file, &error);
+            if self.rule_errors.record(file, error) && self.rule_error_results {
+                self.diagnostics.push(diagnostic);
+            }
+        }
+    }
+}
+
 /// Lint one document — a whole file, or one document of a stream — with
-/// the rule engine and then every loaded plugin, appending to
-/// `diagnostics`.
+/// the rule engine and then every loaded plugin, into `report`.
 ///
 /// After the rule engine runs every `@std/*` and `--rules`-loaded rule,
 /// every plugin loaded from `--plugins <DIR>` gets a chance to contribute
 /// its own diagnostics. Plugin invocation errors propagate — they bubble
 /// through `exit_code_for_error` and route via `PluginError::kind_name()`;
-/// they are not swallowed, mirroring the rule-engine semantics for buggy
-/// rules.
+/// they are not swallowed.
 fn lint_document(
     evaluator: &Evaluator,
     plugins: Option<&LoadedPlugins>,
     file: &Utf8Path,
     ir: &dq_core::Ir<'_>,
     format_name: &str,
-    diagnostics: &mut Vec<Diagnostic>,
+    report: &mut Report,
 ) -> anyhow::Result<()> {
-    let mut found = evaluator.evaluate_file(file, ir, format_name);
-    diagnostics.append(&mut found);
+    report.evaluate(evaluator, file, ir, format_name);
     if let Some(loaded) = plugins
         && let Some(runtime) = loaded.runtime.as_ref()
     {
@@ -319,7 +387,7 @@ fn lint_document(
             let mut plugin_diags = runtime
                 .invoke_lint(handle, ir, Some(file))
                 .map_err(anyhow::Error::new)?;
-            diagnostics.append(&mut plugin_diags);
+            report.diagnostics.append(&mut plugin_diags);
         }
     }
     Ok(())

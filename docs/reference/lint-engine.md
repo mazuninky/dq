@@ -35,6 +35,9 @@ full report — and the run then exits 3. The console prints the other
 files' findings and the parse error on stderr, as before. `dq fix` still
 stops at such a file: it writes files.
 
+A rule that raises a jq error did not run, and its findings may be missing, so
+that run exits 3 as well; see [below](#a-rule-that-raises).
+
 ## Rule files
 
 One rule per `*.yml` file (a file may also hold a list of rules). Fields are
@@ -63,7 +66,9 @@ references:                      # optional; URLs shown by `dq explain`
 ```
 
 `match.format` uses the parser names from [formats.md](formats.md) (`yaml`,
-`json`, `toml`, `markdown`, `dockerfile`, `hcl`, `xml`, …). All jq strings
+`json`, `toml`, `markdown`, `dockerfile`, `hcl`, `xml`, …). A name dq does not
+have, or an empty list, is an error (exit 3): such a rule would never apply.
+All jq strings
 (`filter`, `check.jq`, `extract`, `loc.*`, `fix.*`) and `glob` are compiled
 once when the evaluator is built; a compile error names the rule (exit 3).
 
@@ -87,18 +92,36 @@ The result is deterministic: rule declaration order, then the order of the
 violation stream (for composite rules: extract item order, then the nested
 rule's own order).
 
-A rule whose jq raises a runtime error on a particular input (a filter or
-check that assumed a field's type) is skipped for that file, so one bad rule
-cannot sink a whole run; a `loc.file` or `loc.line` that raises falls back to
-the file under check or the document start. The evaluator returns each of
-these as a rule error beside the diagnostics (`Evaluator::evaluate`). `dq lint`
-prints one warning per rule error on stderr
-(`WARN check.jq raised a runtime error; skipping rule for this file
-rule_id=… error=jq runtime error: …`) and does not change its exit code;
-`dq test` fails the case (see below). The flip side, noted in
-[../roadmap.md](../roadmap.md): `@std` rules that raise on unexpected shapes
-(e.g. `kind: Pod` with `spec: x`) report nothing for that file beyond the
-warning.
+### A rule that raises
+
+A `match.filter` or `check.jq` that raises a runtime error on an input (a typo,
+or a field of a type it did not expect) means the rule did not run on that
+file. `lint`, `check` and `fix` then fail closed:
+
+- Every other rule and file is still evaluated, the report is written and, in
+  `fix`, the other fixes are applied.
+- The rule error is a result under `lint.rule_error`, severity `error`, at 1:1
+  of the file, in every structured format. One per rule, file, field and error
+  text, however many documents of a stream raised it. The console lists
+  findings only.
+- stderr names each one, under `-q` too, and the run exits 3, ahead of findings
+  (4) and `--strict` (1):
+
+```
+ERROR rule did not run rule_id=org.no-debug file=pod.yaml field=check.jq error=jq runtime error: cannot index "x" with "template"
+1 rule error(s): findings may be missing (--allow-rule-errors to accept)
+```
+
+`--allow-rule-errors` accepts them: a `WARN` for each, per document, and the
+exit code left as the findings make it. To make a rule tolerate a shape, guard it:
+`type == "object" and .kind == "Pod"`, or `.kind? == "Pod"`. The `@std` rules
+are written so, and a test feeds them wrong types.
+
+A failed file outranks a rule error in `fix --continue-on-error` (exit 7). A
+`loc.file` or `loc.line` that raises only moves a finding, to the file under
+check or the document start: it stays a warning. `dq test` fails a case whose
+rule raises. In the library, `Evaluator::evaluate` returns the errors beside the
+diagnostics.
 
 ### Diagnostics
 
@@ -145,14 +168,27 @@ Formats without spans (HCL, INI, …) report line 1 even with `loc.pointer`.
 the set of formats present in the inputs:
 
 - With `--rules`, each value is `@std/<namespace>`, a rule file, or a
-  directory (every `*.yml` in it except `*.test.yml`). Only those are used.
+  directory: every `*.yml` / `*.yaml` under it, in any case, except
+  `*.test.yml`. Only those are used. A directory without a rule file is exit 6
+  (`no rules in 'DIR'`).
 - Without `--rules` (`lint`, `fix`), dq auto-binds every `@std` namespace that
   has a rule for one of the input formats, plus every rule under
   `./.dq/rules/` if that directory exists. Rules there need no namespace
   prefix.
-- Duplicate sources are loaded once.
+- Symbolic links to rule files and directories are followed; a directory is
+  walked once and a file loaded once however many links reach it. A link that
+  leads nowhere (or to itself) is exit 5, as it may have been a rule (`.#name`,
+  an editor's lock, is not); so is a special file named as a rule. In
+  `dq test DIR` only links named as a rule or fixture count.
+- `./.dq/rules` that cannot be read or resolved is exit 5, and exit 6 when it
+  is not a directory. It may be absent or empty.
+- The same `--rules` value given twice is loaded twice.
 - An unknown `@std/<name>` is exit 6 with up to three Levenshtein-2
   suggestions.
+
+`dq rules add` checks everything before it writes. It refuses (exit 6) a source
+that overlaps its destination, with or without `--force`. `--force` replaces
+what is in the way, a link itself and never what it points to.
 
 `dq explain` resolves `@std/<ns>.<rule>`, `<ns>.<rule>` for a known
 namespace, or an exact id among loaded rules; an unknown id exits 6 with

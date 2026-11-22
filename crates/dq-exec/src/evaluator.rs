@@ -41,9 +41,10 @@
 //! and a `loc.file` / `loc.line` that raises falls back to the file under
 //! check / the document start. Each of these is a [`RuleError`], returned
 //! beside the diagnostics by [`Evaluator::evaluate`] so a caller can act
-//! on it: the fixture runner fails the case, while
-//! [`Evaluator::evaluate_file`] (what `dq lint` runs) logs each one as a
-//! `tracing::warn!` and keeps going. Fall-through cases that are normal
+//! on it: the fixture runner fails the case, and `dq lint` fails the run
+//! when a rule was skipped ([`RuleErrorStage::skips_rule`]).
+//! [`Evaluator::evaluate_file`] (`dq lint --allow-rule-errors`) logs each
+//! one as a `tracing::warn!` and keeps going. Fall-through cases that are normal
 //! (a `loc.pointer` with no span, a `loc.line` that returns a
 //! non-integer) are `tracing::trace!` only and not rule errors.
 
@@ -108,7 +109,18 @@ impl RuleErrorStage {
         }
     }
 
-    /// What the evaluator did about it, worded for the `dq lint` warning.
+    /// Whether the rule did not run on the document, so that its findings
+    /// may be missing: `match.filter` and `check.jq`. A `loc.file` or
+    /// `loc.line` that raises only moves a finding.
+    #[must_use]
+    pub fn skips_rule(self) -> bool {
+        match self {
+            Self::MatchFilter | Self::CheckJq => true,
+            Self::LocFile | Self::LocLine => false,
+        }
+    }
+
+    /// What the evaluator did about it, worded for [`RuleError::warn`].
     fn consequence(self) -> &'static str {
         match self {
             Self::MatchFilter | Self::CheckJq => "skipping rule for this file",
@@ -128,7 +140,7 @@ impl std::fmt::Display for RuleErrorStage {
 /// in the rule (it indexes a field of a type it did not expect), not in
 /// the document. The evaluator recovers (see [`RuleErrorStage`]) and
 /// reports it here instead of failing the run.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RuleError {
     /// Id of the rule that raised (for a composite rule's `nested` rule,
     /// the nested rule's id).
@@ -140,7 +152,11 @@ pub struct RuleError {
 }
 
 impl RuleError {
-    fn new(rule: &CompiledRule, stage: RuleErrorStage, error: &dq_transform::JqError) -> Self {
+    pub(crate) fn new(
+        rule: &CompiledRule,
+        stage: RuleErrorStage,
+        error: &dq_transform::JqError,
+    ) -> Self {
         Self {
             rule_id: rule.rule.id.clone(),
             stage,
@@ -148,8 +164,8 @@ impl RuleError {
         }
     }
 
-    /// Log the error as `dq lint` reports it: a `tracing::warn!` naming
-    /// the field, what the evaluator did, the rule id and the jq error.
+    /// Log the error as a `tracing::warn!` naming the field, what the
+    /// evaluator did, the rule id and the jq error.
     pub fn warn(&self) {
         tracing::warn!(
             rule_id = %self.rule_id,

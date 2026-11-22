@@ -202,7 +202,7 @@ mod imp {
     use super::paths;
     use core::str::FromStr;
     use jaq_core::load::{Arena, File, Loader};
-    use jaq_core::{Compiler, Ctx, Vars, data, unwrap_valr};
+    use jaq_core::{Compiler, Ctx, ValX, Vars, data};
     use jaq_json::{Num, Val};
 
     /// Compiled jq filter, designed to be shared across rayon workers via
@@ -276,21 +276,15 @@ mod imp {
         ///   `serde_json::Value` (e.g. it contains a `Val::BStr` with
         ///   non-UTF-8 bytes).
         /// - [`JqError::Runtime`] if the filter raises an exception during
-        ///   evaluation (e.g. type mismatch, division by zero).
+        ///   evaluation (e.g. type mismatch, division by zero) or calls
+        ///   `halt` or `halt_error`.
         pub fn run(&self, input: &serde_json::Value) -> Result<Vec<serde_json::Value>, JqError> {
             let val = serde_to_val(input)?;
             let ctx = Ctx::<data::JustLut<Val>>::new(&self.filter.lut, Vars::new([]));
 
             let mut out = Vec::new();
-            for result in self.filter.id.run((ctx, val)).map(unwrap_valr) {
-                match result {
-                    Ok(v) => out.push(val_to_serde(&v)?),
-                    Err(e) => {
-                        return Err(JqError::Runtime {
-                            message: e.to_string(),
-                        });
-                    }
-                }
+            for result in self.filter.id.run((ctx, val)) {
+                out.push(val_to_serde(&output(result)?)?);
             }
             Ok(out)
         }
@@ -318,33 +312,43 @@ mod imp {
         /// - [`JqError::Conversion`] if an output cannot become a
         ///   [`dq_core::Value`] (a `Val::BStr`, an object key that formats
         ///   to an empty string).
-        /// - [`JqError::Runtime`] if the filter raises an exception.
+        /// - [`JqError::Runtime`] if the filter raises an exception or calls
+        ///   `halt` or `halt_error`.
         pub fn run_value(&self, input: &dq_core::Value) -> Result<Vec<dq_core::Value>, JqError> {
             let ctx = Ctx::<data::JustLut<Val>>::new(&self.filter.lut, Vars::new([]));
             let mut out = Vec::new();
-            for result in self
-                .filter
-                .id
-                .run((ctx, value_to_val(input)))
-                .map(unwrap_valr)
-            {
-                match result {
-                    Ok(v) => out.push(val_to_value(&v)?),
-                    Err(e) => {
-                        return Err(JqError::Runtime {
-                            message: e.to_string(),
-                        });
-                    }
-                }
+            for result in self.filter.id.run((ctx, value_to_val(input))) {
+                out.push(val_to_value(&output(result)?)?);
             }
             Ok(out)
         }
     }
 
+    /// The message of a program that calls `halt` or `halt_error`.
+    const HALT: &str = "halt is not available: dq does not let an expression end the process";
+
+    /// One output of a filter.
+    ///
+    /// Takes the place of `jaq_core::unwrap_valr`, which ends the process
+    /// when the filter halts: a rule could end a lint with exit 0 and no
+    /// report, a `set --jq` a bulk run half way. Here a halt is an error,
+    /// whatever `halt` the program reached, and one a `try` does not catch.
+    ///
+    /// # Errors
+    ///
+    /// [`JqError::Runtime`] for a filter that raised, or halted.
+    fn output(result: ValX<'_, Val>) -> Result<Val, JqError> {
+        result.map_err(|exn| JqError::Runtime {
+            message: exn
+                .get_err()
+                .map_or_else(|_| HALT.to_owned(), |err| err.to_string()),
+        })
+    }
+
     /// Load and compile `expression` with jaq's definitions and natives,
     /// then dq's (see [`paths`] and [`super::keys`]), which shadow jaq's
     /// `setpath`, `getpath`, `delpaths`, `del`, `has`, `in`, `pick`,
-    /// `from_entries` and `with_entries`.
+    /// `from_entries`, `with_entries` and `halt_error`.
     fn compile_filter(expression: &str) -> Result<jaq_core::Filter<data::JustLut<Val>>, JqError> {
         let defs = jaq_core::defs()
             .chain(jaq_std::defs())
@@ -1074,6 +1078,58 @@ mod tests_enabled {
             .run(&json!("string"))
             .expect_err("expected runtime error");
         assert_eq!(err.kind_name(), "runtime");
+    }
+
+    /// No way to call jaq's `halt` ends the process, or is caught.
+    #[test]
+    fn engine_halt_is_a_runtime_error_in_every_form() {
+        for expression in [
+            "halt",
+            "halt(0)",
+            "halt(3)",
+            "halt_error",
+            "halt_error(0)",
+            "1, halt",
+            "try halt catch 1",
+            "halt?",
+            "(halt // 1)",
+            "first(halt)",
+            "isempty(halt)",
+            "[limit(2; 1, halt)]",
+            "[.[] | halt]",
+            "sort_by(halt)",
+            "reduce halt as $x (0; .)",
+            "label $out | halt, break $out",
+            "def halt_error: halt(0); halt_error",
+            "def halt_error($c): halt($c); halt_error(0)",
+            "def halt: halt(0); halt",
+            ".[0].a = halt",
+            ".[0] |= halt_error(0)",
+            "map_values(halt)",
+        ] {
+            let engine = JqEngine::compile(expression).expect("compile");
+            let message = "jq runtime error: halt is not available: \
+                           dq does not let an expression end the process";
+            let err = engine.run(&json!([1, 2])).expect_err(expression);
+            assert_eq!(err.to_string(), message, "{expression}");
+            let input = dq_core::Value::from_serde_json(&json!([1, 2]));
+            let err = engine.run_value(&input).expect_err(expression);
+            assert_eq!(err.to_string(), message, "{expression}");
+            assert_eq!(err.kind_name(), "runtime");
+        }
+        // Errors that are no halt, and a program's own filter of that name.
+        let run = |expression: &str| {
+            let engine = JqEngine::compile(expression).expect("compile");
+            engine.run(&json!([1, 2])).map_err(|err| err.to_string())
+        };
+        assert_eq!(
+            run("halt(\"x\")"),
+            Err("jq runtime error: cannot use \"x\" as integer".to_owned())
+        );
+        assert_eq!(run("path(halt)").map_err(|_| ()), Err(()));
+        assert_eq!(run("(halt) |= 1").map_err(|_| ()), Err(()));
+        assert_eq!(run("def halt: 7; halt"), Ok(vec![json!(7)]));
+        assert_eq!(run("if false then halt else 7 end"), Ok(vec![json!(7)]));
     }
 
     #[test]

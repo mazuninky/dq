@@ -16,7 +16,9 @@
 //!   `--doc` on a command that cannot honour it, stdin without
 //!   `--input-format`, a `-F` a write command cannot keep a file in.
 //! - 3 — `PARSE_ERROR` — source could not be parsed (includes Go-template
-//!   guard rejections from [`dq_core::Error::TemplatedFile`]).
+//!   guard rejections from [`dq_core::Error::TemplatedFile`]). Rules share
+//!   the code: one that is invalid or does not compile, and one that raised
+//!   in `match.filter` or `check.jq` ([`crate::error::RuleErrorFail`]).
 //! - 4 — `VALIDATE_FAIL` — `validate` reports the document is invalid;
 //!   also `self update` refusing a downloaded archive at its checksum gate.
 //! - 5 — `IO_ERROR` — read-side IO failure (couldn't read source file).
@@ -57,7 +59,7 @@ use dq_plugin::PluginError;
 
 use crate::error::{
     BulkPartialFailure, CheckPending, DocOutOfRange, DocOutOfRangeEverywhere, InvalidInput,
-    LintFail, LintWarnStrict, ValidateFail, WrongType,
+    LintFail, LintWarnStrict, RuleErrorFail, ValidateFail, WrongType,
 };
 
 /// Successful exit.
@@ -104,6 +106,11 @@ pub fn exit_code_for_error(err: &anyhow::Error) -> i32 {
     }
     if err.downcast_ref::<LintWarnStrict>().is_some() {
         return GENERIC;
+    }
+    // A rule raised and did not run: the family of a rule that does not
+    // compile.
+    if err.downcast_ref::<RuleErrorFail>().is_some() {
+        return PARSE_ERROR;
     }
     // `dq self update` refused the downloaded archive at its checksum gate:
     // the download failed a verification, the "failed a check" family.
@@ -163,10 +170,15 @@ pub fn exit_code_for_error(err: &anyhow::Error) -> i32 {
             // Schema parse failures, jq compile failures, and glob compile
             // failures all share the PARSE_ERROR family — the user's input
             // (rule YAML / jq / glob) was syntactically wrong.
-            "parse" | "rule_compile" | "glob_compile" => PARSE_ERROR,
-            // Unknown `@std/<ns>` / unresolvable rule path — caller-side
-            // input error, same family as `unsupported_format`.
-            "unknown_rule" => INVALID_INPUT,
+            // A `match.format` that is empty, or names a format dq does not
+            // have, is of that kind too.
+            "parse" | "rule_compile" | "glob_compile" | "no_format" | "unknown_format" => {
+                PARSE_ERROR
+            }
+            // Unknown `@std/<ns>` / unresolvable rule path / a rule directory
+            // without a rule / a file where that directory should be —
+            // caller-side input error, same family as `unsupported_format`.
+            "unknown_rule" | "no_rules" | "not_a_directory" => INVALID_INPUT,
             "io" => IO_ERROR,
             // Fixture authoring errors (missing tests:, malformed expected
             // entries) — caller-side input.
@@ -320,6 +332,26 @@ mod tests {
             reason: "it holds an anchor".to_owned(),
         };
         assert_eq!(exit_code_for_error(&anyhow::Error::from(err)), WRITE_FAILED);
+    }
+
+    #[test]
+    fn maps_rule_errors_and_rules_that_never_apply() {
+        let code = |err: anyhow::Error| exit_code_for_error(&err);
+        assert_eq!(code(RuleErrorFail { count: 1 }.into()), PARSE_ERROR);
+        let unknown_format = ExecError::UnknownFormat {
+            rule_id: "t.r".to_owned(),
+            format: "jsn".to_owned(),
+            did_you_mean: vec!["json".to_owned()],
+        };
+        assert_eq!(code(unknown_format.into()), PARSE_ERROR);
+        let no_format = ExecError::NoFormat {
+            rule_id: "t.r".to_owned(),
+        };
+        assert_eq!(code(no_format.into()), PARSE_ERROR);
+        let no_rules = ExecError::NoRules { path: "d".into() };
+        assert_eq!(code(no_rules.into()), INVALID_INPUT);
+        let file = ExecError::NotADirectory { path: "d".into() };
+        assert_eq!(code(file.into()), INVALID_INPUT);
     }
 
     #[test]

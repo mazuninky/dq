@@ -28,6 +28,18 @@ Each has its own page with the design and the remaining steps.
 Found while testing parse-error positions (2026-11-22), not part of that
 change:
 
+- Ways `lint` / `fix` can still check nothing and exit 0: a nested rule whose
+  `match.format` excludes the extracted items; `fix --check` with a fix on a
+  schema check, a fix that is not idempotent, or an edit that was refused (a
+  warning each); `--plugins DIR` without a plugin; a `dq test` case whose
+  `format` is not in the rule's `match.format`; `match.glob` against a path typed
+  as `./x`.
+- TAP and JUnit carry a raw ESC or line break of a file name or rule id in
+  `file:` and in attributes.
+- `schema_file` is resolved against the directory given to `--rules` (or
+  `.dq/rules`), not the rule file's own; `dq rules add` does not copy it.
+- `rules list` and `explain` leave out all of `.dq/rules` when one rule in it
+  does not load.
 - JSON Lines refuses a blank line behind a byte order mark
   (`\u{feff}\n{"a":1}\n` is `EOF while parsing a value`).
 - INI and `.env` do not strip a byte order mark: it becomes part of the

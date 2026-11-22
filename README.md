@@ -289,7 +289,7 @@ Bulk multi-file mode prints `Modified: N, Skipped: M, Failed: K`; Skipped counts
 | 0 | success |
 | 1 | generic (`exists` answering no, `--check` changes pending, `PatchTestFailed`, a value a read command, `convert` or `set --jq` cannot write in the output format, such as NaN or Infinity in JSON; `keys` / `values` / `len` on a node of the wrong type) |
 | 2 | not found (a JSON Pointer or a `--doc N` the file does not have); usage error (incl. `--doc` on a command that cannot honour it, stdin without `--input-format`, a `-F` naming another format than the file a write command keeps, `-i` or `--check` on stdin) |
-| 3 | parse error (incl. templated file) |
+| 3 | parse error (incl. templated file); invalid rule, or a rule that raised (`lint` / `check` / `fix`, unless `--allow-rule-errors`) |
 | 4 | validate fail; `self update` refused an archive at its SHA-256 check |
 | 5 | I/O error (read; `self check` / `update` network errors) |
 | 6 | invalid input |

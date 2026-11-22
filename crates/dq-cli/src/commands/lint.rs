@@ -1,6 +1,6 @@
 //! `dq lint FILE...` — run lint rules over one or more files.
 //!
-//! Routes through [`crate::commands::lint_core::run_with_rulesets`] with
+//! Routes through [`crate::commands::lint_core::run`] with
 //! the user-facing `--rules` list passed verbatim. The shared pipeline
 //! handles glob expansion, format detection, ruleset resolution (including
 //! auto-bind on empty `--rules`), evaluation, and exit-code computation.
@@ -8,7 +8,7 @@
 use std::io::Write;
 
 use crate::cli::{Cli, LintArgs};
-use crate::commands::lint_core::run_with_rulesets;
+use crate::commands::lint_core::{self, LintRun};
 use crate::output::Reporter;
 
 /// Run the `lint` command.
@@ -24,6 +24,9 @@ use crate::output::Reporter;
 ///   not parse (or is templated) is reported as a `lint.parse`
 ///   (`lint.templated_file`) result with the others, every other file still
 ///   linted, and its error is returned once the report is written (exit 3).
+/// - [`crate::error::RuleErrorFail`] (exit 3) when a rule raised on a file
+///   and `--allow-rule-errors` is not set: the other rules and files are
+///   still linted and the report written.
 pub fn run(
     cli: &Cli,
     args: &LintArgs,
@@ -36,16 +39,14 @@ pub fn run(
     // matching a discovered file format plus `<cwd>/.dq/rules/`. The
     // companion `dq check` handler passes `true` instead — see
     // [`crate::commands::check::run`] for why.
-    run_with_rulesets(
-        cli,
-        &args.files,
-        args.rules.clone(),
-        Vec::new(),
-        false,
-        input_format,
-        reporter,
-        out,
-    )
+    let run = LintRun {
+        files: &args.files,
+        rules: args.rules.clone(),
+        extra: Vec::new(),
+        suppress_auto_bind: false,
+        allow_rule_errors: args.allow_rule_errors,
+    };
+    lint_core::run(cli, run, input_format, reporter, out)
 }
 
 #[cfg(test)]
@@ -93,6 +94,7 @@ mod tests {
         let args = LintArgs {
             files: vec![path],
             rules: Vec::new(),
+            allow_rule_errors: false,
         };
         let reporter = JsonReporter;
         let mut out: Vec<u8> = Vec::new();
@@ -132,6 +134,7 @@ check:
         let args = LintArgs {
             files: vec![doc_path],
             rules: vec![rule_path.to_string()],
+            allow_rule_errors: false,
         };
         let reporter = JsonReporter;
         let mut out: Vec<u8> = Vec::new();
@@ -168,6 +171,7 @@ check:
         let args = LintArgs {
             files: vec![doc_path],
             rules: vec![rule_path.to_string()],
+            allow_rule_errors: false,
         };
         let reporter = JsonReporter;
         let mut out: Vec<u8> = Vec::new();
@@ -185,6 +189,7 @@ check:
         let args = LintArgs {
             files: vec![Utf8PathBuf::from("x.yaml")],
             rules: Vec::new(),
+            allow_rule_errors: false,
         };
         let reporter = JsonReporter;
         let mut out: Vec<u8> = Vec::new();

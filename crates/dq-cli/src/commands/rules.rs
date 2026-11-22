@@ -7,12 +7,19 @@
 //! `./.dq/rules/<ns>/`. `--symlink` swaps the copy for a Unix symlink (and
 //! falls back to copy on Windows with a warning); `--force` overwrites
 //! existing destination files.
+//!
+//! `add` follows `.dq` and `.dq/rules` where they are links to directories,
+//! and no link under `.dq/rules`: one in the way of a file counts as an
+//! existing destination, which `--force` replaces and never writes through.
+//! What it would write over or remove of its own source it refuses.
 
+use std::collections::BTreeSet;
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
 use camino::{Utf8Path, Utf8PathBuf};
-use dq_exec::{RuleSet, RuleSource};
+use dq_exec::{RuleSet, RuleSource, rule_dir};
 
 use crate::cli::{RulesAddArgs, RulesListArgs};
 use crate::error::InvalidInput;
@@ -97,8 +104,11 @@ pub fn run_list(
 ///
 /// # Errors
 ///
-/// - `InvalidInput` (exit 6) for unknown `@std/<ns>` namespaces and
-///   destination collisions (without `--force`).
+/// - `InvalidInput` (exit 6) for unknown `@std/<ns>` namespaces, for
+///   destination collisions (without `--force`), and for a source that is the
+///   destination, inside it or around it. Nothing is written then.
+/// - `dq_exec::ExecError` for a `.dq` or `.dq/rules` that cannot be resolved
+///   or is no directory, and for a source directory that does not load.
 /// - `dq_core::Error::Io` (exit 5) when filesystem operations fail.
 pub fn run_add(args: &RulesAddArgs) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()
@@ -112,15 +122,23 @@ pub fn run_add(args: &RulesAddArgs) -> anyhow::Result<()> {
 /// [`run_add`]; tests pin a tempdir-based cwd here so they don't have to
 /// mutate the process-global `std::env::current_dir()`.
 fn run_add_in_cwd(args: &RulesAddArgs, cwd: &Utf8Path) -> anyhow::Result<()> {
+    let rules_dir = cwd.join(".dq").join("rules");
     if let Some(name) = args.ruleset.strip_prefix("@std/") {
         let files = dq_lint::std_rule_files(name).ok_or_else(|| {
             anyhow::Error::new(InvalidInput::new(
                 format!("unknown @std namespace: {name}",),
             ))
         })?;
-        let dest = cwd.join(".dq").join("rules").join(name);
-        materialise_files(&dest, files, args.force, args.symlink, None)?;
-        return Ok(());
+        let dest = rules_dir.join(name);
+        let files: Vec<NewFile> = files
+            .iter()
+            .map(|(name, text)| NewFile {
+                target: dest.join(name),
+                from: Origin::Embedded(text),
+            })
+            .collect();
+        rule_dir::project_dir(cwd).map_err(anyhow::Error::new)?;
+        return materialise(&dest, &files, args);
     }
 
     // Path resolution — file or directory on disk.
@@ -135,214 +153,257 @@ fn run_add_in_cwd(args: &RulesAddArgs, cwd: &Utf8Path) -> anyhow::Result<()> {
         ))));
     }
 
-    // Determine the destination namespace from the path's file stem (file
-    // case) or directory name (dir case).
-    let ns_hint = if candidate.is_file() {
-        candidate
-            .file_stem()
-            .map(str::to_owned)
-            .unwrap_or_else(|| "local".to_owned())
-    } else {
-        candidate
-            .file_name()
-            .map(str::to_owned)
-            .unwrap_or_else(|| "local".to_owned())
-    };
-    let dest = cwd.join(".dq").join("rules").join(&ns_hint);
-
-    if candidate.is_file() {
-        let body = fs::read_to_string(&candidate).map_err(|source| {
-            anyhow::Error::new(dq_core::Error::Io {
-                path: candidate.clone(),
-                source,
-            })
-        })?;
-        let file_name = candidate
-            .file_name()
-            .map(str::to_owned)
-            .unwrap_or_else(|| "rules.yml".to_owned());
-        // `body` and `file_name` are owned and live to the end of this scope,
-        // which outlives the borrow taken by `pair`. The signature of
-        // `materialise_files` accepts `&[(&str, &str)]` with elided lifetimes,
-        // so non-`'static` references are fine here.
-        let pair: [(&str, &str); 1] = [(file_name.as_str(), body.as_str())];
-        materialise_files(
-            &dest,
-            &pair,
-            args.force,
-            args.symlink,
-            Some(candidate.as_path()),
-        )?;
+    // The destination namespace is the path's file stem (file case) or
+    // directory name (dir case).
+    let (dest, files) = if candidate.is_file() {
+        // Text, as a rule is, and readable before anything is removed for it.
+        fs::read_to_string(&candidate).map_err(|source| io_error(&candidate, source))?;
+        let dest = rules_dir.join(candidate.file_stem().unwrap_or("local"));
+        let file = NewFile {
+            target: dest.join(candidate.file_name().unwrap_or("rules.yml")),
+            from: Origin::File(candidate.clone()),
+        };
+        (dest, vec![file])
     } else {
         // Directory: copy every entry that matches the rule-file extension
         // allow-list. We reuse `RuleSet::from_path` for parsing-only
         // validation, then iterate the directory ourselves to copy each
         // file verbatim (preserves comments / formatting).
         let _validated = RuleSet::from_path(&candidate).map_err(anyhow::Error::new)?;
-        copy_directory(&candidate, &dest, args.force, args.symlink)?;
-    }
-    Ok(())
+        let dest = rules_dir.join(candidate.file_name().unwrap_or("local"));
+        let files = directory_files(&candidate, &dest)?;
+        (dest, files)
+    };
+    rule_dir::project_dir(cwd).map_err(anyhow::Error::new)?;
+    ensure_apart(&candidate, &dest, &files)?;
+    materialise(&dest, &files, args)
 }
 
-/// Materialise a list of `(filename, contents)` pairs into `dest`. When
-/// `source_origin` is set, `--symlink` makes a symlink to that file rather
-/// than writing `contents` (the `@std/*` path leaves it `None` and always
-/// copies because the embedded files don't have a stable disk location).
-#[cfg_attr(not(unix), allow(unused_variables))]
-fn materialise_files(
-    dest: &Utf8Path,
-    files: &[(&str, &str)],
-    force: bool,
-    symlink: bool,
-    source_origin: Option<&Utf8Path>,
-) -> anyhow::Result<()> {
-    fs::create_dir_all(dest.as_std_path()).map_err(|source| {
-        anyhow::Error::new(dq_core::Error::Io {
-            path: dest.to_path_buf(),
-            source,
-        })
-    })?;
-
-    for (name, body) in files {
-        let target = dest.join(name);
-        if target.exists() && !force {
-            return Err(anyhow::Error::new(InvalidInput::new(format!(
-                "destination already exists: {target} (pass --force to overwrite)"
-            ))));
-        }
-        if force && target.exists() {
-            fs::remove_file(target.as_std_path()).map_err(|source| {
-                anyhow::Error::new(dq_core::Error::Io {
-                    path: target.clone(),
-                    source,
-                })
-            })?;
-        }
-        if symlink {
-            // On Unix with an on-disk source we create a real symlink. In every
-            // other case (embedded @std/* source on any platform, or non-Unix
-            // platform with any source) we cannot symlink, so we warn the user
-            // unconditionally and fall through to a plain write — they asked
-            // for a symlink and need to know they got a copy instead.
-            #[cfg(unix)]
-            {
-                if let Some(origin) = source_origin {
-                    std::os::unix::fs::symlink(origin.as_std_path(), target.as_std_path())
-                        .map_err(|source| {
-                            anyhow::Error::new(dq_core::Error::Io {
-                                path: target.clone(),
-                                source,
-                            })
-                        })?;
-                    continue;
-                }
-                tracing::warn!(
-                    target = %target,
-                    "--symlink ignored for embedded @std/* source; copying instead"
-                );
-            }
-            #[cfg(not(unix))]
-            tracing::warn!(
-                target = %target,
-                "--symlink not supported on this platform; copying instead"
-            );
-        }
-        fs::write(target.as_std_path(), body).map_err(|source| {
-            anyhow::Error::new(dq_core::Error::Io {
-                path: target.clone(),
-                source,
-            })
-        })?;
-    }
-    Ok(())
+/// A file `rules add` makes.
+struct NewFile {
+    /// Where, under the ruleset's directory.
+    target: Utf8PathBuf,
+    /// What from.
+    from: Origin,
 }
 
-fn copy_directory(
-    src: &Utf8Path,
-    dest: &Utf8Path,
-    force: bool,
-    symlink: bool,
-) -> anyhow::Result<()> {
-    fs::create_dir_all(dest.as_std_path()).map_err(|source| {
-        anyhow::Error::new(dq_core::Error::Io {
-            path: dest.to_path_buf(),
-            source,
-        })
-    })?;
-    for entry in walkdir::WalkDir::new(src.as_std_path()).sort_by_file_name() {
-        let entry = entry.map_err(|source| {
-            anyhow::Error::new(dq_core::Error::Io {
-                path: src.to_path_buf(),
-                source: source.into(),
-            })
-        })?;
-        if !entry.file_type().is_file() {
+/// Where the contents of a [`NewFile`] come from.
+enum Origin {
+    /// The text of an `@std/*` file, which is nowhere on disk to link to.
+    Embedded(&'static str),
+    /// A file to copy, or to link to under `--symlink`.
+    File(Utf8PathBuf),
+}
+
+/// The rule files and fixtures a run over `src` would load, links followed,
+/// at the same places under `dest`.
+fn directory_files(src: &Utf8Path, dest: &Utf8Path) -> anyhow::Result<Vec<NewFile>> {
+    let mut files = Vec::new();
+    for entry in
+        rule_dir::files_under(src, rule_dir::DanglingLinks::Refuse).map_err(anyhow::Error::new)?
+    {
+        // `RuleSet::from_path` has refused a non-UTF-8 path already.
+        let Ok(entry) = Utf8PathBuf::from_path_buf(entry) else {
             continue;
-        }
-        let entry_path = match Utf8PathBuf::from_path_buf(entry.path().to_path_buf()) {
-            Ok(p) => p,
-            Err(_) => continue,
         };
-        if entry_path.file_name().is_none() {
+        if !rule_dir::is_rule_file(&entry) && !rule_dir::is_fixture_file(&entry) {
             continue;
         }
-        if !is_yaml(&entry_path) {
-            continue;
-        }
-        let relative = entry_path.strip_prefix(src).map_err(|_| {
+        let relative = entry.strip_prefix(src).map_err(|_| {
             anyhow::Error::new(InvalidInput::new(format!(
-                "internal: walked path {entry_path} is not under {src}",
+                "internal: walked path {entry} is not under {src}",
             )))
         })?;
-        let target = dest.join(relative);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent.as_std_path()).map_err(|source| {
-                anyhow::Error::new(dq_core::Error::Io {
-                    path: parent.to_path_buf(),
-                    source,
-                })
-            })?;
+        files.push(NewFile {
+            target: dest.join(relative),
+            from: Origin::File(entry),
+        });
+    }
+    Ok(files)
+}
+
+/// Refuse to add `source` to `dest` where the one, links followed, is the
+/// other or inside it, as a whole or by way of a link to one of `files`: the
+/// source would be written over, or removed and linked to itself.
+///
+/// A link in `dest` to a file of the source does not count. That is what
+/// `--symlink` makes, and replacing the link leaves the file alone.
+fn ensure_apart(source: &Utf8Path, dest: &Utf8Path, files: &[NewFile]) -> anyhow::Result<()> {
+    let refused = || {
+        anyhow::Error::new(InvalidInput::new(format!(
+            "cannot add {source} to {dest}: one is inside the other, or they are the same"
+        )))
+    };
+    let real_source = real_path(source.as_std_path());
+    // Where a link at `dest` leads, and where the link itself is.
+    let real_dests = [real_path(dest.as_std_path()), own_path(dest.as_std_path())];
+    let in_dest = |path: &Path| real_dests.iter().any(|dest| path.starts_with(dest));
+    if in_dest(&real_source) || real_dests.iter().any(|dest| dest.starts_with(&real_source)) {
+        return Err(refused());
+    }
+    for file in files {
+        let Origin::File(origin) = &file.from else {
+            continue;
+        };
+        let target = own_path(file.target.as_std_path());
+        if target.starts_with(&real_source)
+            || target == real_path(origin.as_std_path())
+            || link_chain(origin.as_std_path())
+                .iter()
+                .any(|at| in_dest(at))
+        {
+            return Err(refused());
         }
-        if target.exists() && !force {
-            return Err(anyhow::Error::new(InvalidInput::new(format!(
-                "destination already exists: {target} (pass --force to overwrite)"
-            ))));
-        }
-        if force && target.exists() {
-            fs::remove_file(target.as_std_path()).map_err(|source| {
-                anyhow::Error::new(dq_core::Error::Io {
-                    path: target.clone(),
-                    source,
-                })
-            })?;
-        }
-        if symlink {
-            #[cfg(unix)]
-            {
-                std::os::unix::fs::symlink(entry_path.as_std_path(), target.as_std_path())
-                    .map_err(|source| {
-                        anyhow::Error::new(dq_core::Error::Io {
-                            path: target.clone(),
-                            source,
-                        })
-                    })?;
-                continue;
-            }
-            #[cfg(not(unix))]
-            tracing::warn!("--symlink not supported on this platform; copying instead",);
-        }
-        fs::copy(entry_path.as_std_path(), target.as_std_path()).map_err(|source| {
-            anyhow::Error::new(dq_core::Error::Io {
-                path: target.clone(),
-                source,
-            })
-        })?;
     }
     Ok(())
 }
 
-fn is_yaml(p: &Utf8Path) -> bool {
-    matches!(p.extension(), Some("yml" | "yaml"))
+/// `path` with every link on it followed, as far as there is something.
+fn real_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| own_path(path))
+}
+
+/// Where the entry `path` names is: the links above it followed, and not the
+/// entry itself when it is one.
+fn own_path(path: &Path) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => real_path(parent).join(name),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// Where `path` is, and each link and the file it leads to when it is a link.
+fn link_chain(path: &Path) -> Vec<PathBuf> {
+    /// Past the number of links any system follows.
+    const MAX_LINKS: usize = 64;
+    let mut chain = vec![own_path(path)];
+    while chain.len() <= MAX_LINKS
+        && let Some(last) = chain.last()
+        && let Ok(target) = fs::read_link(last)
+    {
+        let next = last.parent().unwrap_or(last).join(target);
+        chain.push(own_path(&next));
+    }
+    chain
+}
+
+/// Make `files` under `dest`, after everything that could refuse it has been
+/// looked at.
+fn materialise(dest: &Utf8Path, files: &[NewFile], args: &RulesAddArgs) -> anyhow::Result<()> {
+    for path in in_the_way(dest, files, args.force)? {
+        remove_entry(&path).map_err(|source| io_error(&path, source))?;
+    }
+    create_dir(dest)?;
+    for file in files {
+        if let Some(parent) = file.target.parent() {
+            create_dir(parent)?;
+        }
+        if !(args.symlink && link_to_origin(file)?) {
+            let made = match &file.from {
+                Origin::Embedded(text) => fs::write(&file.target, text),
+                Origin::File(origin) => fs::copy(origin, &file.target).map(|_| ()),
+            };
+            made.map_err(|source| io_error(&file.target, source))?;
+        }
+    }
+    Ok(())
+}
+
+/// The files and links to remove before `files` can be made under `dest`.
+///
+/// Every step from `dest` down to each file is looked at without following
+/// it, so a link to a directory is in the way like a file is, and one that
+/// leads nowhere like one that does.
+///
+/// # Errors
+///
+/// `InvalidInput` when something is in the way without `force`, and for a
+/// file where a directory must be, or the other way round.
+fn in_the_way(
+    dest: &Utf8Path,
+    files: &[NewFile],
+    force: bool,
+) -> anyhow::Result<BTreeSet<Utf8PathBuf>> {
+    let mut remove = BTreeSet::new();
+    for file in files {
+        let mut steps: Vec<&Utf8Path> = file
+            .target
+            .ancestors()
+            .take_while(|step| step.starts_with(dest))
+            .collect();
+        steps.reverse();
+        for step in steps {
+            let meta = match fs::symlink_metadata(step) {
+                Ok(meta) => meta,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => break,
+                Err(err) => return Err(io_error(step, err)),
+            };
+            let is_target = step == file.target;
+            let refused = if meta.is_dir() && !is_target {
+                continue;
+            } else if meta.is_dir() {
+                format!("destination is a directory: {step}")
+            } else if !is_target && !meta.is_symlink() {
+                format!("destination is not a directory: {step}")
+            } else if !force {
+                format!("destination already exists: {step} (pass --force to overwrite)")
+            } else {
+                remove.insert(step.to_path_buf());
+                break;
+            };
+            return Err(anyhow::Error::new(InvalidInput::new(refused)));
+        }
+    }
+    Ok(remove)
+}
+
+/// Remove a file, or a link and not what it leads to.
+fn remove_entry(path: &Utf8Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        // Windows removes a link to a directory as a directory; neither call
+        // follows it.
+        Err(_) if cfg!(windows) && path.is_symlink() => fs::remove_dir(path),
+        removed => removed,
+    }
+}
+
+/// Make the target of `file` a link to its origin, and say whether it was
+/// made.
+///
+/// On Unix with an on-disk source that is a real symlink. In every other case
+/// (embedded `@std/*` source on any platform, or non-Unix platform with any
+/// source) there is none to make: the user asked for one and is warned that a
+/// copy takes its place.
+fn link_to_origin(file: &NewFile) -> anyhow::Result<bool> {
+    #[cfg(unix)]
+    {
+        if let Origin::File(origin) = &file.from {
+            std::os::unix::fs::symlink(origin, &file.target)
+                .map_err(|source| io_error(&file.target, source))?;
+            return Ok(true);
+        }
+        tracing::warn!(
+            target = %file.target,
+            "--symlink ignored for embedded @std/* source; copying instead"
+        );
+    }
+    #[cfg(not(unix))]
+    tracing::warn!(
+        target = %file.target,
+        "--symlink not supported on this platform; copying instead"
+    );
+    Ok(false)
+}
+
+fn create_dir(path: &Utf8Path) -> anyhow::Result<()> {
+    fs::create_dir_all(path).map_err(|source| io_error(path, source))
+}
+
+fn io_error(path: &Utf8Path, source: io::Error) -> anyhow::Error {
+    anyhow::Error::new(dq_core::Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 #[cfg(test)]

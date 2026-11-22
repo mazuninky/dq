@@ -26,4 +26,9 @@ pub struct CheckArgs {
     /// File paths or glob patterns to check. At least one required.
     #[arg(required = true, value_parser = clap::value_parser!(Utf8PathBuf))]
     pub files: Vec<Utf8PathBuf>,
+
+    /// Accept rules that raise a jq error in `match.filter` or `check.jq`
+    /// and so did not run: warn instead of failing the run (exit 3).
+    #[arg(long)]
+    pub allow_rule_errors: bool,
 }

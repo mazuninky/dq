@@ -28,6 +28,7 @@ pub mod patch;
 pub mod paths;
 pub mod plugin_loader;
 pub mod query;
+pub mod rule_errors;
 pub mod rules;
 pub mod select;
 pub mod self_cmd;

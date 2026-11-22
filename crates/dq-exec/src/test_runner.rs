@@ -28,8 +28,9 @@ use camino::{Utf8Path, Utf8PathBuf};
 use serde::Deserialize;
 
 use crate::diagnostic::Diagnostic;
-use crate::error::{ExecError, Result};
+use crate::error::Result;
 use crate::evaluator::{Evaluation, Evaluator};
+use crate::rule_dir;
 use crate::ruleset::{RuleSet, RuleSource};
 
 /// Top-level fixture file shape.
@@ -117,7 +118,7 @@ pub enum TestOutcome {
         /// One [`crate::RuleError`] per rule expression that raised,
         /// rendered as `rule=<id> <field>: <jq error>`. A rule that
         /// raises is a bug in the rule even when no violation is
-        /// expected: `dq lint` would skip it on such a file.
+        /// expected: `dq lint` would fail the run on such a file.
         raised: Vec<String>,
     },
     /// The runner couldn't even attempt the comparison — fixture parse
@@ -139,32 +140,24 @@ pub enum TestOutcome {
 pub struct RuleTester;
 
 impl RuleTester {
-    /// Walk `dir` recursively and execute every `*.test.yml` /
-    /// `*.test.yaml` fixture found.
+    /// Walk `dir` recursively, links followed, and execute every
+    /// `*.test.yml` / `*.test.yaml` fixture found (in any case).
     ///
     /// # Errors
     ///
-    /// - [`ExecError::Io`] when the directory walk itself fails (e.g.
-    ///   the directory doesn't exist). Per-fixture failures are
-    ///   reported as [`TestOutcome::Error`] entries — they don't bubble
-    ///   up.
+    /// - [`crate::ExecError::Io`] when the directory walk itself fails (e.g.
+    ///   the directory doesn't exist, or a link in it named as a rule or a
+    ///   fixture leads nowhere). Per-fixture failures are reported as
+    ///   [`TestOutcome::Error`] entries — they don't bubble up.
     pub fn run_dir(dir: &Utf8Path) -> Result<Vec<TestOutcome>> {
-        let mut fixtures: Vec<Utf8PathBuf> = Vec::new();
-        for entry in walkdir::WalkDir::new(dir.as_std_path()).sort_by_file_name() {
-            let entry = entry.map_err(|err| ExecError::Io {
-                path: dir.to_path_buf(),
-                source: err.into(),
-            })?;
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let Ok(utf8) = Utf8PathBuf::from_path_buf(entry.path().to_path_buf()) else {
-                continue;
-            };
-            if is_fixture_file(&utf8) {
-                fixtures.push(utf8);
-            }
-        }
+        // A fixture that several links lead to runs once per link: the rule
+        // it tests is the one beside the link.
+        let fixtures: Vec<Utf8PathBuf> =
+            rule_dir::files_under(dir, rule_dir::DanglingLinks::RefuseRules)?
+                .into_iter()
+                .filter_map(|path| Utf8PathBuf::from_path_buf(path).ok())
+                .filter(|path| rule_dir::is_fixture_file(path))
+                .collect();
 
         let mut outcomes = Vec::new();
         for fixture in &fixtures {
@@ -181,7 +174,7 @@ impl RuleTester {
     ///
     /// # Errors
     ///
-    /// - [`ExecError::UnknownRule`] (id `@std/<namespace>`, with typo
+    /// - [`crate::ExecError::UnknownRule`] (id `@std/<namespace>`, with typo
     ///   suggestions) when `dq-lint` has no such namespace.
     pub fn run_std(namespace: &str) -> Result<Vec<TestOutcome>> {
         let arg = format!("@std/{namespace}");
@@ -205,18 +198,10 @@ impl RuleTester {
     }
 }
 
-/// Returns `true` for `*.test.yml` / `*.test.yaml` files.
-fn is_fixture_file(path: &Utf8Path) -> bool {
-    let Some(name) = path.file_name() else {
-        return false;
-    };
-    name.ends_with(".test.yml") || name.ends_with(".test.yaml")
-}
-
 /// Run one fixture file and emit one [`TestOutcome`] per test case.
 fn run_fixture(fixture: &Utf8Path) -> Vec<TestOutcome> {
     // 1. Locate the parent rule file (same stem minus `.test`).
-    let Some(rule_path) = parent_rule_path(fixture) else {
+    let Some(rule_path) = rule_dir::parent_rule_path(fixture) else {
         return file_error(
             fixture,
             format!("could not derive parent rule path from fixture: {fixture}"),
@@ -243,7 +228,7 @@ fn run_std_fixture(
     fixture: &Utf8Path,
     fixture_yaml: &str,
 ) -> Vec<TestOutcome> {
-    let Some(rule_path) = parent_rule_path(fixture) else {
+    let Some(rule_path) = rule_dir::parent_rule_path(fixture) else {
         return file_error(
             fixture,
             format!("could not derive parent rule path from fixture: {fixture}"),
@@ -313,20 +298,6 @@ fn run_fixture_text(
         outcomes.push(run_case(fixture, &evaluator, &default_format, case));
     }
     outcomes
-}
-
-/// Derive the parent rule path from a fixture file path
-/// (`foo.test.yml` → `foo.yml`, `foo.test.yaml` → `foo.yaml`).
-fn parent_rule_path(fixture: &Utf8Path) -> Option<Utf8PathBuf> {
-    let name = fixture.file_name()?;
-    let parent = fixture.parent()?;
-    if let Some(stem) = name.strip_suffix(".test.yml") {
-        return Some(parent.join(format!("{stem}.yml")));
-    }
-    if let Some(stem) = name.strip_suffix(".test.yaml") {
-        return Some(parent.join(format!("{stem}.yaml")));
-    }
-    None
 }
 
 /// Execute one [`RuleTestCase`] against `evaluator`.
@@ -496,6 +467,8 @@ fn describe_actual(diag: &Diagnostic) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ExecError;
+    use crate::rule_dir::parent_rule_path;
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
 

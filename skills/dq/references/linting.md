@@ -120,7 +120,7 @@ dq fix -i --rules @std/k8s deploy.yaml   # restrict to one ruleset
     sarif_file: lint.sarif
 ```
 
-`--strict` promotes `warn`-severity violations to exit 1 (an `error` finding is exit 4 either way; `info` stays exit 0). A file that does not parse stops the run with exit 3 and no report.
+`--strict` promotes `warn`-severity violations to exit 1 (an `error` finding is exit 4 either way; `info` stays exit 0). A file that does not parse is a `lint.parse` result and the run exits 3; the other files are still linted and reported. A rule whose `match.filter` or `check.jq` raises is a `lint.rule_error` result and exit 3 too, because its findings may be missing: guard the expression (`type == "object" and .kind == "Pod"`), or pass `--allow-rule-errors` to accept it as a warning.
 
 `dq validate -F sarif FILE` is the parse-only check of one file: it writes its report to **stderr**, and only when the file fails to parse (exit 4).
 
