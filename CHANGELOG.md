@@ -32,6 +32,9 @@ breaking changes are listed first under Changed.
 
 - Install and pin examples in the README and the skill named `v2026.20.1`,
   a release that does not exist; they now name `v2026.47.3`.
+- `--help` and `dq man` no longer show internal milestone numbers: "(M8)"
+  after `lint`, `check`, `test`, `explain` and `rules`, and similar notes
+  in `-F markdown`, `-F xml`, `--indent` and `set --jq`.
 
 ## [2026.47.3] - 2026-11-21
 

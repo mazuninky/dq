@@ -164,9 +164,9 @@ pub enum OutputFormat {
     Tsv,
     /// Markdown with YAML / TOML / JSON frontmatter.
     Frontmatter,
-    /// CommonMark + GFM markdown (M9 — `convert -F markdown`).
+    /// CommonMark + GFM markdown (`convert -F markdown`).
     Markdown,
-    /// XML 1.0 (M11 — read+write). Round-trippable for element structure,
+    /// XML 1.0, read and write. Round-trippable for element structure,
     /// attributes, comments, CDATA, processing instructions, namespace
     /// prefixes, and the XML declaration. Mixed content (text interleaved
     /// with elements inside a single parent) is partial — see
