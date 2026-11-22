@@ -1,8 +1,10 @@
 # Bulk runs: globs, `--check`, `--continue-on-error`, `--parallel`
 
-The write commands `set`, `del`, `patch`, `merge`, `fmt`, `fix` and
-`convert -i` accept a glob instead of a file and then run once per matched
-file through one driver, `crates/dq-cli/src/bulk.rs` (`run_per_file`).
+The write commands `set`, `del`, `patch`, `merge`, `fmt` and `fix` accept a
+glob instead of a file and then run once per matched file through one driver,
+`crates/dq-cli/src/bulk.rs` (`run_per_file`). `convert -i` accepts one too, with
+a loop of its own that refuses `--check`, `--continue-on-error` and
+`--parallel`.
 `lint` and `check` take several files or globs too, through the lint
 pipeline. Read commands take a single file. `convert` to stdout takes a
 glob only when it matches exactly one file: several files written back to
@@ -62,6 +64,10 @@ transformed in memory, never written. Files that would change are listed as
 any would change, otherwise `0 files would be modified` and exit 0. `--check`
 excludes `-i`, `--diff` and `--backup`.
 
+With `--continue-on-error`, a file that fails outranks pending changes: after
+the `would modify:` lines come the summary (`Modified` counts the files that
+would change) and the failures, and the run exits 7, not 0 or 1.
+
 ## Failure handling
 
 - Without `--continue-on-error`, the run stops at the first failing file and
@@ -90,7 +96,7 @@ sequentially.
 | every file succeeded | 0 |
 | first failure, no `--continue-on-error` | that failure's code |
 | any failure with `--continue-on-error` | 7 |
-| `--check`, nothing would change | 0 |
-| `--check`, something would change | 1 |
+| `--check`, no file failed, nothing would change | 0 |
+| `--check`, no file failed, something would change | 1 |
 | glob matched nothing / walk root missing | 5 |
 | `--doc N` held by no file | 2 |
