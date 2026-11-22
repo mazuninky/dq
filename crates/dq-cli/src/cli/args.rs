@@ -199,7 +199,7 @@ pub struct Cli {
     pub sort_keys: bool,
 
     /// Indentation width for indented formats (json/jsonl honour the value;
-    /// yaml/toml ignore it for the M4 baseline).
+    /// yaml/toml ignore it).
     #[arg(long = "indent", global = true, value_name = "N")]
     pub indent: Option<u8>,
 
@@ -567,15 +567,15 @@ pub enum Command {
     /// attribute on [`SelfArgs`].
     #[command(name = "self")]
     Self_(SelfArgs),
-    /// Lint files with one or more rulesets (M8).
+    /// Lint files with one or more rulesets.
     Lint(LintArgs),
-    /// Run a single rule against files (or `--inline` an ad-hoc rule) (M8).
+    /// Run a single rule against files (or `--inline` an ad-hoc rule).
     Check(CheckArgs),
-    /// Run rule fixture tests under a directory or of `@std/<ns>` (M8).
+    /// Run rule fixture tests under a directory or of `@std/<ns>`.
     Test(TestArgs),
-    /// Print a rule's description, severity, and references (M8).
+    /// Print a rule's description, severity, and references.
     Explain(ExplainArgs),
-    /// Manage rule sources — `list`, `add` (M8).
+    /// Manage rule sources — `list`, `add`.
     Rules(RulesArgs),
     /// Apply every applicable rule's fix (`fix.ops` or `fix.jq`) to the given files.
     Fix(FixArgs),

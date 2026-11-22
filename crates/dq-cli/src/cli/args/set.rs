@@ -45,7 +45,7 @@ pub struct SetArgs {
     ///
     /// NOTE: `--jq` routes through the format's native re-emit path
     /// (`Format::write_with_options`), which drops YAML comments and any
-    /// other formatting the M2 textual-edit splice would have preserved. Use
+    /// other formatting the textual-edit splice would have preserved. Use
     /// point-edits (`dq set FILE POINTER VALUE`) when comment preservation
     /// matters; reach for `--jq` when you need conditional or
     /// structure-changing transforms.
