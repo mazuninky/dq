@@ -1,7 +1,6 @@
 //! Transform-engine benchmarks: [`diff`], [`apply_patch`], [`apply_merge`].
 //!
-//! Three groups, each targeting one of the suspected hot paths surfaced by
-//! the plan:
+//! Five groups, each targeting one suspected hot path:
 //!
 //! - **`transform/diff`** — replace-ratio sweep on a 1k-leaf JSON-like
 //!   `Value`. Variants `b = a` (no diff), and `b = a` mutated at 1% / 10%
@@ -14,6 +13,18 @@
 //!   [`apply_merge`] with an empty `{}` patch. Quantifies the entry-clone
 //!   at `crates/dq-core/src/transform/merge.rs:38` (the function clones
 //!   the full document for zero useful work).
+//! - **`transform/diff_deep`** — diffs two 256-leaf trees whose leaves all
+//!   sit at depth 2 / 4 / 8 / 16 (same leaf count at every depth, so only
+//!   depth varies). Child pointers cost O(depth) per leaf since the walk
+//!   pushes and pops one `Pointer`. The `a == b` check at every node of
+//!   `diff_into` still re-scans a differing chain once per level, so the
+//!   group grows faster than linearly past depth 8.
+//! - **`transform/apply_merge_deep`** — calls [`apply_merge`] with a nested
+//!   sparse merge patch that reaches a seeded ~10% of the leaves of a
+//!   256-leaf tree at depth 2 / 4 / 8 / 16. End-to-end cost, not the walk
+//!   alone: every patched leaf is a textual edit that parses the file again,
+//!   the file grows with depth, and `merge_into` calls `read_value_at`,
+//!   which walks from the root and clones the subtree, at every level.
 
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use dq_core::{Document, PatchOp, Pointer, Value, apply_merge, apply_patch, diff};
@@ -59,6 +70,101 @@ fn synth_diff_pair(ratio_per_thousand: u32) -> (Value, Value) {
         b_map.insert(key, Value::String("changed".to_owned()));
     }
     (a, Value::Map(b_map))
+}
+
+/// Number of keys per level in the two-level base of [`synth_deep_tree`].
+const DEEP_FANOUT: usize = 16;
+
+/// Build a tree with up to `DEEP_FANOUT * DEEP_FANOUT` (256) leaves, every
+/// leaf at exactly `depth` (>= 2). The first two levels are 16-key maps; each
+/// of the 256 paths is then extended with `depth - 2` single-key maps
+/// (`"n"`), so the leaf count stays fixed and only the depth varies.
+/// `leaf(i)` gives the scalar of the i-th leaf in walk order, or `None` to
+/// leave that leaf (and any map left empty by it) out — used for sparse
+/// merge patches.
+fn synth_deep_tree(depth: usize, leaf: impl Fn(usize) -> Option<Value>) -> Value {
+    assert!(depth >= 2, "depth counts the two fan-out levels");
+    let mut root: IndexMap<String, Value> = IndexMap::with_capacity(DEEP_FANOUT);
+    for i in 0..DEEP_FANOUT {
+        let mut mid: IndexMap<String, Value> = IndexMap::with_capacity(DEEP_FANOUT);
+        for j in 0..DEEP_FANOUT {
+            let Some(mut node) = leaf(i * DEEP_FANOUT + j) else {
+                continue;
+            };
+            for _ in 2..depth {
+                let mut single: IndexMap<String, Value> = IndexMap::with_capacity(1);
+                single.insert("n".to_owned(), node);
+                node = Value::Map(single);
+            }
+            mid.insert(format!("k{j}"), node);
+        }
+        if !mid.is_empty() {
+            root.insert(format!("k{i}"), Value::Map(mid));
+        }
+    }
+    Value::Map(root)
+}
+
+/// Deterministic subset of the 256 leaves that the merge bench changes:
+/// about 10%, chosen with a seeded RNG so every depth changes the same ones.
+fn synth_changed_leaves() -> Vec<bool> {
+    let mut rng = StdRng::seed_from_u64(42);
+    (0..DEEP_FANOUT * DEEP_FANOUT)
+        .map(|_| rng.random_range(0..10) == 0)
+        .collect()
+}
+
+fn bench_diff_deep(c: &mut Criterion) {
+    let mut group = c.benchmark_group("transform/diff_deep");
+    for &depth in &[2usize, 4, 8, 16] {
+        let a = synth_deep_tree(depth, |i| Some(Value::Int(i as i64)));
+        // Every leaf changes type, so the walk reaches all 256 leaves and
+        // emits one `Replace` per leaf.
+        let b = synth_deep_tree(depth, |_| Some(Value::String("changed".to_owned())));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(depth),
+            &(&a, &b),
+            |bencher, &(a, b)| {
+                bencher.iter(|| {
+                    let ops = diff(black_box(a), black_box(b));
+                    black_box(ops)
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+fn bench_apply_merge_deep(c: &mut Criterion) {
+    let mut group = c.benchmark_group("transform/apply_merge_deep");
+    let changed = synth_changed_leaves();
+    for &depth in &[2usize, 4, 8, 16] {
+        let doc_bytes = serde_json::to_vec(&synth_deep_tree(depth, |i| Some(Value::Int(i as i64))))
+            .expect("serialize doc");
+        let proto_doc = parse_json_doc(&doc_bytes);
+        // Sparse patch: only the paths down to the changed leaves, as a
+        // real merge patch would be. Every merge-patch leaf is one `set_at`,
+        // a textual edit that parses the whole file again; patching all 256
+        // leaves takes about 40 ms at depth 2, too slow to sample well.
+        let patch = synth_deep_tree(depth, |i| {
+            changed[i].then(|| Value::String("changed".to_owned()))
+        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(depth),
+            &(&proto_doc, &patch),
+            |bencher, &(proto_doc, patch)| {
+                bencher.iter_batched(
+                    || proto_doc.clone(),
+                    |mut doc| {
+                        apply_merge(&mut doc, black_box(patch)).expect("apply merge");
+                        doc
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+    group.finish();
 }
 
 fn bench_diff(c: &mut Criterion) {
@@ -147,5 +253,7 @@ criterion_group!(
     bench_diff,
     bench_apply_patch,
     bench_apply_merge_empty,
+    bench_diff_deep,
+    bench_apply_merge_deep,
 );
 criterion_main!(benches);

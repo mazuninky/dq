@@ -1,6 +1,6 @@
 # Linear-cost pointers in recursive walks (`diff`, `merge`)
 
-**Status: done.** The push/pop API is in, `diff` and `merge` use it, and tests and a bench cover it. What's left is recording numbers and adding a bench that covers deep documents.
+**Status: shipped in 2026.20.2, archived 2026-11-21.** The push/pop API is in, `diff` and `merge` use it, tests and benches cover it, and the numbers are below. Measuring deep documents found two other costs that grow faster than depth; they are open in [../roadmap.md](../roadmap.md). The summary is in [decisions.md](../decisions.md#2026-11-21--linear-json-spans-cached-jq-compiles-in-place-pointer-walks-perf).
 
 ## Problem
 
@@ -69,8 +69,31 @@ There is no RAII guard type that pops on `Drop`. With two recursive walks, balan
 - Property tests in [crates/dq-core/tests/prop_pointer.rs](../../crates/dq-core/tests/prop_pointer.rs): `push_pop_matches_with_segment`, `push_then_pop_is_identity`, `balanced_push_pop_returns_to_start`.
 - Bench group `pointer/recursive_walk/{1,4,16,64}` in [crates/dq-core/benches/pointer.rs](../../crates/dq-core/benches/pointer.rs) models the walk: push d segments, render canonical, pop d segments. Rule of thumb from the design: if depth 64 costs more than 5× depth 16, treat it as a regression. Nothing enforces this; it is checked by hand. The expected curve runs from about 50 ns at depth 1 to about 4 µs at depth 64.
 
-## Remaining work
+## Measured
 
-- Record the after-numbers. Run `cargo bench -p dq-core --bench pointer -- --quick` and add `pointer/recursive_walk/{1,4,16,64}` to this page next to the `with_segment` table. They have never been written down in the repo.
-- Add a deep-document case to the `transform/diff` bench in [crates/dq-core/benches/transform.rs](../../crates/dq-core/benches/transform.rs). Today it diffs a flat 1,000-key map (depth 1), so it can't show the depth effect this change targets. A synthetic tree about 10 levels deep with a few hundred leaves would measure what the user sees. A matching `apply_merge` case with a nested patch would cover `merge_into`.
-- Nothing else is open. Once the numbers are recorded, this plan can move to the finished list in [../roadmap.md](../roadmap.md).
+`cargo bench -p dq-core --bench pointer -- --quick` and `--bench transform`, 2026-11-21, release profile, Apple M4 Pro with other work running (the `with_segment` table above is from an M1 Pro; the same-machine `with_segment` row below is the fair comparison).
+
+| depth | `with_segment` chain | `recursive_walk` (push, render, pop) |
+|---|---|---|
+| 1 | 24 ns | 33 ns |
+| 4 | 213 ns | 57 ns |
+| 16 | 2.40 µs | 285 ns |
+| 64 | 26.9 µs | 829 ns |
+
+Depth 64 costs 2.9× depth 16, inside the 5× rule of thumb, and 32× less than a `with_segment` chain.
+
+Two groups now vary depth with a fixed 256 leaves (16 × 16 maps, then single-key maps down to depth d), as this page asked:
+
+| depth | `transform/diff_deep`, every leaf changed | `transform/apply_merge_deep`, 10% of leaves changed |
+|---|---|---|
+| 2 | 26 µs | 2.9–3.3 ms |
+| 4 | 54 µs | 7.6–7.7 ms |
+| 8 | 117–133 µs | 18.6–18.8 ms |
+| 16 | 335–569 µs | 41.6–41.8 ms |
+
+Ranges are two runs on a loaded machine. Both grow faster than depth, for reasons other than pointers:
+
+- `diff_into` starts with `if a == b`, a deep comparison. On a chain that differs only at its leaf, the comparison at each level walks down to that leaf, so a changed leaf at depth d costs about d²/2 map comparisons. Comparing only at scalars and type mismatches would keep the output and drop the term.
+- `merge_into` asks `read_value_at` whether the target is a map, at every level. That walks from the root and clones the whole subtree under the pointer, the whole document at the root. Each changed leaf is also a textual edit that parses the file again to check it, and the file grows with depth. A borrowing lookup would remove the clones; the per-edit check is deliberate.
+
+Neither shows at the depth of ordinary files: a Kubernetes manifest is about 6 levels deep.

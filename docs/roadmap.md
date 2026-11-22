@@ -13,30 +13,6 @@ Status words: **done** (in the code, only bookkeeping left), **partly done**,
 
 Each has its own page with the design and the remaining steps.
 
-- **[Linear-cost pointers in recursive walks](plans/perf-pointer-recursive-walks.md)
-  — done.** `Pointer::with_segment` copied the whole path on every call, so
-  recursive walks paid O(depth²) per leaf (65 ns at depth 1, 115 µs at depth
-  64). `Pointer::push_segment` / `pop_segment` now let `transform::diff` and
-  `transform::merge_into` walk with one `&mut Pointer`; a property test checks
-  equivalence with `with_segment`, and a `pointer/recursive_walk` bench exists.
-  Left: record the after-numbers and add a deep-document case to the
-  `transform/diff` bench (it only diffs a flat map today).
-- **[Linear-time JSON span map](plans/perf-json-parse-linear.md) — done.** The
-  JSON span builder scanned backwards per value, making compact JSON
-  quadratic (10 000 records: 13.9 s, against about 50 ms for YAML). A
-  precomputed `LineIndex` (newline offsets, binary search, cached indent per
-  line) replaced those scans; a smoke test fails if 10 000 elements take over
-  a second. Left: record the after-numbers (target ≤ 300 ms), a changelog
-  line, and three optional follow-ups (incremental `pointer_for`, a YAML span
-  audit, sharing `LineIndex`).
-- **[Compile each jq expression once per evaluator](plans/perf-jq-compile-cache.md)
-  — done.** `Evaluator::new` compiled every jq expression from scratch (about
-  350 µs each, about 17 ms for `@std/k8s`). A `JqCache` scoped to one
-  `Evaluator::new` now shares one engine per distinct expression, composite
-  `extract` included. Left: measure `evaluate/evaluator_new` and reset the
-  6 ms target to the real rule set, fix a stale doc comment ("28 rules"), a
-  changelog line. Idea recorded in the plan: every compile re-parses jaq's
-  standard definitions, which may be most of the 350 µs.
 - **[`@std/skills`: rules for `SKILL.md` and `evals.json`](plans/add-std-skills-rules.md)
   — partly done.** `skills.frontmatter` and `skills.evals-schema` ship with
   fixtures, and the changelog announces the namespace. `skills.evals-schema`
@@ -98,7 +74,8 @@ not built:
   `language: rust` instead of `system`.
 - **Performance baseline published in the README**: criterion benches exist in
   `dq-core`, `dq-exec`, `dq-transform`, but neither CI nor the release runs
-  them and no numbers are published.
+  them, and the README publishes no numbers (the 2026-11-21 runs are in
+  the archived perf plans).
 - **jq**: conformance against a subset of the jq 1.7 test suite; `--arg` /
   `--argjson` / `--slurpfile`, raw output (`-r`), multi-file and per-line
   JSONL `query`; a fallback to an external `jq` when built without
@@ -146,6 +123,13 @@ Still open; the change that deferred each is in [decisions.md](decisions.md).
   GitHub step summary); a rule-compile cache across runs.
 - **Distribution**: `dq self update --dry-run`; `install.sh` only prints a
   `PATH` hint and does not edit shell profiles (open question).
+- **Performance**: share jaq's parsed standard definitions across compiles
+  (most of a compile's ~190 µs); `diff` without the deep `==` at every node,
+  which re-scans a differing chain once per level; `merge` without cloning
+  the target subtree through `read_value_at` at every level; one read-back
+  parse per batch of textual edits instead of one per edit (`merge`, `patch`
+  and `fix.ops` cost changes × file size); an incremental `pointer_for` in
+  the JSON span builder; a guard that holds the benches to a number.
 
 ## Decided not to do
 

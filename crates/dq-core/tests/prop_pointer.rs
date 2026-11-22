@@ -9,7 +9,7 @@
 //! decision rather than a silent semantic break.
 //!
 //! Test plan tracked in
-//! `docs/plans/perf-pointer-recursive-walks.md`.
+//! `docs/archive/perf-pointer-recursive-walks.md`.
 
 use dq_core::pointer::{Pointer, Segment};
 use proptest::prelude::*;
