@@ -70,6 +70,12 @@ quick-xml = { workspace = true }
 # AND BSD-3-Clause.
 encoding_rs = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# `atomic_write`: the POSIX ACL of an open file on Linux (`fgetxattr`,
+# `fsetxattr`, `fremovexattr`), error numbers, and the flags to open a file
+# that may have become a link or a pipe.
+libc = { workspace = true }
+
 [dev-dependencies]
 insta = { workspace = true, features = ["redactions"] }
 pretty_assertions = { workspace = true }

@@ -59,7 +59,7 @@ impl Reporter for JunitReporter {
             .ok_or_else(|| {
                 anyhow::Error::new(InvalidInput::new(
                     "JUnit reporter expects an object with a `diagnostics` array; \
-                     selecting `-F junit` is only valid for the M8+ lint commands",
+                     selecting `-F junit` is only valid for the lint commands",
                 ))
             })?;
         let xml = build_junit(diagnostics);

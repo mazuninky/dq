@@ -25,7 +25,9 @@ use dq_core::Value;
 
 use crate::bulk::{self, FileOp, FileOpResult};
 use crate::cli::{Cli, MergeArgs};
-use crate::commands::io_helpers::{finish_edit, parse_file_for_edit, pick_format, read_bytes};
+use crate::commands::io_helpers::{
+    finish_edit, parse_file_for_edit, pick_format, read_bytes, read_for_edit,
+};
 use crate::error::InvalidInput;
 
 /// Run `dq merge`.
@@ -90,7 +92,7 @@ impl<'a> FileOp for MergeFileOp<'a> {
         // Mirror `commands::patch::PatchFileOp::apply`, swapping
         // `apply_patch(ops)` for `apply_merge(patch)`.
         let format = pick_format(path, self.input_format)?;
-        let original_bytes = read_bytes(path)?;
+        let (original_bytes, original) = read_for_edit(path)?;
 
         // Template guard, then parse: a file whose templates change what
         // the parser reads is refused; `guard` checks below that the edit
@@ -137,6 +139,7 @@ impl<'a> FileOp for MergeFileOp<'a> {
         Ok(FileOpResult::Modified {
             output_bytes: final_bytes,
             diff,
+            original,
         })
     }
 }

@@ -30,7 +30,7 @@
 //!
 //! ## Write-mode flags
 //!
-//! - `-i` → atomic in-place write (via [`dq_core::atomic_write::write`]).
+//! - `-i` → atomic in-place write (via [`dq_core::atomic_write::rewrite`]).
 //! - `--diff` → unified diff to stdout, no write.
 //! - `--check` → exit 1 if any file would be modified, no write. M10
 //!   reuses [`crate::error::CheckPending`] (already mapped to exit 1)
@@ -67,7 +67,7 @@ use indexmap::IndexSet;
 use crate::bulk::{self, FileOp, FileOpResult};
 use crate::cli::{Cli, DocSelector, FixArgs};
 use crate::commands::io_helpers::{
-    checked_index, parse_for_lint, pick_format, read_bytes, skip_out_of_range,
+    checked_index, parse_for_lint, pick_format, read_for_edit, skip_out_of_range,
 };
 use crate::commands::lint_core::expand_lint_inputs;
 use crate::commands::plugin_loader::{self, LoadedPlugins};
@@ -271,7 +271,7 @@ impl<'a> FileOp for FixFileOp<'a> {
         // `EditScript::apply` would fail with `WriteUnavailable` against a
         // value-only `Document`).
         let format = pick_format(path, self.input_format)?;
-        let original_bytes = read_bytes(path)?;
+        let (original_bytes, original) = read_for_edit(path)?;
         let mut document = parse_for_lint(path, format, &original_bytes, TemplateMode::Guard)?;
         // A multi-document stream is fixed one document at a time, and
         // written back with every document; `--doc N` fixes document N
@@ -429,6 +429,7 @@ impl<'a> FileOp for FixFileOp<'a> {
         Ok(FileOpResult::Modified {
             output_bytes: final_bytes,
             diff,
+            original,
         })
     }
 }

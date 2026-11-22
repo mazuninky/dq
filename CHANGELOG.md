@@ -27,6 +27,12 @@ breaking changes are listed first under Changed.
 
 ### Changed
 
+- **`dq convert -i` does not replace a file that is already at the target.** It
+  was replaced without a question. The run is refused (exit 6, nothing is
+  converted) unless the new `--overwrite` is given, or `--backup`, which keeps
+  a copy.
+- A file that changed on disk between `dq` reading it and writing it is not
+  written: exit 7. The change made in between was lost.
 - jq `halt`, `halt_error` and `halt_error/1` are a runtime error, in rules,
   `query` and `set --jq`. They ended the process: a rule with `halt` made a
   lint exit 0 without a report, whatever the other rules found.
@@ -88,6 +94,20 @@ breaking changes are listed first under Changed.
 
 ### Fixed
 
+- **`-i` changed the permissions of every file it wrote to 0600**: a script lost
+  its execute bit, a 0644 file could no longer be read by others. The mode is
+  kept, and owner, group and ACL where the process may set them; a new file gets
+  0666 less the umask. Where the group or the ACL cannot be kept, access
+  narrows, with a warning.
+- A path that turned into a link between `dq` reading and writing it was
+  followed: as root a bulk run could be led to overwrite another file.
+- `-i` on a symbolic link replaced the link with a regular file and left the file
+  it leads to unchanged. That file is now edited and the link stays; `--backup`
+  goes beside it.
+- `convert -i` lost data: two sources with the same target (`a.yaml` and `a.yml`
+  to `a.json`) overwrote each other and were both removed, and on a
+  case-insensitive file system `convert f.YAML -F yaml -i` removed the file. Both
+  are refused (exit 6). A target that is a link is refused (exit 7).
 - `dq rules add SRC --symlink --force` deleted the source when `.dq/rules`
   already linked to it, and wrote outside `.dq/rules` through links or for a
   file named `...yml`. A source that overlaps its destination and such a name
@@ -121,9 +141,10 @@ breaking changes are listed first under Changed.
   quotes a line break of the file, which could have started a line of its own.
 - Install and pin examples in the README and the skill named `v2026.20.1`,
   a release that does not exist; they now name `v2026.47.3`.
-- `--help` and `dq man` no longer show internal milestone numbers: "(M8)"
-  after `lint`, `check`, `test`, `explain` and `rules`, and similar notes
-  in `-F markdown`, `-F xml`, `--indent` and `set --jq`.
+- `--help`, `dq man` and messages no longer show internal milestone numbers:
+  "(M8)" after `lint`, `check`, `test`, `explain` and `rules`, and similar
+  notes in `-F markdown`, `-F xml`, `--indent`, `set --jq`, the warning of
+  `convert` about lost comments and the errors of read-only formats.
 
 ## [2026.47.3] - 2026-11-21
 

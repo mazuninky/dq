@@ -26,9 +26,9 @@
 //! - `write()` for an unmutated document emits `original_bytes()` verbatim.
 //!   "Unmutated" is detected by re-parsing the original bytes and comparing
 //!   the resulting `Value` for structural equality with `doc.value()`.
-//! - `write()` for a mutated document returns `Error::Format` — textual-edit
-//!   splicing for markdown is M11+ work. The error message names this as
-//!   the M9 contract so callers can decide whether to bail or to ignore.
+//! - `write()` for a mutated document returns `Error::Format` — there is no
+//!   textual edit for markdown. The error message names this as
+//!   the contract so callers can decide whether to bail or to ignore.
 //!
 //! See design D6 (round-trip strategy) for the rationale: M9 markdown is
 //! primarily a lint-target format, and a "canonical" emission via
@@ -104,9 +104,9 @@ impl Format for Markdown {
             }
             return Err(Error::Format {
                 format: "markdown",
-                message: "Markdown document has no source bytes; mutation re-emit is M11+ work \
-                     (the in-memory value tree is read-only in M9)"
-                    .to_owned(),
+                message:
+                    "a changed or new Markdown document cannot be written: Markdown is read-only"
+                        .to_owned(),
             });
         }
         match parse_to_value(original) {
@@ -119,9 +119,9 @@ impl Format for Markdown {
             }
             Ok(_) => Err(Error::Format {
                 format: "markdown",
-                message: "Markdown round-trip on mutated documents is M11+ work; the value tree \
-                     is read-only in M9"
-                    .to_owned(),
+                message:
+                    "a changed or new Markdown document cannot be written: Markdown is read-only"
+                        .to_owned(),
             }),
             Err(e) => Err(e),
         }
@@ -809,7 +809,7 @@ fn node_fields<'a>(
         // Anything else — unmapped variant. Surface the gap.
         other => {
             tracing::warn!(
-                "M9 markdown parser: unmapped comrak NodeValue variant {:?}; emitting `unknown` placeholder",
+                "markdown parser: unmapped comrak NodeValue variant {:?}; emitting `unknown` placeholder",
                 other,
             );
             fields.insert("value".to_owned(), Value::String(format!("{other:?}")));
@@ -1677,9 +1677,9 @@ mod tests {
         match err {
             Error::Format { format, message } => {
                 assert_eq!(format, "markdown");
-                assert!(
-                    message.contains("M11+") || message.contains("read-only"),
-                    "message should mention M9 read-only contract: {message}",
+                assert_eq!(
+                    message,
+                    "a changed or new Markdown document cannot be written: Markdown is read-only"
                 );
             }
             other => panic!("expected Error::Format, got {other:?}"),

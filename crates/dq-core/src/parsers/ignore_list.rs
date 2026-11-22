@@ -53,7 +53,7 @@ impl Format for IgnoreList {
     fn write(&self, _doc: &Document, _w: &mut dyn Write) -> Result<()> {
         Err(Error::Format {
             format: "ignore-list",
-            message: "ignore-list is read-only in M5".to_owned(),
+            message: "ignore-list files are read-only".to_owned(),
         })
     }
 }
@@ -97,10 +97,7 @@ mod tests {
         match err {
             Error::Format { format, message } => {
                 assert_eq!(format, "ignore-list");
-                assert!(
-                    message.contains("read-only"),
-                    "expected read-only message; got: {message}",
-                );
+                assert_eq!(message, "ignore-list files are read-only");
             }
             other => panic!("expected Format error, got {other:?}"),
         }
