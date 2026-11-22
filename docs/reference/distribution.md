@@ -160,9 +160,10 @@ commit and `cargo deny check` before a push.
 (`dq fmt --check`) and `dq-validate` (`dq validate`) for YAML, JSON, TOML
 and JSONL files, with `language: system` (dq must be on `PATH`).
 
-## Claude Code skill
+## Agent skill
 
-`skills/dq/` (`SKILL.md`, `skill.json`, `references/`, `evals/`) is the
-skill published to skills.sh (`npx skills add mazuninky/dq`). It covers
-install, common patterns, formats, exit codes and anti-scope. The skill is
-the only skill meant to be published from this repository.
+`skills/dq/` (`SKILL.md`, `references/`, `evals/`) is the skill for coding
+agents. `SKILL.md` and `references/` are embedded in the binary and installed
+by `dq skill install`; see [skill.md](skill.md). It covers install, common
+patterns, formats, exit codes and anti-scope. `evals/` stays in the repository.
+The Docker builds copy `skills/` for the embedding.

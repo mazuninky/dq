@@ -11,6 +11,10 @@ on:
       - "clippy.toml"
       - "deny.toml"
       - "scripts/**"
+      # Embedded in the binary, and copied by the Docker builds.
+      - "skills/**"
+      - "Dockerfile*"
+      - ".dockerignore"
       - ".github/**"
   # No paths filter here: the branch ruleset requires ci-success, and a
   # workflow skipped by `paths` leaves a required check waiting forever, so a
@@ -88,6 +92,15 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace --all-features --locked
+
+      # A debug build never updates the installed skill, so the tests of that
+      # are ignored above. Without debug assertions they run. Everything is
+      # built again for it, outside the cached target.
+      - name: cargo test (skill update)
+        env:
+          CARGO_PROFILE_DEV_DEBUG_ASSERTIONS: "false"
+          CARGO_TARGET_DIR: ${{ runner.temp }}/no-debug-assertions
+        run: cargo test -p dq-cli --test cli_skill --locked
 
   deny:
     name: cargo deny

@@ -18,6 +18,8 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY clippy.toml deny.toml ./
 COPY crates ./crates
+# The binary embeds the agent skill.
+COPY skills ./skills
 
 RUN cargo build --release --locked --bin dq
 

@@ -358,6 +358,7 @@ fn doc_is_refused_by_every_command_that_cannot_honour_it() {
         ("completions", &["completions", "bash"]),
         ("man", &["man"]),
         ("self", &["self", "check"]),
+        ("skill", &["skill", "status"]),
         ("generate-docs", &["generate-docs", "--output-dir", "out"]),
     ];
     for (command, args) in refused {
@@ -1137,6 +1138,8 @@ fn front_matter_json_and_single_document_yaml_lint_as_before() {
     let lint = |file: &str| {
         let output = assert_cmd::Command::cargo_bin("dq")
             .expect("dq binary built")
+            .env("HOME", "/tmp")
+            .env("DQ_NO_SKILL_UPDATE", "1")
             .env_remove("RUST_LOG")
             .current_dir(&fixtures)
             .args(["--no-color", "-F", "json", "lint", file])

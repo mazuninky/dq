@@ -1,9 +1,16 @@
 //! `dq` binary entry point.
 //!
-//! Exactly five things happen here: SIGPIPE restoration on Unix, clap parse,
-//! tracing init, dependency wiring (color resolution + locked stdio), and
-//! dispatch to `dq::run` with exit-code mapping. All command logic lives in
-//! `dq::commands::*`.
+//! Exactly six things happen here: SIGPIPE restoration on Unix, clap parse,
+//! tracing init, dependency wiring (color resolution + locked stdio),
+//! dispatch to `dq::run` with exit-code mapping, and — once the output is
+//! out and the exit code is settled — the update of an installed skill
+//! (`dq::skill::FirstRun`). All command logic lives in `dq::commands::*`.
+//!
+//! A process that ends before that — clap's own exit (`--help`, `--version`,
+//! a usage error it raises while parsing), a death by SIGPIPE, a panic —
+//! does without: the next run does it.
+
+use std::io::Write;
 
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
@@ -62,11 +69,18 @@ fn main() {
     let stderr = std::io::stderr();
     let mut stderr = stderr.lock();
     let result = dq::run(&cli, colors, &mut stdout, &mut stderr);
-    if let Err(err) = result {
-        if err.downcast_ref::<dq::SilentError>().is_none() {
-            let _ = dq::render_error(&err, colors.stderr, &mut stderr);
+    let code = match result {
+        Ok(()) => dq::exit_code::SUCCESS,
+        Err(err) => {
+            if err.downcast_ref::<dq::SilentError>().is_none() {
+                let _ = dq::render_error(&err, colors.stderr, &mut stderr);
+            }
+            dq::exit_code::exit_code_for_error(&err)
         }
-        std::process::exit(dq::exit_code::exit_code_for_error(&err));
-    }
-    std::process::exit(dq::exit_code::SUCCESS);
+    };
+    // As at a process exit, where nobody is left to be told of a failure.
+    let _ = stdout.flush();
+    let first_run = dq::skill::FirstRun::after(&cli.command, !cfg!(debug_assertions));
+    first_run.update_skill(&dq::skill::Edition::embedded());
+    std::process::exit(code);
 }

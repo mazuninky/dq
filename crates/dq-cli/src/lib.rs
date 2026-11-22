@@ -13,6 +13,7 @@ pub mod error;
 pub mod exit_code;
 mod glob;
 pub mod output;
+pub mod skill;
 
 pub use cli::{Cli, Command};
 pub use error::{
@@ -146,9 +147,23 @@ fn dispatch(
         Command::Self_(args) => {
             cli.ensure_no_write_flags()?;
             match &args.command {
-                cli::SelfCommand::Check => commands::self_cmd::run_check(out),
-                cli::SelfCommand::Update(u) => commands::self_cmd::run_update(u, out),
+                cli::SelfCommand::Check => {
+                    let env = skill::Environment::from_process();
+                    commands::self_cmd::run_check(
+                        commands::self_cmd::GITHUB_RELEASES_LATEST_URL,
+                        &env,
+                        out,
+                    )
+                }
+                cli::SelfCommand::Update(u) => {
+                    commands::self_cmd::run_update(u, &skill::Environment::from_process(), out)
+                }
             }
+        }
+        Command::Skill(args) => {
+            cli.ensure_no_write_flags()?;
+            let env = skill::Environment::from_process().with_current_dir();
+            commands::skill::run(args, cli.quiet, &env, reporter, out)
         }
         // M8 Stage 6: lint engine. The `lint` and `check` handlers route
         // through the shared pipeline in `commands::lint_core` (glob
@@ -475,6 +490,7 @@ fn terminal_message(err: &(dyn std::error::Error + 'static)) -> String {
         return one_line_fields(text, &fields);
     }
     if err.is::<error::InvalidInput>()
+        || err.is::<skill::SkillError>()
         || err.is::<error::DocOutOfRange>()
         || err.is::<error::WrongType>()
     {

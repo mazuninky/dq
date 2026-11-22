@@ -41,4 +41,10 @@ pub struct SelfUpdateArgs {
     /// nothing.
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Leave the installed skill (`dq skill`) as it is. Otherwise, once the
+    /// binary is replaced, the new one brings the skill to its version; a
+    /// failure of that is a warning.
+    #[arg(long)]
+    pub no_skill: bool,
 }
