@@ -711,20 +711,20 @@ fn smoke_hcl_syntax_error_is_one_line_and_is_placed() {
     // column the parser stopped at, as `validate` names them.
     let dir = tempfile::TempDir::new().expect("tempdir");
     std::fs::write(dir.path().join("bad.tf"), "a = 1\nb = {\n").expect("write bad.tf");
+    let want = "parse error in bad.tf: unexpected token\n  --> bad.tf:2:1\n   |\n \
+                2 | b = {\n   | ^\n";
     dq().current_dir(dir.path())
         .args(["--no-color", "-q", "convert", "bad.tf", "-F", "json"])
         .assert()
         .code(3)
         .stdout("")
-        .stderr("parse error in bad.tf: unexpected token\n  --> bad.tf:2:1\n");
+        .stderr(want);
     dq().current_dir(dir.path())
         .args(["--no-color", "-q", "validate", "bad.tf"])
         .assert()
         .code(4)
         .stdout("")
-        .stderr(predicates::str::contains(
-            "line: 2\ncol: 1\nmessage: unexpected token\nsnippet: b = {\n",
-        ));
+        .stderr(want);
 }
 
 #[test]
@@ -1136,8 +1136,8 @@ fn validate_snippet_keeps_non_ascii_next_to_an_escaped_control_character() {
         .code(4);
     let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
     assert!(
-        stderr.contains("snippet: {\"a\": \"é\\x01\"}\n"),
-        "expected the snippet with `é` intact, got:\n{stderr}",
+        stderr.ends_with("\n   |\n 1 | {\"a\": \"é\\x01\"}\n   |         ^\n"),
+        "expected the source line with `é` intact, got:\n{stderr}",
     );
 }
 

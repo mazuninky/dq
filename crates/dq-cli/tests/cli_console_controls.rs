@@ -5,7 +5,7 @@
 //! U+009B (CSI) starts a terminal control sequence on its own, the way
 //! `ESC [` does. They are now escaped the same way, `\xNN` with the code
 //! point (`\x9b`, as dq's YAML writer spells it), in values, in keys and in
-//! the snippet `validate` prints. The invisible direction controls of
+//! the source line of a parse error. The invisible direction controls of
 //! Trojan Source and the line / paragraph separators went through raw as
 //! well; they print as `\uNNNN`, as a YAML double-quoted string reads them.
 //! Other non-ASCII text stays raw.
@@ -68,8 +68,8 @@ fn get_escapes_c1_controls_in_keys() {
     );
 }
 
-/// `validate` prints the offending line as a snippet; a C1 control in it
-/// is escaped like any other value.
+/// `validate` prints the offending line; a C1 control in it is escaped like
+/// in any other text, and the caret is under the character at fault.
 #[test]
 fn validate_escapes_c1_controls_in_the_snippet() {
     let dir = tempfile::tempdir().unwrap();
@@ -84,8 +84,8 @@ fn validate_escapes_c1_controls_in_the_snippet() {
         "raw U+009B reached the terminal: {stderr:?}"
     );
     assert!(
-        stderr.contains("snippet: {\"a\": \"x\\x9by\" oops}"),
-        "expected the escaped snippet, got: {stderr:?}"
+        stderr.ends_with("\n   |\n 1 | {\"a\": \"x\\x9by\" oops}\n   |                ^\n"),
+        "expected the escaped line, got: {stderr:?}"
     );
 }
 
@@ -139,8 +139,8 @@ fn validate_escapes_direction_controls_in_the_snippet() {
         "raw U+202E reached the terminal: {stderr:?}"
     );
     assert!(
-        stderr.contains("snippet: {\"a\": \"x\\u202ey\" oops}"),
-        "expected the escaped snippet, got: {stderr:?}"
+        stderr.ends_with("\n   |\n 1 | {\"a\": \"x\\u202ey\" oops}\n   |                  ^\n"),
+        "expected the escaped line, got: {stderr:?}"
     );
 }
 
@@ -221,4 +221,53 @@ fn errors_escape_line_breaks_in_user_data() {
         "{err:?}"
     );
     assert!(!err.contains("/n\new"), "{err:?}");
+}
+
+/// A cause that says something the message above it does not is escaped as
+/// the message is: here globset's, which quotes the pattern. Its line breaks
+/// stay, indented, so a line of the pattern is no line of dq's.
+#[test]
+fn errors_escape_controls_in_a_cause() {
+    assert_eq!(
+        stderr_of(&["--no-color", "-i", "set", "[z\u{1b}\u{202e}", "/a", "1"]),
+        "invalid glob pattern: [z\\x1b\\u202e\n\nCaused by:\n    \
+         error parsing glob '[z\\x1b\\u202e': unclosed character class; missing ']'\n"
+    );
+    assert_eq!(
+        stderr_of(&["--no-color", "-i", "set", "[z\n\u{9b}\u{2028}", "/a", "1"]),
+        "invalid glob pattern: [z\\x0a\\x9b\\u2028\n\nCaused by:\n    \
+         error parsing glob '[z\n    \\x9b\\u2028': unclosed character class; missing ']'\n"
+    );
+}
+
+/// So is a usage error dq raises after parsing the arguments, which quotes
+/// the file. clap would drop terminal sequences from its text and keep a line
+/// break, which could start a line of its own.
+#[test]
+fn errors_escape_controls_in_a_usage_error() {
+    let err = stderr_of(&[
+        "--no-color",
+        "-i",
+        "-F",
+        "yaml",
+        "set",
+        "f\u{202e}g\u{2028}h\u{9b}i\u{7}j\u{1b}k\nerror: forged.json",
+        "/a",
+        "1",
+    ]);
+    assert!(
+        err.starts_with(
+            "error: -F yaml is the output format, but `dq set` keeps \
+             f\\u202eg\\u2028h\\x9bi\\x07j\\x1bk\\x0aerror: forged.json in its own"
+        ),
+        "{err:?}"
+    );
+    assert!(
+        !err.contains(['\u{202e}', '\u{2028}', '\u{9b}', '\u{7}', '\u{1b}']),
+        "{err:?}"
+    );
+    assert!(
+        !err.lines().any(|line| line.starts_with("error: forged")),
+        "{err:?}"
+    );
 }

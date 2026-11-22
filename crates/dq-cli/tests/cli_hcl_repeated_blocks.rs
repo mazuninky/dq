@@ -250,6 +250,6 @@ fn a_block_with_the_name_of_an_attribute_exits_3_naming_it() {
         .stderr(
             "parse error in x.tf: HCL error: block \"x\" has the name of an \
              attribute of the same body; dq reads both as the key \"x\" and would lose one\n\
-             \x20 --> x.tf:2:1\n",
+             \x20 --> x.tf:2:1\n   |\n 2 | x {\n   | ^~~\n",
         );
 }

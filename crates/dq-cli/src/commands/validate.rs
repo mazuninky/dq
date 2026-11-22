@@ -1,10 +1,10 @@
 //! `dq validate FILE` — exit 0 when the file parses, exit 4 when it does not.
 //!
 //! On success, the handler writes nothing and returns `Ok(())`. On parse
-//! failure, the structured `dq_core::Error::Parse` is rendered to *stderr*
-//! through the supplied [`Reporter`] (so JSON / Console formats both work),
-//! and the original error is propagated so the exit-code mapper produces
-//! `VALIDATE_FAIL` (4).
+//! failure, the `dq_core::Error::Parse` goes to *stderr* — on the console
+//! as any command's error does, in another format as a diagnostic through
+//! the supplied [`Reporter`] — and the original error is propagated so the
+//! exit-code mapper produces `VALIDATE_FAIL` (4).
 //!
 //! This handler is the only one whose output goes to stderr — the lib-level
 //! dispatcher passes a stderr writer here specifically for that reason.
@@ -13,7 +13,7 @@ use std::io::Write;
 
 use camino::Utf8Path;
 
-use super::io_helpers::{pick_format, read_bytes};
+use super::io_helpers::{name_source, pick_format, read_bytes};
 use crate::cli::{Cli, ValidateArgs};
 use crate::error::ValidateFail;
 use crate::output::{OutputFormat, Reporter};
@@ -28,13 +28,14 @@ use crate::output::{OutputFormat, Reporter};
 ///   file's syntax does not match the chosen format. Other I/O /
 ///   unsupported-format errors propagate as usual.
 ///
-/// `err` is the writer for diagnostics; the value renders via the supplied
-/// reporter so `-F json` produces a structured JSON object instead of the
-/// default console rendering.
+/// `err` is the writer for diagnostics, `err_color` whether it is coloured;
+/// a format other than the console renders through the supplied reporter,
+/// so `-F json` produces a structured JSON object.
 pub fn run(
     cli: &Cli,
     args: &ValidateArgs,
     input_format: Option<&str>,
+    err_color: bool,
     reporter: &dyn Reporter,
     err: &mut dyn Write,
 ) -> anyhow::Result<()> {
@@ -46,9 +47,8 @@ pub fn run(
     // `dq set --check` without the flag being filtered out.
     cli.ensure_no_write_flags_except_check()?;
     // Resolve and read by hand rather than through `load_document_with_path`
-    // so the parse error is rendered through `reporter` to `err` before it
-    // is returned: once wrapped in `anyhow::Error` the reporter has no
-    // structured data to format.
+    // so the parse error is rendered to `err` before it is returned: once
+    // wrapped in `anyhow::Error` a reporter has no structured data to format.
     let format = pick_format(&args.file, input_format)?;
     let bytes = read_bytes(&args.file)?;
     // The template guard runs first: a templated file is neither valid nor
@@ -58,75 +58,22 @@ pub fn run(
         Ok(_) => Ok(()),
         Err(e @ dq_core::Error::TemplatedFile { .. }) => Err(anyhow::Error::new(e)),
         Err(e) => {
-            // Render the structured error to stderr through the reporter,
-            // then propagate the error so exit-code mapping picks 4.
-            //
-            // M6 §5: structured reporters (JSON / YAML / TOML / JSONL /
-            // TOON / SARIF) need the canonical `{ "diagnostics": [...] }`
-            // shape so SARIF can consume the same value the existing JSON
-            // path already produces. The Console branch keeps the bare
-            // diagnostic object — the human-readable formatter is unchanged
-            // and the existing test fixtures stay byte-identical.
-            let json = if matches!(cli.format, OutputFormat::Console) {
-                render_parse_error(&e, &args.file)
+            let source = name_source(e, &args.file);
+            // Best-effort in either format: stderr is allowed to fail.
+            if matches!(cli.format, OutputFormat::Console) {
+                crate::render_core_error(&source, err_color, err).ok();
             } else {
-                let mut json = render_parse_error_diagnostics(&e, &args.file);
+                // Every reporter but the console's takes the canonical
+                // `{ "diagnostics": [...] }` shape, as lint's diagnostics.
+                let mut json = render_parse_error_diagnostics(&source, &args.file);
                 if reporter.wants_rule_catalog() {
-                    json["rules"] = rule_catalog(&e);
+                    json["rules"] = rule_catalog(&source);
                 }
-                json
-            };
-            reporter.report(&json, err).ok(); // best-effort — stderr is allowed to fail.
-            // Wrap with the file path if the parser left it unset.
-            let parse_err = match e {
-                dq_core::Error::Parse {
-                    file: None,
-                    line,
-                    col,
-                    span,
-                    snippet,
-                    message,
-                } => dq_core::Error::Parse {
-                    file: Some(args.file.clone()),
-                    line,
-                    col,
-                    span,
-                    snippet,
-                    message,
-                },
-                other => other,
-            };
+                reporter.report(&json, err).ok();
+            }
             // Wrap in ValidateFail so the exit-code mapper produces 4 instead of 3.
-            Err(anyhow::Error::new(ValidateFail { source: parse_err }))
+            Err(anyhow::Error::new(ValidateFail { source }))
         }
-    }
-}
-
-/// Render a parse error as the bare diagnostic object the Console reporter
-/// has emitted since M4 §5. Kept byte-identical to the M5 baseline so the
-/// existing console snapshot tests stay green.
-fn render_parse_error(err: &dq_core::Error, file: &Utf8Path) -> serde_json::Value {
-    if let dq_core::Error::Parse {
-        line,
-        col,
-        snippet,
-        message,
-        ..
-    } = err
-    {
-        serde_json::json!({
-            "kind": "parse",
-            "file": file.as_str(),
-            "line": *line,
-            "col": *col,
-            "message": message,
-            "snippet": snippet,
-        })
-    } else {
-        serde_json::json!({
-            "kind": err.kind_name(),
-            "message": err.to_string(),
-        })
     }
 }
 
@@ -210,7 +157,7 @@ mod tests {
         let args = ValidateArgs { file: path };
         let reporter = JsonReporter;
         let mut err: Vec<u8> = Vec::new();
-        run(&cli, &args, None, &reporter, &mut err).unwrap();
+        run(&cli, &args, None, false, &reporter, &mut err).unwrap();
         assert!(err.is_empty(), "expected no stderr, got {err:?}");
     }
 
@@ -220,11 +167,11 @@ mod tests {
         // Trailing comma — invalid JSON.
         tmp.write_all(b"{\"a\": 1,}").unwrap();
         let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
-        let cli = cli_no_flags(path.as_str());
+        let cli = Cli::try_parse_from(["dq", "-F", "json", "validate", path.as_str()]).unwrap();
         let args = ValidateArgs { file: path };
         let reporter = JsonReporter;
         let mut err: Vec<u8> = Vec::new();
-        let e = run(&cli, &args, None, &reporter, &mut err).unwrap_err();
+        let e = run(&cli, &args, None, false, &reporter, &mut err).unwrap_err();
         // The handler wraps the parse error in ValidateFail so the exit-code
         // mapper picks VALIDATE_FAIL (4) instead of PARSE_ERROR (3).
         let validate_fail = e
@@ -239,6 +186,32 @@ mod tests {
     }
 
     #[test]
+    fn validate_on_the_console_prints_the_error_as_any_command_does() {
+        let mut tmp = NamedTempFile::with_suffix(".json").unwrap();
+        tmp.write_all(b"{\"a\": 1,}").unwrap();
+        let path = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let cli = cli_no_flags(path.as_str());
+        let args = ValidateArgs { file: path.clone() };
+        for color in [false, true] {
+            let mut err: Vec<u8> = Vec::new();
+            let e = run(&cli, &args, None, color, &JsonReporter, &mut err).unwrap_err();
+            assert!(e.downcast_ref::<ValidateFail>().is_some());
+            let s = String::from_utf8(err).unwrap();
+            if color {
+                assert!(s.contains("^\u{1b}[0m\n"), "{s:?}");
+            } else {
+                assert_eq!(
+                    s,
+                    format!(
+                        "parse error in {path}: expected string key in object\n  \
+                         --> {path}:1:9\n   |\n 1 | {{\"a\": 1,}}\n   |         ^\n"
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
     fn validate_rejects_in_place_flag_before_io() {
         let cli = Cli::try_parse_from(["dq", "-i", "validate", "/nope.yaml"]).unwrap();
         let args = ValidateArgs {
@@ -246,7 +219,7 @@ mod tests {
         };
         let reporter = JsonReporter;
         let mut err: Vec<u8> = Vec::new();
-        let e = run(&cli, &args, None, &reporter, &mut err).unwrap_err();
+        let e = run(&cli, &args, None, false, &reporter, &mut err).unwrap_err();
         assert!(e.downcast_ref::<InvalidInput>().is_some());
     }
 
@@ -263,7 +236,7 @@ mod tests {
         let args = ValidateArgs { file: path };
         let reporter = JsonReporter;
         let mut err: Vec<u8> = Vec::new();
-        run(&cli, &args, None, &reporter, &mut err)
+        run(&cli, &args, None, false, &reporter, &mut err)
             .expect("validate --check on a valid file must succeed");
         assert!(err.is_empty(), "happy path must not write to stderr");
     }
@@ -280,7 +253,7 @@ mod tests {
         let args = ValidateArgs { file: path };
         let reporter = JsonReporter;
         let mut err: Vec<u8> = Vec::new();
-        let e = run(&cli, &args, None, &reporter, &mut err).unwrap_err();
+        let e = run(&cli, &args, None, false, &reporter, &mut err).unwrap_err();
         assert!(
             e.downcast_ref::<ValidateFail>().is_some(),
             "validate --check must still wrap parse errors in ValidateFail",

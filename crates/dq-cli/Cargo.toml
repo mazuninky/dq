@@ -54,6 +54,8 @@ toon-format = { workspace = true }
 globset = { workspace = true }
 rayon = { workspace = true }
 walkdir = { workspace = true }
+# Display columns of the source line a parse error shows (`output::error`).
+unicode-width = { workspace = true }
 # M6 distribution. `self_update` drives `dq self update` (atomic GitHub
 # Releases download); `ureq` powers the `dq self check` API ping. Workspace
 # defaults already disable OpenSSL in favour of rustls. `tempfile` is used

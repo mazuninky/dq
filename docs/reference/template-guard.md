@@ -136,7 +136,9 @@ On a reading command each template is read as the string it is written as:
 prints `{{ .Values.x }}`, and `convert` writes it as that string. Lines in
 `lint` positions match the file (a template never spans a line break);
 columns after a template on the same line count the placeholder's length.
-A parse error names its place in the file, not in the substituted text.
+A parse error names its place in the file, not in the substituted text. The
+exception is XML in another encoding than UTF-8 with a template on the line of
+the error: that line is shown, and its columns counted, with the placeholder.
 
 ## `--allow-templates`
 

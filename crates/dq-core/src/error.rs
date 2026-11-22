@@ -450,6 +450,26 @@ impl Error {
         Self::parse_at(bytes, invalid_utf8_span(bytes, err), message)
     }
 
+    /// Whether the line, the column and the source line of an
+    /// [`Error::Parse`] are those of its span in `read`, the bytes its
+    /// parser was handed. Not those of XML read in an encoding other than
+    /// UTF-8, which are of the decoded text — but where the two have them
+    /// alike. No other error has a place.
+    pub(crate) fn is_placed_in(&self, read: &[u8]) -> bool {
+        let Self::Parse {
+            line,
+            col,
+            span,
+            snippet,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        let (at_line, at_col, text) = place_of(read, span.start.min(read.len()));
+        (at_line, at_col) == (*line, *col) && String::from_utf8_lossy(&read[text]) == *snippet
+    }
+
     /// The error of a parser that read `read`, a part of the source `bytes`
     /// or a rewritten form of it: a [`Error::Parse`] placed anew, `to_source`
     /// being the byte of `bytes` for each byte of `read`, and so is the
@@ -641,6 +661,37 @@ mod tests {
             Error::Parse { col: 2, span, message, .. }
                 if span == (1..3) && message.ends_with("incomplete utf-8 byte sequence")
         ));
+    }
+
+    #[test]
+    fn an_error_is_placed_in_the_bytes_its_position_is_of() {
+        for (bytes, at) in [
+            (&b"a\n b"[..], 3),
+            (b"a\n b", 99),
+            ("\u{feff}я\r\nb".as_bytes(), 5),
+            // The snippet has U+FFFD for each, as the bytes have.
+            (b"a\n\xFF\xFEb", 4),
+            (b"", 0),
+        ] {
+            assert!(
+                Error::parse_at(bytes, at..at, "m").is_placed_in(bytes),
+                "{bytes:?}"
+            );
+        }
+        // Of the text the bytes decode to: another column, another line,
+        // the same column of another source line.
+        let bytes = b"a\n\xFF\xFEb";
+        for (text, at) in [("a\nяюb", 6), ("a\n\nb", 4), ("a\nяb", 4)] {
+            let mut err = Error::parse_at(text.as_bytes(), at..at, "m");
+            if let Error::Parse { span, .. } = &mut err {
+                *span = 4..4;
+            }
+            assert!(!err.is_placed_in(bytes), "{text:?}");
+        }
+        let other = Error::WriteUnavailable {
+            reason: "r".to_owned(),
+        };
+        assert!(!other.is_placed_in(b"a"));
     }
 
     #[test]
