@@ -32,8 +32,18 @@
 //! `target_path_for(source) -> Utf8PathBuf` hook is reserved for a future
 //! refactor (M4+); for the M3 baseline we run a simple sequential loop here
 //! that reuses [`crate::bulk::expand_glob`] for file expansion and
-//! [`dq_core::atomic_write::write`] for atomicity. `--parallel` for
+//! [`dq_core::atomic_write::write_like`] for atomicity. `--parallel` for
 //! `convert` is a future enhancement.
+//!
+//! ## Modes and links in `-i`
+//!
+//! A new file takes the access (owner, group, permission bits) of its
+//! source; one that exists already keeps its own, as for every write. A
+//! symbolic link at the target path is refused: the path is made up from the
+//! source's name, so writing through it would change a file the user never
+//! named. A source that is a link is read through it; the converted file
+//! goes next to the link, and the link, not the file it points to, is the
+//! source removed.
 //!
 //! ## Lossy-conversion warnings (M2 placeholder)
 //!
@@ -48,9 +58,11 @@
 use std::io::Write;
 
 use camino::{Utf8Path, Utf8PathBuf};
+use dq_core::atomic_write::Original;
 use dq_core::{Document, FormatTag, FrontmatterKind, WriteOptions};
 
-use super::io_helpers::{checked_index, load_document_with_path};
+use super::convert_targets::find_conflict;
+use super::io_helpers::{checked_index, load_document_for_rewrite, load_document_with_path};
 use crate::bulk;
 use crate::cli::{Cli, ConvertArgs, DocSelector};
 use crate::error::InvalidInput;
@@ -67,7 +79,10 @@ use crate::output::{ConsoleReporter, OutputFormat, Reporter, ToonReporter};
 ///     / `--parallel` (none of which `convert -i` supports);
 ///   - `--backup` is set without `-i`;
 ///   - `-i` is set with `OutputFormat::Console` (no canonical extension);
-///   - the swapped target extension equals the source extension (no-op).
+///   - the swapped target extension equals the source extension (no-op),
+///     or the target is the source under another spelling;
+///   - two files of an `-i` run would be written to one target. Both are
+///     checked over the whole run before anything is written.
 /// - `--check` for `convert -i` is rejected up front (exit 6) — the
 ///   "would the target be created or differ?" semantics are deferred to
 ///   M4+.
@@ -230,8 +245,8 @@ fn run_in_place(
     // exists, copy it to `<target>.bak` before overwriting. If the target
     // does not exist yet (the typical case — extension swap produces a new
     // path), `--backup` is a no-op. This is delegated to
-    // `dq_core::atomic_write::write`, which only creates the backup when
-    // the target file already exists.
+    // `dq_core::atomic_write::write_like`, which only creates the backup
+    // when the target file already exists.
 
     // -- 2. Console / Toon are not valid in-place targets ----------------
     //
@@ -254,51 +269,55 @@ fn run_in_place(
         ));
     }
 
-    // -- 4. Loop ---------------------------------------------------------
+    // -- 4. Refuse targets that would lose data --------------------------
+    //
+    // Over the whole run, before the first file is written: a file that is
+    // its own target, two that share one, one a backup would replace; and a
+    // target where there is a link.
+    let planned = files
+        .into_iter()
+        .map(|source| {
+            let target = compute_target_path(&source, output_format)?;
+            Ok((source, target))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if let Some(conflict) = find_conflict(&planned, cli.backup) {
+        return Err(anyhow::Error::new(InvalidInput::new(
+            conflict.message(output_format_label(output_format)),
+        )));
+    }
+    for (_, target) in &planned {
+        dq_core::atomic_write::check_new(target).map_err(anyhow::Error::new)?;
+    }
+
+    // -- 5. Loop ---------------------------------------------------------
     //
     // Per-file: read → parse → render → atomic-write to target → remove
     // source. We do not call `bulk::run_per_file` because that helper
     // assumes target == source; convert -i breaks that invariant. See the
     // module doc for the rationale.
     let mut modified: usize = 0;
-    let is_bulk = files.len() > 1;
+    let is_bulk = planned.len() > 1;
 
-    for source_path in &files {
-        let target_path = compute_target_path(source_path, output_format)?;
-        if target_path == *source_path {
-            // Same source/target — covered both by the explicit extension
-            // check below and by this defensive check, since some
-            // pathological inputs (no extension, etc.) could otherwise
-            // slip through.
-            return Err(anyhow::Error::new(InvalidInput::new(format!(
-                "convert -i to {}: target path '{source_path}' is identical to source — drop -F or pick a different format",
-                output_format_label(output_format),
-            ))));
-        }
-
+    for (source_path, target_path) in &planned {
         // Parse + render.
-        let (input_fmt, doc) =
-            load_document_with_path(source_path, input_format, cli.template_mode())?;
+        let (input_fmt, doc, original) =
+            load_document_for_rewrite(source_path, input_format, cli.template_mode())?;
         maybe_warn_lossy(input_fmt.name(), output_format);
         let output_bytes = render_to_format(&doc, output_format, use_color, opts)?;
-
-        // Atomic write to target. `--backup` is honoured by atomic_write
-        // when the target already exists.
-        dq_core::atomic_write::write(&target_path, &output_bytes, cli.backup)
-            .map_err(anyhow::Error::new)?;
-
-        // Source removal — only if --keep-source is unset and the target
-        // is genuinely a different path. The second guard is belt-and-
-        // braces; `target_path == *source_path` was already rejected
-        // above.
-        if !args.keep_source && target_path != *source_path {
-            std::fs::remove_file(source_path.as_std_path()).map_err(|source| {
-                anyhow::Error::new(dq_core::Error::WriteIo {
-                    path: source_path.clone(),
-                    source,
-                })
-            })?;
-        }
+        let original = original.ok_or_else(|| {
+            InvalidInput::new(format!(
+                "-i/--in-place needs a file on disk: '{source_path}'"
+            ))
+        })?;
+        replace_source(
+            (source_path, &original),
+            target_path,
+            &output_bytes,
+            cli.backup,
+            args.keep_source,
+        )
+        .map_err(anyhow::Error::new)?;
 
         modified += 1;
     }
@@ -311,6 +330,32 @@ fn run_in_place(
         writeln!(out, "Modified: {modified}, Skipped: 0, Failed: 0")?;
     }
 
+    Ok(())
+}
+
+/// Write `output_bytes` to `target`, with the access of the source, and then
+/// remove the source, unless it is to be kept.
+///
+/// Both are bound to `original`, the file that was read: when the source's
+/// path leads to another by then, nothing is written, or, if that happened
+/// while the target was written, nothing is removed.
+///
+/// # Errors
+///
+/// [`dq_core::Error::WriteIo`], as `atomic_write::write_like` and
+/// `atomic_write::remove` have it.
+fn replace_source(
+    (source, original): (&Utf8Path, &Original),
+    target: &Utf8Path,
+    output_bytes: &[u8],
+    backup: bool,
+    keep_source: bool,
+) -> dq_core::Result<()> {
+    // `--backup` is honoured when the target already exists.
+    dq_core::atomic_write::write_like(target, output_bytes, backup, source, original)?;
+    if !keep_source {
+        dq_core::atomic_write::remove(source, original)?;
+    }
     Ok(())
 }
 
@@ -953,5 +998,44 @@ mod tests {
             s.contains("title"),
             "frontmatter output should preserve the value: got {s:?}"
         );
+    }
+
+    /// Between the read of the source and the write of the target, or the
+    /// removal of the source, the source becomes another file.
+    #[cfg(unix)]
+    #[test]
+    fn replace_source_is_bound_to_the_file_that_was_read() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let [source, target, victim] = ["a.yaml", "a.json", "victim"].map(|n| root.join(n));
+        fs::write(&source, "a: 1\n").unwrap();
+        fs::write(&victim, "victim\n").unwrap();
+        let (_, original) = dq_core::atomic_write::read(&source).unwrap();
+        fs::rename(&source, root.join("moved")).unwrap();
+        for to in ["victim", "moved"] {
+            symlink(to, &source).unwrap();
+
+            let err = replace_source((&source, &original), &target, b"new", true, false)
+                .expect_err("must fail");
+
+            assert!(
+                err.to_string().contains("changed while dq was running"),
+                "{err}"
+            );
+            assert!(err.to_string().contains(source.as_str()), "{err}");
+            assert!(!target.exists());
+            assert_eq!(fs::read_link(&source).unwrap(), Utf8Path::new(to));
+            fs::remove_file(&source).unwrap();
+        }
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "victim\n");
+
+        // The file that was read, back in its place.
+        fs::rename(root.join("moved"), &source).unwrap();
+        replace_source((&source, &original), &target, b"new", true, false).expect("converts");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new");
+        assert!(!source.exists());
     }
 }

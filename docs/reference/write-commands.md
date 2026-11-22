@@ -76,7 +76,8 @@ records, one per line, so its root is an array, not a map").
 Exactly one of:
 
 - **default** — the changed document goes to stdout; the file is untouched.
-- `-i` / `--in-place` — the file is replaced atomically; stdout stays empty.
+- `-i` / `--in-place` — the file is replaced atomically, its permissions kept;
+  stdout stays empty.
 - `--diff` — a unified diff (original vs. changed) on stdout; the file is
   untouched. The headers are `--- a/<path>` and `+++ b/<path>`, the path as
   given, as `git diff` writes them; a shown line that ends the file without a
@@ -107,12 +108,39 @@ with `--input-format`) works in plain stdout mode and with `--diff`; `-i` and
 
 ## Atomic writes
 
-Every `-i` write goes through `dq_core::atomic_write::write`: the content is
-written to a `tempfile::NamedTempFile` created **in the target's directory**
+Every `-i` write goes through `dq_core::atomic_write` (`read` notes the file that
+was read, `rewrite` replaces that one): the content is written to a `tempfile::NamedTempFile` created **in the target's directory**
 and then renamed over the target. Same-directory placement keeps the rename
 atomic (no cross-device `EXDEV`). If writing or renaming fails, the original
-is byte-identical to before and the error exits 7; a leftover temp file may
-remain. Read-side failures (the source cannot be opened) exit 5.
+is byte-identical to before and the error exits 7. Read-side failures (the
+source cannot be opened) exit 5. The file is not synced to disk before the
+rename.
+
+- **Permissions.** The file keeps its mode, and its owner and group where the
+  process may set them. Where the group cannot be kept, the bits it and others
+  had are narrowed, never widened; a lost owner drops setuid, a lost group
+  setgid. Both log a WARN, neither fails the write. At no moment is the new
+  content readable by more users than the old. A new file gets `0666` less the
+  umask. A read-only file is edited (the directory must be writable) and stays
+  read-only.
+- **Symbolic links.** A file edited through a link, or a chain of them, is the
+  one the link leads to, in its own directory; the link stays.
+- **`--backup`** copies the real file to `<real file>.bak` beside it, with its
+  mode. Anything but a regular file at that name (a link, a directory) is
+  refused, exit 7, and nothing is written.
+- **ACLs.** POSIX ACLs on Linux and ACLs on macOS are kept, on the file, its
+  `.bak` and the file `convert -i` makes; one the directory would give the new
+  file is not. Where an ACL cannot be read or kept, the group and others get
+  nothing and a WARN says so: access never widens. Kept through the rename,
+  the ACL's group entry refers to the old group, so a file whose group could not
+  be kept keeps no ACL and is private to its owner.
+- **Changed while dq was running.** The file written is the one that was read:
+  if, between the two, the path leads to another file (it was replaced, or
+  turned into a link), the write is refused, exit 7.
+- **Not preserved:** other ACLs (NFSv4, other systems), extended attributes
+  (the SELinux label too), file flags, timestamps, and the other names of a
+  hard-linked file, which keep the old content.
+- A target that is no regular file (a FIFO) is refused, exit 7.
 
 ## `dq set <file> <pointer> [value]`
 
@@ -237,9 +265,20 @@ then `CLICOLOR_FORCE`, then whether stdout is a terminal (see
 
 `dq convert deploy.yaml -F json -i` writes `deploy.json` atomically and, only
 after that succeeded, removes `deploy.yaml`; `--keep-source` keeps it. A
-conversion to the file's own format is refused (exit 6). `--doc` is refused
-with `-i`, because deleting the source would delete the other documents with
-it.
+conversion to the file's own format is refused (exit 6), and so is a target
+that is the source under another spelling (`f.YAML` to `f.yaml` on a
+case-insensitive file system). `--doc` is refused with `-i`, because deleting
+the source would delete the other documents with it.
+
+The new file takes the mode, owner and group of the source. An existing file at
+the target is replaced without a question and keeps its own mode; `--backup`
+keeps a copy of it. A target that is a link is refused (exit 7). When the source is a
+link, the new file goes beside the link, the link is removed and the file it
+leads to stays. Before anything is written the whole run is planned: two sources
+that map to the same target (`a.yaml` and `a.yml` to `a.json`), a target that is
+a source, a target that is two names of one file (a hard link), a `<target>.bak`
+that is a source, are refused (exit 6), and a link at a target exits 7. Nothing
+is converted then.
 
 ## YAML streams
 

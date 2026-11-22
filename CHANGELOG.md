@@ -72,6 +72,21 @@ breaking changes are listed first under Changed.
 
 ### Fixed
 
+- **`-i` changed the permissions of every file it wrote to 0600**: a script lost
+  its execute bit, a 0644 file could no longer be read by others. The mode is
+  kept, and owner, group and ACL where the process may set them; a new file gets
+  0666 less the umask. Where the group or the ACL cannot be kept, access
+  narrows, with a warning.
+- A file that is replaced, or turned into a link, between `dq` reading it and
+  writing it is not written: exit 7. As root a bulk run could be led to
+  overwrite a file through a link.
+- `-i` on a symbolic link replaced the link with a regular file and left the file
+  it leads to unchanged. That file is now edited and the link stays; `--backup`
+  goes beside it.
+- `convert -i` lost data: two sources with the same target (`a.yaml` and `a.yml`
+  to `a.json`) overwrote each other and were both removed, and on a
+  case-insensitive file system `convert f.YAML -F yaml -i` removed the file. Both
+  are refused (exit 6). A target that is a link is refused (exit 7).
 - A usage error that names the file (`-F yaml … keeps FILE in its own format`)
   shows the name whole and on one line: a line break in it started a line of
   its own, and terminal sequences were dropped from it.

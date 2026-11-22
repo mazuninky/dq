@@ -9,6 +9,7 @@
 pub mod check;
 pub mod completions;
 pub mod convert;
+mod convert_targets;
 pub mod del;
 pub mod diff;
 pub mod exists;

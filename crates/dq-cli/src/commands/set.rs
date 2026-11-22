@@ -41,7 +41,7 @@ use dq_core::{Document, Pointer, Value};
 
 use super::io_helpers::{
     checked_index, finish_edit, load_document_with_path, name_source, parse_file_for_edit,
-    parse_for_edit, pick_format, pointer_in_document, read_bytes, skip_out_of_range,
+    parse_for_edit, pick_format, pointer_in_document, read_for_edit, skip_out_of_range,
 };
 use super::query::jq_compile_to_parse;
 use crate::bulk::{self, FileOp, FileOpResult};
@@ -192,7 +192,7 @@ impl<'a> FileOp for SetFileOp<'a> {
         // 2. Read the original bytes. Used for the diff comparison and the
         //    template guard; parse input may be substituted for the guard's
         //    sake before being handed to the parser.
-        let original_bytes = read_bytes(path)?;
+        let (original_bytes, original) = read_for_edit(path)?;
 
         // Template guard, then parse: a file whose templates change what
         // the parser reads is refused; `guard` checks below that the edit
@@ -260,6 +260,7 @@ impl<'a> FileOp for SetFileOp<'a> {
         Ok(FileOpResult::Modified {
             output_bytes: final_bytes,
             diff,
+            original,
         })
     }
 }
@@ -285,7 +286,7 @@ impl<'a> FileOp for JqFileOp<'a> {
 
         // Read the original bytes — we need them for the diff comparison and
         // for re-parsing through the value-only path.
-        let original_bytes = read_bytes(path)?;
+        let (original_bytes, original) = read_for_edit(path)?;
         // Both escape hatches are refused up front, so the guard always
         // runs: re-emitting a file whose templates changed the reading
         // would write that misreading back.
@@ -388,6 +389,7 @@ impl<'a> FileOp for JqFileOp<'a> {
         Ok(FileOpResult::Modified {
             output_bytes: final_bytes,
             diff,
+            original,
         })
     }
 }

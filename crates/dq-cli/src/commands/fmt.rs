@@ -32,7 +32,7 @@ use camino::Utf8Path;
 use dq_core::template_guard::TemplateMode;
 use dq_core::{Document, FormatTag, WriteOptions};
 
-use super::io_helpers::load_document_with_path;
+use super::io_helpers::load_document_for_rewrite;
 use crate::bulk::{self, FileOp, FileOpResult};
 use crate::cli::{Cli, FmtArgs};
 use crate::error::InvalidInput;
@@ -104,8 +104,8 @@ impl<'a> FileOp for FmtFileOp<'a> {
         //    write-aware (span-collecting) parsers because we are not
         //    splicing — we re-emit the parsed value tree through the
         //    format's native writer.
-        let (input_fmt, doc) =
-            load_document_with_path(path, self.input_format, TemplateMode::Guard)?;
+        let (input_fmt, doc, original) =
+            load_document_for_rewrite(path, self.input_format, TemplateMode::Guard)?;
 
         // The JSON writer copies a document read from bytes verbatim (the
         // textual-edit contract) unless an option forces a re-emit. fmt is
@@ -177,6 +177,7 @@ impl<'a> FileOp for FmtFileOp<'a> {
         Ok(FileOpResult::Modified {
             output_bytes: buf,
             diff,
+            original,
         })
     }
 }

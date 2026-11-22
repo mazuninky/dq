@@ -66,9 +66,9 @@ harmless) or refuses it, as noted.
 | `-q, --quiet` | Log level ERROR. Conflicts with `-v` (clap usage error). |
 | `--no-color` | No ANSI colour. |
 | `--doc <N\|all>` | Pick a document of a multi-document YAML stream; see [read-commands.md](read-commands.md#multi-document-yaml-and---doc). |
-| `-i, --in-place` | Write the result back atomically (write commands only). |
+| `-i, --in-place` | Write the result back atomically, keeping the file's permissions; a link is followed (write commands only). |
 | `--diff` | Print a unified diff instead of writing. |
-| `--backup` | With `-i`, copy the original to `<file>.bak` first. |
+| `--backup` | With `-i`, copy the original to `<file>.bak` first, beside the real file when it is reached through a link. |
 | `--check` | Write nothing; exit 1 if any file would change. |
 | `--continue-on-error` | Bulk runs: keep going past failing files, exit 7 at the end if any failed. |
 | `--parallel <N>` | Bulk runs: N worker threads (`0` = number of CPUs). |

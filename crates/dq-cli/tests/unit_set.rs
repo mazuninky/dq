@@ -364,6 +364,9 @@ fn set_in_place_failure_leaves_original_intact() {
     let mut dir_perms = std::fs::metadata(dir.path()).unwrap().permissions();
     dir_perms.set_mode(0o500);
     std::fs::set_permissions(dir.path(), dir_perms).expect("chmod dir");
+    if std::fs::write(dir.path().join("probe"), "").is_ok() {
+        return; // root writes wherever it wants
+    }
 
     let path_str = path.to_str().unwrap();
     let cli = Cli::try_parse_from(["dq", "-i", "set", path_str, "/a", "2"]).unwrap();

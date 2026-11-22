@@ -16,6 +16,7 @@ use std::fs;
 use std::io::Read;
 
 use camino::{Utf8Path, Utf8PathBuf};
+use dq_core::atomic_write::Original;
 use dq_core::template_guard::{TemplateMode, WriteGuard, guarded_parse, parse_for_write};
 use dq_core::{Document, Format, Pointer, Segment, Value};
 
@@ -44,11 +45,23 @@ pub(crate) fn load_document_with_path(
     format_override: Option<&str>,
     templates: TemplateMode,
 ) -> anyhow::Result<(&'static dyn Format, Document)> {
+    let (format, doc, _) = load_document_for_rewrite(file, format_override, templates)?;
+    Ok((format, doc))
+}
+
+/// As [`load_document_with_path`], for a command that writes the file back
+/// or in place of which it writes another: also which file was read (`None`
+/// for stdin).
+pub(crate) fn load_document_for_rewrite(
+    file: &Utf8Path,
+    format_override: Option<&str>,
+    templates: TemplateMode,
+) -> anyhow::Result<(&'static dyn Format, Document, Option<Original>)> {
     let format = pick_format(file, format_override)?;
-    let bytes = read_bytes(file)?;
+    let (bytes, original) = read_for_edit(file)?;
     let doc = guarded_parse(&bytes, templates, |b| format.parse(b))
         .map_err(|e| anyhow::Error::new(name_source(e, file)))?;
-    Ok((format, doc))
+    Ok((format, doc, original))
 }
 
 /// Load a [`Document`] for the **lint read path**, choosing the
@@ -311,6 +324,21 @@ pub(crate) fn read_bytes(file: &Utf8Path) -> anyhow::Result<Vec<u8>> {
             source,
         })
     })
+}
+
+/// Read `file` as [`read_bytes`] does, for an edit of it: also which file
+/// that was, which the write that follows is bound to
+/// ([`dq_core::atomic_write::rewrite`]). `None` for stdin.
+///
+/// # Errors
+///
+/// As [`read_bytes`].
+pub(crate) fn read_for_edit(file: &Utf8Path) -> anyhow::Result<(Vec<u8>, Option<Original>)> {
+    if file == "-" {
+        return Ok((read_bytes(file)?, None));
+    }
+    let (bytes, original) = dq_core::atomic_write::read(file).map_err(anyhow::Error::new)?;
+    Ok((bytes, Some(original)))
 }
 
 /// How many documents `doc` holds: the stream's length for a

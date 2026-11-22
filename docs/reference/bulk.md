@@ -16,6 +16,10 @@ A single file — a literal path, or a glob that matches exactly one file —
 behaves byte for byte like a plain single-file invocation: no per-file
 markers, no summary.
 
+When two names of a run lead to one file (`fix` given a file and a link to it),
+each edit builds on the one before it, so the result is the one of a sequential
+run, also under `--parallel`. A glob does not match links.
+
 ## Glob expansion
 
 - The argument is a glob when it contains `*`, `?`, `[` or `{` and nothing
