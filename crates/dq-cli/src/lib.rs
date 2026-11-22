@@ -442,13 +442,20 @@ fn terminal_message(err: &(dyn std::error::Error + 'static)) -> String {
         let fields: Vec<&str> = match err {
             X::Parse { .. } => Vec::new(),
             X::UnknownRule { id, .. } => vec![id],
-            X::Io { path, .. } | X::TestFixture { path, .. } => vec![path.as_str()],
+            X::Io { path, .. }
+            | X::TestFixture { path, .. }
+            | X::NoRules { path }
+            | X::NotADirectory { path } => vec![path.as_str()],
             X::CompositeExtractUnknownFormat {
+                rule_id, format, ..
+            }
+            | X::UnknownFormat {
                 rule_id, format, ..
             } => vec![rule_id, format],
             X::SchemaFileAbsolutePath { rule_id, path, .. }
             | X::SchemaFileEscapesRuleDir { rule_id, path, .. } => vec![rule_id, path.as_str()],
             X::RuleCompile { rule_id, .. }
+            | X::NoFormat { rule_id }
             | X::GlobCompile { rule_id, .. }
             | X::FixApply { rule_id, .. }
             | X::CheckMutuallyExclusive { rule_id, .. }

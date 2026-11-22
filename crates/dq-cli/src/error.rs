@@ -214,6 +214,21 @@ pub struct LintWarnStrict {
     pub count: usize,
 }
 
+/// Marker error returned by `lint`, `check` and `fix` when a rule raised in
+/// its `match.filter` or `check.jq` and so did not run on some file. Maps to
+/// exit code 3 (`PARSE_ERROR`), the code of a rule that does not compile:
+/// "no findings" would mean "not checked".
+///
+/// Each rule error has already been named on stderr, and in a structured
+/// report it is a `lint.rule_error` result; the marker only carries how many
+/// there are. `--allow-rule-errors` turns them into warnings.
+#[derive(Debug, thiserror::Error)]
+#[error("{count} rule error(s): findings may be missing (--allow-rule-errors to accept)")]
+pub struct RuleErrorFail {
+    /// Number of rule errors: one per rule, file, rule field and error text.
+    pub count: usize,
+}
+
 /// `--doc N` named a document the file does not have. Maps to exit code 2
 /// (`NOT_FOUND`) — the same family as a JSON Pointer that addresses no
 /// node: the file is fine, the address is not in it.

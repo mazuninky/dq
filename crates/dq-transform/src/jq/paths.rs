@@ -49,7 +49,8 @@ use super::keys;
 /// `from_entries` and `pick` refuse a non-string object key, as jq does
 /// (see [`super::keys`]); `in` and `with_entries` are repeated so they call
 /// these and not jaq's. `from_entries` takes the key and value names jq
-/// 1.8 takes.
+/// 1.8 takes. `halt_error` does not write its input to the log: to call it
+/// is an error (see `output` in [`super`]).
 pub(super) const DEFS: &str = r#"
 def _dq_vivify(f): _dq_ensure([path(f)]);
 def getpath($path): reduce $path[] as $p (.; _dq_objkey($p) | .[$p | _dq_rindex]);
@@ -66,6 +67,8 @@ def from_entries: reduce .[] as $x ({};
   . + { ($x | .key // .Key // .name // .Name | _dq_key):
         ($x | if has("value") then .value else .Value end) });
 def with_entries(f): to_entries | map(f) | from_entries;
+def halt_error($exit_code): halt($exit_code);
+def halt_error: halt;
 "#;
 
 /// The definitions in [`DEFS`], parsed.

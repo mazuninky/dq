@@ -29,7 +29,7 @@ JSON Schema sidecars (`*.schema.json`) live there too.
   where it stays silent.
 - A rule must not fail on shapes it does not expect: guard field access
   (`.spec.containers[]?`, `objects`, type checks) so that an unexpected type
-  produces no finding instead of a jq runtime error.
+  produces no finding instead of a jq runtime error, which would fail the run.
 - Adding a rule: drop `<rule>.yml` and `<rule>.test.yml` into the namespace
   directory; a new namespace is a new directory. See
   [lint-engine.md](lint-engine.md) for the rule format.
@@ -116,10 +116,6 @@ expanded; see [../plans/add-std-skills-rules.md](../plans/add-std-skills-rules.m
 
 Tracked in [../roadmap.md](../roadmap.md):
 
-- Rules that raise a jq runtime error on nested fields of an unexpected type
-  (`kind: Pod` with `spec: x`) are skipped with a warning instead of staying
-  silent by design. The fixture runner fails a case whose rule raises, but no
-  fixture covers these shapes yet.
 - `github-actions.no-pull-request-target-with-checkout` does not recognise a
   checkout of `${{ github.head_ref }}`.
 - Terraform findings report line 1.

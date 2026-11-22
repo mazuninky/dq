@@ -9,7 +9,8 @@
 //! When `args.rules` is non-empty, each entry resolves as:
 //!
 //! - Starts with `@std/` → embedded standard ruleset namespace.
-//! - Path on disk that exists → file or directory of rules.
+//! - Path on disk that exists → file or directory of rules; a directory
+//!   without a rule file is [`crate::error::ExecError::NoRules`].
 //! - Otherwise → [`crate::error::ExecError::UnknownRule`] with a
 //!   Levenshtein-2 suggestion list against `@std/*` namespaces.
 //!
@@ -30,6 +31,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use indexmap::IndexSet;
 
 use crate::error::{ExecError, Result};
+use crate::rule_dir;
 use crate::ruleset::RuleSet;
 
 /// Loader inputs — caller-provided context that drives resolution.
@@ -76,6 +78,11 @@ impl RuleLoader {
     /// - [`ExecError::UnknownRule`] when a `--rules` entry doesn't
     ///   resolve. The variant carries a `did_you_mean` list of
     ///   Levenshtein-2 suggestions against the known `@std/*` namespaces.
+    /// - [`ExecError::NoRules`] when a `--rules` entry is a directory
+    ///   without a rule file. `<cwd>/.dq/rules/`, found automatically, may
+    ///   be empty or not there.
+    /// - [`ExecError::Io`] / [`ExecError::NotADirectory`] when it is there
+    ///   and cannot be resolved or is no directory ([`rule_dir::project_dir`]).
     /// - [`ExecError::Parse`] / [`ExecError::Io`] when a path-based entry
     ///   exists but fails to load. These propagate up unchanged.
     pub fn resolve(args: &LoaderArgs) -> Result<Vec<RuleSet>> {
@@ -89,6 +96,24 @@ impl RuleLoader {
             return Ok(Vec::new());
         }
         resolve_implicit(args)
+    }
+
+    /// Load the rule file or directory at `path`, which the user named as
+    /// `arg`.
+    ///
+    /// # Errors
+    ///
+    /// [`ExecError::NoRules`] (naming `arg`) when it holds no rule — a
+    /// directory without a rule file, where nothing would be checked — and
+    /// whatever [`RuleSet::from_path`] returns.
+    pub fn load_named(path: &Utf8Path, arg: &str) -> Result<RuleSet> {
+        let set = RuleSet::from_path(path)?;
+        if set.rules.is_empty() {
+            return Err(ExecError::NoRules {
+                path: Utf8PathBuf::from(arg),
+            });
+        }
+        Ok(set)
     }
 }
 
@@ -121,7 +146,7 @@ fn resolve_one(arg: &str, cwd: &Utf8Path) -> Result<RuleSet> {
         cwd.join(arg)
     };
     if candidate.exists() {
-        return RuleSet::from_path(&candidate);
+        return RuleLoader::load_named(&candidate, arg);
     }
     Err(unknown_rule(arg))
 }
@@ -163,8 +188,7 @@ fn resolve_implicit(args: &LoaderArgs) -> Result<Vec<RuleSet>> {
     }
 
     // Project-local rules at `<cwd>/.dq/rules/`.
-    let project = args.cwd.join(".dq").join("rules");
-    if project.is_dir() {
+    if let Some(project) = rule_dir::project_dir(&args.cwd)? {
         out.push(RuleSet::from_path(&project)?);
     }
 
@@ -301,6 +325,26 @@ check:
         let sets = RuleLoader::resolve(&args).expect("resolve");
         assert_eq!(sets.len(), 1);
         assert_eq!(sets[0].rules.len(), 1);
+    }
+
+    #[test]
+    fn a_directory_without_a_rule_is_an_error_unless_found_automatically() {
+        let (_t, dir) = tempdir_utf8();
+        let project = dir.join(".dq").join("rules");
+        std::fs::create_dir_all(&project).expect("mkdir");
+        std::fs::write(project.join("a.test.yml"), "tests: []\n").expect("write fixture");
+        let args = |rules: &[&str]| LoaderArgs {
+            rules: rules.iter().map(|s| (*s).to_owned()).collect(),
+            cwd: dir.clone(),
+            discovered_formats: IndexSet::new(),
+            suppress_auto_bind: false,
+        };
+        match RuleLoader::resolve(&args(&[".dq/rules"])) {
+            Err(ExecError::NoRules { path }) => assert_eq!(path, ".dq/rules"),
+            other => panic!("expected NoRules, got {other:?}"),
+        }
+        let sets = RuleLoader::resolve(&args(&[])).expect("an empty .dq/rules is fine");
+        assert!(sets.iter().all(|set| set.rules.is_empty()));
     }
 
     #[test]

@@ -13,6 +13,11 @@
 //! and `fix.ops` are set on a rule, the OPS branch takes the call and a
 //! `tracing::warn!` line records the shadowing.
 //!
+//! A rule whose `match.filter` or `check.jq` raises is skipped for the
+//! document: [`Fixer::apply`] and [`Fixer::apply_to`] log a
+//! `tracing::warn!`, [`Fixer::apply_reporting`] hands the
+//! [`RuleError`] to the caller. A fix expression that raises is an error.
+//!
 //! ## Multi-document streams
 //!
 //! A YAML stream parsed by [`dq_core::parse_yaml_stream_with_spans`] is
@@ -96,7 +101,7 @@ use camino::Utf8Path;
 use dq_core::{Document, EditScript, Pointer, Segment};
 
 use crate::error::{ExecError, Result};
-use crate::evaluator::{CompiledRule, Evaluator, run_on_document};
+use crate::evaluator::{CompiledRule, Evaluator, RuleError, RuleErrorStage, run_on_document};
 
 /// Result of applying every rule's fix to one document.
 ///
@@ -197,10 +202,51 @@ impl Fixer {
         format_name: &str,
         document: Option<usize>,
     ) -> Result<FixOutcome> {
+        let mut audit = Audit {
+            log_rule_errors: true,
+            ..Audit::default()
+        };
+        self.fix_documents(path, doc, format_name, document, &mut audit)?;
+        Ok(audit.into_outcome())
+    }
+
+    /// [`Fixer::apply_to`], with every rule that raised in `match.filter`
+    /// or `check.jq`, and so was skipped for a document, pushed to
+    /// `rule_errors` instead of logged — also when the call fails on a
+    /// later rule. One entry per rule and document, in the order they
+    /// raised.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Fixer::apply`].
+    pub fn apply_reporting(
+        &self,
+        path: &Utf8Path,
+        doc: &mut Document,
+        format_name: &str,
+        document: Option<usize>,
+        rule_errors: &mut Vec<RuleError>,
+    ) -> Result<FixOutcome> {
         let mut audit = Audit::default();
+        let fixed = self.fix_documents(path, doc, format_name, document, &mut audit);
+        rule_errors.append(&mut audit.rule_errors);
+        fixed?;
+        Ok(audit.into_outcome())
+    }
+
+    /// Fix every document of `doc`, or the one `document` names, into
+    /// `audit`.
+    fn fix_documents(
+        &self,
+        path: &Utf8Path,
+        doc: &mut Document,
+        format_name: &str,
+        document: Option<usize>,
+        audit: &mut Audit,
+    ) -> Result<()> {
         match (doc.values().map(<[_]>::len), document) {
             (Some(_), Some(index)) => {
-                self.fix_slot(path, doc, Some(index), format_name, &mut audit)?;
+                self.fix_slot(path, doc, Some(index), format_name, audit)?;
             }
             (Some(_), None) => {
                 let mut index = 0;
@@ -210,7 +256,7 @@ impl Fixer {
                 {
                     // A `fix.ops` `remove ""` takes the document away: the
                     // next one moves into its place.
-                    if !self.fix_slot(path, doc, Some(index), format_name, &mut audit)? {
+                    if !self.fix_slot(path, doc, Some(index), format_name, audit)? {
                         index += 1;
                     }
                 }
@@ -218,20 +264,15 @@ impl Fixer {
                 // second, when the first went.
                 if !doc.is_multi() && index == 0 {
                     audit.rest_of_stream = true;
-                    self.fix_slot(path, doc, None, format_name, &mut audit)?;
+                    self.fix_slot(path, doc, None, format_name, audit)?;
                 }
             }
             (None, Some(0) | None) => {
-                self.fix_slot(path, doc, None, format_name, &mut audit)?;
+                self.fix_slot(path, doc, None, format_name, audit)?;
             }
             (None, Some(_)) => {}
         }
-        Ok(FixOutcome {
-            fixed: !audit.applied_rules.is_empty(),
-            applied_rules: audit.applied_rules,
-            skipped_non_idempotent: audit.skipped_non_idempotent,
-            legacy_jq_applied: audit.legacy_jq_applied,
-        })
+        Ok(())
     }
 
     /// Run every rule against the document in `slot`, in order; `true`
@@ -279,16 +320,16 @@ impl Fixer {
         let Some(value) = slot_value(doc, slot) else {
             return Ok(());
         };
-        if !rule_applies_to(rule, path, value, format_name) {
+        if !rule_applies_to(rule, path, value, format_name, audit) {
             return Ok(());
         }
 
         // 3. Confirm there is at least one violation. Only the legacy
         // `Check::Jq` variant carries a `fix:` block today — schema and
         // composite checks ship without autofix support (an
-        // authoring-time limitation we'll lift in a follow-up). Runtime
-        // errors during the violation probe are tolerated (log + skip) —
-        // same contract as the lint evaluator.
+        // authoring-time limitation we'll lift in a follow-up). A check
+        // that raises skips the rule — same contract as the lint
+        // evaluator.
         let check_engine = match &rule.check {
             crate::evaluator::CompiledCheck::Jq { engine, .. } => engine,
             crate::evaluator::CompiledCheck::Schema { .. }
@@ -304,11 +345,7 @@ impl Fixer {
             Ok(violations) if violations.is_empty() => return Ok(()),
             Ok(_) => {}
             Err(err) => {
-                tracing::warn!(
-                    rule_id = %rule.rule.id,
-                    error = %err,
-                    "check.jq raised a runtime error before fix; skipping rule",
-                );
+                audit.record_rule_error(RuleError::new(rule, RuleErrorStage::CheckJq, &err));
                 return Ok(());
             }
         }
@@ -337,8 +374,8 @@ impl Fixer {
 /// not a stream, `Some(index)` for one document of a stream.
 type Slot = Option<usize>;
 
-/// The audit fields [`Fixer::apply_to`] collects across documents and
-/// rules.
+/// What [`Fixer::apply_to`] and [`Fixer::apply_reporting`] collect across
+/// documents and rules.
 #[derive(Default)]
 struct Audit {
     applied_rules: Vec<String>,
@@ -347,6 +384,37 @@ struct Audit {
     /// Whether the document is what is left of a stream whose other
     /// documents a `fix.ops` `remove ""` took away.
     rest_of_stream: bool,
+    /// The rules that raised before their fix could run.
+    rule_errors: Vec<RuleError>,
+    /// Log each of `rule_errors` the moment it is recorded, so the warnings
+    /// interleave with the ones other stages log.
+    log_rule_errors: bool,
+}
+
+impl Audit {
+    /// Record a rule that raised before its fix could run, logging it when
+    /// this run logs.
+    fn record_rule_error(&mut self, error: RuleError) {
+        if self.log_rule_errors {
+            let message = match error.stage {
+                RuleErrorStage::CheckJq => {
+                    "check.jq raised a runtime error before fix; skipping rule"
+                }
+                _ => "match.filter raised a runtime error; skipping rule for fix",
+            };
+            tracing::warn!(rule_id = %error.rule_id, error = %error.error, "{message}");
+        }
+        self.rule_errors.push(error);
+    }
+
+    fn into_outcome(self) -> FixOutcome {
+        FixOutcome {
+            fixed: !self.applied_rules.is_empty(),
+            applied_rules: self.applied_rules,
+            skipped_non_idempotent: self.skipped_non_idempotent,
+            legacy_jq_applied: self.legacy_jq_applied,
+        }
+    }
 }
 
 /// How many documents `doc` holds: one unless it is a stream.
@@ -661,12 +729,14 @@ fn apply_jq_branch(
 
 /// Mirror of `evaluator::evaluate_one_rule`'s gate, factored down to
 /// just the format / glob / filter checks. Returns `true` when the
-/// rule applies to `(path, value, format_name)`.
+/// rule applies to `(path, value, format_name)`. A filter that raises is
+/// recorded on `audit`, and the rule does not apply.
 fn rule_applies_to(
     rule: &CompiledRule,
     path: &Utf8Path,
     value: &dq_core::Value,
     format_name: &str,
+    audit: &mut Audit,
 ) -> bool {
     if !rule.rule.match_.format.iter().any(|f| f == format_name) {
         return false;
@@ -687,11 +757,7 @@ fn rule_applies_to(
                 }
             }
             Err(err) => {
-                tracing::warn!(
-                    rule_id = %rule.rule.id,
-                    error = %err,
-                    "match.filter raised a runtime error; skipping rule for fix",
-                );
+                audit.record_rule_error(RuleError::new(rule, RuleErrorStage::MatchFilter, &err));
                 return false;
             }
         }
@@ -814,6 +880,48 @@ fix:
         assert_eq!(out.applied_rules, vec!["test.set-fixed".to_owned()]);
         assert_eq!(doc.value().to_serde_json()["fixed"], true);
         assert!(out.skipped_non_idempotent.is_empty());
+    }
+
+    #[test]
+    fn apply_reporting_returns_the_rules_that_raised_even_when_a_fix_fails() {
+        let rule = |id: &str, filter: &str, check: &str, ops: &str| {
+            format!(
+                "id: {id}\ndescription: d\nseverity: warn\nmatch:\n  format: yaml\n  \
+                 filter: '{filter}'\ncheck:\n  jq: '{check}'\n  message: m\nfix:\n  \
+                 ops: '{ops}'\n"
+            )
+        };
+        let rules = [
+            rule("t.filter", ".s.x", ".", "[]"),
+            rule("t.check", ".", ".s.x", "[]"),
+            rule("t.fix", ".", ".", "error(\"boom\")"),
+        ];
+        let fixer = Fixer::new(&evaluator_from_yaml(&rules.join("---\n")));
+        let mut doc = parse_yaml(b"s: text\n");
+        let mut raised = Vec::new();
+        let result = fixer.apply_reporting(
+            Utf8Path::new("doc.yaml"),
+            &mut doc,
+            "yaml",
+            None,
+            &mut raised,
+        );
+        assert!(
+            matches!(&result, Err(ExecError::FixApply { rule_id, .. }) if rule_id == "t.fix"),
+            "{result:?}"
+        );
+        let error = |id: &str, stage| RuleError {
+            rule_id: id.to_owned(),
+            stage,
+            error: "jq runtime error: cannot index \"text\" with \"x\"".to_owned(),
+        };
+        assert_eq!(
+            raised,
+            [
+                error("t.filter", RuleErrorStage::MatchFilter),
+                error("t.check", RuleErrorStage::CheckJq),
+            ]
+        );
     }
 
     /// A rule that sets `.y = 2` with `fix.jq`.

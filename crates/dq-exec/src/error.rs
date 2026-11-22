@@ -58,6 +58,47 @@ pub enum ExecError {
         did_you_mean: Vec<String>,
     },
 
+    /// A directory named as a rule source holds no rule file: none at all,
+    /// or only `*.test.yml` fixtures. Nothing would be checked.
+    #[error("no rules in '{path}'")]
+    NoRules {
+        /// The directory as the caller named it.
+        path: Utf8PathBuf,
+    },
+
+    /// Something else is where a directory of rules is looked for; the
+    /// rules it should hold would be left out without a word.
+    #[error("{path} is not a directory")]
+    NotADirectory {
+        /// What is there, as dq names it: `./.dq` or `./.dq/rules`.
+        path: Utf8PathBuf,
+    },
+
+    /// A rule (or the `nested:` rule of a composite) lists no format in
+    /// `match.format`, so the rule could never apply.
+    #[error("rule {rule_id}: match.format lists no format")]
+    NoFormat {
+        /// The `id:` field of the offending rule.
+        rule_id: String,
+    },
+
+    /// A rule (or the `nested:` rule of a composite) names a format in
+    /// `match.format` that dq does not read, so the rule could never
+    /// apply. `did_you_mean` holds the close names; without one the
+    /// message lists every name.
+    #[error(
+        "rule {rule_id} has unknown format '{format}' in match.format ({})",
+        format_hint(did_you_mean)
+    )]
+    UnknownFormat {
+        /// The `id:` field of the offending rule.
+        rule_id: String,
+        /// The name as the rule spells it.
+        format: String,
+        /// Close format names, nearest first.
+        did_you_mean: Vec<String>,
+    },
+
     /// I/O failure reading a rule file or directory entry. Distinct from
     /// `dq_core::Error::Io` because the failing artifact is a *rule*
     /// source — the exit-code mapper can route this differently.
@@ -227,6 +268,16 @@ pub enum ExecError {
     },
 }
 
+/// What [`ExecError::UnknownFormat`] says after the bad name: the close
+/// names, else every format name.
+fn format_hint(did_you_mean: &[String]) -> String {
+    if did_you_mean.is_empty() {
+        format!("formats: {}", crate::rule::format_names().join(", "))
+    } else {
+        format!("did you mean: {}", did_you_mean.join(", "))
+    }
+}
+
 impl ExecError {
     /// Stable, lowercase string identifying the error category.
     ///
@@ -240,6 +291,10 @@ impl ExecError {
             Self::Parse { .. } => "parse",
             Self::RuleCompile { .. } => "rule_compile",
             Self::UnknownRule { .. } => "unknown_rule",
+            Self::NoRules { .. } => "no_rules",
+            Self::NotADirectory { .. } => "not_a_directory",
+            Self::NoFormat { .. } => "no_format",
+            Self::UnknownFormat { .. } => "unknown_format",
             Self::Io { .. } => "io",
             Self::TestFixture { .. } => "test_fixture",
             Self::GlobCompile { .. } => "glob_compile",
@@ -287,6 +342,41 @@ mod tests {
             hint: "missing 'id' field".to_owned(),
         };
         assert_eq!(err.kind_name(), "parse");
+    }
+
+    #[test]
+    fn rules_that_can_never_apply_say_what_is_wrong() {
+        let unknown = |did_you_mean: &[&str]| ExecError::UnknownFormat {
+            rule_id: "a.b".to_owned(),
+            format: "jsn".to_owned(),
+            did_you_mean: did_you_mean.iter().map(|s| (*s).to_owned()).collect(),
+        };
+        assert_eq!(unknown(&[]).kind_name(), "unknown_format");
+        assert_eq!(
+            unknown(&["json", "jsonl"]).to_string(),
+            "rule a.b has unknown format 'jsn' in match.format (did you mean: json, jsonl)"
+        );
+        let no_format = ExecError::NoFormat {
+            rule_id: "a.b".to_owned(),
+        };
+        assert_eq!(no_format.kind_name(), "no_format");
+        assert_eq!(
+            no_format.to_string(),
+            "rule a.b: match.format lists no format"
+        );
+        // Nothing close: every name.
+        assert_eq!(
+            unknown(&[]).to_string(),
+            "rule a.b has unknown format 'jsn' in match.format (formats: json, yaml, toml, \
+             jsonl, hcl, ini, dotenv, csv, tsv, dockerfile, ignore-list, markdown, frontmatter, \
+             xml)"
+        );
+        let none = ExecError::NoRules { path: "d".into() };
+        assert_eq!(none.kind_name(), "no_rules");
+        assert_eq!(none.to_string(), "no rules in 'd'");
+        let file = ExecError::NotADirectory { path: "d".into() };
+        assert_eq!(file.kind_name(), "not_a_directory");
+        assert_eq!(file.to_string(), "d is not a directory");
     }
 
     #[test]
