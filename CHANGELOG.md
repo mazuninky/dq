@@ -10,6 +10,14 @@ breaking changes are listed first under Changed.
 
 ### Changed
 
+- `dq diff` is faster on nested documents. It compared every pair of
+  subtrees in full before descending into it, so a change deep in a
+  document was scanned again at every level above it. On 256 values
+  16 levels deep it now takes less than half the time, and on a flat
+  document with a few changes about 20% less. `dq merge` no longer copies
+  the target subtree at every level (the whole document at the root) to
+  see whether it is a mapping; next to the check each edit makes, the gain
+  is small. Output is unchanged.
 - Versions in ISO weeks 1–9 have no leading zero: the first release of
   2027 is `2027.1.1`, not `2027.01.1`. Cargo versions are SemVer, which
   forbids a leading zero, so `scripts/bump-version.sh` would have written a

@@ -19,7 +19,7 @@ use crate::document::{Document, Value};
 use crate::error::{Error, PathErrorKind};
 use crate::pointer::{Pointer, Segment};
 
-use super::patch::read_value_at;
+use super::patch::is_map_at;
 
 /// Apply an RFC 7396 merge patch to `doc`.
 ///
@@ -73,7 +73,7 @@ fn merge_into(doc: &mut Document, base: &mut Pointer, patch: &Value) -> Result<(
     };
     // RFC 7396 §2: a target that is no mapping is merged as `{}` — it
     // becomes the patch without its null members.
-    if !matches!(read_value_at(doc, base), Ok(Value::Map(_))) {
+    if !is_map_at(doc, base) {
         return doc.set_at(base, without_nulls(patch));
     }
 
@@ -99,7 +99,7 @@ fn merge_into(doc: &mut Document, base: &mut Pointer, patch: &Value) -> Result<(
             // Recurse only when both the existing target and the patch are
             // maps. Any other shape (target missing, target scalar, target
             // array, or patch non-map) replaces the whole subtree.
-            let target_is_map = matches!(read_value_at(doc, base), Ok(Value::Map(_)));
+            let target_is_map = is_map_at(doc, base);
             if target_is_map && matches!(v, Value::Map(_)) {
                 merge_into(doc, base, v)
             } else {
