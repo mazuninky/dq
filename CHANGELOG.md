@@ -8,6 +8,8 @@ breaking changes are listed first under Changed.
 
 ## [Unreleased]
 
+## [2026.48.1] - 2026-11-23
+
 ### Added
 
 - `dq skill install`, `update`, `status` and `remove`: the skill for coding
