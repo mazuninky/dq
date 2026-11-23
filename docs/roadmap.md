@@ -22,8 +22,34 @@ Each has its own page with the design and the remaining steps.
   contract; remove the downstream copies of these rules in another
   repository; fixtures cannot carry a `path`, so `match.glob` cannot be
   tested.
+- **[Rules as gates](plans/lint-fail-closed.md) — partly done.** Phase 1
+  shipped in 2026.48.1: a rule that raises fails `lint`, `check` and `fix`
+  (exit 3), and a rule that can never apply is an error. Left: fixtures with
+  a `path`, so rules with `match.glob` can be tested, and a rule file that
+  holds a list of rules (phase 2); input globs that drop an unreadable
+  directory or a linked file (phase 3); `.npmrc` as a read-only format and
+  jq `IN` / `INDEX` (phase 4).
+- **[Structured errors](plans/structured-errors.md) — partly done.**
+  Positions and the caret shipped in 2026.48.1. Left: a JSON error object on
+  stderr under `-F json` / `jsonl`, jq compile errors with the expression and
+  offset, clap usage errors in that form, the failed files of a bulk run
+  (phase 3); docs and the skill (phase 4).
 
 ## Open bugs
+
+Found while porting `dq skill` to atl (2026-11-23); atl has them fixed:
+
+- `dq self update --to <older>` runs `dq skill update` with the older
+  binary, which takes a skill installed by a newer dq back to the older
+  version. Two dq binaries on one machine can then flip it on every self
+  update. `self update` should leave a skill newer than its target alone.
+- A run of `dq skill` killed while it writes leaves a `.tmpXXXXXX` file in
+  the skill directory. The next run repairs the skill but leaves the file,
+  and `remove` keeps the directory because of it. Commands that hold the
+  lock should remove such files.
+- `--force` over a link, or over a file larger than 1 MiB, where dq writes a
+  file of the skill deletes it first and writes the new one after. If the
+  write fails (disk full), the old file is gone.
 
 Found while testing parse-error positions (2026-11-22), not part of that
 change:

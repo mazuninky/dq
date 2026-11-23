@@ -1,6 +1,6 @@
 # `dq skill`: the agent skill ships in the binary and updates with it
 
-**Status: implemented (2026-11-22), not released.** The owner's decisions are at the end. Current behaviour: [reference/skill.md](../reference/skill.md).
+**Status: done, released in 2026.48.1.** The owner's decisions are at the end. Current behaviour: [reference/skill.md](../reference/skill.md).
 
 ## Problem
 

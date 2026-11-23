@@ -23,7 +23,7 @@ Work in progress, with design and remaining steps.
 - [plans/lint-fail-closed.md](plans/lint-fail-closed.md) — rules as gates: a
   rule that raises fails the run; fixtures with a path; `.npmrc`.
 - [plans/skill-command.md](plans/skill-command.md) — `dq skill`: the agent skill
-  ships in the binary and updates with it (implemented, not released).
+  ships in the binary and updates with it (released in 2026.48.1).
 - [plans/structured-errors.md](plans/structured-errors.md) — a caret under the
   offending byte and a JSON error object under `-F json` (phases 1 and 2 of 4 done).
 
